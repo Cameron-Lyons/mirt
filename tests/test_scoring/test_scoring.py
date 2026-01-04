@@ -6,8 +6,6 @@ import pytest
 from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.scoring import fscores
 from mirt.scoring.eap import EAPScorer
-from mirt.scoring.map import MAPScorer
-from mirt.scoring.ml import MLScorer
 
 
 class TestFscores:

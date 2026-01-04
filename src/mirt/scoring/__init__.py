@@ -1,6 +1,4 @@
-"""Person scoring methods for IRT models."""
-
-from typing import TYPE_CHECKING, Literal, Optional, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,54 +18,10 @@ def fscores(
     responses: NDArray[np.int_],
     method: Literal["EAP", "MAP", "ML"] = "EAP",
     n_quadpts: int = 49,
-    prior_mean: Optional[NDArray[np.float64]] = None,
-    prior_cov: Optional[NDArray[np.float64]] = None,
-    person_ids: Optional[list] = None,
+    prior_mean: NDArray[np.float64] | None = None,
+    prior_cov: NDArray[np.float64] | None = None,
+    person_ids: list | None = None,
 ) -> ScoreResult:
-    """Estimate person abilities (theta scores).
-
-    This function computes ability estimates for each respondent using
-    various scoring methods.
-
-    Parameters
-    ----------
-    model_or_result : BaseItemModel or FitResult
-        Either a fitted IRT model or a FitResult from model fitting.
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing values coded as -1.
-    method : {'EAP', 'MAP', 'ML'}, default='EAP'
-        Scoring method:
-        - 'EAP': Expected A Posteriori (posterior mean)
-        - 'MAP': Maximum A Posteriori (posterior mode)
-        - 'ML': Maximum Likelihood (no prior)
-    n_quadpts : int, default=49
-        Number of quadrature points for EAP scoring.
-    prior_mean : ndarray, optional
-        Mean of the prior distribution. Default: zeros.
-    prior_cov : ndarray, optional
-        Covariance of the prior. Default: identity.
-    person_ids : list, optional
-        Identifiers for each person in the output.
-
-    Returns
-    -------
-    ScoreResult
-        Object containing theta estimates and standard errors.
-
-    Examples
-    --------
-    >>> result = mirt.fit_mirt(responses, model='2PL')
-    >>> scores = mirt.fscores(result, responses, method='EAP')
-    >>> print(scores.theta)
-    >>> print(scores.to_dataframe())
-
-    >>> # Using MAP scoring
-    >>> scores_map = mirt.fscores(result, responses, method='MAP')
-
-    >>> # Maximum likelihood without prior
-    >>> scores_ml = mirt.fscores(result, responses, method='ML')
-    """
-    # Extract model from FitResult if needed
     from mirt.results.fit_result import FitResult
 
     if isinstance(model_or_result, FitResult):
@@ -78,7 +32,6 @@ def fscores(
     if not model.is_fitted:
         raise ValueError("Model must be fitted before scoring")
 
-    # Validate responses
     responses = np.asarray(responses)
     if responses.ndim != 2:
         raise ValueError(f"responses must be 2D, got {responses.ndim}D")
@@ -87,7 +40,6 @@ def fscores(
             f"responses has {responses.shape[1]} items, expected {model.n_items}"
         )
 
-    # Select scorer
     if method == "EAP":
         scorer = EAPScorer(
             n_quadpts=n_quadpts,
@@ -104,7 +56,6 @@ def fscores(
     else:
         raise ValueError(f"Unknown scoring method: {method}")
 
-    # Compute scores
     result = scorer.score(model, responses)
     result.person_ids = person_ids
 

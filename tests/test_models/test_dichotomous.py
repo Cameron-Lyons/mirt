@@ -4,10 +4,10 @@ import numpy as np
 import pytest
 
 from mirt.models.dichotomous import (
-    OneParameterLogistic,
-    TwoParameterLogistic,
-    ThreeParameterLogistic,
     FourParameterLogistic,
+    OneParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
 )
 
 

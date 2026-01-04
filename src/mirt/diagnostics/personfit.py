@@ -1,10 +1,7 @@
-"""Person fit statistics for IRT models."""
-
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -14,27 +11,8 @@ def compute_personfit(
     model: "BaseItemModel",
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
-    statistics: Optional[list[str]] = None,
+    statistics: list[str] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Compute person fit statistics.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model.
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix.
-    theta : ndarray of shape (n_persons,) or (n_persons, n_factors)
-        Person ability values.
-    statistics : list of str, optional
-        Statistics to compute. Options: 'infit', 'outfit', 'Zh', 'lz'.
-        Default: ['infit', 'outfit', 'Zh'].
-
-    Returns
-    -------
-    dict
-        Dictionary mapping statistic names to arrays of values.
-    """
     if statistics is None:
         statistics = ["infit", "outfit", "Zh"]
 
@@ -46,7 +24,6 @@ def compute_personfit(
 
     n_persons, n_items = responses.shape
 
-    # Compute expected values and variances
     expected = np.zeros((n_persons, n_items))
     variance = np.zeros((n_persons, n_items))
 
@@ -59,136 +36,110 @@ def compute_personfit(
             n_cat = probs.shape[1]
             categories = np.arange(n_cat)
             expected[:, i] = np.sum(probs * categories, axis=1)
-            expected_sq = np.sum(probs * (categories ** 2), axis=1)
+            expected_sq = np.sum(probs * (categories**2), axis=1)
             variance[:, i] = expected_sq - expected[:, i] ** 2
 
-    # Compute residuals
     valid_mask = responses >= 0
-    residuals = np.where(valid_mask, responses - expected, 0.0)
-    std_residuals = np.where(
+    residuals = np.where(valid_mask, responses - expected, np.nan)
+    std_residuals_sq = np.where(
         valid_mask & (variance > 1e-10),
-        residuals / np.sqrt(variance + 1e-10),
-        0.0,
+        (residuals**2) / (variance + 1e-10),
+        np.nan,
     )
 
     result: dict[str, NDArray[np.float64]] = {}
 
     if "outfit" in statistics:
-        # Outfit: unweighted mean square
-        outfit = np.zeros(n_persons)
-        for p in range(n_persons):
-            valid = valid_mask[p, :]
-            if valid.sum() > 0:
-                outfit[p] = np.mean(std_residuals[p, valid] ** 2)
-            else:
-                outfit[p] = np.nan
+        with np.errstate(all="ignore"):
+            outfit = np.nanmean(std_residuals_sq, axis=1)
         result["outfit"] = outfit
 
     if "infit" in statistics:
-        # Infit: weighted mean square
-        infit = np.zeros(n_persons)
-        for p in range(n_persons):
-            valid = valid_mask[p, :]
-            if valid.sum() > 0:
-                numerator = np.sum(residuals[p, valid] ** 2)
-                denominator = np.sum(variance[p, valid])
-                if denominator > 1e-10:
-                    infit[p] = numerator / denominator
-                else:
-                    infit[p] = np.nan
-            else:
-                infit[p] = np.nan
+        residuals_sq = np.where(valid_mask, residuals**2, 0.0)
+        var_sum = np.where(valid_mask, variance, 0.0)
+
+        numerator = np.sum(residuals_sq, axis=1)
+        denominator = np.sum(var_sum, axis=1)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            infit = np.where(denominator > 1e-10, numerator / denominator, np.nan)
         result["infit"] = infit
 
     if "Zh" in statistics or "lz" in statistics:
-        # Zh (Drasgow et al.) / lz (person fit)
-        # Standardized log-likelihood
-        zh = np.zeros(n_persons)
-
-        for p in range(n_persons):
-            valid = valid_mask[p, :]
-            if valid.sum() < 2:
-                zh[p] = np.nan
-                continue
-
-            # Log-likelihood for this person
-            ll = 0.0
-            expected_ll = 0.0
-            var_ll = 0.0
-
-            for i in range(n_items):
-                if not valid[i]:
-                    continue
-
-                resp = responses[p, i]
-                probs = model.probability(theta[p:p+1], i)
-
-                if probs.ndim == 1:
-                    # Dichotomous
-                    prob = probs[0]
-                    prob = np.clip(prob, 1e-10, 1 - 1e-10)
-
-                    if resp == 1:
-                        ll += np.log(prob)
-                    else:
-                        ll += np.log(1 - prob)
-
-                    # Expected log-likelihood
-                    expected_ll += prob * np.log(prob) + (1 - prob) * np.log(1 - prob)
-
-                    # Variance of log-likelihood
-                    log_p = np.log(prob)
-                    log_q = np.log(1 - prob)
-                    var_ll += prob * (1 - prob) * (log_p - log_q) ** 2
-
-                else:
-                    # Polytomous
-                    prob = probs[0, resp]
-                    prob = max(prob, 1e-10)
-                    ll += np.log(prob)
-
-                    # Expected and variance for polytomous
-                    probs_item = probs[0]
-                    probs_item = np.clip(probs_item, 1e-10, 1 - 1e-10)
-                    log_probs = np.log(probs_item)
-
-                    expected_ll += np.sum(probs_item * log_probs)
-                    var_ll += np.sum(probs_item * log_probs ** 2) - \
-                              np.sum(probs_item * log_probs) ** 2
-
-            # Standardize
-            if var_ll > 1e-10:
-                zh[p] = (ll - expected_ll) / np.sqrt(var_ll)
-            else:
-                zh[p] = np.nan
+        zh = _compute_zh_vectorized(model, responses, theta, valid_mask)
 
         if "Zh" in statistics:
             result["Zh"] = zh
         if "lz" in statistics:
-            result["lz"] = zh  # Same computation
+            result["lz"] = zh
 
     return result
 
 
+def _compute_zh_vectorized(
+    model: "BaseItemModel",
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    valid_mask: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    n_persons, n_items = responses.shape
+
+    ll = np.zeros(n_persons)
+    expected_ll = np.zeros(n_persons)
+    var_ll = np.zeros(n_persons)
+
+    for i in range(n_items):
+        probs = model.probability(theta, i)
+
+        if probs.ndim == 1:
+            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            item_valid = valid_mask[:, i]
+            resp = responses[:, i]
+
+            log_p = np.log(probs)
+            log_q = np.log(1 - probs)
+
+            person_ll = np.where(resp == 1, log_p, log_q)
+            ll += np.where(item_valid, person_ll, 0.0)
+
+            item_expected_ll = probs * log_p + (1 - probs) * log_q
+            expected_ll += np.where(item_valid, item_expected_ll, 0.0)
+
+            item_var_ll = probs * (1 - probs) * (log_p - log_q) ** 2
+            var_ll += np.where(item_valid, item_var_ll, 0.0)
+
+        else:
+            n_cat = probs.shape[1]
+            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            log_probs = np.log(probs)
+            item_valid = valid_mask[:, i]
+            resp = responses[:, i]
+
+            resp_clipped = np.clip(resp, 0, n_cat - 1)
+            person_ll = log_probs[np.arange(n_persons), resp_clipped]
+            ll += np.where(item_valid, person_ll, 0.0)
+
+            item_expected_ll = np.sum(probs * log_probs, axis=1)
+            expected_ll += np.where(item_valid, item_expected_ll, 0.0)
+
+            item_var_ll = np.sum(probs * log_probs**2, axis=1) - item_expected_ll**2
+            var_ll += np.where(item_valid, item_var_ll, 0.0)
+
+    valid_count = valid_mask.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        zh = np.where(
+            (valid_count >= 2) & (var_ll > 1e-10),
+            (ll - expected_ll) / np.sqrt(var_ll),
+            np.nan,
+        )
+
+    return zh
+
+
 def flag_aberrant_persons(
     fit_stats: dict[str, NDArray[np.float64]],
-    criteria: Optional[dict[str, tuple[float, float]]] = None,
+    criteria: dict[str, tuple[float, float]] | None = None,
 ) -> NDArray[np.bool_]:
-    """Identify persons with aberrant response patterns.
-
-    Parameters
-    ----------
-    fit_stats : dict
-        Person fit statistics from compute_personfit.
-    criteria : dict, optional
-        Flagging criteria as {statistic: (lower, upper)}.
-        Default: infit/outfit in (0.5, 1.5), Zh in (-2, 2).
-
-    Returns
-    -------
-    ndarray of bool
-        True for persons flagged as aberrant.
-    """
     if criteria is None:
         criteria = {
             "infit": (0.5, 1.5),
@@ -196,7 +147,6 @@ def flag_aberrant_persons(
             "Zh": (-2.0, 2.0),
         }
 
-    # Get number of persons from first statistic
     first_stat = next(iter(fit_stats.values()))
     n_persons = len(first_stat)
 

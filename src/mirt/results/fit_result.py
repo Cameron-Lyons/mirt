@@ -1,52 +1,16 @@
-"""Result container for model fitting."""
-
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Optional
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     import pandas as pd
-    from mirt.models.base import BaseItemModel
 
 
 @dataclass
 class FitResult:
-    """Container for IRT model fitting results.
-
-    This class holds the results of fitting an IRT model, including
-    estimated parameters, standard errors, and fit statistics.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        The fitted IRT model.
-    log_likelihood : float
-        Final log-likelihood value.
-    n_iterations : int
-        Number of iterations until convergence.
-    converged : bool
-        Whether the algorithm converged.
-    standard_errors : dict
-        Standard errors for each parameter.
-    aic : float
-        Akaike Information Criterion.
-    bic : float
-        Bayesian Information Criterion.
-    n_observations : int, optional
-        Number of observations (persons).
-    n_parameters : int, optional
-        Number of free parameters.
-
-    Examples
-    --------
-    >>> result = estimator.fit(model, responses)
-    >>> print(result.summary())
-    >>> params = result.coef()
-    """
-
-    model: Any  # BaseItemModel
+    model: Any
     log_likelihood: float
     n_iterations: int
     converged: bool
@@ -57,29 +21,15 @@ class FitResult:
     n_parameters: int = 0
 
     def summary(self, alpha: float = 0.05) -> str:
-        """Generate a formatted summary of the results.
-
-        Parameters
-        ----------
-        alpha : float, default=0.05
-            Significance level for confidence intervals.
-
-        Returns
-        -------
-        str
-            Formatted summary string.
-        """
         from scipy import stats
 
         lines = []
         width = 80
 
-        # Header
         lines.append("=" * width)
         lines.append(f"{'IRT Model Results':^{width}}")
         lines.append("=" * width)
 
-        # Model info
         lines.append(
             f"Model:              {self.model.model_name:<20} "
             f"Log-Likelihood:    {self.log_likelihood:>12.4f}"
@@ -102,7 +52,6 @@ class FitResult:
         )
         lines.append("-" * width)
 
-        # Parameter tables
         z_crit = stats.norm.ppf(1 - alpha / 2)
 
         for param_name, values in self.model.parameters.items():
@@ -110,8 +59,7 @@ class FitResult:
 
             se = self.standard_errors.get(param_name, np.zeros_like(values))
 
-            # Header row
-            ci_label = f"[{(1-alpha)*100:.0f}%"
+            ci_label = f"[{(1 - alpha) * 100:.0f}%"
             lines.append(
                 f"{'Item':<15} {'Estimate':>10} {'Std.Err':>10} "
                 f"{'z-value':>10} {'P>|z|':>10} "
@@ -119,7 +67,6 @@ class FitResult:
             )
             lines.append("-" * width)
 
-            # Handle 1D and 2D parameter arrays
             if values.ndim == 1:
                 for i in range(len(values)):
                     est = values[i]
@@ -148,7 +95,6 @@ class FitResult:
                         f"{ci_low:>8.4f} {ci_high:>8.4f}"
                     )
             else:
-                # 2D parameters (e.g., multidimensional discrimination)
                 for i in range(values.shape[0]):
                     item_name = (
                         self.model.item_names[i]
@@ -182,13 +128,6 @@ class FitResult:
         return "\n".join(lines)
 
     def coef(self) -> "pd.DataFrame":
-        """Return item parameters as a DataFrame.
-
-        Returns
-        -------
-        pandas.DataFrame
-            DataFrame with item parameters as columns.
-        """
         import pandas as pd
 
         data: dict[str, Any] = {}
@@ -197,9 +136,8 @@ class FitResult:
             if values.ndim == 1:
                 data[param_name] = values
             else:
-                # Multidimensional: split into columns
                 for j in range(values.shape[1]):
-                    data[f"{param_name}_{j+1}"] = values[:, j]
+                    data[f"{param_name}_{j + 1}"] = values[:, j]
 
         df = pd.DataFrame(data)
         df.index = self.model.item_names[: len(df)]
@@ -208,13 +146,6 @@ class FitResult:
         return df
 
     def coef_with_se(self) -> "pd.DataFrame":
-        """Return item parameters with standard errors as a DataFrame.
-
-        Returns
-        -------
-        pandas.DataFrame
-            DataFrame with parameter estimates and their SEs.
-        """
         import pandas as pd
 
         data: dict[str, Any] = {}
@@ -227,9 +158,9 @@ class FitResult:
                 data[f"{param_name}_se"] = se
             else:
                 for j in range(values.shape[1]):
-                    data[f"{param_name}_{j+1}"] = values[:, j]
+                    data[f"{param_name}_{j + 1}"] = values[:, j]
                     if se.ndim > 1 and j < se.shape[1]:
-                        data[f"{param_name}_{j+1}_se"] = se[:, j]
+                        data[f"{param_name}_{j + 1}_se"] = se[:, j]
 
         df = pd.DataFrame(data)
         df.index = self.model.item_names[: len(df)]
@@ -238,13 +169,6 @@ class FitResult:
         return df
 
     def fit_statistics(self) -> dict[str, float]:
-        """Return fit statistics as a dictionary.
-
-        Returns
-        -------
-        dict
-            Dictionary containing AIC, BIC, log-likelihood, etc.
-        """
         return {
             "log_likelihood": self.log_likelihood,
             "aic": self.aic,

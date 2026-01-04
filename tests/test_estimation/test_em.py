@@ -1,10 +1,9 @@
 """Tests for EM estimation algorithm."""
 
 import numpy as np
-import pytest
 
-from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.estimation.em import EMEstimator
+from mirt.models.dichotomous import TwoParameterLogistic
 
 
 class TestEMEstimator:
@@ -50,7 +49,7 @@ class TestEMEstimator:
         assert len(history) > 0
         # Log-likelihood should generally increase (or stay same)
         for i in range(1, len(history)):
-            assert history[i] >= history[i-1] - 0.1  # Allow small fluctuations
+            assert history[i] >= history[i - 1] - 0.1  # Allow small fluctuations
 
     def test_parameter_recovery(self, rng):
         """Test recovery of known parameters."""
