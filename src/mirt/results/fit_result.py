@@ -1,11 +1,8 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 @dataclass
@@ -127,8 +124,8 @@ class FitResult:
         lines.append("=" * width)
         return "\n".join(lines)
 
-    def coef(self) -> "pd.DataFrame":
-        import pandas as pd
+    def coef(self) -> Any:
+        from mirt.utils.dataframe import create_dataframe
 
         data: dict[str, Any] = {}
 
@@ -139,14 +136,13 @@ class FitResult:
                 for j in range(values.shape[1]):
                     data[f"{param_name}_{j + 1}"] = values[:, j]
 
-        df = pd.DataFrame(data)
-        df.index = self.model.item_names[: len(df)]
-        df.index.name = "item"
+        n_items = len(next(iter(data.values())))
+        return create_dataframe(
+            data, index=self.model.item_names[:n_items], index_name="item"
+        )
 
-        return df
-
-    def coef_with_se(self) -> "pd.DataFrame":
-        import pandas as pd
+    def coef_with_se(self) -> Any:
+        from mirt.utils.dataframe import create_dataframe
 
         data: dict[str, Any] = {}
 
@@ -162,11 +158,10 @@ class FitResult:
                     if se.ndim > 1 and j < se.shape[1]:
                         data[f"{param_name}_{j + 1}_se"] = se[:, j]
 
-        df = pd.DataFrame(data)
-        df.index = self.model.item_names[: len(df)]
-        df.index.name = "item"
-
-        return df
+        n_items = len(next(iter(data.values())))
+        return create_dataframe(
+            data, index=self.model.item_names[:n_items], index_name="item"
+        )
 
     def fit_statistics(self) -> dict[str, float]:
         return {

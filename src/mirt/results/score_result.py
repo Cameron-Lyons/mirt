@@ -1,11 +1,8 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 
 @dataclass
@@ -25,10 +22,10 @@ class ScoreResult:
             return 1
         return self.theta.shape[1]
 
-    def to_dataframe(self) -> "pd.DataFrame":
-        import pandas as pd
+    def to_dataframe(self) -> Any:
+        from mirt.utils.dataframe import create_dataframe
 
-        data = {}
+        data: dict[str, Any] = {}
 
         if self.n_factors == 1:
             theta_1d = self.theta.ravel()
@@ -40,13 +37,9 @@ class ScoreResult:
                 data[f"theta_{j + 1}"] = self.theta[:, j]
                 data[f"se_{j + 1}"] = self.standard_error[:, j]
 
-        df = pd.DataFrame(data)
-
-        if self.person_ids is not None:
-            df.index = self.person_ids
-            df.index.name = "person"
-
-        return df
+        return create_dataframe(
+            data, index=self.person_ids, index_name="person" if self.person_ids else None
+        )
 
     def to_array(self, include_se: bool = False) -> NDArray[np.float64]:
         if not include_se:

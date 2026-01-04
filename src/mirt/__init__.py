@@ -1,10 +1,7 @@
-from typing import TYPE_CHECKING, Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-
-if TYPE_CHECKING:
-    import pandas as pd
 
 from mirt._version import __version__
 from mirt.estimation.em import EMEstimator
@@ -29,6 +26,7 @@ from mirt.results.fit_result import FitResult
 from mirt.results.score_result import ScoreResult
 from mirt.scoring import fscores
 from mirt.utils.data import validate_responses
+from mirt.utils.dataframe import set_dataframe_backend
 from mirt.utils.simulation import generate_item_parameters, simdata
 
 
@@ -121,21 +119,18 @@ def itemfit(
     result: FitResult,
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
-) -> "pd.DataFrame":
-    import pandas as pd
-
+) -> Any:
     from mirt.diagnostics.itemfit import compute_itemfit
+    from mirt.utils.dataframe import create_dataframe
 
     if statistics is None:
         statistics = ["infit", "outfit"]
 
     fit_stats = compute_itemfit(result.model, responses, statistics)
 
-    df = pd.DataFrame(fit_stats)
-    df.index = result.model.item_names
-    df.index.name = "item"
-
-    return df
+    return create_dataframe(
+        fit_stats, index=result.model.item_names, index_name="item"
+    )
 
 
 def personfit(
@@ -143,10 +138,9 @@ def personfit(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     statistics: list[str] | None = None,
-) -> "pd.DataFrame":
-    import pandas as pd
-
+) -> Any:
     from mirt.diagnostics.personfit import compute_personfit
+    from mirt.utils.dataframe import create_dataframe
 
     if statistics is None:
         statistics = ["infit", "outfit", "Zh"]
@@ -157,10 +151,7 @@ def personfit(
 
     fit_stats = compute_personfit(result.model, responses, theta, statistics)
 
-    df = pd.DataFrame(fit_stats)
-    df.index.name = "person"
-
-    return df
+    return create_dataframe(fit_stats, index_name="person")
 
 
 __all__ = [
@@ -188,4 +179,5 @@ __all__ = [
     "ScoreResult",
     "generate_item_parameters",
     "validate_responses",
+    "set_dataframe_backend",
 ]
