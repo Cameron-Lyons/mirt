@@ -1,9 +1,13 @@
 """Shared numeric utilities."""
 
-from typing import Callable
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
 
 
 def logsumexp(
@@ -94,8 +98,6 @@ def compute_expected_variance(
     variance : array of shape (n_persons, n_items)
         Variance of scores for each person-item combination.
     """
-    from mirt.models.base import BaseItemModel
-
     n_persons = theta.shape[0]
     expected = np.zeros((n_persons, n_items))
     variance = np.zeros((n_persons, n_items))

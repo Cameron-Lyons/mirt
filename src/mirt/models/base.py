@@ -139,6 +139,14 @@ class BaseItemModel(ABC):
 
 
 class DichotomousItemModel(BaseItemModel):
+    def icc(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Item characteristic curve (alias for probability)."""
+        return self.probability(theta, item_idx)
+
     def log_likelihood(
         self,
         responses: NDArray[np.int_],
