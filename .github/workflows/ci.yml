@@ -16,10 +16,15 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Set up Python
-        run: uv python install 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
 
       - name: Run ruff check
         run: uv run ruff check src/ tests/
@@ -36,10 +41,15 @@ jobs:
         uses: astral-sh/setup-uv@v7
 
       - name: Set up Python 3.14
-        run: uv python install 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+          allow-prereleases: true
 
       - name: Install dependencies
-        run: uv sync --dev
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
 
       - name: Run tests
         run: uv run pytest tests/ -v --cov=src/mirt --cov-report=xml
