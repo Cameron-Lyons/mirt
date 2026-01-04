@@ -5,6 +5,27 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def _compute_z_stats(
+    est: float,
+    err: float,
+    z_crit: float,
+) -> tuple[float, float, float, float]:
+    """Compute z-value, p-value, and confidence interval."""
+    if err > 0 and not np.isnan(err):
+        z = est / err
+        from scipy import stats
+
+        p = 2 * (1 - stats.norm.cdf(abs(z)))
+        ci_low = est - z_crit * err
+        ci_high = est + z_crit * err
+    else:
+        z = np.nan
+        p = np.nan
+        ci_low = np.nan
+        ci_high = np.nan
+    return z, p, ci_low, ci_high
+
+
 @dataclass
 class FitResult:
     model: Any
@@ -68,17 +89,7 @@ class FitResult:
                 for i in range(len(values)):
                     est = values[i]
                     err = se[i] if i < len(se) else 0.0
-
-                    if err > 0 and not np.isnan(err):
-                        z = est / err
-                        p = 2 * (1 - stats.norm.cdf(abs(z)))
-                        ci_low = est - z_crit * err
-                        ci_high = est + z_crit * err
-                    else:
-                        z = np.nan
-                        p = np.nan
-                        ci_low = np.nan
-                        ci_high = np.nan
+                    z, p, ci_low, ci_high = _compute_z_stats(est, err, z_crit)
 
                     item_name = (
                         self.model.item_names[i]
@@ -102,17 +113,7 @@ class FitResult:
                     for j in range(values.shape[1]):
                         est = values[i, j]
                         err = se[i, j] if i < se.shape[0] and j < se.shape[1] else 0.0
-
-                        if err > 0 and not np.isnan(err):
-                            z = est / err
-                            p = 2 * (1 - stats.norm.cdf(abs(z)))
-                            ci_low = est - z_crit * err
-                            ci_high = est + z_crit * err
-                        else:
-                            z = np.nan
-                            p = np.nan
-                            ci_low = np.nan
-                            ci_high = np.nan
+                        z, p, ci_low, ci_high = _compute_z_stats(est, err, z_crit)
 
                         label = f"{item_name}[{j}]"
                         lines.append(

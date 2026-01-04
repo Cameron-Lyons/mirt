@@ -53,33 +53,6 @@ class TwoParameterLogistic(DichotomousItemModel):
             z = np.dot(theta, a.T) - np.sum(a, axis=1) * b
             return 1.0 / (1.0 + np.exp(-z))
 
-    def log_likelihood(
-        self,
-        responses: NDArray[np.int_],
-        theta: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
-        theta = self._ensure_theta_2d(theta)
-
-        if responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {self.n_items}"
-            )
-
-        p = self.probability(theta)
-
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
-
-        valid = responses >= 0
-
-        ll = np.where(
-            valid,
-            responses * np.log(p) + (1 - responses) * np.log(1 - p),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
-
     def information(
         self,
         theta: NDArray[np.float64],
@@ -103,13 +76,6 @@ class TwoParameterLogistic(DichotomousItemModel):
         else:
             a_sq = np.sum(a**2, axis=1)
             return a_sq[None, :] * p * q
-
-    def test_information(
-        self,
-        theta: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        item_info = self.information(theta)
-        return item_info.sum(axis=1)
 
 
 class OneParameterLogistic(TwoParameterLogistic):
@@ -189,31 +155,6 @@ class ThreeParameterLogistic(DichotomousItemModel):
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         p_star = 1.0 / (1.0 + np.exp(-z))
         return c[None, :] + (1.0 - c[None, :]) * p_star
-
-    def log_likelihood(
-        self,
-        responses: NDArray[np.int_],
-        theta: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
-        theta = self._ensure_theta_2d(theta)
-
-        if responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {self.n_items}"
-            )
-
-        p = self.probability(theta)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
-
-        valid = responses >= 0
-        ll = np.where(
-            valid,
-            responses * np.log(p) + (1 - responses) * np.log(1 - p),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
 
     def information(
         self,
@@ -296,31 +237,6 @@ class FourParameterLogistic(DichotomousItemModel):
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         p_star = 1.0 / (1.0 + np.exp(-z))
         return c[None, :] + (d[None, :] - c[None, :]) * p_star
-
-    def log_likelihood(
-        self,
-        responses: NDArray[np.int_],
-        theta: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
-        theta = self._ensure_theta_2d(theta)
-
-        if responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {self.n_items}"
-            )
-
-        p = self.probability(theta)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
-
-        valid = responses >= 0
-        ll = np.where(
-            valid,
-            responses * np.log(p) + (1 - responses) * np.log(1 - p),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
 
     def information(
         self,

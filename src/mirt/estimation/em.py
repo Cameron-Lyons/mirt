@@ -6,6 +6,7 @@ from scipy.optimize import minimize
 
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -18,7 +19,6 @@ class EMEstimator(BaseEstimator):
         n_quadpts: int = 21,
         max_iter: int = 500,
         tol: float = 1e-4,
-        accelerate: bool = True,
         verbose: bool = False,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
@@ -27,7 +27,6 @@ class EMEstimator(BaseEstimator):
             raise ValueError("n_quadpts should be at least 5")
 
         self.n_quadpts = n_quadpts
-        self.accelerate = accelerate
         self._quadrature: GaussHermiteQuadrature | None = None
 
     def fit(
@@ -121,7 +120,7 @@ class EMEstimator(BaseEstimator):
 
         log_joint = log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
 
-        log_marginal = self._logsumexp(log_joint, axis=1, keepdims=True)
+        log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
         log_posterior = log_joint - log_marginal
 
         posterior_weights = np.exp(log_posterior)
@@ -407,17 +406,3 @@ class EMEstimator(BaseEstimator):
 
         log_norm = -0.5 * (d * np.log(2 * np.pi) + log_det)
         return log_norm - 0.5 * maha
-
-    @staticmethod
-    def _logsumexp(
-        a: NDArray[np.float64],
-        axis: int | None = None,
-        keepdims: bool = False,
-    ) -> NDArray[np.float64]:
-        a_max = np.max(a, axis=axis, keepdims=True)
-        result = a_max + np.log(np.sum(np.exp(a - a_max), axis=axis, keepdims=True))
-
-        if not keepdims:
-            result = np.squeeze(result, axis=axis)
-
-        return result

@@ -38,7 +38,9 @@ class ScoreResult:
                 data[f"se_{j + 1}"] = self.standard_error[:, j]
 
         return create_dataframe(
-            data, index=self.person_ids, index_name="person" if self.person_ids else None
+            data,
+            index=self.person_ids,
+            index_name="person" if self.person_ids else None,
         )
 
     def to_array(self, include_se: bool = False) -> NDArray[np.float64]:

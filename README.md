@@ -17,10 +17,10 @@ A comprehensive Python implementation of Item Response Theory (IRT) models, insp
 ## Installation
 
 ```bash
-pip install -e .
+pip install mirt
 ```
 
-Or for development:
+For development:
 
 ```bash
 pip install -e ".[dev]"

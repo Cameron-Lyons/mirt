@@ -139,12 +139,30 @@ class BaseItemModel(ABC):
 
 
 class DichotomousItemModel(BaseItemModel):
-    def icc(
+    def log_likelihood(
         self,
+        responses: NDArray[np.int_],
         theta: NDArray[np.float64],
-        item_idx: int,
     ) -> NDArray[np.float64]:
-        return self.probability(theta, item_idx)
+        responses = np.asarray(responses)
+        theta = self._ensure_theta_2d(theta)
+
+        if responses.shape[1] != self.n_items:
+            raise ValueError(
+                f"responses has {responses.shape[1]} items, expected {self.n_items}"
+            )
+
+        p = self.probability(theta)
+        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+
+        valid = responses >= 0
+        ll = np.where(
+            valid,
+            responses * np.log(p) + (1 - responses) * np.log(1 - p),
+            0.0,
+        )
+
+        return ll.sum(axis=1)
 
     def expected_score(
         self,
@@ -196,6 +214,55 @@ class PolytomousItemModel(BaseItemModel):
         category: int,
     ) -> NDArray[np.float64]: ...
 
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+
+        if item_idx is not None:
+            n_cat = self._n_categories[item_idx]
+            probs = np.zeros((n_persons, n_cat))
+            for k in range(n_cat):
+                probs[:, k] = self.category_probability(theta, item_idx, k)
+            return probs
+
+        max_cat = max(self._n_categories)
+        probs = np.zeros((n_persons, self.n_items, max_cat))
+
+        for i in range(self.n_items):
+            n_cat = self._n_categories[i]
+            for k in range(n_cat):
+                probs[:, i, k] = self.category_probability(theta, i, k)
+
+        return probs
+
+    def information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+
+        if item_idx is not None:
+            return self._item_information(theta, item_idx)
+
+        info = np.zeros(n_persons)
+        for i in range(self.n_items):
+            info += self._item_information(theta, i)
+
+        return info
+
+    @abstractmethod
+    def _item_information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]: ...
+
     def expected_score(
         self,
         theta: NDArray[np.float64],
@@ -230,3 +297,25 @@ class PolytomousItemModel(BaseItemModel):
             curves[:, k] = self.category_probability(theta, item_idx, k)
 
         return curves
+
+    def log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        responses = np.asarray(responses)
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+
+        ll = np.zeros(n_persons)
+
+        for i in range(self.n_items):
+            for person in range(n_persons):
+                resp = responses[person, i]
+                if resp >= 0:
+                    prob = self.category_probability(
+                        theta[person : person + 1], i, resp
+                    )
+                    ll[person] += np.log(prob[0] + 1e-10)
+
+        return ll

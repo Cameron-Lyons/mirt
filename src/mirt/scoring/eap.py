@@ -5,6 +5,7 @@ from numpy.typing import NDArray
 
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.results.score_result import ScoreResult
+from mirt.utils.numeric import logsumexp_axis1
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -62,7 +63,7 @@ class EAPScorer:
 
         log_posterior = log_likes + np.log(quad_weights + 1e-300)[None, :]
 
-        log_norm = self._logsumexp_axis1(log_posterior)
+        log_norm = logsumexp_axis1(log_posterior)
         posterior = np.exp(log_posterior - log_norm[:, None])
 
         theta_eap = np.dot(posterior, quad_points)
@@ -80,18 +81,6 @@ class EAPScorer:
             standard_error=theta_se,
             method="EAP",
         )
-
-    @staticmethod
-    def _logsumexp_axis1(a: NDArray[np.float64]) -> NDArray[np.float64]:
-        a_max = np.max(a, axis=1, keepdims=True)
-        return (
-            a_max + np.log(np.sum(np.exp(a - a_max), axis=1, keepdims=True))
-        ).ravel()
-
-    @staticmethod
-    def _logsumexp(a: NDArray[np.float64]) -> float:
-        a_max = np.max(a)
-        return a_max + np.log(np.sum(np.exp(a - a_max)))
 
     def __repr__(self) -> str:
         return f"EAPScorer(n_quadpts={self.n_quadpts})"

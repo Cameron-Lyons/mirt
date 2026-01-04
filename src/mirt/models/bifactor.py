@@ -99,26 +99,6 @@ class BifactorModel(DichotomousItemModel):
 
         return probs
 
-    def log_likelihood(
-        self,
-        responses: NDArray[np.int_],
-        theta: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
-        theta = self._ensure_theta_2d(theta)
-
-        p = self.probability(theta)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
-
-        valid = responses >= 0
-        ll = np.where(
-            valid,
-            responses * np.log(p) + (1 - responses) * np.log(1 - p),
-            0.0,
-        )
-
-        return ll.sum(axis=1)
-
     def information(
         self,
         theta: NDArray[np.float64],

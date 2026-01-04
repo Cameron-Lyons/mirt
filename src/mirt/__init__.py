@@ -128,9 +128,7 @@ def itemfit(
 
     fit_stats = compute_itemfit(result.model, responses, statistics)
 
-    return create_dataframe(
-        fit_stats, index=result.model.item_names, index_name="item"
-    )
+    return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")
 
 
 def personfit(

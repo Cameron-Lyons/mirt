@@ -5,6 +5,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
 from mirt.results.score_result import ScoreResult
+from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -132,26 +133,7 @@ class MAPScorer:
         )
 
         theta_est = result.x
-
-        h = 1e-5
-        se_est = np.zeros(n_factors)
-        f_center = neg_log_posterior(theta_est)
-
-        for j in range(n_factors):
-            theta_plus = theta_est.copy()
-            theta_plus[j] += h
-            theta_minus = theta_est.copy()
-            theta_minus[j] -= h
-
-            f_plus = neg_log_posterior(theta_plus)
-            f_minus = neg_log_posterior(theta_minus)
-
-            hessian_jj = (f_plus - 2 * f_center + f_minus) / (h**2)
-
-            if hessian_jj > 0:
-                se_est[j] = np.sqrt(1.0 / hessian_jj)
-            else:
-                se_est[j] = np.nan
+        se_est = compute_hessian_se(neg_log_posterior, theta_est)
 
         return theta_est, se_est
 

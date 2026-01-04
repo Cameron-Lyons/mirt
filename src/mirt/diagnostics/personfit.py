@@ -3,6 +3,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.utils.numeric import compute_expected_variance, compute_fit_stats
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -24,48 +26,19 @@ def compute_personfit(
 
     n_persons, n_items = responses.shape
 
-    expected = np.zeros((n_persons, n_items))
-    variance = np.zeros((n_persons, n_items))
-
-    for i in range(n_items):
-        probs = model.probability(theta, i)
-        if probs.ndim == 1:
-            expected[:, i] = probs
-            variance[:, i] = probs * (1 - probs)
-        else:
-            n_cat = probs.shape[1]
-            categories = np.arange(n_cat)
-            expected[:, i] = np.sum(probs * categories, axis=1)
-            expected_sq = np.sum(probs * (categories**2), axis=1)
-            variance[:, i] = expected_sq - expected[:, i] ** 2
-
-    valid_mask = responses >= 0
-    residuals = np.where(valid_mask, responses - expected, np.nan)
-    std_residuals_sq = np.where(
-        valid_mask & (variance > 1e-10),
-        (residuals**2) / (variance + 1e-10),
-        np.nan,
-    )
+    expected, variance = compute_expected_variance(model, theta, n_items)
+    infit, outfit = compute_fit_stats(responses, expected, variance, axis=1)
 
     result: dict[str, NDArray[np.float64]] = {}
 
     if "outfit" in statistics:
-        with np.errstate(all="ignore"):
-            outfit = np.nanmean(std_residuals_sq, axis=1)
         result["outfit"] = outfit
 
     if "infit" in statistics:
-        residuals_sq = np.where(valid_mask, residuals**2, 0.0)
-        var_sum = np.where(valid_mask, variance, 0.0)
-
-        numerator = np.sum(residuals_sq, axis=1)
-        denominator = np.sum(var_sum, axis=1)
-
-        with np.errstate(divide="ignore", invalid="ignore"):
-            infit = np.where(denominator > 1e-10, numerator / denominator, np.nan)
         result["infit"] = infit
 
     if "Zh" in statistics or "lz" in statistics:
+        valid_mask = responses >= 0
         zh = _compute_zh_vectorized(model, responses, theta, valid_mask)
 
         if "Zh" in statistics:

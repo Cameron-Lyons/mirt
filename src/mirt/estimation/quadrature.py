@@ -112,31 +112,3 @@ class GaussHermiteQuadrature:
             f"n_dimensions={self.n_dimensions}, "
             f"n_total_points={self.n_total_points})"
         )
-
-
-def create_quadrature_grid(
-    n_points: int = 21,
-    n_dimensions: int = 1,
-    theta_range: tuple[float, float] = (-6.0, 6.0),
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    points_1d = np.linspace(theta_range[0], theta_range[1], n_points)
-
-    if n_dimensions == 1:
-        nodes = points_1d.reshape(-1, 1)
-        from scipy.stats import norm
-
-        weights = norm.pdf(points_1d)
-        weights = weights / weights.sum()
-        return nodes, weights
-
-    grids = [points_1d] * n_dimensions
-    mesh = np.meshgrid(*grids, indexing="ij")
-    nodes = np.column_stack([g.ravel() for g in mesh])
-
-    from scipy.stats import multivariate_normal
-
-    rv = multivariate_normal(mean=np.zeros(n_dimensions))
-    weights = rv.pdf(nodes)
-    weights = weights / weights.sum()
-
-    return nodes, weights
