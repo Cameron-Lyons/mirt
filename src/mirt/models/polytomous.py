@@ -221,7 +221,7 @@ class PartialCreditModel(GeneralizedPartialCredit):
 
         self._parameters["steps"] = steps
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> "PartialCreditModel":
+    def set_parameters(self, **params: NDArray[np.float64]) -> PartialCreditModel:
         if "discrimination" in params:
             raise ValueError("Cannot set discrimination in PCM (fixed to 1)")
         return super().set_parameters(**params)

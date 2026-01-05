@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def compute_personfit(
-    model: "BaseItemModel",
+    model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
     statistics: list[str] | None = None,
@@ -50,7 +50,7 @@ def compute_personfit(
 
 
 def _compute_zh_vectorized(
-    model: "BaseItemModel",
+    model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
     valid_mask: NDArray[np.bool_],

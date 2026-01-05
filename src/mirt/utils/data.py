@@ -1,9 +1,11 @@
+from typing import Any
+
 import numpy as np
 from numpy.typing import NDArray
 
 
 def validate_responses(
-    responses: NDArray | list,
+    responses: NDArray[Any] | list[Any],
     n_items: int | None = None,
     allow_missing: bool = True,
     missing_code: int = -1,
@@ -41,7 +43,7 @@ def validate_responses(
 def check_response_pattern(
     responses: NDArray[np.int_],
     n_categories: int | list[int] | None = None,
-) -> dict:
+) -> dict[str, Any]:
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
 
@@ -78,7 +80,7 @@ def check_response_pattern(
 
 
 def expand_table(
-    table: NDArray,
+    table: NDArray[Any],
     freq_col: int = -1,
 ) -> NDArray[np.int_]:
     table = np.asarray(table)

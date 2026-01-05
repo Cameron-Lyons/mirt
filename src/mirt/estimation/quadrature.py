@@ -1,3 +1,5 @@
+from collections.abc import Callable
+
 import numpy as np
 from numpy.typing import NDArray
 from scipy.special import roots_hermite
@@ -101,7 +103,7 @@ class GaussHermiteQuadrature:
 
     def integrate(
         self,
-        func: callable,
+        func: Callable[[NDArray[np.float64]], NDArray[np.float64]],
     ) -> float:
         values = func(self._nodes)
         return float(np.sum(self._weights * values))

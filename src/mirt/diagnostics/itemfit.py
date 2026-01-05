@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 
 def compute_itemfit(
-    model: "BaseItemModel",
+    model: BaseItemModel,
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
     theta: NDArray[np.float64] | None = None,
@@ -49,7 +49,7 @@ def compute_itemfit(
 
 
 def compute_s_x2(
-    model: "BaseItemModel",
+    model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_groups: int = 10,

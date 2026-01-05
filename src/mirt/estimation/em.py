@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
-def _is_polytomous(model: "BaseItemModel") -> bool:
+def _is_polytomous(model: BaseItemModel) -> bool:
     """Check if a model is polytomous (has n_categories attribute)."""
     return hasattr(model, "_n_categories")
 
@@ -36,11 +36,11 @@ class EMEstimator(BaseEstimator):
 
     def fit(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
-    ) -> "FitResult":
+    ) -> FitResult:
         from mirt.results.fit_result import FitResult
 
         responses = self._validate_responses(responses, model.n_items)
@@ -105,7 +105,7 @@ class EMEstimator(BaseEstimator):
 
     def _e_step(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         prior_mean: NDArray[np.float64],
         prior_cov: NDArray[np.float64],
@@ -135,7 +135,7 @@ class EMEstimator(BaseEstimator):
 
     def _m_step(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
     ) -> None:
@@ -151,7 +151,7 @@ class EMEstimator(BaseEstimator):
 
     def _optimize_item(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
@@ -217,7 +217,7 @@ class EMEstimator(BaseEstimator):
 
     def _get_item_params_and_bounds(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
     ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
         params_list: list[float] = []
@@ -269,7 +269,7 @@ class EMEstimator(BaseEstimator):
 
     def _set_item_params(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
         params: NDArray[np.float64],
     ) -> None:
@@ -312,7 +312,7 @@ class EMEstimator(BaseEstimator):
 
     def _compute_standard_errors(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
@@ -341,7 +341,7 @@ class EMEstimator(BaseEstimator):
 
     def _compute_item_se(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
         param_name: str,
         responses: NDArray[np.int_],

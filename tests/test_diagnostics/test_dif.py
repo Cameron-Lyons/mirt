@@ -158,12 +158,10 @@ class TestDIF:
         assert flags.dtype == bool
         assert len(flags) == 4
 
-        # Items 0 and 2 have significant p-values and large effect sizes
-        assert flags[0] == True
-        assert flags[2] == True
-        # Items 1 and 3 are not significant
-        assert flags[1] == False
-        assert flags[3] == False
+        assert flags[0]
+        assert flags[2]
+        assert not flags[1]
+        assert not flags[3]
 
     def test_flag_dif_by_classification(self, rng):
         """Test flagging by ETS classification."""

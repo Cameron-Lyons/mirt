@@ -110,8 +110,8 @@ def compute_dif(
 
 
 def _dif_likelihood_ratio(
-    ref_result: "FitResult",
-    focal_result: "FitResult",
+    ref_result: FitResult,
+    focal_result: FitResult,
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
     """Likelihood ratio test for DIF."""
@@ -177,8 +177,8 @@ def _dif_likelihood_ratio(
 
 
 def _dif_wald(
-    ref_result: "FitResult",
-    focal_result: "FitResult",
+    ref_result: FitResult,
+    focal_result: FitResult,
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
     """Wald test for DIF."""
@@ -240,8 +240,8 @@ def _dif_wald(
 
 
 def _dif_lord(
-    ref_result: "FitResult",
-    focal_result: "FitResult",
+    ref_result: FitResult,
+    focal_result: FitResult,
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
     """Lord's chi-square test for DIF."""
@@ -249,8 +249,8 @@ def _dif_lord(
 
 
 def _dif_raju(
-    ref_result: "FitResult",
-    focal_result: "FitResult",
+    ref_result: FitResult,
+    focal_result: FitResult,
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
     """Raju's area measures for DIF."""

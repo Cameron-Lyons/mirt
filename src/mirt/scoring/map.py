@@ -24,7 +24,7 @@ class MAPScorer:
 
     def score(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
         if not model.is_fitted:
@@ -76,7 +76,7 @@ class MAPScorer:
 
     def _score_unidimensional(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         prior_mean: float,
         prior_var: float,
@@ -111,7 +111,7 @@ class MAPScorer:
 
     def _score_multidimensional(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
         prior_mean: NDArray[np.float64],
         prior_prec: NDArray[np.float64],

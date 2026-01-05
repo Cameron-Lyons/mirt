@@ -60,6 +60,7 @@ def fit_mirt(
         if n_categories < 2:
             raise ValueError("n_categories must be at least 2")
 
+    irt_model: BaseItemModel
     if model == "1PL":
         irt_model = OneParameterLogistic(n_items=n_items, item_names=item_names)
     elif model == "2PL":
@@ -71,6 +72,7 @@ def fit_mirt(
     elif model == "4PL":
         irt_model = FourParameterLogistic(n_items=n_items, item_names=item_names)
     elif model == "GRM":
+        assert n_categories is not None
         irt_model = GradedResponseModel(
             n_items=n_items,
             n_categories=n_categories,
@@ -78,6 +80,7 @@ def fit_mirt(
             item_names=item_names,
         )
     elif model == "GPCM":
+        assert n_categories is not None
         irt_model = GeneralizedPartialCredit(
             n_items=n_items,
             n_categories=n_categories,
@@ -85,12 +88,14 @@ def fit_mirt(
             item_names=item_names,
         )
     elif model == "PCM":
+        assert n_categories is not None
         irt_model = PartialCreditModel(
             n_items=n_items,
             n_categories=n_categories,
             item_names=item_names,
         )
     elif model == "NRM":
+        assert n_categories is not None
         irt_model = NominalResponseModel(
             n_items=n_items,
             n_categories=n_categories,
