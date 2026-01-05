@@ -8,7 +8,7 @@ dynamic = ["version"]
 description = "Multidimensional Item Response Theory for Python"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.14"
 authors = [
     {name = "mirt contributors"}
 ]
@@ -69,18 +69,18 @@ addopts = "-v --tb=short"
 
 [tool.black]
 line-length = 88
-target-version = ["py310", "py311", "py312"]
+target-version = ["py314"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py310"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.14"
 warn_return_any = true
 warn_unused_ignores = true
 strict = true
