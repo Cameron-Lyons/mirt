@@ -67,7 +67,9 @@ def compute_dif(
         raise ValueError(f"focal_group {focal_group} not found in groups")
 
     if focal_group == reference_group:
-        reference_group = unique_groups[1] if unique_groups[0] == focal_group else unique_groups[0]
+        reference_group = (
+            unique_groups[1] if unique_groups[0] == focal_group else unique_groups[0]
+        )
 
     ref_mask = groups == reference_group
     focal_mask = groups == focal_group
@@ -131,7 +133,9 @@ def _dif_likelihood_ratio(
             focal_val = np.atleast_1d(focal_params[param_name])
 
             ref_se = ref_result.standard_errors.get(param_name, np.ones_like(ref_val))
-            focal_se = focal_result.standard_errors.get(param_name, np.ones_like(focal_val))
+            focal_se = focal_result.standard_errors.get(
+                param_name, np.ones_like(focal_val)
+            )
 
             if ref_se.ndim > 1:
                 ref_se = ref_se[item_idx]
@@ -143,7 +147,7 @@ def _dif_likelihood_ratio(
             elif len(focal_se) > 1:
                 focal_se = np.atleast_1d(focal_se[item_idx])
 
-            pooled_var = (ref_se**2 + focal_se**2)
+            pooled_var = ref_se**2 + focal_se**2
             pooled_var = np.where(pooled_var > 0, pooled_var, 1.0)
 
             diff = ref_val - focal_val

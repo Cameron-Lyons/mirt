@@ -389,7 +389,10 @@ def compare_invariance(
     results = {}
 
     invariance_levels: list[Literal["configural", "metric", "scalar", "strict"]] = [
-        "configural", "metric", "scalar", "strict"
+        "configural",
+        "metric",
+        "scalar",
+        "strict",
     ]
     for inv in invariance_levels:
         if verbose:
