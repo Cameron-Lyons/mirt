@@ -32,8 +32,12 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="likelihood_ratio",
-            n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="2PL",
+            method="likelihood_ratio",
+            n_quadpts=11,
+            max_iter=30,
         )
 
         assert "statistic" in result
@@ -54,8 +58,7 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="wald",
-            n_quadpts=11, max_iter=30
+            data, groups, model="2PL", method="wald", n_quadpts=11, max_iter=30
         )
 
         assert "statistic" in result
@@ -71,8 +74,7 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="lord",
-            n_quadpts=11, max_iter=30
+            data, groups, model="2PL", method="lord", n_quadpts=11, max_iter=30
         )
 
         assert "statistic" in result
@@ -87,8 +89,7 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="raju",
-            n_quadpts=11, max_iter=30
+            data, groups, model="2PL", method="raju", n_quadpts=11, max_iter=30
         )
 
         assert "statistic" in result
@@ -118,8 +119,12 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="likelihood_ratio",
-            n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="2PL",
+            method="likelihood_ratio",
+            n_quadpts=11,
+            max_iter=30,
         )
 
         # Item 0 should have larger effect size than others
@@ -134,8 +139,12 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="likelihood_ratio",
-            n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="2PL",
+            method="likelihood_ratio",
+            n_quadpts=11,
+            max_iter=30,
         )
 
         # All classifications should be A, B, or C
@@ -179,8 +188,8 @@ class TestDIF:
         # Flag B and C items
         flags_b = flag_dif_items(dif_results, classification="B")
         assert np.sum(flags_b) <= np.sum(
-            (dif_results["classification"] == "B") |
-            (dif_results["classification"] == "C")
+            (dif_results["classification"] == "B")
+            | (dif_results["classification"] == "C")
         )
 
     def test_requires_two_groups(self, rng):
@@ -208,8 +217,7 @@ class TestDIF:
         groups = np.array(["male"] * n_per_group + ["female"] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="2PL", method="wald",
-            n_quadpts=11, max_iter=30
+            data, groups, model="2PL", method="wald", n_quadpts=11, max_iter=30
         )
 
         assert len(result["statistic"]) == n_items
@@ -224,8 +232,13 @@ class TestDIF:
 
         # Specify focal group
         result = compute_dif(
-            data, groups, model="2PL", method="wald",
-            focal_group=0, n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="2PL",
+            method="wald",
+            focal_group=0,
+            n_quadpts=11,
+            max_iter=30,
         )
 
         assert len(result["statistic"]) == n_items
@@ -250,8 +263,12 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="1PL", method="likelihood_ratio",
-            n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="1PL",
+            method="likelihood_ratio",
+            n_quadpts=11,
+            max_iter=30,
         )
 
         assert len(result["statistic"]) == n_items
@@ -266,8 +283,13 @@ class TestDIF:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = compute_dif(
-            data, groups, model="GRM", n_categories=n_categories,
-            method="raju", n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="GRM",
+            n_categories=n_categories,
+            method="raju",
+            n_quadpts=11,
+            max_iter=30,
         )
 
         assert len(result["statistic"]) == n_items
@@ -290,6 +312,7 @@ class TestDIFIntegration:
     def test_dif_function_import(self):
         """Test that dif function is importable from mirt."""
         import mirt
+
         assert hasattr(mirt, "dif")
 
     def test_dif_returns_dataframe(self, rng):
@@ -303,8 +326,7 @@ class TestDIFIntegration:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = mirt.dif(
-            data, groups, model="2PL", method="wald",
-            n_quadpts=11, max_iter=30
+            data, groups, model="2PL", method="wald", n_quadpts=11, max_iter=30
         )
 
         # Should be a pandas DataFrame (or polars if configured)
