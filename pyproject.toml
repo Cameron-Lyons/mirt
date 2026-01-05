@@ -53,9 +53,9 @@ docs = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mirt/mirt"
-Documentation = "https://mirt.readthedocs.io"
-Repository = "https://github.com/mirt/mirt"
+Homepage = "https://github.com/Cameron-Lyons/mirt"
+Documentation = "https://github.com/Cameron-Lyons/mirt#readme"
+Repository = "https://github.com/Cameron-Lyons/mirt"
 
 [tool.setuptools.dynamic]
 version = {attr = "mirt._version.__version__"}

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Literal, Union
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,13 +14,13 @@ if TYPE_CHECKING:
 
 
 def fscores(
-    model_or_result: Union["BaseItemModel", "FitResult"],
+    model_or_result: "BaseItemModel | FitResult",
     responses: NDArray[np.int_],
     method: Literal["EAP", "MAP", "ML"] = "EAP",
     n_quadpts: int = 49,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
-    person_ids: list | None = None,
+    person_ids: list[Any] | None = None,
 ) -> ScoreResult:
     from mirt.results.fit_result import FitResult
 

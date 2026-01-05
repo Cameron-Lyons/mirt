@@ -13,6 +13,11 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
+def _is_polytomous(model: "BaseItemModel") -> bool:
+    """Check if a model is polytomous (has n_categories attribute)."""
+    return hasattr(model, "_n_categories")
+
+
 class EMEstimator(BaseEstimator):
     def __init__(
         self,
@@ -156,24 +161,49 @@ class EMEstimator(BaseEstimator):
         item_responses = responses[:, item_idx]
         valid_mask = item_responses >= 0
 
-        r_k = np.sum(
-            item_responses[valid_mask, None] * posterior_weights[valid_mask, :], axis=0
-        )
-
         n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
-        def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-            self._set_item_params(model, item_idx, params)
+        if _is_polytomous(model):
+            # Polytomous model: compute expected counts for each category
+            n_categories = model._n_categories[item_idx]
+            n_quad = len(n_k)
 
-            probs = model.probability(quad_points, item_idx)
+            # r_kc[k, c] = expected count of category c at quadrature point k
+            r_kc = np.zeros((n_quad, n_categories))
+            for c in range(n_categories):
+                cat_mask = valid_mask & (item_responses == c)
+                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
 
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+                self._set_item_params(model, item_idx, params)
 
-            ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+                # probs shape: (n_quad, n_categories)
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, 1e-10, 1 - 1e-10)
 
-            return -ll
+                # Polytomous likelihood: sum over categories
+                ll = np.sum(r_kc * np.log(probs))
+
+                return -ll
+
+        else:
+            # Dichotomous model: r_k = expected correct responses
+            r_k = np.sum(
+                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                axis=0,
+            )
+
+            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+                self._set_item_params(model, item_idx, params)
+
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+
+                ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+
+                return -ll
 
         result = minimize(
             neg_expected_log_likelihood,
@@ -190,45 +220,46 @@ class EMEstimator(BaseEstimator):
         model: "BaseItemModel",
         item_idx: int,
     ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
-        params_list = []
-        bounds = []
+        params_list: list[float] = []
+        bounds: list[tuple[float, float]] = []
 
         model_name = model.model_name
+        params = model.parameters
 
         if model_name in ("1PL", "2PL", "3PL", "4PL"):
             if model_name != "1PL":
-                a = model._parameters["discrimination"]
+                a = params["discrimination"]
                 if a.ndim == 1:
-                    params_list.append(a[item_idx])
+                    params_list.append(float(a[item_idx]))
                     bounds.append((0.1, 5.0))
                 else:
-                    params_list.extend(a[item_idx])
+                    params_list.extend(a[item_idx].tolist())
                     bounds.extend([(0.1, 5.0)] * model.n_factors)
 
-            b = model._parameters["difficulty"][item_idx]
-            params_list.append(b)
+            b = params["difficulty"][item_idx]
+            params_list.append(float(b))
             bounds.append((-6.0, 6.0))
 
             if model_name in ("3PL", "4PL"):
-                c = model._parameters["guessing"][item_idx]
-                params_list.append(c)
+                c = params["guessing"][item_idx]
+                params_list.append(float(c))
                 bounds.append((0.0, 0.5))
 
             if model_name == "4PL":
-                d = model._parameters["upper"][item_idx]
-                params_list.append(d)
+                d = params["upper"][item_idx]
+                params_list.append(float(d))
                 bounds.append((0.5, 1.0))
 
         else:
-            for name, values in model._parameters.items():
+            for name, values in params.items():
                 if values.ndim == 1 and len(values) == model.n_items:
-                    params_list.append(values[item_idx])
+                    params_list.append(float(values[item_idx]))
                     if "discrimination" in name or "slope" in name:
                         bounds.append((0.1, 5.0))
                     else:
                         bounds.append((-6.0, 6.0))
                 elif values.ndim == 2 and values.shape[0] == model.n_items:
-                    params_list.extend(values[item_idx])
+                    params_list.extend(values[item_idx].tolist())
                     if "discrimination" in name or "slope" in name:
                         bounds.extend([(0.1, 5.0)] * values.shape[1])
                     else:
@@ -247,34 +278,36 @@ class EMEstimator(BaseEstimator):
 
         if model_name in ("1PL", "2PL", "3PL", "4PL"):
             if model_name != "1PL":
-                a = model._parameters["discrimination"]
+                a = model.parameters["discrimination"]
                 if a.ndim == 1:
-                    a[item_idx] = params[idx]
+                    model.set_item_parameter(item_idx, "discrimination", params[idx])
                     idx += 1
                 else:
                     n_factors = a.shape[1]
-                    a[item_idx] = params[idx : idx + n_factors]
+                    model.set_item_parameter(
+                        item_idx, "discrimination", params[idx : idx + n_factors]
+                    )
                     idx += n_factors
 
-            model._parameters["difficulty"][item_idx] = params[idx]
+            model.set_item_parameter(item_idx, "difficulty", params[idx])
             idx += 1
 
             if model_name in ("3PL", "4PL"):
-                model._parameters["guessing"][item_idx] = params[idx]
+                model.set_item_parameter(item_idx, "guessing", params[idx])
                 idx += 1
 
             if model_name == "4PL":
-                model._parameters["upper"][item_idx] = params[idx]
+                model.set_item_parameter(item_idx, "upper", params[idx])
                 idx += 1
 
         else:
-            for name, values in model._parameters.items():
+            for name, values in model.parameters.items():
                 if values.ndim == 1 and len(values) == model.n_items:
-                    values[item_idx] = params[idx]
+                    model.set_item_parameter(item_idx, name, params[idx])
                     idx += 1
                 elif values.ndim == 2 and values.shape[0] == model.n_items:
                     n_vals = values.shape[1]
-                    values[item_idx] = params[idx : idx + n_vals]
+                    model.set_item_parameter(item_idx, name, params[idx : idx + n_vals])
                     idx += n_vals
 
     def _compute_standard_errors(
@@ -284,8 +317,9 @@ class EMEstimator(BaseEstimator):
         posterior_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
         standard_errors: dict[str, NDArray[np.float64]] = {}
+        params = model.parameters
 
-        for name, values in model._parameters.items():
+        for name, values in params.items():
             if name == "discrimination" and model.model_name == "1PL":
                 standard_errors[name] = np.zeros_like(values)
                 continue
@@ -317,36 +351,55 @@ class EMEstimator(BaseEstimator):
         item_responses = responses[:, item_idx]
         valid_mask = item_responses >= 0
 
-        values = model._parameters[param_name]
+        values = model.parameters[param_name]
         if values.ndim == 1:
-            current = values[item_idx]
+            current = float(values[item_idx])
             is_scalar = True
         else:
             current = values[item_idx].copy()
             is_scalar = False
 
-        r_k = np.sum(
-            item_responses[valid_mask, None] * posterior_weights[valid_mask, :], axis=0
-        )
         n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
-        def log_likelihood(param_val):
-            if is_scalar:
-                model._parameters[param_name][item_idx] = param_val
-            else:
-                model._parameters[param_name][item_idx] = param_val
+        if _is_polytomous(model):
+            # Polytomous: compute expected counts per category
+            n_categories = model._n_categories[item_idx]
+            n_quad = len(n_k_valid)
+            r_kc = np.zeros((n_quad, n_categories))
+            for c in range(n_categories):
+                cat_mask = valid_mask & (item_responses == c)
+                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
 
-            probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
+                model.set_item_parameter(item_idx, param_name, param_val)
 
-            ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, 1e-10, 1 - 1e-10)
 
-            if is_scalar:
-                model._parameters[param_name][item_idx] = current
-            else:
-                model._parameters[param_name][item_idx] = current.copy()
+                ll = float(np.sum(r_kc * np.log(probs)))
 
-            return ll
+                model.set_item_parameter(item_idx, param_name, current)
+                return ll
+
+        else:
+            # Dichotomous
+            r_k = np.sum(
+                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                axis=0,
+            )
+
+            def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
+                model.set_item_parameter(item_idx, param_name, param_val)
+
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+
+                ll = float(
+                    np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+                )
+
+                model.set_item_parameter(item_idx, param_name, current)
+                return ll
 
         h = 1e-5
         ll_center = log_likelihood(current)

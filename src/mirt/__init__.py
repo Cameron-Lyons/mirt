@@ -152,6 +152,62 @@ def personfit(
     return create_dataframe(fit_stats, index_name="person")
 
 
+def dif(
+    data: NDArray[np.int_],
+    groups: NDArray[np.int_] | NDArray[np.str_],
+    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] = "2PL",
+    method: Literal["likelihood_ratio", "wald", "lord", "raju"] = "likelihood_ratio",
+    n_categories: int | None = None,
+    n_quadpts: int = 21,
+    max_iter: int = 500,
+    tol: float = 1e-4,
+    focal_group: str | int | None = None,
+) -> Any:
+    """Compute Differential Item Functioning (DIF) statistics.
+
+    DIF analysis tests whether items function differently across groups
+    after controlling for ability level.
+
+    Args:
+        data: Response matrix (n_persons x n_items).
+        groups: Group membership array (n_persons,). Must have exactly 2 groups.
+        model: IRT model type.
+        method: DIF detection method:
+            - 'likelihood_ratio': Likelihood ratio test (recommended)
+            - 'wald': Wald test on parameter differences
+            - 'lord': Lord's chi-square test
+            - 'raju': Raju's area measures
+        n_categories: Number of categories for polytomous models.
+        n_quadpts: Number of quadrature points for EM.
+        max_iter: Maximum EM iterations.
+        tol: Convergence tolerance.
+        focal_group: Which group to use as focal (default: second unique group).
+
+    Returns:
+        DataFrame with DIF statistics for each item:
+            - statistic: Test statistic
+            - p_value: P-value
+            - effect_size: Effect size measure
+            - classification: ETS classification (A/B/C)
+    """
+    from mirt.diagnostics.dif import compute_dif
+    from mirt.utils.dataframe import create_dataframe
+
+    dif_results = compute_dif(
+        data=data,
+        groups=groups,
+        model=model,
+        method=method,
+        n_categories=n_categories,
+        n_quadpts=n_quadpts,
+        max_iter=max_iter,
+        tol=tol,
+        focal_group=focal_group,
+    )
+
+    return create_dataframe(dif_results, index_name="item")
+
+
 __all__ = [
     "__version__",
     "fit_mirt",
@@ -159,6 +215,7 @@ __all__ = [
     "simdata",
     "itemfit",
     "personfit",
+    "dif",
     "OneParameterLogistic",
     "TwoParameterLogistic",
     "ThreeParameterLogistic",

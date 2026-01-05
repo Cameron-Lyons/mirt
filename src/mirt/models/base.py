@@ -106,6 +106,39 @@ class BaseItemModel(ABC):
                 result[name] = values.copy()
         return result
 
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        """Set a parameter value for a specific item.
+
+        Args:
+            item_idx: Index of the item (0-based).
+            param_name: Name of the parameter to set.
+            value: New value for the parameter.
+
+        Raises:
+            IndexError: If item_idx is out of range.
+            ValueError: If param_name is not a valid parameter.
+        """
+        if item_idx < 0 or item_idx >= self.n_items:
+            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
+        if param_name not in self._parameters:
+            valid_params = ", ".join(self._parameters.keys())
+            raise ValueError(
+                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}"
+            )
+
+        values = self._parameters[param_name]
+        if values.ndim == 1 and len(values) == self.n_items:
+            values[item_idx] = float(value)
+        elif values.ndim == 2 and values.shape[0] == self.n_items:
+            values[item_idx] = np.asarray(value, dtype=np.float64)
+        else:
+            raise ValueError(f"Parameter {param_name} does not have per-item values")
+
     def _ensure_theta_2d(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         theta = np.asarray(theta, dtype=np.float64)
         if theta.ndim == 1:

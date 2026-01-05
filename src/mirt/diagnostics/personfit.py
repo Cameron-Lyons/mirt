@@ -88,8 +88,10 @@ def _compute_zh_vectorized(
             item_valid = valid_mask[:, i]
             resp = responses[:, i]
 
-            resp_clipped = np.clip(resp, 0, n_cat - 1)
-            person_ll = log_probs[np.arange(n_persons), resp_clipped]
+            # Use valid responses for indexing, default to 0 for invalid (masked out anyway)
+            resp_safe = np.where(item_valid, resp, 0)
+            resp_safe = np.clip(resp_safe, 0, n_cat - 1)
+            person_ll = log_probs[np.arange(n_persons), resp_safe]
             ll += np.where(item_valid, person_ll, 0.0)
 
             item_expected_ll = np.sum(probs * log_probs, axis=1)
