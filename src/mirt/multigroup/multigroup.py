@@ -13,7 +13,7 @@ class MultigroupResult:
 
     def __init__(
         self,
-        group_results: list["FitResult"],
+        group_results: list[FitResult],
         invariance: str,
         combined_ll: float,
         combined_aic: float,
@@ -30,7 +30,7 @@ class MultigroupResult:
         self.n_observations = n_observations
 
     @property
-    def model(self) -> "BaseItemModel":
+    def model(self) -> BaseItemModel:
         """Return the model from the first group for compatibility."""
         return self.group_results[0].model
 
@@ -65,7 +65,7 @@ def fit_multigroup(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-) -> "FitResult":
+) -> FitResult:
     """Fit a multigroup IRT model with invariance constraints.
 
     Args:
@@ -156,15 +156,15 @@ def fit_multigroup(
 
 def _fit_configural(
     data: NDArray[np.int_],
-    groups: NDArray,
-    unique_groups: NDArray,
-    model: str,
+    groups: NDArray[np.int_] | NDArray[np.str_],
+    unique_groups: NDArray[np.int_] | NDArray[np.str_],
+    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"],
     n_categories: int | None,
     n_quadpts: int,
     max_iter: int,
     tol: float,
     verbose: bool,
-) -> "FitResult":
+) -> FitResult:
     """Fit configural invariance: all parameters free across groups."""
     from mirt import fit_mirt
 
@@ -201,15 +201,15 @@ def _fit_configural(
 
 def _fit_metric(
     data: NDArray[np.int_],
-    groups: NDArray,
-    unique_groups: NDArray,
-    model: str,
+    groups: NDArray[np.int_] | NDArray[np.str_],
+    unique_groups: NDArray[np.int_] | NDArray[np.str_],
+    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"],
     n_categories: int | None,
     n_quadpts: int,
     max_iter: int,
     tol: float,
     verbose: bool,
-) -> "FitResult":
+) -> FitResult:
     """Fit metric invariance: discrimination constrained equal, intercepts free.
 
     Strategy:
@@ -286,15 +286,15 @@ def _fit_metric(
 
 def _fit_scalar(
     data: NDArray[np.int_],
-    groups: NDArray,
-    unique_groups: NDArray,
-    model: str,
+    groups: NDArray[np.int_] | NDArray[np.str_],
+    unique_groups: NDArray[np.int_] | NDArray[np.str_],
+    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"],
     n_categories: int | None,
     n_quadpts: int,
     max_iter: int,
     tol: float,
     verbose: bool,
-) -> "FitResult":
+) -> FitResult:
     """Fit scalar invariance: both discrimination and intercepts constrained equal.
 
     This is equivalent to fitting a single model to the combined data.
@@ -323,15 +323,15 @@ def _fit_scalar(
 
 def _fit_strict(
     data: NDArray[np.int_],
-    groups: NDArray,
-    unique_groups: NDArray,
-    model: str,
+    groups: NDArray[np.int_] | NDArray[np.str_],
+    unique_groups: NDArray[np.int_] | NDArray[np.str_],
+    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"],
     n_categories: int | None,
     n_quadpts: int,
     max_iter: int,
     tol: float,
     verbose: bool,
-) -> "FitResult":
+) -> FitResult:
     """Fit strict invariance: all item parameters constrained equal.
 
     For most IRT models, this is the same as scalar invariance.
@@ -370,7 +370,7 @@ def compare_invariance(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-) -> dict[str, "FitResult"]:
+) -> dict[str, FitResult]:
     """Fit and compare different invariance levels.
 
     Args:
@@ -388,7 +388,10 @@ def compare_invariance(
     """
     results = {}
 
-    for inv in ["configural", "metric", "scalar", "strict"]:
+    invariance_levels: list[Literal["configural", "metric", "scalar", "strict"]] = [
+        "configural", "metric", "scalar", "strict"
+    ]
+    for inv in invariance_levels:
         if verbose:
             print(f"\n{'=' * 50}")
             print(f"Fitting {inv} invariance")

@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -29,10 +29,10 @@ class BaseEstimator(ABC):
     @abstractmethod
     def fit(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
-        **kwargs,
-    ) -> "FitResult": ...
+        **kwargs: Any,
+    ) -> FitResult: ...
 
     @property
     def convergence_history(self) -> list[float]:
@@ -66,7 +66,7 @@ class BaseEstimator(ABC):
         self,
         iteration: int,
         log_likelihood: float,
-        **kwargs,
+        **kwargs: float,
     ) -> None:
         if self.verbose:
             extras = ", ".join(f"{k}={v:.4f}" for k, v in kwargs.items())

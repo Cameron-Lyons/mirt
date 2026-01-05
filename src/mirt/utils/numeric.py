@@ -76,7 +76,7 @@ def compute_hessian_se(
 
 
 def compute_expected_variance(
-    model: "BaseItemModel",
+    model: BaseItemModel,
     theta: NDArray[np.float64],
     n_items: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:

@@ -31,7 +31,7 @@ def _compute_z_stats(
 
 @dataclass
 class FitResult:
-    model: "BaseItemModel"
+    model: BaseItemModel
     log_likelihood: float
     n_iterations: int
     converged: bool

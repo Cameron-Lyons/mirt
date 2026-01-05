@@ -20,7 +20,7 @@ class MLScorer:
 
     def score(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
         if not model.is_fitted:
@@ -59,7 +59,7 @@ class MLScorer:
 
     def _score_unidimensional(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> tuple[float, float]:
         def neg_log_likelihood(theta: float) -> float:
@@ -106,7 +106,7 @@ class MLScorer:
 
     def _score_multidimensional(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         n_factors = model.n_factors

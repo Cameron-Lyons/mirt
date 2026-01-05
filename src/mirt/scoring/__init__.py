@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 def fscores(
-    model_or_result: "BaseItemModel | FitResult",
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     method: Literal["EAP", "MAP", "ML"] = "EAP",
     n_quadpts: int = 49,

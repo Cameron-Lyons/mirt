@@ -27,7 +27,7 @@ class EAPScorer:
 
     def score(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
         if not model.is_fitted:
