@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
+from scipy.integrate import trapezoid
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
@@ -310,11 +311,11 @@ def _dif_raju(
         diff = ref_prob - focal_prob
 
         # Unsigned area (absolute difference)
-        unsigned_area = np.trapezoid(np.abs(diff), theta_range)
+        unsigned_area = trapezoid(np.abs(diff), theta_range)
         statistics[item_idx] = unsigned_area
 
         # Signed area
-        signed_area = np.trapezoid(diff, theta_range)
+        signed_area = trapezoid(diff, theta_range)
         effect_sizes[item_idx] = signed_area
 
         # Approximate p-value using normal approximation
