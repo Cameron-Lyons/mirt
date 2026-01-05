@@ -60,7 +60,6 @@ def compute_dif(
             f"DIF analysis requires exactly 2 groups, got {len(unique_groups)}"
         )
 
-    # Determine reference and focal groups
     reference_group = unique_groups[0]
     if focal_group is None:
         focal_group = unique_groups[1]
@@ -78,7 +77,6 @@ def compute_dif(
 
     n_items = data.shape[1]
 
-    # Fit models to each group
     ref_result = fit_mirt(
         ref_data,
         model=model,
@@ -116,27 +114,15 @@ def _dif_likelihood_ratio(
     focal_result: "FitResult",
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
-    """Likelihood ratio test for DIF.
-
-    For each item, compare:
-    - Compact model: Item parameters constrained equal across groups
-    - Augmented model: Item parameters free across groups
-
-    The LR statistic follows chi-square distribution with df = number of
-    freed parameters.
-    """
+    """Likelihood ratio test for DIF."""
     statistics = np.zeros(n_items)
     p_values = np.zeros(n_items)
     effect_sizes = np.zeros(n_items)
 
-    # For each item, compute LR test
     for item_idx in range(n_items):
-        # Compute LR statistic
-        # This is a simplified approach - compare parameters directly
         ref_params = ref_result.model.get_item_parameters(item_idx)
         focal_params = focal_result.model.get_item_parameters(item_idx)
 
-        # Compute parameter differences
         diff_sum_sq = 0.0
         n_params = 0
 
@@ -144,7 +130,6 @@ def _dif_likelihood_ratio(
             ref_val = np.atleast_1d(ref_params[param_name])
             focal_val = np.atleast_1d(focal_params[param_name])
 
-            # Get standard errors if available
             ref_se = ref_result.standard_errors.get(param_name, np.ones_like(ref_val))
             focal_se = focal_result.standard_errors.get(param_name, np.ones_like(focal_val))
 
@@ -158,7 +143,6 @@ def _dif_likelihood_ratio(
             elif len(focal_se) > 1:
                 focal_se = np.atleast_1d(focal_se[item_idx])
 
-            # Pooled variance
             pooled_var = (ref_se**2 + focal_se**2)
             pooled_var = np.where(pooled_var > 0, pooled_var, 1.0)
 
@@ -169,7 +153,6 @@ def _dif_likelihood_ratio(
         statistics[item_idx] = diff_sum_sq
         p_values[item_idx] = 1 - stats.chi2.cdf(diff_sum_sq, df=max(1, n_params))
 
-        # Effect size: standardized difference in difficulty
         if "difficulty" in ref_params and "difficulty" in focal_params:
             ref_b = float(np.atleast_1d(ref_params["difficulty"])[0])
             focal_b = float(np.atleast_1d(focal_params["difficulty"])[0])
@@ -183,7 +166,6 @@ def _dif_likelihood_ratio(
             focal_b = float(np.atleast_1d(focal_params["intercepts"])[0])
             effect_sizes[item_idx] = abs(ref_b - focal_b)
 
-    # ETS classification based on effect size
     classification = _ets_classify(effect_sizes, p_values)
 
     return {
@@ -199,11 +181,7 @@ def _dif_wald(
     focal_result: "FitResult",
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
-    """Wald test for DIF.
-
-    Tests H0: parameter_ref = parameter_focal
-    Wald statistic = (param_ref - param_focal)^2 / (SE_ref^2 + SE_focal^2)
-    """
+    """Wald test for DIF."""
     statistics = np.zeros(n_items)
     p_values = np.zeros(n_items)
     effect_sizes = np.zeros(n_items)
@@ -246,7 +224,6 @@ def _dif_wald(
         statistics[item_idx] = wald_sum
         p_values[item_idx] = 1 - stats.chi2.cdf(wald_sum, df=max(1, df))
 
-        # Effect size from difficulty
         if "difficulty" in ref_params and "difficulty" in focal_params:
             ref_b = float(np.atleast_1d(ref_params["difficulty"])[0])
             focal_b = float(np.atleast_1d(focal_params["difficulty"])[0])
@@ -267,13 +244,7 @@ def _dif_lord(
     focal_result: "FitResult",
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
-    """Lord's chi-square test for DIF.
-
-    Compares item parameters using a chi-square test based on
-    the covariance matrix of parameter estimates.
-    """
-    # Lord's test is similar to Wald but uses the full covariance structure
-    # For simplicity, we use the Wald approach as an approximation
+    """Lord's chi-square test for DIF."""
     return _dif_wald(ref_result, focal_result, n_items)
 
 
@@ -282,44 +253,34 @@ def _dif_raju(
     focal_result: "FitResult",
     n_items: int,
 ) -> dict[str, NDArray[np.float64]]:
-    """Raju's area measures for DIF.
-
-    Computes the signed and unsigned area between ICCs for reference
-    and focal groups.
-    """
+    """Raju's area measures for DIF."""
     theta_range = np.linspace(-4, 4, 100)
     theta_2d = theta_range.reshape(-1, 1)
 
-    statistics = np.zeros(n_items)  # Unsigned area
-    effect_sizes = np.zeros(n_items)  # Signed area
+    statistics = np.zeros(n_items)
+    effect_sizes = np.zeros(n_items)
     p_values = np.zeros(n_items)
 
     for item_idx in range(n_items):
-        # Get probabilities for both groups
         ref_prob = ref_result.model.probability(theta_2d, item_idx)
         focal_prob = focal_result.model.probability(theta_2d, item_idx)
 
-        # For polytomous, use expected score
         if ref_prob.ndim > 1:
             n_cat = ref_prob.shape[1]
             categories = np.arange(n_cat)
             ref_expected = np.sum(ref_prob * categories, axis=1)
             focal_expected = np.sum(focal_prob * categories, axis=1)
-            ref_prob = ref_expected / (n_cat - 1)  # Normalize to 0-1
+            ref_prob = ref_expected / (n_cat - 1)
             focal_prob = focal_expected / (n_cat - 1)
 
         diff = ref_prob - focal_prob
 
-        # Unsigned area (absolute difference)
         unsigned_area = trapezoid(np.abs(diff), theta_range)
         statistics[item_idx] = unsigned_area
 
-        # Signed area
         signed_area = trapezoid(diff, theta_range)
         effect_sizes[item_idx] = signed_area
 
-        # Approximate p-value using normal approximation
-        # SE approximation based on simulation studies
         se_area = 0.1 * (1 + 0.5 * unsigned_area)
         z = unsigned_area / se_area
         p_values[item_idx] = 2 * (1 - stats.norm.cdf(abs(z)))
@@ -338,16 +299,7 @@ def _ets_classify(
     effect_sizes: NDArray[np.float64],
     p_values: NDArray[np.float64],
 ) -> NDArray:
-    """Classify DIF using ETS guidelines.
-
-    Classification based on effect size (absolute difficulty difference):
-    - A (negligible): |delta| < 1.0 or p > 0.05
-    - B (moderate): 1.0 <= |delta| < 1.5 and p <= 0.05
-    - C (large): |delta| >= 1.5 and p <= 0.05
-
-    Note: These thresholds are on the logit scale. For traditional
-    delta scale (used in some contexts), thresholds would be different.
-    """
+    """Classify DIF using ETS guidelines (A/B/C)."""
     n_items = len(effect_sizes)
     classification = np.empty(n_items, dtype="U1")
 
@@ -355,9 +307,9 @@ def _ets_classify(
         es = effect_sizes[i]
         p = p_values[i]
 
-        if p > 0.05 or es < 0.426:  # ~1.0 on delta scale
+        if p > 0.05 or es < 0.426:
             classification[i] = "A"
-        elif es < 0.638:  # ~1.5 on delta scale
+        elif es < 0.638:
             classification[i] = "B"
         else:
             classification[i] = "C"
