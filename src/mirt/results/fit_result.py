@@ -1,8 +1,11 @@
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
 
 
 def _compute_z_stats(
@@ -28,7 +31,7 @@ def _compute_z_stats(
 
 @dataclass
 class FitResult:
-    model: Any
+    model: "BaseItemModel"
     log_likelihood: float
     n_iterations: int
     converged: bool

@@ -10,9 +10,10 @@ A comprehensive Python implementation of Item Response Theory (IRT) models, insp
 - **Polytomous Models**: GRM, GPCM, PCM, NRM
 - **Estimation**: EM algorithm with Gauss-Hermite quadrature
 - **Scoring**: EAP, MAP, ML methods for person ability estimation
-- **Diagnostics**: Item fit, person fit statistics
+- **Diagnostics**: Item fit, person fit, DIF analysis
 - **Simulation**: Generate response data from IRT models
-- **Multiple Groups**: Basic multiple group analysis
+- **Multiple Groups**: Full multigroup analysis with invariance testing
+- **Advanced Models**: Multidimensional IRT and Bifactor models
 
 ## Installation
 
@@ -111,6 +112,35 @@ person_fit = mirt.personfit(result, responses)
 print(person_fit)
 ```
 
+### Differential Item Functioning (DIF)
+
+```python
+import numpy as np
+
+# Responses with group membership
+groups = np.array([0] * 250 + [1] * 250)  # Two groups
+
+# DIF analysis with likelihood ratio test
+dif_results = mirt.dif(responses, groups, model='2PL', method='likelihood_ratio')
+print(dif_results)
+
+# Other methods: 'wald', 'lord', 'raju'
+dif_wald = mirt.dif(responses, groups, method='wald')
+```
+
+### Multiple Group Analysis
+
+```python
+from mirt.multigroup import fit_multigroup, compare_invariance
+
+# Fit with different invariance levels
+result = fit_multigroup(responses, groups, model='2PL', invariance='configural')
+
+# Compare all invariance levels
+results = compare_invariance(responses, groups, model='2PL', verbose=True)
+# Returns: {'configural': ..., 'metric': ..., 'scalar': ..., 'strict': ...}
+```
+
 ### Data Simulation
 
 ```python
@@ -136,12 +166,20 @@ responses = mirt.simdata(
 - `simdata(model, n_persons, n_items, ...)` - Simulate response data
 - `itemfit(result, responses)` - Item fit statistics
 - `personfit(result, responses)` - Person fit statistics
+- `dif(data, groups, model, method)` - Differential Item Functioning analysis
+
+### Multigroup Functions
+
+- `fit_multigroup(data, groups, model, invariance)` - Fit multigroup IRT model
+- `compare_invariance(data, groups, model)` - Compare invariance levels
 
 ### Model Classes
 
 - `TwoParameterLogistic` - 2PL model class
 - `ThreeParameterLogistic` - 3PL model class
 - `GradedResponseModel` - GRM model class
+- `MultidimensionalModel` - Multidimensional IRT
+- `BifactorModel` - Bifactor model
 - etc.
 
 ## Comparison with R mirt
@@ -151,9 +189,10 @@ responses = mirt.simdata(
 | Dichotomous models | 1PL-4PL | 1PL-4PL |
 | Polytomous models | GRM, GPCM, PCM, NRM | GRM, GPCM, PCM, NRM |
 | Estimation | EM, MHRM | EM |
-| Multidimensional | Full support | Basic 2PL |
-| Bifactor | Yes | Planned |
-| DIF | Yes | Basic |
+| Multidimensional | Full support | Yes |
+| Bifactor | Yes | Yes |
+| DIF | Yes | Yes (LR, Wald, Lord, Raju) |
+| Multiple groups | Full support | Yes (configural, metric, scalar, strict) |
 | GUI | Shiny app | - |
 
 ## Dependencies
