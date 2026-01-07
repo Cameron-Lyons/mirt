@@ -87,7 +87,10 @@ def fit_mirt(
     tol: float = 1e-4,
     verbose: bool = False,
     item_names: list[str] | None = None,
+    use_rust: bool = True,
 ) -> FitResult:
+    from mirt._rust_backend import RUST_AVAILABLE, em_fit_2pl
+
     data = np.asarray(data)
 
     if data.ndim != 2:
@@ -105,6 +108,45 @@ def fit_mirt(
             n_categories = int(data[data >= 0].max()) + 1
         if n_categories < 2:
             raise ValueError("n_categories must be at least 2")
+
+    if (
+        use_rust
+        and RUST_AVAILABLE
+        and model == "2PL"
+        and n_factors == 1
+        and estimation == "EM"
+    ):
+        discrimination, difficulty, log_likelihood, n_iterations, converged = (
+            em_fit_2pl(data, n_quadpts=n_quadpts, max_iter=max_iter, tol=tol)
+        )
+
+        irt_model = TwoParameterLogistic(
+            n_items=n_items, n_factors=n_factors, item_names=item_names
+        )
+        irt_model._parameters = {
+            "discrimination": np.asarray(discrimination),
+            "difficulty": np.asarray(difficulty),
+        }
+        irt_model._is_fitted = True
+
+        n_params = 2 * n_items
+        aic = -2 * log_likelihood + 2 * n_params
+        bic = -2 * log_likelihood + np.log(n_persons) * n_params
+
+        return FitResult(
+            model=irt_model,
+            log_likelihood=log_likelihood,
+            n_iterations=n_iterations,
+            converged=converged,
+            standard_errors={
+                "discrimination": np.full(n_items, np.nan),
+                "difficulty": np.full(n_items, np.nan),
+            },
+            aic=aic,
+            bic=bic,
+            n_observations=n_persons,
+            n_parameters=n_params,
+        )
 
     irt_model: BaseItemModel
     if model == "1PL":

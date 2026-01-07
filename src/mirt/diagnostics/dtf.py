@@ -23,6 +23,7 @@ def compute_dtf(
     method: Literal["signed", "unsigned", "expected_score"] = "unsigned",
     theta_range: tuple[float, float] = (-4, 4),
     n_quadpts: int = 49,
+    n_bootstrap: int = 100,
     **fit_kwargs,
 ) -> dict[str, float | NDArray[np.float64]]:
     """Compute Differential Test Functioning statistics.
@@ -102,7 +103,14 @@ def compute_dtf(
         raise ValueError(f"Unknown DTF method: {method}")
 
     dtf_se, p_value = _bootstrap_dtf_se(
-        data, groups, model, method, theta_range, n_quadpts, n_bootstrap=100
+        data,
+        groups,
+        model,
+        method,
+        theta_range,
+        n_quadpts,
+        n_bootstrap=n_bootstrap,
+        **fit_kwargs,
     )
 
     return {
@@ -149,6 +157,7 @@ def _bootstrap_dtf_se(
     theta_range: tuple[float, float],
     n_quadpts: int,
     n_bootstrap: int = 100,
+    **fit_kwargs,
 ) -> tuple[float, float]:
     """Bootstrap standard error for DTF."""
     from mirt import fit_mirt
@@ -175,8 +184,12 @@ def _bootstrap_dtf_se(
         boot_focal_data = data[boot_focal_idx]
 
         try:
-            ref_result = fit_mirt(boot_ref_data, model=model, verbose=False)
-            focal_result = fit_mirt(boot_focal_data, model=model, verbose=False)
+            ref_result = fit_mirt(
+                boot_ref_data, model=model, verbose=False, **fit_kwargs
+            )
+            focal_result = fit_mirt(
+                boot_focal_data, model=model, verbose=False, **fit_kwargs
+            )
 
             theta_grid = np.linspace(theta_range[0], theta_range[1], n_quadpts)
             exp_ref = _compute_expected_score(ref_result.model, theta_grid)

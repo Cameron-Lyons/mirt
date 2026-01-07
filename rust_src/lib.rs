@@ -11,16 +11,16 @@ use rand_distr::Normal;
 use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
-// ============================================================================
-// Constants
-// ============================================================================
 
-const LOG_2_PI: f64 = 1.8378770664093453; // ln(2*pi)
+
+
+
+const LOG_2_PI: f64 = 1.8378770664093453;
 const EPSILON: f64 = 1e-10;
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
+
+
+
 
 /// Numerically stable log-sum-exp
 #[inline]
@@ -63,9 +63,9 @@ fn clip(x: f64, min: f64, max: f64) -> f64 {
     x.max(min).min(max)
 }
 
-// ============================================================================
-// E-Step Computations (Critical Priority)
-// ============================================================================
+
+
+
 
 /// Compute log-likelihood for 2PL model at single theta point
 #[inline]
@@ -78,7 +78,7 @@ fn log_likelihood_2pl_single(
     let mut ll = 0.0;
     for (j, &resp) in responses.iter().enumerate() {
         if resp < 0 {
-            continue; // Missing response
+            continue;
         }
         let z = discrimination[j] * (theta - difficulty[j]);
         if resp == 1 {
@@ -138,7 +138,7 @@ fn compute_log_likelihoods_2pl<'py>(
     let disc_vec: Vec<f64> = discrimination.to_vec();
     let diff_vec: Vec<f64> = difficulty.to_vec();
 
-    // Parallel computation over persons
+
     let log_likes: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
@@ -156,7 +156,7 @@ fn compute_log_likelihoods_2pl<'py>(
         })
         .collect();
 
-    // Convert to ndarray
+
     let mut result = Array2::zeros((n_persons, n_quad));
     for (i, row) in log_likes.iter().enumerate() {
         for (q, &val) in row.iter().enumerate() {
@@ -223,8 +223,8 @@ fn compute_log_likelihoods_3pl<'py>(
 fn compute_log_likelihoods_mirt<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
-    quad_points: PyReadonlyArray2<f64>,  // (n_quad, n_factors)
-    discrimination: PyReadonlyArray2<f64>,  // (n_items, n_factors)
+    quad_points: PyReadonlyArray2<f64>,
+    discrimination: PyReadonlyArray2<f64>,
     difficulty: PyReadonlyArray1<f64>,
 ) -> Bound<'py, PyArray2<f64>> {
     let responses = responses.as_array();
@@ -237,7 +237,7 @@ fn compute_log_likelihoods_mirt<'py>(
     let n_items = responses.ncols();
     let n_factors = quad_points.ncols();
 
-    // Pre-compute discrimination sums for efficiency
+
     let disc_sums: Vec<f64> = (0..n_items)
         .map(|j| discrimination.row(j).sum())
         .collect();
@@ -254,7 +254,7 @@ fn compute_log_likelihoods_mirt<'py>(
                         if resp < 0 {
                             continue;
                         }
-                        // z = a_j . theta - sum(a_j) * d_j
+
                         let mut z = 0.0;
                         for f in 0..n_factors {
                             z += discrimination[[j, f]] * theta_q[f];
@@ -309,7 +309,7 @@ fn e_step_complete<'py>(
     let quad_vec: Vec<f64> = quad_points.to_vec();
     let weight_vec: Vec<f64> = quad_weights.to_vec();
 
-    // Pre-compute log prior for each quadrature point
+
     let log_prior: Vec<f64> = quad_vec
         .iter()
         .map(|&theta| {
@@ -320,13 +320,13 @@ fn e_step_complete<'py>(
 
     let log_weights: Vec<f64> = weight_vec.iter().map(|w| (w + EPSILON).ln()).collect();
 
-    // Parallel computation
+
     let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-            // Compute log joint for each quadrature point
+
             let log_joint: Vec<f64> = (0..n_quad)
                 .map(|q| {
                     let ll = log_likelihood_2pl_single(
@@ -339,10 +339,10 @@ fn e_step_complete<'py>(
                 })
                 .collect();
 
-            // Log marginal likelihood
+
             let log_marginal = logsumexp(&log_joint);
 
-            // Posterior weights
+
             let posterior: Vec<f64> = log_joint
                 .iter()
                 .map(|&lj| (lj - log_marginal).exp())
@@ -352,7 +352,7 @@ fn e_step_complete<'py>(
         })
         .collect();
 
-    // Convert to arrays
+
     let mut posterior_weights = Array2::zeros((n_persons, n_quad));
     let mut marginal_ll = Array1::zeros(n_persons);
 
@@ -366,9 +366,9 @@ fn e_step_complete<'py>(
     (posterior_weights.to_pyarray(py), marginal_ll.to_pyarray(py))
 }
 
-// ============================================================================
-// M-Step Helper Computations
-// ============================================================================
+
+
+
 
 /// Compute r_k (expected counts) for dichotomous items
 #[pyfunction]
@@ -432,9 +432,9 @@ fn compute_expected_counts_polytomous<'py>(
     r_kc.to_pyarray(py)
 }
 
-// ============================================================================
-// SIBTEST Computations (High Priority)
-// ============================================================================
+
+
+
 
 /// Compute SIBTEST beta statistic efficiently
 #[pyfunction]
@@ -452,7 +452,7 @@ fn sibtest_compute_beta<'py>(
     let focal_scores = focal_scores.as_array();
     let suspect_items = suspect_items.as_array();
 
-    // Get unique scores
+
     let all_scores: Vec<i32> = ref_scores.iter().chain(focal_scores.iter()).cloned().collect();
     let mut unique_scores: Vec<i32> = all_scores.clone();
     unique_scores.sort();
@@ -460,11 +460,11 @@ fn sibtest_compute_beta<'py>(
 
     let suspect_vec: Vec<usize> = suspect_items.iter().map(|&x| x as usize).collect();
 
-    // Compute beta_k and n_k for each score level
+
     let results: Vec<(f64, f64)> = unique_scores
         .par_iter()
         .map(|&k| {
-            // Find persons at this score level
+
             let ref_at_k: Vec<usize> = ref_scores
                 .iter()
                 .enumerate()
@@ -486,7 +486,7 @@ fn sibtest_compute_beta<'py>(
                 return (f64::NAN, 0.0);
             }
 
-            // Compute mean suspect scores for each group at this level
+
             let mean_ref_k: f64 = ref_at_k
                 .iter()
                 .map(|&i| {
@@ -508,7 +508,7 @@ fn sibtest_compute_beta<'py>(
         })
         .collect();
 
-    // Filter valid results
+
     let valid: Vec<(f64, f64)> = results.into_iter().filter(|(b, _)| !b.is_nan()).collect();
 
     if valid.is_empty() {
@@ -521,7 +521,7 @@ fn sibtest_compute_beta<'py>(
     let total_weight: f64 = n_k_arr.sum();
     let beta: f64 = beta_k_arr.iter().zip(n_k_arr.iter()).map(|(&b, &n)| b * n).sum::<f64>() / total_weight;
 
-    // Compute standard error
+
     let weighted_mean = beta;
     let weighted_var: f64 = beta_k_arr
         .iter()
@@ -548,7 +548,7 @@ fn sibtest_all_items<'py>(
 
     let n_items = data.ncols();
 
-    // Determine reference and focal groups
+
     let mut unique_groups: Vec<i32> = groups.iter().cloned().collect();
     unique_groups.sort();
     unique_groups.dedup();
@@ -562,11 +562,11 @@ fn sibtest_all_items<'py>(
         a.as_array().iter().map(|&x| x as usize).collect()
     });
 
-    // Parallel computation for each item
+
     let results: Vec<(f64, f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|item_idx| {
-            // Determine matching items for this item
+
             let matching: Vec<usize> = match &anchor_set {
                 Some(anchors) => anchors.iter().filter(|&&j| j != item_idx).cloned().collect(),
                 None => (0..n_items).filter(|&j| j != item_idx).collect(),
@@ -576,7 +576,7 @@ fn sibtest_all_items<'py>(
                 return (f64::NAN, f64::NAN, f64::NAN);
             }
 
-            // Compute matching scores
+
             let ref_scores: Vec<i32> = ref_mask
                 .iter()
                 .enumerate()
@@ -591,13 +591,13 @@ fn sibtest_all_items<'py>(
                 .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
                 .collect();
 
-            // Get unique score levels
+
             let all_scores: Vec<i32> = ref_scores.iter().chain(focal_scores.iter()).cloned().collect();
             let mut unique_scores = all_scores.clone();
             unique_scores.sort();
             unique_scores.dedup();
 
-            // Extract reference and focal data
+
             let ref_data: Vec<Vec<i32>> = ref_mask
                 .iter()
                 .enumerate()
@@ -612,7 +612,7 @@ fn sibtest_all_items<'py>(
                 .map(|(i, _)| data.row(i).to_vec())
                 .collect();
 
-            // Compute beta
+
             let mut beta_k_vec = Vec::new();
             let mut n_k_vec = Vec::new();
 
@@ -650,7 +650,7 @@ fn sibtest_all_items<'py>(
             let total_weight: f64 = n_k_vec.iter().sum();
             let beta: f64 = beta_k_vec.iter().zip(n_k_vec.iter()).map(|(&b, &n)| b * n).sum::<f64>() / total_weight;
 
-            // Standard error
+
             let weighted_var: f64 = beta_k_vec
                 .iter()
                 .zip(n_k_vec.iter())
@@ -660,7 +660,7 @@ fn sibtest_all_items<'py>(
             let n_total = (ref_scores.len() + focal_scores.len()) as f64;
             let se = (weighted_var / n_total).sqrt();
 
-            // Z-statistic and p-value
+
             let z = if se > EPSILON { beta / se } else { f64::NAN };
             let p_value = if z.is_nan() {
                 f64::NAN
@@ -687,9 +687,9 @@ fn normal_cdf(x: f64) -> f64 {
     if x > 0.0 { 1.0 - p } else { p }
 }
 
-// ============================================================================
-// GRM/GPCM Simulation (High Priority)
-// ============================================================================
+
+
+
 
 /// Simulate responses from Graded Response Model
 #[pyfunction]
@@ -713,7 +713,7 @@ fn simulate_grm<'py>(
         .map(|i| thresholds.row(i).to_vec())
         .collect();
 
-    // Parallel simulation
+
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
@@ -722,21 +722,21 @@ fn simulate_grm<'py>(
 
             (0..n_items)
                 .map(|j| {
-                    // Compute cumulative probabilities
+
                     let mut cum_probs = vec![1.0; n_categories];
                     for k in 0..(n_categories - 1) {
                         let z = disc_vec[j] * (theta_i - thresh_vec[j][k]);
                         cum_probs[k + 1] = sigmoid(z);
                     }
 
-                    // Convert to category probabilities
+
                     let mut cat_probs = vec![0.0; n_categories];
                     for k in 0..n_categories {
                         let next = if k < n_categories - 1 { cum_probs[k + 1] } else { 0.0 };
                         cat_probs[k] = (cum_probs[k] - next).max(0.0);
                     }
 
-                    // Normalize
+
                     let sum: f64 = cat_probs.iter().sum();
                     if sum > EPSILON {
                         for p in &mut cat_probs {
@@ -744,7 +744,7 @@ fn simulate_grm<'py>(
                         }
                     }
 
-                    // Sample category
+
                     let u: f64 = rng.random();
                     let mut cumsum = 0.0;
                     for (k, &p) in cat_probs.iter().enumerate() {
@@ -799,7 +799,7 @@ fn simulate_gpcm<'py>(
 
             (0..n_items)
                 .map(|j| {
-                    // Compute numerators for each category
+
                     let mut numerators = vec![0.0; n_categories];
                     for k in 0..n_categories {
                         let mut cumsum = 0.0;
@@ -809,11 +809,11 @@ fn simulate_gpcm<'py>(
                         numerators[k] = cumsum.exp();
                     }
 
-                    // Normalize to get probabilities
+
                     let sum: f64 = numerators.iter().sum();
                     let cat_probs: Vec<f64> = numerators.iter().map(|&n| n / sum).collect();
 
-                    // Sample category
+
                     let u: f64 = rng.random();
                     let mut cumsum = 0.0;
                     for (k, &p) in cat_probs.iter().enumerate() {
@@ -890,9 +890,9 @@ fn simulate_dichotomous<'py>(
     result.to_pyarray(py)
 }
 
-// ============================================================================
-// Plausible Values Generation (Medium Priority)
-// ============================================================================
+
+
+
 
 /// Generate plausible values using posterior sampling
 #[pyfunction]
@@ -930,7 +930,7 @@ fn generate_plausible_values_posterior<'py>(
             let normal = Normal::new(0.0, jitter_sd).unwrap();
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-            // Compute log posterior
+
             let log_likes: Vec<f64> = (0..n_quad)
                 .map(|q| {
                     log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec)
@@ -943,13 +943,13 @@ fn generate_plausible_values_posterior<'py>(
                 .map(|(&ll, &lw)| ll + lw)
                 .collect();
 
-            // Normalize
+
             let max_lp = log_posterior.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let posterior: Vec<f64> = log_posterior.iter().map(|&lp| (lp - max_lp).exp()).collect();
             let sum: f64 = posterior.iter().sum();
             let posterior: Vec<f64> = posterior.iter().map(|&p| p / sum).collect();
 
-            // Generate plausible values
+
             (0..n_plausible)
                 .map(|_| {
                     let u: f64 = rng.random();
@@ -1016,7 +1016,7 @@ fn generate_plausible_values_mcmc<'py>(
                     let ll_current = log_likelihood_2pl_single(&resp_row, theta, &disc_vec, &diff_vec);
                     let ll_proposal = log_likelihood_2pl_single(&resp_row, proposal, &disc_vec, &diff_vec);
 
-                    // Standard normal prior
+
                     let prior_current = -0.5 * theta * theta;
                     let prior_proposal = -0.5 * proposal * proposal;
 
@@ -1043,9 +1043,9 @@ fn generate_plausible_values_mcmc<'py>(
     result.to_pyarray(py)
 }
 
-// ============================================================================
-// Model Fit - Bivariate Margins (Medium Priority)
-// ============================================================================
+
+
+
 
 /// Compute observed univariate and bivariate margins
 #[pyfunction]
@@ -1057,7 +1057,7 @@ fn compute_observed_margins<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
 
-    // Univariate margins
+
     let obs_uni: Array1<f64> = (0..n_items)
         .into_par_iter()
         .map(|j| {
@@ -1076,7 +1076,7 @@ fn compute_observed_margins<'py>(
         .collect::<Vec<f64>>()
         .into();
 
-    // Bivariate margins (parallel over item pairs)
+
     let pairs: Vec<(usize, usize)> = (0..n_items)
         .flat_map(|i| ((i + 1)..n_items).map(move |j| (i, j)))
         .collect();
@@ -1125,7 +1125,7 @@ fn compute_expected_margins<'py>(
     let n_quad = quad_points.len();
     let n_items = discrimination.len();
 
-    // Pre-compute probabilities at each quadrature point
+
     let probs: Vec<Vec<f64>> = (0..n_items)
         .map(|j| {
             (0..n_quad)
@@ -1134,7 +1134,7 @@ fn compute_expected_margins<'py>(
         })
         .collect();
 
-    // Univariate expected margins
+
     let exp_uni: Array1<f64> = (0..n_items)
         .map(|j| {
             probs[j]
@@ -1146,7 +1146,7 @@ fn compute_expected_margins<'py>(
         .collect::<Vec<f64>>()
         .into();
 
-    // Bivariate expected margins
+
     let pairs: Vec<(usize, usize)> = (0..n_items)
         .flat_map(|i| ((i + 1)..n_items).map(move |j| (i, j)))
         .collect();
@@ -1170,9 +1170,9 @@ fn compute_expected_margins<'py>(
     (exp_uni.to_pyarray(py), exp_bi.to_pyarray(py))
 }
 
-// ============================================================================
-// Bootstrap Helpers (High Priority)
-// ============================================================================
+
+
+
 
 /// Generate bootstrap sample indices
 #[pyfunction]
@@ -1223,9 +1223,9 @@ fn resample_responses<'py>(
     result.to_pyarray(py)
 }
 
-// ============================================================================
-// Imputation Helpers (Medium Priority)
-// ============================================================================
+
+
+
 
 /// Impute missing responses using model probabilities
 #[pyfunction]
@@ -1314,7 +1314,7 @@ fn multiple_imputation<'py>(
                 .map(|i| {
                     let mut rng = Pcg64::seed_from_u64(base_seed + i as u64);
 
-                    // Draw theta from posterior
+
                     let normal = Normal::new(0.0, 1.0).unwrap();
                     let theta_i = theta_mean[i] + rng.sample(normal) * theta_se[i];
 
@@ -1347,9 +1347,9 @@ fn multiple_imputation<'py>(
     result.to_pyarray(py)
 }
 
-// ============================================================================
-// Scoring Functions
-// ============================================================================
+
+
+
 
 /// Compute EAP (Expected A Posteriori) scores
 #[pyfunction]
@@ -1382,7 +1382,7 @@ fn compute_eap_scores<'py>(
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-            // Compute log posterior
+
             let log_likes: Vec<f64> = (0..n_quad)
                 .map(|q| {
                     log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec)
@@ -1395,20 +1395,20 @@ fn compute_eap_scores<'py>(
                 .map(|(&ll, &lw)| ll + lw)
                 .collect();
 
-            // Normalize
+
             let max_lp = log_posterior.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let posterior: Vec<f64> = log_posterior.iter().map(|&lp| (lp - max_lp).exp()).collect();
             let sum: f64 = posterior.iter().sum();
             let posterior: Vec<f64> = posterior.iter().map(|&p| p / sum).collect();
 
-            // EAP estimate (posterior mean)
+
             let eap: f64 = posterior
                 .iter()
                 .zip(quad_vec.iter())
                 .map(|(&p, &theta)| p * theta)
                 .sum();
 
-            // Posterior SD
+
             let psd: f64 = posterior
                 .iter()
                 .zip(quad_vec.iter())
@@ -1426,49 +1426,871 @@ fn compute_eap_scores<'py>(
     (theta.to_pyarray(py), se.to_pyarray(py))
 }
 
-// ============================================================================
-// Python Module Definition
-// ============================================================================
+
+
+
+
+/// Complete 2PL EM estimation in Rust
+/// Returns (discrimination, difficulty, log_likelihood, n_iterations, converged)
+#[pyfunction]
+fn em_fit_2pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    n_quadpts: usize,
+    max_iter: usize,
+    tol: f64,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+    usize,
+    bool,
+) {
+    let responses = responses.as_array();
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+
+
+    let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
+
+
+    let mut discrimination: Vec<f64> = vec![1.0; n_items];
+    let mut difficulty: Vec<f64> = vec![0.0; n_items];
+
+
+    for j in 0..n_items {
+        let mut sum = 0.0;
+        let mut count = 0;
+        for i in 0..n_persons {
+            let r = responses[[i, j]];
+            if r >= 0 {
+                sum += r as f64;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let p = (sum / count as f64).clamp(0.01, 0.99);
+            difficulty[j] = -p.ln() / (1.0 - p).ln().abs().max(0.01);
+        }
+    }
+
+    let mut prev_ll = f64::NEG_INFINITY;
+    let mut converged = false;
+    let mut iteration = 0;
+
+    for iter in 0..max_iter {
+        iteration = iter + 1;
+
+
+        let (posterior_weights, marginal_ll) = e_step_2pl_internal(
+            &responses,
+            &quad_points,
+            &quad_weights,
+            &discrimination,
+            &difficulty,
+            n_persons,
+            n_items,
+            n_quadpts,
+        );
+
+        let current_ll: f64 = marginal_ll.iter().map(|&x| (x + EPSILON).ln()).sum();
+
+
+        if (current_ll - prev_ll).abs() < tol {
+            converged = true;
+            break;
+        }
+        prev_ll = current_ll;
+
+
+        m_step_2pl_internal(
+            &responses,
+            &posterior_weights,
+            &quad_points,
+            &mut discrimination,
+            &mut difficulty,
+            n_persons,
+            n_items,
+            n_quadpts,
+        );
+    }
+
+    let disc_arr: Array1<f64> = discrimination.into();
+    let diff_arr: Array1<f64> = difficulty.into();
+
+    (
+        disc_arr.to_pyarray(py),
+        diff_arr.to_pyarray(py),
+        prev_ll,
+        iteration,
+        converged,
+    )
+}
+
+/// Internal E-step computation
+fn e_step_2pl_internal(
+    responses: &ndarray::ArrayView2<i32>,
+    quad_points: &[f64],
+    quad_weights: &[f64],
+    discrimination: &[f64],
+    difficulty: &[f64],
+    n_persons: usize,
+    n_items: usize,
+    n_quad: usize,
+) -> (Vec<Vec<f64>>, Vec<f64>) {
+    let log_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + EPSILON).ln()).collect();
+
+
+    let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let mut log_joint = vec![0.0; n_quad];
+
+            for q in 0..n_quad {
+                let theta = quad_points[q];
+                let mut ll = 0.0;
+
+                for j in 0..n_items {
+                    let resp = responses[[i, j]];
+                    if resp < 0 {
+                        continue;
+                    }
+                    let z = discrimination[j] * (theta - difficulty[j]);
+                    if resp == 1 {
+                        ll += log_sigmoid(z);
+                    } else {
+                        ll += log_sigmoid(-z);
+                    }
+                }
+
+                log_joint[q] = ll + log_weights[q];
+            }
+
+            let log_marginal = logsumexp(&log_joint);
+            let posterior: Vec<f64> = log_joint
+                .iter()
+                .map(|&lj| (lj - log_marginal).exp())
+                .collect();
+
+            (posterior, log_marginal.exp())
+        })
+        .collect();
+
+    let posterior_weights: Vec<Vec<f64>> = results.iter().map(|(p, _)| p.clone()).collect();
+    let marginal_ll: Vec<f64> = results.iter().map(|(_, m)| *m).collect();
+
+    (posterior_weights, marginal_ll)
+}
+
+/// Internal M-step computation with parallel item updates
+fn m_step_2pl_internal(
+    responses: &ndarray::ArrayView2<i32>,
+    posterior_weights: &[Vec<f64>],
+    quad_points: &[f64],
+    discrimination: &mut [f64],
+    difficulty: &mut [f64],
+    n_persons: usize,
+    n_items: usize,
+    n_quad: usize,
+) {
+
+    let new_params: Vec<(f64, f64)> = (0..n_items)
+        .into_par_iter()
+        .map(|j| {
+
+            let mut r_k = vec![0.0; n_quad];
+            let mut n_k = vec![0.0; n_quad];
+
+            for i in 0..n_persons {
+                let resp = responses[[i, j]];
+                if resp < 0 {
+                    continue;
+                }
+                for q in 0..n_quad {
+                    let w = posterior_weights[i][q];
+                    n_k[q] += w;
+                    if resp == 1 {
+                        r_k[q] += w;
+                    }
+                }
+            }
+
+
+            let mut a = discrimination[j];
+            let mut b = difficulty[j];
+
+            for _ in 0..10 {
+                let mut grad_a = 0.0;
+                let mut grad_b = 0.0;
+                let mut hess_aa = 0.0;
+                let mut hess_bb = 0.0;
+                let mut hess_ab = 0.0;
+
+                for q in 0..n_quad {
+                    if n_k[q] < EPSILON {
+                        continue;
+                    }
+                    let theta = quad_points[q];
+                    let z = a * (theta - b);
+                    let p = sigmoid(z);
+                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
+
+                    let residual = r_k[q] - n_k[q] * p_clipped;
+
+                    grad_a += residual * (theta - b);
+                    grad_b += -residual * a;
+
+                    let info = n_k[q] * p_clipped * (1.0 - p_clipped);
+                    hess_aa += -info * (theta - b) * (theta - b);
+                    hess_bb += -info * a * a;
+                    hess_ab += info * a * (theta - b);
+                }
+
+
+                hess_aa -= 0.01;
+                hess_bb -= 0.01;
+
+                let det = hess_aa * hess_bb - hess_ab * hess_ab;
+                if det.abs() < EPSILON {
+                    break;
+                }
+
+                let delta_a = (hess_bb * grad_a - hess_ab * grad_b) / det;
+                let delta_b = (-hess_ab * grad_a + hess_aa * grad_b) / det;
+
+                a = (a - delta_a * 0.5).clamp(0.1, 5.0);
+                b = (b - delta_b * 0.5).clamp(-6.0, 6.0);
+
+                if delta_a.abs() < 1e-4 && delta_b.abs() < 1e-4 {
+                    break;
+                }
+            }
+
+            (a, b)
+        })
+        .collect();
+
+    for (j, (a, b)) in new_params.into_iter().enumerate() {
+        discrimination[j] = a;
+        difficulty[j] = b;
+    }
+}
+
+/// Gauss-Hermite quadrature nodes and weights
+fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
+
+    match n {
+        11 => {
+            let nodes = vec![
+                -3.66847, -2.78329, -2.02594, -1.32656, -0.65681,
+                0.0, 0.65681, 1.32656, 2.02594, 2.78329, 3.66847,
+            ];
+            let weights = vec![
+                0.00001, 0.00076, 0.01526, 0.13548, 0.53134,
+                0.94531, 0.53134, 0.13548, 0.01526, 0.00076, 0.00001,
+            ];
+
+            let sum: f64 = weights.iter().sum();
+            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
+            (nodes, weights)
+        }
+        15 => {
+            let nodes = vec![
+                -4.49999, -3.66995, -2.96716, -2.32573, -1.71999,
+                -1.13612, -0.56506, 0.0, 0.56506, 1.13612,
+                1.71999, 2.32573, 2.96716, 3.66995, 4.49999,
+            ];
+            let weights = vec![
+                1.5e-09, 1.5e-06, 3.9e-04, 0.00494, 0.03204,
+                0.11094, 0.21181, 0.22418, 0.21181, 0.11094,
+                0.03204, 0.00494, 3.9e-04, 1.5e-06, 1.5e-09,
+            ];
+            let sum: f64 = weights.iter().sum();
+            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
+            (nodes, weights)
+        }
+        21 => {
+            let nodes = vec![
+                -5.38748, -4.60368, -3.94477, -3.34785, -2.78881,
+                -2.25497, -1.73854, -1.23408, -0.73747, -0.24535,
+                0.24535, 0.73747, 1.23408, 1.73854, 2.25497,
+                2.78881, 3.34785, 3.94477, 4.60368, 5.38748,
+                0.0,
+            ];
+            let weights = vec![
+                2.1e-13, 4.4e-10, 1.1e-07, 7.8e-06, 2.3e-04,
+                3.5e-03, 3.1e-02, 1.5e-01, 4.3e-01, 7.2e-01,
+                7.2e-01, 4.3e-01, 1.5e-01, 3.1e-02, 3.5e-03,
+                2.3e-04, 7.8e-06, 1.1e-07, 4.4e-10, 2.1e-13,
+                1.0,
+            ];
+            let sum: f64 = weights.iter().sum();
+            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
+            (nodes, weights)
+        }
+        _ => {
+
+            let mut nodes = Vec::with_capacity(n);
+            let mut weights = Vec::with_capacity(n);
+            let step = 8.0 / (n - 1) as f64;
+            for i in 0..n {
+                let x = -4.0 + i as f64 * step;
+                nodes.push(x);
+                weights.push((-x * x / 2.0).exp());
+            }
+            let sum: f64 = weights.iter().sum();
+            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
+            (nodes, weights)
+        }
+    }
+}
+
+
+
+
+
+/// Full Gibbs sampler for 2PL model in Rust
+/// Returns (disc_chain, diff_chain, theta_chain, ll_chain)
+#[pyfunction]
+fn gibbs_sample_2pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    n_iter: usize,
+    burnin: usize,
+    thin: usize,
+    seed: u64,
+) -> (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray3<f64>>,
+    Bound<'py, PyArray1<f64>>,
+) {
+    let responses = responses.as_array();
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+
+
+    let mut discrimination: Vec<f64> = vec![1.0; n_items];
+    let mut difficulty: Vec<f64> = vec![0.0; n_items];
+    let mut theta: Vec<f64> = vec![0.0; n_persons];
+
+    let n_samples = (n_iter - burnin) / thin;
+    let mut disc_chain: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
+    let mut diff_chain: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
+    let mut theta_chain: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
+    let mut ll_chain: Vec<f64> = Vec::with_capacity(n_samples);
+
+    let mut rng = Pcg64::seed_from_u64(seed);
+    let proposal_theta = Normal::new(0.0, 0.5).unwrap();
+    let proposal_param = Normal::new(0.0, 0.1).unwrap();
+
+    for iter in 0..n_iter {
+
+        theta = sample_theta_mh(
+            &responses,
+            &theta,
+            &discrimination,
+            &difficulty,
+            n_persons,
+            n_items,
+            &mut rng,
+            &proposal_theta,
+        );
+
+
+        discrimination = sample_discrimination_mh(
+            &responses,
+            &theta,
+            &discrimination,
+            &difficulty,
+            n_items,
+            &mut rng,
+            &proposal_param,
+        );
+
+
+        difficulty = sample_difficulty_mh(
+            &responses,
+            &theta,
+            &discrimination,
+            &difficulty,
+            n_items,
+            &mut rng,
+            &proposal_param,
+        );
+
+
+        if iter >= burnin && (iter - burnin) % thin == 0 {
+            disc_chain.push(discrimination.clone());
+            diff_chain.push(difficulty.clone());
+            theta_chain.push(theta.clone());
+
+            let ll = compute_total_ll(&responses, &theta, &discrimination, &difficulty, n_persons, n_items);
+            ll_chain.push(ll);
+        }
+    }
+
+
+    let disc_arr = Array2::from_shape_vec(
+        (n_samples, n_items),
+        disc_chain.into_iter().flatten().collect(),
+    ).unwrap();
+
+    let diff_arr = Array2::from_shape_vec(
+        (n_samples, n_items),
+        diff_chain.into_iter().flatten().collect(),
+    ).unwrap();
+
+    let theta_arr = Array3::from_shape_vec(
+        (n_samples, n_persons, 1),
+        theta_chain.into_iter().flatten().map(|x| x).collect(),
+    ).unwrap();
+
+    let ll_arr: Array1<f64> = ll_chain.into();
+
+    (
+        disc_arr.to_pyarray(py),
+        diff_arr.to_pyarray(py),
+        theta_arr.to_pyarray(py),
+        ll_arr.to_pyarray(py),
+    )
+}
+
+fn sample_theta_mh(
+    responses: &ndarray::ArrayView2<i32>,
+    theta: &[f64],
+    discrimination: &[f64],
+    difficulty: &[f64],
+    n_persons: usize,
+    n_items: usize,
+    rng: &mut Pcg64,
+    proposal: &Normal<f64>,
+) -> Vec<f64> {
+
+    let seeds: Vec<u64> = (0..n_persons).map(|_| rng.random()).collect();
+
+    let new_theta: Vec<f64> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let mut local_rng = Pcg64::seed_from_u64(seeds[i]);
+
+            let current = theta[i];
+            let proposed = current + local_rng.sample(proposal);
+
+
+            let mut ll_current = 0.0;
+            let mut ll_proposed = 0.0;
+
+            for j in 0..n_items {
+                let resp = responses[[i, j]];
+                if resp < 0 {
+                    continue;
+                }
+                let z_curr = discrimination[j] * (current - difficulty[j]);
+                let z_prop = discrimination[j] * (proposed - difficulty[j]);
+
+                if resp == 1 {
+                    ll_current += log_sigmoid(z_curr);
+                    ll_proposed += log_sigmoid(z_prop);
+                } else {
+                    ll_current += log_sigmoid(-z_curr);
+                    ll_proposed += log_sigmoid(-z_prop);
+                }
+            }
+
+
+            let prior_current = -0.5 * current * current;
+            let prior_proposed = -0.5 * proposed * proposed;
+
+            let log_alpha = (ll_proposed + prior_proposed) - (ll_current + prior_current);
+
+            if local_rng.random::<f64>().ln() < log_alpha {
+                proposed
+            } else {
+                current
+            }
+        })
+        .collect();
+
+    new_theta
+}
+
+fn sample_discrimination_mh(
+    responses: &ndarray::ArrayView2<i32>,
+    theta: &[f64],
+    discrimination: &[f64],
+    difficulty: &[f64],
+    n_items: usize,
+    rng: &mut Pcg64,
+    proposal: &Normal<f64>,
+) -> Vec<f64> {
+    let n_persons = theta.len();
+    let mut new_disc = discrimination.to_vec();
+
+    for j in 0..n_items {
+        let current = discrimination[j];
+        let proposed = (current + rng.sample(proposal)).clamp(0.1, 5.0);
+
+        let mut ll_current = 0.0;
+        let mut ll_proposed = 0.0;
+
+        for i in 0..n_persons {
+            let resp = responses[[i, j]];
+            if resp < 0 {
+                continue;
+            }
+            let z_curr = current * (theta[i] - difficulty[j]);
+            let z_prop = proposed * (theta[i] - difficulty[j]);
+
+            if resp == 1 {
+                ll_current += log_sigmoid(z_curr);
+                ll_proposed += log_sigmoid(z_prop);
+            } else {
+                ll_current += log_sigmoid(-z_curr);
+                ll_proposed += log_sigmoid(-z_prop);
+            }
+        }
+
+
+        let prior_current = -0.5 * current.ln().powi(2);
+        let prior_proposed = -0.5 * proposed.ln().powi(2);
+
+        let log_alpha = (ll_proposed + prior_proposed) - (ll_current + prior_current);
+
+        if rng.random::<f64>().ln() < log_alpha {
+            new_disc[j] = proposed;
+        }
+    }
+
+    new_disc
+}
+
+fn sample_difficulty_mh(
+    responses: &ndarray::ArrayView2<i32>,
+    theta: &[f64],
+    discrimination: &[f64],
+    difficulty: &[f64],
+    n_items: usize,
+    rng: &mut Pcg64,
+    proposal: &Normal<f64>,
+) -> Vec<f64> {
+    let n_persons = theta.len();
+    let mut new_diff = difficulty.to_vec();
+
+    for j in 0..n_items {
+        let current = difficulty[j];
+        let proposed = (current + rng.sample(proposal)).clamp(-6.0, 6.0);
+
+        let mut ll_current = 0.0;
+        let mut ll_proposed = 0.0;
+
+        for i in 0..n_persons {
+            let resp = responses[[i, j]];
+            if resp < 0 {
+                continue;
+            }
+            let z_curr = discrimination[j] * (theta[i] - current);
+            let z_prop = discrimination[j] * (theta[i] - proposed);
+
+            if resp == 1 {
+                ll_current += log_sigmoid(z_curr);
+                ll_proposed += log_sigmoid(z_prop);
+            } else {
+                ll_current += log_sigmoid(-z_curr);
+                ll_proposed += log_sigmoid(-z_prop);
+            }
+        }
+
+
+        let prior_current = -0.5 * current * current;
+        let prior_proposed = -0.5 * proposed * proposed;
+
+        let log_alpha = (ll_proposed + prior_proposed) - (ll_current + prior_current);
+
+        if rng.random::<f64>().ln() < log_alpha {
+            new_diff[j] = proposed;
+        }
+    }
+
+    new_diff
+}
+
+fn compute_total_ll(
+    responses: &ndarray::ArrayView2<i32>,
+    theta: &[f64],
+    discrimination: &[f64],
+    difficulty: &[f64],
+    n_persons: usize,
+    n_items: usize,
+) -> f64 {
+    (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let mut ll = 0.0;
+            for j in 0..n_items {
+                let resp = responses[[i, j]];
+                if resp < 0 {
+                    continue;
+                }
+                let z = discrimination[j] * (theta[i] - difficulty[j]);
+                if resp == 1 {
+                    ll += log_sigmoid(z);
+                } else {
+                    ll += log_sigmoid(-z);
+                }
+            }
+            ll
+        })
+        .sum()
+}
+
+
+
+
+
+/// MHRM estimation for 2PL model
+#[pyfunction]
+fn mhrm_fit_2pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    n_cycles: usize,
+    burnin: usize,
+    proposal_sd: f64,
+    seed: u64,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    f64,
+) {
+    let responses = responses.as_array();
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+
+    let mut discrimination: Vec<f64> = vec![1.0; n_items];
+    let mut difficulty: Vec<f64> = vec![0.0; n_items];
+    let mut theta: Vec<f64> = vec![0.0; n_persons];
+
+    let mut rng = Pcg64::seed_from_u64(seed);
+    let proposal = Normal::new(0.0, proposal_sd).unwrap();
+
+    for cycle in 0..n_cycles {
+
+        theta = sample_theta_mh(
+            &responses,
+            &theta,
+            &discrimination,
+            &difficulty,
+            n_persons,
+            n_items,
+            &mut rng,
+            &proposal,
+        );
+
+
+        let gain = 1.0 / (cycle as f64 + 1.0);
+
+        if cycle >= burnin {
+            for j in 0..n_items {
+                let mut grad_a = 0.0;
+                let mut grad_b = 0.0;
+                let mut count = 0;
+
+                for i in 0..n_persons {
+                    let resp = responses[[i, j]];
+                    if resp < 0 {
+                        continue;
+                    }
+                    count += 1;
+                    let z = discrimination[j] * (theta[i] - difficulty[j]);
+                    let p = sigmoid(z);
+                    let residual = resp as f64 - p;
+
+                    grad_a += residual * (theta[i] - difficulty[j]);
+                    grad_b += -residual * discrimination[j];
+                }
+
+                if count > 0 {
+                    grad_a /= count as f64;
+                    grad_b /= count as f64;
+
+                    discrimination[j] = (discrimination[j] + gain * grad_a).clamp(0.1, 5.0);
+                    difficulty[j] = (difficulty[j] + gain * grad_b).clamp(-6.0, 6.0);
+                }
+            }
+        }
+    }
+
+    let ll = compute_total_ll(&responses, &theta, &discrimination, &difficulty, n_persons, n_items);
+
+    let disc_arr: Array1<f64> = discrimination.into();
+    let diff_arr: Array1<f64> = difficulty.into();
+
+    (disc_arr.to_pyarray(py), diff_arr.to_pyarray(py), ll)
+}
+
+
+
+
+
+/// Parallel bootstrap estimation
+#[pyfunction]
+fn bootstrap_fit_2pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    n_bootstrap: usize,
+    n_quadpts: usize,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+) -> (
+    Bound<'py, PyArray2<f64>>,
+    Bound<'py, PyArray2<f64>>,
+) {
+    let responses = responses.as_array();
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+
+
+    let results: Vec<(Vec<f64>, Vec<f64>)> = (0..n_bootstrap)
+        .into_par_iter()
+        .map(|b| {
+            let mut rng = Pcg64::seed_from_u64(seed + b as u64);
+
+
+            let indices: Vec<usize> = (0..n_persons)
+                .map(|_| rng.random_range(0..n_persons))
+                .collect();
+
+
+            let mut boot_responses = Array2::zeros((n_persons, n_items));
+            for (new_i, &orig_i) in indices.iter().enumerate() {
+                for j in 0..n_items {
+                    boot_responses[[new_i, j]] = responses[[orig_i, j]];
+                }
+            }
+
+
+            let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
+            let mut discrimination: Vec<f64> = vec![1.0; n_items];
+            let mut difficulty: Vec<f64> = vec![0.0; n_items];
+
+
+            for j in 0..n_items {
+                let mut sum = 0.0;
+                let mut count = 0;
+                for i in 0..n_persons {
+                    let r = boot_responses[[i, j]];
+                    if r >= 0 {
+                        sum += r as f64;
+                        count += 1;
+                    }
+                }
+                if count > 0 {
+                    let p = (sum / count as f64).clamp(0.01, 0.99);
+                    difficulty[j] = -p.ln() / (1.0 - p).ln().abs().max(0.01);
+                }
+            }
+
+            let mut prev_ll = f64::NEG_INFINITY;
+
+            for _ in 0..max_iter {
+                let (posterior_weights, marginal_ll) = e_step_2pl_internal(
+                    &boot_responses.view(),
+                    &quad_points,
+                    &quad_weights,
+                    &discrimination,
+                    &difficulty,
+                    n_persons,
+                    n_items,
+                    n_quadpts,
+                );
+
+                let current_ll: f64 = marginal_ll.iter().map(|&x| (x + EPSILON).ln()).sum();
+
+                if (current_ll - prev_ll).abs() < tol {
+                    break;
+                }
+                prev_ll = current_ll;
+
+                m_step_2pl_internal(
+                    &boot_responses.view(),
+                    &posterior_weights,
+                    &quad_points,
+                    &mut discrimination,
+                    &mut difficulty,
+                    n_persons,
+                    n_items,
+                    n_quadpts,
+                );
+            }
+
+            (discrimination, difficulty)
+        })
+        .collect();
+
+
+    let mut disc_samples = Array2::zeros((n_bootstrap, n_items));
+    let mut diff_samples = Array2::zeros((n_bootstrap, n_items));
+
+    for (b, (disc, diff)) in results.into_iter().enumerate() {
+        for j in 0..n_items {
+            disc_samples[[b, j]] = disc[j];
+            diff_samples[[b, j]] = diff[j];
+        }
+    }
+
+    (disc_samples.to_pyarray(py), diff_samples.to_pyarray(py))
+}
+
+
+
+
 
 #[pymodule]
 fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // E-step functions
+
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_3pl, m)?)?;
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_mirt, m)?)?;
     m.add_function(wrap_pyfunction!(e_step_complete, m)?)?;
 
-    // M-step helpers
+
     m.add_function(wrap_pyfunction!(compute_expected_counts, m)?)?;
     m.add_function(wrap_pyfunction!(compute_expected_counts_polytomous, m)?)?;
 
-    // SIBTEST
+
     m.add_function(wrap_pyfunction!(sibtest_compute_beta, m)?)?;
     m.add_function(wrap_pyfunction!(sibtest_all_items, m)?)?;
 
-    // Simulation
+
     m.add_function(wrap_pyfunction!(simulate_grm, m)?)?;
     m.add_function(wrap_pyfunction!(simulate_gpcm, m)?)?;
     m.add_function(wrap_pyfunction!(simulate_dichotomous, m)?)?;
 
-    // Plausible values
+
     m.add_function(wrap_pyfunction!(generate_plausible_values_posterior, m)?)?;
     m.add_function(wrap_pyfunction!(generate_plausible_values_mcmc, m)?)?;
 
-    // Model fit
+
     m.add_function(wrap_pyfunction!(compute_observed_margins, m)?)?;
     m.add_function(wrap_pyfunction!(compute_expected_margins, m)?)?;
 
-    // Bootstrap
+
     m.add_function(wrap_pyfunction!(generate_bootstrap_indices, m)?)?;
     m.add_function(wrap_pyfunction!(resample_responses, m)?)?;
 
-    // Imputation
+
     m.add_function(wrap_pyfunction!(impute_from_probabilities, m)?)?;
     m.add_function(wrap_pyfunction!(multiple_imputation, m)?)?;
 
-    // Scoring
+
     m.add_function(wrap_pyfunction!(compute_eap_scores, m)?)?;
+
+
+    m.add_function(wrap_pyfunction!(em_fit_2pl, m)?)?;
+    m.add_function(wrap_pyfunction!(gibbs_sample_2pl, m)?)?;
+    m.add_function(wrap_pyfunction!(mhrm_fit_2pl, m)?)?;
+    m.add_function(wrap_pyfunction!(bootstrap_fit_2pl, m)?)?;
 
     Ok(())
 }

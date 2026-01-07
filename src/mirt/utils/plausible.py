@@ -25,6 +25,7 @@ def generate_plausible_values(
     n_plausible: int = 5,
     method: Literal["posterior", "mcmc"] = "posterior",
     n_quadpts: int = 21,
+    n_iter: int = 50,
     seed: int | None = None,
 ) -> NDArray[np.float64]:
     """Generate plausible values for latent abilities.
@@ -47,6 +48,8 @@ def generate_plausible_values(
         - 'mcmc': MCMC sampling (slower but more flexible)
     n_quadpts : int
         Number of quadrature points (for posterior method)
+    n_iter : int
+        Number of MCMC iterations (for mcmc method)
     seed : int, optional
         Random seed
 
@@ -68,7 +71,7 @@ def generate_plausible_values(
     if method == "posterior":
         pvs = _generate_pv_posterior(model, responses, n_plausible, n_quadpts, rng)
     elif method == "mcmc":
-        pvs = _generate_pv_mcmc(model, responses, n_plausible, rng)
+        pvs = _generate_pv_mcmc(model, responses, n_plausible, rng, n_iter)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -125,12 +128,12 @@ def _generate_pv_mcmc(
     responses: NDArray[np.int_],
     n_plausible: int,
     rng: np.random.Generator,
+    n_iter: int = 50,
 ) -> NDArray[np.float64]:
     """Generate PVs using MCMC sampling."""
     n_persons = responses.shape[0]
     n_factors = model.n_factors
 
-    n_iter = 500
     proposal_sd = 0.5
 
     pvs = np.zeros((n_persons, n_factors, n_plausible))

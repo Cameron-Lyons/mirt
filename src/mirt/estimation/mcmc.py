@@ -3,6 +3,8 @@
 This module provides stochastic estimation methods:
 - MHRM (Metropolis-Hastings Robbins-Monro)
 - Gibbs Sampling for full Bayesian inference
+
+Uses fast Rust backend when available for 2PL models.
 """
 
 from __future__ import annotations
@@ -19,6 +21,15 @@ if TYPE_CHECKING:
 
 from mirt.estimation.base import BaseEstimator
 from mirt.results.fit_result import FitResult
+
+
+def _is_2pl_unidimensional(model: BaseItemModel) -> bool:
+    """Check if model is 2PL unidimensional."""
+    return (
+        model.model_name == "2PL"
+        and hasattr(model, "n_factors")
+        and model.n_factors == 1
+    )
 
 
 @dataclass
@@ -87,6 +98,8 @@ class MHRMEstimator(BaseEstimator):
     This is faster than full MCMC while providing good estimates
     for complex models where EM may struggle.
 
+    Uses fast parallel Rust backend for 2PL models when available.
+
     References
     ----------
     Cai, L. (2010). Metropolis-Hastings Robbins-Monro algorithm for
@@ -102,6 +115,8 @@ class MHRMEstimator(BaseEstimator):
         proposal_sd: float = 0.5,
         gain_sequence: str = "standard",
         verbose: bool = False,
+        use_rust: bool = True,
+        seed: int | None = None,
     ) -> None:
         """Initialize MHRM estimator.
 
@@ -119,6 +134,10 @@ class MHRMEstimator(BaseEstimator):
             Type of gain sequence ('standard' or 'adaptive')
         verbose : bool
             Whether to print progress
+        use_rust : bool
+            Whether to use Rust backend when available
+        seed : int, optional
+            Random seed for reproducibility
         """
         super().__init__(max_iter=n_cycles, tol=1e-4, verbose=verbose)
         self.n_cycles = n_cycles
@@ -126,6 +145,8 @@ class MHRMEstimator(BaseEstimator):
         self.n_chains = n_chains
         self.proposal_sd = proposal_sd
         self.gain_sequence = gain_sequence
+        self.use_rust = use_rust
+        self.seed = seed
 
     def fit(
         self,
@@ -149,8 +170,50 @@ class MHRMEstimator(BaseEstimator):
         FitResult
             Fitted model result
         """
+        from mirt._rust_backend import RUST_AVAILABLE, mhrm_fit_2pl
+
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
+
+        if self.use_rust and RUST_AVAILABLE and _is_2pl_unidimensional(model):
+            seed = (
+                self.seed
+                if self.seed is not None
+                else np.random.default_rng().integers(0, 2**31)
+            )
+
+            discrimination, difficulty, log_likelihood = mhrm_fit_2pl(
+                responses,
+                n_cycles=self.n_cycles,
+                burnin=self.burnin,
+                proposal_sd=self.proposal_sd,
+                seed=seed,
+            )
+
+            if not model._parameters:
+                model._initialize_parameters()
+            model._parameters["discrimination"] = np.asarray(discrimination)
+            model._parameters["difficulty"] = np.asarray(difficulty)
+            model._is_fitted = True
+
+            n_params = 2 * n_items
+            aic = -2 * log_likelihood + 2 * n_params
+            bic = -2 * log_likelihood + np.log(n_persons) * n_params
+
+            return FitResult(
+                model=model,
+                log_likelihood=log_likelihood,
+                n_iterations=self.n_cycles,
+                converged=True,
+                standard_errors={
+                    "discrimination": np.full(n_items, np.nan),
+                    "difficulty": np.full(n_items, np.nan),
+                },
+                aic=aic,
+                bic=bic,
+                n_observations=n_persons * n_items,
+                n_parameters=n_params,
+            )
 
         if not model._parameters:
             model._initialize_parameters()
@@ -159,7 +222,7 @@ class MHRMEstimator(BaseEstimator):
 
         param_history: dict[str, list] = {name: [] for name in model.parameters}
 
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.seed)
 
         for cycle in range(self.n_cycles):
             theta = self._sample_theta(model, responses, theta, rng)
@@ -311,6 +374,8 @@ class GibbsSampler(BaseEstimator):
     2. Sample parameters | theta, data
 
     This provides full posterior distributions for all parameters.
+
+    Uses fast parallel Rust backend for 2PL models when available.
     """
 
     def __init__(
@@ -321,6 +386,8 @@ class GibbsSampler(BaseEstimator):
         n_chains: int = 1,
         priors: dict[str, Any] | None = None,
         verbose: bool = False,
+        use_rust: bool = True,
+        seed: int | None = None,
     ) -> None:
         """Initialize Gibbs sampler.
 
@@ -338,6 +405,10 @@ class GibbsSampler(BaseEstimator):
             Prior specifications for parameters
         verbose : bool
             Whether to print progress
+        use_rust : bool
+            Whether to use Rust backend when available
+        seed : int, optional
+            Random seed for reproducibility
         """
         super().__init__(max_iter=n_iter, verbose=verbose)
         self.n_iter = n_iter
@@ -345,6 +416,8 @@ class GibbsSampler(BaseEstimator):
         self.thin = thin
         self.n_chains = n_chains
         self.priors = priors or {}
+        self.use_rust = use_rust
+        self.seed = seed
 
     def fit(
         self,
@@ -366,14 +439,64 @@ class GibbsSampler(BaseEstimator):
         MCMCResult
             MCMC estimation result with chains and diagnostics
         """
+        from mirt._rust_backend import RUST_AVAILABLE, gibbs_sample_2pl
+
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
+
+        if self.use_rust and RUST_AVAILABLE and _is_2pl_unidimensional(model):
+            seed = (
+                self.seed
+                if self.seed is not None
+                else np.random.default_rng().integers(0, 2**31)
+            )
+
+            disc_chain, diff_chain, theta_chain, ll_chain = gibbs_sample_2pl(
+                responses,
+                n_iter=self.n_iter,
+                burnin=self.burnin,
+                thin=self.thin,
+                seed=seed,
+            )
+
+            if not model._parameters:
+                model._initialize_parameters()
+            model._parameters["discrimination"] = np.mean(disc_chain, axis=0)
+            model._parameters["difficulty"] = np.mean(diff_chain, axis=0)
+            model._is_fitted = True
+
+            chain_arrays: dict[str, NDArray[np.float64]] = {
+                "discrimination": np.asarray(disc_chain),
+                "difficulty": np.asarray(diff_chain),
+                "theta": np.asarray(theta_chain),
+                "log_likelihood": np.asarray(ll_chain),
+            }
+
+            rhat = self._compute_rhat(chain_arrays)
+            ess = self._compute_ess(chain_arrays)
+            ll_mean = float(np.mean(ll_chain))
+
+            dic = self._compute_dic_from_chains(chain_arrays, model, responses)
+            waic = self._compute_waic_from_chains(chain_arrays, model, responses)
+
+            return MCMCResult(
+                model=model,
+                chains=chain_arrays,
+                log_likelihood=ll_mean,
+                dic=dic,
+                waic=waic,
+                rhat=rhat,
+                ess=ess,
+                n_iterations=self.n_iter,
+                burnin=self.burnin,
+                thin=self.thin,
+            )
 
         if not model._parameters:
             model._initialize_parameters()
 
         theta = np.zeros((n_persons, model.n_factors))
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(self.seed)
 
         chains: dict[str, list] = {name: [] for name in model.parameters}
         chains["theta"] = []
@@ -558,6 +681,28 @@ class GibbsSampler(BaseEstimator):
 
         return float(deviance_mean + pd)
 
+    def _compute_dic_from_chains(
+        self,
+        chains: dict[str, NDArray],
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+    ) -> float:
+        """Compute DIC from Rust chains."""
+        ll_mean = np.mean(chains["log_likelihood"])
+        deviance_mean = -2 * ll_mean
+
+        theta_chain = chains["theta"]
+        theta_mean = np.mean(theta_chain, axis=0)
+        if theta_mean.ndim == 2:
+            theta_mean = theta_mean
+
+        ll_at_mean = np.sum(model.log_likelihood(responses, theta_mean))
+        deviance_at_mean = -2 * ll_at_mean
+
+        pd = deviance_mean - deviance_at_mean
+
+        return float(deviance_mean + pd)
+
     def _compute_waic(
         self,
         chains: dict[str, NDArray],
@@ -574,6 +719,34 @@ class GibbsSampler(BaseEstimator):
             person_ll = []
             for s in range(n_samples):
                 theta_s = chains["theta"][s][i : i + 1]
+                resp_i = responses[i : i + 1]
+                ll_s = model.log_likelihood(resp_i, theta_s)[0]
+                person_ll.append(ll_s)
+
+            person_ll = np.array(person_ll)
+            lppd += np.log(np.mean(np.exp(person_ll)))
+            pwaic += np.var(person_ll)
+
+        return float(-2 * (lppd - pwaic))
+
+    def _compute_waic_from_chains(
+        self,
+        chains: dict[str, NDArray],
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+    ) -> float:
+        """Compute WAIC from Rust chains."""
+        theta_chain = chains["theta"]
+        n_samples = theta_chain.shape[0]
+        n_persons = responses.shape[0]
+
+        lppd = 0.0
+        pwaic = 0.0
+
+        for i in range(n_persons):
+            person_ll = []
+            for s in range(n_samples):
+                theta_s = theta_chain[s, i : i + 1, :]
                 resp_i = responses[i : i + 1]
                 ll_s = model.log_likelihood(resp_i, theta_s)[0]
                 person_ll.append(ll_s)

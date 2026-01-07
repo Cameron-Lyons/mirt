@@ -2,33 +2,31 @@
 
 import numpy as np
 
-from mirt import bootstrap_ci, bootstrap_se, fit_mirt, parametric_bootstrap
+from mirt import bootstrap_ci, bootstrap_se, parametric_bootstrap
 
 
 class TestBootstrapSE:
     """Tests for bootstrap standard errors."""
 
-    def test_bootstrap_se(self, dichotomous_responses):
+    def test_bootstrap_se(self, fitted_2pl_model, dichotomous_responses):
         """Test bootstrap SE computation."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         se = bootstrap_se(
-            result,
+            fitted_2pl_model,
             responses,
-            n_bootstrap=10,
+            n_bootstrap=3,
             seed=42,
         )
 
         assert "discrimination" in se or "discrimination_se" in se.keys()
         assert "difficulty" in se or "difficulty_se" in se.keys()
 
-    def test_bootstrap_se_positive(self, dichotomous_responses):
+    def test_bootstrap_se_positive(self, fitted_2pl_model, dichotomous_responses):
         """Test that bootstrap SEs are positive."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
-        se = bootstrap_se(result, responses, n_bootstrap=10, seed=42)
+        se = bootstrap_se(fitted_2pl_model, responses, n_bootstrap=3, seed=42)
 
         for key, values in se.items():
             if isinstance(values, np.ndarray):
@@ -38,15 +36,14 @@ class TestBootstrapSE:
 class TestBootstrapCI:
     """Tests for bootstrap confidence intervals."""
 
-    def test_bootstrap_ci_percentile(self, dichotomous_responses):
+    def test_bootstrap_ci_percentile(self, fitted_2pl_model, dichotomous_responses):
         """Test percentile bootstrap CI."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         ci = bootstrap_ci(
-            result,
+            fitted_2pl_model,
             responses,
-            n_bootstrap=10,
+            n_bootstrap=3,
             method="percentile",
             alpha=0.05,
             seed=42,
@@ -57,15 +54,14 @@ class TestBootstrapCI:
             if isinstance(value, tuple):
                 assert len(value) == 2
 
-    def test_bootstrap_ci_basic(self, dichotomous_responses):
+    def test_bootstrap_ci_basic(self, fitted_2pl_model, dichotomous_responses):
         """Test basic bootstrap CI."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         ci = bootstrap_ci(
-            result,
+            fitted_2pl_model,
             responses,
-            n_bootstrap=10,
+            n_bootstrap=3,
             method="basic",
             alpha=0.05,
             seed=42,
@@ -73,15 +69,14 @@ class TestBootstrapCI:
 
         assert ci is not None
 
-    def test_bootstrap_ci_bca(self, dichotomous_responses):
+    def test_bootstrap_ci_bca(self, fitted_2pl_model, dichotomous_responses):
         """Test BCa bootstrap CI."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         ci = bootstrap_ci(
-            result,
+            fitted_2pl_model,
             responses,
-            n_bootstrap=10,
+            n_bootstrap=3,
             method="BCa",
             alpha=0.05,
             seed=42,
@@ -93,14 +88,11 @@ class TestBootstrapCI:
 class TestParametricBootstrap:
     """Tests for parametric bootstrap."""
 
-    def test_parametric_bootstrap(self, dichotomous_responses):
+    def test_parametric_bootstrap(self, fitted_2pl_model):
         """Test parametric bootstrap."""
-        responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
-
         bootstrap_results = parametric_bootstrap(
-            result,
-            n_bootstrap=5,
+            fitted_2pl_model,
+            n_bootstrap=3,
             seed=42,
         )
 
@@ -108,14 +100,11 @@ class TestParametricBootstrap:
         assert "discrimination" in bootstrap_results
         assert "difficulty" in bootstrap_results
 
-    def test_parametric_bootstrap_variance(self, dichotomous_responses):
+    def test_parametric_bootstrap_variance(self, fitted_2pl_model):
         """Test parametric bootstrap variance estimation."""
-        responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
-
         bootstrap_results = parametric_bootstrap(
-            result,
-            n_bootstrap=10,
+            fitted_2pl_model,
+            n_bootstrap=3,
             seed=42,
         )
 

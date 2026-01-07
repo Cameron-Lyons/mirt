@@ -20,10 +20,15 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install dependencies
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies and build
         run: |
           uv venv
+          uv pip install maturin
           uv pip install -e ".[dev]"
+          uv run maturin develop --release
 
       - name: Run ruff check
         run: uv run ruff check src/ tests/
@@ -44,10 +49,15 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install dependencies
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies and build
         run: |
           uv venv
+          uv pip install maturin
           uv pip install -e ".[dev]"
+          uv run maturin develop --release
 
       - name: Run mypy
         run: uv run mypy src/mirt --ignore-missing-imports
@@ -65,10 +75,15 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Install dependencies
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install dependencies and build
         run: |
           uv venv
+          uv pip install maturin
           uv pip install -e ".[dev]"
+          uv run maturin develop --release
 
       - name: Run tests
         run: uv run pytest tests/ -v --cov=src/mirt --cov-report=xml

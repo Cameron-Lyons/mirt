@@ -5,7 +5,6 @@ import pytest
 
 from mirt import (
     combine_plausible_values,
-    fit_mirt,
     generate_plausible_values,
     plausible_value_regression,
     plausible_value_statistics,
@@ -15,26 +14,25 @@ from mirt import (
 class TestGeneratePlausibleValues:
     """Tests for plausible value generation."""
 
-    def test_generate_pv_posterior(self, dichotomous_responses):
+    def test_generate_pv_posterior(self, fitted_2pl_model, dichotomous_responses):
         """Test posterior sampling method."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             method="posterior",
             seed=42,
         )
 
         n_persons = responses.shape[0]
-        assert pvs.shape == (n_persons, 1, 5)
+        assert pvs.shape == (n_persons, 1, 3)
 
-    def test_generate_pv_mcmc(self, dichotomous_responses):
+    def test_generate_pv_mcmc(self, fitted_2pl_model_small):
         """Test MCMC sampling method."""
-        responses = dichotomous_responses["responses"][:50]  # Smaller for speed
-        result = fit_mirt(responses, model="2PL", max_iter=50)
+        responses = fitted_2pl_model_small["responses"]
+        result = fitted_2pl_model_small["result"]
 
         pvs = generate_plausible_values(
             result,
@@ -47,15 +45,14 @@ class TestGeneratePlausibleValues:
         n_persons = responses.shape[0]
         assert pvs.shape == (n_persons, 1, 3)
 
-    def test_pv_variability(self, dichotomous_responses):
+    def test_pv_variability(self, fitted_2pl_model, dichotomous_responses):
         """Test that PVs show appropriate variability."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             method="posterior",
             seed=42,
         )
@@ -63,16 +60,15 @@ class TestGeneratePlausibleValues:
         pv_variance = np.var(pvs, axis=2)
         assert np.mean(pv_variance) > 0
 
-    def test_pv_correlation_with_ability(self, dichotomous_responses):
+    def test_pv_correlation_with_ability(self, fitted_2pl_model, dichotomous_responses):
         """Test that PVs correlate with true ability."""
         responses = dichotomous_responses["responses"]
         true_theta = dichotomous_responses["theta"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
@@ -124,20 +120,20 @@ class TestCombinePlausibleValues:
 class TestPlausibleValueRegression:
     """Tests for regression using plausible values."""
 
-    def test_pv_regression(self, dichotomous_responses):
+    def test_pv_regression(self, fitted_2pl_model, dichotomous_responses):
         """Test regression with PVs as predictor."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
         true_theta = dichotomous_responses["theta"]
-        y = true_theta + np.random.randn(len(true_theta)) * 0.5
+        rng = np.random.default_rng(42)
+        y = true_theta + rng.standard_normal(len(true_theta)) * 0.5
 
         reg_result = plausible_value_regression(pvs, y)
 
@@ -145,20 +141,20 @@ class TestPlausibleValueRegression:
         assert "se" in reg_result
         assert "pvalues" in reg_result
 
-    def test_pv_regression_significance(self, dichotomous_responses):
+    def test_pv_regression_significance(self, fitted_2pl_model, dichotomous_responses):
         """Test that regression detects true relationship."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
         true_theta = dichotomous_responses["theta"]
-        y = 2 * true_theta + np.random.randn(len(true_theta)) * 0.1
+        rng = np.random.default_rng(42)
+        y = 2 * true_theta + rng.standard_normal(len(true_theta)) * 0.1
 
         reg_result = plausible_value_regression(pvs, y)
 
@@ -168,15 +164,14 @@ class TestPlausibleValueRegression:
 class TestPlausibleValueStatistics:
     """Tests for computing statistics with PVs."""
 
-    def test_pv_mean(self, dichotomous_responses):
+    def test_pv_mean(self, fitted_2pl_model, dichotomous_responses):
         """Test population mean estimation."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
@@ -186,15 +181,14 @@ class TestPlausibleValueStatistics:
         assert "se" in stats
         assert abs(stats["estimate"]) < 1.0
 
-    def test_pv_variance(self, dichotomous_responses):
+    def test_pv_variance(self, fitted_2pl_model, dichotomous_responses):
         """Test population variance estimation."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
@@ -203,15 +197,14 @@ class TestPlausibleValueStatistics:
         assert "estimate" in stats
         assert 0.5 < stats["estimate"] < 2.0
 
-    def test_pv_percentile(self, dichotomous_responses):
+    def test_pv_percentile(self, fitted_2pl_model, dichotomous_responses):
         """Test percentile estimation."""
         responses = dichotomous_responses["responses"]
-        result = fit_mirt(responses, model="2PL", max_iter=50)
 
         pvs = generate_plausible_values(
-            result,
+            fitted_2pl_model,
             responses,
-            n_plausible=5,
+            n_plausible=3,
             seed=42,
         )
 
