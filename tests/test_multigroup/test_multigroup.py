@@ -11,27 +11,22 @@ class TestMultigroupAnalysis:
 
     def test_configural_invariance(self, rng):
         """Test configural invariance fitting."""
-        # Generate two-group data
         n_persons_per_group = 100
         n_items = 10
 
-        # Group 1
         theta1 = rng.standard_normal(n_persons_per_group)
         difficulty1 = rng.normal(0, 1, n_items)
         probs1 = 1 / (1 + np.exp(-(theta1[:, None] - difficulty1)))
         responses1 = (rng.random((n_persons_per_group, n_items)) < probs1).astype(int)
 
-        # Group 2 (slightly different difficulty)
         theta2 = rng.standard_normal(n_persons_per_group)
-        difficulty2 = difficulty1 + 0.5  # Shifted difficulty
+        difficulty2 = difficulty1 + 0.5
         probs2 = 1 / (1 + np.exp(-(theta2[:, None] - difficulty2)))
         responses2 = (rng.random((n_persons_per_group, n_items)) < probs2).astype(int)
 
-        # Combine data
         responses = np.vstack([responses1, responses2])
         groups = np.array([0] * n_persons_per_group + [1] * n_persons_per_group)
 
-        # Fit configural model
         result = fit_multigroup(
             responses,
             groups,
@@ -51,7 +46,7 @@ class TestMultigroupAnalysis:
         n_items = 5
 
         responses = rng.integers(0, 2, size=(n_persons, n_items))
-        groups = np.zeros(n_persons)  # Only one group
+        groups = np.zeros(n_persons)
 
         with pytest.raises(ValueError, match="At least 2 groups"):
             fit_multigroup(responses, groups, model="2PL")
@@ -220,12 +215,10 @@ class TestMultigroupAnalysis:
             verbose=False,
         )
 
-        # All four invariance levels should be present
         assert "configural" in results
         assert "metric" in results
         assert "scalar" in results
         assert "strict" in results
 
-        # All results should be fitted
         for inv, result in results.items():
             assert result.model.is_fitted

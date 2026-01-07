@@ -122,7 +122,7 @@ class MultidimensionalModel(DichotomousItemModel):
         loadings = self.get_factor_loadings(standardized=True)
         return np.sum(loadings**2, axis=1)
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> MultidimensionalModel:
+    def set_parameters(self, **params: NDArray[np.float64]) -> "MultidimensionalModel":
         if "slopes" in params:
             slopes = np.asarray(params["slopes"])
             slopes = slopes * self._loading_pattern

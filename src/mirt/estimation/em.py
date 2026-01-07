@@ -166,11 +166,9 @@ class EMEstimator(BaseEstimator):
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
         if _is_polytomous(model):
-            # Polytomous model: compute expected counts for each category
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k)
 
-            # r_kc[k, c] = expected count of category c at quadrature point k
             r_kc = np.zeros((n_quad, n_categories))
             for c in range(n_categories):
                 cat_mask = valid_mask & (item_responses == c)
@@ -179,17 +177,14 @@ class EMEstimator(BaseEstimator):
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
                 self._set_item_params(model, item_idx, params)
 
-                # probs shape: (n_quad, n_categories)
                 probs = model.probability(quad_points, item_idx)
                 probs = np.clip(probs, 1e-10, 1 - 1e-10)
 
-                # Polytomous likelihood: sum over categories
                 ll = np.sum(r_kc * np.log(probs))
 
                 return -ll
 
         else:
-            # Dichotomous model: r_k = expected correct responses
             r_k = np.sum(
                 item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
                 axis=0,
@@ -362,7 +357,6 @@ class EMEstimator(BaseEstimator):
         n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         if _is_polytomous(model):
-            # Polytomous: compute expected counts per category
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k_valid)
             r_kc = np.zeros((n_quad, n_categories))
@@ -382,7 +376,6 @@ class EMEstimator(BaseEstimator):
                 return ll
 
         else:
-            # Dichotomous
             r_k = np.sum(
                 item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
                 axis=0,

@@ -7,6 +7,18 @@ from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.scoring import fscores
 from mirt.scoring.eap import EAPScorer
 
+try:
+    import pandas  # noqa: F401
+
+    HAS_DATAFRAME = True
+except ImportError:
+    try:
+        import polars  # noqa: F401
+
+        HAS_DATAFRAME = True
+    except ImportError:
+        HAS_DATAFRAME = False
+
 
 class TestFscores:
     """Tests for fscores function."""
@@ -36,7 +48,6 @@ class TestFscores:
         assert result.theta.shape == (responses.shape[0],)
         assert result.standard_error.shape == (responses.shape[0],)
 
-        # SEs should be positive
         assert np.all(result.standard_error > 0)
 
     def test_map_scoring(self, fitted_model):
@@ -66,9 +77,9 @@ class TestFscores:
         sum_scores = responses.sum(axis=1)
         correlation = np.corrcoef(result.theta, sum_scores)[0, 1]
 
-        # Theta should correlate positively with sum score
         assert correlation > 0.7
 
+    @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
     def test_to_dataframe(self, fitted_model):
         """Test DataFrame conversion."""
         model, responses = fitted_model
@@ -100,13 +111,11 @@ class TestEAPScorer:
         estimator = EMEstimator(n_quadpts=15, max_iter=30)
         estimator.fit(model, responses)
 
-        # Score with different priors
         scorer_default = EAPScorer()
         scorer_shifted = EAPScorer(prior_mean=np.array([1.0]))
 
         result_default = scorer_default.score(model, responses)
         result_shifted = scorer_shifted.score(model, responses)
 
-        # Shifted prior should shift estimates
         mean_diff = result_shifted.theta.mean() - result_default.theta.mean()
-        assert mean_diff > 0  # Shifted prior should increase mean theta
+        assert mean_diff > 0
