@@ -32,7 +32,7 @@ class TestMultidimensionalModel:
 
     def test_confirmatory_pattern_shape(self):
         """Test loading pattern shape validation."""
-        pattern = np.ones((10, 3))  # Wrong shape
+        pattern = np.ones((10, 3))
 
         with pytest.raises(ValueError, match="doesn't match"):
             MultidimensionalModel(
@@ -122,15 +122,12 @@ class TestMultidimensionalModel:
         """Test factor loading extraction."""
         model = MultidimensionalModel(n_items=5, n_factors=2)
 
-        # Unstandardized
         loadings = model.get_factor_loadings(standardized=False)
         assert loadings.shape == (5, 2)
 
-        # Standardized
         loadings_std = model.get_factor_loadings(standardized=True)
         assert loadings_std.shape == (5, 2)
 
-        # Standardized loadings should be smaller in magnitude
         assert np.all(np.abs(loadings_std) <= np.abs(loadings) + 1e-10)
 
     def test_communalities(self):
@@ -153,7 +150,7 @@ class TestBifactorModel:
         model = BifactorModel(n_items=9, specific_factors=specific_factors)
 
         assert model.n_items == 9
-        assert model.n_factors == 4  # 1 general + 3 specific
+        assert model.n_factors == 4
         assert model.n_specific_factors == 3
         assert model.model_name == "Bifactor"
         assert not model.is_fitted
@@ -173,7 +170,7 @@ class TestBifactorModel:
         specific_factors = [0, 0, 1, 1]
         model = BifactorModel(n_items=4, specific_factors=specific_factors)
 
-        theta = np.random.randn(100, 3)  # 1 general + 2 specific
+        theta = np.random.randn(100, 3)
         probs = model.probability(theta)
 
         assert probs.shape == (100, 4)
@@ -206,15 +203,13 @@ class TestBifactorModel:
 
         loadings = model.get_loading_matrix()
 
-        assert loadings.shape == (4, 3)  # items x (1 general + 2 specific)
+        assert loadings.shape == (4, 3)
 
-        # General loadings in first column
         assert np.all(loadings[:, 0] > 0)
 
-        # Specific loadings in appropriate columns
-        assert loadings[0, 1] > 0  # Item 0 loads on specific factor 0
-        assert loadings[0, 2] == 0  # Item 0 doesn't load on specific factor 1
-        assert loadings[2, 2] > 0  # Item 2 loads on specific factor 1
+        assert loadings[0, 1] > 0
+        assert loadings[0, 2] == 0
+        assert loadings[2, 2] > 0
 
     def test_omega_hierarchical(self):
         """Test omega hierarchical computation."""
@@ -232,7 +227,7 @@ class TestBifactorModel:
 
         omega_0 = model.omega_subscale(0)
         omega_1 = model.omega_subscale(1)
-        omega_invalid = model.omega_subscale(5)  # Non-existent factor
+        omega_invalid = model.omega_subscale(5)
 
         assert 0 <= omega_0 <= 1
         assert 0 <= omega_1 <= 1
@@ -249,10 +244,8 @@ class TestBifactorModel:
         assert "specific_0" in ecv
         assert "specific_1" in ecv
 
-        # All values should be positive
         assert all(v > 0 for v in ecv.values())
 
-        # Should sum to approximately 1
         total = sum(ecv.values())
         np.testing.assert_almost_equal(total, 1.0, decimal=5)
 
@@ -305,7 +298,6 @@ class TestMultidimensionalParameterSetting:
         new_slopes = np.ones((4, 2)) * 2.0
         model.set_parameters(slopes=new_slopes)
 
-        # Slopes should be masked by pattern
         expected = np.array(
             [
                 [2.0, 0.0],

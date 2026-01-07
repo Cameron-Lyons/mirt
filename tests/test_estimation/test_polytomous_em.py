@@ -18,7 +18,6 @@ class TestPolytomousEM:
         n_items = 8
         n_categories = 5
 
-        # Generate polytomous responses
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
@@ -26,7 +25,6 @@ class TestPolytomousEM:
 
         result = estimator.fit(model, responses)
 
-        # Check result structure
         assert result.model is model
         assert model.is_fitted
         assert result.log_likelihood < 0
@@ -64,11 +62,9 @@ class TestPolytomousEM:
 
         result = estimator.fit(model, responses)
 
-        # Check SEs exist for both discrimination and thresholds
         assert "discrimination" in result.standard_errors
         assert "thresholds" in result.standard_errors
 
-        # SEs should be positive (or NaN if couldn't compute)
         se_disc = result.standard_errors["discrimination"]
         assert np.all((se_disc > 0) | np.isnan(se_disc))
 
@@ -80,14 +76,12 @@ class TestPolytomousEM:
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
-        # Add some missing values
         mask = rng.random(responses.shape) < 0.1
         responses[mask] = -1
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
         estimator = EMEstimator(n_quadpts=15, max_iter=50)
 
-        # Should run without error
         result = estimator.fit(model, responses)
         assert result.converged or result.n_iterations == 50
 
@@ -97,7 +91,6 @@ class TestPolytomousEM:
         n_categories = [3, 4, 5, 3, 4, 5]
         n_items = len(n_categories)
 
-        # Generate responses respecting category limits
         responses = np.zeros((n_persons, n_items), dtype=int)
         for i, n_cat in enumerate(n_categories):
             responses[:, i] = rng.integers(0, n_cat, size=n_persons)
@@ -126,7 +119,5 @@ class TestPolytomousEM:
         history = estimator.convergence_history
         assert len(history) > 0
 
-        # Log-likelihood should generally increase (or stay same)
         for i in range(1, len(history)):
-            # Allow small fluctuations due to numerical issues
             assert history[i] >= history[i - 1] - 0.5

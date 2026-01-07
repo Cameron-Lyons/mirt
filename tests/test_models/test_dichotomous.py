@@ -49,7 +49,7 @@ class TestTwoParameterLogistic:
         model = TwoParameterLogistic(n_items=1)
         model.set_parameters(difficulty=np.array([1.0]))
 
-        theta = np.array([1.0])  # At difficulty
+        theta = np.array([1.0])
         prob = model.icc(theta, item_idx=0)
 
         np.testing.assert_almost_equal(prob[0], 0.5, decimal=5)
@@ -64,7 +64,7 @@ class TestTwoParameterLogistic:
         ll = model.log_likelihood(responses, theta)
 
         assert ll.shape == (2,)
-        assert np.all(ll <= 0)  # Log-likelihood is always negative
+        assert np.all(ll <= 0)
 
     def test_information(self):
         """Test Fisher information computation."""
@@ -119,10 +119,9 @@ class TestThreeParameterLogistic:
         model = ThreeParameterLogistic(n_items=1)
         model.set_parameters(
             guessing=np.array([0.25]),
-            difficulty=np.array([10.0]),  # Very difficult
+            difficulty=np.array([10.0]),
         )
 
-        # At very low theta, probability should approach guessing
         theta = np.array([-10.0])
         prob = model.probability(theta, item_idx=0)
 
@@ -137,7 +136,6 @@ class TestThreeParameterLogistic:
 
         guessing = model.guessing
 
-        # All probabilities should be >= guessing
         for i in range(5):
             assert np.all(probs[:, i] >= guessing[i] - 1e-6)
 
@@ -150,10 +148,9 @@ class TestFourParameterLogistic:
         model = FourParameterLogistic(n_items=1)
         model.set_parameters(
             upper=np.array([0.9]),
-            difficulty=np.array([-10.0]),  # Very easy
+            difficulty=np.array([-10.0]),
         )
 
-        # At very high theta, probability should approach upper
         theta = np.array([10.0])
         prob = model.probability(theta, item_idx=0)
 

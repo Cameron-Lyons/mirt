@@ -188,8 +188,6 @@ def _fit_configural(
         )
         group_results.append(result)
 
-    # Return the first group's result for compatibility
-    # (users can access group_results through the MultigroupResult wrapper)
     combined_result = group_results[0]
 
     if verbose:
@@ -222,7 +220,6 @@ def _fit_metric(
     if verbose:
         print("Step 1: Fitting combined model to estimate shared discrimination")
 
-    # Step 1: Fit combined model to all data
     combined_result = fit_mirt(
         data,
         model=model,
@@ -233,7 +230,6 @@ def _fit_metric(
         verbose=False,
     )
 
-    # Get the shared discrimination parameters
     shared_model = combined_result.model
     shared_params = shared_model.parameters
 
@@ -250,11 +246,8 @@ def _fit_metric(
         if verbose:
             print(f"  Fitting group {g} (n={group_mask.sum()})")
 
-        # Create a copy of the model for this group
         group_model = shared_model.copy()
 
-        # Fit with only intercepts/difficulties varying
-        # We do this by setting discrimination and refitting only difficulty
         estimator = EMEstimator(
             n_quadpts=n_quadpts,
             max_iter=max_iter,
@@ -264,7 +257,6 @@ def _fit_metric(
 
         result = estimator.fit(group_model, group_data)
 
-        # Restore shared discrimination after fitting
         if "discrimination" in shared_params:
             group_model.set_parameters(discrimination=shared_params["discrimination"])
         elif "slopes" in shared_params:
@@ -280,7 +272,6 @@ def _fit_metric(
     if verbose:
         print(f"Combined log-likelihood: {total_ll:.4f}")
 
-    # Return the first group's result
     return group_results[0]
 
 
@@ -304,7 +295,6 @@ def _fit_scalar(
     if verbose:
         print("Fitting single model to combined data (scalar invariance)")
 
-    # Scalar invariance: fit single model to all data
     result = fit_mirt(
         data,
         model=model,
@@ -344,7 +334,6 @@ def _fit_strict(
         print("Fitting single model to combined data (strict invariance)")
         print("Note: For standard IRT models, strict = scalar invariance")
 
-    # Strict invariance: same as scalar for standard IRT
     result = fit_mirt(
         data,
         model=model,

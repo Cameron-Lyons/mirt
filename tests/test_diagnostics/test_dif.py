@@ -5,6 +5,18 @@ import pytest
 
 from mirt.diagnostics.dif import compute_dif, flag_dif_items
 
+try:
+    import pandas  # noqa: F401
+
+    HAS_DATAFRAME = True
+except ImportError:
+    try:
+        import polars  # noqa: F401
+
+        HAS_DATAFRAME = True
+    except ImportError:
+        HAS_DATAFRAME = False
+
 
 class TestDIF:
     """Tests for DIF detection functions."""
@@ -14,14 +26,11 @@ class TestDIF:
         n_per_group = 100
         n_items = 5
 
-        # Create two groups with similar ability distributions
         theta1 = rng.standard_normal(n_per_group)
         theta2 = rng.standard_normal(n_per_group)
 
-        # Same difficulty for both groups (no DIF)
         difficulty = rng.normal(0, 1, n_items)
 
-        # Generate responses
         probs1 = 1 / (1 + np.exp(-(theta1[:, None] - difficulty)))
         probs2 = 1 / (1 + np.exp(-(theta2[:, None] - difficulty)))
 
@@ -94,7 +103,6 @@ class TestDIF:
 
         assert "statistic" in result
         assert "effect_size" in result
-        # Raju gives signed area in effect_size
 
     def test_dif_detects_biased_item(self, rng):
         """Test that DIF detects an item with large difficulty difference."""
@@ -104,10 +112,9 @@ class TestDIF:
         theta1 = rng.standard_normal(n_per_group)
         theta2 = rng.standard_normal(n_per_group)
 
-        # Same difficulty except item 0 has DIF
         difficulty = np.zeros(n_items)
         difficulty_group2 = difficulty.copy()
-        difficulty_group2[0] = 2.0  # Large shift for item 0
+        difficulty_group2[0] = 2.0
 
         probs1 = 1 / (1 + np.exp(-(theta1[:, None] - difficulty)))
         probs2 = 1 / (1 + np.exp(-(theta2[:, None] - difficulty_group2)))
@@ -127,7 +134,6 @@ class TestDIF:
             max_iter=30,
         )
 
-        # Item 0 should have larger effect size than others
         assert result["effect_size"][0] > np.mean(result["effect_size"][1:])
 
     def test_ets_classification(self, rng):
@@ -147,14 +153,12 @@ class TestDIF:
             max_iter=30,
         )
 
-        # All classifications should be A, B, or C
         valid_classes = {"A", "B", "C"}
         for c in result["classification"]:
             assert c in valid_classes
 
     def test_flag_dif_items(self, rng):
         """Test flag_dif_items helper function."""
-        # Create mock DIF results
         dif_results = {
             "statistic": np.array([10.0, 2.0, 15.0, 1.0]),
             "p_value": np.array([0.001, 0.15, 0.0001, 0.3]),
@@ -162,7 +166,6 @@ class TestDIF:
             "classification": np.array(["C", "A", "C", "A"]),
         }
 
-        # Flag with default settings
         flags = flag_dif_items(dif_results)
         assert flags.dtype == bool
         assert len(flags) == 4
@@ -181,11 +184,9 @@ class TestDIF:
             "classification": np.array(["C", "B", "C", "A"]),
         }
 
-        # Flag only C items
         flags_c = flag_dif_items(dif_results, classification="C")
         assert np.sum(flags_c) <= np.sum(dif_results["classification"] == "C")
 
-        # Flag B and C items
         flags_b = flag_dif_items(dif_results, classification="B")
         assert np.sum(flags_b) <= np.sum(
             (dif_results["classification"] == "B")
@@ -198,12 +199,10 @@ class TestDIF:
         n_items = 5
         data = rng.integers(0, 2, size=(n_persons, n_items))
 
-        # Only one group
         groups = np.zeros(n_persons)
         with pytest.raises(ValueError, match="exactly 2 groups"):
             compute_dif(data, groups)
 
-        # Three groups
         groups = np.array([0] * 33 + [1] * 33 + [2] * 34)
         with pytest.raises(ValueError, match="exactly 2 groups"):
             compute_dif(data, groups)
@@ -230,7 +229,6 @@ class TestDIF:
         data = rng.integers(0, 2, size=(n_per_group * 2, n_items))
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
-        # Specify focal group
         result = compute_dif(
             data,
             groups,
@@ -315,6 +313,7 @@ class TestDIFIntegration:
 
         assert hasattr(mirt, "dif")
 
+    @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
     def test_dif_returns_dataframe(self, rng):
         """Test that mirt.dif() returns a DataFrame."""
         import mirt
@@ -329,5 +328,4 @@ class TestDIFIntegration:
             data, groups, model="2PL", method="wald", n_quadpts=11, max_iter=30
         )
 
-        # Should be a pandas DataFrame (or polars if configured)
         assert hasattr(result, "columns") or hasattr(result, "schema")

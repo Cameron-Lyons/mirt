@@ -60,7 +60,6 @@ class TestGradedResponseModel:
 
         theta = np.array([0.0])
 
-        # Cumulative probabilities should be monotonically decreasing
         for item_idx in range(model.n_items):
             cum_probs = [
                 model.cumulative_probability(theta, item_idx, k)[0]
@@ -88,7 +87,6 @@ class TestGradedResponseModel:
         expected = model.expected_score(theta)
 
         assert expected.shape == (20,)
-        # Expected score should be between 0 and n_items * (max_cat - 1)
         assert np.all(expected >= 0)
         assert np.all(expected <= model.n_items * (model.max_categories - 1))
 
@@ -132,7 +130,7 @@ class TestGeneralizedPartialCredit:
         model = GeneralizedPartialCredit(n_items=5, n_categories=4)
 
         steps = model.steps
-        assert steps.shape == (5, 3)  # n_items x (n_categories - 1)
+        assert steps.shape == (5, 3)
 
     def test_information(self):
         """Test Fisher information computation."""
@@ -236,7 +234,7 @@ class TestPolytomousLogLikelihood:
         ll = model.log_likelihood(responses, theta_2d)
 
         assert ll.shape == (len(theta),)
-        assert np.all(ll <= 0)  # Log-likelihood is always negative
+        assert np.all(ll <= 0)
 
     def test_gpcm_log_likelihood(self, polytomous_responses):
         """Test GPCM log-likelihood computation."""
@@ -270,11 +268,9 @@ class TestCategoryProbabilityBounds:
         for item_idx in range(model.n_items):
             probs = model.probability(theta_extreme, item_idx=item_idx)
 
-            # Probabilities should be valid
             assert np.all(probs >= 0)
             assert np.all(probs <= 1)
 
-            # Should sum to 1
             np.testing.assert_array_almost_equal(
                 probs.sum(axis=1), np.ones(3), decimal=5
             )

@@ -97,7 +97,7 @@ class OneParameterLogistic(TwoParameterLogistic):
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> OneParameterLogistic:
+    def set_parameters(self, **params: NDArray[np.float64]) -> "OneParameterLogistic":
         if "discrimination" in params:
             raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")
         return super().set_parameters(**params)
