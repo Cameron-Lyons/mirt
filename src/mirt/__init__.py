@@ -148,7 +148,6 @@ def fit_mirt(
             n_parameters=n_params,
         )
 
-    irt_model: BaseItemModel
     if model == "1PL":
         irt_model = OneParameterLogistic(n_items=n_items, item_names=item_names)
     elif model == "2PL":
