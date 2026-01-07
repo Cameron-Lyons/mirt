@@ -19,7 +19,7 @@ try:
     RUST_AVAILABLE = True
 except ImportError:
     RUST_AVAILABLE = False
-    mirt_rs = None  # type: ignore
+    mirt_rs = None
 
 if TYPE_CHECKING:
     pass
@@ -629,7 +629,7 @@ def generate_plausible_values_mcmc(
     n_persons = responses.shape[0]
     pvs = np.zeros((n_persons, n_plausible))
 
-    def log_likelihood(resp, theta):
+    def log_likelihood(resp: NDArray[np.int_], theta: float) -> float:
         ll = 0.0
         for j in range(len(resp)):
             if resp[j] >= 0:
