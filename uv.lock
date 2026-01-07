@@ -272,6 +272,7 @@ polars = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "mypy" },
     { name = "pytest" },
 ]
 
@@ -295,7 +296,10 @@ requires-dist = [
 provides-extras = ["pandas", "polars", "dev", "docs"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=9.0.2" }]
+dev = [
+    { name = "mypy", specifier = ">=1.19.1" },
+    { name = "pytest", specifier = ">=9.0.2" },
+]
 
 [[package]]
 name = "mypy"

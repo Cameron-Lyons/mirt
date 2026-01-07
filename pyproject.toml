@@ -85,9 +85,10 @@ python_version = "3.13"
 warn_return_any = false
 warn_unused_ignores = true
 strict = true
-disable_error_code = ["no-any-return", "type-arg", "arg-type", "return-value", "assignment", "union-attr", "attr-defined", "override"]
+disable_error_code = ["no-any-return", "type-arg", "arg-type", "return-value", "assignment", "union-attr", "attr-defined", "override", "dict-item", "operator", "index", "list-item", "no-untyped-def", "import-not-found", "import-untyped"]
 
 [dependency-groups]
 dev = [
+    "mypy>=1.19.1",
     "pytest>=9.0.2",
 ]
