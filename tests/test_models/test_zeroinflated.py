@@ -32,7 +32,6 @@ class TestZeroInflated2PL:
         model = ZeroInflated2PL(n_items=5)
         model._initialize_parameters()
 
-        # Set high zero inflation
         model._parameters["zero_inflation"] = np.full(5, 0.5)
 
         theta = np.array([[0.0], [2.0]])
@@ -44,7 +43,8 @@ class TestZeroInflated2PL:
 
     def test_log_likelihood(self, dichotomous_responses):
         """Test log-likelihood computation."""
-        model = ZeroInflated2PL(n_items=10)
+        n_items = dichotomous_responses["n_items"]
+        model = ZeroInflated2PL(n_items=n_items)
         model._initialize_parameters()
 
         responses = dichotomous_responses["responses"]
@@ -89,7 +89,6 @@ class TestHurdleIRT:
 
         theta = np.array([[0.0], [1.0], [-1.0]])
 
-        # Full probability
         probs = model.probability(theta)
         assert probs.shape == (3, 5)
         assert np.all((probs >= 0) & (probs <= 1))

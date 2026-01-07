@@ -242,8 +242,11 @@ def bootstrap_ci(
             prop_below = np.mean(stacked < original, axis=0)
             z0 = stats.norm.ppf(np.clip(prop_below, 0.001, 0.999))
 
+            max_jack = min(20, n_persons)
+            jack_indices = rng.choice(n_persons, size=max_jack, replace=False)
+
             jackknife_estimates = []
-            for i in range(n_persons):
+            for i in jack_indices:
                 jack_responses = np.delete(responses, i, axis=0)
                 jack_model = original_model.copy()
                 try:

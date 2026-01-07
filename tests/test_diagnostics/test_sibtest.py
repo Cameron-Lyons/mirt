@@ -11,7 +11,7 @@ class TestSIBTEST:
     def test_sibtest_original(self, two_group_responses):
         """Test original SIBTEST method."""
         suspect_items = [2, 3]
-        matching_items = [0, 1, 4, 5, 6, 7, 8, 9]
+        matching_items = [0, 1, 4, 5, 6, 7]
 
         result = sibtest(
             data=two_group_responses["responses"],
@@ -28,7 +28,7 @@ class TestSIBTEST:
     def test_sibtest_crossing(self, two_group_responses):
         """Test crossing SIBTEST method."""
         suspect_items = [2, 3]
-        matching_items = [0, 1, 4, 5, 6, 7, 8, 9]
+        matching_items = [0, 1, 4, 5, 6, 7]
 
         result = sibtest(
             data=two_group_responses["responses"],
@@ -56,7 +56,7 @@ class TestSIBTEST:
     def test_sibtest_detects_dif(self, two_group_responses):
         """Test that SIBTEST detects DIF in known items."""
         suspect_items = [2, 3]
-        matching_items = [0, 1, 4, 5, 6, 7, 8, 9]
+        matching_items = [0, 1, 4, 5, 6, 7]
 
         result = sibtest(
             data=two_group_responses["responses"],

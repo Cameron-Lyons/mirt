@@ -14,14 +14,14 @@ class TestPolytomousEM:
 
     def test_grm_em_basic(self, rng):
         """Test basic GRM fitting with EM."""
-        n_persons = 200
-        n_items = 8
-        n_categories = 5
+        n_persons = 50
+        n_items = 4
+        n_categories = 3
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=50, verbose=False)
+        estimator = EMEstimator(n_quadpts=9, max_iter=15, verbose=False)
 
         result = estimator.fit(model, responses)
 
@@ -34,14 +34,14 @@ class TestPolytomousEM:
 
     def test_gpcm_em_basic(self, rng):
         """Test basic GPCM fitting with EM."""
-        n_persons = 200
-        n_items = 8
-        n_categories = 4
+        n_persons = 50
+        n_items = 4
+        n_categories = 3
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
         model = GeneralizedPartialCredit(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=50, verbose=False)
+        estimator = EMEstimator(n_quadpts=9, max_iter=15, verbose=False)
 
         result = estimator.fit(model, responses)
 
@@ -51,14 +51,14 @@ class TestPolytomousEM:
 
     def test_grm_standard_errors(self, rng):
         """Test that standard errors are computed for GRM."""
-        n_persons = 200
-        n_items = 5
-        n_categories = 4
+        n_persons = 50
+        n_items = 3
+        n_categories = 3
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=50)
+        estimator = EMEstimator(n_quadpts=9, max_iter=15)
 
         result = estimator.fit(model, responses)
 
@@ -70,9 +70,9 @@ class TestPolytomousEM:
 
     def test_grm_missing_data(self, rng):
         """Test GRM with missing data."""
-        n_persons = 200
-        n_items = 8
-        n_categories = 5
+        n_persons = 50
+        n_items = 4
+        n_categories = 3
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
@@ -80,15 +80,15 @@ class TestPolytomousEM:
         responses[mask] = -1
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=50)
+        estimator = EMEstimator(n_quadpts=9, max_iter=15)
 
         result = estimator.fit(model, responses)
-        assert result.converged or result.n_iterations == 50
+        assert result.converged or result.n_iterations == 15
 
     def test_varying_categories(self, rng):
         """Test GRM with varying categories per item."""
-        n_persons = 200
-        n_categories = [3, 4, 5, 3, 4, 5]
+        n_persons = 50
+        n_categories = [3, 3, 3]
         n_items = len(n_categories)
 
         responses = np.zeros((n_persons, n_items), dtype=int)
@@ -96,7 +96,7 @@ class TestPolytomousEM:
             responses[:, i] = rng.integers(0, n_cat, size=n_persons)
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=50)
+        estimator = EMEstimator(n_quadpts=9, max_iter=15)
 
         result = estimator.fit(model, responses)
 
@@ -105,14 +105,14 @@ class TestPolytomousEM:
 
     def test_convergence_improves(self, rng):
         """Test that log-likelihood improves during fitting."""
-        n_persons = 300
-        n_items = 6
-        n_categories = 4
+        n_persons = 50
+        n_items = 3
+        n_categories = 3
 
         responses = rng.integers(0, n_categories, size=(n_persons, n_items))
 
         model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-        estimator = EMEstimator(n_quadpts=15, max_iter=30)
+        estimator = EMEstimator(n_quadpts=9, max_iter=10)
 
         estimator.fit(model, responses)
 

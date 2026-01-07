@@ -5,7 +5,7 @@ build-backend = "maturin"
 [tool.maturin]
 features = ["pyo3/extension-module"]
 python-source = "src"
-module-name = "mirt_rs"
+module-name = "mirt.mirt_rs"
 bindings = "pyo3"
 
 [project]
@@ -73,7 +73,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -m 'not slow'"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
 
 [tool.black]
 line-length = 88

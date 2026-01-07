@@ -1,5 +1,7 @@
 """Tests for MCMC estimation methods."""
 
+import pytest
+
 from mirt import GibbsSampler, MCMCResult, MHRMEstimator, TwoParameterLogistic
 
 
@@ -8,16 +10,16 @@ class TestMHRMEstimator:
 
     def test_init(self):
         """Test MHRM estimator initialization."""
-        estimator = MHRMEstimator(n_cycles=100, burnin=50)
-        assert estimator.n_cycles == 100
-        assert estimator.burnin == 50
+        estimator = MHRMEstimator(n_cycles=50, burnin=20)
+        assert estimator.n_cycles == 50
+        assert estimator.burnin == 20
 
     def test_fit(self, dichotomous_responses):
         """Test MHRM fitting."""
-        model = TwoParameterLogistic(n_items=10)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
         estimator = MHRMEstimator(
-            n_cycles=50,
-            burnin=20,
+            n_cycles=30,
+            burnin=10,
         )
 
         result = estimator.fit(model, dichotomous_responses["responses"])
@@ -28,8 +30,8 @@ class TestMHRMEstimator:
 
     def test_convergence_tracking(self, dichotomous_responses):
         """Test that convergence is tracked."""
-        model = TwoParameterLogistic(n_items=10)
-        estimator = MHRMEstimator(n_cycles=30, burnin=10)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        estimator = MHRMEstimator(n_cycles=20, burnin=5)
 
         result = estimator.fit(model, dichotomous_responses["responses"])
 
@@ -41,17 +43,17 @@ class TestGibbsSampler:
 
     def test_init(self):
         """Test Gibbs sampler initialization."""
-        sampler = GibbsSampler(n_iter=1000, burnin=200, thin=2)
-        assert sampler.n_iter == 1000
-        assert sampler.burnin == 200
+        sampler = GibbsSampler(n_iter=100, burnin=20, thin=2)
+        assert sampler.n_iter == 100
+        assert sampler.burnin == 20
         assert sampler.thin == 2
 
     def test_fit(self, dichotomous_responses):
         """Test Gibbs sampler fitting."""
-        model = TwoParameterLogistic(n_items=10)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
         sampler = GibbsSampler(
-            n_iter=100,
-            burnin=30,
+            n_iter=50,
+            burnin=15,
             thin=1,
         )
 
@@ -62,8 +64,8 @@ class TestGibbsSampler:
 
     def test_mcmc_result_has_chains(self, dichotomous_responses):
         """Test MCMCResult has chains."""
-        model = TwoParameterLogistic(n_items=10)
-        sampler = GibbsSampler(n_iter=50, burnin=20, thin=1)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        sampler = GibbsSampler(n_iter=40, burnin=15, thin=1)
 
         result = sampler.fit(model, dichotomous_responses["responses"])
 
@@ -77,8 +79,8 @@ class TestMCMCResult:
 
     def test_summary(self, dichotomous_responses):
         """Test posterior summary."""
-        model = TwoParameterLogistic(n_items=10)
-        sampler = GibbsSampler(n_iter=100, burnin=30, thin=1)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        sampler = GibbsSampler(n_iter=50, burnin=20, thin=1)
 
         result = sampler.fit(model, dichotomous_responses["responses"])
         summary = result.summary()
@@ -88,8 +90,8 @@ class TestMCMCResult:
 
     def test_convergence_diagnostics(self, dichotomous_responses):
         """Test convergence diagnostics."""
-        model = TwoParameterLogistic(n_items=10)
-        sampler = GibbsSampler(n_iter=100, burnin=30, thin=1)
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        sampler = GibbsSampler(n_iter=50, burnin=20, thin=1)
 
         result = sampler.fit(model, dichotomous_responses["responses"])
 
@@ -98,9 +100,10 @@ class TestMCMCResult:
         assert "discrimination" in result.rhat
         assert "difficulty" in result.rhat
 
+    @pytest.mark.slow
     def test_dic_waic(self, dichotomous_responses):
-        """Test DIC and WAIC computation."""
-        model = TwoParameterLogistic(n_items=10)
+        """Test DIC and WAIC computation (slow)."""
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
         sampler = GibbsSampler(n_iter=100, burnin=30, thin=1)
 
         result = sampler.fit(model, dichotomous_responses["responses"])

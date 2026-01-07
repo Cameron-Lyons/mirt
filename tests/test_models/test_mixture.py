@@ -56,7 +56,8 @@ class TestMixtureIRT:
     def test_class_posterior(self, dichotomous_responses):
         """Test class posterior computation."""
         responses = dichotomous_responses["responses"]
-        model = MixtureIRT(n_items=10, n_classes=2)
+        n_items = dichotomous_responses["n_items"]
+        model = MixtureIRT(n_items=n_items, n_classes=2)
         model._initialize_parameters()
 
         theta = np.zeros((len(responses), 1))
@@ -68,7 +69,8 @@ class TestMixtureIRT:
     def test_classify_persons(self, dichotomous_responses):
         """Test person classification."""
         responses = dichotomous_responses["responses"]
-        model = MixtureIRT(n_items=10, n_classes=2)
+        n_items = dichotomous_responses["n_items"]
+        model = MixtureIRT(n_items=n_items, n_classes=2)
         model._initialize_parameters()
 
         theta = np.zeros((len(responses), 1))

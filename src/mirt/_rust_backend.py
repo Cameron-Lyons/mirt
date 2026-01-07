@@ -12,9 +12,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-# Try to import the Rust extension
 try:
-    import mirt_rs
+    from mirt import mirt_rs
 
     RUST_AVAILABLE = True
 except ImportError:
@@ -28,11 +27,6 @@ if TYPE_CHECKING:
 def is_rust_available() -> bool:
     """Check if the Rust backend is available."""
     return RUST_AVAILABLE
-
-
-# ============================================================================
-# E-Step Functions
-# ============================================================================
 
 
 def compute_log_likelihoods_2pl(
@@ -67,7 +61,6 @@ def compute_log_likelihoods_2pl(
             difficulty.astype(np.float64),
         )
 
-    # Fallback to pure Python
     n_persons, n_items = responses.shape
     n_quad = len(quad_points)
     log_likes = np.zeros((n_persons, n_quad))
@@ -108,7 +101,6 @@ def compute_log_likelihoods_3pl(
             guessing.astype(np.float64),
         )
 
-    # Fallback implementation
     n_persons, n_items = responses.shape
     n_quad = len(quad_points)
     log_likes = np.zeros((n_persons, n_quad))
@@ -148,7 +140,6 @@ def compute_log_likelihoods_mirt(
             difficulty.astype(np.float64),
         )
 
-    # Fallback for MIRT
     n_persons = responses.shape[0]
     n_quad = quad_points.shape[0]
 
@@ -201,14 +192,12 @@ def e_step_complete(
             float(prior_var),
         )
 
-    # Fallback
     from mirt.utils.numeric import logsumexp
 
     log_likes = compute_log_likelihoods_2pl(
         responses, quad_points, discrimination, difficulty
     )
 
-    # Log prior
     log_prior = (
         -0.5 * np.log(2 * np.pi * prior_var)
         - 0.5 * ((quad_points - prior_mean) ** 2) / prior_var
@@ -224,11 +213,6 @@ def e_step_complete(
     return posterior_weights, marginal_ll
 
 
-# ============================================================================
-# M-Step Helpers
-# ============================================================================
-
-
 def compute_expected_counts(
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
@@ -240,7 +224,6 @@ def compute_expected_counts(
             posterior_weights.astype(np.float64),
         )
 
-    # Fallback
     n_persons = len(responses)
     n_quad = posterior_weights.shape[1]
     valid_mask = responses >= 0
@@ -270,7 +253,6 @@ def compute_expected_counts_polytomous(
             n_categories,
         )
 
-    # Fallback
     n_quad = posterior_weights.shape[1]
     r_kc = np.zeros((n_quad, n_categories))
 
@@ -279,11 +261,6 @@ def compute_expected_counts_polytomous(
             r_kc[:, resp] += posterior_weights[i]
 
     return r_kc
-
-
-# ============================================================================
-# SIBTEST Functions
-# ============================================================================
 
 
 def sibtest_compute_beta(
@@ -303,7 +280,6 @@ def sibtest_compute_beta(
             suspect_items.astype(np.int32),
         )
 
-    # Fallback - simplified version
     all_scores = np.concatenate([ref_scores, focal_scores])
     unique_scores = np.unique(all_scores)
 
@@ -350,7 +326,6 @@ def sibtest_all_items(
             anchor_items.astype(np.int32) if anchor_items is not None else None,
         )
 
-    # Fallback - sequential computation
     from scipy import stats
 
     n_items = data.shape[1]
@@ -398,11 +373,6 @@ def sibtest_all_items(
     return betas, zs, p_values
 
 
-# ============================================================================
-# Simulation Functions
-# ============================================================================
-
-
 def simulate_grm(
     theta: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -424,7 +394,6 @@ def simulate_grm(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     n_persons = theta.shape[0]
     n_items = len(discrimination)
@@ -471,7 +440,6 @@ def simulate_gpcm(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     n_persons = theta.shape[0]
     n_items = len(discrimination)
@@ -515,7 +483,6 @@ def simulate_dichotomous(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     n_persons = len(theta)
     n_items = len(discrimination)
@@ -529,11 +496,6 @@ def simulate_dichotomous(
 
     u = rng.random((n_persons, n_items))
     return (u < probs).astype(np.int_)
-
-
-# ============================================================================
-# Plausible Values Functions
-# ============================================================================
 
 
 def generate_plausible_values_posterior(
@@ -562,7 +524,6 @@ def generate_plausible_values_posterior(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     n_persons = responses.shape[0]
     n_quad = len(quad_points)
@@ -622,7 +583,6 @@ def generate_plausible_values_mcmc(
             int(seed),
         )
 
-    # Fallback - simplified MCMC
     from scipy import stats
 
     rng = np.random.default_rng(seed)
@@ -668,11 +628,6 @@ def generate_plausible_values_mcmc(
     return pvs
 
 
-# ============================================================================
-# Model Fit Functions
-# ============================================================================
-
-
 def compute_observed_margins(
     responses: NDArray[np.int_],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -680,7 +635,6 @@ def compute_observed_margins(
     if RUST_AVAILABLE:
         return mirt_rs.compute_observed_margins(responses.astype(np.int32))
 
-    # Fallback
     n_persons, n_items = responses.shape
 
     obs_uni = np.zeros(n_items)
@@ -715,20 +669,16 @@ def compute_expected_margins(
             difficulty.astype(np.float64),
         )
 
-    # Fallback
     n_items = len(discrimination)
     n_quad = len(quad_points)
 
-    # Pre-compute probabilities
     probs = np.zeros((n_items, n_quad))
     for j in range(n_items):
         z = discrimination[j] * (quad_points - difficulty[j])
         probs[j] = 1.0 / (1.0 + np.exp(-z))
 
-    # Univariate
     exp_uni = np.sum(probs * quad_weights, axis=1)
 
-    # Bivariate
     exp_bi = np.zeros((n_items, n_items))
     for i in range(n_items):
         for j in range(i + 1, n_items):
@@ -736,11 +686,6 @@ def compute_expected_margins(
             exp_bi[j, i] = exp_bi[i, j]
 
     return exp_uni, exp_bi
-
-
-# ============================================================================
-# Bootstrap Functions
-# ============================================================================
 
 
 def generate_bootstrap_indices(
@@ -755,7 +700,6 @@ def generate_bootstrap_indices(
     if RUST_AVAILABLE:
         return mirt_rs.generate_bootstrap_indices(n_persons, n_bootstrap, int(seed))
 
-    # Fallback
     rng = np.random.default_rng(seed)
     return rng.integers(0, n_persons, size=(n_bootstrap, n_persons))
 
@@ -772,11 +716,6 @@ def resample_responses(
         )
 
     return responses[indices]
-
-
-# ============================================================================
-# Imputation Functions
-# ============================================================================
 
 
 def impute_from_probabilities(
@@ -801,7 +740,6 @@ def impute_from_probabilities(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     imputed = responses.copy()
     n_persons, n_items = responses.shape
@@ -842,7 +780,6 @@ def multiple_imputation(
             int(seed),
         )
 
-    # Fallback
     rng = np.random.default_rng(seed)
     n_persons, n_items = responses.shape
     imputations = np.zeros((n_imputations, n_persons, n_items), dtype=np.int_)
@@ -854,11 +791,6 @@ def multiple_imputation(
         )
 
     return imputations
-
-
-# ============================================================================
-# Scoring Functions
-# ============================================================================
 
 
 def compute_eap_scores(
@@ -878,7 +810,6 @@ def compute_eap_scores(
             difficulty.astype(np.float64),
         )
 
-    # Fallback
     n_persons = responses.shape[0]
     n_quad = len(quad_points)
 
@@ -911,3 +842,118 @@ def compute_eap_scores(
         se[i] = np.sqrt(np.sum(posterior * (quad_points - theta[i]) ** 2))
 
     return theta, se
+
+
+def em_fit_2pl(
+    responses: NDArray[np.int_],
+    n_quadpts: int = 21,
+    max_iter: int = 500,
+    tol: float = 1e-4,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float, int, bool]:
+    """Fit 2PL model using EM algorithm in Rust.
+
+    Returns
+    -------
+    tuple
+        (discrimination, difficulty, log_likelihood, n_iterations, converged)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.em_fit_2pl(
+            responses.astype(np.int32),
+            n_quadpts,
+            max_iter,
+            tol,
+        )
+
+    raise RuntimeError("Rust backend required for em_fit_2pl")
+
+
+def gibbs_sample_2pl(
+    responses: NDArray[np.int_],
+    n_iter: int = 5000,
+    burnin: int = 1000,
+    thin: int = 1,
+    seed: int | None = None,
+) -> tuple[
+    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+]:
+    """Run Gibbs sampler for 2PL model in Rust.
+
+    Returns
+    -------
+    tuple
+        (disc_chain, diff_chain, theta_chain, ll_chain)
+    """
+    if seed is None:
+        seed = np.random.default_rng().integers(0, 2**31)
+
+    if RUST_AVAILABLE:
+        return mirt_rs.gibbs_sample_2pl(
+            responses.astype(np.int32),
+            n_iter,
+            burnin,
+            thin,
+            int(seed),
+        )
+
+    raise RuntimeError("Rust backend required for gibbs_sample_2pl")
+
+
+def mhrm_fit_2pl(
+    responses: NDArray[np.int_],
+    n_cycles: int = 2000,
+    burnin: int = 500,
+    proposal_sd: float = 0.5,
+    seed: int | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+    """Fit 2PL model using MHRM algorithm in Rust.
+
+    Returns
+    -------
+    tuple
+        (discrimination, difficulty, log_likelihood)
+    """
+    if seed is None:
+        seed = np.random.default_rng().integers(0, 2**31)
+
+    if RUST_AVAILABLE:
+        return mirt_rs.mhrm_fit_2pl(
+            responses.astype(np.int32),
+            n_cycles,
+            burnin,
+            proposal_sd,
+            int(seed),
+        )
+
+    raise RuntimeError("Rust backend required for mhrm_fit_2pl")
+
+
+def bootstrap_fit_2pl(
+    responses: NDArray[np.int_],
+    n_bootstrap: int = 100,
+    n_quadpts: int = 21,
+    max_iter: int = 100,
+    tol: float = 1e-4,
+    seed: int | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Run parallel bootstrap for 2PL model in Rust.
+
+    Returns
+    -------
+    tuple
+        (disc_samples, diff_samples) - arrays of shape (n_bootstrap, n_items)
+    """
+    if seed is None:
+        seed = np.random.default_rng().integers(0, 2**31)
+
+    if RUST_AVAILABLE:
+        return mirt_rs.bootstrap_fit_2pl(
+            responses.astype(np.int32),
+            n_bootstrap,
+            n_quadpts,
+            max_iter,
+            tol,
+            int(seed),
+        )
+
+    raise RuntimeError("Rust backend required for bootstrap_fit_2pl")
