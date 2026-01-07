@@ -21,7 +21,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies and build
         run: |
@@ -50,7 +50,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies and build
         run: |
@@ -76,7 +76,7 @@ jobs:
           python-version: "3.14"
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies and build
         run: |
