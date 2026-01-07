@@ -11,16 +11,8 @@ use rand_distr::Normal;
 use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
-
-
-
-
 const LOG_2_PI: f64 = 1.8378770664093453;
 const EPSILON: f64 = 1e-10;
-
-
-
-
 
 /// Numerically stable log-sum-exp
 #[inline]
@@ -62,10 +54,6 @@ fn log_sigmoid(x: f64) -> f64 {
 fn clip(x: f64, min: f64, max: f64) -> f64 {
     x.max(min).min(max)
 }
-
-
-
-
 
 /// Compute log-likelihood for 2PL model at single theta point
 #[inline]
@@ -133,29 +121,20 @@ fn compute_log_likelihoods_2pl<'py>(
 
     let n_persons = responses.nrows();
     let n_quad = quad_points.len();
-    let n_items = responses.ncols();
+    let _n_items = responses.ncols();
 
     let disc_vec: Vec<f64> = discrimination.to_vec();
     let diff_vec: Vec<f64> = difficulty.to_vec();
-
 
     let log_likes: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
             (0..n_quad)
-                .map(|q| {
-                    log_likelihood_2pl_single(
-                        &resp_row,
-                        quad_points[q],
-                        &disc_vec,
-                        &diff_vec,
-                    )
-                })
+                .map(|q| log_likelihood_2pl_single(&resp_row, quad_points[q], &disc_vec, &diff_vec))
                 .collect()
         })
         .collect();
-
 
     let mut result = Array2::zeros((n_persons, n_quad));
     for (i, row) in log_likes.iter().enumerate() {
@@ -237,10 +216,7 @@ fn compute_log_likelihoods_mirt<'py>(
     let n_items = responses.ncols();
     let n_factors = quad_points.ncols();
 
-
-    let disc_sums: Vec<f64> = (0..n_items)
-        .map(|j| discrimination.row(j).sum())
-        .collect();
+    let disc_sums: Vec<f64> = (0..n_items).map(|j| discrimination.row(j).sum()).collect();
 
     let log_likes: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
@@ -285,6 +261,7 @@ fn compute_log_likelihoods_mirt<'py>(
 
 /// Complete E-step computation with posterior weights
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn e_step_complete<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -309,7 +286,6 @@ fn e_step_complete<'py>(
     let quad_vec: Vec<f64> = quad_points.to_vec();
     let weight_vec: Vec<f64> = quad_weights.to_vec();
 
-
     let log_prior: Vec<f64> = quad_vec
         .iter()
         .map(|&theta| {
@@ -320,28 +296,20 @@ fn e_step_complete<'py>(
 
     let log_weights: Vec<f64> = weight_vec.iter().map(|w| (w + EPSILON).ln()).collect();
 
-
     let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-
             let log_joint: Vec<f64> = (0..n_quad)
                 .map(|q| {
-                    let ll = log_likelihood_2pl_single(
-                        &resp_row,
-                        quad_vec[q],
-                        &disc_vec,
-                        &diff_vec,
-                    );
+                    let ll =
+                        log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec);
                     ll + log_prior[q] + log_weights[q]
                 })
                 .collect();
 
-
             let log_marginal = logsumexp(&log_joint);
-
 
             let posterior: Vec<f64> = log_joint
                 .iter()
@@ -351,7 +319,6 @@ fn e_step_complete<'py>(
             (posterior, log_marginal.exp())
         })
         .collect();
-
 
     let mut posterior_weights = Array2::zeros((n_persons, n_quad));
     let mut marginal_ll = Array1::zeros(n_persons);
@@ -365,10 +332,6 @@ fn e_step_complete<'py>(
 
     (posterior_weights.to_pyarray(py), marginal_ll.to_pyarray(py))
 }
-
-
-
-
 
 /// Compute r_k (expected counts) for dichotomous items
 #[pyfunction]
@@ -432,10 +395,6 @@ fn compute_expected_counts_polytomous<'py>(
     r_kc.to_pyarray(py)
 }
 
-
-
-
-
 /// Compute SIBTEST beta statistic efficiently
 #[pyfunction]
 fn sibtest_compute_beta<'py>(
@@ -445,26 +404,32 @@ fn sibtest_compute_beta<'py>(
     ref_scores: PyReadonlyArray1<i32>,
     focal_scores: PyReadonlyArray1<i32>,
     suspect_items: PyReadonlyArray1<i32>,
-) -> (f64, f64, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>) {
+) -> (
+    f64,
+    f64,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+) {
     let ref_data = ref_data.as_array();
     let focal_data = focal_data.as_array();
     let ref_scores = ref_scores.as_array();
     let focal_scores = focal_scores.as_array();
     let suspect_items = suspect_items.as_array();
 
-
-    let all_scores: Vec<i32> = ref_scores.iter().chain(focal_scores.iter()).cloned().collect();
+    let all_scores: Vec<i32> = ref_scores
+        .iter()
+        .chain(focal_scores.iter())
+        .cloned()
+        .collect();
     let mut unique_scores: Vec<i32> = all_scores.clone();
     unique_scores.sort();
     unique_scores.dedup();
 
     let suspect_vec: Vec<usize> = suspect_items.iter().map(|&x| x as usize).collect();
 
-
     let results: Vec<(f64, f64)> = unique_scores
         .par_iter()
         .map(|&k| {
-
             let ref_at_k: Vec<usize> = ref_scores
                 .iter()
                 .enumerate()
@@ -486,20 +451,27 @@ fn sibtest_compute_beta<'py>(
                 return (f64::NAN, 0.0);
             }
 
-
             let mean_ref_k: f64 = ref_at_k
                 .iter()
                 .map(|&i| {
-                    suspect_vec.iter().map(|&j| ref_data[[i, j]] as f64).sum::<f64>()
+                    suspect_vec
+                        .iter()
+                        .map(|&j| ref_data[[i, j]] as f64)
+                        .sum::<f64>()
                 })
-                .sum::<f64>() / n_ref_k as f64;
+                .sum::<f64>()
+                / n_ref_k as f64;
 
             let mean_focal_k: f64 = focal_at_k
                 .iter()
                 .map(|&i| {
-                    suspect_vec.iter().map(|&j| focal_data[[i, j]] as f64).sum::<f64>()
+                    suspect_vec
+                        .iter()
+                        .map(|&j| focal_data[[i, j]] as f64)
+                        .sum::<f64>()
                 })
-                .sum::<f64>() / n_focal_k as f64;
+                .sum::<f64>()
+                / n_focal_k as f64;
 
             let beta_k = mean_ref_k - mean_focal_k;
             let weight = 2.0 * n_ref_k as f64 * n_focal_k as f64 / (n_ref_k + n_focal_k) as f64;
@@ -508,26 +480,35 @@ fn sibtest_compute_beta<'py>(
         })
         .collect();
 
-
     let valid: Vec<(f64, f64)> = results.into_iter().filter(|(b, _)| !b.is_nan()).collect();
 
     if valid.is_empty() {
-        return (f64::NAN, f64::NAN, Array1::zeros(0).to_pyarray(py), Array1::zeros(0).to_pyarray(py));
+        return (
+            f64::NAN,
+            f64::NAN,
+            Array1::zeros(0).to_pyarray(py),
+            Array1::zeros(0).to_pyarray(py),
+        );
     }
 
     let beta_k_arr: Array1<f64> = Array1::from(valid.iter().map(|(b, _)| *b).collect::<Vec<_>>());
     let n_k_arr: Array1<f64> = Array1::from(valid.iter().map(|(_, n)| *n).collect::<Vec<_>>());
 
     let total_weight: f64 = n_k_arr.sum();
-    let beta: f64 = beta_k_arr.iter().zip(n_k_arr.iter()).map(|(&b, &n)| b * n).sum::<f64>() / total_weight;
-
+    let beta: f64 = beta_k_arr
+        .iter()
+        .zip(n_k_arr.iter())
+        .map(|(&b, &n)| b * n)
+        .sum::<f64>()
+        / total_weight;
 
     let weighted_mean = beta;
     let weighted_var: f64 = beta_k_arr
         .iter()
         .zip(n_k_arr.iter())
         .map(|(&b, &n)| n * (b - weighted_mean).powi(2))
-        .sum::<f64>() / total_weight;
+        .sum::<f64>()
+        / total_weight;
 
     let n_total = (ref_scores.len() + focal_scores.len()) as f64;
     let se = (weighted_var / n_total).sqrt();
@@ -537,17 +518,21 @@ fn sibtest_compute_beta<'py>(
 
 /// Run SIBTEST for all items in parallel
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 fn sibtest_all_items<'py>(
     py: Python<'py>,
     data: PyReadonlyArray2<i32>,
     groups: PyReadonlyArray1<i32>,
     anchor_items: Option<PyReadonlyArray1<i32>>,
-) -> (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>) {
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+) {
     let data = data.as_array();
     let groups = groups.as_array();
 
     let n_items = data.ncols();
-
 
     let mut unique_groups: Vec<i32> = groups.iter().cloned().collect();
     unique_groups.sort();
@@ -558,24 +543,24 @@ fn sibtest_all_items<'py>(
     let ref_mask: Vec<bool> = groups.iter().map(|&g| g == ref_group).collect();
     let focal_mask: Vec<bool> = groups.iter().map(|&g| g == focal_group).collect();
 
-    let anchor_set: Option<Vec<usize>> = anchor_items.map(|a| {
-        a.as_array().iter().map(|&x| x as usize).collect()
-    });
-
+    let anchor_set: Option<Vec<usize>> =
+        anchor_items.map(|a| a.as_array().iter().map(|&x| x as usize).collect());
 
     let results: Vec<(f64, f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|item_idx| {
-
             let matching: Vec<usize> = match &anchor_set {
-                Some(anchors) => anchors.iter().filter(|&&j| j != item_idx).cloned().collect(),
+                Some(anchors) => anchors
+                    .iter()
+                    .filter(|&&j| j != item_idx)
+                    .cloned()
+                    .collect(),
                 None => (0..n_items).filter(|&j| j != item_idx).collect(),
             };
 
             if matching.is_empty() {
                 return (f64::NAN, f64::NAN, f64::NAN);
             }
-
 
             let ref_scores: Vec<i32> = ref_mask
                 .iter()
@@ -591,12 +576,14 @@ fn sibtest_all_items<'py>(
                 .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
                 .collect();
 
-
-            let all_scores: Vec<i32> = ref_scores.iter().chain(focal_scores.iter()).cloned().collect();
+            let all_scores: Vec<i32> = ref_scores
+                .iter()
+                .chain(focal_scores.iter())
+                .cloned()
+                .collect();
             let mut unique_scores = all_scores.clone();
             unique_scores.sort();
             unique_scores.dedup();
-
 
             let ref_data: Vec<Vec<i32>> = ref_mask
                 .iter()
@@ -611,7 +598,6 @@ fn sibtest_all_items<'py>(
                 .filter(|(_, &is_focal)| is_focal)
                 .map(|(i, _)| data.row(i).to_vec())
                 .collect();
-
 
             let mut beta_k_vec = Vec::new();
             let mut n_k_vec = Vec::new();
@@ -635,11 +621,21 @@ fn sibtest_all_items<'py>(
                 let n_focal_k = focal_at_k.len();
 
                 if n_ref_k > 0 && n_focal_k > 0 {
-                    let mean_ref: f64 = ref_at_k.iter().map(|&i| ref_data[i][item_idx] as f64).sum::<f64>() / n_ref_k as f64;
-                    let mean_focal: f64 = focal_at_k.iter().map(|&i| focal_data[i][item_idx] as f64).sum::<f64>() / n_focal_k as f64;
+                    let mean_ref: f64 = ref_at_k
+                        .iter()
+                        .map(|&i| ref_data[i][item_idx] as f64)
+                        .sum::<f64>()
+                        / n_ref_k as f64;
+                    let mean_focal: f64 = focal_at_k
+                        .iter()
+                        .map(|&i| focal_data[i][item_idx] as f64)
+                        .sum::<f64>()
+                        / n_focal_k as f64;
 
                     beta_k_vec.push(mean_ref - mean_focal);
-                    n_k_vec.push(2.0 * n_ref_k as f64 * n_focal_k as f64 / (n_ref_k + n_focal_k) as f64);
+                    n_k_vec.push(
+                        2.0 * n_ref_k as f64 * n_focal_k as f64 / (n_ref_k + n_focal_k) as f64,
+                    );
                 }
             }
 
@@ -648,18 +644,22 @@ fn sibtest_all_items<'py>(
             }
 
             let total_weight: f64 = n_k_vec.iter().sum();
-            let beta: f64 = beta_k_vec.iter().zip(n_k_vec.iter()).map(|(&b, &n)| b * n).sum::<f64>() / total_weight;
-
+            let beta: f64 = beta_k_vec
+                .iter()
+                .zip(n_k_vec.iter())
+                .map(|(&b, &n)| b * n)
+                .sum::<f64>()
+                / total_weight;
 
             let weighted_var: f64 = beta_k_vec
                 .iter()
                 .zip(n_k_vec.iter())
                 .map(|(&b, &n)| n * (b - beta).powi(2))
-                .sum::<f64>() / total_weight;
+                .sum::<f64>()
+                / total_weight;
 
             let n_total = (ref_scores.len() + focal_scores.len()) as f64;
             let se = (weighted_var / n_total).sqrt();
-
 
             let z = if se > EPSILON { beta / se } else { f64::NAN };
             let p_value = if z.is_nan() {
@@ -674,22 +674,28 @@ fn sibtest_all_items<'py>(
 
     let betas: Array1<f64> = Array1::from(results.iter().map(|(b, _, _)| *b).collect::<Vec<_>>());
     let zs: Array1<f64> = Array1::from(results.iter().map(|(_, z, _)| *z).collect::<Vec<_>>());
-    let p_values: Array1<f64> = Array1::from(results.iter().map(|(_, _, p)| *p).collect::<Vec<_>>());
+    let p_values: Array1<f64> =
+        Array1::from(results.iter().map(|(_, _, p)| *p).collect::<Vec<_>>());
 
-    (betas.to_pyarray(py), zs.to_pyarray(py), p_values.to_pyarray(py))
+    (
+        betas.to_pyarray(py),
+        zs.to_pyarray(py),
+        p_values.to_pyarray(py),
+    )
 }
 
 /// Standard normal CDF approximation
 fn normal_cdf(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.2316419 * x.abs());
     let d = 0.3989423 * (-x * x / 2.0).exp();
-    let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-    if x > 0.0 { 1.0 - p } else { p }
+    let p =
+        d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+    if x > 0.0 {
+        1.0 - p
+    } else {
+        p
+    }
 }
-
-
-
-
 
 /// Simulate responses from Graded Response Model
 #[pyfunction]
@@ -709,10 +715,7 @@ fn simulate_grm<'py>(
     let n_categories = thresholds.ncols() + 1;
 
     let disc_vec: Vec<f64> = discrimination.to_vec();
-    let thresh_vec: Vec<Vec<f64>> = (0..n_items)
-        .map(|i| thresholds.row(i).to_vec())
-        .collect();
-
+    let thresh_vec: Vec<Vec<f64>> = (0..n_items).map(|i| thresholds.row(i).to_vec()).collect();
 
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
@@ -722,20 +725,21 @@ fn simulate_grm<'py>(
 
             (0..n_items)
                 .map(|j| {
-
                     let mut cum_probs = vec![1.0; n_categories];
                     for k in 0..(n_categories - 1) {
                         let z = disc_vec[j] * (theta_i - thresh_vec[j][k]);
                         cum_probs[k + 1] = sigmoid(z);
                     }
 
-
                     let mut cat_probs = vec![0.0; n_categories];
                     for k in 0..n_categories {
-                        let next = if k < n_categories - 1 { cum_probs[k + 1] } else { 0.0 };
+                        let next = if k < n_categories - 1 {
+                            cum_probs[k + 1]
+                        } else {
+                            0.0
+                        };
                         cat_probs[k] = (cum_probs[k] - next).max(0.0);
                     }
-
 
                     let sum: f64 = cat_probs.iter().sum();
                     if sum > EPSILON {
@@ -743,7 +747,6 @@ fn simulate_grm<'py>(
                             *p /= sum;
                         }
                     }
-
 
                     let u: f64 = rng.random();
                     let mut cumsum = 0.0;
@@ -787,9 +790,7 @@ fn simulate_gpcm<'py>(
     let n_categories = thresholds.ncols() + 1;
 
     let disc_vec: Vec<f64> = discrimination.to_vec();
-    let thresh_vec: Vec<Vec<f64>> = (0..n_items)
-        .map(|i| thresholds.row(i).to_vec())
-        .collect();
+    let thresh_vec: Vec<Vec<f64>> = (0..n_items).map(|i| thresholds.row(i).to_vec()).collect();
 
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
@@ -799,20 +800,17 @@ fn simulate_gpcm<'py>(
 
             (0..n_items)
                 .map(|j| {
-
                     let mut numerators = vec![0.0; n_categories];
-                    for k in 0..n_categories {
-                        let mut cumsum = 0.0;
-                        for v in 0..k {
-                            cumsum += disc_vec[j] * (theta_i - thresh_vec[j][v]);
-                        }
-                        numerators[k] = cumsum.exp();
+                    for (k, num) in numerators.iter_mut().enumerate() {
+                        let cumsum: f64 = thresh_vec[j][..k]
+                            .iter()
+                            .map(|&t| disc_vec[j] * (theta_i - t))
+                            .sum();
+                        *num = cumsum.exp();
                     }
-
 
                     let sum: f64 = numerators.iter().sum();
                     let cat_probs: Vec<f64> = numerators.iter().map(|&n| n / sum).collect();
-
 
                     let u: f64 = rng.random();
                     let mut cumsum = 0.0;
@@ -874,7 +872,11 @@ fn simulate_dichotomous<'py>(
                     let p = guess_vec[j] + (1.0 - guess_vec[j]) * p_star;
 
                     let u: f64 = rng.random();
-                    if u < p { 1 } else { 0 }
+                    if u < p {
+                        1
+                    } else {
+                        0
+                    }
                 })
                 .collect()
         })
@@ -890,12 +892,9 @@ fn simulate_dichotomous<'py>(
     result.to_pyarray(py)
 }
 
-
-
-
-
 /// Generate plausible values using posterior sampling
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn generate_plausible_values_posterior<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -930,11 +929,8 @@ fn generate_plausible_values_posterior<'py>(
             let normal = Normal::new(0.0, jitter_sd).unwrap();
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-
             let log_likes: Vec<f64> = (0..n_quad)
-                .map(|q| {
-                    log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec)
-                })
+                .map(|q| log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec))
                 .collect();
 
             let log_posterior: Vec<f64> = log_likes
@@ -943,12 +939,16 @@ fn generate_plausible_values_posterior<'py>(
                 .map(|(&ll, &lw)| ll + lw)
                 .collect();
 
-
-            let max_lp = log_posterior.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let posterior: Vec<f64> = log_posterior.iter().map(|&lp| (lp - max_lp).exp()).collect();
+            let max_lp = log_posterior
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let posterior: Vec<f64> = log_posterior
+                .iter()
+                .map(|&lp| (lp - max_lp).exp())
+                .collect();
             let sum: f64 = posterior.iter().sum();
             let posterior: Vec<f64> = posterior.iter().map(|&p| p / sum).collect();
-
 
             (0..n_plausible)
                 .map(|_| {
@@ -980,6 +980,7 @@ fn generate_plausible_values_posterior<'py>(
 
 /// Generate plausible values using MCMC
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn generate_plausible_values_mcmc<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -1009,13 +1010,14 @@ fn generate_plausible_values_mcmc<'py>(
             let mut theta = 0.0;
             let mut results = Vec::with_capacity(n_plausible);
 
-            for p in 0..n_plausible {
+            for _p in 0..n_plausible {
                 for _ in 0..n_iter {
                     let proposal = theta + rng.sample(proposal_dist);
 
-                    let ll_current = log_likelihood_2pl_single(&resp_row, theta, &disc_vec, &diff_vec);
-                    let ll_proposal = log_likelihood_2pl_single(&resp_row, proposal, &disc_vec, &diff_vec);
-
+                    let ll_current =
+                        log_likelihood_2pl_single(&resp_row, theta, &disc_vec, &diff_vec);
+                    let ll_proposal =
+                        log_likelihood_2pl_single(&resp_row, proposal, &disc_vec, &diff_vec);
 
                     let prior_current = -0.5 * theta * theta;
                     let prior_proposal = -0.5 * proposal * proposal;
@@ -1043,10 +1045,6 @@ fn generate_plausible_values_mcmc<'py>(
     result.to_pyarray(py)
 }
 
-
-
-
-
 /// Compute observed univariate and bivariate margins
 #[pyfunction]
 fn compute_observed_margins<'py>(
@@ -1056,7 +1054,6 @@ fn compute_observed_margins<'py>(
     let responses = responses.as_array();
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
-
 
     let obs_uni: Array1<f64> = (0..n_items)
         .into_par_iter()
@@ -1075,7 +1072,6 @@ fn compute_observed_margins<'py>(
         })
         .collect::<Vec<f64>>()
         .into();
-
 
     let pairs: Vec<(usize, usize)> = (0..n_items)
         .flat_map(|i| ((i + 1)..n_items).map(move |j| (i, j)))
@@ -1125,7 +1121,6 @@ fn compute_expected_margins<'py>(
     let n_quad = quad_points.len();
     let n_items = discrimination.len();
 
-
     let probs: Vec<Vec<f64>> = (0..n_items)
         .map(|j| {
             (0..n_quad)
@@ -1133,7 +1128,6 @@ fn compute_expected_margins<'py>(
                 .collect()
         })
         .collect();
-
 
     let exp_uni: Array1<f64> = (0..n_items)
         .map(|j| {
@@ -1145,7 +1139,6 @@ fn compute_expected_margins<'py>(
         })
         .collect::<Vec<f64>>()
         .into();
-
 
     let pairs: Vec<(usize, usize)> = (0..n_items)
         .flat_map(|i| ((i + 1)..n_items).map(move |j| (i, j)))
@@ -1170,10 +1163,6 @@ fn compute_expected_margins<'py>(
     (exp_uni.to_pyarray(py), exp_bi.to_pyarray(py))
 }
 
-
-
-
-
 /// Generate bootstrap sample indices
 #[pyfunction]
 fn generate_bootstrap_indices<'py>(
@@ -1186,7 +1175,9 @@ fn generate_bootstrap_indices<'py>(
         .into_par_iter()
         .map(|b| {
             let mut rng = Pcg64::seed_from_u64(seed + b as u64);
-            (0..n_persons).map(|_| rng.random_range(0..n_persons as i64)).collect()
+            (0..n_persons)
+                .map(|_| rng.random_range(0..n_persons as i64))
+                .collect()
         })
         .collect();
 
@@ -1222,10 +1213,6 @@ fn resample_responses<'py>(
 
     result.to_pyarray(py)
 }
-
-
-
-
 
 /// Impute missing responses using model probabilities
 #[pyfunction]
@@ -1263,7 +1250,11 @@ fn impute_from_probabilities<'py>(
                     } else {
                         let p = sigmoid(disc_vec[j] * (theta_i - diff_vec[j]));
                         let u: f64 = rng.random();
-                        if u < p { 1 } else { 0 }
+                        if u < p {
+                            1
+                        } else {
+                            0
+                        }
                     }
                 })
                 .collect()
@@ -1282,6 +1273,7 @@ fn impute_from_probabilities<'py>(
 
 /// Multiple imputation in parallel
 #[pyfunction]
+#[allow(clippy::too_many_arguments)]
 fn multiple_imputation<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -1314,7 +1306,6 @@ fn multiple_imputation<'py>(
                 .map(|i| {
                     let mut rng = Pcg64::seed_from_u64(base_seed + i as u64);
 
-
                     let normal = Normal::new(0.0, 1.0).unwrap();
                     let theta_i = theta_mean[i] + rng.sample(normal) * theta_se[i];
 
@@ -1326,7 +1317,11 @@ fn multiple_imputation<'py>(
                             } else {
                                 let p = sigmoid(disc_vec[j] * (theta_i - diff_vec[j]));
                                 let u: f64 = rng.random();
-                                if u < p { 1 } else { 0 }
+                                if u < p {
+                                    1
+                                } else {
+                                    0
+                                }
                             }
                         })
                         .collect()
@@ -1346,10 +1341,6 @@ fn multiple_imputation<'py>(
 
     result.to_pyarray(py)
 }
-
-
-
-
 
 /// Compute EAP (Expected A Posteriori) scores
 #[pyfunction]
@@ -1382,11 +1373,8 @@ fn compute_eap_scores<'py>(
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-
             let log_likes: Vec<f64> = (0..n_quad)
-                .map(|q| {
-                    log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec)
-                })
+                .map(|q| log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec))
                 .collect();
 
             let log_posterior: Vec<f64> = log_likes
@@ -1395,19 +1383,22 @@ fn compute_eap_scores<'py>(
                 .map(|(&ll, &lw)| ll + lw)
                 .collect();
 
-
-            let max_lp = log_posterior.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let posterior: Vec<f64> = log_posterior.iter().map(|&lp| (lp - max_lp).exp()).collect();
+            let max_lp = log_posterior
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let posterior: Vec<f64> = log_posterior
+                .iter()
+                .map(|&lp| (lp - max_lp).exp())
+                .collect();
             let sum: f64 = posterior.iter().sum();
             let posterior: Vec<f64> = posterior.iter().map(|&p| p / sum).collect();
-
 
             let eap: f64 = posterior
                 .iter()
                 .zip(quad_vec.iter())
                 .map(|(&p, &theta)| p * theta)
                 .sum();
-
 
             let psd: f64 = posterior
                 .iter()
@@ -1425,10 +1416,6 @@ fn compute_eap_scores<'py>(
 
     (theta.to_pyarray(py), se.to_pyarray(py))
 }
-
-
-
-
 
 /// Complete 2PL EM estimation in Rust
 /// Returns (discrimination, difficulty, log_likelihood, n_iterations, converged)
@@ -1450,13 +1437,10 @@ fn em_fit_2pl<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
 
-
     let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
-
 
     let mut discrimination: Vec<f64> = vec![1.0; n_items];
     let mut difficulty: Vec<f64> = vec![0.0; n_items];
-
 
     for j in 0..n_items {
         let mut sum = 0.0;
@@ -1481,7 +1465,6 @@ fn em_fit_2pl<'py>(
     for iter in 0..max_iter {
         iteration = iter + 1;
 
-
         let (posterior_weights, marginal_ll) = e_step_2pl_internal(
             &responses,
             &quad_points,
@@ -1495,13 +1478,11 @@ fn em_fit_2pl<'py>(
 
         let current_ll: f64 = marginal_ll.iter().map(|&x| (x + EPSILON).ln()).sum();
 
-
         if (current_ll - prev_ll).abs() < tol {
             converged = true;
             break;
         }
         prev_ll = current_ll;
-
 
         m_step_2pl_internal(
             &responses,
@@ -1528,6 +1509,7 @@ fn em_fit_2pl<'py>(
 }
 
 /// Internal E-step computation
+#[allow(clippy::too_many_arguments)]
 fn e_step_2pl_internal(
     responses: &ndarray::ArrayView2<i32>,
     quad_points: &[f64],
@@ -1539,7 +1521,6 @@ fn e_step_2pl_internal(
     n_quad: usize,
 ) -> (Vec<Vec<f64>>, Vec<f64>) {
     let log_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + EPSILON).ln()).collect();
-
 
     let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
         .into_par_iter()
@@ -1583,6 +1564,7 @@ fn e_step_2pl_internal(
 }
 
 /// Internal M-step computation with parallel item updates
+#[allow(clippy::too_many_arguments)]
 fn m_step_2pl_internal(
     responses: &ndarray::ArrayView2<i32>,
     posterior_weights: &[Vec<f64>],
@@ -1593,11 +1575,9 @@ fn m_step_2pl_internal(
     n_items: usize,
     n_quad: usize,
 ) {
-
     let new_params: Vec<(f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
-
             let mut r_k = vec![0.0; n_quad];
             let mut n_k = vec![0.0; n_quad];
 
@@ -1614,7 +1594,6 @@ fn m_step_2pl_internal(
                     }
                 }
             }
-
 
             let mut a = discrimination[j];
             let mut b = difficulty[j];
@@ -1645,7 +1624,6 @@ fn m_step_2pl_internal(
                     hess_bb += -info * a * a;
                     hess_ab += info * a * (theta - b);
                 }
-
 
                 hess_aa -= 0.01;
                 hess_bb -= 0.01;
@@ -1678,16 +1656,15 @@ fn m_step_2pl_internal(
 
 /// Gauss-Hermite quadrature nodes and weights
 fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
-
     match n {
         11 => {
             let nodes = vec![
-                -3.66847, -2.78329, -2.02594, -1.32656, -0.65681,
-                0.0, 0.65681, 1.32656, 2.02594, 2.78329, 3.66847,
+                -3.66847, -2.78329, -2.02594, -1.32656, -0.65681, 0.0, 0.65681, 1.32656, 2.02594,
+                2.78329, 3.66847,
             ];
             let weights = vec![
-                0.00001, 0.00076, 0.01526, 0.13548, 0.53134,
-                0.94531, 0.53134, 0.13548, 0.01526, 0.00076, 0.00001,
+                0.00001, 0.00076, 0.01526, 0.13548, 0.53134, 0.94531, 0.53134, 0.13548, 0.01526,
+                0.00076, 0.00001,
             ];
 
             let sum: f64 = weights.iter().sum();
@@ -1696,14 +1673,12 @@ fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
         }
         15 => {
             let nodes = vec![
-                -4.49999, -3.66995, -2.96716, -2.32573, -1.71999,
-                -1.13612, -0.56506, 0.0, 0.56506, 1.13612,
-                1.71999, 2.32573, 2.96716, 3.66995, 4.49999,
+                -4.49999, -3.66995, -2.96716, -2.32573, -1.71999, -1.13612, -0.56506, 0.0, 0.56506,
+                1.13612, 1.71999, 2.32573, 2.96716, 3.66995, 4.49999,
             ];
             let weights = vec![
-                1.5e-09, 1.5e-06, 3.9e-04, 0.00494, 0.03204,
-                0.11094, 0.21181, 0.22418, 0.21181, 0.11094,
-                0.03204, 0.00494, 3.9e-04, 1.5e-06, 1.5e-09,
+                1.5e-09, 1.5e-06, 3.9e-04, 0.00494, 0.03204, 0.11094, 0.21181, 0.22418, 0.21181,
+                0.11094, 0.03204, 0.00494, 3.9e-04, 1.5e-06, 1.5e-09,
             ];
             let sum: f64 = weights.iter().sum();
             let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
@@ -1711,25 +1686,20 @@ fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
         }
         21 => {
             let nodes = vec![
-                -5.38748, -4.60368, -3.94477, -3.34785, -2.78881,
-                -2.25497, -1.73854, -1.23408, -0.73747, -0.24535,
-                0.24535, 0.73747, 1.23408, 1.73854, 2.25497,
-                2.78881, 3.34785, 3.94477, 4.60368, 5.38748,
-                0.0,
+                -5.38748, -4.60368, -3.94477, -3.34785, -2.78881, -2.25497, -1.73854, -1.23408,
+                -0.73747, -0.24535, 0.24535, 0.73747, 1.23408, 1.73854, 2.25497, 2.78881, 3.34785,
+                3.94477, 4.60368, 5.38748, 0.0,
             ];
             let weights = vec![
-                2.1e-13, 4.4e-10, 1.1e-07, 7.8e-06, 2.3e-04,
-                3.5e-03, 3.1e-02, 1.5e-01, 4.3e-01, 7.2e-01,
-                7.2e-01, 4.3e-01, 1.5e-01, 3.1e-02, 3.5e-03,
-                2.3e-04, 7.8e-06, 1.1e-07, 4.4e-10, 2.1e-13,
-                1.0,
+                2.1e-13, 4.4e-10, 1.1e-07, 7.8e-06, 2.3e-04, 3.5e-03, 3.1e-02, 1.5e-01, 4.3e-01,
+                7.2e-01, 7.2e-01, 4.3e-01, 1.5e-01, 3.1e-02, 3.5e-03, 2.3e-04, 7.8e-06, 1.1e-07,
+                4.4e-10, 2.1e-13, 1.0,
             ];
             let sum: f64 = weights.iter().sum();
             let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
             (nodes, weights)
         }
         _ => {
-
             let mut nodes = Vec::with_capacity(n);
             let mut weights = Vec::with_capacity(n);
             let step = 8.0 / (n - 1) as f64;
@@ -1745,13 +1715,10 @@ fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
     }
 }
 
-
-
-
-
 /// Full Gibbs sampler for 2PL model in Rust
 /// Returns (disc_chain, diff_chain, theta_chain, ll_chain)
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 fn gibbs_sample_2pl<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -1769,7 +1736,6 @@ fn gibbs_sample_2pl<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
 
-
     let mut discrimination: Vec<f64> = vec![1.0; n_items];
     let mut difficulty: Vec<f64> = vec![0.0; n_items];
     let mut theta: Vec<f64> = vec![0.0; n_persons];
@@ -1785,7 +1751,6 @@ fn gibbs_sample_2pl<'py>(
     let proposal_param = Normal::new(0.0, 0.1).unwrap();
 
     for iter in 0..n_iter {
-
         theta = sample_theta_mh(
             &responses,
             &theta,
@@ -1797,7 +1762,6 @@ fn gibbs_sample_2pl<'py>(
             &proposal_theta,
         );
 
-
         discrimination = sample_discrimination_mh(
             &responses,
             &theta,
@@ -1807,7 +1771,6 @@ fn gibbs_sample_2pl<'py>(
             &mut rng,
             &proposal_param,
         );
-
 
         difficulty = sample_difficulty_mh(
             &responses,
@@ -1819,32 +1782,40 @@ fn gibbs_sample_2pl<'py>(
             &proposal_param,
         );
 
-
-        if iter >= burnin && (iter - burnin) % thin == 0 {
+        if iter >= burnin && (iter - burnin).is_multiple_of(thin) {
             disc_chain.push(discrimination.clone());
             diff_chain.push(difficulty.clone());
             theta_chain.push(theta.clone());
 
-            let ll = compute_total_ll(&responses, &theta, &discrimination, &difficulty, n_persons, n_items);
+            let ll = compute_total_ll(
+                &responses,
+                &theta,
+                &discrimination,
+                &difficulty,
+                n_persons,
+                n_items,
+            );
             ll_chain.push(ll);
         }
     }
 
-
     let disc_arr = Array2::from_shape_vec(
         (n_samples, n_items),
         disc_chain.into_iter().flatten().collect(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let diff_arr = Array2::from_shape_vec(
         (n_samples, n_items),
         diff_chain.into_iter().flatten().collect(),
-    ).unwrap();
+    )
+    .unwrap();
 
     let theta_arr = Array3::from_shape_vec(
         (n_samples, n_persons, 1),
-        theta_chain.into_iter().flatten().map(|x| x).collect(),
-    ).unwrap();
+        theta_chain.into_iter().flatten().collect(),
+    )
+    .unwrap();
 
     let ll_arr: Array1<f64> = ll_chain.into();
 
@@ -1856,6 +1827,7 @@ fn gibbs_sample_2pl<'py>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_theta_mh(
     responses: &ndarray::ArrayView2<i32>,
     theta: &[f64],
@@ -1866,7 +1838,6 @@ fn sample_theta_mh(
     rng: &mut Pcg64,
     proposal: &Normal<f64>,
 ) -> Vec<f64> {
-
     let seeds: Vec<u64> = (0..n_persons).map(|_| rng.random()).collect();
 
     let new_theta: Vec<f64> = (0..n_persons)
@@ -1876,7 +1847,6 @@ fn sample_theta_mh(
 
             let current = theta[i];
             let proposed = current + local_rng.sample(proposal);
-
 
             let mut ll_current = 0.0;
             let mut ll_proposed = 0.0;
@@ -1897,7 +1867,6 @@ fn sample_theta_mh(
                     ll_proposed += log_sigmoid(-z_prop);
                 }
             }
-
 
             let prior_current = -0.5 * current * current;
             let prior_proposed = -0.5 * proposed * proposed;
@@ -1951,7 +1920,6 @@ fn sample_discrimination_mh(
             }
         }
 
-
         let prior_current = -0.5 * current.ln().powi(2);
         let prior_proposed = -0.5 * proposed.ln().powi(2);
 
@@ -2001,7 +1969,6 @@ fn sample_difficulty_mh(
             }
         }
 
-
         let prior_current = -0.5 * current * current;
         let prior_proposed = -0.5 * proposed * proposed;
 
@@ -2044,10 +2011,6 @@ fn compute_total_ll(
         .sum()
 }
 
-
-
-
-
 /// MHRM estimation for 2PL model
 #[pyfunction]
 fn mhrm_fit_2pl<'py>(
@@ -2057,11 +2020,7 @@ fn mhrm_fit_2pl<'py>(
     burnin: usize,
     proposal_sd: f64,
     seed: u64,
-) -> (
-    Bound<'py, PyArray1<f64>>,
-    Bound<'py, PyArray1<f64>>,
-    f64,
-) {
+) -> (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>, f64) {
     let responses = responses.as_array();
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
@@ -2074,7 +2033,6 @@ fn mhrm_fit_2pl<'py>(
     let proposal = Normal::new(0.0, proposal_sd).unwrap();
 
     for cycle in 0..n_cycles {
-
         theta = sample_theta_mh(
             &responses,
             &theta,
@@ -2085,7 +2043,6 @@ fn mhrm_fit_2pl<'py>(
             &mut rng,
             &proposal,
         );
-
 
         let gain = 1.0 / (cycle as f64 + 1.0);
 
@@ -2120,17 +2077,20 @@ fn mhrm_fit_2pl<'py>(
         }
     }
 
-    let ll = compute_total_ll(&responses, &theta, &discrimination, &difficulty, n_persons, n_items);
+    let ll = compute_total_ll(
+        &responses,
+        &theta,
+        &discrimination,
+        &difficulty,
+        n_persons,
+        n_items,
+    );
 
     let disc_arr: Array1<f64> = discrimination.into();
     let diff_arr: Array1<f64> = difficulty.into();
 
     (disc_arr.to_pyarray(py), diff_arr.to_pyarray(py), ll)
 }
-
-
-
-
 
 /// Parallel bootstrap estimation
 #[pyfunction]
@@ -2142,25 +2102,19 @@ fn bootstrap_fit_2pl<'py>(
     max_iter: usize,
     tol: f64,
     seed: u64,
-) -> (
-    Bound<'py, PyArray2<f64>>,
-    Bound<'py, PyArray2<f64>>,
-) {
+) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>) {
     let responses = responses.as_array();
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
-
 
     let results: Vec<(Vec<f64>, Vec<f64>)> = (0..n_bootstrap)
         .into_par_iter()
         .map(|b| {
             let mut rng = Pcg64::seed_from_u64(seed + b as u64);
 
-
             let indices: Vec<usize> = (0..n_persons)
                 .map(|_| rng.random_range(0..n_persons))
                 .collect();
-
 
             let mut boot_responses = Array2::zeros((n_persons, n_items));
             for (new_i, &orig_i) in indices.iter().enumerate() {
@@ -2169,11 +2123,9 @@ fn bootstrap_fit_2pl<'py>(
                 }
             }
 
-
             let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
             let mut discrimination: Vec<f64> = vec![1.0; n_items];
             let mut difficulty: Vec<f64> = vec![0.0; n_items];
-
 
             for j in 0..n_items {
                 let mut sum = 0.0;
@@ -2228,7 +2180,6 @@ fn bootstrap_fit_2pl<'py>(
         })
         .collect();
 
-
     let mut disc_samples = Array2::zeros((n_bootstrap, n_items));
     let mut diff_samples = Array2::zeros((n_bootstrap, n_items));
 
@@ -2242,50 +2193,36 @@ fn bootstrap_fit_2pl<'py>(
     (disc_samples.to_pyarray(py), diff_samples.to_pyarray(py))
 }
 
-
-
-
-
 #[pymodule]
 fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
-
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_3pl, m)?)?;
     m.add_function(wrap_pyfunction!(compute_log_likelihoods_mirt, m)?)?;
     m.add_function(wrap_pyfunction!(e_step_complete, m)?)?;
 
-
     m.add_function(wrap_pyfunction!(compute_expected_counts, m)?)?;
     m.add_function(wrap_pyfunction!(compute_expected_counts_polytomous, m)?)?;
 
-
     m.add_function(wrap_pyfunction!(sibtest_compute_beta, m)?)?;
     m.add_function(wrap_pyfunction!(sibtest_all_items, m)?)?;
-
 
     m.add_function(wrap_pyfunction!(simulate_grm, m)?)?;
     m.add_function(wrap_pyfunction!(simulate_gpcm, m)?)?;
     m.add_function(wrap_pyfunction!(simulate_dichotomous, m)?)?;
 
-
     m.add_function(wrap_pyfunction!(generate_plausible_values_posterior, m)?)?;
     m.add_function(wrap_pyfunction!(generate_plausible_values_mcmc, m)?)?;
-
 
     m.add_function(wrap_pyfunction!(compute_observed_margins, m)?)?;
     m.add_function(wrap_pyfunction!(compute_expected_margins, m)?)?;
 
-
     m.add_function(wrap_pyfunction!(generate_bootstrap_indices, m)?)?;
     m.add_function(wrap_pyfunction!(resample_responses, m)?)?;
-
 
     m.add_function(wrap_pyfunction!(impute_from_probabilities, m)?)?;
     m.add_function(wrap_pyfunction!(multiple_imputation, m)?)?;
 
-
     m.add_function(wrap_pyfunction!(compute_eap_scores, m)?)?;
-
 
     m.add_function(wrap_pyfunction!(em_fit_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(gibbs_sample_2pl, m)?)?;
