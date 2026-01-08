@@ -7,6 +7,8 @@ from numpy.typing import NDArray
 from scipy import stats
 from scipy.integrate import trapezoid
 
+from mirt.diagnostics._utils import extract_item_se, fit_group_models, split_groups
+
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
@@ -49,54 +51,20 @@ def compute_dif(
             - 'effect_size': Effect size measure
             - 'classification': ETS classification (A/B/C)
     """
-    from mirt import fit_mirt
-
     data = np.asarray(data)
     groups = np.asarray(groups)
-
-    unique_groups = np.unique(groups)
-    if len(unique_groups) != 2:
-        raise ValueError(
-            f"DIF analysis requires exactly 2 groups, got {len(unique_groups)}"
-        )
-
-    reference_group = unique_groups[0]
-    if focal_group is None:
-        focal_group = unique_groups[1]
-    elif focal_group not in unique_groups:
-        raise ValueError(f"focal_group {focal_group} not found in groups")
-
-    if focal_group == reference_group:
-        reference_group = (
-            unique_groups[1] if unique_groups[0] == focal_group else unique_groups[0]
-        )
-
-    ref_mask = groups == reference_group
-    focal_mask = groups == focal_group
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
-
     n_items = data.shape[1]
 
-    ref_result = fit_mirt(
-        ref_data,
-        model=model,
-        n_categories=n_categories,
-        n_quadpts=n_quadpts,
-        max_iter=max_iter,
-        tol=tol,
-        verbose=False,
-    )
+    ref_data, focal_data, _, _, _, _ = split_groups(data, groups, focal_group)
 
-    focal_result = fit_mirt(
+    ref_result, focal_result = fit_group_models(
+        ref_data,
         focal_data,
         model=model,
         n_categories=n_categories,
         n_quadpts=n_quadpts,
         max_iter=max_iter,
         tol=tol,
-        verbose=False,
     )
 
     if method == "likelihood_ratio":
@@ -132,20 +100,15 @@ def _dif_likelihood_ratio(
             ref_val = np.atleast_1d(ref_params[param_name])
             focal_val = np.atleast_1d(focal_params[param_name])
 
-            ref_se = ref_result.standard_errors.get(param_name, np.ones_like(ref_val))
-            focal_se = focal_result.standard_errors.get(
+            ref_se_full = ref_result.standard_errors.get(
+                param_name, np.ones_like(ref_val)
+            )
+            focal_se_full = focal_result.standard_errors.get(
                 param_name, np.ones_like(focal_val)
             )
 
-            if ref_se.ndim > 1:
-                ref_se = ref_se[item_idx]
-            elif len(ref_se) > 1:
-                ref_se = np.atleast_1d(ref_se[item_idx])
-
-            if focal_se.ndim > 1:
-                focal_se = focal_se[item_idx]
-            elif len(focal_se) > 1:
-                focal_se = np.atleast_1d(focal_se[item_idx])
+            ref_se = extract_item_se(ref_se_full, item_idx)
+            focal_se = extract_item_se(focal_se_full, item_idx)
 
             pooled_var = ref_se**2 + focal_se**2
             pooled_var = np.where(pooled_var > 0, pooled_var, 1.0)
@@ -201,21 +164,14 @@ def _dif_wald(
             ref_val = np.atleast_1d(ref_params[param_name])
             focal_val = np.atleast_1d(focal_params[param_name])
 
-            ref_se = ref_result.standard_errors.get(param_name)
-            focal_se = focal_result.standard_errors.get(param_name)
+            ref_se_full = ref_result.standard_errors.get(param_name)
+            focal_se_full = focal_result.standard_errors.get(param_name)
 
-            if ref_se is None or focal_se is None:
+            if ref_se_full is None or focal_se_full is None:
                 continue
 
-            if ref_se.ndim > 1:
-                ref_se = ref_se[item_idx]
-            elif len(ref_se) > 1:
-                ref_se = np.atleast_1d(ref_se[item_idx])
-
-            if focal_se.ndim > 1:
-                focal_se = focal_se[item_idx]
-            elif len(focal_se) > 1:
-                focal_se = np.atleast_1d(focal_se[item_idx])
+            ref_se = extract_item_se(ref_se_full, item_idx)
+            focal_se = extract_item_se(focal_se_full, item_idx)
 
             pooled_var = ref_se**2 + focal_se**2
             valid = pooled_var > 1e-10

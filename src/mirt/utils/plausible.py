@@ -273,7 +273,7 @@ def plausible_value_regression(
             design = np.column_stack([np.ones(n_persons), theta_p])
 
         try:
-            coef, residuals, rank, s = np.linalg.lstsq(design, y, rcond=None)
+            coef, residuals, _, _ = np.linalg.lstsq(design, y, rcond=None)
 
             if len(residuals) > 0:
                 mse = residuals[0] / (n_persons - design.shape[1])

@@ -28,11 +28,6 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
-def _is_polytomous(model: BaseItemModel) -> bool:
-    """Check if a model is polytomous."""
-    return hasattr(model, "_n_categories")
-
-
 class WeightedEMEstimator(EMEstimator):
     """EM estimator with support for survey weights.
 
@@ -251,7 +246,7 @@ class WeightedEMEstimator(EMEstimator):
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
-        if _is_polytomous(model):
+        if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k)
 

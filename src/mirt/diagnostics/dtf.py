@@ -12,6 +12,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import integrate, stats
 
+from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -62,27 +64,16 @@ def compute_dtf(
         - 'expected_score_focal': Expected score curve for focal group
         - 'theta_grid': Theta values used
     """
-    from mirt import fit_mirt
-
     data = np.asarray(data)
     groups = np.asarray(groups)
 
-    unique_groups = np.unique(groups)
-    if len(unique_groups) != 2:
-        raise ValueError(f"Expected 2 groups, found {len(unique_groups)}")
-
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
-
-    ref_result = fit_mirt(ref_data, model=model, verbose=False, **fit_kwargs)
-    focal_result = fit_mirt(focal_data, model=model, verbose=False, **fit_kwargs)
-
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_quadpts)
+    ref_data, focal_data, ref_mask, focal_mask, ref_group, focal_group = split_groups(
+        data, groups
+    )
+    ref_result, focal_result = fit_group_models(
+        ref_data, focal_data, model=model, **fit_kwargs
+    )
+    theta_grid, _ = create_theta_grid(theta_range, n_quadpts)
 
     exp_score_ref = _compute_expected_score(ref_result.model, theta_grid)
     exp_score_focal = _compute_expected_score(focal_result.model, theta_grid)
