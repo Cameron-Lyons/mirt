@@ -38,6 +38,10 @@ class BaseItemModel(ABC):
         self._is_fitted: bool = False
         self._initialize_parameters()
 
+    @property
+    def is_polytomous(self) -> bool:
+        return hasattr(self, "_n_categories")
+
     @abstractmethod
     def _initialize_parameters(self) -> None: ...
 

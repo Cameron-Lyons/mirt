@@ -35,11 +35,6 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
-def _is_polytomous(model: BaseItemModel) -> bool:
-    """Check if a model is polytomous."""
-    return hasattr(model, "_n_categories")
-
-
 class MCEMEstimator(BaseEstimator):
     """Monte Carlo EM estimator for IRT models.
 
@@ -267,7 +262,7 @@ class MCEMEstimator(BaseEstimator):
         valid_theta = theta_samples[valid_mask]
         valid_weights = weights[valid_mask]
 
-        if _is_polytomous(model):
+        if model.is_polytomous:
 
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
                 self._set_item_params(model, item_idx, params)

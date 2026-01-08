@@ -12,6 +12,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.diagnostics._utils import split_groups
+
 
 def sibtest(
     data: NDArray[np.int_],
@@ -58,13 +60,7 @@ def sibtest(
     groups = np.asarray(groups)
     suspect_items = np.asarray(suspect_items)
 
-    n_persons, n_items = data.shape
-
-    unique_groups = np.unique(groups)
-    if len(unique_groups) != 2:
-        raise ValueError(f"Expected 2 groups, found {len(unique_groups)}")
-
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
+    n_items = data.shape[1]
 
     if matching_items is None:
         all_items = set(range(n_items))
@@ -75,16 +71,11 @@ def sibtest(
     if len(matching_items) == 0:
         raise ValueError("No matching items available")
 
+    ref_data, focal_data, ref_mask, focal_mask, _, _ = split_groups(data, groups)
+
     matching_scores = data[:, matching_items].sum(axis=1)
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
     ref_scores = matching_scores[ref_mask]
     focal_scores = matching_scores[focal_mask]
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
 
     if method == "original":
         beta, beta_se = _compute_sibtest_original(

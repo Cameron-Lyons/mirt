@@ -12,6 +12,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import integrate
 
+from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
+
 
 def compute_drf(
     data: NDArray[np.int_],
@@ -53,27 +55,14 @@ def compute_drf(
         - 'reliability_ref': Marginal reliability for reference group
         - 'reliability_focal': Marginal reliability for focal group
     """
-    from mirt import fit_mirt
-
     data = np.asarray(data)
     groups = np.asarray(groups)
 
-    unique_groups = np.unique(groups)
-    if len(unique_groups) != 2:
-        raise ValueError(f"Expected 2 groups, found {len(unique_groups)}")
-
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
-
-    ref_result = fit_mirt(ref_data, model=model, verbose=False, **fit_kwargs)
-    focal_result = fit_mirt(focal_data, model=model, verbose=False, **fit_kwargs)
-
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_points)
+    ref_data, focal_data, _, _, ref_group, focal_group = split_groups(data, groups)
+    ref_result, focal_result = fit_group_models(
+        ref_data, focal_data, model=model, **fit_kwargs
+    )
+    theta_grid, _ = create_theta_grid(theta_range, n_points)
 
     info_ref = _compute_test_information(ref_result.model, theta_grid)
     info_focal = _compute_test_information(focal_result.model, theta_grid)
@@ -174,26 +163,15 @@ def compute_item_drf(
         - 'info_ref': Item information functions for reference (n_items x n_points)
         - 'info_focal': Item information functions for focal (n_items x n_points)
     """
-    from mirt import fit_mirt
-
     data = np.asarray(data)
     groups = np.asarray(groups)
     n_items = data.shape[1]
 
-    unique_groups = np.unique(groups)
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
-
-    ref_result = fit_mirt(ref_data, model=model, verbose=False, **fit_kwargs)
-    focal_result = fit_mirt(focal_data, model=model, verbose=False, **fit_kwargs)
-
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_points)
-    theta_2d = theta_grid.reshape(-1, 1)
+    ref_data, focal_data, _, _, _, _ = split_groups(data, groups)
+    ref_result, focal_result = fit_group_models(
+        ref_data, focal_data, model=model, **fit_kwargs
+    )
+    theta_grid, theta_2d = create_theta_grid(theta_range, n_points)
 
     info_ref_all = ref_result.model.information(theta_2d)
     info_focal_all = focal_result.model.information(theta_2d)
@@ -237,7 +215,7 @@ def plot_drf(
         raise ImportError("matplotlib required for plotting")
 
     if ax is None:
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        _, axes = plt.subplots(1, 2, figsize=(12, 5))
     else:
         axes = [ax, ax.twinx()]
 
@@ -319,17 +297,8 @@ def reliability_invariance(
     data = np.asarray(data)
     groups = np.asarray(groups)
 
-    unique_groups = np.unique(groups)
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
-    ref_data = data[ref_mask]
-    focal_data = data[focal_mask]
-
-    ref_result = fit_mirt(ref_data, model=model, verbose=False)
-    focal_result = fit_mirt(focal_data, model=model, verbose=False)
+    ref_data, focal_data, _, _, _, _ = split_groups(data, groups)
+    ref_result, focal_result = fit_group_models(ref_data, focal_data, model=model)
 
     rel_ref = _compute_marginal_reliability(ref_result.model, (-4, 4))
     rel_focal = _compute_marginal_reliability(focal_result.model, (-4, 4))

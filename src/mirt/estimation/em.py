@@ -13,11 +13,6 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
-def _is_polytomous(model: BaseItemModel) -> bool:
-    """Check if a model is polytomous (has n_categories attribute)."""
-    return hasattr(model, "_n_categories")
-
-
 class EMEstimator(BaseEstimator):
     def __init__(
         self,
@@ -165,7 +160,7 @@ class EMEstimator(BaseEstimator):
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
-        if _is_polytomous(model):
+        if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k)
 
@@ -356,7 +351,7 @@ class EMEstimator(BaseEstimator):
 
         n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
-        if _is_polytomous(model):
+        if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k_valid)
             r_kc = np.zeros((n_quad, n_categories))

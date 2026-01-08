@@ -280,7 +280,7 @@ class MixedEffectsIRT:
 
         X_with_intercept = np.column_stack([np.ones(len(y)), X])
 
-        beta, residuals, rank, s = np.linalg.lstsq(X_with_intercept, y, rcond=None)
+        beta, residuals, _, _ = np.linalg.lstsq(X_with_intercept, y, rcond=None)
 
         effects = beta[1:]
 
@@ -310,7 +310,7 @@ class MixedEffectsIRT:
 
         W_with_intercept = np.column_stack([np.ones(len(b)), W])
 
-        gamma, residuals, rank, s = np.linalg.lstsq(W_with_intercept, b, rcond=None)
+        gamma, residuals, _, _ = np.linalg.lstsq(W_with_intercept, b, rcond=None)
 
         effects = gamma[1:]
 
@@ -445,9 +445,7 @@ class LLTM:
         rasch_result = fit_mirt(responses, model="1PL", verbose=False)
         b_rasch = rasch_result.model.parameters["difficulty"]
 
-        self._eta, residuals, rank, s = np.linalg.lstsq(
-            self._q_matrix, b_rasch, rcond=None
-        )
+        self._eta, _, _, _ = np.linalg.lstsq(self._q_matrix, b_rasch, rcond=None)
 
         b_lltm = self._q_matrix @ self._eta
 
