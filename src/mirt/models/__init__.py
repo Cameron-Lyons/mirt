@@ -9,6 +9,13 @@ from mirt.models.compensatory import (
     NoncompensatoryModel,
     PartiallyCompensatoryModel,
 )
+from mirt.models.custom import (
+    CustomItemModel,
+    ItemTypeSpec,
+    create_item_type,
+    get_standard_item_type,
+    list_standard_item_types,
+)
 from mirt.models.dichotomous import (
     ComplementaryLogLog,
     FiveParameterLogistic,
@@ -74,4 +81,9 @@ __all__ = [
     "MonotonicSplineModel",
     "MonotonicPolynomialModel",
     "KernelSmoothingModel",
+    "CustomItemModel",
+    "ItemTypeSpec",
+    "create_item_type",
+    "get_standard_item_type",
+    "list_standard_item_types",
 ]

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,6 +9,7 @@ from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
+    from mirt.estimation.latent_density import LatentDensity
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -20,6 +21,9 @@ class EMEstimator(BaseEstimator):
         max_iter: int = 500,
         tol: float = 1e-4,
         verbose: bool = False,
+        latent_density: LatentDensity
+        | Literal["gaussian", "empirical", "davidian", "mixture"]
+        | None = None,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -28,6 +32,8 @@ class EMEstimator(BaseEstimator):
 
         self.n_quadpts = n_quadpts
         self._quadrature: GaussHermiteQuadrature | None = None
+        self._latent_density_spec = latent_density
+        self._latent_density: LatentDensity | None = None
 
     def fit(
         self,
@@ -36,6 +42,7 @@ class EMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
     ) -> FitResult:
+        from mirt.estimation.latent_density import GaussianDensity, create_density
         from mirt.results.fit_result import FitResult
 
         responses = self._validate_responses(responses, model.n_items)
@@ -51,6 +58,20 @@ class EMEstimator(BaseEstimator):
         if prior_cov is None:
             prior_cov = np.eye(model.n_factors)
 
+        if self._latent_density_spec is None:
+            self._latent_density = GaussianDensity(
+                mean=prior_mean,
+                cov=prior_cov,
+                n_dimensions=model.n_factors,
+            )
+        elif isinstance(self._latent_density_spec, str):
+            self._latent_density = create_density(
+                self._latent_density_spec,
+                n_dimensions=model.n_factors,
+            )
+        else:
+            self._latent_density = self._latent_density_spec
+
         if not model._is_fitted:
             model._initialize_parameters()
 
@@ -58,9 +79,7 @@ class EMEstimator(BaseEstimator):
         prev_ll = -np.inf
 
         for iteration in range(self.max_iter):
-            posterior_weights, marginal_ll = self._e_step(
-                model, responses, prior_mean, prior_cov
-            )
+            posterior_weights, marginal_ll = self._e_step(model, responses)
 
             current_ll = np.sum(np.log(marginal_ll + 1e-300))
             self._convergence_history.append(current_ll)
@@ -76,13 +95,16 @@ class EMEstimator(BaseEstimator):
 
             self._m_step(model, responses, posterior_weights)
 
+            n_k = posterior_weights.sum(axis=0)
+            self._latent_density.update(self._quadrature.nodes, n_k)
+
         model._is_fitted = True
 
         standard_errors = self._compute_standard_errors(
             model, responses, posterior_weights
         )
 
-        n_params = model.n_parameters
+        n_params = model.n_parameters + self._latent_density.n_parameters
         aic = self._compute_aic(current_ll, n_params)
         bic = self._compute_bic(current_ll, n_params, n_persons)
 
@@ -102,8 +124,6 @@ class EMEstimator(BaseEstimator):
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
-        prior_mean: NDArray[np.float64],
-        prior_cov: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
@@ -116,7 +136,7 @@ class EMEstimator(BaseEstimator):
             theta_q = np.tile(quad_points[q], (n_persons, 1))
             log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
 
-        log_prior = self._log_multivariate_normal(quad_points, prior_mean, prior_cov)
+        log_prior = self._latent_density.log_density(quad_points)
 
         log_joint = log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
 

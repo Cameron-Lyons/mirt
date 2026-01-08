@@ -5,6 +5,7 @@ from numpy.typing import NDArray
 
 from mirt.results.score_result import ScoreResult
 from mirt.scoring.eap import EAPScorer
+from mirt.scoring.eapsum import EAPSumScorer, eapsum, sum_score_to_theta
 from mirt.scoring.map import MAPScorer
 from mirt.scoring.ml import MLScorer
 from mirt.scoring.wle import WLEScorer
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 def fscores(
     model_or_result: "BaseItemModel | FitResult",
     responses: NDArray[np.int_],
-    method: Literal["EAP", "MAP", "ML", "WLE"] = "EAP",
+    method: Literal["EAP", "MAP", "ML", "WLE", "EAPsum"] = "EAP",
     n_quadpts: int = 49,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
@@ -48,6 +49,12 @@ def fscores(
             prior_mean=prior_mean,
             prior_cov=prior_cov,
         )
+    elif method == "EAPsum":
+        scorer = EAPSumScorer(
+            n_quadpts=n_quadpts,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
     elif method == "MAP":
         scorer = MAPScorer(
             prior_mean=prior_mean,
@@ -69,7 +76,10 @@ def fscores(
 __all__ = [
     "fscores",
     "EAPScorer",
+    "EAPSumScorer",
     "MAPScorer",
     "MLScorer",
     "WLEScorer",
+    "eapsum",
+    "sum_score_to_theta",
 ]
