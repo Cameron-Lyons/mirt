@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from mirt.multigroup.multigroup import compare_invariance, fit_multigroup
+from mirt.multigroup import compare_invariance, fit_multigroup
 
 
 class TestMultigroupAnalysis:
