@@ -126,14 +126,10 @@ class WLEScorer:
         def neg_weighted_log_likelihood(theta: float) -> float:
             theta_arr = np.array([[theta]])
 
-            # Log-likelihood
             ll = model.log_likelihood(responses[None, :], theta_arr)[0]
 
-            # Test information
             info = self._test_information(model, theta_arr, valid_mask)[0]
 
-            # WLE criterion: log L(theta) + 0.5 * log I(theta)
-            # Adding log sqrt(I) = 0.5 * log(I)
             if info > 1e-10:
                 wl = ll + 0.5 * np.log(info)
             else:
@@ -141,7 +137,6 @@ class WLEScorer:
 
             return -wl
 
-        # Optimize to find WLE estimate
         result = minimize_scalar(
             neg_weighted_log_likelihood,
             bounds=self.bounds,
@@ -151,7 +146,6 @@ class WLEScorer:
 
         theta_hat = result.x
 
-        # Standard error from test information at WLE estimate
         theta_arr = np.array([[theta_hat]])
         info = self._test_information(model, theta_arr, valid_mask)[0]
 
@@ -210,7 +204,6 @@ class WLEScorer:
 
                 return -wl
 
-            # Initial guess at origin
             x0 = np.zeros(n_factors)
 
             result = minimize(
@@ -223,7 +216,6 @@ class WLEScorer:
 
             theta_wle[i] = result.x
 
-            # Approximate SE from information matrix
             theta_arr = result.x.reshape(1, -1)
             info = self._test_information(model, theta_arr, valid_mask)[0]
 

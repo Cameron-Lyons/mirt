@@ -149,7 +149,6 @@ def compute_residuals(
     for j in range(n_items):
         probs = model.probability(theta, j)
 
-        # Handle polytomous
         if probs.ndim == 2:
             n_cats = probs.shape[1]
             expected = np.sum(probs * np.arange(n_cats), axis=1)
@@ -172,7 +171,6 @@ def compute_residuals(
         elif residual_type == "pearson":
             residuals[valid, j] = raw / np.sqrt(exp_valid + 1e-10)
         elif residual_type == "deviance":
-            # Deviance residual
             with np.errstate(divide="ignore", invalid="ignore"):
                 if probs.ndim == 2:
                     p_obs = probs[valid, observed]
@@ -223,13 +221,11 @@ def analyze_residuals(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    # Compute all residual types
     raw = compute_residuals(model, responses, theta, "raw")
     standardized = compute_residuals(model, responses, theta, "standardized")
     pearson = compute_residuals(model, responses, theta, "pearson")
     deviance = compute_residuals(model, responses, theta, "deviance")
 
-    # Expected values
     expected = np.zeros((n_persons, n_items))
     for j in range(n_items):
         probs = model.probability(theta, j)
@@ -238,7 +234,6 @@ def analyze_residuals(
         else:
             expected[:, j] = probs
 
-    # Item-level statistics
     item_residuals = {}
     for j in range(n_items):
         valid = ~np.isnan(standardized[:, j])
@@ -249,7 +244,6 @@ def analyze_residuals(
             "max_abs_z": float(np.max(np.abs(z_j))) if len(z_j) > 0 else 0,
         }
 
-    # Response pattern statistics
     pattern_residuals = {}
     for i in range(n_persons):
         pattern = tuple(responses[i])
@@ -269,7 +263,6 @@ def analyze_residuals(
         pattern_residuals[pattern]["n"] += np.sum(valid)
         pattern_residuals[pattern]["count"] += 1
 
-    # Compute pattern statistics
     for pattern, stats in pattern_residuals.items():
         if stats["n"] > 0:
             stats["mean_z"] = stats["sum_z"] / stats["n"]
@@ -329,7 +322,6 @@ def compute_outfit_infit(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    # Compute standardized residuals and variances
     z_sq = np.zeros((n_persons, n_items))
     variances = np.zeros((n_persons, n_items))
 
@@ -351,18 +343,15 @@ def compute_outfit_infit(
         z_sq[valid, j] = (raw**2) / (var[valid] + 1e-10)
         variances[valid, j] = var[valid]
 
-    # Mark missing as NaN
     missing = responses < 0
     z_sq[missing] = np.nan
     variances[missing] = np.nan
 
-    # Item statistics
     item_outfit = np.nanmean(z_sq, axis=0)
     item_infit = np.nansum(z_sq * variances, axis=0) / (
         np.nansum(variances, axis=0) + 1e-10
     )
 
-    # Person statistics
     person_outfit = np.nanmean(z_sq, axis=1)
     person_infit = np.nansum(z_sq * variances, axis=1) / (
         np.nansum(variances, axis=1) + 1e-10
@@ -406,7 +395,6 @@ def identify_misfitting_patterns(
     analysis = analyze_residuals(model, responses, theta)
     fit_stats = compute_outfit_infit(model, responses, theta)
 
-    # Misfitting items
     misfitting_items = []
     for j in range(responses.shape[1]):
         if fit_stats["item_outfit"][j] > outfit_threshold:
@@ -418,7 +406,6 @@ def identify_misfitting_patterns(
                 }
             )
 
-    # Misfitting persons
     misfitting_persons = []
     for i in range(responses.shape[0]):
         if fit_stats["person_outfit"][i] > outfit_threshold:
@@ -430,7 +417,6 @@ def identify_misfitting_patterns(
                 }
             )
 
-    # Aberrant responses (large residuals)
     aberrant = []
     z = analysis.standardized_residuals
     for i in range(responses.shape[0]):

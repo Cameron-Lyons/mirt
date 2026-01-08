@@ -33,7 +33,6 @@ from mirt.estimation.weighted import (
 )
 
 __all__ = [
-    # Estimators
     "BaseEstimator",
     "EMEstimator",
     "GaussHermiteQuadrature",
@@ -41,15 +40,12 @@ __all__ = [
     "QMCEMEstimator",
     "StochasticEMEstimator",
     "WeightedEMEstimator",
-    # Utility functions
     "compute_effective_sample_size",
     "compute_design_effect",
-    # Standard errors
     "compute_observed_information",
     "compute_sandwich_se",
     "compute_oakes_se",
     "compute_sem_se",
-    # Priors
     "Prior",
     "NormalPrior",
     "TruncatedNormalPrior",

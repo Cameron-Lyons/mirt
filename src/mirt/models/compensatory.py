@@ -65,8 +65,7 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones((self.n_items, self.n_factors))
         self._parameters["difficulty"] = np.zeros((self.n_items, self.n_factors))
-        # Compensation of 1.0 = fully compensatory (standard MIRT)
-        # Compensation of 0.0 = fully non-compensatory (conjunctive)
+
         self._parameters["compensation"] = np.full((self.n_items, self.n_factors), 0.5)
 
     @property
@@ -94,17 +93,15 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
         c = self._parameters["compensation"]
 
         if item_idx is not None:
-            # Single item
             prob = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[item_idx, k] * (theta[:, k] - b[item_idx, k])
                 p_k = 1.0 / (1.0 + np.exp(-z_k))
-                # Weighted geometric mean via compensation parameter
+
                 prob *= np.power(p_k, c[item_idx, k])
 
             return prob
 
-        # All items
         probs = np.ones((n_persons, self.n_items))
         for j in range(self.n_items):
             for k in range(self.n_factors):
@@ -119,7 +116,6 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        # Numerical approximation for information
         theta = self._ensure_theta_2d(theta)
         p = self.probability(theta, item_idx)
 
@@ -280,7 +276,6 @@ class DisjunctiveModel(DichotomousItemModel):
         b = self._parameters["difficulty"]
 
         if item_idx is not None:
-            # P(fail all) = prod_k P(fail k)
             p_fail_all = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[item_idx, k] * (theta[:, k] - b[item_idx, k])

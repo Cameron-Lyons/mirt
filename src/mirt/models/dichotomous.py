@@ -383,7 +383,6 @@ class FiveParameterLogistic(DichotomousItemModel):
         theta = self._ensure_theta_2d(theta)
         p = self.probability(theta, item_idx)
 
-        # Numerical derivative for information
         h = 1e-5
         theta_plus = theta + h
         theta_minus = theta - h
@@ -393,7 +392,6 @@ class FiveParameterLogistic(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        # Information = (dp/dtheta)^2 / (p * q)
         return (dp**2) / (p * (1 - p) + 1e-10)
 
 
@@ -492,7 +490,6 @@ class ComplementaryLogLog(DichotomousItemModel):
             p = 1.0 - exp_neg_exp_z
             q = exp_neg_exp_z
 
-            # Derivative of CLL: dp/dtheta = a * exp(z) * exp(-exp(z))
             dp = a[item_idx] * exp_z * exp_neg_exp_z
 
             return (dp**2) / (p * q + 1e-10)

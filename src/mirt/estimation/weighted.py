@@ -108,7 +108,6 @@ class WeightedEMEstimator(EMEstimator):
         responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
 
-        # Handle weights
         if weights is None:
             weights = np.ones(n_persons)
         else:
@@ -147,7 +146,6 @@ class WeightedEMEstimator(EMEstimator):
                 model, responses, prior_mean, prior_cov, weights
             )
 
-            # Weighted log-likelihood
             current_ll = np.sum(weights * np.log(marginal_ll + 1e-300))
             self._convergence_history.append(current_ll)
 
@@ -164,7 +162,6 @@ class WeightedEMEstimator(EMEstimator):
 
         model._is_fitted = True
 
-        # Compute weighted standard errors
         standard_errors = self._compute_weighted_standard_errors(
             model, responses, posterior_weights, weights
         )
@@ -229,7 +226,6 @@ class WeightedEMEstimator(EMEstimator):
         quad_points = self._quadrature.nodes
         n_items = model.n_items
 
-        # Weight the posterior by survey weights
         weighted_posterior = posterior_weights * survey_weights[:, None]
         n_k = weighted_posterior.sum(axis=0)
 
@@ -308,7 +304,7 @@ class WeightedEMEstimator(EMEstimator):
         survey_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
         """Compute design-based standard errors."""
-        # For weighted estimation, use sandwich estimator
+
         standard_errors: dict[str, NDArray[np.float64]] = {}
 
         for name, values in model.parameters.items():
@@ -316,7 +312,6 @@ class WeightedEMEstimator(EMEstimator):
                 standard_errors[name] = np.zeros_like(values)
                 continue
 
-            # Basic SE computation (can be enhanced with sandwich)
             se = np.zeros_like(values)
 
             for item_idx in range(model.n_items):

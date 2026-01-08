@@ -77,17 +77,15 @@ class TwoPLNestedLogit(PolytomousItemModel):
             self._correct = list(correct_response)
 
     def _initialize_parameters(self) -> None:
-        # Parameters for correct/incorrect
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
-        # Parameters for distractor choice
         max_cats = max(self._n_categories)
         self._parameters["distractor_slopes"] = np.zeros((self.n_items, max_cats))
         self._parameters["distractor_intercepts"] = np.zeros((self.n_items, max_cats))
 
         for i, n_cat in enumerate(self._n_categories):
-            n_dist = n_cat - 1  # Number of distractors
+            n_dist = n_cat - 1
             if n_dist > 0:
                 self._parameters["distractor_intercepts"][i, :n_cat] = np.linspace(
                     -0.5, 0.5, n_cat
@@ -118,24 +116,19 @@ class TwoPLNestedLogit(PolytomousItemModel):
         a = self._parameters["discrimination"][item_idx]
         b = self._parameters["difficulty"][item_idx]
 
-        # Probability of correct response
         z = a * (theta_1d - b)
         p_correct = 1.0 / (1.0 + np.exp(-z))
 
         if category == correct_idx:
             return p_correct
 
-        # Probability of this distractor given incorrect
         d_slopes = self._parameters["distractor_slopes"][item_idx, :n_cat]
         d_intercepts = self._parameters["distractor_intercepts"][item_idx, :n_cat]
 
-        # Compute distractor logits (excluding correct response)
         distractor_logits = d_slopes * theta_1d[:, None] + d_intercepts
 
-        # Set correct response logit to -inf (won't be chosen in distractor model)
         distractor_logits[:, correct_idx] = -np.inf
 
-        # Softmax for distractors
         max_logits = np.max(distractor_logits, axis=1, keepdims=True)
         exp_logits = np.exp(distractor_logits - max_logits)
         p_distractor_given_incorrect = exp_logits / np.sum(
@@ -152,7 +145,6 @@ class TwoPLNestedLogit(PolytomousItemModel):
         n_cat = self._n_categories[item_idx]
         probs = self.probability(theta, item_idx)
 
-        # Score for correct response
         correct_idx = self._correct[item_idx]
         scores = np.zeros(n_cat)
         scores[correct_idx] = 1
@@ -199,7 +191,6 @@ class ThreePLNestedLogit(TwoPLNestedLogit):
         b = self._parameters["difficulty"][item_idx]
         c = self._parameters["guessing"][item_idx]
 
-        # 3PL probability of correct
         z = a * (theta_1d - b)
         p_star = 1.0 / (1.0 + np.exp(-z))
         p_correct = c + (1.0 - c) * p_star
@@ -207,7 +198,6 @@ class ThreePLNestedLogit(TwoPLNestedLogit):
         if category == correct_idx:
             return p_correct
 
-        # Distractor probabilities
         d_slopes = self._parameters["distractor_slopes"][item_idx, :n_cat]
         d_intercepts = self._parameters["distractor_intercepts"][item_idx, :n_cat]
 
@@ -258,7 +248,6 @@ class FourPLNestedLogit(ThreePLNestedLogit):
         c = self._parameters["guessing"][item_idx]
         d = self._parameters["upper"][item_idx]
 
-        # 4PL probability of correct
         z = a * (theta_1d - b)
         p_star = 1.0 / (1.0 + np.exp(-z))
         p_correct = c + (d - c) * p_star
@@ -266,7 +255,6 @@ class FourPLNestedLogit(ThreePLNestedLogit):
         if category == correct_idx:
             return p_correct
 
-        # Distractor probabilities
         d_slopes = self._parameters["distractor_slopes"][item_idx, :n_cat]
         d_intercepts = self._parameters["distractor_intercepts"][item_idx, :n_cat]
 

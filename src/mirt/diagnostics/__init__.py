@@ -22,14 +22,12 @@ __all__ = [
     "compute_personfit",
     "compute_dif",
     "flag_dif_items",
-    # Local dependence
     "compute_ld_statistics",
     "compute_q3",
     "compute_ld_chi2",
     "flag_ld_pairs",
     "ld_summary_table",
     "LDResult",
-    # Residuals
     "compute_residuals",
     "analyze_residuals",
     "compute_outfit_infit",

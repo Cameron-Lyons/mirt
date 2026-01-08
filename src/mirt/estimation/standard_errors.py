@@ -56,11 +56,10 @@ def compute_observed_information(
     ndarray
         Observed information matrix
     """
-    # Get all parameters as flat vector
+
     params_flat, param_shapes = _flatten_parameters(model)
     n_params = len(params_flat)
 
-    # Compute Hessian numerically
     hessian = np.zeros((n_params, n_params))
 
     ll_center = _complete_data_log_likelihood(
@@ -70,7 +69,6 @@ def compute_observed_information(
     for i in range(n_params):
         for j in range(i, n_params):
             if i == j:
-                # Diagonal: second derivative
                 params_plus = params_flat.copy()
                 params_plus[i] += h
                 params_minus = params_flat.copy()
@@ -88,7 +86,6 @@ def compute_observed_information(
 
                 hessian[i, i] = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
             else:
-                # Off-diagonal: mixed partial
                 params_pp = params_flat.copy()
                 params_pp[i] += h
                 params_pp[j] += h
@@ -128,10 +125,8 @@ def compute_observed_information(
                 hessian[i, j] = (ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
                 hessian[j, i] = hessian[i, j]
 
-    # Restore original parameters
     _set_flat_parameters(model, params_flat, param_shapes)
 
-    # Information is negative Hessian
     return -hessian
 
 
@@ -175,19 +170,15 @@ def compute_sandwich_se(
     if survey_weights is None:
         survey_weights = np.ones(n_persons)
 
-    # Get parameters and their structure
     params_flat, param_shapes = _flatten_parameters(model)
     n_params = len(params_flat)
 
-    # Compute score contributions for each person
     scores = _compute_person_scores(
         model, responses, posterior_weights, quadrature, params_flat, param_shapes
     )
 
-    # Weight scores by survey weights
     weighted_scores = scores * survey_weights[:, None]
 
-    # Bread: inverse of expected information (J^-1)
     J = compute_observed_information(model, responses, posterior_weights, quadrature)
 
     try:
@@ -195,15 +186,12 @@ def compute_sandwich_se(
     except np.linalg.LinAlgError:
         J_inv = np.linalg.pinv(J)
 
-    # Meat: variance of weighted scores
     V = np.zeros((n_params, n_params))
     for i in range(n_persons):
         V += np.outer(weighted_scores[i], weighted_scores[i])
 
-    # Sandwich covariance
     sandwich_cov = J_inv @ V @ J_inv
 
-    # Extract diagonal and reshape to parameter structure
     variances = np.diag(sandwich_cov)
     se_flat = np.sqrt(np.maximum(variances, 0))
 
@@ -253,21 +241,16 @@ def compute_oakes_se(
     """
     params_flat, param_shapes = _flatten_parameters(model)
 
-    # Complete-data information
     I_comp = _compute_complete_data_information(
         model, responses, posterior_weights, quadrature, h
     )
 
-    # Missing information via Oakes formula
-    # I_miss = -E[d²Q/dθdθ'] where Q is the E-step objective
     I_miss = _compute_missing_information_oakes(
         model, responses, posterior_weights, quadrature, params_flat, param_shapes, h
     )
 
-    # Observed information
     I_obs = I_comp - I_miss
 
-    # Compute standard errors
     try:
         I_obs_inv = np.linalg.inv(I_obs)
     except np.linalg.LinAlgError:
@@ -317,38 +300,30 @@ def compute_sem_se(
     params_flat, param_shapes = _flatten_parameters(model)
     n_params = len(params_flat)
 
-    # Compute complete-data information
     I_comp = _compute_complete_data_information(
         model, responses, posterior_weights, quadrature
     )
 
-    # Estimate EM rate matrix DM via perturbation
     DM = np.zeros((n_params, n_params))
     perturbation_scale = 0.01
 
     for _ in range(n_bootstrap):
-        # Perturb parameters
         perturbation = rng.normal(0, perturbation_scale, n_params)
         perturbed_params = params_flat + perturbation
 
-        # One M-step iteration from perturbed start
         _set_flat_parameters(model, perturbed_params, param_shapes)
 
-        # Get M-step update direction (simplified)
         new_params = _one_m_step_iteration(
             model, responses, posterior_weights, quadrature, param_shapes
         )
 
-        # Accumulate rate estimate
         direction = (new_params - perturbed_params) / perturbation_scale
         DM += np.outer(direction, perturbation / perturbation_scale)
 
     DM /= n_bootstrap
 
-    # Restore original parameters
     _set_flat_parameters(model, params_flat, param_shapes)
 
-    # SEM information: I_obs = I_comp @ (I - DM)^-1
     I_minus_DM = np.eye(n_params) - DM
 
     try:
@@ -358,7 +333,6 @@ def compute_sem_se(
 
     I_obs = I_comp @ I_minus_DM_inv
 
-    # Standard errors
     try:
         I_obs_inv = np.linalg.inv(I_obs)
     except np.linalg.LinAlgError:
@@ -368,9 +342,6 @@ def compute_sem_se(
     se_flat = np.sqrt(np.maximum(variances, 0))
 
     return _unflatten_se(se_flat, param_shapes, model)
-
-
-# Helper functions
 
 
 def _flatten_parameters(
@@ -436,7 +407,6 @@ def _complete_data_log_likelihood(
         weighted_posterior = posterior_weights[valid_mask]
 
         if hasattr(model, "_n_categories"):
-            # Polytomous
             n_categories = model._n_categories[item_idx]
             for c in range(n_categories):
                 cat_mask = item_responses[valid_mask] == c
@@ -446,7 +416,6 @@ def _complete_data_log_likelihood(
                 probs = np.clip(probs[:, c], 1e-10, 1 - 1e-10)
                 ll += np.sum(r_kc * np.log(probs))
         else:
-            # Dichotomous
             r_k = np.sum(
                 item_responses[valid_mask, None] * weighted_posterior,
                 axis=0,
@@ -476,7 +445,6 @@ def _compute_person_scores(
 
     scores = np.zeros((n_persons, n_params))
 
-    # Numerical gradient for each person
     for p in range(n_params):
         params_plus = params_flat.copy()
         params_plus[p] += h
@@ -495,7 +463,6 @@ def _compute_person_scores(
 
         scores[:, p] = (ll_plus - ll_minus) / (2 * h)
 
-    # Restore parameters
     _set_flat_parameters(model, params_flat, param_shapes)
 
     return scores
@@ -631,15 +598,10 @@ def _compute_missing_information_oakes(
     n_params = len(params_flat)
     I_miss = np.zeros((n_params, n_params))
 
-    # Oakes: I_miss[i,j] = -E[d/dθ_i (d log L_c / dθ_j)]
-    # This involves computing how the score changes with theta
-
-    # Simplified approximation using score variance
     scores = _compute_person_scores(
         model, responses, posterior_weights, quadrature, params_flat, param_shapes, h
     )
 
-    # Missing information approximated by score covariance
     score_means = scores.mean(axis=0)
     for i in range(scores.shape[0]):
         centered = scores[i] - score_means
@@ -660,14 +622,11 @@ def _one_m_step_iteration(
     """Perform one M-step iteration and return updated parameters."""
     from mirt.estimation.em import EMEstimator
 
-    # Create temporary estimator
     estimator = EMEstimator(n_quadpts=len(quadrature.weights))
     estimator._quadrature = quadrature
 
-    # Run M-step
     estimator._m_step(model, responses, posterior_weights)
 
-    # Get updated parameters
     new_params, _ = _flatten_parameters(model)
 
     return new_params
