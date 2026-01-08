@@ -118,23 +118,18 @@ class SequentialResponseModel(PolytomousItemModel):
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
-        # Probability of passing each step
         step_probs = []
         for j in range(n_cat - 1):
             step_probs.append(self._step_probability(theta_1d, item_idx, j))
 
-        # Category 0: fail first step
         if category == 0:
             return 1.0 - step_probs[0]
 
-        # Category k: pass steps 0..k-1, fail step k (or reach end)
         prob = np.ones_like(theta_1d)
 
-        # Pass all steps up to category
         for j in range(category):
             prob *= step_probs[j]
 
-        # Fail step k (unless highest category)
         if category < n_cat - 1:
             prob *= 1.0 - step_probs[category]
 
@@ -227,19 +222,14 @@ class ContinuationRatioModel(PolytomousItemModel):
         a = self._parameters["discrimination"][item_idx]
         b = self._parameters["thresholds"][item_idx]
 
-        # Compute continuation ratio probabilities
-        # P(X >= k | X >= k-1) = logistic(a(theta - b_k))
         cr_probs = []
         for k in range(n_cat - 1):
             z = a * (theta_1d - b[k])
             cr_probs.append(1.0 / (1.0 + np.exp(-z)))
 
-        # P(X = 0) = 1 - P(X >= 1)
         if category == 0:
             return 1.0 - cr_probs[0]
 
-        # P(X = k) = P(X >= k) - P(X >= k+1)
-        # P(X >= k) = prod_{j=1}^{k} P(X >= j | X >= j-1)
         p_geq_k = np.ones_like(theta_1d)
         for j in range(category):
             p_geq_k *= cr_probs[j]
@@ -328,12 +318,10 @@ class AdjacentCategoryModel(PolytomousItemModel):
         a = self._parameters["discrimination"][item_idx]
         b = self._parameters["thresholds"][item_idx]
 
-        # Compute log-odds ratios: log(P_k / P_0) = sum_{j=1}^k a(theta - b_j)
         log_ratios = np.zeros((n_persons, n_cat))
         for k in range(1, n_cat):
             log_ratios[:, k] = log_ratios[:, k - 1] + a * (theta_1d - b[k - 1])
 
-        # Convert to probabilities via softmax
         log_ratios_max = np.max(log_ratios, axis=1, keepdims=True)
         exp_ratios = np.exp(log_ratios - log_ratios_max)
         probs = exp_ratios / np.sum(exp_ratios, axis=1, keepdims=True)

@@ -133,7 +133,6 @@ class TruncatedNormalPrior(Prior):
         self.lower = lower
         self.upper = upper
 
-        # Standardized bounds
         a = (lower - mu) / sigma
         b = (upper - mu) / sigma
         self._dist = stats.truncnorm(a, b, loc=mu, scale=sigma)
@@ -403,11 +402,11 @@ class PriorSpecification:
         Prior for latent abilities
     """
 
-    discrimination: Prior = None  # type: ignore
-    difficulty: Prior = None  # type: ignore
+    discrimination: Prior | None = None
+    difficulty: Prior | None = None
     guessing: Prior | None = None
     upper: Prior | None = None
-    theta: Prior = None  # type: ignore
+    theta: Prior | None = None
 
     def __post_init__(self) -> None:
         if self.discrimination is None:

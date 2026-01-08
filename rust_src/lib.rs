@@ -1,8 +1,3 @@
-//! High-performance Rust backend for MIRT (Multidimensional Item Response Theory)
-//!
-//! This module provides optimized implementations of computationally intensive
-//! IRT algorithms using Rust with PyO3 bindings.
-
 use ndarray::{Array1, Array2, Array3};
 use numpy::{
     PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray,
@@ -16,7 +11,6 @@ use rayon::prelude::*;
 const LOG_2_PI: f64 = 1.8378770664093453;
 const EPSILON: f64 = 1e-10;
 
-/// Numerically stable log-sum-exp
 #[inline]
 fn logsumexp(arr: &[f64]) -> f64 {
     if arr.is_empty() {
@@ -30,7 +24,6 @@ fn logsumexp(arr: &[f64]) -> f64 {
     max_val + sum.ln()
 }
 
-/// Logistic sigmoid function
 #[inline]
 fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
@@ -41,7 +34,6 @@ fn sigmoid(x: f64) -> f64 {
     }
 }
 
-/// Log of logistic sigmoid (numerically stable)
 #[inline]
 fn log_sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
@@ -51,13 +43,11 @@ fn log_sigmoid(x: f64) -> f64 {
     }
 }
 
-/// Clip value to range
 #[inline]
 fn clip(x: f64, min: f64, max: f64) -> f64 {
     x.max(min).min(max)
 }
 
-/// Compute log-likelihood for 2PL model at single theta point
 #[inline]
 fn log_likelihood_2pl_single(
     responses: &[i32],
@@ -80,7 +70,6 @@ fn log_likelihood_2pl_single(
     ll
 }
 
-/// Compute log-likelihood for 3PL model at single theta point
 #[inline]
 fn log_likelihood_3pl_single(
     responses: &[i32],
@@ -106,8 +95,6 @@ fn log_likelihood_3pl_single(
     ll
 }
 
-/// Compute log-likelihoods for all persons at all quadrature points (2PL)
-/// This is the critical E-step bottleneck
 #[pyfunction]
 fn compute_log_likelihoods_2pl<'py>(
     py: Python<'py>,
@@ -199,7 +186,6 @@ fn compute_log_likelihoods_3pl<'py>(
     result.to_pyarray(py)
 }
 
-/// Compute log-likelihoods for multidimensional 2PL (MIRT)
 #[pyfunction]
 fn compute_log_likelihoods_mirt<'py>(
     py: Python<'py>,
@@ -397,7 +383,6 @@ fn compute_expected_counts_polytomous<'py>(
     r_kc.to_pyarray(py)
 }
 
-/// Compute SIBTEST beta statistic efficiently
 #[pyfunction]
 fn sibtest_compute_beta<'py>(
     py: Python<'py>,
@@ -518,7 +503,6 @@ fn sibtest_compute_beta<'py>(
     (beta, se, beta_k_arr.to_pyarray(py), n_k_arr.to_pyarray(py))
 }
 
-/// Run SIBTEST for all items in parallel
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn sibtest_all_items<'py>(
@@ -774,7 +758,6 @@ fn simulate_grm<'py>(
     result.to_pyarray(py)
 }
 
-/// Simulate responses from GPCM
 #[pyfunction]
 fn simulate_gpcm<'py>(
     py: Python<'py>,
@@ -894,7 +877,6 @@ fn simulate_dichotomous<'py>(
     result.to_pyarray(py)
 }
 
-/// Generate plausible values using posterior sampling
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 fn generate_plausible_values_posterior<'py>(
@@ -1047,7 +1029,6 @@ fn generate_plausible_values_mcmc<'py>(
     result.to_pyarray(py)
 }
 
-/// Compute observed univariate and bivariate margins
 #[pyfunction]
 fn compute_observed_margins<'py>(
     py: Python<'py>,
@@ -1106,7 +1087,6 @@ fn compute_observed_margins<'py>(
     (obs_uni.to_pyarray(py), obs_bi.to_pyarray(py))
 }
 
-/// Compute expected univariate and bivariate margins under model
 #[pyfunction]
 fn compute_expected_margins<'py>(
     py: Python<'py>,
@@ -1165,7 +1145,6 @@ fn compute_expected_margins<'py>(
     (exp_uni.to_pyarray(py), exp_bi.to_pyarray(py))
 }
 
-/// Generate bootstrap sample indices
 #[pyfunction]
 fn generate_bootstrap_indices<'py>(
     py: Python<'py>,
@@ -1216,7 +1195,6 @@ fn resample_responses<'py>(
     result.to_pyarray(py)
 }
 
-/// Impute missing responses using model probabilities
 #[pyfunction]
 fn impute_from_probabilities<'py>(
     py: Python<'py>,
@@ -1344,7 +1322,6 @@ fn multiple_imputation<'py>(
     result.to_pyarray(py)
 }
 
-/// Compute EAP (Expected A Posteriori) scores
 #[pyfunction]
 fn compute_eap_scores<'py>(
     py: Python<'py>,
@@ -1419,8 +1396,6 @@ fn compute_eap_scores<'py>(
     (theta.to_pyarray(py), se.to_pyarray(py))
 }
 
-/// Complete 2PL EM estimation in Rust
-/// Returns (discrimination, difficulty, log_likelihood, n_iterations, converged)
 #[pyfunction]
 fn em_fit_2pl<'py>(
     py: Python<'py>,
@@ -1510,7 +1485,6 @@ fn em_fit_2pl<'py>(
     )
 }
 
-/// Internal E-step computation
 #[allow(clippy::too_many_arguments)]
 fn e_step_2pl_internal(
     responses: &ndarray::ArrayView2<i32>,
@@ -1565,7 +1539,6 @@ fn e_step_2pl_internal(
     (posterior_weights, marginal_ll)
 }
 
-/// Internal M-step computation with parallel item updates
 #[allow(clippy::too_many_arguments)]
 fn m_step_2pl_internal(
     responses: &ndarray::ArrayView2<i32>,
@@ -1656,7 +1629,6 @@ fn m_step_2pl_internal(
     }
 }
 
-/// Gauss-Hermite quadrature nodes and weights
 fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
     match n {
         11 => {
@@ -1717,8 +1689,6 @@ fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
     }
 }
 
-/// Full Gibbs sampler for 2PL model in Rust
-/// Returns (disc_chain, diff_chain, theta_chain, ll_chain)
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn gibbs_sample_2pl<'py>(
@@ -2013,7 +1983,6 @@ fn compute_total_ll(
         .sum()
 }
 
-/// MHRM estimation for 2PL model
 #[pyfunction]
 fn mhrm_fit_2pl<'py>(
     py: Python<'py>,
@@ -2094,7 +2063,6 @@ fn mhrm_fit_2pl<'py>(
     (disc_arr.to_pyarray(py), diff_arr.to_pyarray(py), ll)
 }
 
-/// Parallel bootstrap estimation
 #[pyfunction]
 fn bootstrap_fit_2pl<'py>(
     py: Python<'py>,
@@ -2195,11 +2163,6 @@ fn bootstrap_fit_2pl<'py>(
     (disc_samples.to_pyarray(py), diff_samples.to_pyarray(py))
 }
 
-// ============================================================================
-// LOCAL DEPENDENCE (LD) STATISTICS
-// ============================================================================
-
-/// Compute standardized residuals for all person-item combinations
 #[pyfunction]
 fn compute_standardized_residuals<'py>(
     py: Python<'py>,
@@ -2361,7 +2324,6 @@ fn compute_ld_chi2_matrix<'py>(
     let chi2_values: Vec<((usize, usize), f64)> = pairs
         .par_iter()
         .map(|&(i, j)| {
-            // Count observed cross-classification
             let mut obs = [[0.0; 2]; 2];
             let mut exp = [[0.0; 2]; 2];
 
@@ -2378,14 +2340,12 @@ fn compute_ld_chi2_matrix<'py>(
 
                 obs[r_i as usize][r_j as usize] += 1.0;
 
-                // Expected under local independence
                 exp[0][0] += (1.0 - p_i) * (1.0 - p_j);
                 exp[0][1] += (1.0 - p_i) * p_j;
                 exp[1][0] += p_i * (1.0 - p_j);
                 exp[1][1] += p_i * p_j;
             }
 
-            // Compute chi-square
             let mut chi2 = 0.0;
             for a in 0..2 {
                 for b in 0..2 {
@@ -2407,16 +2367,11 @@ fn compute_ld_chi2_matrix<'py>(
     chi2_matrix.to_pyarray(py)
 }
 
-// ============================================================================
-// MONTE CARLO EM (MCEM) E-STEP
-// ============================================================================
-
-/// MCEM E-step: compute log-likelihoods for Monte Carlo samples
 #[pyfunction]
 fn mcem_e_step<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
-    theta_samples: PyReadonlyArray3<f64>, // (n_persons, n_samples, n_factors)
+    theta_samples: PyReadonlyArray3<f64>,
     discrimination: PyReadonlyArray1<f64>,
     difficulty: PyReadonlyArray1<f64>,
 ) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>) {
@@ -2436,7 +2391,6 @@ fn mcem_e_step<'py>(
         .map(|i| {
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
-            // Compute log-likelihood for each sample
             let log_likes: Vec<f64> = (0..n_samples)
                 .map(|s| {
                     let theta_s = theta_samples[[i, s, 0]];
@@ -2444,13 +2398,11 @@ fn mcem_e_step<'py>(
                 })
                 .collect();
 
-            // Importance weights (normalized)
             let max_ll = log_likes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let weights: Vec<f64> = log_likes.iter().map(|&ll| (ll - max_ll).exp()).collect();
             let sum: f64 = weights.iter().sum();
             let normalized: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
 
-            // Marginal likelihood estimate
             let marginal = (sum / n_samples as f64) * max_ll.exp();
 
             (normalized, marginal)
@@ -2473,14 +2425,13 @@ fn mcem_e_step<'py>(
     )
 }
 
-/// Generate QMC samples using Sobol sequence (simplified)
 #[pyfunction]
 fn generate_qmc_samples<'py>(
     py: Python<'py>,
     n_persons: usize,
     n_samples: usize,
     n_factors: usize,
-    _seed: u64, // Reserved for future use with scrambled sequences
+    _seed: u64,
 ) -> Bound<'py, PyArray3<f64>> {
     // Generate quasi-random samples transformed to standard normal
     // Using van der Corput sequence for simplicity
@@ -2714,7 +2665,6 @@ fn weighted_e_step<'py>(
     (posterior_weights.to_pyarray(py), weighted_ll)
 }
 
-/// Weighted M-step expected counts
 #[pyfunction]
 fn weighted_expected_counts<'py>(
     py: Python<'py>,
@@ -2750,11 +2700,6 @@ fn weighted_expected_counts<'py>(
     (r_k.to_pyarray(py), n_k.to_pyarray(py))
 }
 
-// ============================================================================
-// RESPONSE RESIDUALS
-// ============================================================================
-
-/// Compute outfit and infit statistics
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 fn compute_fit_statistics<'py>(
@@ -2777,7 +2722,6 @@ fn compute_fit_statistics<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
 
-    // Compute z² and variances
     let z_sq_var: Vec<Vec<(f64, f64)>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
@@ -2798,7 +2742,6 @@ fn compute_fit_statistics<'py>(
         })
         .collect();
 
-    // Item outfit/infit
     let item_stats: Vec<(f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
@@ -2833,7 +2776,6 @@ fn compute_fit_statistics<'py>(
         })
         .collect();
 
-    // Person outfit/infit
     let person_stats: Vec<(f64, f64)> = z_sq_var
         .par_iter()
         .map(|person_data| {
@@ -2896,11 +2838,6 @@ fn compute_fit_statistics<'py>(
     )
 }
 
-// ============================================================================
-// PARTIALLY COMPENSATORY MODELS
-// ============================================================================
-
-/// Compute probabilities for partially compensatory MIRT model
 #[pyfunction]
 fn compute_partially_compensatory_probs<'py>(
     py: Python<'py>,
@@ -2987,7 +2924,6 @@ fn compute_noncompensatory_probs<'py>(
     result.to_pyarray(py)
 }
 
-/// Compute probabilities for disjunctive MIRT model
 #[pyfunction]
 fn compute_disjunctive_probs<'py>(
     py: Python<'py>,
@@ -3062,19 +2998,15 @@ fn compute_sequential_probs<'py>(
                 let n_cat = n_categories[j] as usize;
                 let a = discrimination[j];
 
-                // Compute step probabilities
                 let mut step_probs = Vec::with_capacity(n_cat - 1);
                 for k in 0..(n_cat - 1) {
                     let z = a * (theta_i - thresholds[[j, k]]);
                     step_probs.push(sigmoid(z));
                 }
 
-                // Compute category probabilities
                 for k in 0..n_cat {
-                    // Must pass all steps up to k
                     let mut prob: f64 = step_probs.iter().take(k).product();
 
-                    // Must fail step k (unless highest category)
                     if k < n_cat - 1 && k < step_probs.len() {
                         prob *= 1.0 - step_probs[k];
                     }

@@ -68,15 +68,11 @@ class MonotonicSplineModel(DichotomousItemModel):
         self._n_basis = n_knots + degree + 1
 
     def _initialize_parameters(self) -> None:
-        # Spline weights (must be non-negative for monotonicity)
-        # Store as log-weights for unconstrained optimization
         self._parameters["log_weights"] = np.zeros((self.n_items, self._n_basis))
 
-        # Lower and upper asymptotes
         self._parameters["lower"] = np.zeros(self.n_items)
         self._parameters["upper"] = np.ones(self.n_items)
 
-        # Knot locations (fixed during estimation typically)
         knots = np.linspace(-3, 3, self.n_knots)
         self._knots = knots
 
@@ -104,7 +100,6 @@ class MonotonicSplineModel(DichotomousItemModel):
         """
         theta = np.asarray(theta).ravel()
 
-        # Full knot sequence with boundary knots
         all_knots = np.concatenate(
             [
                 np.full(self.degree + 1, -4),
@@ -113,28 +108,21 @@ class MonotonicSplineModel(DichotomousItemModel):
             ]
         )
 
-        # Compute I-spline as integral of B-spline
-        # Simplified implementation using cumulative sum approach
         from scipy.interpolate import BSpline
 
-        # B-spline basis
         c = np.zeros(len(all_knots) - self.degree - 1)
         if knot_idx < len(c):
             c[knot_idx] = 1
 
         bspline = BSpline(all_knots, c, self.degree, extrapolate=True)
 
-        # I-spline is cumulative integral of B-spline
-        # Approximate by evaluating at grid and cumsum
         ispline_vals = np.zeros_like(theta)
 
         for i, t in enumerate(theta):
-            # Integrate B-spline from -inf to t
             grid = np.linspace(-4, t, 50)
             b_vals = bspline(grid)
             ispline_vals[i] = np.trapz(b_vals, grid)
 
-        # Normalize to [0, 1]
         max_val = np.trapz(bspline(np.linspace(-4, 4, 100)), np.linspace(-4, 4, 100))
         if max_val > 0:
             ispline_vals = ispline_vals / max_val
@@ -155,17 +143,14 @@ class MonotonicSplineModel(DichotomousItemModel):
         w = self.weights
 
         if item_idx is not None:
-            # Single item: sum of weighted I-splines
             p_star = np.zeros(n_persons)
             for k in range(self._n_basis):
                 basis = self._ispline_basis(theta_1d, k)
                 p_star += w[item_idx, k] * basis
 
-            # Normalize and bound
             p_star = p_star / (np.sum(w[item_idx]) + 1e-10)
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
-        # All items
         probs = np.zeros((n_persons, self.n_items))
         for j in range(self.n_items):
             p_star = np.zeros(n_persons)
@@ -186,7 +171,6 @@ class MonotonicSplineModel(DichotomousItemModel):
         theta = self._ensure_theta_2d(theta)
         p = self.probability(theta, item_idx)
 
-        # Numerical derivative
         h = 1e-5
         p_plus = self.probability(theta + h, item_idx)
         p_minus = self.probability(theta - h, item_idx)
@@ -243,15 +227,11 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         self.degree = degree
 
     def _initialize_parameters(self) -> None:
-        # Polynomial coefficients (log-scale for positivity constraint)
-        # Start with uniform weights
         self._parameters["log_coefficients"] = np.zeros((self.n_items, self.degree + 1))
 
-        # Location/scale for mapping theta to [0, 1]
         self._parameters["location"] = np.zeros(self.n_items)
         self._parameters["scale"] = np.ones(self.n_items)
 
-        # Lower and upper asymptotes
         self._parameters["lower"] = np.zeros(self.n_items)
         self._parameters["upper"] = np.ones(self.n_items)
 
@@ -288,22 +268,18 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         w = self.coefficients
 
         if item_idx is not None:
-            # Map theta to [0, 1] using logistic
             z = scale[item_idx] * (theta_1d - loc[item_idx])
             t = 1.0 / (1.0 + np.exp(-z))
 
-            # Evaluate Bernstein polynomial
             p_star = np.zeros(n_persons)
             for k in range(self.degree + 1):
                 basis = self._bernstein_basis(t, k, self.degree)
                 p_star += w[item_idx, k] * basis
 
-            # Normalize
             p_star = p_star / (np.sum(w[item_idx]) + 1e-10)
 
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
-        # All items
         probs = np.zeros((n_persons, self.n_items))
         for j in range(self.n_items):
             z = scale[j] * (theta_1d - loc[j])
@@ -378,8 +354,6 @@ class KernelSmoothingModel(DichotomousItemModel):
         self._irf_values: NDArray[np.float64] | None = None
 
     def _initialize_parameters(self) -> None:
-        # For kernel smoothing, we store IRF values on a grid
-        # rather than parametric coefficients
         self._theta_grid = np.linspace(-4, 4, 81)
         self._irf_values = np.full((self.n_items, len(self._theta_grid)), 0.5)
 
@@ -408,11 +382,9 @@ class KernelSmoothingModel(DichotomousItemModel):
             theta_j = theta[valid]
 
             for g, t in enumerate(grid):
-                # Gaussian kernel weights
                 weights = np.exp(-0.5 * ((theta_j - t) / self.bandwidth) ** 2)
                 weights_sum = np.sum(weights) + 1e-10
 
-                # Weighted proportion correct
                 self._irf_values[j, g] = np.sum(weights * resp_j) / weights_sum
 
         self._is_fitted = True
@@ -430,7 +402,6 @@ class KernelSmoothingModel(DichotomousItemModel):
         n_persons = len(theta_1d)
 
         if item_idx is not None:
-            # Interpolate IRF at given theta values
             return np.interp(theta_1d, self._theta_grid, self._irf_values[item_idx])
 
         probs = np.zeros((n_persons, self.n_items))

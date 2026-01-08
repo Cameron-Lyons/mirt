@@ -70,7 +70,6 @@ class LDResult:
             "",
         ]
 
-        # Q3 statistics summary
         q3_upper = self.q3_matrix[np.triu_indices_from(self.q3_matrix, k=1)]
         lines.extend(
             [
@@ -91,10 +90,9 @@ class LDResult:
                         f"  {self.item_names[i]} - {self.item_names[j]}: Q3 = {q3:.4f}"
                     )
                 else:
-                    lines.append(f"  Item {i+1} - Item {j+1}: Q3 = {q3:.4f}")
+                    lines.append(f"  Item {i + 1} - Item {j + 1}: Q3 = {q3:.4f}")
             lines.append("")
 
-        # Chi-square statistics summary
         chi2_upper = self.ld_chi2_matrix[np.triu_indices_from(self.ld_chi2_matrix, k=1)]
         lines.extend(
             [
@@ -115,7 +113,7 @@ class LDResult:
                     )
                 else:
                     lines.append(
-                        f"  Item {i+1} - Item {j+1}: χ² = {chi2:.2f}, p = {p:.4f}"
+                        f"  Item {i + 1} - Item {j + 1}: χ² = {chi2:.2f}, p = {p:.4f}"
                     )
             lines.append("")
 
@@ -164,7 +162,6 @@ def compute_ld_statistics(
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
 
-    # Get theta estimates if not provided
     if theta is None:
         from mirt.scoring import fscores
 
@@ -177,21 +174,16 @@ def compute_ld_statistics(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    # Compute residuals
     residuals = _compute_residuals(model, responses, theta)
 
-    # Q3 statistics (residual correlations)
     q3_matrix = _compute_q3(residuals, responses)
 
-    # Adjusted residual correlations
     adj_residual_corr = _compute_adjusted_residual_corr(
         model, responses, theta, n_quadpts
     )
 
-    # LD chi-square and G2 statistics
     ld_chi2_matrix, g2_matrix = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
-    # Flag problematic pairs
     q3_flagged = []
     chi2_flagged = []
 
@@ -201,7 +193,6 @@ def compute_ld_statistics(
                 q3_flagged.append((i, j, float(q3_matrix[i, j])))
 
             if not np.isnan(ld_chi2_matrix[i, j]):
-                # LD chi2 has 1 df for dichotomous items
                 p_value = 1 - stats.chi2.cdf(ld_chi2_matrix[i, j], df=1)
                 if p_value < alpha:
                     chi2_flagged.append(
@@ -327,10 +318,8 @@ def _compute_residuals(
     residuals = np.full((n_persons, n_items), np.nan)
 
     for j in range(n_items):
-        # Get expected probability at each theta
         probs = model.probability(theta, j)
 
-        # For polytomous items, probability returns matrix; use expected score
         if probs.ndim == 2:
             n_cats = probs.shape[1]
             expected = np.sum(probs * np.arange(n_cats), axis=1)
@@ -357,7 +346,6 @@ def _compute_q3(
 
     for i in range(n_items):
         for j in range(i + 1, n_items):
-            # Only use cases with valid responses on both items
             valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
             valid &= ~np.isnan(residuals[:, i]) & ~np.isnan(residuals[:, j])
 
@@ -365,7 +353,6 @@ def _compute_q3(
                 r_i = residuals[valid, i]
                 r_j = residuals[valid, j]
 
-                # Pearson correlation of residuals
                 q3 = np.corrcoef(r_i, r_j)[0, 1]
                 q3_matrix[i, j] = q3
                 q3_matrix[j, i] = q3
@@ -385,14 +372,11 @@ def _compute_adjusted_residual_corr(
     """
     n_items = responses.shape[1]
 
-    # Get Q3 matrix
     residuals = _compute_residuals(model, responses, theta)
     q3 = _compute_q3(residuals, responses)
 
-    # Expected Q3 under local independence is approximately -1/(n_items - 1)
     expected_q3 = -1.0 / (n_items - 1)
 
-    # Adjusted residual correlation
     adj_corr = q3 - expected_q3
 
     return adj_corr
@@ -416,7 +400,6 @@ def _compute_ld_chi2_g2(
 
     for i in range(n_items):
         for j in range(i + 1, n_items):
-            # Only consider dichotomous items for this implementation
             valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
             n_valid = valid.sum()
 
@@ -427,28 +410,22 @@ def _compute_ld_chi2_g2(
             resp_j = responses[valid, j]
             theta_valid = theta[valid]
 
-            # Compute expected probabilities
             prob_i = model.probability(theta_valid, i)
             prob_j = model.probability(theta_valid, j)
 
-            # Handle polytomous case - convert to dichotomous (correct/incorrect)
             if prob_i.ndim == 2:
-                prob_i = 1 - prob_i[:, 0]  # P(X > 0)
+                prob_i = 1 - prob_i[:, 0]
             if prob_j.ndim == 2:
                 prob_j = 1 - prob_j[:, 0]
 
-            # Dichotomize responses if polytomous
             resp_i_bin = (resp_i > 0).astype(int)
             resp_j_bin = (resp_j > 0).astype(int)
 
-            # Observed cross-classification
             obs_00 = np.sum((resp_i_bin == 0) & (resp_j_bin == 0))
             obs_01 = np.sum((resp_i_bin == 0) & (resp_j_bin == 1))
             obs_10 = np.sum((resp_i_bin == 1) & (resp_j_bin == 0))
             obs_11 = np.sum((resp_i_bin == 1) & (resp_j_bin == 1))
 
-            # Expected cross-classification under local independence
-            # E[X_i = a, X_j = b] = sum over persons of P(X_i = a) * P(X_j = b)
             exp_00 = np.sum((1 - prob_i) * (1 - prob_j))
             exp_01 = np.sum((1 - prob_i) * prob_j)
             exp_10 = np.sum(prob_i * (1 - prob_j))
@@ -457,15 +434,12 @@ def _compute_ld_chi2_g2(
             observed = np.array([obs_00, obs_01, obs_10, obs_11])
             expected = np.array([exp_00, exp_01, exp_10, exp_11])
 
-            # Avoid division by zero
             expected = np.maximum(expected, 0.5)
 
-            # Pearson chi-square
             chi2 = np.sum((observed - expected) ** 2 / expected)
             chi2_matrix[i, j] = chi2
             chi2_matrix[j, i] = chi2
 
-            # G² (likelihood ratio)
             g2 = 2 * np.sum(observed * np.log(observed / expected + 1e-10))
             g2_matrix[i, j] = g2
             g2_matrix[j, i] = g2
@@ -537,7 +511,6 @@ def ld_summary_table(
     """
     n_items = ld_result.q3_matrix.shape[0]
 
-    # Collect all pairs with statistics
     pairs_data = []
     for i in range(n_items):
         for j in range(i + 1, n_items):
@@ -561,10 +534,8 @@ def ld_summary_table(
                 }
             )
 
-    # Sort by absolute Q3
     pairs_data.sort(key=lambda x: -abs(x["q3"]))
 
-    # Build table
     lines = [
         f"{'Item i':<8} {'Item j':<8} {'Q3':>8} {'Adj r':>8} {'LD χ²':>10} {'p-value':>10}",
         "-" * 62,

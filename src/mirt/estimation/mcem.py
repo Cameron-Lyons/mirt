@@ -138,16 +138,13 @@ class MCEMEstimator(BaseEstimator):
         self._convergence_history = []
         prev_ll = -np.inf
 
-        # Cholesky decomposition for sampling
         L = np.linalg.cholesky(prior_cov)
 
         for iteration in range(self.max_iter):
-            # E-step: Monte Carlo integration
             theta_samples, weights = self._e_step_mc(
                 model, responses, prior_mean, L, n_factors
             )
 
-            # Estimate marginal log-likelihood
             current_ll = self._estimate_marginal_ll(
                 model, responses, theta_samples, weights
             )
@@ -162,12 +159,10 @@ class MCEMEstimator(BaseEstimator):
 
             prev_ll = current_ll
 
-            # M-step: optimize item parameters
             self._m_step_mc(model, responses, theta_samples, weights)
 
         model._is_fitted = True
 
-        # Compute standard errors using final samples
         standard_errors = self._compute_standard_errors_mc(
             model, responses, theta_samples, weights
         )
@@ -202,18 +197,15 @@ class MCEMEstimator(BaseEstimator):
         """
         n_persons = responses.shape[0]
 
-        # Sample from prior: theta = mean + L @ z, z ~ N(0, I)
         z = self._rng.standard_normal((n_persons, self.n_samples, n_factors))
         theta_samples = prior_mean + np.einsum("ij,...j->...i", L, z)
 
-        # Compute log-likelihoods for all samples
         log_likes = np.zeros((n_persons, self.n_samples))
 
         for s in range(self.n_samples):
             theta_s = theta_samples[:, s, :]
             log_likes[:, s] = model.log_likelihood(responses, theta_s)
 
-        # Importance weights (proportional to likelihood when sampling from prior)
         log_weights = log_likes
         log_weights_normalized = log_weights - logsumexp(
             log_weights, axis=1, keepdims=True
@@ -237,7 +229,6 @@ class MCEMEstimator(BaseEstimator):
             theta_s = theta_samples[:, s, :]
             log_likes[:, s] = model.log_likelihood(responses, theta_s)
 
-        # Marginal likelihood ≈ mean of likelihoods under prior samples
         log_marginal = logsumexp(log_likes, axis=1) - np.log(self.n_samples)
 
         return float(np.sum(log_marginal))
@@ -272,10 +263,9 @@ class MCEMEstimator(BaseEstimator):
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
-        # Extract valid responses, samples, and weights
         valid_responses = item_responses[valid_mask]
-        valid_theta = theta_samples[valid_mask]  # (n_valid, n_samples, n_factors)
-        valid_weights = weights[valid_mask]  # (n_valid, n_samples)
+        valid_theta = theta_samples[valid_mask]
+        valid_weights = weights[valid_mask]
 
         if _is_polytomous(model):
 
@@ -288,7 +278,6 @@ class MCEMEstimator(BaseEstimator):
                     probs = model.probability(theta_s, item_idx)
                     probs = np.clip(probs, 1e-10, 1 - 1e-10)
 
-                    # Sum over categories
                     for c in range(probs.shape[1]):
                         mask_c = valid_responses == c
                         ll += np.sum(
@@ -440,7 +429,6 @@ class MCEMEstimator(BaseEstimator):
                 standard_errors[name] = np.zeros_like(values)
                 continue
 
-            # Use numerical differentiation for SE
             se = np.full_like(values, np.nan)
             standard_errors[name] = se
 
@@ -514,34 +502,27 @@ class QMCEMEstimator(MCEMEstimator):
         """E-step using Quasi-Monte Carlo sampling."""
         n_persons = responses.shape[0]
 
-        # Generate QMC samples
         if self.sequence == "sobol":
             sampler = qmc.Sobol(d=n_factors, scramble=True, seed=self.seed)
         else:
             sampler = qmc.Halton(d=n_factors, scramble=True, seed=self.seed)
 
-        # Generate uniform samples and transform to standard normal
         uniform_samples = sampler.random(self.n_samples)
-        # Use inverse CDF to transform to standard normal
+
         from scipy.stats import norm
 
-        z_base = norm.ppf(uniform_samples)  # (n_samples, n_factors)
+        z_base = norm.ppf(uniform_samples)
 
-        # Transform to multivariate normal with prior distribution
-        # theta = mean + L @ z
-        theta_base = prior_mean + z_base @ L.T  # (n_samples, n_factors)
+        theta_base = prior_mean + z_base @ L.T
 
-        # Replicate for all persons (same QMC points for all)
         theta_samples = np.tile(theta_base[None, :, :], (n_persons, 1, 1))
 
-        # Compute log-likelihoods for all samples
         log_likes = np.zeros((n_persons, self.n_samples))
 
         for s in range(self.n_samples):
             theta_s = theta_samples[:, s, :]
             log_likes[:, s] = model.log_likelihood(responses, theta_s)
 
-        # Importance weights
         log_weights = log_likes
         log_weights_normalized = log_weights - logsumexp(
             log_weights, axis=1, keepdims=True
@@ -593,7 +574,7 @@ class StochasticEMEstimator(MCEMEstimator):
         n_chains: int = 5,
     ) -> None:
         super().__init__(
-            n_samples=n_chains,  # One sample per chain
+            n_samples=n_chains,
             max_iter=max_iter,
             tol=tol,
             verbose=verbose,
@@ -613,33 +594,27 @@ class StochasticEMEstimator(MCEMEstimator):
         """E-step: sample from posterior using Metropolis-Hastings."""
         n_persons = responses.shape[0]
 
-        # Initialize theta at prior mean
         theta_samples = np.zeros((n_persons, self.n_chains, n_factors))
 
         for chain in range(self.n_chains):
             theta_current = np.tile(prior_mean, (n_persons, 1))
 
-            # Run a few MH steps
             n_mh_steps = 20
             proposal_sd = 0.5
 
             for _ in range(n_mh_steps):
-                # Propose new theta
                 theta_proposed = theta_current + self._rng.normal(
                     0, proposal_sd, theta_current.shape
                 )
 
-                # Compute log-posteriors
                 ll_current = model.log_likelihood(responses, theta_current)
                 ll_proposed = model.log_likelihood(responses, theta_proposed)
 
-                # Log-prior (standard normal)
                 lp_current = -0.5 * np.sum(theta_current**2, axis=1)
                 lp_proposed = -0.5 * np.sum(theta_proposed**2, axis=1)
 
                 log_accept = (ll_proposed + lp_proposed) - (ll_current + lp_current)
 
-                # Accept/reject
                 u = np.log(self._rng.random(n_persons))
                 accept = u < log_accept
 
@@ -647,7 +622,6 @@ class StochasticEMEstimator(MCEMEstimator):
 
             theta_samples[:, chain, :] = theta_current
 
-        # Equal weights for SEM
         weights = np.ones((n_persons, self.n_chains)) / self.n_chains
 
         return theta_samples, weights

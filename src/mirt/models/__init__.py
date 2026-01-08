@@ -44,11 +44,9 @@ from mirt.models.sequential import (
 )
 
 __all__ = [
-    # Base classes
     "BaseItemModel",
     "DichotomousItemModel",
     "PolytomousItemModel",
-    # Standard dichotomous models
     "OneParameterLogistic",
     "TwoParameterLogistic",
     "ThreeParameterLogistic",
@@ -57,28 +55,22 @@ __all__ = [
     "Rasch",
     "ComplementaryLogLog",
     "NegativeLogLog",
-    # Standard polytomous models
     "GradedResponseModel",
     "GeneralizedPartialCredit",
     "PartialCreditModel",
     "RatingScaleModel",
     "NominalResponseModel",
-    # Sequential models
     "SequentialResponseModel",
     "ContinuationRatioModel",
     "AdjacentCategoryModel",
-    # Nested logit models
     "TwoPLNestedLogit",
     "ThreePLNestedLogit",
     "FourPLNestedLogit",
-    # Multidimensional models
     "MultidimensionalModel",
     "BifactorModel",
-    # Compensatory models
     "PartiallyCompensatoryModel",
     "NoncompensatoryModel",
     "DisjunctiveModel",
-    # Nonparametric models
     "MonotonicSplineModel",
     "MonotonicPolynomialModel",
     "KernelSmoothingModel",

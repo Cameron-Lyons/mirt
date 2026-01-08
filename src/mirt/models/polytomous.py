@@ -283,7 +283,6 @@ class RatingScaleModel(PolytomousItemModel):
         if n_factors != 1:
             raise ValueError("RSM only supports unidimensional analysis")
 
-        # RSM requires all items to have the same number of categories
         if isinstance(n_categories, list):
             if len(set(n_categories)) != 1:
                 raise ValueError(
@@ -295,10 +294,8 @@ class RatingScaleModel(PolytomousItemModel):
         self._n_cats = n_categories
 
     def _initialize_parameters(self) -> None:
-        # Item difficulties
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
-        # Shared threshold parameters (n_categories - 1)
         n_thresholds = self._n_cats - 1
         self._parameters["thresholds"] = np.linspace(-1, 1, n_thresholds)
 
@@ -345,7 +342,6 @@ class RatingScaleModel(PolytomousItemModel):
         tau = self._parameters["thresholds"]
         theta_1d = theta.ravel()
 
-        # Compute numerators for all categories
         numerators = np.zeros((n_persons, n_cat))
 
         for k in range(n_cat):
@@ -375,7 +371,6 @@ class RatingScaleModel(PolytomousItemModel):
         expected_sq = np.sum(probs * (categories**2), axis=1)
         variance = expected_sq - expected**2
 
-        # Information is variance (for Rasch-family models)
         return variance
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "RatingScaleModel":
