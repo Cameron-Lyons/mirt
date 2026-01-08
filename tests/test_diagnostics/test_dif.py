@@ -200,11 +200,11 @@ class TestDIF:
         data = rng.integers(0, 2, size=(n_persons, n_items))
 
         groups = np.zeros(n_persons)
-        with pytest.raises(ValueError, match="exactly 2 groups"):
+        with pytest.raises(ValueError, match="Expected 2 groups"):
             compute_dif(data, groups)
 
         groups = np.array([0] * 33 + [1] * 33 + [2] * 34)
-        with pytest.raises(ValueError, match="exactly 2 groups"):
+        with pytest.raises(ValueError, match="Expected 2 groups"):
             compute_dif(data, groups)
 
     def test_string_group_labels(self, rng):
