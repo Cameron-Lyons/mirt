@@ -2,6 +2,7 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags:
       - "v*"
   workflow_dispatch:
@@ -38,16 +39,12 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    strategy:
-      matrix:
-        target: [x64]
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          architecture: ${{ matrix.target }}
 
       - name: Build wheels
         uses: PyO3/maturin-action@v1
@@ -58,7 +55,7 @@ jobs:
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
-          name: wheels-windows-${{ matrix.target }}
+          name: wheels-windows-x64
           path: dist
 
   macos:
@@ -103,11 +100,11 @@ jobs:
           name: wheels-sdist
           path: dist
 
-  release:
-    name: Release
+  publish:
+    name: Publish to PyPI
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
     needs: [linux, windows, macos, sdist]
+    environment: pypi
     permissions:
       id-token: write
     steps:
@@ -118,7 +115,4 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
-        with:
-          command: upload
-          args: --non-interactive --skip-existing dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
