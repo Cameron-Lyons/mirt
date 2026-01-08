@@ -7,6 +7,7 @@ from mirt.results.score_result import ScoreResult
 from mirt.scoring.eap import EAPScorer
 from mirt.scoring.map import MAPScorer
 from mirt.scoring.ml import MLScorer
+from mirt.scoring.wle import WLEScorer
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -14,13 +15,14 @@ if TYPE_CHECKING:
 
 
 def fscores(
-    model_or_result: BaseItemModel | FitResult,
+    model_or_result: "BaseItemModel | FitResult",
     responses: NDArray[np.int_],
-    method: Literal["EAP", "MAP", "ML"] = "EAP",
+    method: Literal["EAP", "MAP", "ML", "WLE"] = "EAP",
     n_quadpts: int = 49,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
     person_ids: list[Any] | None = None,
+    bounds: tuple[float, float] = (-6.0, 6.0),
 ) -> ScoreResult:
     from mirt.results.fit_result import FitResult
 
@@ -53,6 +55,8 @@ def fscores(
         )
     elif method == "ML":
         scorer = MLScorer()
+    elif method == "WLE":
+        scorer = WLEScorer(bounds=bounds)
     else:
         raise ValueError(f"Unknown scoring method: {method}")
 
@@ -67,4 +71,5 @@ __all__ = [
     "EAPScorer",
     "MAPScorer",
     "MLScorer",
+    "WLEScorer",
 ]
