@@ -227,6 +227,185 @@ class PartialCreditModel(GeneralizedPartialCredit):
         return super().set_parameters(**params)
 
 
+class RatingScaleModel(PolytomousItemModel):
+    """Rating Scale Model (RSM) for polytomous items.
+
+    The RSM is a special case of the Partial Credit Model where step
+    parameters are constrained to be equal across all items. This is
+    appropriate when all items share the same rating scale structure
+    (e.g., Likert scales with the same response options).
+
+    Parameters
+    ----------
+    n_items : int
+        Number of items
+    n_categories : int
+        Number of response categories (must be same for all items)
+    item_names : list of str, optional
+        Names for each item
+
+    Attributes
+    ----------
+    difficulty : ndarray of shape (n_items,)
+        Item location/difficulty parameters
+    thresholds : ndarray of shape (n_categories - 1,)
+        Step thresholds shared across all items
+
+    Notes
+    -----
+    The probability of responding in category k for item j is:
+
+        P(X_j = k | theta) = exp(sum_{v=0}^{k} (theta - b_j - tau_v)) /
+                             sum_{c=0}^{K} exp(sum_{v=0}^{c} (theta - b_j - tau_v))
+
+    where b_j is the item difficulty and tau_v are the shared thresholds.
+
+    The RSM reduces the number of parameters compared to GPCM/PCM,
+    which can be beneficial when the assumption of equal thresholds
+    is reasonable.
+
+    References
+    ----------
+    Andrich, D. (1978). A rating formulation for ordered response categories.
+        Psychometrika, 43(4), 561-573.
+    """
+
+    model_name = "RSM"
+    supports_multidimensional = False
+
+    def __init__(
+        self,
+        n_items: int,
+        n_categories: int | list[int],
+        n_factors: int = 1,
+        item_names: list[str] | None = None,
+    ) -> None:
+        if n_factors != 1:
+            raise ValueError("RSM only supports unidimensional analysis")
+
+        # RSM requires all items to have the same number of categories
+        if isinstance(n_categories, list):
+            if len(set(n_categories)) != 1:
+                raise ValueError(
+                    "RSM requires all items to have the same number of categories"
+                )
+            n_categories = n_categories[0]
+
+        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
+        self._n_cats = n_categories
+
+    def _initialize_parameters(self) -> None:
+        # Item difficulties
+        self._parameters["difficulty"] = np.zeros(self.n_items)
+
+        # Shared threshold parameters (n_categories - 1)
+        n_thresholds = self._n_cats - 1
+        self._parameters["thresholds"] = np.linspace(-1, 1, n_thresholds)
+
+    @property
+    def difficulty(self) -> NDArray[np.float64]:
+        """Item difficulty/location parameters."""
+        return self._parameters["difficulty"]
+
+    @property
+    def thresholds(self) -> NDArray[np.float64]:
+        """Shared step threshold parameters."""
+        return self._parameters["thresholds"]
+
+    def category_probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+        category: int,
+    ) -> NDArray[np.float64]:
+        """Compute probability of responding in a specific category.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Ability values
+        item_idx : int
+            Item index
+        category : int
+            Response category (0 to n_categories - 1)
+
+        Returns
+        -------
+        ndarray
+            Probability of category response for each theta
+        """
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+        n_cat = self._n_cats
+
+        if category < 0 or category >= n_cat:
+            raise ValueError(f"Category {category} out of range [0, {n_cat})")
+
+        b_j = self._parameters["difficulty"][item_idx]
+        tau = self._parameters["thresholds"]
+        theta_1d = theta.ravel()
+
+        # Compute numerators for all categories
+        numerators = np.zeros((n_persons, n_cat))
+
+        for k in range(n_cat):
+            cumsum = 0.0
+            for v in range(k):
+                cumsum += theta_1d - b_j - tau[v]
+            numerators[:, k] = np.exp(cumsum)
+
+        denominator = numerators.sum(axis=1)
+
+        return numerators[:, category] / denominator
+
+    def _item_information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute item information function.
+
+        Uses the variance of the item score as the information.
+        """
+        n_cat = self._n_cats
+        probs = self.probability(theta, item_idx)
+
+        categories = np.arange(n_cat)
+        expected = np.sum(probs * categories, axis=1)
+        expected_sq = np.sum(probs * (categories**2), axis=1)
+        variance = expected_sq - expected**2
+
+        # Information is variance (for Rasch-family models)
+        return variance
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> "RatingScaleModel":
+        """Set model parameters.
+
+        Parameters
+        ----------
+        difficulty : ndarray of shape (n_items,)
+            Item difficulty parameters
+        thresholds : ndarray of shape (n_categories - 1,)
+            Shared threshold parameters
+
+        Returns
+        -------
+        self
+        """
+        for name, values in params.items():
+            if name not in self._parameters:
+                raise ValueError(f"Unknown parameter: {name}")
+            values = np.asarray(values)
+            if name == "difficulty" and values.shape != (self.n_items,):
+                raise ValueError(f"difficulty must have shape ({self.n_items},)")
+            if name == "thresholds" and values.shape != (self._n_cats - 1,):
+                raise ValueError(f"thresholds must have shape ({self._n_cats - 1},)")
+            self._parameters[name] = values
+
+        self._is_fitted = True
+        return self
+
+
 class NominalResponseModel(PolytomousItemModel):
     model_name = "NRM"
     supports_multidimensional = True
