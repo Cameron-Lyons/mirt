@@ -6,7 +6,7 @@ across groups, complementing DIF and DTF analyses.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -17,11 +17,11 @@ from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_g
 
 def compute_drf(
     data: NDArray[np.int_],
-    groups: NDArray,
+    groups: NDArray[Any],
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] = "2PL",
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 49,
-    **fit_kwargs,
+    **fit_kwargs: Any,
 ) -> dict[str, NDArray[np.float64] | float]:
     """Compute Differential Response Functioning statistics.
 
@@ -89,7 +89,7 @@ def compute_drf(
 
 
 def _compute_test_information(
-    model,
+    model: Any,
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute test information function."""
@@ -102,7 +102,7 @@ def _compute_test_information(
 
 
 def _compute_marginal_reliability(
-    model,
+    model: Any,
     theta_range: tuple[float, float],
     n_points: int = 49,
 ) -> float:
@@ -131,11 +131,11 @@ def _compute_marginal_reliability(
 
 def compute_item_drf(
     data: NDArray[np.int_],
-    groups: NDArray,
+    groups: NDArray[Any],
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] = "2PL",
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 49,
-    **fit_kwargs,
+    **fit_kwargs: Any,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute DRF for each item individually.
 
@@ -194,10 +194,10 @@ def compute_item_drf(
 
 
 def plot_drf(
-    drf_result: dict,
-    ax=None,
-    **kwargs,
-):
+    drf_result: dict[str, Any],
+    ax: Any = None,
+    **kwargs: Any,
+) -> None:
     """Plot DRF results showing information functions.
 
     Parameters

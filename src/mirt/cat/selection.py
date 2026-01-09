@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -205,7 +205,6 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         item_idx: int,
     ) -> float:
         """Compute expected information for an item."""
-        # For Fisher information, expected info is the same regardless of response
         info = model.information(theta, item_idx=item_idx)
         return float(info.sum())
 
@@ -276,7 +275,6 @@ class KullbackLeibler(ItemSelectionStrategy):
         theta_arr = np.array([[theta]])
         prob_theta = model.probability(theta_arr, item_idx=item_idx)
 
-        # Integration points around theta
         theta_points = np.linspace(
             theta - self.delta, theta + self.delta, self.n_points
         )
@@ -288,7 +286,6 @@ class KullbackLeibler(ItemSelectionStrategy):
             t_arr = np.array([[t]])
             prob_t = model.probability(t_arr, item_idx=item_idx)
 
-            # KL divergence
             kl = self._kl_divergence(prob_theta, prob_t)
             kl_sum += kl
 
@@ -305,7 +302,6 @@ class KullbackLeibler(ItemSelectionStrategy):
         q = np.clip(q.ravel(), eps, 1 - eps)
 
         if len(p) == 1:
-            # Dichotomous: p and 1-p
             p_full = np.array([p[0], 1 - p[0]])
             q_full = np.array([q[0], 1 - q[0]])
         else:
@@ -353,11 +349,9 @@ class UrryRule(ItemSelectionStrategy):
         for item_idx in available_items:
             params = model.get_item_parameters(item_idx)
 
-            # Get difficulty parameter
             if "difficulty" in params:
                 b = params["difficulty"]
             elif "thresholds" in params:
-                # For polytomous: use mean threshold
                 b = np.mean(params["thresholds"])
             else:
                 b = 0.0
@@ -382,7 +376,6 @@ class UrryRule(ItemSelectionStrategy):
             b = np.mean(params["thresholds"])
         else:
             b = 0.0
-        # Return negative absolute difference (higher = closer = better)
         return -abs(float(theta[0, 0]) - b)
 
 
@@ -461,10 +454,8 @@ class AStratified(ItemSelectionStrategy):
             else:
                 discriminations.append((i, 1.0))
 
-        # Sort by discrimination
         discriminations.sort(key=lambda x: x[1])
 
-        # Divide into strata
         n_items = len(discriminations)
         items_per_stratum = n_items // self.n_strata
         remainder = n_items % self.n_strata
@@ -493,29 +484,24 @@ class AStratified(ItemSelectionStrategy):
 
         n_administered = len(administered_items) if administered_items else 0
 
-        # Determine which stratum to use based on test progress
-        # Start with low discrimination, move to high
         stratum_idx = min(
             n_administered // (model.n_items // self.n_strata // 2 + 1),
             self.n_strata - 1,
         )
 
-        # Find available items in current or higher strata
         for s in range(stratum_idx, self.n_strata):
             stratum_available = available_items & self._strata[s]
             if stratum_available:
-                # Use MFI within stratum
                 mfi = MaxFisherInformation()
                 return mfi.select_item(model, theta, stratum_available)
 
-        # Fallback: use MFI on all available
         mfi = MaxFisherInformation()
         return mfi.select_item(model, theta, available_items)
 
 
 def create_selection_strategy(
     method: str,
-    **kwargs,
+    **kwargs: Any,
 ) -> ItemSelectionStrategy:
     """Factory function to create item selection strategies.
 
@@ -554,5 +540,8 @@ def create_selection_strategy(
         valid = ", ".join(strategies.keys())
         raise ValueError(f"Unknown selection method '{method}'. Valid options: {valid}")
 
-    strategy_class = strategies.get(method_upper) or strategies.get(method)
+    if method_upper in strategies:
+        strategy_class = strategies[method_upper]
+    else:
+        strategy_class = strategies[method]
     return strategy_class(**kwargs)

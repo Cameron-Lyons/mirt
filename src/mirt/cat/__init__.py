@@ -80,12 +80,9 @@ from mirt.cat.stopping import (
 )
 
 __all__ = [
-    # Engine
     "CATEngine",
-    # Results
     "CATResult",
     "CATState",
-    # Item selection
     "ItemSelectionStrategy",
     "MaxFisherInformation",
     "MaxExpectedInformation",
@@ -94,7 +91,6 @@ __all__ = [
     "RandomSelection",
     "AStratified",
     "create_selection_strategy",
-    # Stopping rules
     "StoppingRule",
     "StandardErrorStop",
     "MaxItemsStop",
@@ -103,14 +99,12 @@ __all__ = [
     "ClassificationStop",
     "CombinedStop",
     "create_stopping_rule",
-    # Exposure control
     "ExposureControl",
     "NoExposureControl",
     "SympsonHetter",
     "Randomesque",
     "ProgressiveRestricted",
     "create_exposure_control",
-    # Content balancing
     "ContentConstraint",
     "NoContentConstraint",
     "ContentBlueprint",

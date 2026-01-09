@@ -121,13 +121,11 @@ class CATEngine:
         self.seed = seed
         self.rng = np.random.default_rng(seed)
 
-        # Initialize item selection strategy
         if isinstance(item_selection, str):
             self._selection = create_selection_strategy(item_selection)
         else:
             self._selection = item_selection
 
-        # Initialize stopping rule
         if isinstance(stopping_rule, str):
             if stopping_rule == "SE":
                 base_rule = StandardErrorStop(se_threshold)
@@ -136,7 +134,6 @@ class CATEngine:
         else:
             base_rule = stopping_rule
 
-        # Combine with max_items and min_items if specified
         rules = [base_rule]
         if max_items is not None:
             rules.append(MaxItemsStop(max_items))
@@ -146,7 +143,6 @@ class CATEngine:
         else:
             self._stopping = base_rule
 
-        # Initialize exposure control
         if exposure_control is None:
             self._exposure = NoExposureControl()
         elif isinstance(exposure_control, str):
@@ -154,13 +150,11 @@ class CATEngine:
         else:
             self._exposure = exposure_control
 
-        # Initialize content constraint
         if content_constraint is None:
             self._content = NoContentConstraint()
         else:
             self._content = content_constraint
 
-        # Initialize state
         self._current_theta = initial_theta
         self._current_se = float("inf")
         self._items_administered: list[int] = []
@@ -235,26 +229,21 @@ class CATEngine:
 
     def _select_next_item(self) -> int:
         """Internal item selection with constraint handling."""
-        # Apply content constraints
         content_eligible = self._content.filter_items(
             self._available_items, self._items_administered
         )
 
-        # Apply exposure control
         exposure_eligible = self._exposure.filter_items(
             content_eligible, self.model, self._current_theta
         )
 
-        # If using randomesque, handle specially
         if isinstance(self._exposure, Randomesque):
-            # Get ranked items
             criteria = self._selection.get_item_criteria(
                 self.model, self._current_theta, exposure_eligible
             )
             ranked = sorted(criteria.items(), key=lambda x: x[1], reverse=True)
             return self._exposure.select_from_ranked(ranked)
 
-        # Standard selection
         return self._selection.select_item(
             self.model,
             self._current_theta,
@@ -287,40 +276,32 @@ class CATEngine:
         if self._is_complete:
             raise RuntimeError("CAT session is already complete")
 
-        # Select item if not already selected
         if not hasattr(self, "_pending_item"):
             self._pending_item = self._select_next_item()
 
         item_idx = self._pending_item
         delattr(self, "_pending_item")
 
-        # Record item information before update
         theta_arr = np.array([[self._current_theta]])
         item_info = float(self.model.information(theta_arr, item_idx=item_idx).sum())
         self._info_history.append(item_info)
 
-        # Update administered items
         self._items_administered.append(item_idx)
         self._responses.append(response)
         self._available_items.discard(item_idx)
 
-        # Update exposure control
         self._exposure.update(item_idx)
 
-        # Update ability estimate
         self._update_theta()
 
-        # Record history
         self._theta_history.append(self._current_theta)
         self._se_history.append(self._current_se)
 
-        # Check stopping rule
         state = self.get_current_state()
         if self._stopping.should_stop(state):
             self._is_complete = True
             self._stopping_reason = self._stopping.get_reason()
 
-        # Check if items exhausted
         if not self._available_items and not self._is_complete:
             self._is_complete = True
             self._stopping_reason = "Item pool exhausted"
@@ -331,12 +312,10 @@ class CATEngine:
         """Update ability estimate based on administered items."""
         from mirt.scoring import fscores
 
-        # Build response array (all items, with -1 for non-administered)
         responses = np.full((1, self.model.n_items), -1, dtype=np.int_)
         for item_idx, resp in zip(self._items_administered, self._responses):
             responses[0, item_idx] = resp
 
-        # Score with selected method
         try:
             result = fscores(
                 self.model,
@@ -348,7 +327,6 @@ class CATEngine:
             self._current_theta = float(result.theta.ravel()[0])
             self._current_se = float(result.standard_error.ravel()[0])
         except Exception:
-            # Fallback to simple estimate on failure
             self._current_theta = self._simple_theta_estimate()
             self._current_se = self._simple_se_estimate()
 
@@ -357,11 +335,9 @@ class CATEngine:
         if not self._responses:
             return self.initial_theta
 
-        # For dichotomous items
         p = np.mean(self._responses)
         p = np.clip(p, 0.01, 0.99)
 
-        # Logit transform
         return float(np.log(p / (1 - p)))
 
     def _simple_se_estimate(self) -> float:
@@ -430,17 +406,14 @@ class CATEngine:
         self.reset()
 
         while not self._is_complete:
-            # Select next item
             item_idx = self.select_next_item()
             self._pending_item = item_idx
 
-            # Generate response
             if response_generator is not None:
                 response = response_generator(item_idx, true_theta)
             else:
                 response = self._generate_response(item_idx, true_theta)
 
-            # Administer item
             self.administer_item(response)
 
         return self.get_result()
@@ -464,11 +437,9 @@ class CATEngine:
         prob = self.model.probability(theta_arr, item_idx=item_idx)
 
         if prob.ndim == 1 or (prob.ndim == 2 and prob.shape[1] == 1):
-            # Dichotomous item
             p = float(prob.ravel()[0])
             return int(self.rng.random() < p)
         else:
-            # Polytomous item - sample from category probabilities
             probs = prob.ravel()
             return int(self.rng.choice(len(probs), p=probs))
 
@@ -497,13 +468,11 @@ class CATEngine:
         """
         thetas = np.asarray(true_thetas).ravel()
 
-        # Check if we can use Rust backend
         can_use_rust = use_rust and RUST_AVAILABLE and self._can_use_rust_simulation()
 
         if can_use_rust:
             return self._run_batch_rust(thetas, n_replications)
 
-        # Python fallback
         results = []
         for theta in thetas:
             for _ in range(n_replications):
@@ -514,21 +483,16 @@ class CATEngine:
 
     def _can_use_rust_simulation(self) -> bool:
         """Check if Rust simulation can be used."""
-        # Only 2PL models with MFI selection
-
         if not isinstance(self._selection, MaxFisherInformation):
             return False
 
-        # Check if model has discrimination and difficulty parameters
         params = self.model.parameters
         if "discrimination" not in params or "difficulty" not in params:
             return False
 
-        # Only unidimensional
         if self.model.n_factors != 1:
             return False
 
-        # Check discrimination shape (must be 1D)
         disc = params["discrimination"]
         if disc.ndim != 1:
             return False
@@ -554,12 +518,10 @@ class CATEngine:
 
         quad_points, quad_weights = self._get_quadrature()
 
-        # Get stopping parameters
-        se_threshold = 0.3  # Default
+        se_threshold = 0.3
         max_items = self.model.n_items
         min_items = 1
 
-        # Extract from stopping rule if possible
         if hasattr(self._stopping, "threshold"):
             se_threshold = self._stopping.threshold
         if hasattr(self._stopping, "max_items"):
@@ -567,7 +529,6 @@ class CATEngine:
         if hasattr(self._stopping, "min_items"):
             min_items = self._stopping.min_items
 
-        # Run Rust simulation
         seed = (
             self.seed
             if self.seed is not None
@@ -587,7 +548,6 @@ class CATEngine:
         )
 
         if result is None:
-            # Fallback to Python
             results = []
             for theta in true_thetas:
                 for _ in range(n_replications):
@@ -597,14 +557,13 @@ class CATEngine:
 
         theta_est, se_est, n_items, true_theta_out = result
 
-        # Convert to CATResult objects
         results = []
         for i in range(len(theta_est)):
             results.append(
                 CATResult(
                     theta=float(theta_est[i]),
                     standard_error=float(se_est[i]),
-                    items_administered=[],  # Not tracked in Rust
+                    items_administered=[],
                     responses=np.array([], dtype=np.int_),
                     n_items_administered=int(n_items[i]),
                     stopping_reason="SE threshold reached"
@@ -647,7 +606,6 @@ class CATEngine:
         """
         thetas = np.asarray(true_thetas).ravel()
 
-        # Check if we can use Rust backend
         can_use_rust = use_rust and RUST_AVAILABLE and self._can_use_rust_simulation()
 
         if can_use_rust:
@@ -657,7 +615,6 @@ class CATEngine:
 
             quad_points, quad_weights = self._get_quadrature()
 
-            # Get stopping parameters
             se_threshold = 0.3
             max_items = self.model.n_items
             min_items = 1
@@ -690,7 +647,6 @@ class CATEngine:
             if result is not None:
                 return result
 
-        # Python fallback
         biases = np.zeros(len(thetas))
         mses = np.zeros(len(thetas))
         avg_items = np.zeros(len(thetas))

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     pass
@@ -114,7 +114,6 @@ class ContentBlueprint(ContentConstraint):
         self.areas = areas
         self.strict = strict
 
-        # Build item to area mapping
         self._item_to_area: dict[int, ContentArea] = {}
         for area in areas:
             for item in area.items:
@@ -122,7 +121,6 @@ class ContentBlueprint(ContentConstraint):
                     raise ValueError(f"Item {item} belongs to multiple content areas")
                 self._item_to_area[item] = area
 
-        # Track counts per area
         self._area_counts: dict[str, int] = {area.name: 0 for area in areas}
 
     def filter_items(
@@ -130,18 +128,14 @@ class ContentBlueprint(ContentConstraint):
         available_items: set[int],
         administered_items: list[int],
     ) -> set[int]:
-        # Update area counts based on administered items
         self._update_counts(administered_items)
 
-        # Filter items based on constraints
         eligible = set()
 
         for item_idx in available_items:
             if self._is_item_eligible(item_idx):
                 eligible.add(item_idx)
 
-        # If no items are eligible due to constraints, prioritize
-        # areas that haven't met minimum requirements
         if not eligible:
             eligible = self._get_priority_items(available_items)
 
@@ -158,17 +152,14 @@ class ContentBlueprint(ContentConstraint):
     def _is_item_eligible(self, item_idx: int) -> bool:
         """Check if an item is eligible based on content constraints."""
         if item_idx not in self._item_to_area:
-            # Item not in any content area - always eligible
             return True
 
         area = self._item_to_area[item_idx]
         current_count = self._area_counts[area.name]
 
         if self.strict:
-            # Don't exceed maximum
             return current_count < area.max_items
         else:
-            # Prefer items from areas below target
             target = area.target_items or area.max_items
             return current_count < target
 
@@ -179,7 +170,6 @@ class ContentBlueprint(ContentConstraint):
         for area in self.areas:
             current_count = self._area_counts[area.name]
             if current_count < area.min_items:
-                # This area needs items
                 area_available = available_items & area.items
                 priority_items.update(area_available)
 
@@ -302,7 +292,6 @@ class WeightedContent(ContentConstraint):
         available_items: set[int],
         administered_items: list[int],
     ) -> set[int]:
-        # All items remain available; weighting is applied in selection
         return available_items
 
     def get_adjusted_weights(
@@ -328,20 +317,17 @@ class WeightedContent(ContentConstraint):
         if n_administered == 0:
             return {i: self.item_weights.get(i, 1.0) for i in available_items}
 
-        # Calculate current area proportions
         area_counts: dict[str, int] = {}
         for item_idx in administered_items:
             area = self.item_areas.get(item_idx, "unknown")
             area_counts[area] = area_counts.get(area, 0) + 1
 
-        # Compute multipliers based on underrepresentation
         weights = {}
         for item_idx in available_items:
             area = self.item_areas.get(item_idx, "unknown")
             current_prop = area_counts.get(area, 0) / n_administered
             target_prop = self.area_targets.get(area, 1.0 / len(self.area_targets))
 
-            # Items from underrepresented areas get higher weight
             if current_prop < target_prop:
                 multiplier = target_prop / max(current_prop, 0.01)
             else:
@@ -355,7 +341,7 @@ class WeightedContent(ContentConstraint):
 
 def create_content_constraint(
     method: str | None,
-    **kwargs,
+    **kwargs: Any,
 ) -> ContentConstraint:
     """Factory function to create content constraints.
 

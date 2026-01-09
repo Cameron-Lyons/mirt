@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -250,8 +250,16 @@ class DavidianCurve(LatentDensity):
         self._normalize_coefficients()
 
     def _normalize_coefficients(self) -> None:
-        """Normalize coefficients so density integrates to 1."""
-        pass
+        """Normalize coefficients so density integrates to 1.
+
+        For Hermite polynomial expansion f(x) = phi(x) * g(x)^2 where
+        g(x) = sum_k c_k * H_k(x), the integral is sum_k c_k^2 * k!
+        due to orthogonality of Hermite polynomials.
+        """
+        factorials = np.array([np.math.factorial(k) for k in range(self.degree + 1)])
+        norm_sq = np.sum(self._coeffs**2 * factorials)
+        if norm_sq > 0:
+            self._coeffs = self._coeffs / np.sqrt(norm_sq)
 
     def _hermite_polynomials(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute probabilist's Hermite polynomials H_k(x).
@@ -456,7 +464,7 @@ class CustomDensity(LatentDensity):
 
 def create_density(
     density_type: str = "gaussian",
-    **kwargs,
+    **kwargs: Any,
 ) -> LatentDensity:
     """Factory function to create latent density objects.
 

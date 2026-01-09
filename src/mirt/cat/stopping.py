@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from mirt.cat.results import CATState
@@ -119,8 +119,6 @@ class MinItemsStop(StoppingRule):
         self.min_items = min_items
 
     def should_stop(self, state: CATState) -> bool:
-        # This rule alone never stops the test
-        # It's meant to be combined with other rules
         return False
 
     def is_satisfied(self, state: CATState) -> bool:
@@ -193,8 +191,7 @@ class ThetaChangeStop(StoppingRule):
 
     def get_reason(self) -> str:
         return (
-            f"Theta stabilized (change <= {self.threshold} "
-            f"for {self.n_stable} items)"
+            f"Theta stabilized (change <= {self.threshold} for {self.n_stable} items)"
         )
 
 
@@ -221,10 +218,8 @@ class ClassificationStop(StoppingRule):
         self._classification: str | None = None
 
     def should_stop(self, state: CATState) -> bool:
-        # Compute z-score for cut score
         z = abs(state.theta - self.cut_score) / state.standard_error
 
-        # Convert to confidence using normal CDF
         from scipy.stats import norm
 
         conf = norm.cdf(z)
@@ -275,7 +270,6 @@ class CombinedStop(StoppingRule):
         self._triggered_rule: StoppingRule | None = None
 
     def should_stop(self, state: CATState) -> bool:
-        # Check minimum items first
         if state.n_items < self.min_items:
             return False
 
@@ -287,7 +281,7 @@ class CombinedStop(StoppingRule):
                     self._triggered_rule = rule
                     return True
             return False
-        else:  # "and"
+        else:
             if all(results):
                 self._triggered_rule = self.rules[0]
                 return True
@@ -301,7 +295,7 @@ class CombinedStop(StoppingRule):
 
 def create_stopping_rule(
     method: str,
-    **kwargs,
+    **kwargs: Any,
 ) -> StoppingRule:
     """Factory function to create stopping rules.
 

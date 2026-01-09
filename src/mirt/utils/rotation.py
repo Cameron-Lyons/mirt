@@ -13,7 +13,10 @@ References
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
 
 import numpy as np
 from numpy.typing import NDArray
@@ -346,7 +349,7 @@ def _geomin(
 
 
 def apply_rotation_to_model(
-    model,
+    model: BaseItemModel,
     rotation_matrix: NDArray[np.float64],
     factor_correlation: NDArray[np.float64] | None = None,
 ) -> None:
@@ -378,9 +381,9 @@ def apply_rotation_to_model(
 
 
 def get_rotated_loadings(
-    model,
+    model: BaseItemModel,
     method: str = "varimax",
-    **kwargs,
+    **kwargs: Any,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
     """Get rotated loadings from a fitted MIRT model.
 
@@ -414,19 +417,19 @@ def get_rotated_loadings(
     return rotated, factor_corr
 
 
-def varimax(loadings: NDArray[np.float64], **kwargs) -> NDArray[np.float64]:
+def varimax(loadings: NDArray[np.float64], **kwargs: Any) -> NDArray[np.float64]:
     """Convenience function for varimax rotation."""
     rotated, _, _ = rotate_loadings(loadings, method="varimax", **kwargs)
     return rotated
 
 
-def promax(loadings: NDArray[np.float64], **kwargs) -> NDArray[np.float64]:
+def promax(loadings: NDArray[np.float64], **kwargs: Any) -> NDArray[np.float64]:
     """Convenience function for promax rotation."""
     rotated, _, _ = rotate_loadings(loadings, method="promax", **kwargs)
     return rotated
 
 
-def oblimin(loadings: NDArray[np.float64], **kwargs) -> NDArray[np.float64]:
+def oblimin(loadings: NDArray[np.float64], **kwargs: Any) -> NDArray[np.float64]:
     """Convenience function for oblimin rotation."""
     rotated, _, _ = rotate_loadings(loadings, method="oblimin", **kwargs)
     return rotated

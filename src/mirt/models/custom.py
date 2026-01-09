@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -275,7 +275,7 @@ class CustomItemModel:
         """Total number of parameters."""
         return self.n_items * len(self.item_type.par_names)
 
-    def set_parameters(self, **kwargs) -> None:
+    def set_parameters(self, **kwargs: Any) -> None:
         """Set model parameters."""
         for name, values in kwargs.items():
             if name in self._parameters:

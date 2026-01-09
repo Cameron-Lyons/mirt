@@ -184,14 +184,12 @@ class CATResult:
 
         steps = list(range(1, len(self.theta_history) + 1))
 
-        # Plot theta convergence
         ax1.plot(steps, self.theta_history, "b-o", markersize=4)
         ax1.axhline(y=self.theta, color="r", linestyle="--", alpha=0.7)
         ax1.set_ylabel("Theta Estimate")
         ax1.set_title("CAT Convergence")
         ax1.grid(True, alpha=0.3)
 
-        # Plot SE convergence
         ax2.plot(steps, self.se_history, "g-o", markersize=4)
         ax2.axhline(y=self.standard_error, color="r", linestyle="--", alpha=0.7)
         ax2.set_xlabel("Items Administered")
