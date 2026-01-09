@@ -107,6 +107,7 @@ dependencies = [
 name = "mirt_rs"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "ndarray",
  "numpy",
  "pyo3",

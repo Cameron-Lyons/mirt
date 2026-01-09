@@ -4,6 +4,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._version import __version__
+from mirt.cat import CATEngine, CATResult, CATState
 from mirt.diagnostics.comparison import (
     anova_irt,
     compare_models,
@@ -308,6 +309,10 @@ __all__ = [
     "itemfit",
     "personfit",
     "dif",
+    # CAT
+    "CATEngine",
+    "CATResult",
+    "CATState",
     "OneParameterLogistic",
     "TwoParameterLogistic",
     "ThreeParameterLogistic",

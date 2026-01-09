@@ -29,3 +29,10 @@ SIBTESTMethod = Literal["original", "crossing"]
 ImputationMethod = Literal["mean", "mode", "random", "EM", "multiple"]
 
 BootstrapCIMethod = Literal["percentile", "BCa", "basic"]
+
+# CAT types
+ItemSelectionMethod = Literal["MFI", "MEI", "KL", "Urry", "random", "a-stratified"]
+StoppingMethod = Literal[
+    "SE", "max_items", "min_items", "theta_change", "classification"
+]
+ExposureMethod = Literal["sympson-hetter", "randomesque", "progressive", "none"]
