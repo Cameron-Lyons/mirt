@@ -8,8 +8,8 @@ use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
 use crate::utils::{
-    compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior, sigmoid,
-    LOG_2_PI,
+    LOG_2_PI, compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior,
+    sigmoid,
 };
 
 /// Item parameters for 2PL model

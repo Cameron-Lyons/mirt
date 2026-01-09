@@ -25,10 +25,12 @@ pub mod estep;
 pub mod estimation;
 pub mod likelihood;
 pub mod mirt_models;
+pub mod mstep;
 pub mod plausible;
 pub mod scoring;
 pub mod sibtest;
 pub mod simulation;
+pub mod standard_errors;
 
 /// Python module for mirt_rs
 #[pymodule]
@@ -45,6 +47,8 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     mirt_models::register(m)?;
     eapsum::register(m)?;
     cat::register(m)?;
+    mstep::register(m)?;
+    standard_errors::register(m)?;
 
     Ok(())
 }

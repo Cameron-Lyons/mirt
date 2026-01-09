@@ -58,7 +58,8 @@ class EAPScorer:
 
         log_likes = np.zeros((n_persons, n_quad))
         for q in range(n_quad):
-            theta_q = np.tile(quad_points[q], (n_persons, 1))
+            # Use broadcasting instead of np.tile for efficiency
+            theta_q = quad_points[q : q + 1]  # Shape (1, n_factors), broadcasts
             log_likes[:, q] = model.log_likelihood(responses, theta_q)
 
         log_posterior = log_likes + np.log(quad_weights + 1e-300)[None, :]

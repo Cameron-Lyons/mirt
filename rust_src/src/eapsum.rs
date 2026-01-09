@@ -4,7 +4,7 @@ use ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use pyo3::prelude::*;
 
-use crate::utils::{compute_eap_with_se, log_sigmoid, logsumexp, normalize_log_posterior, EPSILON};
+use crate::utils::{EPSILON, compute_eap_with_se, log_sigmoid, logsumexp, normalize_log_posterior};
 
 /// Lord-Wingersky recursion for computing sum score distributions.
 /// This is the core algorithm for EAPsum scoring.

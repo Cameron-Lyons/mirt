@@ -8,7 +8,7 @@ use rand_distr::Normal;
 use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
-use crate::utils::{log_likelihood_2pl_single, EPSILON};
+use crate::utils::{EPSILON, log_likelihood_2pl_single};
 
 /// Generate plausible values using posterior sampling
 #[pyfunction]

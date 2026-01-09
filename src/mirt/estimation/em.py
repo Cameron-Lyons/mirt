@@ -24,6 +24,10 @@ class EMEstimator(BaseEstimator):
         latent_density: LatentDensity
         | Literal["gaussian", "empirical", "davidian", "mixture"]
         | None = None,
+        prob_epsilon: float = 1e-10,
+        item_optim_maxiter: int = 50,
+        item_optim_ftol: float = 1e-6,
+        se_step_size: float = 1e-5,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -31,6 +35,10 @@ class EMEstimator(BaseEstimator):
             raise ValueError("n_quadpts should be at least 5")
 
         self.n_quadpts = n_quadpts
+        self.prob_epsilon = prob_epsilon
+        self.item_optim_maxiter = item_optim_maxiter
+        self.item_optim_ftol = item_optim_ftol
+        self.se_step_size = se_step_size
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
@@ -133,7 +141,8 @@ class EMEstimator(BaseEstimator):
         log_likelihoods = np.zeros((n_persons, n_quad))
 
         for q in range(n_quad):
-            theta_q = np.tile(quad_points[q], (n_persons, 1))
+            # Use broadcasting instead of np.tile for efficiency
+            theta_q = quad_points[q : q + 1]  # Shape (1, n_factors), broadcasts
             log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
 
         log_prior = self._latent_density.log_density(quad_points)
@@ -189,11 +198,13 @@ class EMEstimator(BaseEstimator):
                 cat_mask = valid_mask & (item_responses == c)
                 r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
 
+            eps = self.prob_epsilon
+
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
                 self._set_item_params(model, item_idx, params)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, eps, 1 - eps)
 
                 ll = np.sum(r_kc * np.log(probs))
 
@@ -204,12 +215,13 @@ class EMEstimator(BaseEstimator):
                 item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
                 axis=0,
             )
+            eps = self.prob_epsilon
 
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
                 self._set_item_params(model, item_idx, params)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, eps, 1 - eps)
 
                 ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
 
@@ -220,7 +232,7 @@ class EMEstimator(BaseEstimator):
             x0=current_params,
             method="L-BFGS-B",
             bounds=bounds,
-            options={"maxiter": 50, "ftol": 1e-6},
+            options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
         )
 
         self._set_item_params(model, item_idx, result.x)
@@ -276,6 +288,8 @@ class EMEstimator(BaseEstimator):
 
         n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
+        eps = self.prob_epsilon
+
         if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k_valid)
@@ -288,7 +302,7 @@ class EMEstimator(BaseEstimator):
                 model.set_item_parameter(item_idx, param_name, param_val)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, eps, 1 - eps)
 
                 ll = float(np.sum(r_kc * np.log(probs)))
 
@@ -305,7 +319,7 @@ class EMEstimator(BaseEstimator):
                 model.set_item_parameter(item_idx, param_name, param_val)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, eps, 1 - eps)
 
                 ll = float(
                     np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
@@ -314,7 +328,7 @@ class EMEstimator(BaseEstimator):
                 model.set_item_parameter(item_idx, param_name, current)
                 return ll
 
-        h = 1e-5
+        h = self.se_step_size
         ll_center = log_likelihood(current)
 
         if is_scalar:
