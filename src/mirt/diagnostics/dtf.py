@@ -6,7 +6,7 @@ aggregating item-level DIF to a test-level measure.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,13 +20,13 @@ if TYPE_CHECKING:
 
 def compute_dtf(
     data: NDArray[np.int_],
-    groups: NDArray,
+    groups: NDArray[Any],
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] = "2PL",
     method: Literal["signed", "unsigned", "expected_score"] = "unsigned",
     theta_range: tuple[float, float] = (-4, 4),
     n_quadpts: int = 49,
     n_bootstrap: int = 100,
-    **fit_kwargs,
+    **fit_kwargs: Any,
 ) -> dict[str, float | NDArray[np.float64]]:
     """Compute Differential Test Functioning statistics.
 
@@ -142,13 +142,13 @@ def _compute_expected_score(
 
 def _bootstrap_dtf_se(
     data: NDArray[np.int_],
-    groups: NDArray,
+    groups: NDArray[Any],
     model: str,
     method: str,
     theta_range: tuple[float, float],
     n_quadpts: int,
     n_bootstrap: int = 100,
-    **fit_kwargs,
+    **fit_kwargs: Any,
 ) -> tuple[float, float]:
     """Bootstrap standard error for DTF."""
     from mirt import fit_mirt
@@ -213,9 +213,9 @@ def _bootstrap_dtf_se(
 
 
 def plot_dtf(
-    dtf_result: dict,
-    ax=None,
-    **kwargs,
+    dtf_result: dict[str, Any],
+    ax: Any = None,
+    **kwargs: Any,
 ) -> None:
     """Plot DTF results showing expected score curves.
 

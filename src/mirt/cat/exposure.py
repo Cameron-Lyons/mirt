@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -114,7 +114,6 @@ class SympsonHetter(ExposureControl):
         else:
             self._params = {i: float(p) for i, p in enumerate(exposure_params)}
 
-        # Track exposure counts for calibration
         self._selection_counts: dict[int, int] = {}
         self._eligibility_counts: dict[int, int] = {}
         self._n_examinees = 0
@@ -128,17 +127,14 @@ class SympsonHetter(ExposureControl):
         eligible = set()
 
         for item_idx in available_items:
-            # Get exposure parameter (default 1.0 if not set)
             k = self._params.get(item_idx, 1.0)
 
-            # Probabilistic eligibility
             if self.rng.random() <= k:
                 eligible.add(item_idx)
                 self._eligibility_counts[item_idx] = (
                     self._eligibility_counts.get(item_idx, 0) + 1
                 )
 
-        # Ensure at least one item is eligible
         if not eligible and available_items:
             eligible.add(self.rng.choice(list(available_items)))
 
@@ -170,11 +166,9 @@ class SympsonHetter(ExposureControl):
             exposure_rate = self._selection_counts.get(item_idx, 0) / self._n_examinees
 
             if exposure_rate > self.target_rate:
-                # Reduce eligibility probability
                 current = self._params.get(item_idx, 1.0)
                 self._params[item_idx] = current * (self.target_rate / exposure_rate)
             else:
-                # Increase eligibility probability
                 current = self._params.get(item_idx, 1.0)
                 self._params[item_idx] = min(1.0, current * 1.1)
 
@@ -227,8 +221,6 @@ class Randomesque(ExposureControl):
         model: BaseItemModel,
         theta: float,
     ) -> set[int]:
-        # Return all items - the actual randomization happens
-        # in conjunction with item selection
         return available_items
 
     def select_from_ranked(
@@ -254,7 +246,6 @@ class Randomesque(ExposureControl):
         k = min(self.k, len(ranked_items))
         top_k = ranked_items[:k]
 
-        # Random selection from top-k
         idx = self.rng.integers(k)
         return top_k[idx][0]
 
@@ -303,10 +294,8 @@ class ProgressiveRestricted(ExposureControl):
         if not item_info:
             return set()
 
-        # Find maximum information
         max_info = max(info for _, info in item_info)
 
-        # Items within window are eligible
         threshold = max_info - self.window_size
         for item_idx, info in item_info:
             if info >= threshold:
@@ -320,7 +309,7 @@ class ProgressiveRestricted(ExposureControl):
 
 def create_exposure_control(
     method: str | None,
-    **kwargs,
+    **kwargs: Any,
 ) -> ExposureControl:
     """Factory function to create exposure control methods.
 

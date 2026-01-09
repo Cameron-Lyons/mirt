@@ -72,16 +72,20 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Set up Python
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
         with:
-          python-version: "3.14"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -98,6 +102,7 @@ jobs:
 
       - name: Upload coverage
         uses: codecov/codecov-action@v5
+        if: matrix.python-version == '3.14'
         with:
           files: coverage.xml
           fail_ci_if_error: false

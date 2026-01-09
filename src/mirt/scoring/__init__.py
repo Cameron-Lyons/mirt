@@ -25,6 +25,58 @@ def fscores(
     person_ids: list[Any] | None = None,
     bounds: tuple[float, float] = (-6.0, 6.0),
 ) -> ScoreResult:
+    """Compute ability (theta) estimates for respondents.
+
+    This is the main function for estimating latent trait scores from
+    response data using a fitted IRT model.
+
+    Parameters
+    ----------
+    model_or_result : BaseItemModel | FitResult
+        A fitted IRT model or a FitResult from fit_mirt().
+    responses : ndarray of shape (n_persons, n_items)
+        Response matrix. Missing responses should be coded as -1.
+    method : {"EAP", "MAP", "ML", "WLE", "EAPsum"}, default="EAP"
+        Scoring method to use:
+
+        - "EAP": Expected A Posteriori (Bayesian mean)
+        - "MAP": Maximum A Posteriori (Bayesian mode)
+        - "ML": Maximum Likelihood
+        - "WLE": Weighted Likelihood Estimation (Warm's estimator)
+        - "EAPsum": EAP based on sum scores (Lord-Wingersky)
+
+    n_quadpts : int, default=49
+        Number of quadrature points for EAP/EAPsum methods.
+    prior_mean : ndarray, optional
+        Prior mean for Bayesian methods. Default is 0.
+    prior_cov : ndarray, optional
+        Prior covariance for Bayesian methods. Default is identity.
+    person_ids : list, optional
+        Identifiers for each person in the output.
+    bounds : tuple of float, default=(-6.0, 6.0)
+        Bounds for theta estimation (used by WLE).
+
+    Returns
+    -------
+    ScoreResult
+        Object containing:
+
+        - theta: Ability estimates, shape (n_persons, n_factors)
+        - standard_error: Standard errors, shape (n_persons, n_factors)
+        - person_ids: Person identifiers if provided
+
+    Raises
+    ------
+    ValueError
+        If model is not fitted or responses shape is invalid.
+
+    Examples
+    --------
+    >>> from mirt import fit_mirt, fscores
+    >>> result = fit_mirt(data, model="2PL")
+    >>> scores = fscores(result, data, method="EAP")
+    >>> print(scores.theta[:5])
+    """
     from mirt.results.fit_result import FitResult
 
     if isinstance(model_or_result, FitResult):

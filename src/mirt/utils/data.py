@@ -10,6 +10,48 @@ def validate_responses(
     allow_missing: bool = True,
     missing_code: int = -1,
 ) -> NDArray[np.int_]:
+    """Validate and convert response data for IRT analysis.
+
+    Performs input validation on response matrices, checking dimensions,
+    response codes, and handling of missing data.
+
+    Parameters
+    ----------
+    responses : array-like of shape (n_persons, n_items)
+        Response data to validate. Can be a list, numpy array, or any
+        array-like object.
+    n_items : int, optional
+        Expected number of items. If provided, validates that responses
+        have this many columns.
+    allow_missing : bool, default=True
+        Whether to allow missing responses coded as missing_code.
+    missing_code : int, default=-1
+        Value used to represent missing responses.
+
+    Returns
+    -------
+    ndarray of shape (n_persons, n_items)
+        Validated response matrix as integer array.
+
+    Raises
+    ------
+    ValueError
+        If responses are not 2D, empty, have wrong number of items,
+        or contain invalid values.
+
+    Examples
+    --------
+    >>> from mirt import validate_responses
+    >>> import numpy as np
+    >>> data = [[1, 0, 1], [0, 1, 0]]
+    >>> validated = validate_responses(data)
+    >>> print(validated.dtype)
+    int64
+
+    >>> # With missing data
+    >>> data_with_missing = [[1, -1, 1], [0, 1, 0]]
+    >>> validated = validate_responses(data_with_missing, allow_missing=True)
+    """
     responses = np.asarray(responses)
 
     if responses.ndim != 2:
@@ -44,6 +86,39 @@ def check_response_pattern(
     responses: NDArray[np.int_],
     n_categories: int | list[int] | None = None,
 ) -> dict[str, Any]:
+    """Analyze response patterns and data quality.
+
+    Provides summary statistics about response data including missing
+    data rates, extreme response patterns, and basic descriptives.
+
+    Parameters
+    ----------
+    responses : ndarray of shape (n_persons, n_items)
+        Response matrix with missing data coded as negative values.
+    n_categories : int or list of int, optional
+        Number of response categories. If int, applies to all items.
+        If list, specifies categories per item. If None, inferred from data.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        - n_persons: Number of respondents
+        - n_items: Number of items
+        - missing_rate: Overall proportion of missing responses
+        - missing_by_item: Missing rate per item
+        - missing_by_person: Count of missing responses per person
+        - extreme_patterns: Counts of all-minimum and all-maximum patterns
+
+    Examples
+    --------
+    >>> from mirt.utils.data import check_response_pattern
+    >>> import numpy as np
+    >>> data = np.array([[1, 0, 1], [0, -1, 0], [1, 1, 1]])
+    >>> stats = check_response_pattern(data)
+    >>> print(f"Missing rate: {stats['missing_rate']:.2%}")
+    """
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
 
@@ -83,6 +158,40 @@ def expand_table(
     table: NDArray[Any],
     freq_col: int = -1,
 ) -> NDArray[np.int_]:
+    """Expand frequency table to individual response records.
+
+    Converts a summarized frequency table where each row represents a
+    response pattern with a frequency count into individual response
+    records suitable for IRT analysis.
+
+    Parameters
+    ----------
+    table : ndarray of shape (n_patterns, n_items + 1)
+        Frequency table with response patterns and counts. Each row
+        contains item responses followed by (or preceded by) the frequency.
+    freq_col : int, default=-1
+        Column index containing frequency counts. Default is last column.
+
+    Returns
+    -------
+    ndarray of shape (n_persons, n_items)
+        Expanded response matrix where each pattern is repeated according
+        to its frequency.
+
+    Raises
+    ------
+    ValueError
+        If table is not 2D.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> # Table: [item1, item2, frequency]
+    >>> freq_table = np.array([[1, 1, 10], [1, 0, 5], [0, 0, 3]])
+    >>> data = expand_table(freq_table)
+    >>> print(data.shape)
+    (18, 2)
+    """
     table = np.asarray(table)
 
     if table.ndim != 2:

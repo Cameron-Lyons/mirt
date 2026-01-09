@@ -1021,11 +1021,6 @@ def lord_wingersky_polytomous(
     return None
 
 
-# ============================================================================
-# CAT (Computerized Adaptive Testing) Functions
-# ============================================================================
-
-
 def cat_compute_item_info(
     theta: float,
     discrimination: NDArray[np.float64],
@@ -1055,7 +1050,6 @@ def cat_compute_item_info(
             difficulty.astype(np.float64),
         )
 
-    # Python fallback
     z = discrimination * (theta - difficulty)
     p = 1.0 / (1.0 + np.exp(-z))
     q = 1.0 - p
@@ -1094,7 +1088,6 @@ def cat_select_max_info(
             available_mask.astype(np.bool_),
         )
 
-    # Python fallback
     info = cat_compute_item_info(theta, discrimination, difficulty)
     info = np.where(available_mask, info, -np.inf)
     return int(np.argmax(info))
@@ -1141,10 +1134,8 @@ def cat_eap_update(
         )
         return float(theta[0]), float(se[0])
 
-    # Python fallback
     n_quad = len(quad_points)
 
-    # Compute log-likelihood at each quadrature point
     log_likes = np.zeros(n_quad)
     for q in range(n_quad):
         theta_q = quad_points[q]
@@ -1162,17 +1153,14 @@ def cat_eap_update(
                     ll += np.log(1 - p)
         log_likes[q] = ll
 
-    # Add log prior (standard normal)
     log_prior = -0.5 * quad_points**2 - 0.5 * np.log(2 * np.pi)
     log_posterior = log_likes + log_prior + np.log(quad_weights + 1e-300)
 
-    # Normalize
     log_norm = np.max(log_posterior) + np.log(
         np.sum(np.exp(log_posterior - np.max(log_posterior)))
     )
     posterior = np.exp(log_posterior - log_norm)
 
-    # EAP estimate
     theta_eap = np.sum(posterior * quad_points)
     variance = np.sum(posterior * (quad_points - theta_eap) ** 2)
     se = np.sqrt(variance)
