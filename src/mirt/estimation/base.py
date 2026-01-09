@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
@@ -95,7 +97,7 @@ class BaseEstimator(ABC):
 
     def _get_item_params_and_bounds(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
     ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
         """Get current item parameters and their bounds for optimization."""
@@ -148,7 +150,7 @@ class BaseEstimator(ABC):
 
     def _set_item_params(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         item_idx: int,
         params: NDArray[np.float64],
     ) -> None:
