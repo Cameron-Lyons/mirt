@@ -40,11 +40,9 @@ pub fn m_step_dichotomous_parallel<'py>(
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
 
-    // Parallel optimization across items
     let new_params: Vec<(f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
-            // Compute expected counts for this item
             let mut r_k = vec![0.0; n_quad];
             let mut n_k = vec![0.0; n_quad];
 
@@ -62,7 +60,6 @@ pub fn m_step_dichotomous_parallel<'py>(
                 }
             }
 
-            // Newton-Raphson optimization
             let mut a = disc_init[j];
             let mut b = diff_init[j];
 
@@ -93,7 +90,6 @@ pub fn m_step_dichotomous_parallel<'py>(
                     hess_ab += info * a * (theta - b);
                 }
 
-                // Add regularization to ensure negative definite Hessian
                 hess_aa -= regularization;
                 hess_bb -= regularization;
 
@@ -105,7 +101,6 @@ pub fn m_step_dichotomous_parallel<'py>(
                 let delta_a = (hess_bb * grad_a - hess_ab * grad_b) / det;
                 let delta_b = (-hess_ab * grad_a + hess_aa * grad_b) / det;
 
-                // Update with damping and constraints
                 a = (a - delta_a * damping).clamp(disc_bounds.0, disc_bounds.1);
                 b = (b - delta_b * damping).clamp(diff_bounds.0, diff_bounds.1);
 
@@ -168,11 +163,9 @@ pub fn m_step_3pl_parallel<'py>(
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
 
-    // Parallel optimization across items
     let new_params: Vec<(f64, f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
-            // Compute expected counts
             let mut r_k = vec![0.0; n_quad];
             let mut n_k = vec![0.0; n_quad];
 
@@ -194,9 +187,7 @@ pub fn m_step_3pl_parallel<'py>(
             let mut b = diff_init[j];
             let mut c = guess_init[j];
 
-            // Coordinate descent for 3PL (guessing complicates joint optimization)
             for _ in 0..max_iter {
-                // Update a and b with c fixed
                 let mut grad_a = 0.0;
                 let mut grad_b = 0.0;
                 let mut hess_aa = 0.0;
@@ -235,7 +226,6 @@ pub fn m_step_3pl_parallel<'py>(
                     b = (b - grad_b / hess_bb * damping_ab).clamp(diff_bounds.0, diff_bounds.1);
                 }
 
-                // Update c with a and b fixed
                 let mut grad_c = 0.0;
                 let mut hess_cc = 0.0;
 
@@ -256,7 +246,7 @@ pub fn m_step_3pl_parallel<'py>(
                     hess_cc -= n_k[q] * dp_dc * dp_dc / (p_clipped * (1.0 - p_clipped) + EPSILON);
                 }
 
-                hess_cc -= regularization_c; // Stronger regularization for guessing
+                hess_cc -= regularization_c;
 
                 if hess_cc.abs() > EPSILON {
                     c = (c - grad_c / hess_cc * damping_c).clamp(guess_bounds.0, guess_bounds.1);
@@ -310,7 +300,6 @@ pub fn compute_expected_counts_parallel<'py>(
     let n_items = responses.ncols();
     let n_quad = posterior_weights.ncols();
 
-    // Parallel over items
     let counts: Vec<(Vec<f64>, Vec<f64>)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
