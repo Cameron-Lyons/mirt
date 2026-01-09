@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.integrate import trapezoid
 
 from mirt.models.base import DichotomousItemModel
 
@@ -121,9 +122,9 @@ class MonotonicSplineModel(DichotomousItemModel):
         for i, t in enumerate(theta):
             grid = np.linspace(-4, t, 50)
             b_vals = bspline(grid)
-            ispline_vals[i] = np.trapz(b_vals, grid)
+            ispline_vals[i] = trapezoid(b_vals, grid)
 
-        max_val = np.trapz(bspline(np.linspace(-4, 4, 100)), np.linspace(-4, 4, 100))
+        max_val = trapezoid(bspline(np.linspace(-4, 4, 100)), np.linspace(-4, 4, 100))
         if max_val > 0:
             ispline_vals = ispline_vals / max_val
 
