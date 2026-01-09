@@ -1307,6 +1307,642 @@ def cat_conditional_mse(
     return None
 
 
+def compute_standardized_residuals(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute standardized residuals for each person-item combination.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Standardized residuals (n_persons, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_standardized_residuals(
+            responses.astype(np.int32),
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64),
+            difficulty.astype(np.float64),
+        )
+
+    # Python fallback
+    n_persons, n_items = responses.shape
+    residuals = np.full((n_persons, n_items), np.nan)
+
+    for j in range(n_items):
+        z = discrimination[j] * (theta - difficulty[j])
+        p = 1.0 / (1.0 + np.exp(-z))
+        p = np.clip(p, 1e-10, 1 - 1e-10)
+        variance = p * (1 - p)
+
+        valid = responses[:, j] >= 0
+        residuals[valid, j] = (responses[valid, j] - p[valid]) / np.sqrt(
+            variance[valid] + 1e-10
+        )
+
+    return residuals
+
+
+def compute_q3_matrix(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute Yen's Q3 (residual correlation) matrix.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Q3 correlation matrix (n_items, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_q3_matrix(
+            responses.astype(np.int32),
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64),
+            difficulty.astype(np.float64),
+        )
+
+    # Python fallback - compute residuals first
+    residuals = compute_standardized_residuals(
+        responses, theta, discrimination, difficulty
+    )
+
+    n_items = responses.shape[1]
+    q3_matrix = np.zeros((n_items, n_items))
+
+    for i in range(n_items):
+        for j in range(i + 1, n_items):
+            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
+            valid &= ~np.isnan(residuals[:, i]) & ~np.isnan(residuals[:, j])
+
+            if valid.sum() > 2:
+                r_i = residuals[valid, i]
+                r_j = residuals[valid, j]
+                q3 = np.corrcoef(r_i, r_j)[0, 1]
+                q3_matrix[i, j] = q3
+                q3_matrix[j, i] = q3
+
+    return q3_matrix
+
+
+def compute_ld_chi2_matrix(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute LD chi-square statistics for all item pairs.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    NDArray
+        LD chi-square matrix (n_items, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_ld_chi2_matrix(
+            responses.astype(np.int32),
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64),
+            difficulty.astype(np.float64),
+        )
+
+    # Python fallback
+    n_persons, n_items = responses.shape
+    chi2_matrix = np.full((n_items, n_items), np.nan)
+
+    for i in range(n_items):
+        for j in range(i + 1, n_items):
+            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
+            n_valid = valid.sum()
+
+            if n_valid < 10:
+                continue
+
+            resp_i = responses[valid, i]
+            resp_j = responses[valid, j]
+            theta_valid = theta[valid]
+
+            z_i = discrimination[i] * (theta_valid - difficulty[i])
+            z_j = discrimination[j] * (theta_valid - difficulty[j])
+            prob_i = 1.0 / (1.0 + np.exp(-z_i))
+            prob_j = 1.0 / (1.0 + np.exp(-z_j))
+
+            resp_i_bin = (resp_i > 0).astype(int)
+            resp_j_bin = (resp_j > 0).astype(int)
+
+            obs_00 = np.sum((resp_i_bin == 0) & (resp_j_bin == 0))
+            obs_01 = np.sum((resp_i_bin == 0) & (resp_j_bin == 1))
+            obs_10 = np.sum((resp_i_bin == 1) & (resp_j_bin == 0))
+            obs_11 = np.sum((resp_i_bin == 1) & (resp_j_bin == 1))
+
+            exp_00 = np.sum((1 - prob_i) * (1 - prob_j))
+            exp_01 = np.sum((1 - prob_i) * prob_j)
+            exp_10 = np.sum(prob_i * (1 - prob_j))
+            exp_11 = np.sum(prob_i * prob_j)
+
+            observed = np.array([obs_00, obs_01, obs_10, obs_11])
+            expected = np.array([exp_00, exp_01, exp_10, exp_11])
+            expected = np.maximum(expected, 0.5)
+
+            chi2 = np.sum((observed - expected) ** 2 / expected)
+            chi2_matrix[i, j] = chi2
+            chi2_matrix[j, i] = chi2
+
+    return chi2_matrix
+
+
+def m_step_dichotomous_parallel(
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    max_iter: int = 10,
+    tol: float = 1e-4,
+    disc_bounds: tuple[float, float] = (0.1, 5.0),
+    diff_bounds: tuple[float, float] = (-6.0, 6.0),
+    damping: float = 0.5,
+    regularization: float = 0.01,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Parallel M-step optimization for dichotomous items.
+
+    Uses Newton-Raphson optimization for each item in parallel using Rayon.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    posterior_weights : NDArray
+        Posterior weights from E-step (n_persons, n_quad)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    discrimination : NDArray
+        Initial discrimination parameters (n_items,)
+    difficulty : NDArray
+        Initial difficulty parameters (n_items,)
+    max_iter : int
+        Maximum Newton-Raphson iterations per item
+    tol : float
+        Convergence tolerance
+    disc_bounds : tuple[float, float]
+        Bounds for discrimination parameters (min, max)
+    diff_bounds : tuple[float, float]
+        Bounds for difficulty parameters (min, max)
+    damping : float
+        Damping factor for Newton-Raphson updates
+    regularization : float
+        Regularization for Hessian diagonal
+
+    Returns
+    -------
+    tuple
+        (new_discrimination, new_difficulty)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.m_step_dichotomous_parallel(
+            responses.astype(np.int32),
+            posterior_weights.astype(np.float64),
+            quad_points.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+            max_iter,
+            tol,
+            disc_bounds,
+            diff_bounds,
+            damping,
+            regularization,
+        )
+
+    # Python fallback - sequential optimization
+    from scipy.optimize import minimize
+
+    n_items = responses.shape[1]
+    new_disc = np.zeros(n_items)
+    new_diff = np.zeros(n_items)
+
+    for j in range(n_items):
+        item_responses = responses[:, j]
+        valid_mask = item_responses >= 0
+
+        r_k = np.sum(
+            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+            axis=0,
+        )
+        n_k = np.sum(posterior_weights[valid_mask], axis=0)
+
+        def neg_ll(params):
+            a, b = params
+            z = a * (quad_points - b)
+            p = 1.0 / (1.0 + np.exp(-z))
+            p = np.clip(p, 1e-10, 1 - 1e-10)
+            ll = np.sum(r_k * np.log(p) + (n_k - r_k) * np.log(1 - p))
+            return -ll
+
+        result = minimize(
+            neg_ll,
+            x0=[discrimination[j], difficulty[j]],
+            method="L-BFGS-B",
+            bounds=[disc_bounds, diff_bounds],
+        )
+        new_disc[j], new_diff[j] = result.x
+
+    return new_disc, new_diff
+
+
+def compute_item_se_parallel(
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    h: float = 1e-5,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute per-item standard errors in parallel.
+
+    Exploits block diagonal structure of the Hessian.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    posterior_weights : NDArray
+        Posterior weights from E-step (n_persons, n_quad)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    discrimination : NDArray
+        Discrimination parameters (n_items,)
+    difficulty : NDArray
+        Difficulty parameters (n_items,)
+    h : float
+        Step size for finite difference
+
+    Returns
+    -------
+    tuple
+        (se_discrimination, se_difficulty)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_item_se_parallel(
+            responses.astype(np.int32),
+            posterior_weights.astype(np.float64),
+            quad_points.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+            h,
+        )
+
+    # Python fallback
+    n_items = responses.shape[1]
+    se_disc = np.zeros(n_items)
+    se_diff = np.zeros(n_items)
+
+    for j in range(n_items):
+        item_responses = responses[:, j]
+        valid_mask = item_responses >= 0
+
+        r_k = np.sum(
+            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+            axis=0,
+        )
+        n_k = np.sum(posterior_weights[valid_mask], axis=0)
+
+        def item_ll(a, b):
+            z = a * (quad_points - b)
+            p = 1.0 / (1.0 + np.exp(-z))
+            p = np.clip(p, 1e-10, 1 - 1e-10)
+            return np.sum(r_k * np.log(p) + (n_k - r_k) * np.log(1 - p))
+
+        a, b = discrimination[j], difficulty[j]
+        ll_center = item_ll(a, b)
+
+        # Discrimination SE
+        ll_a_plus = item_ll(a + h, b)
+        ll_a_minus = item_ll(a - h, b)
+        hess_aa = (ll_a_plus - 2 * ll_center + ll_a_minus) / (h**2)
+        se_disc[j] = np.sqrt(-1.0 / hess_aa) if hess_aa < -1e-10 else np.nan
+
+        # Difficulty SE
+        ll_b_plus = item_ll(a, b + h)
+        ll_b_minus = item_ll(a, b - h)
+        hess_bb = (ll_b_plus - 2 * ll_center + ll_b_minus) / (h**2)
+        se_diff[j] = np.sqrt(-1.0 / hess_bb) if hess_bb < -1e-10 else np.nan
+
+    return se_disc, se_diff
+
+
+def compute_hessian_block_diagonal(
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    h: float = 1e-5,
+) -> NDArray[np.float64]:
+    """Compute full Hessian matrix exploiting block diagonal structure.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items)
+    posterior_weights : NDArray
+        Posterior weights (n_persons, n_quad)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    discrimination : NDArray
+        Discrimination parameters (n_items,)
+    difficulty : NDArray
+        Difficulty parameters (n_items,)
+    h : float
+        Step size for finite difference
+
+    Returns
+    -------
+    NDArray
+        Hessian matrix (n_params, n_params) where n_params = n_items * 2
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_hessian_block_diagonal(
+            responses.astype(np.int32),
+            posterior_weights.astype(np.float64),
+            quad_points.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+            h,
+        )
+
+    # Python fallback - compute block by block
+    n_items = len(discrimination)
+    n_params = n_items * 2
+    hessian = np.zeros((n_params, n_params))
+
+    se_disc, se_diff = compute_item_se_parallel(
+        responses, posterior_weights, quad_points, discrimination, difficulty, h
+    )
+
+    for j in range(n_items):
+        idx_a = j * 2
+        idx_b = j * 2 + 1
+
+        # Approximate from SEs (diagonal only in fallback)
+        if not np.isnan(se_disc[j]):
+            hessian[idx_a, idx_a] = -1.0 / (se_disc[j] ** 2)
+        if not np.isnan(se_diff[j]):
+            hessian[idx_b, idx_b] = -1.0 / (se_diff[j] ** 2)
+
+    return hessian
+
+
+def compute_expected_counts_parallel(
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute expected counts for all items in parallel.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items)
+    posterior_weights : NDArray
+        Posterior weights (n_persons, n_quad)
+
+    Returns
+    -------
+    tuple
+        (r_k_all, n_k_all) both shape (n_items, n_quad)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_expected_counts_parallel(
+            responses.astype(np.int32),
+            posterior_weights.astype(np.float64),
+        )
+
+    # Python fallback
+    n_items = responses.shape[1]
+    n_quad = posterior_weights.shape[1]
+
+    r_k_all = np.zeros((n_items, n_quad))
+    n_k_all = np.zeros((n_items, n_quad))
+
+    for j in range(n_items):
+        item_responses = responses[:, j]
+        valid_mask = item_responses >= 0
+
+        r_k_all[j] = np.sum(
+            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+            axis=0,
+        )
+        n_k_all[j] = np.sum(posterior_weights[valid_mask], axis=0)
+
+    return r_k_all, n_k_all
+
+
+def compute_fit_statistics(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+]:
+    """Compute item and person fit statistics (infit/outfit).
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    tuple
+        (item_outfit, item_infit, person_outfit, person_infit)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_fit_statistics(
+            responses.astype(np.int32),
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64),
+            difficulty.astype(np.float64),
+        )
+
+    # Python fallback
+    n_persons, n_items = responses.shape
+
+    # Compute z^2 and variance for each person-item
+    z_sq = np.full((n_persons, n_items), np.nan)
+    variance = np.full((n_persons, n_items), np.nan)
+
+    for j in range(n_items):
+        z = discrimination[j] * (theta - difficulty[j])
+        p = 1.0 / (1.0 + np.exp(-z))
+        p = np.clip(p, 1e-10, 1 - 1e-10)
+        var = p * (1 - p)
+
+        valid = responses[:, j] >= 0
+        raw_resid = responses[valid, j] - p[valid]
+        z_sq[valid, j] = (raw_resid**2) / (var[valid] + 1e-10)
+        variance[valid, j] = var[valid]
+
+    # Item statistics
+    item_outfit = np.nanmean(z_sq, axis=0)
+    item_infit = np.nansum(z_sq * variance, axis=0) / np.nansum(variance, axis=0)
+
+    # Person statistics
+    person_outfit = np.nanmean(z_sq, axis=1)
+    person_infit = np.nansum(z_sq * variance, axis=1) / np.nansum(variance, axis=1)
+
+    return item_outfit, item_infit, person_outfit, person_infit
+
+
+def compute_probabilities_batch(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute probabilities for all items in batch (2PL model).
+
+    Parameters
+    ----------
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Probabilities (n_persons, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_probabilities_batch(
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+        )
+
+    # Python fallback
+    z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
+    return 1.0 / (1.0 + np.exp(-z))
+
+
+def compute_probabilities_batch_3pl(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute probabilities for all items in batch (3PL model).
+
+    Parameters
+    ----------
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+    guessing : NDArray
+        Item guessing parameters (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Probabilities (n_persons, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_probabilities_batch_3pl(
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+            guessing.astype(np.float64).ravel(),
+        )
+
+    # Python fallback
+    z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
+    p_star = 1.0 / (1.0 + np.exp(-z))
+    return guessing[None, :] + (1 - guessing[None, :]) * p_star
+
+
+def compute_expected_variance_batch(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute expected values and variances for all items in batch.
+
+    Parameters
+    ----------
+    theta : NDArray
+        Ability estimates (n_persons,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    difficulty : NDArray
+        Item difficulty parameters (n_items,)
+
+    Returns
+    -------
+    tuple
+        (expected, variance) both shape (n_persons, n_items)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_expected_variance_batch(
+            theta.astype(np.float64).ravel(),
+            discrimination.astype(np.float64).ravel(),
+            difficulty.astype(np.float64).ravel(),
+        )
+
+    # Python fallback
+    probs = compute_probabilities_batch(theta, discrimination, difficulty)
+    expected = probs
+    variance = probs * (1 - probs)
+    return expected, variance
+
+
 def eapsum_from_distribution(
     log_p_score_theta: NDArray[np.float64],
     log_prior: NDArray[np.float64],

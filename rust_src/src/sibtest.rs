@@ -5,7 +5,7 @@ use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{normal_cdf, EPSILON};
+use crate::utils::{EPSILON, normal_cdf};
 
 /// Compute SIBTEST beta statistic
 #[pyfunction]
@@ -45,14 +45,14 @@ pub fn sibtest_compute_beta<'py>(
             let ref_at_k: Vec<usize> = ref_scores
                 .iter()
                 .enumerate()
-                .filter(|(_, &s)| s == k)
+                .filter(|&(_, &s)| s == k)
                 .map(|(i, _)| i)
                 .collect();
 
             let focal_at_k: Vec<usize> = focal_scores
                 .iter()
                 .enumerate()
-                .filter(|(_, &s)| s == k)
+                .filter(|&(_, &s)| s == k)
                 .map(|(i, _)| i)
                 .collect();
 
@@ -177,14 +177,14 @@ pub fn sibtest_all_items<'py>(
             let ref_scores: Vec<i32> = ref_mask
                 .iter()
                 .enumerate()
-                .filter(|(_, &is_ref)| is_ref)
+                .filter(|&(_, &is_ref)| is_ref)
                 .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
                 .collect();
 
             let focal_scores: Vec<i32> = focal_mask
                 .iter()
                 .enumerate()
-                .filter(|(_, &is_focal)| is_focal)
+                .filter(|&(_, &is_focal)| is_focal)
                 .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
                 .collect();
 
@@ -200,14 +200,14 @@ pub fn sibtest_all_items<'py>(
             let ref_data: Vec<Vec<i32>> = ref_mask
                 .iter()
                 .enumerate()
-                .filter(|(_, &is_ref)| is_ref)
+                .filter(|&(_, &is_ref)| is_ref)
                 .map(|(i, _)| data.row(i).to_vec())
                 .collect();
 
             let focal_data: Vec<Vec<i32>> = focal_mask
                 .iter()
                 .enumerate()
-                .filter(|(_, &is_focal)| is_focal)
+                .filter(|&(_, &is_focal)| is_focal)
                 .map(|(i, _)| data.row(i).to_vec())
                 .collect();
 
@@ -218,14 +218,14 @@ pub fn sibtest_all_items<'py>(
                 let ref_at_k: Vec<usize> = ref_scores
                     .iter()
                     .enumerate()
-                    .filter(|(_, &s)| s == k)
+                    .filter(|&(_, &s)| s == k)
                     .map(|(i, _)| i)
                     .collect();
 
                 let focal_at_k: Vec<usize> = focal_scores
                     .iter()
                     .enumerate()
-                    .filter(|(_, &s)| s == k)
+                    .filter(|&(_, &s)| s == k)
                     .map(|(i, _)| i)
                     .collect();
 

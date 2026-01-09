@@ -9,7 +9,7 @@ use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
 use crate::utils::{
-    compute_log_weights, gauss_hermite_quadrature, log_sigmoid, logsumexp, sigmoid, EPSILON,
+    EPSILON, compute_log_weights, gauss_hermite_quadrature, log_sigmoid, logsumexp, sigmoid,
 };
 
 /// EM algorithm for 2PL model fitting

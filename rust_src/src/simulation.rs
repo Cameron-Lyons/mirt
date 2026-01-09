@@ -7,7 +7,7 @@ use rand::prelude::*;
 use rand_pcg::Pcg64;
 use rayon::prelude::*;
 
-use crate::utils::{sigmoid, EPSILON};
+use crate::utils::{EPSILON, sigmoid};
 
 /// Simulate responses from Graded Response Model
 #[pyfunction]
@@ -184,11 +184,7 @@ pub fn simulate_dichotomous<'py>(
                     let p = guess_vec[j] + (1.0 - guess_vec[j]) * p_star;
 
                     let u: f64 = rng.random();
-                    if u < p {
-                        1
-                    } else {
-                        0
-                    }
+                    if u < p { 1 } else { 0 }
                 })
                 .collect()
         })

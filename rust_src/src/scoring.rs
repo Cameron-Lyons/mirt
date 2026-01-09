@@ -6,8 +6,8 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::utils::{
-    compute_eap_with_se, compute_log_weights, fisher_info_2pl, log_likelihood_2pl_single,
-    normalize_log_posterior, EPSILON,
+    EPSILON, compute_eap_with_se, compute_log_weights, fisher_info_2pl, log_likelihood_2pl_single,
+    normalize_log_posterior,
 };
 
 /// Compute EAP (Expected A Posteriori) scores

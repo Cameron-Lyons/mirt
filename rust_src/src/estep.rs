@@ -5,7 +5,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyAr
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{compute_log_weights, log_likelihood_2pl_single, logsumexp, LOG_2_PI};
+use crate::utils::{LOG_2_PI, compute_log_weights, log_likelihood_2pl_single, logsumexp};
 
 /// Complete E-step computation with posterior weights
 #[pyfunction]

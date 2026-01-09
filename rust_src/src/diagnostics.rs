@@ -5,7 +5,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{sigmoid, EPSILON};
+use crate::utils::{EPSILON, sigmoid};
 
 /// Compute observed univariate and bivariate margins
 #[pyfunction]
@@ -467,6 +467,128 @@ pub fn compute_fit_statistics<'py>(
     )
 }
 
+/// Compute probabilities for all items in batch (2PL model).
+///
+/// Parallelizes over persons for efficient computation.
+#[pyfunction]
+pub fn compute_probabilities_batch<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+) -> Bound<'py, PyArray2<f64>> {
+    let theta = theta.as_array();
+    let discrimination = discrimination.as_array();
+    let difficulty = difficulty.as_array();
+
+    let n_persons = theta.len();
+    let n_items = discrimination.len();
+
+    let probs: Vec<Vec<f64>> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let theta_i = theta[i];
+            (0..n_items)
+                .map(|j| sigmoid(discrimination[j] * (theta_i - difficulty[j])))
+                .collect()
+        })
+        .collect();
+
+    let mut result = Array2::zeros((n_persons, n_items));
+    for (i, row) in probs.iter().enumerate() {
+        for (j, &val) in row.iter().enumerate() {
+            result[[i, j]] = val;
+        }
+    }
+
+    result.to_pyarray(py)
+}
+
+/// Compute probabilities with guessing parameter (3PL model).
+#[pyfunction]
+pub fn compute_probabilities_batch_3pl<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+    guessing: PyReadonlyArray1<f64>,
+) -> Bound<'py, PyArray2<f64>> {
+    let theta = theta.as_array();
+    let discrimination = discrimination.as_array();
+    let difficulty = difficulty.as_array();
+    let guessing = guessing.as_array();
+
+    let n_persons = theta.len();
+    let n_items = discrimination.len();
+
+    let probs: Vec<Vec<f64>> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let theta_i = theta[i];
+            (0..n_items)
+                .map(|j| {
+                    let p_star = sigmoid(discrimination[j] * (theta_i - difficulty[j]));
+                    guessing[j] + (1.0 - guessing[j]) * p_star
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut result = Array2::zeros((n_persons, n_items));
+    for (i, row) in probs.iter().enumerate() {
+        for (j, &val) in row.iter().enumerate() {
+            result[[i, j]] = val;
+        }
+    }
+
+    result.to_pyarray(py)
+}
+
+/// Compute expected values and variances for all items in batch.
+///
+/// Returns (expected, variance) arrays of shape (n_persons, n_items).
+#[pyfunction]
+pub fn compute_expected_variance_batch<'py>(
+    py: Python<'py>,
+    theta: PyReadonlyArray1<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>) {
+    let theta = theta.as_array();
+    let discrimination = discrimination.as_array();
+    let difficulty = difficulty.as_array();
+
+    let n_persons = theta.len();
+    let n_items = discrimination.len();
+
+    let results: Vec<Vec<(f64, f64)>> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let theta_i = theta[i];
+            (0..n_items)
+                .map(|j| {
+                    let p = sigmoid(discrimination[j] * (theta_i - difficulty[j]));
+                    let expected = p;
+                    let variance = p * (1.0 - p);
+                    (expected, variance)
+                })
+                .collect()
+        })
+        .collect();
+
+    let mut expected = Array2::zeros((n_persons, n_items));
+    let mut variance = Array2::zeros((n_persons, n_items));
+
+    for (i, row) in results.iter().enumerate() {
+        for (j, &(e, v)) in row.iter().enumerate() {
+            expected[[i, j]] = e;
+            variance[[i, j]] = v;
+        }
+    }
+
+    (expected.to_pyarray(py), variance.to_pyarray(py))
+}
+
 /// Register diagnostics functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_observed_margins, m)?)?;
@@ -475,5 +597,8 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_q3_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(compute_ld_chi2_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(compute_fit_statistics, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_probabilities_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_probabilities_batch_3pl, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_expected_variance_batch, m)?)?;
     Ok(())
 }

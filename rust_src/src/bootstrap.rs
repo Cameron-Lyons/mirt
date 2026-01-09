@@ -97,11 +97,7 @@ pub fn impute_from_probabilities<'py>(
                     } else {
                         let p = sigmoid(disc_vec[j] * (theta_i - diff_vec[j]));
                         let u: f64 = rng.random();
-                        if u < p {
-                            1
-                        } else {
-                            0
-                        }
+                        if u < p { 1 } else { 0 }
                     }
                 })
                 .collect()
@@ -164,11 +160,7 @@ pub fn multiple_imputation<'py>(
                             } else {
                                 let p = sigmoid(disc_vec[j] * (theta_i - diff_vec[j]));
                                 let u: f64 = rng.random();
-                                if u < p {
-                                    1
-                                } else {
-                                    0
-                                }
+                                if u < p { 1 } else { 0 }
                             }
                         })
                         .collect()
@@ -225,11 +217,7 @@ pub fn generate_qmc_samples<'py>(
                             let z = t
                                 - (c0 + c1 * t + c2 * t * t)
                                     / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
-                            if u < 0.5 {
-                                -z
-                            } else {
-                                z
-                            }
+                            if u < 0.5 { -z } else { z }
                         })
                         .collect()
                 })
