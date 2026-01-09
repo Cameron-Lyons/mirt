@@ -9,6 +9,8 @@ Reference:
     response theory. Psychometrika, 54(3), 427-450.
 """
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -66,7 +68,7 @@ class WLEScorer:
 
     def score(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
         """Compute WLE ability estimates.
@@ -114,7 +116,7 @@ class WLEScorer:
 
     def _estimate_person(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> tuple[float, float]:
         """Estimate theta for a single person using WLE."""
@@ -158,7 +160,7 @@ class WLEScorer:
 
     def _test_information(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         theta: NDArray[np.float64],
         valid_mask: NDArray[np.bool_],
     ) -> NDArray[np.float64]:
@@ -173,7 +175,7 @@ class WLEScorer:
 
     def _score_multidimensional(
         self,
-        model: "BaseItemModel",
+        model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
         """Estimate multidimensional WLE scores."""
