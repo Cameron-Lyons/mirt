@@ -1339,7 +1339,6 @@ def compute_standardized_residuals(
             difficulty.astype(np.float64),
         )
 
-    # Python fallback
     n_persons, n_items = responses.shape
     residuals = np.full((n_persons, n_items), np.nan)
 
@@ -1389,7 +1388,6 @@ def compute_q3_matrix(
             difficulty.astype(np.float64),
         )
 
-    # Python fallback - compute residuals first
     residuals = compute_standardized_residuals(
         responses, theta, discrimination, difficulty
     )
@@ -1444,7 +1442,6 @@ def compute_ld_chi2_matrix(
             difficulty.astype(np.float64),
         )
 
-    # Python fallback
     n_persons, n_items = responses.shape
     chi2_matrix = np.full((n_items, n_items), np.nan)
 
@@ -1551,7 +1548,6 @@ def m_step_dichotomous_parallel(
             regularization,
         )
 
-    # Python fallback - sequential optimization
     from scipy.optimize import minimize
 
     n_items = responses.shape[1]
@@ -1629,7 +1625,6 @@ def compute_item_se_parallel(
             h,
         )
 
-    # Python fallback
     n_items = responses.shape[1]
     se_disc = np.zeros(n_items)
     se_diff = np.zeros(n_items)
@@ -1653,13 +1648,11 @@ def compute_item_se_parallel(
         a, b = discrimination[j], difficulty[j]
         ll_center = item_ll(a, b)
 
-        # Discrimination SE
         ll_a_plus = item_ll(a + h, b)
         ll_a_minus = item_ll(a - h, b)
         hess_aa = (ll_a_plus - 2 * ll_center + ll_a_minus) / (h**2)
         se_disc[j] = np.sqrt(-1.0 / hess_aa) if hess_aa < -1e-10 else np.nan
 
-        # Difficulty SE
         ll_b_plus = item_ll(a, b + h)
         ll_b_minus = item_ll(a, b - h)
         hess_bb = (ll_b_plus - 2 * ll_center + ll_b_minus) / (h**2)
@@ -1708,7 +1701,6 @@ def compute_hessian_block_diagonal(
             h,
         )
 
-    # Python fallback - compute block by block
     n_items = len(discrimination)
     n_params = n_items * 2
     hessian = np.zeros((n_params, n_params))
@@ -1721,7 +1713,6 @@ def compute_hessian_block_diagonal(
         idx_a = j * 2
         idx_b = j * 2 + 1
 
-        # Approximate from SEs (diagonal only in fallback)
         if not np.isnan(se_disc[j]):
             hessian[idx_a, idx_a] = -1.0 / (se_disc[j] ** 2)
         if not np.isnan(se_diff[j]):
@@ -1754,7 +1745,6 @@ def compute_expected_counts_parallel(
             posterior_weights.astype(np.float64),
         )
 
-    # Python fallback
     n_items = responses.shape[1]
     n_quad = posterior_weights.shape[1]
 
@@ -1808,10 +1798,8 @@ def compute_fit_statistics(
             difficulty.astype(np.float64),
         )
 
-    # Python fallback
     n_persons, n_items = responses.shape
 
-    # Compute z^2 and variance for each person-item
     z_sq = np.full((n_persons, n_items), np.nan)
     variance = np.full((n_persons, n_items), np.nan)
 
@@ -1826,11 +1814,9 @@ def compute_fit_statistics(
         z_sq[valid, j] = (raw_resid**2) / (var[valid] + 1e-10)
         variance[valid, j] = var[valid]
 
-    # Item statistics
     item_outfit = np.nanmean(z_sq, axis=0)
     item_infit = np.nansum(z_sq * variance, axis=0) / np.nansum(variance, axis=0)
 
-    # Person statistics
     person_outfit = np.nanmean(z_sq, axis=1)
     person_infit = np.nansum(z_sq * variance, axis=1) / np.nansum(variance, axis=1)
 
@@ -1865,7 +1851,6 @@ def compute_probabilities_batch(
             difficulty.astype(np.float64).ravel(),
         )
 
-    # Python fallback
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
     return 1.0 / (1.0 + np.exp(-z))
 
@@ -1902,7 +1887,6 @@ def compute_probabilities_batch_3pl(
             guessing.astype(np.float64).ravel(),
         )
 
-    # Python fallback
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
     p_star = 1.0 / (1.0 + np.exp(-z))
     return guessing[None, :] + (1 - guessing[None, :]) * p_star
@@ -1936,7 +1920,6 @@ def compute_expected_variance_batch(
             difficulty.astype(np.float64).ravel(),
         )
 
-    # Python fallback
     probs = compute_probabilities_batch(theta, discrimination, difficulty)
     expected = probs
     variance = probs * (1 - probs)

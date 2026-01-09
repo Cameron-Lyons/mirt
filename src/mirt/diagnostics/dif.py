@@ -1,5 +1,7 @@
 """Differential Item Functioning (DIF) analysis."""
 
+from __future__ import annotations
+
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
