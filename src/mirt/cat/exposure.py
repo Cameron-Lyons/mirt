@@ -284,7 +284,6 @@ class ProgressiveRestricted(ExposureControl):
         theta_arr = np.array([[theta]])
         eligible = set()
 
-        # Compute information for all available items
         item_info: list[tuple[int, float]] = []
         for item_idx in available_items:
             info = model.information(theta_arr, item_idx=item_idx)

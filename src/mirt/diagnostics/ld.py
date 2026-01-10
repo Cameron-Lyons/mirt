@@ -254,7 +254,6 @@ def compute_q3(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    # Use Rust backend for dichotomous models
     if RUST_AVAILABLE and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
@@ -262,7 +261,6 @@ def compute_q3(
             theta_flat = theta.ravel() if theta.ndim > 1 else theta
             return rust_compute_q3(responses, theta_flat, disc.ravel(), diff.ravel())
 
-    # Python fallback
     residuals = _compute_residuals(model, responses, theta)
     return _compute_q3(residuals, responses)
 
@@ -311,7 +309,6 @@ def compute_ld_chi2(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    # Use Rust backend for dichotomous models
     if RUST_AVAILABLE and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
@@ -343,7 +340,6 @@ def _compute_residuals(
     """Compute standardized residuals for each person-item combination."""
     from mirt._rust_backend import RUST_AVAILABLE, compute_standardized_residuals
 
-    # Use Rust backend for dichotomous models
     if RUST_AVAILABLE and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
@@ -353,7 +349,6 @@ def _compute_residuals(
                 responses, theta_flat, disc.ravel(), diff.ravel()
             )
 
-    # Python fallback for polytomous or when Rust not available
     n_persons, n_items = responses.shape
     residuals = np.full((n_persons, n_items), np.nan)
 
@@ -381,8 +376,6 @@ def _compute_q3(
     responses: NDArray[np.int_],
 ) -> NDArray[np.float64]:
     """Compute Q3 (residual correlation) matrix."""
-    # Note: The Rust backend computes residuals internally, so this function
-    # is used as a fallback when residuals are pre-computed for polytomous models
     n_items = residuals.shape[1]
     q3_matrix = np.zeros((n_items, n_items))
 

@@ -414,7 +414,7 @@ class RandomSelection(ItemSelectionStrategy):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        return 0.0  # No criterion for random selection
+        return 0.0
 
 
 class AStratified(ItemSelectionStrategy):
