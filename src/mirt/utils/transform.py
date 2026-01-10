@@ -65,7 +65,7 @@ def key2binary(
 
 def poly2dich(
     responses: NDArray[np.float64],
-    cutoff: int | list[int] | None = None,
+    cutoff: int | float | list[int] | list[float] | None = None,
     method: str = "threshold",
 ) -> NDArray[np.float64]:
     """Convert polytomous responses to dichotomous.

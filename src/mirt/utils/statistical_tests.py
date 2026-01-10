@@ -106,10 +106,10 @@ def wald(
 
     if hasattr(model, "parameters"):
         params = model.parameters
-        all_params = []
+        all_params_list: list[float] = []
         for key in sorted(params.keys()):
-            all_params.extend(np.asarray(params[key]).ravel())
-        all_params = np.array(all_params)
+            all_params_list.extend(np.asarray(params[key]).ravel())
+        all_params = np.array(all_params_list)
     else:
         all_params = np.concatenate(
             [
@@ -216,10 +216,10 @@ def lagrange(
 
     if hasattr(model, "parameters"):
         params = model.parameters
-        all_params = []
+        all_params_list: list[float] = []
         for key in sorted(params.keys()):
-            all_params.extend(np.asarray(params[key]).ravel())
-        all_params = np.array(all_params)
+            all_params_list.extend(np.asarray(params[key]).ravel())
+        all_params = np.array(all_params_list)
     else:
         all_params = np.concatenate(
             [
