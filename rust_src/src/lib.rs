@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 pub mod utils;
 
 pub mod bootstrap;
+pub mod calibration;
 pub mod cat;
 pub mod diagnostics;
 pub mod eapsum;
@@ -49,6 +50,7 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     cat::register(m)?;
     mstep::register(m)?;
     standard_errors::register(m)?;
+    calibration::register(m)?;
 
     Ok(())
 }

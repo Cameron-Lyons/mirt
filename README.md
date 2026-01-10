@@ -49,6 +49,10 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Built-in sample datasets
 - Plotting (ICC, information, Wright maps, DIF)
 - DataFrame output (pandas or polars)
+- Fixed-item calibration and test equating
+- Reliable Change Index (RCI) for clinical significance
+- Profile-likelihood confidence intervals
+- Posterior parameter sampling
 
 ## Installation
 
@@ -224,6 +228,35 @@ from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
 ```
 
+### Test Equating & Calibration
+
+```python
+from mirt.utils import fixed_calib, equate, Q3, residuals
+
+# Fixed-item calibration: calibrate new items to existing scale
+calib_result = fixed_calib(
+    responses=combined_responses,
+    anchor_model=existing_model,
+    anchor_items=[0, 1, 2, 3, 4],  # Items with known parameters
+)
+print(f"New item difficulties: {calib_result.new_difficulty}")
+
+# Test form equating
+equating = equate(
+    model_old=form_a_model,
+    model_new=form_b_model,
+    anchor_items_old=[0, 1, 2],
+    anchor_items_new=[0, 1, 2],
+    method="stocking_lord",  # or "haebara", "mean_sigma", "mean_mean"
+)
+print(f"Scale transformation: theta_new = {equating.A:.3f} * theta_old + {equating.B:.3f}")
+
+# Local dependence analysis
+q3_matrix = Q3(result.model, responses, scores.theta)
+resid = residuals(result.model, responses, scores.theta)
+print(f"Max Q3 (off-diagonal): {np.max(np.abs(np.triu(q3_matrix, 1))):.3f}")
+```
+
 ### Plotting
 
 ```python
@@ -304,6 +337,37 @@ plot_person_item_map(result.model, scores.theta)
 | `generate_plausible_values()` | Plausible values |
 | `impute_responses()` | Missing data imputation |
 | `set_dataframe_backend()` | Choose pandas/polars |
+| `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
+| `Q3()` | Yen's Q3 local dependence statistic |
+| `LD_X2()` | Chen & Thissen LD chi-square |
+| `fixed_calib()` | Fixed-item calibration for test equating |
+| `equate()` | Test form equating (Stocking-Lord, Haebara, mean/sigma) |
+| `RCI()` | Reliable Change Index for clinical significance |
+| `PLCI()` | Profile-likelihood confidence intervals |
+| `draw_parameters()` | Draw samples from posterior distribution |
+| `randef()` / `fixef()` | Random/fixed effects from mixed models |
+
+### Data Transformation Functions
+
+| Function | Description |
+|----------|-------------|
+| `key2binary()` | Score multiple choice with answer key |
+| `poly2dich()` | Convert polytomous to dichotomous |
+| `reverse_score()` | Reverse score items |
+| `expand_table()` | Expand frequency table to response matrix |
+| `collapse_table()` | Collapse responses to frequency table |
+| `recode_responses()` | Recode response values |
+
+### Information Functions
+
+| Function | Description |
+|----------|-------------|
+| `testinfo()` | Test information function |
+| `iteminfo()` | Item information function |
+| `areainfo()` | Area under information curve |
+| `expected_score()` | Expected score at theta |
+| `gen_difficulty()` | Generalized difficulty index |
+| `theta_for_score()` | Find theta for target score |
 
 ## Comparison with R mirt
 
@@ -330,6 +394,7 @@ When the Rust backend is available (automatically built during installation), th
 | **EM Algorithm** | E-step (posterior computation), M-step (Newton-Raphson optimization), full EM fitting |
 | **Scoring** | EAP scores, WLE scores, Lord-Wingersky recursion for sum scores |
 | **Diagnostics** | Q3 matrix, LD chi-square, infit/outfit statistics, standardized residuals |
+| **Calibration** | Fixed-item calibration EM algorithm, Stocking-Lord equating criterion |
 | **SIBTEST** | Beta statistic computation, all-items SIBTEST |
 | **CAT** | Item information, item selection, EAP updates, batch simulation |
 | **Simulation** | Response generation for 2PL/3PL, GRM, GPCM |
@@ -435,7 +500,7 @@ If you use this package in your research, please cite:
   author = {Lyons, Cameron},
   title = {mirt: Multidimensional Item Response Theory for Python},
   url = {https://github.com/Cameron-Lyons/mirt},
-  version = {0.1.12}
+  version = {1.0.2}
 }
 ```
 
