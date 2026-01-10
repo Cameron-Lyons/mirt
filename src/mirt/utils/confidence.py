@@ -327,6 +327,6 @@ def delta_method(
         gradient[i] = (transform_func(e_plus) - transform_func(e_minus)) / (2 * eps)
 
     var = gradient @ vcov @ gradient
-    se = np.sqrt(max(var, 0))
+    se = np.sqrt(np.maximum(var, 0))
 
     return float(transformed), float(se)
