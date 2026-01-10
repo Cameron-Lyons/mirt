@@ -35,11 +35,9 @@ pub fn compute_item_se_parallel<'py>(
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
 
-    // Parallel computation of SE for each item
     let se_results: Vec<(f64, f64)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
-            // Compute expected counts
             let mut r_k = vec![0.0; n_quad];
             let mut n_k = vec![0.0; n_quad];
 
@@ -60,20 +58,16 @@ pub fn compute_item_se_parallel<'py>(
             let a = disc[j];
             let b = diff[j];
 
-            // Compute expected log-likelihood at center point
             let ll_center = compute_item_ll(&r_k, &n_k, &quad_points, a, b);
 
-            // Finite difference for discrimination (diagonal)
             let ll_a_plus = compute_item_ll(&r_k, &n_k, &quad_points, a + h, b);
             let ll_a_minus = compute_item_ll(&r_k, &n_k, &quad_points, a - h, b);
             let hess_aa = (ll_a_plus - 2.0 * ll_center + ll_a_minus) / (h * h);
 
-            // Finite difference for difficulty (diagonal)
             let ll_b_plus = compute_item_ll(&r_k, &n_k, &quad_points, a, b + h);
             let ll_b_minus = compute_item_ll(&r_k, &n_k, &quad_points, a, b - h);
             let hess_bb = (ll_b_plus - 2.0 * ll_center + ll_b_minus) / (h * h);
 
-            // Standard errors from diagonal of inverse Hessian
             let se_a = if hess_aa < -EPSILON {
                 (-1.0 / hess_aa).sqrt()
             } else {
@@ -153,9 +147,8 @@ pub fn compute_hessian_block_diagonal<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
-    let n_params = n_items * 2; // a and b for each item
+    let n_params = n_items * 2;
 
-    // Compute expected counts in parallel
     let expected_counts: Vec<(Vec<f64>, Vec<f64>)> = (0..n_items)
         .into_par_iter()
         .map(|j| {
@@ -180,7 +173,6 @@ pub fn compute_hessian_block_diagonal<'py>(
         })
         .collect();
 
-    // Compute block diagonal Hessian in parallel
     let blocks: Vec<[[f64; 2]; 2]> = (0..n_items)
         .into_par_iter()
         .map(|j| {
@@ -190,7 +182,6 @@ pub fn compute_hessian_block_diagonal<'py>(
 
             let ll_center = compute_item_ll(r_k, n_k, &quad_points, a, b);
 
-            // Diagonal elements
             let ll_a_plus = compute_item_ll(r_k, n_k, &quad_points, a + h, b);
             let ll_a_minus = compute_item_ll(r_k, n_k, &quad_points, a - h, b);
             let hess_aa = (ll_a_plus - 2.0 * ll_center + ll_a_minus) / (h * h);
@@ -199,7 +190,6 @@ pub fn compute_hessian_block_diagonal<'py>(
             let ll_b_minus = compute_item_ll(r_k, n_k, &quad_points, a, b - h);
             let hess_bb = (ll_b_plus - 2.0 * ll_center + ll_b_minus) / (h * h);
 
-            // Off-diagonal element (cross partial)
             let ll_pp = compute_item_ll(r_k, n_k, &quad_points, a + h, b + h);
             let ll_pm = compute_item_ll(r_k, n_k, &quad_points, a + h, b - h);
             let ll_mp = compute_item_ll(r_k, n_k, &quad_points, a - h, b + h);
@@ -210,7 +200,6 @@ pub fn compute_hessian_block_diagonal<'py>(
         })
         .collect();
 
-    // Assemble full Hessian matrix (block diagonal)
     let mut hessian = Array2::zeros((n_params, n_params));
 
     for (j, block) in blocks.iter().enumerate() {
@@ -237,8 +226,6 @@ pub fn compute_se_from_hessian<'py>(
     let hessian = hessian.as_array();
     let n_params = hessian.nrows();
 
-    // Compute inverse of negative Hessian
-    // For block diagonal, we can invert blocks independently
     let n_items = n_params / 2;
 
     let mut se = Array1::zeros(n_params);
@@ -254,7 +241,6 @@ pub fn compute_se_from_hessian<'py>(
         let det = h_aa * h_bb - h_ab * h_ab;
 
         if det > EPSILON {
-            // Inverse of 2x2 matrix
             let inv_aa = h_bb / det;
             let inv_bb = h_aa / det;
 
@@ -299,7 +285,6 @@ pub fn compute_complete_data_ll<'py>(
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
 
-    // Parallel over persons
     let ll: f64 = (0..n_persons)
         .into_par_iter()
         .map(|i| {

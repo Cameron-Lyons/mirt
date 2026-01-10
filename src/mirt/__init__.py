@@ -55,7 +55,9 @@ from mirt.models.zeroinflated import HurdleIRT, ZeroInflated2PL, ZeroInflated3PL
 from mirt.results.fit_result import FitResult
 from mirt.results.score_result import ScoreResult
 from mirt.scoring import fscores
+from mirt.utils.batch import BatchFitResult, fit_models
 from mirt.utils.bootstrap import bootstrap_ci, bootstrap_se, parametric_bootstrap
+from mirt.utils.cv import CVResult, KFold, LeaveOneOut, StratifiedKFold, cross_validate
 from mirt.utils.data import validate_responses
 from mirt.utils.dataframe import set_dataframe_backend
 from mirt.utils.datasets import list_datasets, load_dataset
@@ -543,6 +545,13 @@ __all__ = [
     "combine_plausible_values",
     "plausible_value_regression",
     "plausible_value_statistics",
+    "cross_validate",
+    "CVResult",
+    "KFold",
+    "StratifiedKFold",
+    "LeaveOneOut",
+    "fit_models",
+    "BatchFitResult",
 ]
 
 if _HAS_PLOTTING:

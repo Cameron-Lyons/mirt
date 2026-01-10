@@ -318,16 +318,59 @@ plot_person_item_map(result.model, scores.theta)
 | CAT | mirtCAT package | Built-in |
 | DIF | Yes | Yes (LR, Wald, Lord, Raju) |
 | Multiple groups | Full support | Full support |
-| Rust acceleration | No | Yes (2PL EM) |
+| Rust acceleration | No | Yes (see below) |
+
+## Rust Acceleration
+
+When the Rust backend is available (automatically built during installation), the following operations are accelerated with parallel processing:
+
+| Category | Accelerated Operations |
+|----------|------------------------|
+| **Likelihood** | Log-likelihood computation for 2PL, 3PL, and multidimensional models |
+| **EM Algorithm** | E-step (posterior computation), M-step (Newton-Raphson optimization), full EM fitting |
+| **Scoring** | EAP scores, WLE scores, Lord-Wingersky recursion for sum scores |
+| **Diagnostics** | Q3 matrix, LD chi-square, infit/outfit statistics, standardized residuals |
+| **SIBTEST** | Beta statistic computation, all-items SIBTEST |
+| **CAT** | Item information, item selection, EAP updates, batch simulation |
+| **Simulation** | Response generation for 2PL/3PL, GRM, GPCM |
+| **Bootstrap** | Index generation, resampling, parallel bootstrap fitting |
+| **Plausible Values** | Posterior sampling, MCMC generation |
+| **MCMC** | Gibbs sampling for 2PL, MHRM estimation |
+
+All Rust functions fall back to pure Python implementations if the extension is not available. The Rust backend provides significant speedups for large datasets (1000+ persons) due to:
+
+- **Rayon parallelization**: Computation across persons or items runs in parallel
+- **SIMD optimizations**: Vectorized arithmetic where available
+- **Memory efficiency**: Reduced allocations compared to NumPy broadcasting
+
+To check if Rust acceleration is available:
+```python
+from mirt._rust_backend import RUST_AVAILABLE
+print(f"Rust backend: {'enabled' if RUST_AVAILABLE else 'disabled'}")
+```
 
 ## Requirements
 
+### Core Dependencies (always required)
 - Python >= 3.11
 - numpy >= 1.24
 - scipy >= 1.9
-- pandas >= 1.5 (optional)
-- polars >= 0.20 (optional)
-- matplotlib (optional, for plotting)
+
+### Optional Dependencies
+
+| Package | Purpose | Installation |
+|---------|---------|--------------|
+| **matplotlib** | Plotting (ICC, information curves, Wright maps, DIF) | `pip install matplotlib` |
+| **pandas** | DataFrame output for results | `pip install mirt[pandas]` |
+| **polars** | DataFrame output (faster, preferred when both installed) | `pip install mirt[polars]` |
+
+When neither pandas nor polars is installed, functions that return DataFrames will raise an `ImportError` with installation instructions. Plotting functions similarly require matplotlib.
+
+To set your preferred DataFrame backend explicitly:
+```python
+import mirt
+mirt.set_dataframe_backend("pandas")  # or "polars"
+```
 
 ## Development
 
@@ -350,6 +393,34 @@ mypy src/mirt
 black src tests
 ruff check src tests
 ```
+
+## API Stability (v1.0)
+
+Starting with v1.0, this package follows [semantic versioning](https://semver.org/).
+
+### Stable Public API
+
+The following are guaranteed stable and will not have breaking changes in v1.x releases:
+
+- **Core functions**: `fit_mirt()`, `fscores()`, `simdata()`, `itemfit()`, `personfit()`, `dif()`
+- **Result classes**: `FitResult`, `ScoreResult`, `CVResult`, `BatchFitResult`
+- **Model classes**: All IRT models (`TwoParameterLogistic`, `GradedResponseModel`, etc.)
+- **CAT**: `CATEngine`, `CATResult`, `CATState`
+- **Diagnostics**: `compare_models()`, `anova_irt()`, `compute_fit_indices()`, `sibtest()`
+- **Utilities**: `bootstrap_se()`, `bootstrap_ci()`, `generate_plausible_values()`, `cross_validate()`, `fit_models()`
+- **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`
+
+### Experimental (may change in minor releases)
+
+- Internal `_rust_backend` module functions (use public wrappers instead)
+- MCMC samplers (`GibbsSampler`, `MHRMEstimator`) - API may be refined
+- Cognitive Diagnostic Models (`DINA`, `DINO`, `fit_cdm()`) - under active development
+
+### Versioning Policy
+
+- **Major version (2.0, 3.0)**: Breaking API changes
+- **Minor version (1.1, 1.2)**: New features, backward compatible
+- **Patch version (1.0.1, 1.0.2)**: Bug fixes only
 
 ## License
 
