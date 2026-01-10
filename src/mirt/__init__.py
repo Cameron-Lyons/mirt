@@ -57,18 +57,43 @@ from mirt.results.score_result import ScoreResult
 from mirt.scoring import fscores
 from mirt.utils.batch import BatchFitResult, fit_models
 from mirt.utils.bootstrap import bootstrap_ci, bootstrap_se, parametric_bootstrap
+from mirt.utils.calibration import equate, fixed_calib
+from mirt.utils.classical import TraditionalStats, traditional
+from mirt.utils.clinical import RCI, clinical_significance
+from mirt.utils.confidence import PLCI, score_CI
 from mirt.utils.cv import CVResult, KFold, LeaveOneOut, StratifiedKFold, cross_validate
 from mirt.utils.data import validate_responses
 from mirt.utils.dataframe import set_dataframe_backend
 from mirt.utils.datasets import list_datasets, load_dataset
+from mirt.utils.empirical import RMSD_DIF, empirical_ES, empirical_plot
+from mirt.utils.extraction import coef, extract_item, mod2values
 from mirt.utils.imputation import analyze_missing, impute_responses, listwise_deletion
+from mirt.utils.information import (
+    areainfo,
+    gen_difficulty,
+    iteminfo,
+    probtrace,
+    testinfo,
+)
+from mirt.utils.multidimensional import MDIFF, MDISC
 from mirt.utils.plausible import (
     combine_plausible_values,
     generate_plausible_values,
     plausible_value_regression,
     plausible_value_statistics,
 )
+from mirt.utils.predictions import fixef, randef
+from mirt.utils.reliability import empirical_rxx, marginal_rxx, sem
+from mirt.utils.residuals import Q3, residuals
+from mirt.utils.sampling import draw_parameters
 from mirt.utils.simulation import generate_item_parameters, simdata
+from mirt.utils.statistical_tests import lagrange, wald
+from mirt.utils.transform import (
+    expand_table,
+    key2binary,
+    poly2dich,
+    reverse_score,
+)
 
 try:
     from mirt.plotting import (  # noqa: F401
@@ -552,6 +577,41 @@ __all__ = [
     "LeaveOneOut",
     "fit_models",
     "BatchFitResult",
+    "testinfo",
+    "iteminfo",
+    "areainfo",
+    "probtrace",
+    "gen_difficulty",
+    "marginal_rxx",
+    "empirical_rxx",
+    "sem",
+    "traditional",
+    "TraditionalStats",
+    "wald",
+    "lagrange",
+    "mod2values",
+    "extract_item",
+    "coef",
+    "MDIFF",
+    "MDISC",
+    "empirical_ES",
+    "empirical_plot",
+    "RMSD_DIF",
+    "RCI",
+    "clinical_significance",
+    "residuals",
+    "Q3",
+    "fixed_calib",
+    "equate",
+    "PLCI",
+    "score_CI",
+    "key2binary",
+    "poly2dich",
+    "reverse_score",
+    "expand_table",
+    "draw_parameters",
+    "randef",
+    "fixef",
 ]
 
 if _HAS_PLOTTING:
