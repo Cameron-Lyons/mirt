@@ -15,6 +15,7 @@ from mirt.estimation.constraints import (
     mean_constraint,
 )
 from mirt.estimation.em import EMEstimator
+from mirt.estimation.gvem import GVEMEstimator
 from mirt.estimation.latent_density import (
     CustomDensity,
     DavidianCurve,
@@ -44,6 +45,11 @@ from mirt.estimation.priors import (
     weakly_informative_priors,
 )
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.sparse_bayesian import (
+    SparseBayesianEstimator,
+    SparseBayesianResult,
+    SpikeSlabLassoPrior,
+)
 from mirt.estimation.standard_errors import (
     compute_oakes_se,
     compute_observed_information,
@@ -59,9 +65,13 @@ from mirt.estimation.weighted import (
 __all__ = [
     "BaseEstimator",
     "EMEstimator",
+    "GVEMEstimator",
     "GaussHermiteQuadrature",
     "MCEMEstimator",
     "QMCEMEstimator",
+    "SparseBayesianEstimator",
+    "SparseBayesianResult",
+    "SpikeSlabLassoPrior",
     "StochasticEMEstimator",
     "WeightedEMEstimator",
     "compute_effective_sample_size",
