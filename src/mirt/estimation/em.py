@@ -30,6 +30,7 @@ class EMEstimator(BaseEstimator):
         item_optim_maxiter: int = 50,
         item_optim_ftol: float = 1e-6,
         se_step_size: float = 1e-5,
+        n_jobs: int = 1,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -41,6 +42,7 @@ class EMEstimator(BaseEstimator):
         self.item_optim_maxiter = item_optim_maxiter
         self.item_optim_ftol = item_optim_ftol
         self.se_step_size = se_step_size
+        self.n_jobs = n_jobs
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
@@ -137,14 +139,16 @@ class EMEstimator(BaseEstimator):
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
-        n_persons = responses.shape[0]
-        n_quad = len(quad_weights)
 
-        log_likelihoods = np.zeros((n_persons, n_quad))
-
-        for q in range(n_quad):
-            theta_q = quad_points[q : q + 1]
-            log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
+        if hasattr(model, "log_likelihood_batch"):
+            log_likelihoods = model.log_likelihood_batch(responses, quad_points)
+        else:
+            n_persons = responses.shape[0]
+            n_quad = len(quad_weights)
+            log_likelihoods = np.zeros((n_persons, n_quad))
+            for q in range(n_quad):
+                theta_q = quad_points[q : q + 1]
+                log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
 
         log_prior = self._latent_density.log_density(quad_points)
 
@@ -164,15 +168,35 @@ class EMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
     ) -> None:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
         quad_points = self._quadrature.nodes
         n_items = model.n_items
 
         n_k = posterior_weights.sum(axis=0)
 
-        for item_idx in range(n_items):
-            self._optimize_item(
-                model, item_idx, responses, posterior_weights, quad_points, n_k
-            )
+        n_jobs = self.n_jobs
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
+
+        if n_jobs == 1:
+            for item_idx in range(n_items):
+                self._optimize_item(
+                    model, item_idx, responses, posterior_weights, quad_points, n_k
+                )
+        else:
+
+            def optimize_single_item(item_idx):
+                return item_idx, self._optimize_item_return(
+                    model, item_idx, responses, posterior_weights, quad_points, n_k
+                )
+
+            with ThreadPoolExecutor(max_workers=min(n_jobs, n_items)) as executor:
+                results = list(executor.map(optimize_single_item, range(n_items)))
+
+            for item_idx, optimal_params in results:
+                self._set_item_params(model, item_idx, optimal_params)
 
     def _optimize_item(
         self,
@@ -237,6 +261,71 @@ class EMEstimator(BaseEstimator):
         )
 
         self._set_item_params(model, item_idx, result.x)
+
+    def _optimize_item_return(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+        responses: NDArray[np.int_],
+        posterior_weights: NDArray[np.float64],
+        quad_points: NDArray[np.float64],
+        n_k: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Optimize item parameters and return the result (for parallel execution)."""
+        item_responses = responses[:, item_idx]
+        valid_mask = item_responses >= 0
+
+        n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
+
+        current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
+
+        if model.is_polytomous:
+            n_categories = model._n_categories[item_idx]
+            n_quad = len(n_k)
+
+            r_kc = np.zeros((n_quad, n_categories))
+            for c in range(n_categories):
+                cat_mask = valid_mask & (item_responses == c)
+                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
+
+            eps = self.prob_epsilon
+
+            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+                self._set_item_params(model, item_idx, params)
+
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, eps, 1 - eps)
+
+                ll = np.sum(r_kc * np.log(probs))
+
+                return -ll
+
+        else:
+            r_k = np.sum(
+                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                axis=0,
+            )
+            eps = self.prob_epsilon
+
+            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+                self._set_item_params(model, item_idx, params)
+
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, eps, 1 - eps)
+
+                ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+
+                return -ll
+
+        result = minimize(
+            neg_expected_log_likelihood,
+            x0=current_params,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
+        )
+
+        return result.x
 
     def _compute_standard_errors(
         self,

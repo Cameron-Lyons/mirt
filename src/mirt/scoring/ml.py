@@ -17,14 +17,19 @@ class MLScorer:
     def __init__(
         self,
         theta_bounds: tuple[float, float] = (-6.0, 6.0),
+        n_jobs: int = 1,
     ) -> None:
         self.theta_bounds = theta_bounds
+        self.n_jobs = n_jobs
 
     def score(
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
+        import os
+        from concurrent.futures import ThreadPoolExecutor
+
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
@@ -35,19 +40,37 @@ class MLScorer:
         theta_ml = np.zeros((n_persons, n_factors))
         theta_se = np.zeros((n_persons, n_factors))
 
-        for i in range(n_persons):
-            person_responses = responses[i : i + 1, :]
+        n_jobs = self.n_jobs
+        if n_jobs == -1:
+            n_jobs = os.cpu_count() or 1
 
+        def score_person(i):
+            person_responses = responses[i : i + 1, :]
             if n_factors == 1:
-                theta_est, se_est = self._score_unidimensional(model, person_responses)
-                theta_ml[i, 0] = theta_est
-                theta_se[i, 0] = se_est
+                return self._score_unidimensional(model, person_responses)
             else:
-                theta_est, se_est = self._score_multidimensional(
-                    model, person_responses
-                )
-                theta_ml[i] = theta_est
-                theta_se[i] = se_est
+                return self._score_multidimensional(model, person_responses)
+
+        if n_jobs == 1:
+            for i in range(n_persons):
+                theta_est, se_est = score_person(i)
+                if n_factors == 1:
+                    theta_ml[i, 0] = theta_est
+                    theta_se[i, 0] = se_est
+                else:
+                    theta_ml[i] = theta_est
+                    theta_se[i] = se_est
+        else:
+            with ThreadPoolExecutor(max_workers=min(n_jobs, n_persons)) as executor:
+                results = list(executor.map(score_person, range(n_persons)))
+
+            for i, (theta_est, se_est) in enumerate(results):
+                if n_factors == 1:
+                    theta_ml[i, 0] = theta_est
+                    theta_se[i, 0] = se_est
+                else:
+                    theta_ml[i] = theta_est
+                    theta_se[i] = se_est
 
         if n_factors == 1:
             theta_ml = theta_ml.ravel()

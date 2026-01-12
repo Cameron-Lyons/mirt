@@ -210,6 +210,126 @@ class EmpiricalHistogram(LatentDensity):
         return len(self._probs) - 1
 
 
+class EmpiricalHistogramWoods(LatentDensity):
+    """Empirical histogram density with Woods extrapolation.
+
+    Extends the standard empirical histogram approach using the method
+    of Woods (2007) which extrapolates probabilities at the tails of
+    the distribution to improve estimation in sparse regions.
+
+    Parameters
+    ----------
+    n_bins : int
+        Number of histogram bins (equals n_quadpts typically)
+    extrapolation_factor : float
+        Factor controlling extrapolation strength (0.5-2.0 typical)
+
+    References
+    ----------
+    Woods, C. M. (2007). Empirical histograms in item response theory
+        with ordinal data. Educational and Psychological Measurement,
+        67, 73-87.
+    """
+
+    def __init__(
+        self,
+        n_bins: int | None = None,
+        extrapolation_factor: float = 1.0,
+        initial_probs: NDArray[np.float64] | None = None,
+    ) -> None:
+        self.n_bins = n_bins
+        self.extrapolation_factor = extrapolation_factor
+        self._probs: NDArray[np.float64] | None = None
+        self._theta_points: NDArray[np.float64] | None = None
+
+        if initial_probs is not None:
+            self._probs = np.asarray(initial_probs)
+            self._probs = self._probs / self._probs.sum()
+            self.n_bins = len(self._probs)
+
+    def _initialize(
+        self, n_points: int, theta_points: NDArray[np.float64] | None = None
+    ) -> None:
+        """Initialize with uniform distribution."""
+        if self._probs is None or len(self._probs) != n_points:
+            self.n_bins = n_points
+            self._probs = np.ones(n_points) / n_points
+        if theta_points is not None:
+            self._theta_points = theta_points
+
+    def _extrapolate_tails(self, probs: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Apply Woods extrapolation to tail probabilities.
+
+        The method fits a polynomial to the log-probabilities in the
+        interior region and extrapolates to the tails.
+        """
+        n = len(probs)
+        if n < 5:
+            return probs
+
+        log_probs = np.log(np.clip(probs, 1e-10, None))
+
+        n_interior = max(3, n // 3)
+        lower_idx = n_interior
+        upper_idx = n - n_interior
+
+        interior_mask = np.zeros(n, dtype=bool)
+        interior_mask[lower_idx:upper_idx] = True
+
+        if interior_mask.sum() < 3:
+            return probs
+
+        x = np.arange(n)
+        try:
+            poly = np.polyfit(x[interior_mask], log_probs[interior_mask], deg=2)
+
+            lower_extrap = np.exp(np.polyval(poly, x[:lower_idx]))
+            upper_extrap = np.exp(np.polyval(poly, x[upper_idx:]))
+
+            extrap_probs = probs.copy()
+            alpha = self.extrapolation_factor
+
+            extrap_probs[:lower_idx] = (1 - alpha) * probs[
+                :lower_idx
+            ] + alpha * lower_extrap
+            extrap_probs[upper_idx:] = (1 - alpha) * probs[
+                upper_idx:
+            ] + alpha * upper_extrap
+
+            extrap_probs = np.clip(extrap_probs, 1e-10, None)
+            extrap_probs = extrap_probs / extrap_probs.sum()
+
+            return extrap_probs
+        except (np.linalg.LinAlgError, ValueError):
+            return probs
+
+    def log_density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        if self._probs is None:
+            raise ValueError("Histogram not initialized. Call update() first.")
+        return np.log(np.clip(self._probs, 1e-300, None))
+
+    def update(
+        self,
+        theta_points: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> None:
+        self._initialize(len(weights), theta_points)
+
+        raw_probs = weights / weights.sum()
+        raw_probs = np.clip(raw_probs, 1e-10, None)
+
+        self._probs = self._extrapolate_tails(raw_probs)
+
+        self._probs = np.clip(self._probs, 1e-10, None)
+        self._probs = self._probs / self._probs.sum()
+
+    @property
+    def n_parameters(self) -> int:
+        if self._probs is None:
+            return 0
+        return len(self._probs) - 1
+
+
 class DavidianCurve(LatentDensity):
     """Davidian curve semi-parametric density.
 
@@ -486,6 +606,9 @@ def create_density(
         "normal": GaussianDensity,
         "empirical": EmpiricalHistogram,
         "histogram": EmpiricalHistogram,
+        "eh": EmpiricalHistogram,
+        "ehw": EmpiricalHistogramWoods,
+        "empiricalhist_woods": EmpiricalHistogramWoods,
         "davidian": DavidianCurve,
         "mixture": MixtureDensity,
         "custom": CustomDensity,

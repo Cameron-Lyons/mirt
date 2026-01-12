@@ -27,7 +27,9 @@ pub mod estimation;
 pub mod likelihood;
 pub mod mirt_models;
 pub mod mstep;
+pub mod multigroup;
 pub mod plausible;
+pub mod polytomous;
 pub mod scoring;
 pub mod sibtest;
 pub mod simulation;
@@ -51,6 +53,8 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     mstep::register(m)?;
     standard_errors::register(m)?;
     calibration::register(m)?;
+    polytomous::register(m)?;
+    multigroup::register(m)?;
 
     Ok(())
 }

@@ -209,6 +209,52 @@ class DichotomousItemModel(BaseItemModel):
 
         return ll.sum(axis=1)
 
+    def log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute log-likelihood for all persons at all theta points.
+
+        Parameters
+        ----------
+        responses : ndarray of shape (n_persons, n_items)
+            Response matrix.
+        theta : ndarray of shape (n_theta, n_factors)
+            Ability values at which to compute likelihood.
+
+        Returns
+        -------
+        ndarray of shape (n_persons, n_theta)
+            Log-likelihood for each person at each theta point.
+        """
+        responses = np.asarray(responses)
+        theta = self._ensure_theta_2d(theta)
+        n_persons = responses.shape[0]
+        n_theta = theta.shape[0]
+
+        p = self.probability(theta)
+        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+        log_p = np.log(p)
+        log_1_minus_p = np.log(1 - p)
+
+        valid = responses >= 0
+
+        ll = np.zeros((n_persons, n_theta))
+        for j in range(self.n_items):
+            item_valid = valid[:, j]
+            item_resp = responses[:, j]
+
+            ll_correct = log_p[:, j]
+            ll_incorrect = log_1_minus_p[:, j]
+
+            ll[item_valid, :] += (
+                item_resp[item_valid, None] * ll_correct[None, :]
+                + (1 - item_resp[item_valid, None]) * ll_incorrect[None, :]
+            )
+
+        return ll
+
     def expected_score(
         self,
         theta: NDArray[np.float64],
@@ -250,6 +296,17 @@ class PolytomousItemModel(BaseItemModel):
     @property
     def max_categories(self) -> int:
         return max(self._n_categories)
+
+    def copy(self) -> Self:
+        new_model = self.__class__(
+            n_items=self.n_items,
+            n_categories=self._n_categories.copy(),
+            n_factors=self.n_factors,
+            item_names=self.item_names.copy(),
+        )
+        new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
+        new_model._is_fitted = self._is_fitted
+        return new_model
 
     @abstractmethod
     def category_probability(
@@ -362,5 +419,49 @@ class PolytomousItemModel(BaseItemModel):
                         theta[person : person + 1], i, resp
                     )
                     ll[person] += np.log(prob[0] + 1e-10)
+
+        return ll
+
+    def log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute log-likelihood for all persons at all theta points.
+
+        Parameters
+        ----------
+        responses : ndarray of shape (n_persons, n_items)
+            Response matrix.
+        theta : ndarray of shape (n_theta, n_factors)
+            Ability values at which to compute likelihood.
+
+        Returns
+        -------
+        ndarray of shape (n_persons, n_theta)
+            Log-likelihood for each person at each theta point.
+        """
+        responses = np.asarray(responses)
+        theta = self._ensure_theta_2d(theta)
+        n_persons = responses.shape[0]
+        n_theta = theta.shape[0]
+
+        ll = np.zeros((n_persons, n_theta))
+
+        for item_idx in range(self.n_items):
+            n_cat = self._n_categories[item_idx]
+            probs = np.zeros((n_theta, n_cat))
+            for k in range(n_cat):
+                probs[:, k] = self.category_probability(theta, item_idx, k)
+            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            log_probs = np.log(probs)
+
+            item_resp = responses[:, item_idx]
+            valid_mask = item_resp >= 0
+
+            for c in range(n_cat):
+                cat_mask = valid_mask & (item_resp == c)
+                if np.any(cat_mask):
+                    ll[cat_mask, :] += log_probs[None, :, c]
 
         return ll

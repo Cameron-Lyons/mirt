@@ -267,6 +267,120 @@ class FourParameterLogistic(DichotomousItemModel):
 
 Rasch = OneParameterLogistic
 
+ThreeParameterLogisticUpper = FourParameterLogistic
+
+
+class UnipolarLogLogistic(DichotomousItemModel):
+    """Unipolar Log-Logistic (ULL) model for dichotomous items.
+
+    The ULL model is designed for items where only positive trait levels
+    are expected to endorse the item. It has a lower asymptote at 0 and
+    approaches 1 more slowly than the standard logistic.
+
+    This is useful for clinical or personality assessment where items
+    measure presence/absence of a trait that only manifests at higher
+    trait levels.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of items
+    item_names : list of str, optional
+        Names for items
+
+    Attributes
+    ----------
+    discrimination : ndarray
+        Item discrimination parameters (must be positive)
+    difficulty : ndarray
+        Item difficulty/location parameters
+
+    Notes
+    -----
+    The ULL probability function is:
+
+        P(X=1|θ) = exp(a(θ - b)) / (1 + exp(a(θ - b)))^2
+
+    which is the derivative of the logistic function, giving a
+    bell-shaped response function peaking near b.
+
+    Alternatively, using the log-logistic formulation:
+
+        P(X=1|θ) = 1 / (1 + exp(-a(θ - b)))  for θ >= b
+        P(X=1|θ) ≈ 0                          for θ << b
+
+    References
+    ----------
+    Samejima, F. (1995). Acceleration model in the heterogeneous case
+        of the general graded response model. Psychometrika, 60, 549-572.
+    """
+
+    model_name = "ULL"
+    n_params_per_item = 2
+    supports_multidimensional = False
+
+    def __init__(
+        self,
+        n_items: int,
+        n_factors: int = 1,
+        item_names: list[str] | None = None,
+    ) -> None:
+        if n_factors != 1:
+            raise ValueError("ULL model only supports unidimensional analysis")
+        super().__init__(n_items, n_factors=1, item_names=item_names)
+
+    def _initialize_parameters(self) -> None:
+        self._parameters["discrimination"] = np.ones(self.n_items)
+        self._parameters["difficulty"] = np.zeros(self.n_items)
+
+    @property
+    def discrimination(self) -> NDArray[np.float64]:
+        return self._parameters["discrimination"]
+
+    @property
+    def difficulty(self) -> NDArray[np.float64]:
+        return self._parameters["difficulty"]
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        theta_1d = theta.ravel()
+
+        a = self._parameters["discrimination"]
+        b = self._parameters["difficulty"]
+
+        if item_idx is not None:
+            z = a[item_idx] * (theta_1d - b[item_idx])
+            exp_z = np.exp(np.clip(z, -700, 700))
+            return exp_z / ((1.0 + exp_z) ** 2)
+
+        z = a[None, :] * (theta_1d[:, None] - b[None, :])
+        exp_z = np.exp(np.clip(z, -700, 700))
+        return exp_z / ((1.0 + exp_z) ** 2)
+
+    def information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        p = self.probability(theta, item_idx)
+        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+
+        h = 1e-5
+        theta_plus = theta + h
+        theta_minus = theta - h
+
+        p_plus = self.probability(theta_plus, item_idx)
+        p_minus = self.probability(theta_minus, item_idx)
+
+        dp = (p_plus - p_minus) / (2 * h)
+
+        return (dp**2) / (p * (1 - p) + 1e-10)
+
 
 class FiveParameterLogistic(DichotomousItemModel):
     """Five-Parameter Logistic (5PL) model with asymmetric curves.

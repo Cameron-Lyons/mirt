@@ -1,6 +1,11 @@
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._rust_backend import (
+    RUST_AVAILABLE,
+    compute_log_likelihoods_gpcm,
+    compute_log_likelihoods_grm,
+)
 from mirt.models.base import PolytomousItemModel
 
 
@@ -105,6 +110,21 @@ class GradedResponseModel(PolytomousItemModel):
 
         return info
 
+    def log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        if RUST_AVAILABLE and self.n_factors == 1:
+            quad_points = theta.ravel() if theta.ndim == 2 else theta
+            disc = self._parameters["discrimination"]
+            thresh = self._parameters["thresholds"]
+            n_cats = np.array(self._n_categories, dtype=np.int32)
+            return compute_log_likelihoods_grm(
+                responses, quad_points, disc, thresh, n_cats
+            )
+        return super().log_likelihood_batch(responses, theta)
+
 
 class GeneralizedPartialCredit(PolytomousItemModel):
     model_name = "GPCM"
@@ -192,6 +212,23 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         variance = expected_sq - expected**2
 
         return (a_val**2) * variance
+
+    def log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        if RUST_AVAILABLE and self.n_factors == 1:
+            quad_points = theta.ravel() if theta.ndim == 2 else theta
+            disc = self._parameters["discrimination"]
+            steps_full = np.zeros((self.n_items, max(self._n_categories)))
+            for i, n_cat in enumerate(self._n_categories):
+                steps_full[i, 1:n_cat] = self._parameters["steps"][i, : n_cat - 1]
+            n_cats = np.array(self._n_categories, dtype=np.int32)
+            return compute_log_likelihoods_gpcm(
+                responses, quad_points, disc, steps_full, n_cats
+            )
+        return super().log_likelihood_batch(responses, theta)
 
 
 class PartialCreditModel(GeneralizedPartialCredit):
@@ -396,6 +433,178 @@ class RatingScaleModel(PolytomousItemModel):
             if name == "thresholds" and values.shape != (self._n_cats - 1,):
                 raise ValueError(f"thresholds must have shape ({self._n_cats - 1},)")
             self._parameters[name] = values
+
+        self._is_fitted = True
+        return self
+
+
+class GradedRatingScaleModel(PolytomousItemModel):
+    """Graded Rating Scale Model (GRSM) for polytomous items.
+
+    The GRSM is a constrained GRM where discrimination parameters are
+    equal across all items. This is the graded response analog of the
+    Rating Scale Model.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of items
+    n_categories : int
+        Number of response categories (must be same for all items)
+    item_names : list of str, optional
+        Names for each item
+
+    Attributes
+    ----------
+    discrimination : float
+        Common discrimination parameter for all items
+    difficulty : ndarray of shape (n_items,)
+        Item location parameters
+    thresholds : ndarray of shape (n_categories - 1,)
+        Category threshold parameters (relative to item location)
+
+    Notes
+    -----
+    The GRSM cumulative probability is:
+
+        P(X >= k | theta) = 1 / (1 + exp(-a * (theta - b_j - tau_k)))
+
+    where a is the common discrimination, b_j is item location, and
+    tau_k are shared category thresholds.
+
+    References
+    ----------
+    Muraki, E. (1990). Fitting a polytomous item response model to
+        Likert-type data. Applied Psychological Measurement, 14, 59-71.
+    """
+
+    model_name = "GRSM"
+    supports_multidimensional = False
+
+    def __init__(
+        self,
+        n_items: int,
+        n_categories: int | list[int],
+        n_factors: int = 1,
+        item_names: list[str] | None = None,
+    ) -> None:
+        if n_factors != 1:
+            raise ValueError("GRSM only supports unidimensional analysis")
+
+        if isinstance(n_categories, list):
+            if len(set(n_categories)) != 1:
+                raise ValueError(
+                    "GRSM requires all items to have the same number of categories"
+                )
+            n_categories = n_categories[0]
+
+        self._n_cats = n_categories
+        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
+
+    def _initialize_parameters(self) -> None:
+        self._parameters["discrimination"] = np.array([1.0])
+        self._parameters["difficulty"] = np.zeros(self.n_items)
+        n_thresholds = self._n_cats - 1
+        self._parameters["thresholds"] = np.linspace(-2, 2, n_thresholds)
+
+    @property
+    def discrimination(self) -> float:
+        """Common discrimination parameter."""
+        return float(self._parameters["discrimination"][0])
+
+    @property
+    def difficulty(self) -> NDArray[np.float64]:
+        """Item location parameters."""
+        return self._parameters["difficulty"]
+
+    @property
+    def thresholds(self) -> NDArray[np.float64]:
+        """Shared category threshold parameters."""
+        return self._parameters["thresholds"]
+
+    def cumulative_probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+        threshold_idx: int,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        theta_1d = theta.ravel()
+
+        a = self._parameters["discrimination"][0]
+        b_j = self._parameters["difficulty"][item_idx]
+        tau_k = self._parameters["thresholds"][threshold_idx]
+
+        z = a * (theta_1d - b_j - tau_k)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    def category_probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+        category: int,
+    ) -> NDArray[np.float64]:
+        n_cat = self._n_cats
+
+        if category < 0 or category >= n_cat:
+            raise ValueError(f"Category {category} out of range [0, {n_cat})")
+
+        if category == 0:
+            return 1.0 - self.cumulative_probability(theta, item_idx, 0)
+        elif category == n_cat - 1:
+            return self.cumulative_probability(theta, item_idx, category - 1)
+        else:
+            p_upper = self.cumulative_probability(theta, item_idx, category - 1)
+            p_lower = self.cumulative_probability(theta, item_idx, category)
+            return p_upper - p_lower
+
+    def _item_information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        n_persons = theta.shape[0]
+        n_cat = self._n_cats
+
+        a = self._parameters["discrimination"][0]
+        probs = self.probability(theta, item_idx)
+
+        cum_probs = np.zeros((n_persons, n_cat + 1))
+        cum_probs[:, 0] = 1.0
+        for k in range(n_cat - 1):
+            cum_probs[:, k + 1] = self.cumulative_probability(theta, item_idx, k)
+        cum_probs[:, n_cat] = 0.0
+
+        info = np.zeros(n_persons)
+        for k in range(n_cat):
+            p_k = probs[:, k]
+            p_star_k = cum_probs[:, k]
+            p_star_k1 = cum_probs[:, k + 1]
+
+            dp_k = a * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
+
+            info += np.where(p_k > 1e-10, (dp_k**2) / p_k, 0.0)
+
+        return info
+
+    def set_parameters(
+        self,
+        discrimination: float | None = None,
+        difficulty: NDArray[np.float64] | None = None,
+        thresholds: NDArray[np.float64] | None = None,
+    ) -> "GradedRatingScaleModel":
+        if discrimination is not None:
+            self._parameters["discrimination"] = np.array([float(discrimination)])
+        if difficulty is not None:
+            difficulty = np.asarray(difficulty)
+            if difficulty.shape != (self.n_items,):
+                raise ValueError(f"difficulty must have shape ({self.n_items},)")
+            self._parameters["difficulty"] = difficulty
+        if thresholds is not None:
+            thresholds = np.asarray(thresholds)
+            if thresholds.shape != (self._n_cats - 1,):
+                raise ValueError(f"thresholds must have shape ({self._n_cats - 1},)")
+            self._parameters["thresholds"] = thresholds
 
         self._is_fitted = True
         return self

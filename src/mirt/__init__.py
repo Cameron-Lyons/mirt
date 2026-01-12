@@ -15,10 +15,13 @@ from mirt.diagnostics.drf import compute_drf, compute_item_drf, reliability_inva
 from mirt.diagnostics.dtf import compute_dtf
 from mirt.diagnostics.modelfit import compute_fit_indices, compute_m2
 from mirt.diagnostics.sibtest import sibtest, sibtest_items
+from mirt.estimation.bl import BLEstimator
 from mirt.estimation.em import EMEstimator
+from mirt.estimation.latent_density import EmpiricalHistogramWoods
 from mirt.estimation.mcmc import GibbsSampler, MCMCResult, MHRMEstimator
 from mirt.estimation.mixed import LLTM, MixedEffectsFitResult, MixedEffectsIRT
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.se_methods import SEMethod, compute_se
 from mirt.exceptions import (
     MirtConvergenceError,
     MirtDataError,
@@ -45,12 +48,15 @@ from mirt.models.dichotomous import (
     OneParameterLogistic,
     Rasch,
     ThreeParameterLogistic,
+    ThreeParameterLogisticUpper,
     TwoParameterLogistic,
+    UnipolarLogLogistic,
 )
 from mirt.models.mixture import MixtureIRT, fit_mixture_irt
 from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
+    GradedRatingScaleModel,
     GradedResponseModel,
     NominalResponseModel,
     PartialCreditModel,
@@ -62,6 +68,20 @@ from mirt.models.unfolding import (
     IdealPointModel,
 )
 from mirt.models.zeroinflated import HurdleIRT, ZeroInflated2PL, ZeroInflated3PL
+from mirt.multigroup import (
+    GroupLatentDistribution,
+    InvarianceSpec,
+    InvarianceTestResult,
+    MultigroupEMEstimator,
+    MultigroupFitResult,
+    MultigroupLatentDensity,
+    MultigroupModel,
+    ParameterLink,
+    compare_invariance,
+    fit_multigroup,
+    invariance_lrt,
+    test_invariance_hierarchy,
+)
 from mirt.results.fit_result import FitResult
 from mirt.results.score_result import ScoreResult
 from mirt.scoring import fscores
@@ -70,6 +90,7 @@ from mirt.utils.bootstrap import bootstrap_ci, bootstrap_se, parametric_bootstra
 from mirt.utils.calibration import equate, fixed_calib
 from mirt.utils.classical import ItemStats, TraditionalStats, itemstats, traditional
 from mirt.utils.clinical import RCI, clinical_significance
+from mirt.utils.collapse import CollapsedData, collapse_patterns
 from mirt.utils.confidence import PLCI, score_CI
 from mirt.utils.cv import CVResult, KFold, LeaveOneOut, StratifiedKFold, cross_validate
 from mirt.utils.data import validate_responses
@@ -109,6 +130,7 @@ from mirt.utils.reliability import empirical_rxx, marginal_rxx, sem
 from mirt.utils.residuals import Q3, residuals
 from mirt.utils.sampling import draw_parameters
 from mirt.utils.simulation import generate_item_parameters, simdata
+from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
 from mirt.utils.statistical_tests import lagrange, wald
 from mirt.utils.transform import (
     expand_table,
@@ -533,8 +555,11 @@ __all__ = [
     "TwoParameterLogistic",
     "ThreeParameterLogistic",
     "FourParameterLogistic",
+    "ThreeParameterLogisticUpper",
+    "UnipolarLogLogistic",
     "Rasch",
     "GradedResponseModel",
+    "GradedRatingScaleModel",
     "GeneralizedPartialCredit",
     "PartialCreditModel",
     "NominalResponseModel",
@@ -556,7 +581,11 @@ __all__ = [
     "fit_mixture_irt",
     "BaseItemModel",
     "EMEstimator",
+    "BLEstimator",
     "GaussHermiteQuadrature",
+    "EmpiricalHistogramWoods",
+    "compute_se",
+    "SEMethod",
     "MHRMEstimator",
     "GibbsSampler",
     "MCMCResult",
@@ -632,6 +661,11 @@ __all__ = [
     "reverse_score",
     "expand_table",
     "draw_parameters",
+    "collapse_patterns",
+    "CollapsedData",
+    "gen_random_pars",
+    "calc_null",
+    "multi_start_fit",
     "randef",
     "fixef",
     "itemGAM",
@@ -650,6 +684,18 @@ __all__ = [
     "create_item_type",
     "get_standard_item_type",
     "list_standard_item_types",
+    "fit_multigroup",
+    "compare_invariance",
+    "test_invariance_hierarchy",
+    "MultigroupFitResult",
+    "MultigroupModel",
+    "MultigroupEMEstimator",
+    "MultigroupLatentDensity",
+    "GroupLatentDistribution",
+    "InvarianceSpec",
+    "InvarianceTestResult",
+    "ParameterLink",
+    "invariance_lrt",
 ]
 
 if _HAS_PLOTTING:

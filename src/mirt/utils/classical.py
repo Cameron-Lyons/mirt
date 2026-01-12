@@ -10,6 +10,9 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._rust_backend import RUST_AVAILABLE
+from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
+
 
 @dataclass
 class TraditionalStats:
@@ -105,20 +108,23 @@ def traditional(
     else:
         alpha = 0.0
 
-    alpha_if_deleted = np.zeros(n_items)
-    for j in range(n_items):
-        remaining_items = np.delete(responses, j, axis=1)
-        remaining_variances = np.nanvar(remaining_items, axis=0, ddof=1)
-        remaining_total = np.nansum(remaining_items, axis=1)
-        remaining_total_var = np.nanvar(remaining_total, ddof=1)
+    if RUST_AVAILABLE:
+        alpha_if_deleted = _rust_alpha_if_deleted(responses)
+    else:
+        alpha_if_deleted = np.zeros(n_items)
+        for j in range(n_items):
+            remaining_items = np.delete(responses, j, axis=1)
+            remaining_variances = np.nanvar(remaining_items, axis=0, ddof=1)
+            remaining_total = np.nansum(remaining_items, axis=1)
+            remaining_total_var = np.nanvar(remaining_total, ddof=1)
 
-        k = n_items - 1
-        if remaining_total_var > 0 and k > 1:
-            alpha_if_deleted[j] = (k / (k - 1)) * (
-                1 - np.sum(remaining_variances) / remaining_total_var
-            )
-        else:
-            alpha_if_deleted[j] = 0.0
+            k = n_items - 1
+            if remaining_total_var > 0 and k > 1:
+                alpha_if_deleted[j] = (k / (k - 1)) * (
+                    1 - np.sum(remaining_variances) / remaining_total_var
+                )
+            else:
+                alpha_if_deleted[j] = 0.0
 
     return TraditionalStats(
         difficulty=difficulty,
