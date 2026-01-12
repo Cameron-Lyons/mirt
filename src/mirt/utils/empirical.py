@@ -13,6 +13,12 @@ from numpy.typing import NDArray
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
+EPSILON = 1e-10
+PROB_CLIP_MIN = 0.01
+PROB_CLIP_MAX = 0.99
+SILVERMAN_CONSTANT = 1.06
+SILVERMAN_EXPONENT = -1 / 5
+
 
 @dataclass
 class DIFEffectSize:
@@ -528,3 +534,162 @@ def weighted_RMSD_DIF(
     weighted_rmsd = np.sqrt(np.sum(weights * squared_diff))
 
     return float(weighted_rmsd)
+
+
+@dataclass
+class ItemGAMResult:
+    """Container for itemGAM results.
+
+    Attributes
+    ----------
+    item_idx : int
+        Item index.
+    theta_grid : NDArray[np.float64]
+        Grid of theta values for smooth curve.
+    smoothed_probs : NDArray[np.float64]
+        Smoothed empirical probabilities.
+    model_probs : NDArray[np.float64]
+        Model-predicted probabilities.
+    se_bands : NDArray[np.float64]
+        Standard error bands (lower, upper) for smoothed curve.
+    raw_theta : NDArray[np.float64]
+        Raw theta values from data.
+    raw_probs : NDArray[np.float64]
+        Raw observed probabilities at each theta.
+    """
+
+    item_idx: int
+    theta_grid: NDArray[np.float64]
+    smoothed_probs: NDArray[np.float64]
+    model_probs: NDArray[np.float64]
+    se_bands: NDArray[np.float64]
+    raw_theta: NDArray[np.float64]
+    raw_probs: NDArray[np.float64]
+
+
+def itemGAM(
+    model: "BaseItemModel",
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    item_idx: int | list[int] | None = None,
+    n_grid: int = 100,
+    bandwidth: float | None = None,
+    se: bool = True,
+    alpha: float = 0.05,
+    theta_margin: float = 0.1,
+) -> ItemGAMResult | list[ItemGAMResult]:
+    """Compute parametric smoothed regression lines for item response functions.
+
+    Fits a kernel-smoothed regression to compare observed item performance
+    with model predictions. Useful for detecting model misfit.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        A fitted IRT model.
+    responses : NDArray[np.float64]
+        Response matrix. Shape: (n_persons, n_items).
+    theta : NDArray[np.float64]
+        Ability estimates. Shape: (n_persons,) or (n_persons, 1).
+    item_idx : int, list of int, or None
+        Item index or indices to analyze. If None, all items.
+    n_grid : int
+        Number of points in theta grid. Default 100.
+    bandwidth : float, optional
+        Kernel bandwidth. If None, uses Silverman's rule of thumb.
+    se : bool
+        Whether to compute standard error bands. Default True.
+    alpha : float
+        Significance level for confidence bands. Default 0.05 (95% CI).
+    theta_margin : float
+        Fraction of theta range to extend grid beyond observed values.
+        Default 0.1 (10% on each side).
+
+    Returns
+    -------
+    ItemGAMResult or list of ItemGAMResult
+        Smoothed regression results for each item.
+
+    Examples
+    --------
+    >>> result = fit_mirt(responses, model="2PL")
+    >>> scores = fscores(result, responses)
+    >>> gam = itemGAM(result.model, responses, scores.theta, item_idx=0)
+    >>> # Plot smoothed vs model curve
+    >>> import matplotlib.pyplot as plt
+    >>> plt.plot(gam.theta_grid, gam.smoothed_probs, label='Observed (smoothed)')
+    >>> plt.plot(gam.theta_grid, gam.model_probs, label='Model')
+    >>> plt.fill_between(gam.theta_grid, gam.se_bands[0], gam.se_bands[1], alpha=0.2)
+    >>> plt.legend()
+    """
+    from scipy import stats
+
+    responses = np.asarray(responses, dtype=np.float64)
+    theta = np.atleast_1d(theta).ravel()
+    n_items = responses.shape[1]
+
+    z_crit = stats.norm.ppf(1 - alpha / 2)
+
+    if item_idx is None:
+        item_indices = list(range(n_items))
+    elif isinstance(item_idx, int):
+        item_indices = [item_idx]
+    else:
+        item_indices = list(item_idx)
+
+    if bandwidth is None:
+        bandwidth = (
+            SILVERMAN_CONSTANT * np.std(theta) * len(theta) ** SILVERMAN_EXPONENT
+        )
+
+    theta_min, theta_max = np.min(theta), np.max(theta)
+    margin = theta_margin * (theta_max - theta_min)
+    theta_grid = np.linspace(theta_min - margin, theta_max + margin, n_grid)
+
+    results = []
+    for idx in item_indices:
+        item_responses = responses[:, idx]
+        valid_mask = ~np.isnan(item_responses) & (item_responses >= 0)
+        item_resp_valid = item_responses[valid_mask]
+        theta_valid = theta[valid_mask]
+
+        smoothed_probs = np.zeros(n_grid)
+        se_lower = np.zeros(n_grid)
+        se_upper = np.zeros(n_grid)
+
+        for i, t in enumerate(theta_grid):
+            weights = np.exp(-0.5 * ((theta_valid - t) / bandwidth) ** 2)
+            weights = weights / (np.sum(weights) + EPSILON)
+
+            smoothed_probs[i] = np.sum(weights * item_resp_valid)
+
+            if se:
+                n_eff = 1 / (np.sum(weights**2) + EPSILON)
+                p = smoothed_probs[i]
+                p = np.clip(p, PROB_CLIP_MIN, PROB_CLIP_MAX)
+                se_val = np.sqrt(p * (1 - p) / n_eff)
+                se_lower[i] = max(0, p - z_crit * se_val)
+                se_upper[i] = min(1, p + z_crit * se_val)
+
+        theta_2d = theta_grid.reshape(-1, 1)
+        model_probs = model.probability(theta_2d, item_idx=idx)
+        if model_probs.ndim > 1:
+            model_probs = (
+                model_probs[:, 0] if model_probs.shape[1] == 1 else model_probs.ravel()
+            )
+
+        results.append(
+            ItemGAMResult(
+                item_idx=idx,
+                theta_grid=theta_grid,
+                smoothed_probs=smoothed_probs,
+                model_probs=model_probs,
+                se_bands=np.array([se_lower, se_upper]),
+                raw_theta=theta_valid,
+                raw_probs=item_resp_valid,
+            )
+        )
+
+    if isinstance(item_idx, int):
+        return results[0]
+    return results

@@ -481,3 +481,230 @@ def get_standard_item_type(name: str) -> ItemTypeSpec:
     if name not in types:
         raise ValueError(f"Unknown item type: {name}. Available: {list(types.keys())}")
     return types[name]
+
+
+@dataclass
+class GroupSpec:
+    """Specification for a custom group-level object.
+
+    Used in multiple group IRT analysis to define group-specific
+    characteristics like latent distribution parameters.
+
+    Parameters
+    ----------
+    name : str
+        Name of the group.
+    mean_function : callable, optional
+        Function computing group mean of latent trait.
+        Signature: f(**params) -> float or ndarray
+    cov_function : callable, optional
+        Function computing group covariance of latent trait.
+        Signature: f(**params) -> ndarray
+    par_names : list[str]
+        Names of group-level parameters.
+    par_bounds : dict[str, tuple]
+        Bounds for each parameter as (lower, upper).
+    par_defaults : dict[str, float]
+        Default values for each parameter.
+    n_factors : int
+        Number of latent factors. Default 1.
+    """
+
+    name: str
+    mean_function: Callable[..., float | NDArray[np.float64]] | None = None
+    cov_function: Callable[..., NDArray[np.float64]] | None = None
+    par_names: list[str] = field(default_factory=list)
+    par_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
+    par_defaults: dict[str, float] = field(default_factory=dict)
+    n_factors: int = 1
+
+    def __post_init__(self):
+        for name in self.par_names:
+            if name not in self.par_bounds:
+                self.par_bounds[name] = (-np.inf, np.inf)
+            if name not in self.par_defaults:
+                self.par_defaults[name] = 0.0
+
+
+def createGroup(
+    name: str,
+    mean_function: Callable[..., float | NDArray[np.float64]] | None = None,
+    cov_function: Callable[..., NDArray[np.float64]] | None = None,
+    par_names: list[str] | None = None,
+    par_bounds: dict[str, tuple[float, float]] | None = None,
+    par_defaults: dict[str, float] | None = None,
+    n_factors: int = 1,
+) -> GroupSpec:
+    """Create a user-defined group-level object for multiple group analysis.
+
+    This is equivalent to R's mirt::createGroup() function. It allows
+    specification of custom latent distribution models for groups in
+    multiple group IRT analysis.
+
+    Parameters
+    ----------
+    name : str
+        Name for the group specification.
+    mean_function : callable, optional
+        Function that computes the group mean of the latent trait.
+        Signature: f(param1, param2, ...) -> float or ndarray
+
+        If None, uses zero mean.
+
+    cov_function : callable, optional
+        Function that computes the group covariance matrix.
+        Signature: f(param1, param2, ...) -> ndarray
+
+        If None, uses identity covariance.
+
+    par_names : list[str], optional
+        Names of the group-level parameters.
+        If None, inferred from function signatures.
+
+    par_bounds : dict, optional
+        Bounds for each parameter as {"param_name": (lower, upper)}.
+
+    par_defaults : dict, optional
+        Default initial values for each parameter.
+
+    n_factors : int
+        Number of latent factors. Default 1.
+
+    Returns
+    -------
+    GroupSpec
+        Group specification for use in multiple group models.
+
+    Examples
+    --------
+    >>> # Define a group with estimable mean and variance
+    >>> def group_mean(mu):
+    ...     return mu
+    >>>
+    >>> def group_cov(sigma):
+    ...     return np.array([[sigma**2]])
+    >>>
+    >>> FreeGroup = createGroup(
+    ...     name="FreeGroup",
+    ...     mean_function=group_mean,
+    ...     cov_function=group_cov,
+    ...     par_names=["mu", "sigma"],
+    ...     par_bounds={"mu": (-5, 5), "sigma": (0.1, 5)},
+    ...     par_defaults={"mu": 0, "sigma": 1},
+    ... )
+
+    >>> # Use in multiple group analysis
+    >>> # result = fit_multigroup(data, groups, group_spec=FreeGroup)
+
+    Notes
+    -----
+    Common use cases include:
+    - Freely estimating group means and variances
+    - Specifying non-normal latent distributions
+    - Implementing latent regression models at the group level
+    """
+    import inspect
+
+    inferred_names: list[str] = []
+
+    if par_names is None:
+        if mean_function is not None:
+            sig = inspect.signature(mean_function)
+            inferred_names.extend(
+                p.name
+                for p in sig.parameters.values()
+                if p.name not in ("self", "theta")
+            )
+
+        if cov_function is not None:
+            sig = inspect.signature(cov_function)
+            for p in sig.parameters.values():
+                if p.name not in ("self", "theta") and p.name not in inferred_names:
+                    inferred_names.append(p.name)
+
+        par_names = inferred_names if inferred_names else []
+
+    return GroupSpec(
+        name=name,
+        mean_function=mean_function,
+        cov_function=cov_function,
+        par_names=par_names,
+        par_bounds=par_bounds or {},
+        par_defaults=par_defaults or {},
+        n_factors=n_factors,
+    )
+
+
+class CustomGroupModel:
+    """Model for custom group-level specifications.
+
+    Wraps a GroupSpec for use in multiple group IRT models.
+
+    Parameters
+    ----------
+    group_spec : GroupSpec
+        Group specification from createGroup().
+    """
+
+    def __init__(self, group_spec: GroupSpec) -> None:
+        self.spec = group_spec
+        self.name = group_spec.name
+        self.n_factors = group_spec.n_factors
+        self._parameters: dict[str, float] = {}
+        self._initialize_parameters()
+
+    def _initialize_parameters(self) -> None:
+        """Initialize parameters with default values."""
+        for name in self.spec.par_names:
+            self._parameters[name] = self.spec.par_defaults.get(name, 0.0)
+
+    @property
+    def parameters(self) -> dict[str, float]:
+        """Get group parameters."""
+        return self._parameters.copy()
+
+    def set_parameters(self, **kwargs: float) -> None:
+        """Set group parameters."""
+        for name, value in kwargs.items():
+            if name in self._parameters:
+                self._parameters[name] = value
+
+    def get_mean(self) -> NDArray[np.float64]:
+        """Get the group mean vector."""
+        if self.spec.mean_function is None:
+            return np.zeros(self.n_factors)
+        result = self.spec.mean_function(**self._parameters)
+        return np.atleast_1d(result)
+
+    def get_cov(self) -> NDArray[np.float64]:
+        """Get the group covariance matrix."""
+        if self.spec.cov_function is None:
+            return np.eye(self.n_factors)
+        return np.atleast_2d(self.spec.cov_function(**self._parameters))
+
+    def sample(
+        self,
+        n: int,
+        rng: np.random.Generator | None = None,
+    ) -> NDArray[np.float64]:
+        """Sample from the group latent distribution.
+
+        Parameters
+        ----------
+        n : int
+            Number of samples.
+        rng : Generator, optional
+            Random number generator.
+
+        Returns
+        -------
+        ndarray
+            Samples of shape (n, n_factors).
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        mean = self.get_mean()
+        cov = self.get_cov()
+
+        return rng.multivariate_normal(mean, cov, size=n)
