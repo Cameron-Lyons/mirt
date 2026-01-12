@@ -2104,3 +2104,503 @@ def stocking_lord_criterion(
             total_diff += (p_old - p_new) ** 2
 
     return total_diff
+
+
+def compute_log_likelihoods_grm(
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    thresholds: NDArray[np.float64],
+    n_categories: NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Compute log-likelihoods for GRM at all quadrature points.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    thresholds : NDArray
+        Threshold parameters (n_items, max_categories-1)
+    n_categories : NDArray
+        Number of categories per item (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Log-likelihoods (n_persons, n_quad)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_log_likelihoods_grm(
+            responses.astype(np.int32),
+            quad_points.astype(np.float64),
+            discrimination.astype(np.float64),
+            thresholds.astype(np.float64),
+            n_categories.astype(np.int32),
+        )
+
+    n_persons, n_items = responses.shape
+    n_quad = len(quad_points)
+    log_likes = np.zeros((n_persons, n_quad))
+    eps = 1e-10
+
+    for q in range(n_quad):
+        theta = quad_points[q]
+        for i in range(n_persons):
+            ll = 0.0
+            for j in range(n_items):
+                resp = responses[i, j]
+                if resp < 0:
+                    continue
+                n_cat = n_categories[j]
+                if resp == 0:
+                    z = discrimination[j] * (theta - thresholds[j, 0])
+                    p_above = 1.0 / (1.0 + np.exp(-z))
+                    prob = max(1.0 - p_above, eps)
+                elif resp == n_cat - 1:
+                    z = discrimination[j] * (theta - thresholds[j, resp - 1])
+                    prob = max(1.0 / (1.0 + np.exp(-z)), eps)
+                else:
+                    z_upper = discrimination[j] * (theta - thresholds[j, resp - 1])
+                    z_lower = discrimination[j] * (theta - thresholds[j, resp])
+                    p_upper = 1.0 / (1.0 + np.exp(-z_upper))
+                    p_lower = 1.0 / (1.0 + np.exp(-z_lower))
+                    prob = max(p_upper - p_lower, eps)
+                ll += np.log(prob)
+            log_likes[i, q] = ll
+
+    return log_likes
+
+
+def compute_log_likelihoods_gpcm(
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    steps: NDArray[np.float64],
+    n_categories: NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Compute log-likelihoods for GPCM at all quadrature points.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    discrimination : NDArray
+        Item discrimination parameters (n_items,)
+    steps : NDArray
+        Step parameters (n_items, max_categories)
+    n_categories : NDArray
+        Number of categories per item (n_items,)
+
+    Returns
+    -------
+    NDArray
+        Log-likelihoods (n_persons, n_quad)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_log_likelihoods_gpcm(
+            responses.astype(np.int32),
+            quad_points.astype(np.float64),
+            discrimination.astype(np.float64),
+            steps.astype(np.float64),
+            n_categories.astype(np.int32),
+        )
+
+    n_persons, n_items = responses.shape
+    n_quad = len(quad_points)
+    log_likes = np.zeros((n_persons, n_quad))
+
+    for q in range(n_quad):
+        theta = quad_points[q]
+        for i in range(n_persons):
+            ll = 0.0
+            for j in range(n_items):
+                resp = responses[i, j]
+                if resp < 0:
+                    continue
+                n_cat = n_categories[j]
+                a = discrimination[j]
+                numerators = np.zeros(n_cat)
+                for k in range(1, n_cat):
+                    numerators[k] = numerators[k - 1] + a * (theta - steps[j, k])
+                max_num = np.max(numerators)
+                sum_exp = np.sum(np.exp(numerators - max_num))
+                log_denom = max_num + np.log(sum_exp)
+                prob = np.exp(numerators[resp] - log_denom)
+                ll += np.log(max(prob, 1e-10))
+            log_likes[i, q] = ll
+
+    return log_likes
+
+
+def compute_alpha_if_deleted(
+    responses: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute Cronbach's alpha if each item is deleted.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), NaN for missing
+
+    Returns
+    -------
+    NDArray
+        Alpha-if-deleted for each item (n_items,)
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.compute_alpha_if_deleted(
+            responses.astype(np.float64),
+        )
+
+    n_persons, n_items = responses.shape
+
+    total_scores = np.nansum(responses, axis=1)
+
+    item_variances = np.zeros(n_items)
+    for j in range(n_items):
+        col = responses[:, j]
+        valid = ~np.isnan(col)
+        if valid.sum() > 1:
+            mean = np.nanmean(col)
+            item_variances[j] = np.nansum((col[valid] - mean) ** 2) / (valid.sum() - 1)
+
+    alpha_if_deleted = np.zeros(n_items)
+    for j in range(n_items):
+        remaining_scores = total_scores - np.where(
+            np.isnan(responses[:, j]), 0, responses[:, j]
+        )
+        remaining_var_sum = np.sum(item_variances[np.arange(n_items) != j])
+        remaining_mean = np.mean(remaining_scores)
+        remaining_total_var = np.sum((remaining_scores - remaining_mean) ** 2) / max(
+            n_persons - 1, 1
+        )
+
+        k = n_items - 1
+        if remaining_total_var > 0 and k > 1:
+            alpha_if_deleted[j] = (k / (k - 1)) * (
+                1 - remaining_var_sum / remaining_total_var
+            )
+        else:
+            alpha_if_deleted[j] = 0.0
+
+    return alpha_if_deleted
+
+
+def multigroup_e_step_2pl(
+    responses_list: list[NDArray[np.int_]],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    disc_list: list[NDArray[np.float64]],
+    diff_list: list[NDArray[np.float64]],
+    prior_means: NDArray[np.float64],
+    prior_vars: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Compute multigroup E-step for 2PL models using Rust backend.
+
+    Processes all groups in parallel using Rayon.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    disc_list : list of NDArray
+        Discrimination arrays, one per group (n_items,)
+    diff_list : list of NDArray
+        Difficulty arrays, one per group (n_items,)
+    prior_means : NDArray
+        Prior means per group (n_groups,)
+    prior_vars : NDArray
+        Prior variances per group (n_groups,)
+
+    Returns
+    -------
+    tuple or None
+        (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+        - posterior_weights: list of (n_persons_g, n_quad) arrays
+        - group_log_likelihoods: (n_groups,) array
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        disc_float = [d.astype(np.float64) for d in disc_list]
+        diff_float = [d.astype(np.float64) for d in diff_list]
+
+        return mirt_rs.multigroup_e_step_2pl(
+            responses_int,
+            quad_points.astype(np.float64),
+            quad_weights.astype(np.float64),
+            disc_float,
+            diff_float,
+            prior_means.astype(np.float64),
+            prior_vars.astype(np.float64),
+        )
+
+    return None
+
+
+def multigroup_e_step_3pl(
+    responses_list: list[NDArray[np.int_]],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    disc_list: list[NDArray[np.float64]],
+    diff_list: list[NDArray[np.float64]],
+    guess_list: list[NDArray[np.float64]],
+    prior_means: NDArray[np.float64],
+    prior_vars: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Compute multigroup E-step for 3PL models using Rust backend.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    disc_list : list of NDArray
+        Discrimination arrays, one per group (n_items,)
+    diff_list : list of NDArray
+        Difficulty arrays, one per group (n_items,)
+    guess_list : list of NDArray
+        Guessing arrays, one per group (n_items,)
+    prior_means : NDArray
+        Prior means per group (n_groups,)
+    prior_vars : NDArray
+        Prior variances per group (n_groups,)
+
+    Returns
+    -------
+    tuple or None
+        (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        disc_float = [d.astype(np.float64) for d in disc_list]
+        diff_float = [d.astype(np.float64) for d in diff_list]
+        guess_float = [g.astype(np.float64) for g in guess_list]
+
+        return mirt_rs.multigroup_e_step_3pl(
+            responses_int,
+            quad_points.astype(np.float64),
+            quad_weights.astype(np.float64),
+            disc_float,
+            diff_float,
+            guess_float,
+            prior_means.astype(np.float64),
+            prior_vars.astype(np.float64),
+        )
+
+    return None
+
+
+def multigroup_e_step_grm(
+    responses_list: list[NDArray[np.int_]],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    disc_list: list[NDArray[np.float64]],
+    thresh_list: list[NDArray[np.float64]],
+    n_categories_list: list[NDArray[np.int_]],
+    prior_means: NDArray[np.float64],
+    prior_vars: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Compute multigroup E-step for GRM models using Rust backend.
+
+    Processes all groups in parallel using Rayon.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    disc_list : list of NDArray
+        Discrimination arrays, one per group (n_items,)
+    thresh_list : list of NDArray
+        Threshold matrices, one per group (n_items, max_categories-1)
+    n_categories_list : list of NDArray
+        Number of categories per item, one per group (n_items,)
+    prior_means : NDArray
+        Prior means per group (n_groups,)
+    prior_vars : NDArray
+        Prior variances per group (n_groups,)
+
+    Returns
+    -------
+    tuple or None
+        (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        disc_float = [d.astype(np.float64) for d in disc_list]
+        thresh_float = [t.astype(np.float64) for t in thresh_list]
+        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+
+        return mirt_rs.multigroup_e_step_grm(
+            responses_int,
+            quad_points.astype(np.float64),
+            quad_weights.astype(np.float64),
+            disc_float,
+            thresh_float,
+            n_cats_int,
+            prior_means.astype(np.float64),
+            prior_vars.astype(np.float64),
+        )
+
+    return None
+
+
+def multigroup_e_step_gpcm(
+    responses_list: list[NDArray[np.int_]],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    disc_list: list[NDArray[np.float64]],
+    steps_list: list[NDArray[np.float64]],
+    n_categories_list: list[NDArray[np.int_]],
+    prior_means: NDArray[np.float64],
+    prior_vars: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Compute multigroup E-step for GPCM models using Rust backend.
+
+    Processes all groups in parallel using Rayon.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    disc_list : list of NDArray
+        Discrimination arrays, one per group (n_items,)
+    steps_list : list of NDArray
+        Step matrices, one per group (n_items, max_categories)
+    n_categories_list : list of NDArray
+        Number of categories per item, one per group (n_items,)
+    prior_means : NDArray
+        Prior means per group (n_groups,)
+    prior_vars : NDArray
+        Prior variances per group (n_groups,)
+
+    Returns
+    -------
+    tuple or None
+        (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        disc_float = [d.astype(np.float64) for d in disc_list]
+        steps_float = [s.astype(np.float64) for s in steps_list]
+        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+
+        return mirt_rs.multigroup_e_step_gpcm(
+            responses_int,
+            quad_points.astype(np.float64),
+            quad_weights.astype(np.float64),
+            disc_float,
+            steps_float,
+            n_cats_int,
+            prior_means.astype(np.float64),
+            prior_vars.astype(np.float64),
+        )
+
+    return None
+
+
+def multigroup_e_step_nrm(
+    responses_list: list[NDArray[np.int_]],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    slopes_list: list[NDArray[np.float64]],
+    intercepts_list: list[NDArray[np.float64]],
+    n_categories_list: list[NDArray[np.int_]],
+    prior_means: NDArray[np.float64],
+    prior_vars: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Compute multigroup E-step for NRM models using Rust backend.
+
+    Processes all groups in parallel using Rayon.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    slopes_list : list of NDArray
+        Slope matrices, one per group (n_items, max_categories)
+    intercepts_list : list of NDArray
+        Intercept matrices, one per group (n_items, max_categories)
+    n_categories_list : list of NDArray
+        Number of categories per item, one per group (n_items,)
+    prior_means : NDArray
+        Prior means per group (n_groups,)
+    prior_vars : NDArray
+        Prior variances per group (n_groups,)
+
+    Returns
+    -------
+    tuple or None
+        (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        slopes_float = [s.astype(np.float64) for s in slopes_list]
+        intercepts_float = [i.astype(np.float64) for i in intercepts_list]
+        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+
+        return mirt_rs.multigroup_e_step_nrm(
+            responses_int,
+            quad_points.astype(np.float64),
+            quad_weights.astype(np.float64),
+            slopes_float,
+            intercepts_float,
+            n_cats_int,
+            prior_means.astype(np.float64),
+            prior_vars.astype(np.float64),
+        )
+
+    return None
+
+
+def multigroup_expected_counts(
+    responses_list: list[NDArray[np.int_]],
+    posterior_weights_list: list[NDArray[np.float64]],
+) -> tuple[list[NDArray[np.float64]], list[NDArray[np.float64]]] | None:
+    """Compute expected counts for all groups in parallel.
+
+    Parameters
+    ----------
+    responses_list : list of NDArray
+        Response matrices, one per group (n_persons_g, n_items)
+    posterior_weights_list : list of NDArray
+        Posterior weights, one per group (n_persons_g, n_quad)
+
+    Returns
+    -------
+    tuple or None
+        (r_k_list, n_k_list) or None if Rust unavailable
+        - r_k_list: list of (n_items, n_quad) expected correct counts
+        - n_k_list: list of (n_items, n_quad) expected total counts
+    """
+    if RUST_AVAILABLE:
+        responses_int = [r.astype(np.int32) for r in responses_list]
+        weights_float = [w.astype(np.float64) for w in posterior_weights_list]
+
+        return mirt_rs.multigroup_expected_counts(responses_int, weights_float)
+
+    return None
