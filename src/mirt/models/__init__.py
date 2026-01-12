@@ -4,6 +4,12 @@ from mirt.models.base import (
     PolytomousItemModel,
 )
 from mirt.models.bifactor import BifactorModel
+from mirt.models.cdm_advanced import (
+    GDINA,
+    AttributeHierarchy,
+    HigherOrderCDM,
+    fit_gdina,
+)
 from mirt.models.compensatory import (
     DisjunctiveModel,
     NoncompensatoryModel,
@@ -26,11 +32,52 @@ from mirt.models.dichotomous import (
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
+from mirt.models.dynamic import (
+    BKTModel,
+    BKTResult,
+    GrowthMixtureModel,
+    GrowthMixtureResult,
+    LongitudinalIRTModel,
+    LongitudinalResult,
+    NonlinearGrowthModel,
+    PiecewiseGrowthModel,
+    StateSpaceIRT,
+)
+from mirt.models.explanatory import (
+    LLTM,
+    ExplanatoryIRT,
+    ExplanatoryIRTResult,
+    LatentRegressionModel,
+    LatentRegressionResult,
+    LLTMResult,
+    RaschLLTM,
+)
+from mirt.models.mfrm import (
+    Facet,
+    ManyFacetRaschModel,
+    MFRMResult,
+    PolytomousMFRM,
+)
 from mirt.models.multidimensional import MultidimensionalModel
+from mirt.models.multilevel import (
+    CrossedRandomEffectsModel,
+    MultilevelIRTModel,
+    MultilevelIRTResult,
+    NestedHierarchy,
+    RandomEffectSpec,
+    ThreeLevelIRTModel,
+)
 from mirt.models.nested import (
     FourPLNestedLogit,
     ThreePLNestedLogit,
     TwoPLNestedLogit,
+)
+from mirt.models.network import (
+    GaussianGraphicalModel,
+    IsingModel,
+    compare_networks,
+    fit_ggm,
+    fit_ising,
 )
 from mirt.models.nonparametric import (
     KernelSmoothingModel,
@@ -49,6 +96,13 @@ from mirt.models.sequential import (
     ContinuationRatioModel,
     SequentialResponseModel,
 )
+from mirt.models.testlet import (
+    BifactorTestletModel,
+    RandomTestletEffectsModel,
+    TestletModel,
+    compute_testlet_q3,
+    create_testlet_structure,
+)
 
 __all__ = [
     "BaseItemModel",
@@ -62,6 +116,23 @@ __all__ = [
     "Rasch",
     "ComplementaryLogLog",
     "NegativeLogLog",
+    "LLTM",
+    "LLTMResult",
+    "RaschLLTM",
+    "LatentRegressionModel",
+    "LatentRegressionResult",
+    "ExplanatoryIRT",
+    "ExplanatoryIRTResult",
+    "Facet",
+    "ManyFacetRaschModel",
+    "MFRMResult",
+    "PolytomousMFRM",
+    "MultilevelIRTModel",
+    "MultilevelIRTResult",
+    "ThreeLevelIRTModel",
+    "CrossedRandomEffectsModel",
+    "RandomEffectSpec",
+    "NestedHierarchy",
     "GradedResponseModel",
     "GeneralizedPartialCredit",
     "PartialCreditModel",
@@ -75,15 +146,38 @@ __all__ = [
     "FourPLNestedLogit",
     "MultidimensionalModel",
     "BifactorModel",
+    "GDINA",
+    "HigherOrderCDM",
+    "AttributeHierarchy",
+    "fit_gdina",
     "PartiallyCompensatoryModel",
     "NoncompensatoryModel",
     "DisjunctiveModel",
     "MonotonicSplineModel",
     "MonotonicPolynomialModel",
     "KernelSmoothingModel",
+    "TestletModel",
+    "BifactorTestletModel",
+    "RandomTestletEffectsModel",
+    "create_testlet_structure",
+    "compute_testlet_q3",
     "CustomItemModel",
     "ItemTypeSpec",
     "create_item_type",
     "get_standard_item_type",
     "list_standard_item_types",
+    "IsingModel",
+    "GaussianGraphicalModel",
+    "fit_ising",
+    "fit_ggm",
+    "compare_networks",
+    "BKTModel",
+    "BKTResult",
+    "LongitudinalIRTModel",
+    "LongitudinalResult",
+    "StateSpaceIRT",
+    "PiecewiseGrowthModel",
+    "NonlinearGrowthModel",
+    "GrowthMixtureModel",
+    "GrowthMixtureResult",
 ]

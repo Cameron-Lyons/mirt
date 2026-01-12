@@ -155,6 +155,19 @@ try:
 except ImportError:
     _HAS_PLOTTING = False
 
+try:
+    from mirt.reports import (  # noqa: F401
+        DIFAnalysisReport,
+        FullDiagnosticReport,
+        ItemAnalysisReport,
+        ModelFitReport,
+        generate_report,
+    )
+
+    _HAS_REPORTS = True
+except ImportError:
+    _HAS_REPORTS = False
+
 
 def fit_mirt(
     data: NDArray[np.int_],
