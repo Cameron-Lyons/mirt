@@ -135,7 +135,7 @@ jobs:
         shell: bash
         run: |
           pip install --upgrade pip
-          pip install --find-links dist mirt
+          pip install --no-index --find-links dist mirt
 
       - name: Smoke test - import and basic functionality
         run: |
