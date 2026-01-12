@@ -1,3 +1,14 @@
+from mirt.diagnostics.bayesian import (
+    PPCResult,
+    PSISResult,
+    WAICResult,
+    compare_models,
+    compute_pointwise_log_lik,
+    dic,
+    posterior_predictive_check,
+    psis_loo,
+    waic,
+)
 from mirt.diagnostics.dif import compute_dif, flag_dif_items
 from mirt.diagnostics.itemfit import compute_itemfit
 from mirt.diagnostics.ld import (
@@ -33,4 +44,13 @@ __all__ = [
     "compute_outfit_infit",
     "identify_misfitting_patterns",
     "ResidualAnalysisResult",
+    "psis_loo",
+    "waic",
+    "dic",
+    "posterior_predictive_check",
+    "compute_pointwise_log_lik",
+    "compare_models",
+    "PSISResult",
+    "WAICResult",
+    "PPCResult",
 ]
