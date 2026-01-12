@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod eapsum;
 pub mod estep;
 pub mod estimation;
+pub mod gvem;
 pub mod likelihood;
 pub mod mirt_models;
 pub mod mstep;
@@ -55,6 +56,7 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     calibration::register(m)?;
     polytomous::register(m)?;
     multigroup::register(m)?;
+    gvem::register(m)?;
 
     Ok(())
 }

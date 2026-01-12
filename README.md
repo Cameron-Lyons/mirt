@@ -22,6 +22,8 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 
 ### Estimation Methods
 - **EM Algorithm**: Gauss-Hermite quadrature (with Rust acceleration)
+- **GVEM**: Gaussian Variational EM for fast high-dimensional estimation
+- **Sparse Bayesian**: Spike-slab LASSO for automatic structure discovery
 - **MHRM**: Metropolis-Hastings Robbins-Monro
 - **MCMC**: Gibbs sampling for Bayesian estimation
 - **MCEM/QMCEM**: Monte Carlo EM for high dimensions
@@ -228,6 +230,26 @@ from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
 ```
 
+### Exploratory Factor Analysis with Automatic Structure Discovery
+
+```python
+from mirt import TwoParameterLogistic
+from mirt.estimation import SparseBayesianEstimator, GVEMEstimator
+
+# Sparse Bayesian MIRT - automatically discovers factor structure
+model = TwoParameterLogistic(n_items=20, n_factors=5)  # Specify max factors
+estimator = SparseBayesianEstimator(k_max=5, lambda_0=0.04, lambda_1=1.0)
+result = estimator.fit(model, responses)
+
+print(f"Effective dimensions: {result.effective_dimensionality}")
+print(f"Sparsity ratio: {1 - result.sparsity_pattern.mean():.1%}")
+print(result.loading_table())  # Sparse loading matrix
+
+# GVEM - fast variational EM for high-dimensional models
+estimator = GVEMEstimator(max_iter=200, tol=1e-4)
+result = estimator.fit(model, responses)
+```
+
 ### Test Equating & Calibration
 
 ```python
@@ -317,6 +339,17 @@ plot_person_item_map(result.model, scores.theta)
 | `dif()` | DIF analysis |
 | `load_dataset()` | Load sample datasets |
 
+### Estimator Classes
+
+| Class | Description |
+|-------|-------------|
+| `EMEstimator` | Standard EM with Gauss-Hermite quadrature |
+| `GVEMEstimator` | Gaussian Variational EM (fast, high-dimensional) |
+| `SparseBayesianEstimator` | Spike-slab LASSO for sparse structure discovery |
+| `MCEMEstimator` | Monte Carlo EM for high dimensions |
+| `QMCEMEstimator` | Quasi-Monte Carlo EM |
+| `StochasticEMEstimator` | Stochastic EM |
+
 ### Diagnostic Functions
 
 | Function | Description |
@@ -378,7 +411,8 @@ plot_person_item_map(result.model, scores.theta)
 | Multidimensional | Full support | Full support |
 | Bifactor | Yes | Yes |
 | Cognitive diagnostic | mirtCAT separate | Built-in (DINA, DINO) |
-| Estimation | EM, MHRM, MCMC | EM, MHRM, MCMC |
+| Estimation | EM, MHRM, MCMC | EM, GVEM, Sparse Bayesian, MHRM, MCMC |
+| Automatic structure discovery | No | Yes (spike-slab LASSO) |
 | CAT | mirtCAT package | Built-in |
 | DIF | Yes | Yes (LR, Wald, Lord, Raju) |
 | Multiple groups | Full support | Full support |
@@ -508,4 +542,6 @@ If you use this package in your research, please cite:
 
 - Chalmers, R. P. (2012). mirt: A Multidimensional Item Response Theory Package for the R Environment. *Journal of Statistical Software*, 48(6), 1-29.
 - Bock, R. D., & Aitkin, M. (1981). Marginal maximum likelihood estimation of item parameters: Application of an EM algorithm. *Psychometrika*, 46(4), 443-459.
+- Cho, A. E., Wang, C., Zhang, X., & Xu, G. (2021). Gaussian variational estimation for multidimensional item response theory. *British Journal of Mathematical and Statistical Psychology*, 74, 52-85.
+- Rockova, V., & George, E. I. (2018). The spike-and-slab LASSO. *Journal of the American Statistical Association*, 113(521), 431-444.
 - de la Torre, J. (2011). The generalized DINA model framework. *Psychometrika*, 76(2), 179-199.
