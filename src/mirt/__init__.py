@@ -30,6 +30,16 @@ from mirt.exceptions import (
 from mirt.models.base import BaseItemModel
 from mirt.models.bifactor import BifactorModel
 from mirt.models.cdm import DINA, DINO, BaseCDM, fit_cdm
+from mirt.models.custom import (
+    CustomGroupModel,
+    CustomItemModel,
+    GroupSpec,
+    ItemTypeSpec,
+    create_item_type,
+    createGroup,
+    get_standard_item_type,
+    list_standard_item_types,
+)
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     OneParameterLogistic,
@@ -58,16 +68,28 @@ from mirt.scoring import fscores
 from mirt.utils.batch import BatchFitResult, fit_models
 from mirt.utils.bootstrap import bootstrap_ci, bootstrap_se, parametric_bootstrap
 from mirt.utils.calibration import equate, fixed_calib
-from mirt.utils.classical import TraditionalStats, traditional
+from mirt.utils.classical import ItemStats, TraditionalStats, itemstats, traditional
 from mirt.utils.clinical import RCI, clinical_significance
 from mirt.utils.confidence import PLCI, score_CI
 from mirt.utils.cv import CVResult, KFold, LeaveOneOut, StratifiedKFold, cross_validate
 from mirt.utils.data import validate_responses
 from mirt.utils.dataframe import set_dataframe_backend
 from mirt.utils.datasets import list_datasets, load_dataset
-from mirt.utils.empirical import RMSD_DIF, empirical_ES, empirical_plot
-from mirt.utils.extraction import coef, extract_item, mod2values
-from mirt.utils.imputation import analyze_missing, impute_responses, listwise_deletion
+from mirt.utils.empirical import (
+    RMSD_DIF,
+    ItemGAMResult,
+    empirical_ES,
+    empirical_plot,
+    itemGAM,
+)
+from mirt.utils.extraction import coef, estfun, estfun_summary, extract_item, mod2values
+from mirt.utils.imputation import (
+    MIResult,
+    analyze_missing,
+    averageMI,
+    impute_responses,
+    listwise_deletion,
+)
 from mirt.utils.information import (
     areainfo,
     gen_difficulty,
@@ -612,6 +634,22 @@ __all__ = [
     "draw_parameters",
     "randef",
     "fixef",
+    "itemGAM",
+    "ItemGAMResult",
+    "averageMI",
+    "MIResult",
+    "itemstats",
+    "ItemStats",
+    "estfun",
+    "estfun_summary",
+    "createGroup",
+    "GroupSpec",
+    "CustomGroupModel",
+    "CustomItemModel",
+    "ItemTypeSpec",
+    "create_item_type",
+    "get_standard_item_type",
+    "list_standard_item_types",
 ]
 
 if _HAS_PLOTTING:

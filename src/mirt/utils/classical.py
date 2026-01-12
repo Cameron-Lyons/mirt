@@ -5,6 +5,7 @@ from response data.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -193,3 +194,184 @@ def item_fit_chisq(
         p_values[j] = 1 - stats.chi2.cdf(chi2, df)
 
     return chisq, p_values
+
+
+@dataclass
+class ItemStats:
+    """Container for generic item summary statistics.
+
+    Attributes
+    ----------
+    n : NDArray[np.intp]
+        Number of valid responses per item.
+    mean : NDArray[np.float64]
+        Mean response per item (p-value for binary).
+    sd : NDArray[np.float64]
+        Standard deviation per item.
+    min : NDArray[np.float64]
+        Minimum response per item.
+    max : NDArray[np.float64]
+        Maximum response per item.
+    skewness : NDArray[np.float64]
+        Skewness per item.
+    kurtosis : NDArray[np.float64]
+        Excess kurtosis per item.
+    n_missing : NDArray[np.intp]
+        Number of missing values per item.
+    pct_missing : NDArray[np.float64]
+        Percentage missing per item.
+    frequencies : list[dict]
+        Response frequency tables per item.
+    """
+
+    n: NDArray[np.intp]
+    mean: NDArray[np.float64]
+    sd: NDArray[np.float64]
+    min: NDArray[np.float64]
+    max: NDArray[np.float64]
+    skewness: NDArray[np.float64]
+    kurtosis: NDArray[np.float64]
+    n_missing: NDArray[np.intp]
+    pct_missing: NDArray[np.float64]
+    frequencies: list[dict[int, int]]
+
+
+def itemstats(
+    responses: NDArray[np.float64],
+    missing_code: int = -1,
+    na_rm: bool = True,
+) -> ItemStats:
+    """Compute generic item summary statistics.
+
+    Provides descriptive statistics for each item, useful for initial
+    data inspection before IRT analysis.
+
+    Parameters
+    ----------
+    responses : NDArray[np.float64]
+        Response matrix. Shape: (n_persons, n_items).
+    missing_code : int
+        Code used to indicate missing values. Default -1.
+    na_rm : bool
+        If True, exclude missing values from calculations. Default True.
+
+    Returns
+    -------
+    ItemStats
+        Object containing:
+        - n: Valid response count per item
+        - mean: Mean (proportion correct for binary)
+        - sd: Standard deviation
+        - min, max: Range of responses
+        - skewness, kurtosis: Distribution shape
+        - n_missing, pct_missing: Missing data info
+        - frequencies: Response distribution tables
+
+    Examples
+    --------
+    >>> from mirt import load_dataset, itemstats
+    >>> data = load_dataset('LSAT7')['data']
+    >>> stats = itemstats(data)
+    >>> print(f"Item means (p-values): {stats.mean}")
+    >>> print(f"Missing rate: {stats.pct_missing.mean():.1%}")
+
+    Notes
+    -----
+    For binary items, the mean is the proportion correct (p-value).
+    For polytomous items, interpret as average category selected.
+    """
+    from scipy import stats as sp_stats
+
+    responses = np.asarray(responses, dtype=np.float64)
+    n_persons, n_items = responses.shape
+
+    missing_mask = (responses == missing_code) | np.isnan(responses)
+
+    n = np.zeros(n_items, dtype=np.intp)
+    mean = np.zeros(n_items)
+    sd = np.zeros(n_items)
+    min_val = np.zeros(n_items)
+    max_val = np.zeros(n_items)
+    skewness = np.zeros(n_items)
+    kurtosis = np.zeros(n_items)
+    n_missing = np.zeros(n_items, dtype=np.intp)
+    pct_missing = np.zeros(n_items)
+    frequencies: list[dict[int, int]] = []
+
+    for j in range(n_items):
+        item_missing = missing_mask[:, j]
+        n_missing[j] = int(np.sum(item_missing))
+        pct_missing[j] = n_missing[j] / n_persons * 100
+
+        if na_rm:
+            item_data = responses[~item_missing, j]
+        else:
+            item_data = responses[:, j]
+
+        n[j] = len(item_data)
+
+        if n[j] > 0:
+            mean[j] = np.nanmean(item_data)
+            sd[j] = np.nanstd(item_data, ddof=1) if n[j] > 1 else 0.0
+            min_val[j] = np.nanmin(item_data)
+            max_val[j] = np.nanmax(item_data)
+
+            if n[j] > 2 and sd[j] > 0:
+                skewness[j] = float(sp_stats.skew(item_data, nan_policy="omit"))
+                kurtosis[j] = float(sp_stats.kurtosis(item_data, nan_policy="omit"))
+
+        valid_responses = responses[~item_missing, j].astype(int)
+        unique, counts = np.unique(valid_responses, return_counts=True)
+        freq_dict = {int(k): int(v) for k, v in zip(unique, counts)}
+        frequencies.append(freq_dict)
+
+    return ItemStats(
+        n=n,
+        mean=mean,
+        sd=sd,
+        min=min_val,
+        max=max_val,
+        skewness=skewness,
+        kurtosis=kurtosis,
+        n_missing=n_missing,
+        pct_missing=pct_missing,
+        frequencies=frequencies,
+    )
+
+
+def itemstats_to_dataframe(
+    stats: ItemStats, item_names: list[str] | None = None
+) -> Any:
+    """Convert ItemStats to a DataFrame.
+
+    Parameters
+    ----------
+    stats : ItemStats
+        Item statistics object.
+    item_names : list of str, optional
+        Names for items. If None, uses Item_1, Item_2, etc.
+
+    Returns
+    -------
+    DataFrame
+        DataFrame with item statistics.
+    """
+    from mirt.utils.dataframe import create_dataframe
+
+    n_items = len(stats.n)
+    if item_names is None:
+        item_names = [f"Item_{i + 1}" for i in range(n_items)]
+
+    data = {
+        "n": stats.n,
+        "mean": stats.mean,
+        "sd": stats.sd,
+        "min": stats.min,
+        "max": stats.max,
+        "skewness": stats.skewness,
+        "kurtosis": stats.kurtosis,
+        "n_missing": stats.n_missing,
+        "pct_missing": stats.pct_missing,
+    }
+
+    return create_dataframe(data, index=item_names, index_name="item")

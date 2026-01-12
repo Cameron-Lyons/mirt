@@ -13,6 +13,10 @@ from numpy.typing import NDArray
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
+EPSILON = 1e-10
+PROB_CLIP_MIN = 1e-10
+PROB_CLIP_MAX = 1 - 1e-10
+
 
 @dataclass
 class ItemParameters:
@@ -307,4 +311,164 @@ def itemplot_data(
         "theta": theta,
         "probability": probs,
         "information": item_info,
+    }
+
+
+def estfun(
+    model: "BaseItemModel",
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Extract empirical estimating functions from a fitted model.
+
+    Computes the score function (gradient of log-likelihood) for each
+    person. Used for sandwich estimators of standard errors and for
+    detecting influential observations.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        A fitted IRT model.
+    responses : NDArray[np.float64]
+        Response matrix. Shape: (n_persons, n_items).
+    theta : NDArray[np.float64]
+        Ability estimates. Shape: (n_persons,) or (n_persons, n_factors).
+
+    Returns
+    -------
+    NDArray[np.float64]
+        Estimating functions (scores) for each person-parameter combination.
+        Shape: (n_persons, n_parameters).
+
+    Examples
+    --------
+    >>> result = fit_mirt(responses, model="2PL")
+    >>> scores = fscores(result, responses)
+    >>> ef = estfun(result.model, responses, scores.theta)
+    >>> # Sum should be close to zero at MLE
+    >>> print(f"Sum of estimating functions: {ef.sum(axis=0)}")
+
+    Notes
+    -----
+    The estimating functions are the first derivatives of the log-likelihood
+    with respect to the item parameters. At the MLE, these should sum to
+    approximately zero across all persons.
+
+    For the 2PL model, returns gradients with respect to both discrimination
+    (a) and difficulty (b) parameters, giving shape (n_persons, 2*n_items).
+
+    These can be used to compute:
+    - Robust (sandwich) standard errors
+    - Influence functions for individual observations
+    - Model-based residuals
+    """
+    responses = np.asarray(responses, dtype=np.float64)
+    theta = np.atleast_1d(theta)
+    if theta.ndim == 2:
+        theta = theta[:, 0]
+
+    n_persons, n_items = responses.shape
+
+    values = mod2values(model)
+
+    param_vec = []
+    param_names = []
+
+    disc = values.discrimination
+    if disc.ndim == 1:
+        disc = disc.reshape(-1, 1)
+
+    for j in range(n_items):
+        for d in range(disc.shape[1]):
+            param_vec.append(disc[j, d])
+            param_names.append(f"a_{j}_{d}")
+
+    diff = values.difficulty
+    if diff.ndim == 1:
+        for j in range(n_items):
+            param_vec.append(diff[j])
+            param_names.append(f"b_{j}")
+    else:
+        for j in range(n_items):
+            for k in range(diff.shape[1]):
+                param_vec.append(diff[j, k])
+                param_names.append(f"b_{j}_{k}")
+
+    if values.guessing is not None:
+        for j in range(n_items):
+            param_vec.append(values.guessing[j])
+            param_names.append(f"c_{j}")
+
+    if values.slipping is not None:
+        for j in range(n_items):
+            param_vec.append(values.slipping[j])
+            param_names.append(f"d_{j}")
+
+    n_params = len(param_vec)
+
+    ef = np.zeros((n_persons, n_params))
+
+    probs = model.probability(theta.reshape(-1, 1))
+    if probs.ndim == 1:
+        probs = probs.reshape(-1, 1)
+
+    probs = np.clip(probs, PROB_CLIP_MIN, PROB_CLIP_MAX)
+
+    valid = responses >= 0
+    for j in range(n_items):
+        p = probs[:, j]
+        x = responses[:, j]
+        v = valid[:, j]
+
+        residual = np.where(v, x - p, 0.0)
+
+        if disc.shape[1] == 1:
+            dp_da = p * (1 - p) * (theta - values.difficulty[j])
+            dp_db = -p * (1 - p) * disc[j, 0]
+
+            a_idx = j
+            b_idx = n_items * disc.shape[1] + j
+
+            ef[:, a_idx] = np.where(v, residual * dp_da / (p * (1 - p) + EPSILON), 0.0)
+            ef[:, b_idx] = np.where(v, residual * dp_db / (p * (1 - p) + EPSILON), 0.0)
+
+    return ef
+
+
+def estfun_summary(
+    model: "BaseItemModel",
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64],
+) -> dict[str, NDArray[np.float64]]:
+    """Compute summary statistics for estimating functions.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        A fitted IRT model.
+    responses : NDArray[np.float64]
+        Response matrix.
+    theta : NDArray[np.float64]
+        Ability estimates.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - sum: Sum of estimating functions (should be ~0)
+        - mean: Mean estimating function
+        - var: Variance of estimating functions
+        - meat: "Meat" matrix for sandwich estimator (sum of outer products)
+    """
+    ef = estfun(model, responses, theta)
+
+    n_persons = ef.shape[0]
+
+    meat = ef.T @ ef / n_persons
+
+    return {
+        "sum": ef.sum(axis=0),
+        "mean": ef.mean(axis=0),
+        "var": ef.var(axis=0),
+        "meat": meat,
     }

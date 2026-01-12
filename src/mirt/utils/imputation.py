@@ -8,6 +8,7 @@ This module provides methods for handling missing responses:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -15,6 +16,9 @@ from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     pass
+
+EPSILON = 1e-10
+LARGE_DF = 1e10
 
 
 def impute_responses(
@@ -350,3 +354,156 @@ def pairwise_available(
             joint_available[i, j] = (valid[:, i] & valid[:, j]).sum()
 
     return n_available, joint_available
+
+
+@dataclass
+class MIResult:
+    """Container for combined multiple imputation results.
+
+    Attributes
+    ----------
+    estimate : float or NDArray[np.float64]
+        Combined point estimate.
+    within_variance : float or NDArray[np.float64]
+        Average within-imputation variance.
+    between_variance : float or NDArray[np.float64]
+        Between-imputation variance.
+    total_variance : float or NDArray[np.float64]
+        Total variance (within + between + correction).
+    standard_error : float or NDArray[np.float64]
+        Standard error of combined estimate.
+    df : float or NDArray[np.float64]
+        Degrees of freedom for inference.
+    fmi : float or NDArray[np.float64]
+        Fraction of missing information.
+    lambda_hat : float or NDArray[np.float64]
+        Proportion of variation due to missingness.
+    """
+
+    estimate: float | NDArray[np.float64]
+    within_variance: float | NDArray[np.float64]
+    between_variance: float | NDArray[np.float64]
+    total_variance: float | NDArray[np.float64]
+    standard_error: float | NDArray[np.float64]
+    df: float | NDArray[np.float64]
+    fmi: float | NDArray[np.float64]
+    lambda_hat: float | NDArray[np.float64]
+
+
+def averageMI(
+    estimates: list[float | NDArray[np.float64]],
+    variances: list[float | NDArray[np.float64]] | None = None,
+    standard_errors: list[float | NDArray[np.float64]] | None = None,
+) -> MIResult:
+    """Combine results from multiple imputation using Rubin's rules.
+
+    Combines point estimates and standard errors/variances from multiple
+    imputations into a single inference, properly accounting for both
+    within-imputation and between-imputation variability.
+
+    Parameters
+    ----------
+    estimates : list of float or ndarray
+        Point estimates from each imputation. Each element should be
+        the same shape (scalar, 1D array, or 2D array).
+    variances : list of float or ndarray, optional
+        Variance estimates from each imputation. If None, must provide
+        standard_errors.
+    standard_errors : list of float or ndarray, optional
+        Standard errors from each imputation. Squared to get variances.
+        If None, must provide variances.
+
+    Returns
+    -------
+    MIResult
+        Combined results with:
+        - estimate: Combined point estimate
+        - within_variance: Average within-imputation variance
+        - between_variance: Between-imputation variance
+        - total_variance: Total variance (Rubin's formula)
+        - standard_error: Square root of total variance
+        - df: Degrees of freedom for t-distribution
+        - fmi: Fraction of missing information
+        - lambda_hat: Proportion of variation due to missingness
+
+    Examples
+    --------
+    >>> # Fit model on multiple imputations
+    >>> imputations = impute_responses(data, method='multiple', n_imputations=5)
+    >>> estimates = []
+    >>> se_list = []
+    >>> for imp in imputations:
+    ...     result = fit_mirt(imp, model='2PL')
+    ...     estimates.append(result.model.parameters['difficulty'])
+    ...     se_list.append(result.standard_errors['difficulty'])
+    >>> combined = averageMI(estimates, standard_errors=se_list)
+    >>> print(f"Combined estimate: {combined.estimate}")
+    >>> print(f"SE: {combined.standard_error}")
+
+    Notes
+    -----
+    Uses Rubin's (1987) combining rules:
+    - Combined estimate: Q_bar = mean(Q_m)
+    - Within variance: U_bar = mean(U_m)
+    - Between variance: B = var(Q_m)
+    - Total variance: T = U_bar + (1 + 1/m) * B
+    - Degrees of freedom: Based on Barnard & Rubin (1999)
+    """
+    if variances is None and standard_errors is None:
+        raise ValueError("Must provide either variances or standard_errors")
+
+    m = len(estimates)
+    if m < 2:
+        raise ValueError("Need at least 2 imputations to combine")
+
+    estimates_arr = [np.asarray(e) for e in estimates]
+
+    if variances is not None:
+        variances_arr = [np.asarray(v) for v in variances]
+    else:
+        assert standard_errors is not None
+        variances_arr = [np.asarray(se) ** 2 for se in standard_errors]
+
+    q_bar = np.mean(estimates_arr, axis=0)
+
+    u_bar = np.mean(variances_arr, axis=0)
+
+    deviations = [e - q_bar for e in estimates_arr]
+    b = np.sum([d**2 for d in deviations], axis=0) / (m - 1)
+
+    total_var = u_bar + (1 + 1 / m) * b
+
+    se = np.sqrt(total_var)
+
+    r = (1 + 1 / m) * b / (u_bar + EPSILON)
+
+    lambda_hat = (1 + 1 / m) * b / (total_var + EPSILON)
+
+    df_old = (m - 1) * (1 + 1 / r) ** 2
+    df_old = np.where(np.isinf(df_old) | np.isnan(df_old), LARGE_DF, df_old)
+
+    fmi = (r + 2 / (df_old + 3)) / (r + 1)
+    fmi = np.clip(fmi, 0, 1)
+
+    if np.isscalar(q_bar):
+        return MIResult(
+            estimate=float(q_bar),
+            within_variance=float(u_bar),
+            between_variance=float(b),
+            total_variance=float(total_var),
+            standard_error=float(se),
+            df=float(df_old),
+            fmi=float(fmi),
+            lambda_hat=float(lambda_hat),
+        )
+
+    return MIResult(
+        estimate=q_bar,
+        within_variance=u_bar,
+        between_variance=b,
+        total_variance=total_var,
+        standard_error=se,
+        df=df_old,
+        fmi=fmi,
+        lambda_hat=lambda_hat,
+    )
