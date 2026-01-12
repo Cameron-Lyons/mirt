@@ -446,6 +446,7 @@ def cross_validate(
     tol: float = 1e-4,
     verbose: bool = False,
     return_models: bool = False,
+    n_jobs: int = 1,
 ) -> CVResult:
     """Perform cross-validation for an IRT model.
 
@@ -474,6 +475,8 @@ def cross_validate(
         Print progress.
     return_models : bool, default=False
         Whether to return fitted models for each fold.
+    n_jobs : int, default=1
+        Number of parallel jobs for fold fitting. Use -1 for all CPUs.
 
     Returns
     -------
@@ -493,6 +496,9 @@ def cross_validate(
     ... )
     >>> print(cv_result.summary())
     """
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
     from mirt import fit_mirt
 
     responses = np.asarray(responses)
@@ -506,13 +512,16 @@ def cross_validate(
     scores: dict[str, list[float]] = {s.name: [] for s in scorers}
     fold_results: list[FitResult] = []
 
-    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(responses)):
-        if verbose:
-            print(f"Fold {fold_idx + 1}/{splitter.n_splits}")
+    if n_jobs == -1:
+        n_jobs = os.cpu_count() or 1
 
+    splits = list(splitter.split(responses))
+
+    def fit_fold(
+        fold_data: tuple[int, tuple[NDArray[np.intp], NDArray[np.intp]]],
+    ) -> tuple[int, FitResult, NDArray[np.intp]]:
+        fold_idx, (train_idx, test_idx) = fold_data
         train_data = responses[train_idx]
-        test_data = responses[test_idx]
-
         result = fit_mirt(
             train_data,
             model=model_type,
@@ -523,13 +532,54 @@ def cross_validate(
             tol=tol,
             verbose=False,
         )
+        return fold_idx, result, test_idx
 
-        if return_models:
-            fold_results.append(result)
+    if n_jobs > 1 and len(splits) > 1:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, len(splits))) as executor:
+            fold_data_list = list(enumerate(splits))
+            results_list = list(executor.map(fit_fold, fold_data_list))
 
-        for scorer in scorers:
-            score = scorer(result, train_data, test_data, test_idx)
-            scores[scorer.name].append(score)
+        results_list.sort(key=lambda x: x[0])
+
+        for fold_idx, result, test_idx in results_list:
+            if verbose:
+                print(f"Fold {fold_idx + 1}/{splitter.n_splits} completed")
+
+            train_idx = splits[fold_idx][0]
+            train_data = responses[train_idx]
+            test_data = responses[test_idx]
+
+            if return_models:
+                fold_results.append(result)
+
+            for scorer in scorers:
+                score = scorer(result, train_data, test_data, test_idx)
+                scores[scorer.name].append(score)
+    else:
+        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+            if verbose:
+                print(f"Fold {fold_idx + 1}/{splitter.n_splits}")
+
+            train_data = responses[train_idx]
+            test_data = responses[test_idx]
+
+            result = fit_mirt(
+                train_data,
+                model=model_type,
+                n_categories=n_categories,
+                n_factors=n_factors,
+                n_quadpts=n_quadpts,
+                max_iter=max_iter,
+                tol=tol,
+                verbose=False,
+            )
+
+            if return_models:
+                fold_results.append(result)
+
+            for scorer in scorers:
+                score = scorer(result, train_data, test_data, test_idx)
+                scores[scorer.name].append(score)
 
     mean_scores = {k: float(np.mean(v)) for k, v in scores.items()}
     std_scores = {

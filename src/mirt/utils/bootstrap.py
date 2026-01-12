@@ -26,6 +26,7 @@ def bootstrap_se(
     statistic: Literal["parameters", "theta"] | Callable = "parameters",
     seed: int | None = None,
     verbose: bool = False,
+    warm_start: bool = True,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute bootstrap standard errors.
 
@@ -46,6 +47,9 @@ def bootstrap_se(
         Random seed for reproducibility
     verbose : bool
         Whether to print progress
+    warm_start : bool
+        Whether to use original parameter estimates as starting values
+        for bootstrap samples. This significantly speeds up convergence.
 
     Returns
     -------
@@ -64,7 +68,10 @@ def bootstrap_se(
 
     boot_estimates: dict[str, list[NDArray]] = {}
 
-    estimator = EMEstimator(max_iter=200, tol=1e-3, verbose=False)
+    max_iter = 100 if warm_start else 200
+    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
+
+    original_params = {k: v.copy() for k, v in model.parameters.items()}
 
     for b in range(n_bootstrap):
         if verbose and (b + 1) % 50 == 0:
@@ -74,6 +81,11 @@ def bootstrap_se(
         boot_responses = responses[indices]
 
         boot_model = model.copy()
+
+        if warm_start:
+            for name, values in original_params.items():
+                boot_model._parameters[name] = values.copy()
+            boot_model._is_fitted = False
 
         try:
             result = estimator.fit(boot_model, boot_responses)
@@ -122,6 +134,7 @@ def bootstrap_ci(
     statistic: Literal["parameters", "theta"] | Callable = "parameters",
     seed: int | None = None,
     verbose: bool = False,
+    warm_start: bool = True,
 ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
     """Compute bootstrap confidence intervals.
 
@@ -146,6 +159,9 @@ def bootstrap_ci(
         Random seed
     verbose : bool
         Whether to print progress
+    warm_start : bool
+        Whether to use original parameter estimates as starting values
+        for bootstrap samples. This significantly speeds up convergence.
 
     Returns
     -------
@@ -179,7 +195,10 @@ def bootstrap_ci(
 
     boot_estimates: dict[str, list[NDArray]] = {k: [] for k in original_estimates}
 
-    estimator = EMEstimator(max_iter=200, tol=1e-3, verbose=False)
+    original_params = {k: v.copy() for k, v in original_model.parameters.items()}
+
+    max_iter = 100 if warm_start else 200
+    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
 
     for b in range(n_bootstrap):
         if verbose and (b + 1) % 50 == 0:
@@ -188,6 +207,11 @@ def bootstrap_ci(
         indices = rng.integers(0, n_persons, size=n_persons)
         boot_responses = responses[indices]
         boot_model = original_model.copy()
+
+        if warm_start:
+            for name, values in original_params.items():
+                boot_model._parameters[name] = values.copy()
+            boot_model._is_fitted = False
 
         try:
             result = estimator.fit(boot_model, boot_responses)
@@ -325,6 +349,7 @@ def parametric_bootstrap(
     n_persons: int | None = None,
     seed: int | None = None,
     verbose: bool = False,
+    warm_start: bool = True,
 ) -> dict[str, NDArray[np.float64]]:
     """Parametric bootstrap using model to generate data.
 
@@ -342,6 +367,9 @@ def parametric_bootstrap(
         Random seed
     verbose : bool
         Whether to print progress
+    warm_start : bool
+        Whether to use original parameter estimates as starting values
+        for bootstrap samples. This significantly speeds up convergence.
 
     Returns
     -------
@@ -361,10 +389,12 @@ def parametric_bootstrap(
     rng = np.random.default_rng(seed)
     boot_estimates: dict[str, list[NDArray]] = {}
 
-    estimator = EMEstimator(max_iter=200, tol=1e-3, verbose=False)
+    max_iter = 100 if warm_start else 200
+    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
 
     params = model.parameters
     model_name = model.model_name
+    original_params = {k: v.copy() for k, v in params.items()}
 
     for b in range(n_bootstrap):
         if verbose and (b + 1) % 50 == 0:
@@ -394,6 +424,12 @@ def parametric_bootstrap(
             sim_data = (rng.random((n_persons, model.n_items)) < probs).astype(np.int_)
 
         boot_model = model.copy()
+
+        if warm_start:
+            for name, values in original_params.items():
+                boot_model._parameters[name] = values.copy()
+            boot_model._is_fitted = False
+
         try:
             result = estimator.fit(boot_model, sim_data)
 

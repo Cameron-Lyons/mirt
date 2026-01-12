@@ -87,6 +87,8 @@ class EMEstimator(BaseEstimator):
         if not model._is_fitted:
             model._initialize_parameters()
 
+        valid_masks = [responses[:, j] >= 0 for j in range(model.n_items)]
+
         self._convergence_history = []
         prev_ll = -np.inf
 
@@ -105,7 +107,7 @@ class EMEstimator(BaseEstimator):
 
             prev_ll = current_ll
 
-            self._m_step(model, responses, posterior_weights)
+            self._m_step(model, responses, posterior_weights, valid_masks)
 
             n_k = posterior_weights.sum(axis=0)
             self._latent_density.update(self._quadrature.nodes, n_k)
@@ -167,14 +169,33 @@ class EMEstimator(BaseEstimator):
         model: BaseItemModel,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
+        valid_masks: list[NDArray[np.bool_]] | None = None,
     ) -> None:
         import os
         from concurrent.futures import ThreadPoolExecutor
 
         quad_points = self._quadrature.nodes
         n_items = model.n_items
+        n_quad = len(quad_points)
 
         n_k = posterior_weights.sum(axis=0)
+
+        if valid_masks is None:
+            valid_masks = [responses[:, j] >= 0 for j in range(n_items)]
+
+        if not model.is_polytomous:
+            r_k_all = np.zeros((n_items, n_quad))
+            n_k_valid_all = np.zeros((n_items, n_quad))
+            for j in range(n_items):
+                valid = valid_masks[j]
+                item_resp = responses[:, j]
+                r_k_all[j] = np.sum(
+                    item_resp[valid, None] * posterior_weights[valid, :], axis=0
+                )
+                n_k_valid_all[j] = np.sum(posterior_weights[valid], axis=0)
+        else:
+            r_k_all = None
+            n_k_valid_all = None
 
         n_jobs = self.n_jobs
         if n_jobs == -1:
@@ -182,14 +203,38 @@ class EMEstimator(BaseEstimator):
 
         if n_jobs == 1:
             for item_idx in range(n_items):
+                r_k = r_k_all[item_idx] if r_k_all is not None else None
+                n_k_valid = (
+                    n_k_valid_all[item_idx] if n_k_valid_all is not None else None
+                )
                 self._optimize_item(
-                    model, item_idx, responses, posterior_weights, quad_points, n_k
+                    model,
+                    item_idx,
+                    responses,
+                    posterior_weights,
+                    quad_points,
+                    n_k,
+                    valid_masks[item_idx],
+                    r_k,
+                    n_k_valid,
                 )
         else:
 
             def optimize_single_item(item_idx):
+                r_k = r_k_all[item_idx] if r_k_all is not None else None
+                n_k_valid = (
+                    n_k_valid_all[item_idx] if n_k_valid_all is not None else None
+                )
                 return item_idx, self._optimize_item_return(
-                    model, item_idx, responses, posterior_weights, quad_points, n_k
+                    model,
+                    item_idx,
+                    responses,
+                    posterior_weights,
+                    quad_points,
+                    n_k,
+                    valid_masks[item_idx],
+                    r_k,
+                    n_k_valid,
                 )
 
             with ThreadPoolExecutor(max_workers=min(n_jobs, n_items)) as executor:
@@ -206,11 +251,16 @@ class EMEstimator(BaseEstimator):
         posterior_weights: NDArray[np.float64],
         quad_points: NDArray[np.float64],
         n_k: NDArray[np.float64],
+        valid_mask: NDArray[np.bool_] | None = None,
+        r_k: NDArray[np.float64] | None = None,
+        n_k_valid: NDArray[np.float64] | None = None,
     ) -> None:
         item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
+        if valid_mask is None:
+            valid_mask = item_responses >= 0
 
-        n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
+        if n_k_valid is None:
+            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
@@ -236,10 +286,11 @@ class EMEstimator(BaseEstimator):
                 return -ll
 
         else:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                axis=0,
-            )
+            if r_k is None:
+                r_k = np.sum(
+                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                    axis=0,
+                )
             eps = self.prob_epsilon
 
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
@@ -270,12 +321,17 @@ class EMEstimator(BaseEstimator):
         posterior_weights: NDArray[np.float64],
         quad_points: NDArray[np.float64],
         n_k: NDArray[np.float64],
+        valid_mask: NDArray[np.bool_] | None = None,
+        r_k: NDArray[np.float64] | None = None,
+        n_k_valid: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Optimize item parameters and return the result (for parallel execution)."""
         item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
+        if valid_mask is None:
+            valid_mask = item_responses >= 0
 
-        n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
+        if n_k_valid is None:
+            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
 
@@ -301,10 +357,11 @@ class EMEstimator(BaseEstimator):
                 return -ll
 
         else:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                axis=0,
-            )
+            if r_k is None:
+                r_k = np.sum(
+                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                    axis=0,
+                )
             eps = self.prob_epsilon
 
             def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:

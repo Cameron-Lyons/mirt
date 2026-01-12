@@ -392,6 +392,7 @@ When the Rust backend is available (automatically built during installation), th
 |----------|------------------------|
 | **Likelihood** | Log-likelihood computation for 2PL, 3PL, and multidimensional models |
 | **EM Algorithm** | E-step (posterior computation), M-step (Newton-Raphson optimization), full EM fitting |
+| **Multigroup** | E-step for all models (2PL, 3PL, GRM, GPCM, NRM), expected counts |
 | **Scoring** | EAP scores, WLE scores, Lord-Wingersky recursion for sum scores |
 | **Diagnostics** | Q3 matrix, LD chi-square, infit/outfit statistics, standardized residuals |
 | **Calibration** | Fixed-item calibration EM algorithm, Stocking-Lord equating criterion |
@@ -500,7 +501,7 @@ If you use this package in your research, please cite:
   author = {Lyons, Cameron},
   title = {mirt: Multidimensional Item Response Theory for Python},
   url = {https://github.com/Cameron-Lyons/mirt},
-  version = {1.0.2}
+  version = {1.1.0}
 }
 ```
 
