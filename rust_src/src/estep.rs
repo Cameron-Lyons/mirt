@@ -175,7 +175,7 @@ pub fn mcem_e_step<'py>(
                 })
                 .collect();
 
-            let max_ll = log_likes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let max_ll = log_likes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let weights: Vec<f64> = log_likes.iter().map(|&ll| (ll - max_ll).exp()).collect();
             let sum: f64 = weights.iter().sum();
             let normalized: Vec<f64> = weights.iter().map(|&w| w / sum).collect();

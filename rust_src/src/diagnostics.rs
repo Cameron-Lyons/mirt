@@ -261,6 +261,128 @@ pub fn compute_q3_matrix<'py>(
     q3_matrix.to_pyarray(py)
 }
 
+/// Compute Q3 matrix with threshold filtering (optimized for large item banks)
+///
+/// Returns only item pairs with |Q3| above the threshold.
+/// For large item banks, this avoids computing the full O(n^2) matrix.
+///
+/// Returns:
+/// - item_i: first item indices
+/// - item_j: second item indices
+/// - q3_values: Q3 values for each pair
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+pub fn compute_q3_matrix_sparse<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    theta: PyReadonlyArray1<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+    threshold: f64,
+) -> (
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<i32>>,
+    Bound<'py, PyArray1<f64>>,
+) {
+    let responses = responses.as_array();
+    let theta = theta.as_array();
+    let discrimination = discrimination.as_array();
+    let difficulty = difficulty.as_array();
+
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+
+    let residuals: Vec<Vec<f64>> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let theta_i = theta[i];
+            (0..n_items)
+                .map(|j| {
+                    let resp = responses[[i, j]];
+                    if resp < 0 {
+                        return f64::NAN;
+                    }
+                    let p = sigmoid(discrimination[j] * (theta_i - difficulty[j]));
+                    let expected = p;
+                    let variance = p * (1.0 - p);
+                    (resp as f64 - expected) / (variance + EPSILON).sqrt()
+                })
+                .collect()
+        })
+        .collect();
+
+    let pairs: Vec<(usize, usize)> = (0..n_items)
+        .flat_map(|i| ((i + 1)..n_items).map(move |j| (i, j)))
+        .collect();
+
+    let significant_pairs: Vec<(i32, i32, f64)> = pairs
+        .par_iter()
+        .filter_map(|&(i, j)| {
+            let mut sum_xy = 0.0;
+            let mut sum_x = 0.0;
+            let mut sum_y = 0.0;
+            let mut sum_x2 = 0.0;
+            let mut sum_y2 = 0.0;
+            let mut n = 0.0;
+
+            for person_residuals in &residuals {
+                let r_i = person_residuals[i];
+                let r_j = person_residuals[j];
+                if r_i.is_nan() || r_j.is_nan() {
+                    continue;
+                }
+                sum_xy += r_i * r_j;
+                sum_x += r_i;
+                sum_y += r_j;
+                sum_x2 += r_i * r_i;
+                sum_y2 += r_j * r_j;
+                n += 1.0;
+            }
+
+            if n < 3.0 {
+                return None;
+            }
+
+            let mean_x = sum_x / n;
+            let mean_y = sum_y / n;
+            let var_x = sum_x2 / n - mean_x * mean_x;
+            let var_y = sum_y2 / n - mean_y * mean_y;
+            let cov_xy = sum_xy / n - mean_x * mean_y;
+
+            let denom = (var_x * var_y).sqrt();
+            let corr = if denom > EPSILON { cov_xy / denom } else { 0.0 };
+
+            if corr.abs() >= threshold {
+                Some((i as i32, j as i32, corr))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let item_i: Array1<i32> = significant_pairs
+        .iter()
+        .map(|(i, _, _)| *i)
+        .collect::<Vec<_>>()
+        .into();
+    let item_j: Array1<i32> = significant_pairs
+        .iter()
+        .map(|(_, j, _)| *j)
+        .collect::<Vec<_>>()
+        .into();
+    let q3_values: Array1<f64> = significant_pairs
+        .iter()
+        .map(|(_, _, v)| *v)
+        .collect::<Vec<_>>()
+        .into();
+
+    (
+        item_i.to_pyarray(py),
+        item_j.to_pyarray(py),
+        q3_values.to_pyarray(py),
+    )
+}
+
 /// Compute LD chi-square statistics for all item pairs
 #[pyfunction]
 pub fn compute_ld_chi2_matrix<'py>(
@@ -595,6 +717,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_expected_margins, m)?)?;
     m.add_function(wrap_pyfunction!(compute_standardized_residuals, m)?)?;
     m.add_function(wrap_pyfunction!(compute_q3_matrix, m)?)?;
+    m.add_function(wrap_pyfunction!(compute_q3_matrix_sparse, m)?)?;
     m.add_function(wrap_pyfunction!(compute_ld_chi2_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(compute_fit_statistics, m)?)?;
     m.add_function(wrap_pyfunction!(compute_probabilities_batch, m)?)?;

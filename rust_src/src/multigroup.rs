@@ -9,12 +9,35 @@ fn logsumexp(arr: &[f64]) -> f64 {
     if arr.is_empty() {
         return f64::NEG_INFINITY;
     }
-    let max_val = arr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max_val = arr.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if max_val.is_infinite() {
         return max_val;
     }
     let sum_exp: f64 = arr.iter().map(|&x| (x - max_val).exp()).sum();
     max_val + sum_exp.ln()
+}
+
+fn compute_log_prior(quad_points: &[f64], prior_mean: f64, prior_var: f64) -> Vec<f64> {
+    quad_points
+        .iter()
+        .map(|&theta| {
+            let diff = theta - prior_mean;
+            -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln() - 0.5 * diff * diff / prior_var
+        })
+        .collect()
+}
+
+fn compute_log_quad_weights(quad_weights: &[f64]) -> Vec<f64> {
+    quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect()
+}
+
+fn compute_posterior_from_log_joint(log_joint: &[f64]) -> (Vec<f64>, f64) {
+    let log_marginal = logsumexp(log_joint);
+    let posterior: Vec<f64> = log_joint
+        .iter()
+        .map(|&lj| (lj - log_marginal).exp())
+        .collect();
+    (posterior, log_marginal)
 }
 
 fn compute_log_likelihoods_2pl_single(
@@ -23,10 +46,8 @@ fn compute_log_likelihoods_2pl_single(
     quad_points: &[f64],
     discrimination: &[f64],
     difficulty: &[f64],
-) -> Vec<f64> {
-    let n_quad = quad_points.len();
-    let mut log_likes = vec![0.0; n_quad];
-
+    log_likes: &mut [f64],
+) {
     for (q, &theta) in quad_points.iter().enumerate() {
         let mut ll = 0.0;
         for j in 0..n_items {
@@ -44,8 +65,6 @@ fn compute_log_likelihoods_2pl_single(
         }
         log_likes[q] = ll;
     }
-
-    log_likes
 }
 
 /// Compute multigroup E-step for 2PL models
@@ -83,7 +102,7 @@ pub fn multigroup_e_step_2pl<'py>(
     let n_quad = quad_points.len();
     let _n_groups = responses_list.len();
 
-    let log_quad_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect();
+    let log_quad_weights = compute_log_quad_weights(&quad_weights);
 
     let group_data: Vec<_> = responses_list
         .iter()
@@ -114,38 +133,26 @@ pub fn multigroup_e_step_2pl<'py>(
             let prior_mean = prior_means[g];
             let prior_var = prior_vars[g];
 
-            let log_prior: Vec<f64> = quad_points
-                .iter()
-                .map(|&theta| {
-                    let diff = theta - prior_mean;
-                    -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln()
-                        - 0.5 * diff * diff / prior_var
-                })
-                .collect();
+            let log_prior = compute_log_prior(&quad_points, prior_mean, prior_var);
 
             let person_results: Vec<(Vec<f64>, f64)> = resp_vec
                 .par_iter()
                 .map(|person_resp| {
-                    let log_likes = compute_log_likelihoods_2pl_single(
+                    let mut log_likes = vec![0.0; n_quad];
+                    compute_log_likelihoods_2pl_single(
                         person_resp,
                         n_items,
                         &quad_points,
                         &disc_vec,
                         &diff_vec,
+                        &mut log_likes,
                     );
 
                     let log_joint: Vec<f64> = (0..n_quad)
                         .map(|q| log_likes[q] + log_prior[q] + log_quad_weights[q])
                         .collect();
 
-                    let log_marginal = logsumexp(&log_joint);
-
-                    let posterior: Vec<f64> = log_joint
-                        .iter()
-                        .map(|&lj| (lj - log_marginal).exp())
-                        .collect();
-
-                    (posterior, log_marginal)
+                    compute_posterior_from_log_joint(&log_joint)
                 })
                 .collect();
 
@@ -198,7 +205,7 @@ pub fn multigroup_e_step_3pl<'py>(
     let n_quad = quad_points.len();
     let _n_groups = responses_list.len();
 
-    let log_quad_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect();
+    let log_quad_weights = compute_log_quad_weights(&quad_weights);
 
     let group_data: Vec<_> = responses_list
         .iter()
@@ -235,14 +242,7 @@ pub fn multigroup_e_step_3pl<'py>(
                 let prior_mean = prior_means[g];
                 let prior_var = prior_vars[g];
 
-                let log_prior: Vec<f64> = quad_points
-                    .iter()
-                    .map(|&theta| {
-                        let diff = theta - prior_mean;
-                        -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln()
-                            - 0.5 * diff * diff / prior_var
-                    })
-                    .collect();
+                let log_prior = compute_log_prior(&quad_points, prior_mean, prior_var);
 
                 let person_results: Vec<(Vec<f64>, f64)> = resp_vec
                     .par_iter()
@@ -272,14 +272,7 @@ pub fn multigroup_e_step_3pl<'py>(
                             .map(|q| log_likes[q] + log_prior[q] + log_quad_weights[q])
                             .collect();
 
-                        let log_marginal = logsumexp(&log_joint);
-
-                        let posterior: Vec<f64> = log_joint
-                            .iter()
-                            .map(|&lj| (lj - log_marginal).exp())
-                            .collect();
-
-                        (posterior, log_marginal)
+                        compute_posterior_from_log_joint(&log_joint)
                     })
                     .collect();
 
@@ -471,7 +464,7 @@ pub fn multigroup_e_step_grm<'py>(
     let n_quad = quad_points.len();
     let _n_groups = responses_list.len();
 
-    let log_quad_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect();
+    let log_quad_weights = compute_log_quad_weights(&quad_weights);
 
     let group_data: Vec<_> = responses_list
         .iter()
@@ -520,14 +513,7 @@ pub fn multigroup_e_step_grm<'py>(
                 let prior_mean = prior_means[g];
                 let prior_var = prior_vars[g];
 
-                let log_prior: Vec<f64> = quad_points
-                    .iter()
-                    .map(|&theta| {
-                        let diff = theta - prior_mean;
-                        -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln()
-                            - 0.5 * diff * diff / prior_var
-                    })
-                    .collect();
+                let log_prior = compute_log_prior(&quad_points, prior_mean, prior_var);
 
                 let person_results: Vec<(Vec<f64>, f64)> = resp_vec
                     .par_iter()
@@ -550,14 +536,7 @@ pub fn multigroup_e_step_grm<'py>(
                             .map(|q| log_likes[q] + log_prior[q] + log_quad_weights[q])
                             .collect();
 
-                        let log_marginal = logsumexp(&log_joint);
-
-                        let posterior: Vec<f64> = log_joint
-                            .iter()
-                            .map(|&lj| (lj - log_marginal).exp())
-                            .collect();
-
-                        (posterior, log_marginal)
+                        compute_posterior_from_log_joint(&log_joint)
                     })
                     .collect();
 
@@ -613,7 +592,7 @@ fn compute_gpcm_log_likelihood_single(
             numerators[k] = numerators[k - 1] + a * (theta - steps[j][k]);
         }
 
-        let max_num = numerators.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_num = numerators.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let sum_exp: f64 = numerators.iter().map(|&x| (x - max_num).exp()).sum();
         let log_denom = max_num + sum_exp.ln();
 
@@ -645,7 +624,7 @@ fn compute_nrm_log_likelihood_single(
             logits[k] = slopes[j][k] * theta + intercepts[j][k];
         }
 
-        let max_logit = logits.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let sum_exp: f64 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
         let log_denom = max_logit + sum_exp.ln();
 
@@ -692,7 +671,7 @@ pub fn multigroup_e_step_gpcm<'py>(
     let n_quad = quad_points.len();
     let _n_groups = responses_list.len();
 
-    let log_quad_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect();
+    let log_quad_weights = compute_log_quad_weights(&quad_weights);
 
     let group_data: Vec<_> = responses_list
         .iter()
@@ -735,14 +714,7 @@ pub fn multigroup_e_step_gpcm<'py>(
                 let prior_mean = prior_means[g];
                 let prior_var = prior_vars[g];
 
-                let log_prior: Vec<f64> = quad_points
-                    .iter()
-                    .map(|&theta| {
-                        let diff = theta - prior_mean;
-                        -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln()
-                            - 0.5 * diff * diff / prior_var
-                    })
-                    .collect();
+                let log_prior = compute_log_prior(&quad_points, prior_mean, prior_var);
 
                 let person_results: Vec<(Vec<f64>, f64)> = resp_vec
                     .par_iter()
@@ -765,14 +737,7 @@ pub fn multigroup_e_step_gpcm<'py>(
                             .map(|q| log_likes[q] + log_prior[q] + log_quad_weights[q])
                             .collect();
 
-                        let log_marginal = logsumexp(&log_joint);
-
-                        let posterior: Vec<f64> = log_joint
-                            .iter()
-                            .map(|&lj| (lj - log_marginal).exp())
-                            .collect();
-
-                        (posterior, log_marginal)
+                        compute_posterior_from_log_joint(&log_joint)
                     })
                     .collect();
 
@@ -842,7 +807,7 @@ pub fn multigroup_e_step_nrm<'py>(
     let n_quad = quad_points.len();
     let _n_groups = responses_list.len();
 
-    let log_quad_weights: Vec<f64> = quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect();
+    let log_quad_weights = compute_log_quad_weights(&quad_weights);
 
     let group_data: Vec<_> = responses_list
         .iter()
@@ -897,14 +862,7 @@ pub fn multigroup_e_step_nrm<'py>(
                 let prior_mean = prior_means[g];
                 let prior_var = prior_vars[g];
 
-                let log_prior: Vec<f64> = quad_points
-                    .iter()
-                    .map(|&theta| {
-                        let diff = theta - prior_mean;
-                        -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln()
-                            - 0.5 * diff * diff / prior_var
-                    })
-                    .collect();
+                let log_prior = compute_log_prior(&quad_points, prior_mean, prior_var);
 
                 let person_results: Vec<(Vec<f64>, f64)> = resp_vec
                     .par_iter()
@@ -927,14 +885,7 @@ pub fn multigroup_e_step_nrm<'py>(
                             .map(|q| log_likes[q] + log_prior[q] + log_quad_weights[q])
                             .collect();
 
-                        let log_marginal = logsumexp(&log_joint);
-
-                        let posterior: Vec<f64> = log_joint
-                            .iter()
-                            .map(|&lj| (lj - log_marginal).exp())
-                            .collect();
-
-                        (posterior, log_marginal)
+                        compute_posterior_from_log_joint(&log_joint)
                     })
                     .collect();
 

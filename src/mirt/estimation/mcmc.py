@@ -376,6 +376,7 @@ class GibbsSampler(BaseEstimator):
     This provides full posterior distributions for all parameters.
 
     Uses fast parallel Rust backend for 2PL models when available.
+    Supports multi-chain parallelization when n_chains > 1 and parallel_chains=True.
     """
 
     def __init__(
@@ -388,6 +389,7 @@ class GibbsSampler(BaseEstimator):
         verbose: bool = False,
         use_rust: bool = True,
         seed: int | None = None,
+        parallel_chains: bool = False,
     ) -> None:
         """Initialize Gibbs sampler.
 
@@ -409,6 +411,8 @@ class GibbsSampler(BaseEstimator):
             Whether to use Rust backend when available
         seed : int, optional
             Random seed for reproducibility
+        parallel_chains : bool
+            Whether to run multiple chains in parallel (only when n_chains > 1)
         """
         super().__init__(max_iter=n_iter, verbose=verbose)
         self.n_iter = n_iter
@@ -418,6 +422,7 @@ class GibbsSampler(BaseEstimator):
         self.priors = priors or {}
         self.use_rust = use_rust
         self.seed = seed
+        self.parallel_chains = parallel_chains
 
     def fit(
         self,
@@ -495,30 +500,12 @@ class GibbsSampler(BaseEstimator):
         if not model._parameters:
             model._initialize_parameters()
 
-        theta = np.zeros((n_persons, model.n_factors))
-        rng = np.random.default_rng(self.seed)
-
-        chains: dict[str, list] = {name: [] for name in model.parameters}
-        chains["theta"] = []
-        chains["log_likelihood"] = []
-
-        for iteration in range(self.n_iter):
-            theta = self._sample_theta_gibbs(model, responses, theta, rng)
-
-            self._sample_parameters(model, responses, theta, rng)
-
-            if iteration >= self.burnin and (iteration - self.burnin) % self.thin == 0:
-                for name, values in model.parameters.items():
-                    chains[name].append(values.copy())
-                chains["theta"].append(theta.copy())
-                ll = np.sum(model.log_likelihood(responses, theta))
-                chains["log_likelihood"].append(ll)
-
-            if self.verbose and (iteration + 1) % 500 == 0:
-                ll = np.sum(model.log_likelihood(responses, theta))
-                print(f"Iteration {iteration + 1}/{self.n_iter}: LL = {ll:.4f}")
-
-        chain_arrays = {name: np.array(chain) for name, chain in chains.items()}
+        if self.parallel_chains and self.n_chains > 1:
+            chain_arrays = self._run_parallel_chains(model, responses, n_persons)
+        else:
+            chain_arrays = self._run_single_chain(
+                model, responses, n_persons, self.seed
+            )
 
         for name in model.parameters:
             model._parameters[name] = np.mean(chain_arrays[name], axis=0)
@@ -543,6 +530,74 @@ class GibbsSampler(BaseEstimator):
             burnin=self.burnin,
             thin=self.thin,
         )
+
+    def _run_single_chain(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        n_persons: int,
+        seed: int | None,
+    ) -> dict[str, NDArray]:
+        """Run a single MCMC chain."""
+        theta = np.zeros((n_persons, model.n_factors))
+        rng = np.random.default_rng(seed)
+
+        chains: dict[str, list] = {name: [] for name in model.parameters}
+        chains["theta"] = []
+        chains["log_likelihood"] = []
+
+        for iteration in range(self.n_iter):
+            theta = self._sample_theta_gibbs(model, responses, theta, rng)
+
+            self._sample_parameters(model, responses, theta, rng)
+
+            if iteration >= self.burnin and (iteration - self.burnin) % self.thin == 0:
+                for name, values in model.parameters.items():
+                    chains[name].append(values.copy())
+                chains["theta"].append(theta.copy())
+                ll = np.sum(model.log_likelihood(responses, theta))
+                chains["log_likelihood"].append(ll)
+
+            if self.verbose and (iteration + 1) % 500 == 0:
+                ll = np.sum(model.log_likelihood(responses, theta))
+                print(f"Iteration {iteration + 1}/{self.n_iter}: LL = {ll:.4f}")
+
+        return {name: np.array(chain) for name, chain in chains.items()}
+
+    def _run_parallel_chains(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        n_persons: int,
+    ) -> dict[str, NDArray]:
+        """Run multiple MCMC chains in parallel and combine results."""
+        from concurrent.futures import ProcessPoolExecutor
+
+        base_seed = self.seed if self.seed is not None else 0
+        seeds = [base_seed + i * 1000 for i in range(self.n_chains)]
+
+        if self.verbose:
+            print(f"Running {self.n_chains} chains in parallel...")
+
+        with ProcessPoolExecutor(max_workers=self.n_chains) as executor:
+            futures = [
+                executor.submit(
+                    self._run_single_chain, model.copy(), responses, n_persons, seed
+                )
+                for seed in seeds
+            ]
+            all_chains = [f.result() for f in futures]
+
+        combined: dict[str, list[NDArray]] = {}
+        for chain_result in all_chains:
+            for name, values in chain_result.items():
+                if name not in combined:
+                    combined[name] = []
+                combined[name].append(values)
+
+        return {
+            name: np.concatenate(arrays, axis=0) for name, arrays in combined.items()
+        }
 
     def _sample_theta_gibbs(
         self,

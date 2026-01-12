@@ -7,8 +7,6 @@ if the Rust extension is not available.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 import numpy as np
 from numpy.typing import NDArray
 
@@ -19,9 +17,6 @@ try:
 except ImportError:
     RUST_AVAILABLE = False
     mirt_rs = None
-
-if TYPE_CHECKING:
-    pass
 
 
 def is_rust_available() -> bool:

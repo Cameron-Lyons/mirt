@@ -62,68 +62,60 @@ def compute_observed_information(
 
     hessian = np.zeros((n_params, n_params))
 
-    ll_center = _complete_data_log_likelihood(
-        model, responses, posterior_weights, quadrature
-    )
+    ll_cache: dict[tuple, float] = {}
+
+    def cached_ll(params: NDArray[np.float64]) -> float:
+        key = tuple(params)
+        if key not in ll_cache:
+            _set_flat_parameters(model, params, param_shapes)
+            ll_cache[key] = _complete_data_log_likelihood(
+                model, responses, posterior_weights, quadrature
+            )
+        return ll_cache[key]
+
+    ll_center = cached_ll(params_flat)
+
+    ll_single_plus = {}
+    ll_single_minus = {}
+    for i in range(n_params):
+        params_plus = params_flat.copy()
+        params_plus[i] += h
+        ll_single_plus[i] = cached_ll(params_plus)
+
+        params_minus = params_flat.copy()
+        params_minus[i] -= h
+        ll_single_minus[i] = cached_ll(params_minus)
 
     for i in range(n_params):
-        for j in range(i, n_params):
-            if i == j:
-                params_plus = params_flat.copy()
-                params_plus[i] += h
-                params_minus = params_flat.copy()
-                params_minus[i] -= h
+        hessian[i, i] = (ll_single_plus[i] - 2 * ll_center + ll_single_minus[i]) / (
+            h**2
+        )
 
-                _set_flat_parameters(model, params_plus, param_shapes)
-                ll_plus = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
+    for i in range(n_params):
+        for j in range(i + 1, n_params):
+            params_pp = params_flat.copy()
+            params_pp[i] += h
+            params_pp[j] += h
 
-                _set_flat_parameters(model, params_minus, param_shapes)
-                ll_minus = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
+            params_pm = params_flat.copy()
+            params_pm[i] += h
+            params_pm[j] -= h
 
-                hessian[i, i] = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
-            else:
-                params_pp = params_flat.copy()
-                params_pp[i] += h
-                params_pp[j] += h
+            params_mp = params_flat.copy()
+            params_mp[i] -= h
+            params_mp[j] += h
 
-                params_pm = params_flat.copy()
-                params_pm[i] += h
-                params_pm[j] -= h
+            params_mm = params_flat.copy()
+            params_mm[i] -= h
+            params_mm[j] -= h
 
-                params_mp = params_flat.copy()
-                params_mp[i] -= h
-                params_mp[j] += h
+            ll_pp = cached_ll(params_pp)
+            ll_pm = cached_ll(params_pm)
+            ll_mp = cached_ll(params_mp)
+            ll_mm = cached_ll(params_mm)
 
-                params_mm = params_flat.copy()
-                params_mm[i] -= h
-                params_mm[j] -= h
-
-                _set_flat_parameters(model, params_pp, param_shapes)
-                ll_pp = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_pm, param_shapes)
-                ll_pm = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_mp, param_shapes)
-                ll_mp = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_mm, param_shapes)
-                ll_mm = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                hessian[i, j] = (ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
-                hessian[j, i] = hessian[i, j]
+            hessian[i, j] = (ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
+            hessian[j, i] = hessian[i, j]
 
     _set_flat_parameters(model, params_flat, param_shapes)
 
@@ -517,68 +509,58 @@ def _compute_complete_data_information(
 
     info = np.zeros((n_params, n_params))
 
-    ll_center = _complete_data_log_likelihood(
-        model, responses, posterior_weights, quadrature
-    )
+    ll_cache: dict[tuple, float] = {}
+
+    def cached_ll(params: NDArray[np.float64]) -> float:
+        key = tuple(params)
+        if key not in ll_cache:
+            _set_flat_parameters(model, params, param_shapes)
+            ll_cache[key] = _complete_data_log_likelihood(
+                model, responses, posterior_weights, quadrature
+            )
+        return ll_cache[key]
+
+    ll_center = cached_ll(params_flat)
+
+    ll_single_plus = {}
+    ll_single_minus = {}
+    for i in range(n_params):
+        params_plus = params_flat.copy()
+        params_plus[i] += h
+        ll_single_plus[i] = cached_ll(params_plus)
+
+        params_minus = params_flat.copy()
+        params_minus[i] -= h
+        ll_single_minus[i] = cached_ll(params_minus)
 
     for i in range(n_params):
-        for j in range(i, n_params):
-            if i == j:
-                params_plus = params_flat.copy()
-                params_plus[i] += h
-                params_minus = params_flat.copy()
-                params_minus[i] -= h
+        info[i, i] = -(ll_single_plus[i] - 2 * ll_center + ll_single_minus[i]) / (h**2)
 
-                _set_flat_parameters(model, params_plus, param_shapes)
-                ll_plus = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
+    for i in range(n_params):
+        for j in range(i + 1, n_params):
+            params_pp = params_flat.copy()
+            params_pp[i] += h
+            params_pp[j] += h
 
-                _set_flat_parameters(model, params_minus, param_shapes)
-                ll_minus = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
+            params_mm = params_flat.copy()
+            params_mm[i] -= h
+            params_mm[j] -= h
 
-                info[i, i] = -(ll_plus - 2 * ll_center + ll_minus) / (h**2)
-            else:
-                params_pp = params_flat.copy()
-                params_pp[i] += h
-                params_pp[j] += h
+            params_pm = params_flat.copy()
+            params_pm[i] += h
+            params_pm[j] -= h
 
-                params_mm = params_flat.copy()
-                params_mm[i] -= h
-                params_mm[j] -= h
+            params_mp = params_flat.copy()
+            params_mp[i] -= h
+            params_mp[j] += h
 
-                params_pm = params_flat.copy()
-                params_pm[i] += h
-                params_pm[j] -= h
+            ll_pp = cached_ll(params_pp)
+            ll_mm = cached_ll(params_mm)
+            ll_pm = cached_ll(params_pm)
+            ll_mp = cached_ll(params_mp)
 
-                params_mp = params_flat.copy()
-                params_mp[i] -= h
-                params_mp[j] += h
-
-                _set_flat_parameters(model, params_pp, param_shapes)
-                ll_pp = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_mm, param_shapes)
-                ll_mm = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_pm, param_shapes)
-                ll_pm = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                _set_flat_parameters(model, params_mp, param_shapes)
-                ll_mp = _complete_data_log_likelihood(
-                    model, responses, posterior_weights, quadrature
-                )
-
-                info[i, j] = -(ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
-                info[j, i] = info[i, j]
+            info[i, j] = -(ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
+            info[j, i] = info[i, j]
 
     _set_flat_parameters(model, params_flat, param_shapes)
 

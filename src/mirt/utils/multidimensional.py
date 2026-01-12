@@ -13,6 +13,36 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+def _get_discrimination_matrix(model: "BaseItemModel") -> NDArray[np.float64]:
+    """Extract discrimination parameters as a 2D array (n_items, n_dims)."""
+    if hasattr(model, "discrimination"):
+        disc = np.asarray(model.discrimination)
+    else:
+        params = model.get_params()
+        disc = params
+
+    if disc.ndim == 1:
+        disc = disc.reshape(-1, 1)
+
+    return disc
+
+
+def _select_items(
+    values: NDArray[np.float64],
+    item_idx: int | list[int] | None,
+) -> NDArray[np.float64]:
+    """Select items by index, returning appropriate subset of values."""
+    if item_idx is None:
+        return values
+
+    if isinstance(item_idx, int):
+        if values.ndim == 1:
+            return np.array([values[item_idx]])
+        return values[item_idx : item_idx + 1]
+
+    return values[item_idx]
+
+
 def MDISC(
     model: "BaseItemModel",
     item_idx: int | list[int] | None = None,
@@ -49,24 +79,9 @@ def MDISC(
     across all dimensions. Higher values indicate greater sensitivity
     to differences in the latent trait space.
     """
-    if hasattr(model, "discrimination"):
-        disc = np.asarray(model.discrimination)
-    else:
-        params = model.get_params()
-        disc = params
-
-    if disc.ndim == 1:
-        disc = disc.reshape(-1, 1)
-
+    disc = _get_discrimination_matrix(model)
     mdisc = np.sqrt(np.sum(disc**2, axis=1))
-
-    if item_idx is None:
-        return mdisc
-
-    if isinstance(item_idx, int):
-        return np.array([mdisc[item_idx]])
-
-    return mdisc[item_idx]
+    return _select_items(mdisc, item_idx)
 
 
 def MDIFF(
@@ -107,15 +122,7 @@ def MDIFF(
     from the origin in the direction of maximum discrimination.
     """
     mdisc = MDISC(model)
-
-    if hasattr(model, "discrimination"):
-        disc = np.asarray(model.discrimination)
-    else:
-        params = model.get_params()
-        disc = params
-
-    if disc.ndim == 1:
-        disc = disc.reshape(-1, 1)
+    disc = _get_discrimination_matrix(model)
 
     if hasattr(model, "difficulty"):
         diff = np.asarray(model.difficulty)
@@ -126,14 +133,7 @@ def MDIFF(
         intercept = np.zeros(disc.shape[0])
 
     mdiff = -intercept / np.maximum(mdisc, 1e-10)
-
-    if item_idx is None:
-        return mdiff
-
-    if isinstance(item_idx, int):
-        return np.array([mdiff[item_idx]])
-
-    return mdiff[item_idx]
+    return _select_items(mdiff, item_idx)
 
 
 def direction_cosines(
@@ -165,25 +165,10 @@ def direction_cosines(
     >>> angles_deg = np.arccos(cosines) * 180 / np.pi
     >>> print(f"Item 0 angles: {angles_deg}")
     """
-    if hasattr(model, "discrimination"):
-        disc = np.asarray(model.discrimination)
-    else:
-        params = model.get_params()
-        disc = params
-
-    if disc.ndim == 1:
-        disc = disc.reshape(-1, 1)
-
+    disc = _get_discrimination_matrix(model)
     mdisc = np.sqrt(np.sum(disc**2, axis=1, keepdims=True))
     cosines = disc / np.maximum(mdisc, 1e-10)
-
-    if item_idx is None:
-        return cosines
-
-    if isinstance(item_idx, int):
-        return cosines[item_idx : item_idx + 1]
-
-    return cosines[item_idx]
+    return _select_items(cosines, item_idx)
 
 
 def composite_score_weights(
@@ -213,15 +198,7 @@ def composite_score_weights(
     >>> weights = composite_score_weights(result.model)
     >>> composite = responses @ weights
     """
-    if hasattr(model, "discrimination"):
-        disc = np.asarray(model.discrimination)
-    else:
-        params = model.get_params()
-        disc = params
-
-    if disc.ndim == 1:
-        disc = disc.reshape(-1, 1)
-
+    disc = _get_discrimination_matrix(model)
     n_dims = disc.shape[1]
 
     if reference_direction is None:
