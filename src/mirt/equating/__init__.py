@@ -95,6 +95,15 @@ from mirt.equating.score_equating import (
     theta_to_score,
     true_score_equating,
 )
+from mirt.equating.vertical import (
+    GradeData,
+    VerticalScaleDiagnostics,
+    VerticalScaleResult,
+    compute_vertical_diagnostics,
+    plot_vertical_scale,
+    vertical_scale,
+    vertical_scale_summary,
+)
 
 __all__ = [
     # Core linking
@@ -153,4 +162,12 @@ __all__ = [
     "detect_longitudinal_drift",
     "ChainLinkingResult",
     "TimePointModel",
+    # Vertical scaling
+    "vertical_scale",
+    "compute_vertical_diagnostics",
+    "vertical_scale_summary",
+    "plot_vertical_scale",
+    "GradeData",
+    "VerticalScaleResult",
+    "VerticalScaleDiagnostics",
 ]
