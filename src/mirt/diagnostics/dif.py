@@ -327,6 +327,7 @@ def compute_grdif(
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
+    scaling_method: Literal["mean", "mad", "iqr"] = "mean",
 ) -> dict[str, Any]:
     """Compute Generalized Residual DIF (GRDIF) statistics for multiple groups.
 
@@ -354,6 +355,10 @@ def compute_grdif(
         n_quadpts: Number of quadrature points for EM.
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
+        scaling_method: Method for variance estimation:
+            - 'mean': Standard sample variance (default)
+            - 'mad': Median absolute deviation (robust to outliers)
+            - 'iqr': Interquartile range (robust to outliers)
 
     Returns:
         Dictionary with GRDIF results:
@@ -418,7 +423,13 @@ def compute_grdif(
     if purify:
         for iteration in range(max_purify_iter):
             grdif_r, grdif_s, grdif_rs, p_r, p_s, p_rs = _compute_grdif_statistics(
-                data, theta, fit_result.model, group_masks, unique_groups, anchor_items
+                data,
+                theta,
+                fit_result.model,
+                group_masks,
+                unique_groups,
+                anchor_items,
+                scaling_method,
             )
 
             if purify_by == "grdif_rs":
@@ -447,7 +458,13 @@ def compute_grdif(
             anchor_items = new_anchors
 
     grdif_r, grdif_s, grdif_rs, p_r, p_s, p_rs = _compute_grdif_statistics(
-        data, theta, fit_result.model, group_masks, unique_groups, anchor_items
+        data,
+        theta,
+        fit_result.model,
+        group_masks,
+        unique_groups,
+        anchor_items,
+        scaling_method,
     )
 
     return {
@@ -475,6 +492,7 @@ def _compute_grdif_statistics(
     group_masks: dict[Any, NDArray[np.bool_]],
     unique_groups: NDArray,
     anchor_items: NDArray[np.bool_],
+    scaling_method: Literal["mean", "mad", "iqr"] = "mean",
 ) -> tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -541,8 +559,16 @@ def _compute_grdif_statistics(
             mrr = np.mean(residuals)
             msr = np.mean(residuals**2)
 
-            var_mrr = np.var(residuals, ddof=1) / n_valid if n_valid > 1 else 1.0
-            var_msr = np.var(residuals**2, ddof=1) / n_valid if n_valid > 1 else 1.0
+            var_mrr = (
+                _compute_robust_scale(residuals, scaling_method) / n_valid
+                if n_valid > 1
+                else 1.0
+            )
+            var_msr = (
+                _compute_robust_scale(residuals**2, scaling_method) / n_valid
+                if n_valid > 1
+                else 1.0
+            )
 
             var_mrr = max(var_mrr, PROB_EPSILON)
             var_msr = max(var_msr, PROB_EPSILON)
@@ -578,6 +604,35 @@ def _compute_grdif_statistics(
     p_rs = 1 - stats.chi2.cdf(grdif_rs, df=df_rs)
 
     return grdif_r, grdif_s, grdif_rs, p_r, p_s, p_rs
+
+
+def _compute_robust_scale(
+    data: NDArray[np.float64],
+    method: Literal["mean", "mad", "iqr"] = "mean",
+) -> float:
+    """Compute scale estimate (variance-like) using specified method.
+
+    Args:
+        data: Array of values to compute scale for.
+        method: Scaling method:
+            - 'mean': Standard sample variance
+            - 'mad': Median absolute deviation squared (robust)
+            - 'iqr': Interquartile range squared (robust)
+
+    Returns:
+        Scale estimate (variance-like quantity).
+    """
+    if method == "mean":
+        return float(np.var(data, ddof=1)) if len(data) > 1 else 1.0
+    elif method == "mad":
+        median = np.median(data)
+        mad = np.median(np.abs(data - median)) * 1.4826
+        return max(float(mad**2), PROB_EPSILON)
+    elif method == "iqr":
+        q75, q25 = np.percentile(data, [75, 25])
+        iqr_scale = (q75 - q25) / 1.349
+        return max(float(iqr_scale**2), PROB_EPSILON)
+    raise ValueError(f"Unknown scaling method: {method}")
 
 
 def compute_pairwise_rdif(
