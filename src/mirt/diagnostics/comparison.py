@@ -14,6 +14,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
@@ -209,7 +211,7 @@ def vuong_test(
     mean_diff = np.mean(diff)
     var_diff = np.var(diff, ddof=1)
 
-    if var_diff < 1e-10:
+    if var_diff < PROB_EPSILON:
         return {
             "z": 0.0,
             "p_value": 1.0,

@@ -15,6 +15,7 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
 
 
@@ -152,7 +153,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
             term2_k = np.exp(alpha * ((M - k) * (theta_1d - delta) - tau_sum_k))
             denominator += term1_k + term2_k
 
-        return numerator / (denominator + 1e-10)
+        return numerator / (denominator + PROB_EPSILON)
 
     def _item_information(
         self,
@@ -266,10 +267,10 @@ class IdealPointModel(DichotomousItemModel):
 
         if item_idx is not None:
             deriv = -2 * a[item_idx] * (theta_1d - delta[item_idx]) * p
-            return deriv**2 / (p * q + 1e-10)
+            return deriv**2 / (p * q + PROB_EPSILON)
 
         deriv = -2 * a[None, :] * (theta_1d[:, None] - delta[None, :]) * p
-        return deriv**2 / (p * q + 1e-10)
+        return deriv**2 / (p * q + PROB_EPSILON)
 
     def copy(self) -> Self:
         """Create a deep copy of this model."""
@@ -360,11 +361,11 @@ class HyperbolicCosineModel(DichotomousItemModel):
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - delta[item_idx]) - gamma[item_idx]
             deriv = -a[item_idx] * np.sinh(z) * p**2
-            return deriv**2 / (p * q + 1e-10)
+            return deriv**2 / (p * q + PROB_EPSILON)
 
         z = a[None, :] * (theta_1d[:, None] - delta[None, :]) - gamma[None, :]
         deriv = -a[None, :] * np.sinh(z) * p**2
-        return deriv**2 / (p * q + 1e-10)
+        return deriv**2 / (p * q + PROB_EPSILON)
 
     def copy(self) -> Self:
         """Create a deep copy of this model."""

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 from mirt.utils.numeric import compute_expected_variance, compute_fit_stats
 
 if TYPE_CHECKING:
@@ -108,7 +109,7 @@ def compute_s_x2(
                 exp_score = np.sum(probs * np.arange(n_cat), axis=1).mean()
                 expected = exp_score / (n_cat - 1)
 
-            expected = np.clip(expected, 0.01, 0.99)
+            expected = np.clip(expected, PROB_CLIP_MIN, PROB_CLIP_MAX)
 
             if expected > 0 and expected < 1:
                 chi2 += n_g * (observed - expected) ** 2 / (expected * (1 - expected))

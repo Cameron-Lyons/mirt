@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import integrate
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
 
 
@@ -119,7 +120,7 @@ def _compute_marginal_reliability(
     weights = stats.norm.pdf(theta_grid)
     weights = weights / weights.sum()
 
-    se_sq = 1.0 / np.maximum(info, 1e-10)
+    se_sq = 1.0 / np.maximum(info, PROB_EPSILON)
     avg_se_sq = np.sum(weights * se_sq)
 
     var_theta = 1.0
@@ -236,8 +237,8 @@ def plot_drf(
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    se_ref = 1 / np.sqrt(np.maximum(info_ref, 1e-10))
-    se_focal = 1 / np.sqrt(np.maximum(info_focal, 1e-10))
+    se_ref = 1 / np.sqrt(np.maximum(info_ref, PROB_EPSILON))
+    se_focal = 1 / np.sqrt(np.maximum(info_focal, PROB_EPSILON))
 
     axes[1].plot(
         theta, se_ref, label=f"Reference ({drf_result['ref_group']})", linewidth=2
@@ -327,7 +328,7 @@ def reliability_invariance(
         p_value = np.nan
     else:
         se = float(np.std(boot_diffs, ddof=1))
-        z = rel_diff / (se + 1e-10)
+        z = rel_diff / (se + PROB_EPSILON)
         from scipy import stats
 
         p_value = float(2 * (1 - stats.norm.cdf(abs(z))))

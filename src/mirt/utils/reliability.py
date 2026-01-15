@@ -10,6 +10,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -64,7 +66,7 @@ def marginal_rxx(
 
     weights = weights / np.sum(weights)
 
-    se_theta = 1.0 / np.sqrt(np.maximum(test_info, 1e-10))
+    se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
     expected_var_error = np.sum(weights * se_theta**2)
 
     rxx = 1.0 - expected_var_error
@@ -109,18 +111,18 @@ def empirical_rxx(
 
     observed_var = np.var(theta[:, 0])
 
-    if observed_var < 1e-10:
+    if observed_var < PROB_EPSILON:
         return 0.0
 
     if method == "posterior_variance":
         item_info = model.information(theta)
         test_info = np.sum(item_info, axis=1)
-        se_theta = 1.0 / np.sqrt(np.maximum(test_info, 1e-10))
+        se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
         avg_error_var = np.mean(se_theta**2)
     else:
         item_info = model.information(theta)
         test_info = np.sum(item_info, axis=1)
-        se_theta = 1.0 / np.sqrt(np.maximum(test_info, 1e-10))
+        se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
         avg_error_var = np.mean(se_theta**2)
 
     true_var = observed_var - avg_error_var
@@ -164,4 +166,4 @@ def sem(
     item_info = model.information(theta_arr)
     test_info = np.sum(item_info, axis=1)
 
-    return 1.0 / np.sqrt(np.maximum(test_info, 1e-10))
+    return 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))

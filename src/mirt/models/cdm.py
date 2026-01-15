@@ -13,6 +13,7 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import BaseItemModel
 
 
@@ -229,7 +230,7 @@ class DINA(BaseCDM):
         responses.shape[0]
 
         probs = self.probability(alpha)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -412,7 +413,7 @@ class DINO(BaseCDM):
         alpha = self._ensure_alpha_2d(alpha)
 
         probs = self.probability(alpha)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -532,7 +533,7 @@ def fit_cdm(
             alpha = np.tile(pattern, (n_persons, 1))
             log_like_matrix[:, p_idx] = cdm.log_likelihood(responses, alpha)
 
-        log_posterior = log_like_matrix + np.log(class_probs + 1e-10)
+        log_posterior = log_like_matrix + np.log(class_probs + PROB_EPSILON)
 
         log_sum = np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
         posterior = np.exp(log_posterior - log_sum)
@@ -559,11 +560,11 @@ def fit_cdm(
                     n_0_eta_0 += np.sum(weight[valid] * (1 - responses[valid, j]))
 
             denom_s = n_1_eta_1 + n_0_eta_1
-            if denom_s > 1e-10:
+            if denom_s > PROB_EPSILON:
                 cdm._parameters["slip"][j] = np.clip(n_0_eta_1 / denom_s, 0.001, 0.999)
 
             denom_g = n_1_eta_0 + n_0_eta_0
-            if denom_g > 1e-10:
+            if denom_g > PROB_EPSILON:
                 cdm._parameters["guess"][j] = np.clip(n_1_eta_0 / denom_g, 0.001, 0.999)
 
         current_ll = np.sum(log_sum)

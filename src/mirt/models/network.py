@@ -13,6 +13,8 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 
 @dataclass
 class NetworkResult:
@@ -170,7 +172,7 @@ class IsingModel:
         log_psl = 0.0
         for i in range(self._n_nodes):
             p_i = self.conditional_probability(i, responses)
-            p_i = np.clip(p_i, 1e-10, 1 - 1e-10)
+            p_i = np.clip(p_i, PROB_EPSILON, 1 - PROB_EPSILON)
             log_psl += np.sum(
                 responses[:, i] * np.log(p_i) + (1 - responses[:, i]) * np.log(1 - p_i)
             )
@@ -503,7 +505,7 @@ def fit_ising(
             X[:, i + 1] = 0
 
             p = 1 / (1 + np.exp(-(thresholds[i] + responses @ interactions[i, :])))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
             grad_threshold = np.mean(y - p)
             grad_interactions = np.mean((y - p)[:, None] * responses, axis=0)

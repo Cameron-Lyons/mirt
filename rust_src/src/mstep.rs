@@ -15,6 +15,7 @@ use crate::utils::{EPSILON, sigmoid};
 /// Uses Newton-Raphson optimization for each item in parallel.
 /// Each item's parameters are optimized independently given the posterior weights.
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights, quad_points, discrimination, difficulty, max_iter, tol, disc_bounds, diff_bounds, damping, regularization))]
 #[allow(clippy::too_many_arguments)]
 pub fn m_step_dichotomous_parallel<'py>(
     py: Python<'py>,
@@ -129,6 +130,7 @@ pub fn m_step_dichotomous_parallel<'py>(
 
 /// Parallel M-step for 3PL model including guessing parameter.
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights, quad_points, discrimination, difficulty, guessing, max_iter, tol, disc_bounds, diff_bounds, guess_bounds, damping_ab, damping_c, regularization, regularization_c))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn m_step_3pl_parallel<'py>(
     py: Python<'py>,
@@ -288,6 +290,7 @@ pub fn m_step_3pl_parallel<'py>(
 ///
 /// Returns r_k (correct responses) and n_k (total responses) per quadrature point.
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights))]
 pub fn compute_expected_counts_parallel<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,

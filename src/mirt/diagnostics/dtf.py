@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import integrate, stats
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
 
 if TYPE_CHECKING:
@@ -206,7 +207,7 @@ def _bootstrap_dtf_se(
     boot_dtf = np.array(boot_dtf)
     se = float(np.std(boot_dtf, ddof=1))
 
-    z = np.mean(boot_dtf) / (se + 1e-10)
+    z = np.mean(boot_dtf) / (se + PROB_EPSILON)
     p_value = float(2 * (1 - stats.norm.cdf(abs(z))))
 
     return se, p_value

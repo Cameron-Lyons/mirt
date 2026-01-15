@@ -1,3 +1,4 @@
+from mirt._core import sigmoid
 from mirt.utils.batch import BatchFitResult, fit_model_grid, fit_models
 from mirt.utils.calibration import (
     CalibrationResult,
@@ -101,6 +102,8 @@ from mirt.utils.transform import (
 )
 
 __all__ = [
+    # Core utilities
+    "sigmoid",
     # Simulation
     "simdata",
     # Data validation

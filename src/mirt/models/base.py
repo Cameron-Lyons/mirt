@@ -4,6 +4,8 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 
 class BaseItemModel(ABC):
     model_name: str = "BaseModel"
@@ -198,7 +200,7 @@ class DichotomousItemModel(BaseItemModel):
             )
 
         p = self.probability(theta)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+        p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -234,7 +236,7 @@ class DichotomousItemModel(BaseItemModel):
         n_theta = theta.shape[0]
 
         p = self.probability(theta)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+        p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
         log_p = np.log(p)
         log_1_minus_p = np.log(1 - p)
 
@@ -418,7 +420,7 @@ class PolytomousItemModel(BaseItemModel):
                     prob = self.category_probability(
                         theta[person : person + 1], i, resp
                     )
-                    ll[person] += np.log(prob[0] + 1e-10)
+                    ll[person] += np.log(prob[0] + PROB_EPSILON)
 
         return ll
 
@@ -453,7 +455,7 @@ class PolytomousItemModel(BaseItemModel):
             probs = np.zeros((n_theta, n_cat))
             for k in range(n_cat):
                 probs[:, k] = self.category_probability(theta, item_idx, k)
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             log_probs = np.log(probs)
 
             item_resp = responses[:, item_idx]

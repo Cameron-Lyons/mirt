@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -195,7 +197,7 @@ class MultigroupLatentDensity:
             return
 
         weights_sum = weights.sum()
-        if weights_sum < 1e-10:
+        if weights_sum < PROB_EPSILON:
             return
 
         weights_norm = weights / weights_sum
@@ -210,7 +212,7 @@ class MultigroupLatentDensity:
                 axis=0,
             )
             dist.cov = (dist.cov + dist.cov.T) / 2
-            dist.cov += 1e-6 * np.eye(self.n_factors)
+            dist.cov += REGULARIZATION_EPSILON * np.eye(self.n_factors)
 
         dist._update_precision()
 

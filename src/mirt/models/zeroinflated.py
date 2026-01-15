@@ -11,6 +11,8 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -79,11 +81,11 @@ class ZeroInflated2PL(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_2pl = 1.0 / (1.0 + np.exp(-z))
+            p_2pl = sigmoid(z)
             return (1 - pi[item_idx]) * p_2pl
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_2pl = 1.0 / (1.0 + np.exp(-z))
+        p_2pl = sigmoid(z)
         return (1 - pi[None, :]) * p_2pl
 
     def probability_zero(
@@ -111,10 +113,10 @@ class ZeroInflated2PL(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def information(
         self,
@@ -161,7 +163,7 @@ class ZeroInflated2PL(DichotomousItemModel):
         pi = self._parameters["zero_inflation"]
 
         mean_p0 = p_0_total.mean(axis=0)
-        return pi / (mean_p0 + 1e-10)
+        return pi / (mean_p0 + PROB_EPSILON)
 
     def copy(self) -> Self:
         """Create a deep copy of this model."""
@@ -232,12 +234,12 @@ class ZeroInflated3PL(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_2pl = 1.0 / (1.0 + np.exp(-z))
+            p_2pl = sigmoid(z)
             p_3pl = c[item_idx] + (1 - c[item_idx]) * p_2pl
             return (1 - pi[item_idx]) * p_3pl
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_2pl = 1.0 / (1.0 + np.exp(-z))
+        p_2pl = sigmoid(z)
         p_3pl = c[None, :] + (1 - c[None, :]) * p_2pl
         return (1 - pi[None, :]) * p_3pl
 
@@ -257,7 +259,7 @@ class ZeroInflated3PL(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_2pl = 1.0 / (1.0 + np.exp(-z))
+            p_2pl = sigmoid(z)
             p_3pl = c[item_idx] + (1 - c[item_idx]) * p_2pl
 
             info = (
@@ -266,12 +268,12 @@ class ZeroInflated3PL(DichotomousItemModel):
                 * (p_2pl**2)
                 * ((1 - p_2pl) ** 2)
             )
-            info = info / (p_3pl * (1 - p_3pl) + 1e-10)
+            info = info / (p_3pl * (1 - p_3pl) + PROB_EPSILON)
 
             return (1 - pi[item_idx]) * info
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_2pl = 1.0 / (1.0 + np.exp(-z))
+        p_2pl = sigmoid(z)
         p_3pl = c[None, :] + (1 - c[None, :]) * p_2pl
 
         info = (
@@ -280,7 +282,7 @@ class ZeroInflated3PL(DichotomousItemModel):
             * (p_2pl**2)
             * ((1 - p_2pl) ** 2)
         )
-        info = info / (p_3pl * (1 - p_3pl) + 1e-10)
+        info = info / (p_3pl * (1 - p_3pl) + PROB_EPSILON)
 
         return (1 - pi[None, :]) * info
 
@@ -348,10 +350,10 @@ class HurdleIRT(DichotomousItemModel):
 
         if item_idx is not None:
             z = alpha_0[item_idx] + alpha_1[item_idx] * theta_1d
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         z = alpha_0[None, :] + alpha_1[None, :] * theta_1d[:, None]
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def probability(
         self,
@@ -369,11 +371,11 @@ class HurdleIRT(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_2pl = 1.0 / (1.0 + np.exp(-z))
+            p_2pl = sigmoid(z)
             return p_engage * p_2pl
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_2pl = 1.0 / (1.0 + np.exp(-z))
+        p_2pl = sigmoid(z)
         return p_engage * p_2pl
 
     def information(

@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.estimation.quadrature import GaussHermiteQuadrature
     from mirt.models.base import BaseItemModel
@@ -218,7 +220,7 @@ def _compute_item_se_central(
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
             probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             ll = float(np.sum(r_kc * np.log(probs)))
             model.set_item_parameter(item_idx, param_name, current)
             return ll
@@ -231,7 +233,7 @@ def _compute_item_se_central(
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
             probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             ll = float(
                 np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
             )
@@ -342,7 +344,7 @@ def _se_louis(
             for q in range(n_quad):
                 theta_q = quad_points[q : q + 1]
                 probs = model.probability(theta_q, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 if model.is_polytomous:
                     for i in range(n_persons):

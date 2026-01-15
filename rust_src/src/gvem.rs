@@ -23,6 +23,7 @@ fn lambda_jj(xi: f64) -> f64 {
 /// GVEM E-step: update variational parameters (mu, sigma, xi)
 /// Parallelizes over persons using Rayon
 #[pyfunction]
+#[pyo3(signature = (responses, loadings, intercepts, prior_cov_inv, mu_in, sigma_in, xi_in, n_inner_iter))]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn gvem_e_step<'py>(
     py: Python<'py>,
@@ -174,6 +175,7 @@ pub fn gvem_e_step<'py>(
 /// GVEM M-step: update item parameters (loadings, intercepts)
 /// Parallelizes over items using Rayon
 #[pyfunction]
+#[pyo3(signature = (responses, mu, sigma, xi, loadings_in, intercepts_in))]
 pub fn gvem_m_step<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -278,6 +280,7 @@ pub fn gvem_m_step<'py>(
 
 /// Compute ELBO (Evidence Lower Bound)
 #[pyfunction]
+#[pyo3(signature = (responses, loadings, intercepts, mu, sigma, xi, prior_mean, prior_cov))]
 #[allow(clippy::too_many_arguments)]
 pub fn gvem_compute_elbo(
     responses: PyReadonlyArray2<i32>,

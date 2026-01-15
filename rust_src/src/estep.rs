@@ -4,11 +4,13 @@ use ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
+use std::sync::Arc;
 
-use crate::utils::{LOG_2_PI, compute_log_weights, log_likelihood_2pl_single, logsumexp};
+use crate::utils::{LOG_2_PI, compute_log_weights, log_likelihood_2pl_view, logsumexp};
 
 /// Complete E-step computation with posterior weights
 #[pyfunction]
+#[pyo3(signature = (responses, quad_points, quad_weights, discrimination, difficulty, prior_mean, prior_var))]
 #[allow(clippy::too_many_arguments)]
 pub fn e_step_complete<'py>(
     py: Python<'py>,
@@ -29,10 +31,11 @@ pub fn e_step_complete<'py>(
     let n_persons = responses.nrows();
     let n_quad = quad_points.len();
 
-    let disc_vec: Vec<f64> = discrimination.to_vec();
-    let diff_vec: Vec<f64> = difficulty.to_vec();
+    let disc_arc = Arc::new(discrimination.to_vec());
+    let diff_arc = Arc::new(difficulty.to_vec());
     let quad_vec: Vec<f64> = quad_points.to_vec();
     let weight_vec: Vec<f64> = quad_weights.to_vec();
+    let responses_owned = responses.to_owned();
 
     let log_prior: Vec<f64> = quad_vec
         .iter()
@@ -44,45 +47,51 @@ pub fn e_step_complete<'py>(
 
     let log_weights = compute_log_weights(&weight_vec);
 
-    let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let resp_row: Vec<i32> = responses.row(i).to_vec();
+    let (posterior_weights, marginal_ll) = py.detach(|| {
+        let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+            .into_par_iter()
+            .map(|i| {
+                let disc = Arc::clone(&disc_arc);
+                let diff = Arc::clone(&diff_arc);
+                let resp_row = responses_owned.row(i);
 
-            let log_joint: Vec<f64> = (0..n_quad)
-                .map(|q| {
-                    let ll =
-                        log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec);
-                    ll + log_prior[q] + log_weights[q]
-                })
-                .collect();
+                let log_joint: Vec<f64> = (0..n_quad)
+                    .map(|q| {
+                        let ll = log_likelihood_2pl_view(resp_row, quad_vec[q], &disc, &diff);
+                        ll + log_prior[q] + log_weights[q]
+                    })
+                    .collect();
 
-            let log_marginal = logsumexp(&log_joint);
+                let log_marginal = logsumexp(&log_joint);
 
-            let posterior: Vec<f64> = log_joint
-                .iter()
-                .map(|&lj| (lj - log_marginal).exp())
-                .collect();
+                let posterior: Vec<f64> = log_joint
+                    .iter()
+                    .map(|&lj| (lj - log_marginal).exp())
+                    .collect();
 
-            (posterior, log_marginal.exp())
-        })
-        .collect();
+                (posterior, log_marginal.exp())
+            })
+            .collect();
 
-    let mut posterior_weights = Array2::zeros((n_persons, n_quad));
-    let mut marginal_ll = Array1::zeros(n_persons);
+        let mut posterior_weights = Array2::zeros((n_persons, n_quad));
+        let mut marginal_ll = Array1::zeros(n_persons);
 
-    for (i, (post, marg)) in results.iter().enumerate() {
-        for (q, &p) in post.iter().enumerate() {
-            posterior_weights[[i, q]] = p;
+        for (i, (post, marg)) in results.iter().enumerate() {
+            for (q, &p) in post.iter().enumerate() {
+                posterior_weights[[i, q]] = p;
+            }
+            marginal_ll[i] = *marg;
         }
-        marginal_ll[i] = *marg;
-    }
+
+        (posterior_weights, marginal_ll)
+    });
 
     (posterior_weights.to_pyarray(py), marginal_ll.to_pyarray(py))
 }
 
 /// Compute r_k (expected counts) for dichotomous items
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights))]
 pub fn compute_expected_counts<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray1<i32>,
@@ -116,6 +125,7 @@ pub fn compute_expected_counts<'py>(
 
 /// Compute r_kc (expected counts per category) for polytomous items
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights, n_categories))]
 pub fn compute_expected_counts_polytomous<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray1<i32>,
@@ -145,6 +155,7 @@ pub fn compute_expected_counts_polytomous<'py>(
 
 /// MCEM E-step using theta samples
 #[pyfunction]
+#[pyo3(signature = (responses, theta_samples, discrimination, difficulty))]
 pub fn mcem_e_step<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -160,41 +171,49 @@ pub fn mcem_e_step<'py>(
     let n_persons = responses.nrows();
     let n_samples = theta_samples.shape()[1];
 
-    let disc_vec: Vec<f64> = discrimination.to_vec();
-    let diff_vec: Vec<f64> = difficulty.to_vec();
+    let disc_arc = Arc::new(discrimination.to_vec());
+    let diff_arc = Arc::new(difficulty.to_vec());
+    let responses_owned = responses.to_owned();
+    let theta_owned = theta_samples.to_owned();
 
-    let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let resp_row: Vec<i32> = responses.row(i).to_vec();
+    let (importance_weights, marginal_ll) = py.detach(|| {
+        let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+            .into_par_iter()
+            .map(|i| {
+                let disc = Arc::clone(&disc_arc);
+                let diff = Arc::clone(&diff_arc);
+                let resp_row = responses_owned.row(i);
 
-            let log_likes: Vec<f64> = (0..n_samples)
-                .map(|s| {
-                    let theta_s = theta_samples[[i, s, 0]];
-                    log_likelihood_2pl_single(&resp_row, theta_s, &disc_vec, &diff_vec)
-                })
-                .collect();
+                let log_likes: Vec<f64> = (0..n_samples)
+                    .map(|s| {
+                        let theta_s = theta_owned[[i, s, 0]];
+                        log_likelihood_2pl_view(resp_row, theta_s, &disc, &diff)
+                    })
+                    .collect();
 
-            let max_ll = log_likes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let weights: Vec<f64> = log_likes.iter().map(|&ll| (ll - max_ll).exp()).collect();
-            let sum: f64 = weights.iter().sum();
-            let normalized: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
+                let max_ll = log_likes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = log_likes.iter().map(|&ll| (ll - max_ll).exp()).collect();
+                let sum: f64 = weights.iter().sum();
+                let normalized: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
 
-            let marginal = (sum / n_samples as f64) * max_ll.exp();
+                let marginal = (sum / n_samples as f64) * max_ll.exp();
 
-            (normalized, marginal)
-        })
-        .collect();
+                (normalized, marginal)
+            })
+            .collect();
 
-    let mut importance_weights = Array2::zeros((n_persons, n_samples));
-    let mut marginal_ll = Array1::zeros(n_persons);
+        let mut importance_weights = Array2::zeros((n_persons, n_samples));
+        let mut marginal_ll = Array1::zeros(n_persons);
 
-    for (i, (weights, marg)) in results.iter().enumerate() {
-        for (s, &w) in weights.iter().enumerate() {
-            importance_weights[[i, s]] = w;
+        for (i, (weights, marg)) in results.iter().enumerate() {
+            for (s, &w) in weights.iter().enumerate() {
+                importance_weights[[i, s]] = w;
+            }
+            marginal_ll[i] = *marg;
         }
-        marginal_ll[i] = *marg;
-    }
+
+        (importance_weights, marginal_ll)
+    });
 
     (
         importance_weights.to_pyarray(py),
@@ -204,6 +223,7 @@ pub fn mcem_e_step<'py>(
 
 /// Weighted E-step for survey data
 #[pyfunction]
+#[pyo3(signature = (responses, weights, quad_points, quad_weights, discrimination, difficulty))]
 #[allow(clippy::too_many_arguments)]
 pub fn weighted_e_step<'py>(
     py: Python<'py>,
@@ -224,52 +244,60 @@ pub fn weighted_e_step<'py>(
     let n_persons = responses.nrows();
     let n_quad = quad_points.len();
 
-    let disc_vec: Vec<f64> = discrimination.to_vec();
-    let diff_vec: Vec<f64> = difficulty.to_vec();
+    let disc_arc = Arc::new(discrimination.to_vec());
+    let diff_arc = Arc::new(difficulty.to_vec());
     let quad_vec: Vec<f64> = quad_points.to_vec();
     let weight_vec: Vec<f64> = quad_weights.to_vec();
+    let survey_vec: Vec<f64> = survey_weights.to_vec();
+    let responses_owned = responses.to_owned();
 
     let log_weights = compute_log_weights(&weight_vec);
 
-    let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let resp_row: Vec<i32> = responses.row(i).to_vec();
+    let (posterior_weights, weighted_ll) = py.detach(|| {
+        let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+            .into_par_iter()
+            .map(|i| {
+                let disc = Arc::clone(&disc_arc);
+                let diff = Arc::clone(&diff_arc);
+                let resp_row = responses_owned.row(i);
 
-            let log_joint: Vec<f64> = (0..n_quad)
-                .map(|q| {
-                    let ll =
-                        log_likelihood_2pl_single(&resp_row, quad_vec[q], &disc_vec, &diff_vec);
-                    ll + log_weights[q]
-                })
-                .collect();
+                let log_joint: Vec<f64> = (0..n_quad)
+                    .map(|q| {
+                        let ll = log_likelihood_2pl_view(resp_row, quad_vec[q], &disc, &diff);
+                        ll + log_weights[q]
+                    })
+                    .collect();
 
-            let log_marginal = logsumexp(&log_joint);
+                let log_marginal = logsumexp(&log_joint);
 
-            let posterior: Vec<f64> = log_joint
-                .iter()
-                .map(|&lj| (lj - log_marginal).exp())
-                .collect();
+                let posterior: Vec<f64> = log_joint
+                    .iter()
+                    .map(|&lj| (lj - log_marginal).exp())
+                    .collect();
 
-            (posterior, log_marginal)
-        })
-        .collect();
+                (posterior, log_marginal)
+            })
+            .collect();
 
-    let mut posterior_weights = Array2::zeros((n_persons, n_quad));
-    let mut weighted_ll = 0.0;
+        let mut posterior_weights = Array2::zeros((n_persons, n_quad));
+        let mut weighted_ll = 0.0;
 
-    for (i, (post, log_marg)) in results.iter().enumerate() {
-        for (q, &p) in post.iter().enumerate() {
-            posterior_weights[[i, q]] = p;
+        for (i, (post, log_marg)) in results.iter().enumerate() {
+            for (q, &p) in post.iter().enumerate() {
+                posterior_weights[[i, q]] = p;
+            }
+            weighted_ll += survey_vec[i] * log_marg;
         }
-        weighted_ll += survey_weights[i] * log_marg;
-    }
+
+        (posterior_weights, weighted_ll)
+    });
 
     (posterior_weights.to_pyarray(py), weighted_ll)
 }
 
 /// Weighted expected counts for survey data
 #[pyfunction]
+#[pyo3(signature = (responses, posterior_weights, survey_weights))]
 pub fn weighted_expected_counts<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray1<i32>,

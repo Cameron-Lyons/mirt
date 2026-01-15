@@ -1,5 +1,7 @@
 //! Core utility functions for IRT computations.
 
+use ndarray::ArrayView1;
+
 pub const LOG_2_PI: f64 = 1.8378770664093453;
 pub const EPSILON: f64 = 1e-10;
 
@@ -68,8 +70,55 @@ pub fn log_likelihood_2pl_single(
 }
 
 #[inline]
+pub fn log_likelihood_2pl_view(
+    responses: ArrayView1<i32>,
+    theta: f64,
+    discrimination: &[f64],
+    difficulty: &[f64],
+) -> f64 {
+    let mut ll = 0.0;
+    for (j, &resp) in responses.iter().enumerate() {
+        if resp < 0 {
+            continue;
+        }
+        let z = discrimination[j] * (theta - difficulty[j]);
+        if resp == 1 {
+            ll += log_sigmoid(z);
+        } else {
+            ll += log_sigmoid(-z);
+        }
+    }
+    ll
+}
+
+#[inline]
 pub fn log_likelihood_3pl_single(
     responses: &[i32],
+    theta: f64,
+    discrimination: &[f64],
+    difficulty: &[f64],
+    guessing: &[f64],
+) -> f64 {
+    let mut ll = 0.0;
+    for (j, &resp) in responses.iter().enumerate() {
+        if resp < 0 {
+            continue;
+        }
+        let p_star = sigmoid(discrimination[j] * (theta - difficulty[j]));
+        let p = guessing[j] + (1.0 - guessing[j]) * p_star;
+        let p_clipped = clip(p, EPSILON, 1.0 - EPSILON);
+        if resp == 1 {
+            ll += p_clipped.ln();
+        } else {
+            ll += (1.0 - p_clipped).ln();
+        }
+    }
+    ll
+}
+
+#[inline]
+pub fn log_likelihood_3pl_view(
+    responses: ArrayView1<i32>,
     theta: f64,
     discrimination: &[f64],
     difficulty: &[f64],
@@ -147,6 +196,31 @@ pub fn fisher_info_2pl_items(theta: f64, discrimination: &[f64], difficulty: &[f
             a * a * p * (1.0 - p)
         })
         .collect()
+}
+
+#[inline]
+pub fn grm_category_probability(
+    theta: f64,
+    discrimination: f64,
+    thresholds: &[f64],
+    category: usize,
+    n_categories: usize,
+) -> f64 {
+    if category == 0 {
+        let z = discrimination * (theta - thresholds[0]);
+        let p_above = sigmoid(z);
+        (1.0 - p_above).max(EPSILON)
+    } else if category == n_categories - 1 {
+        let z = discrimination * (theta - thresholds[category - 1]);
+        let p_above = sigmoid(z);
+        p_above.max(EPSILON)
+    } else {
+        let z_upper = discrimination * (theta - thresholds[category - 1]);
+        let z_lower = discrimination * (theta - thresholds[category]);
+        let p_upper = sigmoid(z_upper);
+        let p_lower = sigmoid(z_lower);
+        (p_upper - p_lower).max(EPSILON)
+    }
 }
 
 /// Gauss-Hermite quadrature nodes and weights

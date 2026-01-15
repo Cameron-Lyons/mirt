@@ -27,6 +27,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize
 from scipy.stats import qmc
 
+from mirt.constants import PROB_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.utils.numeric import logsumexp
 
@@ -271,7 +272,7 @@ class MCEMEstimator(BaseEstimator):
                 for s in range(self.n_samples):
                     theta_s = valid_theta[:, s, :]
                     probs = model.probability(theta_s, item_idx)
-                    probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                    probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     for c in range(probs.shape[1]):
                         mask_c = valid_responses == c
@@ -290,7 +291,7 @@ class MCEMEstimator(BaseEstimator):
                 for s in range(self.n_samples):
                     theta_s = valid_theta[:, s, :]
                     probs = model.probability(theta_s, item_idx)
-                    probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                    probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     ll += np.sum(
                         valid_weights[:, s]

@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 path = "rust_src/src/lib.rs"
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module"] }
+pyo3 = { version = "0.27.2", features = ["extension-module", "abi3-py311"] }
 numpy = "0.27.1"
 ndarray = { version = "0.17.2", features = ["rayon"] }
 rayon = "1.11.0"
