@@ -131,11 +131,14 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist
 
+      - name: List dist contents
+        run: ls -la dist/
+
       - name: Install wheel
         shell: bash
         run: |
           pip install --upgrade pip
-          pip install --no-index --find-links dist mirt
+          pip install dist/mirt*.whl
 
       - name: Smoke test - import and basic functionality
         run: |
