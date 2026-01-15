@@ -345,6 +345,10 @@ def equate(
 ) -> EquatingResult:
     """Equate two test forms using anchor items.
 
+    .. deprecated::
+        This function is deprecated. Use :func:`mirt.equating.link` instead,
+        which provides more linking methods, diagnostics, and polytomous support.
+
     Finds transformation constants A and B such that:
         theta_new = A * theta_old + B
 
@@ -370,11 +374,23 @@ def equate(
     EquatingResult
         Transformation constants and diagnostics.
 
+    See Also
+    --------
+    mirt.equating.link : Recommended replacement with more features.
+
     Examples
     --------
     >>> eq = equate(old_model, new_model, [0,1,2], [0,1,2])
     >>> theta_equated = eq.A * theta_new + eq.B
     """
+    import warnings
+
+    warnings.warn(
+        "equate() is deprecated. Use mirt.equating.link() instead for more "
+        "linking methods, diagnostics, and polytomous/multidimensional support.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     disc_old = np.asarray(model_old.discrimination)[anchor_items_old]
     diff_old = np.asarray(model_old.difficulty)[anchor_items_old]
     disc_new = np.asarray(model_new.discrimination)[anchor_items_new]
