@@ -6,6 +6,7 @@ This module provides comprehensive CAT functionality including:
 - Exposure control (Sympson-Hetter, randomesque)
 - Content balancing (test blueprints)
 - CAT engine for orchestrating adaptive tests
+- Multidimensional CAT (MCAT) support
 
 Examples
 --------
@@ -38,6 +39,18 @@ With content balancing:
 ...     ContentArea("Geometry", items={4, 5, 6}, min_items=1),
 ... ])
 >>> cat = CATEngine(model, content_constraint=blueprint)
+
+Multidimensional CAT:
+
+>>> from mirt import fit_mirt
+>>> from mirt.cat import MCATEngine
+>>> result = fit_mirt(data, model="MIRT", n_factors=2)
+>>> mcat = MCATEngine(result.model, trace_threshold=0.5, max_items=30)
+>>> state = mcat.get_current_state()
+>>> while not state.is_complete:
+...     response = get_response(state.next_item)
+...     state = mcat.administer_item(response)
+>>> print(mcat.get_result().summary())
 """
 
 from mirt.cat.content import (
@@ -57,7 +70,29 @@ from mirt.cat.exposure import (
     SympsonHetter,
     create_exposure_control,
 )
-from mirt.cat.results import CATResult, CATState
+from mirt.cat.mcat_engine import MCATEngine
+from mirt.cat.mcat_selection import (
+    AOptimality,
+    BayesianMCAT,
+    COptimality,
+    DOptimality,
+    KullbackLeiblerMCAT,
+    MCATSelectionStrategy,
+    RandomMCATSelection,
+    create_mcat_selection_strategy,
+)
+from mirt.cat.mcat_stopping import (
+    AvgSEStop,
+    CombinedMCATStop,
+    CovarianceDeterminantStop,
+    CovarianceTraceStop,
+    MaxItemsMCATStop,
+    MaxSEStop,
+    MCATStoppingRule,
+    ThetaChangeMCATStop,
+    create_mcat_stopping_rule,
+)
+from mirt.cat.results import CATResult, CATState, MCATResult, MCATState
 from mirt.cat.selection import (
     AStratified,
     ItemSelectionStrategy,
@@ -80,6 +115,7 @@ from mirt.cat.stopping import (
 )
 
 __all__ = [
+    # Unidimensional CAT
     "CATEngine",
     "CATResult",
     "CATState",
@@ -99,6 +135,28 @@ __all__ = [
     "ClassificationStop",
     "CombinedStop",
     "create_stopping_rule",
+    # Multidimensional CAT
+    "MCATEngine",
+    "MCATResult",
+    "MCATState",
+    "MCATSelectionStrategy",
+    "DOptimality",
+    "AOptimality",
+    "COptimality",
+    "KullbackLeiblerMCAT",
+    "BayesianMCAT",
+    "RandomMCATSelection",
+    "create_mcat_selection_strategy",
+    "MCATStoppingRule",
+    "CovarianceTraceStop",
+    "CovarianceDeterminantStop",
+    "MaxSEStop",
+    "AvgSEStop",
+    "MaxItemsMCATStop",
+    "ThetaChangeMCATStop",
+    "CombinedMCATStop",
+    "create_mcat_stopping_rule",
+    # Shared
     "ExposureControl",
     "NoExposureControl",
     "SympsonHetter",
