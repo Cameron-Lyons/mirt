@@ -10,12 +10,10 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN, PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
-
-EPSILON = 1e-10
-PROB_CLIP_MIN = 1e-10
-PROB_CLIP_MAX = 1 - 1e-10
 
 
 @dataclass
@@ -429,8 +427,12 @@ def estfun(
             a_idx = j
             b_idx = n_items * disc.shape[1] + j
 
-            ef[:, a_idx] = np.where(v, residual * dp_da / (p * (1 - p) + EPSILON), 0.0)
-            ef[:, b_idx] = np.where(v, residual * dp_db / (p * (1 - p) + EPSILON), 0.0)
+            ef[:, a_idx] = np.where(
+                v, residual * dp_da / (p * (1 - p) + PROB_EPSILON), 0.0
+            )
+            ef[:, b_idx] = np.where(
+                v, residual * dp_db / (p * (1 - p) + PROB_EPSILON), 0.0
+            )
 
     return ef
 

@@ -6,6 +6,7 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
 from mirt.models.base import DichotomousItemModel
 
 
@@ -187,10 +188,10 @@ class LLTM(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def information(
         self,
@@ -515,10 +516,10 @@ class ExplanatoryIRT(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def probability_given_covariates(
         self,

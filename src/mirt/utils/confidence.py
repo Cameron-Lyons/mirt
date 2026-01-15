@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -137,7 +139,7 @@ def PLCI(
 
                     logit = disc[j, 0] * (theta_q - diff[j])
                     p = 1 / (1 + np.exp(-logit))
-                    p = np.clip(p, 1e-10, 1 - 1e-10)
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     if responses[i, j] == 1:
                         ll_q += np.log(p)
@@ -235,7 +237,7 @@ def score_CI(
     info = model.information(theta_2d)
     test_info = np.sum(info)
 
-    se = 1 / np.sqrt(max(test_info, 1e-10))
+    se = 1 / np.sqrt(max(test_info, PROB_EPSILON))
 
     z = stats.norm.ppf(1 - alpha / 2)
 
@@ -248,7 +250,7 @@ def score_CI(
         def ll_at_theta(t):
             t_2d = np.array([[t]])
             probs = model.probability(t_2d).ravel()
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
             ll = 0.0
             for j, r in enumerate(responses):

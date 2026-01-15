@@ -14,6 +14,7 @@ from mirt._rust_backend import (
 from mirt._rust_backend import (
     gvem_m_step as _rust_gvem_m_step,
 )
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation.base import BaseEstimator
 
 if TYPE_CHECKING:
@@ -200,7 +201,7 @@ class GVEMEstimator(BaseEstimator):
         if model.n_factors == 1:
             a = self._slopes.ravel()
             d = self._intercepts
-            b = -d / (a + 1e-10)
+            b = -d / (a + PROB_EPSILON)
 
             model._parameters["discrimination"] = a
             model._parameters["difficulty"] = b
@@ -208,7 +209,7 @@ class GVEMEstimator(BaseEstimator):
             a = self._slopes
             d = self._intercepts
             a_sum = np.sum(a, axis=1)
-            b = -d / (a_sum + 1e-10)
+            b = -d / (a_sum + PROB_EPSILON)
 
             model._parameters["discrimination"] = a
             model._parameters["difficulty"] = b
@@ -385,7 +386,7 @@ class GVEMEstimator(BaseEstimator):
             coeffs = y_valid - 0.5 - 2 * lam_valid * d_j
             b_j = np.einsum("i,ik->k", coeffs, mu_valid)
 
-            A_j += 1e-6 * np.eye(n_factors)
+            A_j += REGULARIZATION_EPSILON * np.eye(n_factors)
 
             try:
                 a_j_new = np.linalg.solve(A_j, b_j)
@@ -401,7 +402,7 @@ class GVEMEstimator(BaseEstimator):
             d_numerator = np.sum(y_valid - 0.5 - 2 * lam_valid * linear_terms)
             d_denominator = 2 * np.sum(lam_valid)
 
-            if d_denominator > 1e-10:
+            if d_denominator > PROB_EPSILON:
                 d_j_new = d_numerator / d_denominator
             else:
                 d_j_new = 0.0

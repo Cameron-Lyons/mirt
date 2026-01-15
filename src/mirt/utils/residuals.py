@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -115,7 +117,7 @@ def residuals(
         )
 
         expected = model.probability(theta)
-        expected = np.clip(expected, 1e-10, 1 - 1e-10)
+        expected = np.clip(expected, PROB_EPSILON, 1 - PROB_EPSILON)
         raw = responses - expected
 
         mask = ~np.isnan(responses)
@@ -130,7 +132,7 @@ def residuals(
 
     else:
         expected = model.probability(theta)
-        expected = np.clip(expected, 1e-10, 1 - 1e-10)
+        expected = np.clip(expected, PROB_EPSILON, 1 - PROB_EPSILON)
 
         raw = responses - expected
         variance = expected * (1 - expected)
@@ -144,8 +146,8 @@ def residuals(
         elif type == "deviance":
             sign = np.sign(raw)
             dev_sq = -2 * (
-                responses * np.log(expected + 1e-10)
-                + (1 - responses) * np.log(1 - expected + 1e-10)
+                responses * np.log(expected + PROB_EPSILON)
+                + (1 - responses) * np.log(1 - expected + PROB_EPSILON)
             )
             standardized = sign * np.sqrt(np.maximum(dev_sq, 0))
         else:
@@ -345,7 +347,7 @@ def LD_X2(
 
     n_persons, n_items = responses.shape
     probs = model.probability(theta)
-    probs = np.clip(probs, 1e-10, 1 - 1e-10)
+    probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
     ld_x2 = np.zeros((n_items, n_items))
     p_values = np.ones((n_items, n_items))

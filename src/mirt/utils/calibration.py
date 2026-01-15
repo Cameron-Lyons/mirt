@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -223,7 +225,7 @@ def fixed_calib(
             theta_q = theta_grid[q]
             logit = anchor_disc[:, 0] * (theta_q - anchor_diff)
             probs = 1 / (1 + np.exp(-logit))
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
             for j in range(n_anchor):
                 mask = ~np.isnan(anchor_responses[:, j])
@@ -246,7 +248,7 @@ def fixed_calib(
 
             logit_new = new_disc[:, 0] * (theta_q - new_diff)
             probs_new = 1 / (1 + np.exp(-logit_new))
-            probs_new = np.clip(probs_new, 1e-10, 1 - 1e-10)
+            probs_new = np.clip(probs_new, PROB_EPSILON, 1 - PROB_EPSILON)
 
             ll_new = np.zeros(n_persons)
             for j in range(n_new):
@@ -258,9 +260,9 @@ def fixed_calib(
             posterior[:, q] = np.exp(anchor_ll[:, q] + ll_new) * weights[q]
 
         posterior_sum = np.sum(posterior, axis=1, keepdims=True)
-        posterior = posterior / np.maximum(posterior_sum, 1e-10)
+        posterior = posterior / np.maximum(posterior_sum, PROB_EPSILON)
 
-        new_ll = np.sum(np.log(np.maximum(posterior_sum.ravel(), 1e-10)))
+        new_ll = np.sum(np.log(np.maximum(posterior_sum.ravel(), PROB_EPSILON)))
 
         if abs(new_ll - log_likelihood) < tol:
             converged = True
@@ -284,7 +286,7 @@ def fixed_calib(
                 r_j[q] = np.sum(posterior[mask, q] * new_responses[mask, j])
                 n_j[q] = np.sum(posterior[mask, q])
 
-            p_j = r_j / np.maximum(n_j, 1e-10)
+            p_j = r_j / np.maximum(n_j, PROB_EPSILON)
             p_j = np.clip(p_j, prob_clamp[0], prob_clamp[1])
 
             logit_j = np.log(p_j / (1 - p_j))
@@ -306,7 +308,7 @@ def fixed_calib(
                     weights=weights_valid,
                 )
 
-                if var_theta > 1e-10:
+                if var_theta > PROB_EPSILON:
                     new_disc[j, 0] = np.clip(
                         cov_theta_logit / var_theta, disc_bounds[0], disc_bounds[1]
                     )

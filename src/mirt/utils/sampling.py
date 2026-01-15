@@ -10,6 +10,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -105,8 +107,8 @@ def draw_parameters(
 
     vcov = (vcov + vcov.T) / 2
     min_eig = np.min(np.linalg.eigvalsh(vcov))
-    if min_eig < 1e-10:
-        vcov = vcov + np.eye(n_params) * (1e-10 - min_eig)
+    if min_eig < PROB_EPSILON:
+        vcov = vcov + np.eye(n_params) * (REGULARIZATION_EPSILON - min_eig)
 
     if method == "mvn":
         samples = rng.multivariate_normal(mean, vcov, size=n_samples)

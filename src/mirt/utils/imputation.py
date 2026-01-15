@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
-EPSILON = 1e-10
 LARGE_DF = 1e10
 
 
@@ -247,7 +248,7 @@ def _impute_multiple(
             if probs.ndim > 1:
                 n_missing = probs.shape[0]
                 for i in range(n_missing):
-                    p = np.clip(probs[i], 1e-10, 1 - 1e-10)
+                    p = np.clip(probs[i], PROB_EPSILON, 1 - PROB_EPSILON)
                     p = p / p.sum()
                     imputed[np.where(item_missing)[0][i], j] = rng.choice(len(p), p=p)
             else:
@@ -475,9 +476,9 @@ def averageMI(
 
     se = np.sqrt(total_var)
 
-    r = (1 + 1 / m) * b / (u_bar + EPSILON)
+    r = (1 + 1 / m) * b / (u_bar + PROB_EPSILON)
 
-    lambda_hat = (1 + 1 / m) * b / (total_var + EPSILON)
+    lambda_hat = (1 + 1 / m) * b / (total_var + PROB_EPSILON)
 
     df_old = (m - 1) * (1 + 1 / r) ** 2
     df_old = np.where(np.isinf(df_old) | np.isnan(df_old), LARGE_DF, df_old)

@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.estimation.quadrature import GaussHermiteQuadrature
     from mirt.models.base import BaseItemModel
@@ -405,7 +407,7 @@ def _complete_data_log_likelihood(
                 r_kc = np.sum(weighted_posterior[cat_mask, :], axis=0)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs[:, c], 1e-10, 1 - 1e-10)
+                probs = np.clip(probs[:, c], PROB_EPSILON, 1 - PROB_EPSILON)
                 ll += np.sum(r_kc * np.log(probs))
         else:
             r_k = np.sum(
@@ -415,7 +417,7 @@ def _complete_data_log_likelihood(
             n_k = np.sum(weighted_posterior, axis=0)
 
             probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
             ll += np.sum(r_k * np.log(probs) + (n_k - r_k) * np.log(1 - probs))
 
@@ -484,10 +486,10 @@ def _person_log_likelihoods(
             weights = posterior_weights[i]
 
             if hasattr(model, "_n_categories"):
-                probs = np.clip(probs_all[:, resp], 1e-10, 1 - 1e-10)
+                probs = np.clip(probs_all[:, resp], PROB_EPSILON, 1 - PROB_EPSILON)
             else:
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
                 if resp == 0:
                     probs = 1 - probs
 

@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt.constants import PROB_EPSILON
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -259,7 +260,7 @@ class WeightedEMEstimator(EMEstimator):
                 self._set_item_params(model, item_idx, params)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 ll = np.sum(r_kc * np.log(probs))
 
@@ -275,7 +276,7 @@ class WeightedEMEstimator(EMEstimator):
                 self._set_item_params(model, item_idx, params)
 
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
 

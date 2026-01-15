@@ -17,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
 from mirt.models.base import PolytomousItemModel
 
 
@@ -117,7 +118,7 @@ class TwoPLNestedLogit(PolytomousItemModel):
         b = self._parameters["difficulty"][item_idx]
 
         z = a * (theta_1d - b)
-        p_correct = 1.0 / (1.0 + np.exp(-z))
+        p_correct = sigmoid(z)
 
         if category == correct_idx:
             return p_correct
@@ -192,7 +193,7 @@ class ThreePLNestedLogit(TwoPLNestedLogit):
         c = self._parameters["guessing"][item_idx]
 
         z = a * (theta_1d - b)
-        p_star = 1.0 / (1.0 + np.exp(-z))
+        p_star = sigmoid(z)
         p_correct = c + (1.0 - c) * p_star
 
         if category == correct_idx:
@@ -249,7 +250,7 @@ class FourPLNestedLogit(ThreePLNestedLogit):
         d = self._parameters["upper"][item_idx]
 
         z = a * (theta_1d - b)
-        p_star = 1.0 / (1.0 + np.exp(-z))
+        p_star = sigmoid(z)
         p_correct = c + (d - c) * p_star
 
         if category == correct_idx:

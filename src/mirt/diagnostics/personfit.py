@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
 from mirt.utils.numeric import compute_expected_variance, compute_fit_stats
 
 if TYPE_CHECKING:
@@ -67,7 +68,7 @@ def _compute_zh_vectorized(
         probs = model.probability(theta, i)
 
         if probs.ndim == 1:
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             item_valid = valid_mask[:, i]
             resp = responses[:, i]
 
@@ -85,7 +86,7 @@ def _compute_zh_vectorized(
 
         else:
             n_cat = probs.shape[1]
-            probs = np.clip(probs, 1e-10, 1 - 1e-10)
+            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             log_probs = np.log(probs)
             item_valid = valid_mask[:, i]
             resp = responses[:, i]
@@ -104,7 +105,7 @@ def _compute_zh_vectorized(
     valid_count = valid_mask.sum(axis=1)
     with np.errstate(divide="ignore", invalid="ignore"):
         zh = np.where(
-            (valid_count >= 2) & (var_ll > 1e-10),
+            (valid_count >= 2) & (var_ll > PROB_EPSILON),
             (ll - expected_ll) / np.sqrt(var_ll),
             np.nan,
         )

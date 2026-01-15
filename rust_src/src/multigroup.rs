@@ -5,17 +5,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-fn logsumexp(arr: &[f64]) -> f64 {
-    if arr.is_empty() {
-        return f64::NEG_INFINITY;
-    }
-    let max_val = arr.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if max_val.is_infinite() {
-        return max_val;
-    }
-    let sum_exp: f64 = arr.iter().map(|&x| (x - max_val).exp()).sum();
-    max_val + sum_exp.ln()
-}
+use crate::utils::{grm_category_probability, logsumexp};
 
 fn compute_log_prior(quad_points: &[f64], prior_mean: f64, prior_var: f64) -> Vec<f64> {
     quad_points
@@ -374,32 +364,6 @@ pub fn multigroup_expected_counts<'py>(
         .collect();
 
     (r_k_py, n_k_py)
-}
-
-fn grm_category_probability(
-    theta: f64,
-    discrimination: f64,
-    thresholds: &[f64],
-    category: usize,
-    n_categories: usize,
-) -> f64 {
-    let eps = 1e-10;
-
-    if category == 0 {
-        let z = discrimination * (theta - thresholds[0]);
-        let p_above = 1.0 / (1.0 + (-z).exp());
-        (1.0 - p_above).max(eps)
-    } else if category == n_categories - 1 {
-        let z = discrimination * (theta - thresholds[category - 1]);
-        let p_above = 1.0 / (1.0 + (-z).exp());
-        p_above.max(eps)
-    } else {
-        let z_upper = discrimination * (theta - thresholds[category - 1]);
-        let z_lower = discrimination * (theta - thresholds[category]);
-        let p_upper = 1.0 / (1.0 + (-z_upper).exp());
-        let p_lower = 1.0 / (1.0 + (-z_lower).exp());
-        (p_upper - p_lower).max(eps)
-    }
 }
 
 fn compute_grm_log_likelihood_single(

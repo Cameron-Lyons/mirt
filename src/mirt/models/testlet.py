@@ -11,6 +11,8 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -159,7 +161,7 @@ class TestletModel(DichotomousItemModel):
                 gamma = theta[:, testlet_pos]
                 z = z + d[item_idx] * gamma
 
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         probs = np.zeros((n_persons, self.n_items))
 
@@ -172,7 +174,7 @@ class TestletModel(DichotomousItemModel):
                 gamma = theta[:, testlet_pos]
                 z = z + d[j] * gamma
 
-            probs[:, j] = 1.0 / (1.0 + np.exp(-z))
+            probs[:, j] = sigmoid(z)
 
         return probs
 
@@ -204,7 +206,7 @@ class TestletModel(DichotomousItemModel):
 
             if testlet_idx < 0:
                 z = a[item_idx] * theta_general - b[item_idx]
-                return 1.0 / (1.0 + np.exp(-z))
+                return sigmoid(z)
 
             var_t = testlet_vars[testlet_idx]
             probs = np.zeros(n_persons)
@@ -212,7 +214,7 @@ class TestletModel(DichotomousItemModel):
             for q in range(n_quadpts):
                 gamma = nodes[q] * np.sqrt(var_t)
                 z = a[item_idx] * theta_general + d[item_idx] * gamma - b[item_idx]
-                probs += weights[q] * (1.0 / (1.0 + np.exp(-z)))
+                probs += weights[q] * (sigmoid(z))
 
             return probs
 
@@ -223,13 +225,13 @@ class TestletModel(DichotomousItemModel):
 
             if testlet_idx < 0:
                 z = a[j] * theta_general - b[j]
-                probs[:, j] = 1.0 / (1.0 + np.exp(-z))
+                probs[:, j] = sigmoid(z)
             else:
                 var_t = testlet_vars[testlet_idx]
                 for q in range(n_quadpts):
                     gamma = nodes[q] * np.sqrt(var_t)
                     z = a[j] * theta_general + d[j] * gamma - b[j]
-                    probs[:, j] += weights[q] * (1.0 / (1.0 + np.exp(-z)))
+                    probs[:, j] += weights[q] * (sigmoid(z))
 
         return probs
 
@@ -603,8 +605,8 @@ class RandomTestletEffectsModel(TestletModel):
         for j in standalone_items:
             if responses[:, j].min() >= 0:
                 z = a[j] * theta - b[j]
-                p = 1.0 / (1.0 + np.exp(-z))
-                p = np.clip(p, 1e-10, 1 - 1e-10)
+                p = sigmoid(z)
+                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                 ll_standalone += responses[:, j] * np.log(p) + (
                     1 - responses[:, j]
                 ) * np.log(1 - p)
@@ -625,8 +627,8 @@ class RandomTestletEffectsModel(TestletModel):
                 for j in items:
                     if responses[:, j].min() >= 0:
                         z = a[j] * theta + d[j] * gamma - b[j]
-                        p = 1.0 / (1.0 + np.exp(-z))
-                        p = np.clip(p, 1e-10, 1 - 1e-10)
+                        p = sigmoid(z)
+                        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                         cond_ll += responses[:, j] * np.log(p) + (
                             1 - responses[:, j]
                         ) * np.log(1 - p)
@@ -676,7 +678,7 @@ class RandomTestletEffectsModel(TestletModel):
             residuals = np.zeros((len(theta), n_items_t))
             for i, j in enumerate(items):
                 z = a[j] * theta - b[j]
-                expected = 1.0 / (1.0 + np.exp(-z))
+                expected = sigmoid(z)
                 residuals[:, i] = responses[:, j] - expected
 
             corr_matrix = np.corrcoef(residuals.T)
@@ -743,7 +745,7 @@ def compute_testlet_q3(
     residuals = np.zeros_like(responses, dtype=np.float64)
     for j in range(n_items):
         z = discrimination[j] * theta - difficulty[j]
-        expected = 1.0 / (1.0 + np.exp(-z))
+        expected = sigmoid(z)
         residuals[:, j] = responses[:, j] - expected
 
     q3_matrix = np.corrcoef(residuals.T)

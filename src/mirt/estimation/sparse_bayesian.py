@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import (
+    PROB_CLIP_MAX,
+    PROB_CLIP_MIN,
+    PROB_EPSILON,
+    REGULARIZATION_EPSILON,
+)
 from mirt.estimation.base import BaseEstimator
 
 if TYPE_CHECKING:
@@ -192,8 +198,8 @@ class SpikeSlabLassoPrior:
         """
         abs_x = np.abs(x)
 
-        log_spike = np.log(1 - self.theta + 1e-10) - abs_x / self.lambda_0
-        log_slab = np.log(self.theta + 1e-10) - abs_x / self.lambda_1
+        log_spike = np.log(1 - self.theta + PROB_EPSILON) - abs_x / self.lambda_0
+        log_slab = np.log(self.theta + PROB_EPSILON) - abs_x / self.lambda_1
 
         log_max = np.maximum(log_spike, log_slab)
         log_sum = log_max + np.log(
@@ -217,7 +223,7 @@ class SpikeSlabLassoPrior:
         threshold = 1 / lambda_eff
         """
         rate = (1 - gamma) / self.lambda_0 + gamma / self.lambda_1
-        return 1.0 / (rate + 1e-10)
+        return 1.0 / (rate + PROB_EPSILON)
 
     @staticmethod
     def soft_threshold(
@@ -236,7 +242,7 @@ class SpikeSlabLassoPrior:
     ) -> None:
         """Update inclusion probability theta from posterior gammas (if adaptive)."""
         if self.adaptive:
-            self.theta = np.clip(np.mean(gamma), 0.01, 0.99)
+            self.theta = np.clip(np.mean(gamma), PROB_CLIP_MIN, PROB_CLIP_MAX)
 
     @property
     def mean(self) -> float:
@@ -404,7 +410,7 @@ class SparseBayesianEstimator(BaseEstimator):
             sparse_loadings
         )
 
-        sparsity_pattern = np.abs(sparse_loadings) > 1e-10
+        sparsity_pattern = np.abs(sparse_loadings) > PROB_EPSILON
 
         n_nonzero = np.sum(sparsity_pattern) + n_items
         log_likelihood = current_elbo
@@ -443,7 +449,7 @@ class SparseBayesianEstimator(BaseEstimator):
         """Initialize loadings and intercepts."""
         valid_responses = np.where(responses >= 0, responses, np.nan)
         p = np.nanmean(valid_responses, axis=0)
-        p = np.clip(p, 0.01, 0.99)
+        p = np.clip(p, PROB_CLIP_MIN, PROB_CLIP_MAX)
 
         self._intercepts = np.log(p / (1 - p))
 
@@ -455,7 +461,7 @@ class SparseBayesianEstimator(BaseEstimator):
     def _compute_difficulty_from_intercept(self) -> NDArray[np.float64]:
         """Convert intercepts back to difficulty parameters."""
         a_sum = np.sum(self._loadings, axis=1)
-        return -self._intercepts / (np.abs(a_sum) + 1e-10)
+        return -self._intercepts / (np.abs(a_sum) + PROB_EPSILON)
 
     @staticmethod
     def _lambda_jj(xi: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -529,7 +535,7 @@ class SparseBayesianEstimator(BaseEstimator):
                     const_term = d_j**2
 
                     self._xi[i, j] = np.sqrt(
-                        np.maximum(quad_term + linear_term + const_term, 1e-10)
+                        np.maximum(quad_term + linear_term + const_term, PROB_EPSILON)
                     )
 
     def _m_step_ssl(
@@ -561,7 +567,7 @@ class SparseBayesianEstimator(BaseEstimator):
             coeffs = y_valid - 0.5 - 2 * lam_valid * d_j
             b_j = np.einsum("i,ik->k", coeffs, mu_valid)
 
-            A_j += 1e-6 * np.eye(self.k_max)
+            A_j += REGULARIZATION_EPSILON * np.eye(self.k_max)
 
             try:
                 a_ols = np.linalg.solve(A_j, b_j)
@@ -574,14 +580,14 @@ class SparseBayesianEstimator(BaseEstimator):
                 j
             ] / self._ssl_prior.lambda_1
             A_j_diag = np.diag(A_j)
-            penalty = penalty_raw / (A_j_diag + 1e-10)
+            penalty = penalty_raw / (A_j_diag + PROB_EPSILON)
             self._loadings[j] = self._ssl_prior.soft_threshold(a_ols, penalty)
 
             linear_terms = mu_valid @ self._loadings[j]
             d_numerator = np.sum(y_valid - 0.5 - 2 * lam_valid * linear_terms)
             d_denominator = 2 * np.sum(lam_valid)
 
-            if d_denominator > 1e-10:
+            if d_denominator > PROB_EPSILON:
                 d_j_new = d_numerator / d_denominator
             else:
                 d_j_new = 0.0
@@ -667,7 +673,7 @@ class SparseBayesianEstimator(BaseEstimator):
         sparse_loadings: NDArray[np.float64],
     ) -> tuple[int, list[int]]:
         """Count factors with at least one non-zero loading."""
-        nonzero_per_factor = np.sum(np.abs(sparse_loadings) > 1e-10, axis=0)
+        nonzero_per_factor = np.sum(np.abs(sparse_loadings) > PROB_EPSILON, axis=0)
         active_factors = list(np.where(nonzero_per_factor > 0)[0])
         return len(active_factors), active_factors
 

@@ -10,6 +10,9 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 try:
     from mirt import mirt_rs
 
@@ -63,8 +66,8 @@ def compute_log_likelihoods_2pl(
     for q in range(n_quad):
         theta = quad_points[q]
         z = discrimination * (theta - difficulty)
-        probs = 1.0 / (1.0 + np.exp(-z))
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = sigmoid(z)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         for i in range(n_persons):
             ll = 0.0
@@ -103,9 +106,9 @@ def compute_log_likelihoods_3pl(
     for q in range(n_quad):
         theta = quad_points[q]
         z = discrimination * (theta - difficulty)
-        p_star = 1.0 / (1.0 + np.exp(-z))
+        p_star = sigmoid(z)
         probs = guessing + (1 - guessing) * p_star
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         for i in range(n_persons):
             ll = 0.0
@@ -149,8 +152,8 @@ def compute_log_likelihoods_mirt(
             ll = 0.0
             for j in range(responses.shape[1]):
                 if responses[i, j] >= 0:
-                    p = 1.0 / (1.0 + np.exp(-z[j]))
-                    p = np.clip(p, 1e-10, 1 - 1e-10)
+                    p = sigmoid(z[j])
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                     if responses[i, j] == 1:
                         ll += np.log(p)
                     else:
@@ -358,7 +361,7 @@ def sibtest_all_items(
         )
 
         betas[i] = beta
-        if se > 1e-10:
+        if se > PROB_EPSILON:
             zs[i] = beta / se
             p_values[i] = 2 * (1 - stats.norm.cdf(abs(zs[i])))
         else:
@@ -400,7 +403,7 @@ def simulate_grm(
         cum_probs = np.ones((n_persons, n_categories))
         for k in range(n_categories - 1):
             z = discrimination[i] * (theta[:, 0] - thresholds[i, k])
-            cum_probs[:, k + 1] = 1.0 / (1.0 + np.exp(-z))
+            cum_probs[:, k + 1] = sigmoid(z)
 
         cat_probs = np.diff(
             np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1
@@ -486,7 +489,7 @@ def simulate_dichotomous(
         guessing = np.zeros(n_items)
 
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
-    p_star = 1.0 / (1.0 + np.exp(-z))
+    p_star = sigmoid(z)
     probs = guessing[None, :] + (1 - guessing[None, :]) * p_star
 
     u = rng.random((n_persons, n_items))
@@ -534,8 +537,8 @@ def generate_plausible_values_posterior(
             for j in range(responses.shape[1]):
                 if responses[i, j] >= 0:
                     z = discrimination[j] * (theta - difficulty[j])
-                    p = 1.0 / (1.0 + np.exp(-z))
-                    p = np.clip(p, 1e-10, 1 - 1e-10)
+                    p = sigmoid(z)
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                     if responses[i, j] == 1:
                         ll += np.log(p)
                     else:
@@ -589,8 +592,8 @@ def generate_plausible_values_mcmc(
         for j in range(len(resp)):
             if resp[j] >= 0:
                 z = discrimination[j] * (theta - difficulty[j])
-                p = 1.0 / (1.0 + np.exp(-z))
-                p = np.clip(p, 1e-10, 1 - 1e-10)
+                p = sigmoid(z)
+                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                 if resp[j] == 1:
                     ll += np.log(p)
                 else:
@@ -670,7 +673,7 @@ def compute_expected_margins(
     probs = np.zeros((n_items, n_quad))
     for j in range(n_items):
         z = discrimination[j] * (quad_points - difficulty[j])
-        probs[j] = 1.0 / (1.0 + np.exp(-z))
+        probs[j] = sigmoid(z)
 
     exp_uni = np.sum(probs * quad_weights, axis=1)
 
@@ -743,7 +746,7 @@ def impute_from_probabilities(
         for j in range(n_items):
             if responses[i, j] == missing_code:
                 z = discrimination[j] * (theta[i] - difficulty[j])
-                p = 1.0 / (1.0 + np.exp(-z))
+                p = sigmoid(z)
                 imputed[i, j] = 1 if rng.random() < p else 0
 
     return imputed
@@ -820,8 +823,8 @@ def compute_eap_scores(
             for j in range(responses.shape[1]):
                 if responses[i, j] >= 0:
                     z = discrimination[j] * (t - difficulty[j])
-                    p = 1.0 / (1.0 + np.exp(-z))
-                    p = np.clip(p, 1e-10, 1 - 1e-10)
+                    p = sigmoid(z)
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                     if responses[i, j] == 1:
                         ll += np.log(p)
                     else:
@@ -1046,7 +1049,7 @@ def cat_compute_item_info(
         )
 
     z = discrimination * (theta - difficulty)
-    p = 1.0 / (1.0 + np.exp(-z))
+    p = sigmoid(z)
     q = 1.0 - p
     return (discrimination**2) * p * q
 
@@ -1140,8 +1143,8 @@ def cat_eap_update(
             r = responses[i]
             if r >= 0:
                 z = discrimination[j] * (theta_q - difficulty[j])
-                p = 1.0 / (1.0 + np.exp(-z))
-                p = np.clip(p, 1e-10, 1 - 1e-10)
+                p = sigmoid(z)
+                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
                 if r == 1:
                     ll += np.log(p)
                 else:
@@ -1339,13 +1342,13 @@ def compute_standardized_residuals(
 
     for j in range(n_items):
         z = discrimination[j] * (theta - difficulty[j])
-        p = 1.0 / (1.0 + np.exp(-z))
-        p = np.clip(p, 1e-10, 1 - 1e-10)
+        p = sigmoid(z)
+        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
         variance = p * (1 - p)
 
         valid = responses[:, j] >= 0
         residuals[valid, j] = (responses[valid, j] - p[valid]) / np.sqrt(
-            variance[valid] + 1e-10
+            variance[valid] + PROB_EPSILON
         )
 
     return residuals
@@ -1454,8 +1457,8 @@ def compute_ld_chi2_matrix(
 
             z_i = discrimination[i] * (theta_valid - difficulty[i])
             z_j = discrimination[j] * (theta_valid - difficulty[j])
-            prob_i = 1.0 / (1.0 + np.exp(-z_i))
-            prob_j = 1.0 / (1.0 + np.exp(-z_j))
+            prob_i = sigmoid(z_i)
+            prob_j = sigmoid(z_j)
 
             resp_i_bin = (resp_i > 0).astype(int)
             resp_j_bin = (resp_j > 0).astype(int)
@@ -1562,8 +1565,8 @@ def m_step_dichotomous_parallel(
         def neg_ll(params):
             a, b = params
             z = a * (quad_points - b)
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = sigmoid(z)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
             ll = np.sum(r_k * np.log(p) + (n_k - r_k) * np.log(1 - p))
             return -ll
 
@@ -1636,8 +1639,8 @@ def compute_item_se_parallel(
 
         def item_ll(a, b):
             z = a * (quad_points - b)
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = sigmoid(z)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
             return np.sum(r_k * np.log(p) + (n_k - r_k) * np.log(1 - p))
 
         a, b = discrimination[j], difficulty[j]
@@ -1646,12 +1649,12 @@ def compute_item_se_parallel(
         ll_a_plus = item_ll(a + h, b)
         ll_a_minus = item_ll(a - h, b)
         hess_aa = (ll_a_plus - 2 * ll_center + ll_a_minus) / (h**2)
-        se_disc[j] = np.sqrt(-1.0 / hess_aa) if hess_aa < -1e-10 else np.nan
+        se_disc[j] = np.sqrt(-1.0 / hess_aa) if hess_aa < -PROB_EPSILON else np.nan
 
         ll_b_plus = item_ll(a, b + h)
         ll_b_minus = item_ll(a, b - h)
         hess_bb = (ll_b_plus - 2 * ll_center + ll_b_minus) / (h**2)
-        se_diff[j] = np.sqrt(-1.0 / hess_bb) if hess_bb < -1e-10 else np.nan
+        se_diff[j] = np.sqrt(-1.0 / hess_bb) if hess_bb < -PROB_EPSILON else np.nan
 
     return se_disc, se_diff
 
@@ -1800,13 +1803,13 @@ def compute_fit_statistics(
 
     for j in range(n_items):
         z = discrimination[j] * (theta - difficulty[j])
-        p = 1.0 / (1.0 + np.exp(-z))
-        p = np.clip(p, 1e-10, 1 - 1e-10)
+        p = sigmoid(z)
+        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
         var = p * (1 - p)
 
         valid = responses[:, j] >= 0
         raw_resid = responses[valid, j] - p[valid]
-        z_sq[valid, j] = (raw_resid**2) / (var[valid] + 1e-10)
+        z_sq[valid, j] = (raw_resid**2) / (var[valid] + PROB_EPSILON)
         variance[valid, j] = var[valid]
 
     item_outfit = np.nanmean(z_sq, axis=0)
@@ -1847,7 +1850,7 @@ def compute_probabilities_batch(
         )
 
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
-    return 1.0 / (1.0 + np.exp(-z))
+    return sigmoid(z)
 
 
 def compute_probabilities_batch_3pl(
@@ -1883,7 +1886,7 @@ def compute_probabilities_batch_3pl(
         )
 
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
-    p_star = 1.0 / (1.0 + np.exp(-z))
+    p_star = sigmoid(z)
     return guessing[None, :] + (1 - guessing[None, :]) * p_star
 
 
@@ -2093,9 +2096,9 @@ def stocking_lord_criterion(
     total_diff = 0.0
     for j in range(n_items):
         for theta in theta_grid:
-            p_old = 1.0 / (1.0 + np.exp(-disc_old[j] * (theta - diff_old[j])))
+            p_old = sigmoid(disc_old[j] * (theta - diff_old[j]))
             theta_trans = a * theta + b
-            p_new = 1.0 / (1.0 + np.exp(-disc_new[j] * (theta_trans - diff_new[j])))
+            p_new = sigmoid(disc_new[j] * (theta_trans - diff_new[j]))
             total_diff += (p_old - p_new) ** 2
 
     return total_diff
@@ -2140,7 +2143,7 @@ def compute_log_likelihoods_grm(
     n_persons, n_items = responses.shape
     n_quad = len(quad_points)
     log_likes = np.zeros((n_persons, n_quad))
-    eps = 1e-10
+    eps = PROB_EPSILON
 
     for q in range(n_quad):
         theta = quad_points[q]
@@ -2153,16 +2156,16 @@ def compute_log_likelihoods_grm(
                 n_cat = n_categories[j]
                 if resp == 0:
                     z = discrimination[j] * (theta - thresholds[j, 0])
-                    p_above = 1.0 / (1.0 + np.exp(-z))
+                    p_above = sigmoid(z)
                     prob = max(1.0 - p_above, eps)
                 elif resp == n_cat - 1:
                     z = discrimination[j] * (theta - thresholds[j, resp - 1])
-                    prob = max(1.0 / (1.0 + np.exp(-z)), eps)
+                    prob = max(sigmoid(z), eps)
                 else:
                     z_upper = discrimination[j] * (theta - thresholds[j, resp - 1])
                     z_lower = discrimination[j] * (theta - thresholds[j, resp])
-                    p_upper = 1.0 / (1.0 + np.exp(-z_upper))
-                    p_lower = 1.0 / (1.0 + np.exp(-z_lower))
+                    p_upper = sigmoid(z_upper)
+                    p_lower = sigmoid(z_lower)
                     prob = max(p_upper - p_lower, eps)
                 ll += np.log(prob)
             log_likes[i, q] = ll
@@ -2227,7 +2230,7 @@ def compute_log_likelihoods_gpcm(
                 sum_exp = np.sum(np.exp(numerators - max_num))
                 log_denom = max_num + np.log(sum_exp)
                 prob = np.exp(numerators[resp] - log_denom)
-                ll += np.log(max(prob, 1e-10))
+                ll += np.log(max(prob, PROB_EPSILON))
             log_likes[i, q] = ll
 
     return log_likes

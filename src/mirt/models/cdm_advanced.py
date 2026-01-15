@@ -14,6 +14,7 @@ from typing import Literal, Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN, PROB_EPSILON
 from mirt.models.cdm import BaseCDM
 
 ReducedModelType = Literal["DINA", "DINO", "ACDM", "LLM", "RRUM", "saturated"]
@@ -397,7 +398,7 @@ class GDINA(BaseCDM):
         alpha = self._ensure_alpha_2d(alpha)
 
         probs = self.probability(alpha)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -472,7 +473,7 @@ class GDINA(BaseCDM):
                 for p_idx in range(n_patterns):
                     alpha = patterns[p_idx].reshape(1, -1)
                     prob = self.probability(alpha, j)[0]
-                    prob = np.clip(prob, 1e-10, 1 - 1e-10)
+                    prob = np.clip(prob, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     weight = posterior[:, p_idx]
                     valid = responses[:, j] >= 0
@@ -705,7 +706,9 @@ class HigherOrderCDM(BaseCDM):
                     prob *= 1 - attr_prob[:, k]
             pattern_prob[:, p_idx] = prob
 
-        pattern_prob = pattern_prob / (pattern_prob.sum(axis=1, keepdims=True) + 1e-10)
+        pattern_prob = pattern_prob / (
+            pattern_prob.sum(axis=1, keepdims=True) + PROB_EPSILON
+        )
 
         return pattern_prob
 
@@ -769,7 +772,7 @@ class HigherOrderCDM(BaseCDM):
         theta = np.asarray(theta).ravel()
 
         probs = self.probability(theta)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -909,7 +912,7 @@ def fit_gdina(
             alpha = np.tile(pattern, (n_persons, 1))
             log_like_matrix[:, p_idx] = model.log_likelihood(responses, alpha)
 
-        log_posterior = log_like_matrix + np.log(class_probs + 1e-10)
+        log_posterior = log_like_matrix + np.log(class_probs + PROB_EPSILON)
         log_sum = np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
         posterior = np.exp(log_posterior - log_sum)
 
@@ -936,8 +939,10 @@ def fit_gdina(
                             num += np.sum(weight[valid] * responses[valid, j])
                             denom += np.sum(weight[valid])
 
-                    if denom > 1e-10:
-                        model._delta_params[j][g] = np.clip(num / denom, 0.01, 0.99)
+                    if denom > PROB_EPSILON:
+                        model._delta_params[j][g] = np.clip(
+                            num / denom, PROB_CLIP_MIN, PROB_CLIP_MAX
+                        )
 
         current_ll = np.sum(log_sum)
 
