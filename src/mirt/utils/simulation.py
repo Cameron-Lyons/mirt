@@ -3,6 +3,8 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+
 
 def simdata(
     model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM"] = "2PL",
@@ -181,7 +183,7 @@ def _simulate_dichotomous(
         a = discrimination
         z = np.dot(theta, a.T) - np.sum(a, axis=1) * difficulty
 
-    p_star = 1.0 / (1.0 + np.exp(-z))
+    p_star = sigmoid(z)
 
     if model == "1PL" or model == "2PL":
         probs = p_star
@@ -233,7 +235,7 @@ def _simulate_grm(
             else:
                 z = np.dot(theta, a[i]) - np.sum(a[i]) * thresholds[i, k]
 
-            cum_probs[:, k + 1] = 1.0 / (1.0 + np.exp(-z))
+            cum_probs[:, k + 1] = sigmoid(z)
 
         cat_probs = np.diff(
             np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1

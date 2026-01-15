@@ -24,6 +24,7 @@ pub mod cat;
 pub mod diagnostics;
 pub mod dynamic;
 pub mod eapsum;
+pub mod equating;
 pub mod estep;
 pub mod estimation;
 pub mod explanatory;
@@ -73,6 +74,7 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     response_time::register(m)?;
     dynamic::register(m)?;
     explanatory::register(m)?;
+    equating::register(m)?;
 
     Ok(())
 }

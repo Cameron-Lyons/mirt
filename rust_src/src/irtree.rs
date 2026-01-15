@@ -10,28 +10,7 @@ use numpy::{
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::EPSILON;
-
-/// Sigmoid function with numerical stability.
-#[inline]
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let exp_x = x.exp();
-        exp_x / (1.0 + exp_x)
-    }
-}
-
-/// Log-sum-exp for numerical stability.
-fn logsumexp(values: &[f64]) -> f64 {
-    let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if max_val.is_infinite() {
-        return f64::NEG_INFINITY;
-    }
-    let sum_exp: f64 = values.iter().map(|&x| (x - max_val).exp()).sum();
-    max_val + sum_exp.ln()
-}
+use crate::utils::{EPSILON, logsumexp, sigmoid};
 
 /// Compute log-likelihood for IRTree pseudo-items at all quadrature points.
 ///

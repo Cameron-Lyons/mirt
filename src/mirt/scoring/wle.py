@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
+from mirt.constants import PROB_EPSILON
 from mirt.results.score_result import ScoreResult
 
 if TYPE_CHECKING:
@@ -132,7 +133,7 @@ class WLEScorer:
 
             info = self._test_information(model, theta_arr, valid_mask)[0]
 
-            if info > 1e-10:
+            if info > PROB_EPSILON:
                 wl = ll + 0.5 * np.log(info)
             else:
                 wl = ll
@@ -151,7 +152,7 @@ class WLEScorer:
         theta_arr = np.array([[theta_hat]])
         info = self._test_information(model, theta_arr, valid_mask)[0]
 
-        if info > 1e-10:
+        if info > PROB_EPSILON:
             se = 1.0 / np.sqrt(info)
         else:
             se = np.inf
@@ -199,7 +200,7 @@ class WLEScorer:
                 ll = model.log_likelihood(resp_i[None, :], theta_arr)[0]
                 info = self._test_information(model, theta_arr, valid_mask)[0]
 
-                if info > 1e-10:
+                if info > PROB_EPSILON:
                     wl = ll + 0.5 * np.log(info)
                 else:
                     wl = ll
@@ -221,7 +222,7 @@ class WLEScorer:
             theta_arr = result.x.reshape(1, -1)
             info = self._test_information(model, theta_arr, valid_mask)[0]
 
-            if info > 1e-10:
+            if info > PROB_EPSILON:
                 theta_se[i] = 1.0 / np.sqrt(info / n_factors)
             else:
                 theta_se[i] = np.inf

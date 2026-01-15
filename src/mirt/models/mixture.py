@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING, Literal, Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN, PROB_EPSILON
 from mirt.models.base import BaseItemModel
 
 if TYPE_CHECKING:
@@ -168,11 +170,11 @@ class MixtureIRT(BaseItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_2pl = 1.0 / (1.0 + np.exp(-z))
+            p_2pl = sigmoid(z)
             return c[item_idx] + (1 - c[item_idx]) * p_2pl
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_2pl = 1.0 / (1.0 + np.exp(-z))
+        p_2pl = sigmoid(z)
         return c[None, :] + (1 - c[None, :]) * p_2pl
 
     def probability(
@@ -223,7 +225,7 @@ class MixtureIRT(BaseItemModel):
         responses.shape[0]
 
         probs = self.probability(theta)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(
@@ -265,7 +267,7 @@ class MixtureIRT(BaseItemModel):
 
         for k in range(self._n_classes):
             probs_k = self.class_probability(theta, k, None)
-            probs_k = np.clip(probs_k, 1e-10, 1 - 1e-10)
+            probs_k = np.clip(probs_k, PROB_EPSILON, 1 - PROB_EPSILON)
 
             valid = responses >= 0
             ll_k = np.where(
@@ -273,7 +275,7 @@ class MixtureIRT(BaseItemModel):
                 responses * np.log(probs_k) + (1 - responses) * np.log(1 - probs_k),
                 0.0,
             )
-            log_likes[:, k] = ll_k.sum(axis=1) + np.log(pi[k] + 1e-10)
+            log_likes[:, k] = ll_k.sum(axis=1) + np.log(pi[k] + PROB_EPSILON)
 
         log_sum = np.logaddexp.reduce(log_likes, axis=1, keepdims=True)
         posterior = np.exp(log_likes - log_sum)
@@ -402,7 +404,7 @@ def fit_mixture_irt(
             for q in range(n_quadpts):
                 theta_q = np.full((n_persons, 1), nodes[q])
                 probs = model.class_probability(theta_q, k, None)
-                probs = np.clip(probs, 1e-10, 1 - 1e-10)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 valid = responses >= 0
                 ll_q = np.where(
@@ -416,7 +418,7 @@ def fit_mixture_irt(
             class_posteriors[:, k] = model.class_proportions[k] * log_like_k
 
         row_sums = class_posteriors.sum(axis=1, keepdims=True)
-        class_posteriors = class_posteriors / (row_sums + 1e-10)
+        class_posteriors = class_posteriors / (row_sums + PROB_EPSILON)
 
         model._parameters["class_proportions"] = class_posteriors.mean(axis=0)
 
@@ -429,12 +431,12 @@ def fit_mixture_irt(
                     weighted_mean = np.average(
                         responses[valid, j], weights=weights_k[valid]
                     )
-                    weighted_mean = np.clip(weighted_mean, 0.01, 0.99)
+                    weighted_mean = np.clip(weighted_mean, PROB_CLIP_MIN, PROB_CLIP_MAX)
                     model._parameters[f"difficulty_class{k}"][j] = -np.log(
                         weighted_mean / (1 - weighted_mean)
                     )
 
-        current_ll = np.sum(np.log(row_sums + 1e-10))
+        current_ll = np.sum(np.log(row_sums + PROB_EPSILON))
 
         if verbose:
             print(f"Iteration {iteration + 1}: LL = {current_ll:.4f}")

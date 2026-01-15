@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -148,8 +150,8 @@ def compute_fit_stats(
     valid_mask = responses >= 0
     residuals = np.where(valid_mask, responses - expected, np.nan)
     std_residuals_sq = np.where(
-        valid_mask & (variance > 1e-10),
-        (residuals**2) / (variance + 1e-10),
+        valid_mask & (variance > PROB_EPSILON),
+        (residuals**2) / (variance + PROB_EPSILON),
         np.nan,
     )
 
@@ -163,6 +165,6 @@ def compute_fit_stats(
     denominator = np.sum(var_valid, axis=axis)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        infit = np.where(denominator > 1e-10, numerator / denominator, np.nan)
+        infit = np.where(denominator > PROB_EPSILON, numerator / denominator, np.nan)
 
     return infit, outfit

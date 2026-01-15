@@ -28,6 +28,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -365,7 +367,7 @@ def _compute_residuals(
 
         valid = responses[:, j] >= 0
         residuals[valid, j] = (responses[valid, j] - expected[valid]) / np.sqrt(
-            variance[valid] + 1e-10
+            variance[valid] + PROB_EPSILON
         )
 
     return residuals
@@ -475,7 +477,7 @@ def _compute_ld_chi2_g2(
             chi2_matrix[i, j] = chi2
             chi2_matrix[j, i] = chi2
 
-            g2 = 2 * np.sum(observed * np.log(observed / expected + 1e-10))
+            g2 = 2 * np.sum(observed * np.log(observed / expected + PROB_EPSILON))
             g2_matrix[i, j] = g2
             g2_matrix[j, i] = g2
 

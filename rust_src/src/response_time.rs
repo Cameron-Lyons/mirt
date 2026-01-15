@@ -8,18 +8,7 @@ use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::EPSILON;
-
-/// Sigmoid function with numerical stability.
-#[inline]
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let exp_x = x.exp();
-        exp_x / (1.0 + exp_x)
-    }
-}
+use crate::utils::{EPSILON, sigmoid};
 
 /// Log-normal density.
 #[inline]

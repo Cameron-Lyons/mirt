@@ -7,6 +7,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -315,8 +317,8 @@ class IRTreeEMEstimator(BaseEstimator):
                 b = diff[node_idx]
 
                 z = a * (theta[trait_idx] - b)
-                p = 1.0 / (1.0 + np.exp(-z))
-                p = np.clip(p, 1e-10, 1 - 1e-10)
+                p = sigmoid(z)
+                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 responses = pseudo_responses[valid_persons, j, node_idx]
                 ll[valid_persons] += responses * np.log(p) + (1 - responses) * np.log(
@@ -357,8 +359,8 @@ class IRTreeEMEstimator(BaseEstimator):
                     for q in range(len(quad_points)):
                         theta_k = quad_points[q, trait_idx]
                         z = a * (theta_k - b)
-                        p = 1.0 / (1.0 + np.exp(-z))
-                        p = np.clip(p, 1e-10, 1 - 1e-10)
+                        p = sigmoid(z)
+                        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                         r_q = np.sum(responses * weights[:, q])
                         n_q = np.sum(weights[:, q])

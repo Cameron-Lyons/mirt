@@ -39,6 +39,7 @@ from mirt.cat.stopping import (
     StoppingRule,
     create_stopping_rule,
 )
+from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -336,7 +337,7 @@ class CATEngine:
             return self.initial_theta
 
         p = np.mean(self._responses)
-        p = np.clip(p, 0.01, 0.99)
+        p = np.clip(p, PROB_CLIP_MIN, PROB_CLIP_MAX)
 
         return float(np.log(p / (1 - p)))
 

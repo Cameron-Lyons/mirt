@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
@@ -298,7 +300,7 @@ def bootstrap_ci(
                 jack_mean = np.nanmean(jack_stacked, axis=0)
                 jack_diff = jack_mean - jack_stacked
                 a = np.nansum(jack_diff**3, axis=0) / (
-                    6 * np.nansum(jack_diff**2, axis=0) ** 1.5 + 1e-10
+                    6 * np.nansum(jack_diff**2, axis=0) ** 1.5 + PROB_EPSILON
                 )
             else:
                 a = np.zeros_like(original)
@@ -307,10 +309,10 @@ def bootstrap_ci(
             z_1_alpha = stats.norm.ppf(1 - alpha / 2)
 
             adj_lower = stats.norm.cdf(
-                z0 + (z0 + z_alpha) / (1 - a * (z0 + z_alpha) + 1e-10)
+                z0 + (z0 + z_alpha) / (1 - a * (z0 + z_alpha) + PROB_EPSILON)
             )
             adj_upper = stats.norm.cdf(
-                z0 + (z0 + z_1_alpha) / (1 - a * (z0 + z_1_alpha) + 1e-10)
+                z0 + (z0 + z_1_alpha) / (1 - a * (z0 + z_1_alpha) + PROB_EPSILON)
             )
 
             adj_lower = np.clip(adj_lower, 0.001, 0.999)

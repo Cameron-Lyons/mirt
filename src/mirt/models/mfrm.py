@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Literal, Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+
 if TYPE_CHECKING:
     pass
 
@@ -265,7 +267,7 @@ class ManyFacetRaschModel:
             Probability of correct response.
         """
         z = self.log_odds(theta, item_idx, facet_indices)
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def information(
         self,

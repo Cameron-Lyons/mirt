@@ -5,40 +5,7 @@ use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-#[allow(dead_code)]
-fn log_sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        -(-x).exp().ln_1p()
-    } else {
-        x - x.exp().ln_1p()
-    }
-}
-
-fn grm_category_probability(
-    theta: f64,
-    discrimination: f64,
-    thresholds: &[f64],
-    category: usize,
-    n_categories: usize,
-) -> f64 {
-    let eps = 1e-10;
-
-    if category == 0 {
-        let z = discrimination * (theta - thresholds[0]);
-        let p_above = 1.0 / (1.0 + (-z).exp());
-        (1.0 - p_above).max(eps)
-    } else if category == n_categories - 1 {
-        let z = discrimination * (theta - thresholds[category - 1]);
-        let p_above = 1.0 / (1.0 + (-z).exp());
-        p_above.max(eps)
-    } else {
-        let z_upper = discrimination * (theta - thresholds[category - 1]);
-        let z_lower = discrimination * (theta - thresholds[category]);
-        let p_upper = 1.0 / (1.0 + (-z_upper).exp());
-        let p_lower = 1.0 / (1.0 + (-z_lower).exp());
-        (p_upper - p_lower).max(eps)
-    }
-}
+use crate::utils::grm_category_probability;
 
 /// Compute log-likelihoods for GRM at all quadrature points
 ///

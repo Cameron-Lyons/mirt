@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -167,16 +169,16 @@ def compute_residuals(
         if residual_type == "raw":
             residuals[valid, j] = raw
         elif residual_type == "standardized":
-            residuals[valid, j] = raw / np.sqrt(var_valid + 1e-10)
+            residuals[valid, j] = raw / np.sqrt(var_valid + PROB_EPSILON)
         elif residual_type == "pearson":
-            residuals[valid, j] = raw / np.sqrt(exp_valid + 1e-10)
+            residuals[valid, j] = raw / np.sqrt(exp_valid + PROB_EPSILON)
         elif residual_type == "deviance":
             with np.errstate(divide="ignore", invalid="ignore"):
                 if probs.ndim == 2:
                     p_obs = probs[valid, observed]
                 else:
                     p_obs = np.where(observed == 1, probs[valid], 1 - probs[valid])
-                p_obs = np.clip(p_obs, 1e-10, 1 - 1e-10)
+                p_obs = np.clip(p_obs, PROB_EPSILON, 1 - PROB_EPSILON)
                 deviance = np.sign(raw) * np.sqrt(-2 * np.log(p_obs))
             residuals[valid, j] = deviance
         else:
@@ -340,7 +342,7 @@ def compute_outfit_infit(
         observed = responses[valid, j]
 
         raw = observed - expected[valid]
-        z_sq[valid, j] = (raw**2) / (var[valid] + 1e-10)
+        z_sq[valid, j] = (raw**2) / (var[valid] + PROB_EPSILON)
         variances[valid, j] = var[valid]
 
     missing = responses < 0
@@ -349,12 +351,12 @@ def compute_outfit_infit(
 
     item_outfit = np.nanmean(z_sq, axis=0)
     item_infit = np.nansum(z_sq * variances, axis=0) / (
-        np.nansum(variances, axis=0) + 1e-10
+        np.nansum(variances, axis=0) + PROB_EPSILON
     )
 
     person_outfit = np.nanmean(z_sq, axis=1)
     person_infit = np.nansum(z_sq * variances, axis=1) / (
-        np.nansum(variances, axis=1) + 1e-10
+        np.nansum(variances, axis=1) + PROB_EPSILON
     )
 
     return {

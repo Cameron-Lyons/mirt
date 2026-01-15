@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
@@ -124,35 +126,37 @@ def calc_null(
 ) -> dict[str, float]:
     """Calculate null model statistics for baseline comparisons.
 
-    The null model serves as a baseline for computing incremental fit
-    indices such as CFI and TLI. It represents a model with no item
-    discrimination (all items equally uninformative).
+        The null model serves as a baseline for computing incremental fit
+        indices such as CFI and TLI. It represents a model with no item
+        discrimination (all items equally uninformative).
 
-    Parameters
-    ----------
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix.
-    model_type : str
-        Type of null model:
-        - 'independence': Items are independent, difficulty-only model
-        - 'intercept_only': Uses observed proportions only
+        Parameters
+        ----------
+        responses : ndarray of shape (n_persons, n_items)
+            Response matrix.
+        model_type : str
+            Type of null model:
+            - 'independence': Items are independent, difficulty-only model
+            - 'intercept_only': Uses observed proportions only
 
-    Returns
-    -------
-    dict
-        Dictionary containing:
-        - log_likelihood: Null model log-likelihood
-        - n_parameters: Number of parameters in null model
-        - aic: Akaike Information Criterion
-        - bic: Bayesian Information Criterion
+        Returns
+        -------
+        dict
+            Dictionary containing:
+            - log_likelihood: Null model log-likelihood
+            - n_parameters: Number of parameters in null model
+            - aic: Akaike Information Criterion
+            - bic: Bayesian Information Criterion
 
-    Examples
-    --------
-    >>> import numpy as np
-    >>> from mirt.utils.starting import calc_null
-    >>> data = np.random.randint(0, 2, (100, 10))
-    >>> null_stats = calc_null(data)
-    >>> print(f"Null LL: {null_stats['log_likelihood']:.2f}")
+        Examples
+        --------
+        >>> import numpy as np
+
+    from mirt.constants import PROB_EPSILON
+        >>> from mirt.utils.starting import calc_null
+        >>> data = np.random.randint(0, 2, (100, 10))
+        >>> null_stats = calc_null(data)
+        >>> print(f"Null LL: {null_stats['log_likelihood']:.2f}")
     """
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
@@ -169,7 +173,7 @@ def calc_null(
             n_correct_per_item / n_valid_per_item,
             0.5,
         )
-    p_items = np.clip(p_items, 1e-10, 1 - 1e-10)
+    p_items = np.clip(p_items, PROB_EPSILON, 1 - PROB_EPSILON)
 
     log_p = np.log(p_items)
     log_1_minus_p = np.log(1 - p_items)
