@@ -8,7 +8,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::EPSILON;
+use crate::utils::{EPSILON, sigmoid};
 
 /// Soft-thresholding operator for LASSO penalty.
 #[inline]
@@ -19,17 +19,6 @@ fn soft_threshold(x: f64, lambda: f64) -> f64 {
         x + lambda
     } else {
         0.0
-    }
-}
-
-/// Sigmoid function with numerical stability.
-#[inline]
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let exp_x = x.exp();
-        exp_x / (1.0 + exp_x)
     }
 }
 

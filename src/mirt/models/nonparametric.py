@@ -20,6 +20,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.integrate import trapezoid
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -149,7 +151,7 @@ class MonotonicSplineModel(DichotomousItemModel):
                 basis = self._ispline_basis(theta_1d, k)
                 p_star += w[item_idx, k] * basis
 
-            p_star = p_star / (np.sum(w[item_idx]) + 1e-10)
+            p_star = p_star / (np.sum(w[item_idx]) + PROB_EPSILON)
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
         probs = np.zeros((n_persons, self.n_items))
@@ -159,7 +161,7 @@ class MonotonicSplineModel(DichotomousItemModel):
                 basis = self._ispline_basis(theta_1d, k)
                 p_star += w[j, k] * basis
 
-            p_star = p_star / (np.sum(w[j]) + 1e-10)
+            p_star = p_star / (np.sum(w[j]) + PROB_EPSILON)
             probs[:, j] = c[j] + (d[j] - c[j]) * p_star
 
         return probs
@@ -178,7 +180,7 @@ class MonotonicSplineModel(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        return (dp**2) / (p * (1 - p) + 1e-10)
+        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
 
 
 class MonotonicPolynomialModel(DichotomousItemModel):
@@ -270,28 +272,28 @@ class MonotonicPolynomialModel(DichotomousItemModel):
 
         if item_idx is not None:
             z = scale[item_idx] * (theta_1d - loc[item_idx])
-            t = 1.0 / (1.0 + np.exp(-z))
+            t = sigmoid(z)
 
             p_star = np.zeros(n_persons)
             for k in range(self.degree + 1):
                 basis = self._bernstein_basis(t, k, self.degree)
                 p_star += w[item_idx, k] * basis
 
-            p_star = p_star / (np.sum(w[item_idx]) + 1e-10)
+            p_star = p_star / (np.sum(w[item_idx]) + PROB_EPSILON)
 
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
         probs = np.zeros((n_persons, self.n_items))
         for j in range(self.n_items):
             z = scale[j] * (theta_1d - loc[j])
-            t = 1.0 / (1.0 + np.exp(-z))
+            t = sigmoid(z)
 
             p_star = np.zeros(n_persons)
             for k in range(self.degree + 1):
                 basis = self._bernstein_basis(t, k, self.degree)
                 p_star += w[j, k] * basis
 
-            p_star = p_star / (np.sum(w[j]) + 1e-10)
+            p_star = p_star / (np.sum(w[j]) + PROB_EPSILON)
             probs[:, j] = c[j] + (d[j] - c[j]) * p_star
 
         return probs
@@ -310,7 +312,7 @@ class MonotonicPolynomialModel(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        return (dp**2) / (p * (1 - p) + 1e-10)
+        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
 
 
 class KernelSmoothingModel(DichotomousItemModel):
@@ -384,7 +386,7 @@ class KernelSmoothingModel(DichotomousItemModel):
 
             for g, t in enumerate(grid):
                 weights = np.exp(-0.5 * ((theta_j - t) / self.bandwidth) ** 2)
-                weights_sum = np.sum(weights) + 1e-10
+                weights_sum = np.sum(weights) + PROB_EPSILON
 
                 self._irf_values[j, g] = np.sum(weights * resp_j) / weights_sum
 
@@ -425,4 +427,4 @@ class KernelSmoothingModel(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        return (dp**2) / (p * (1 - p) + 1e-10)
+        return (dp**2) / (p * (1 - p) + PROB_EPSILON)

@@ -1,6 +1,8 @@
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -40,18 +42,18 @@ class TwoParameterLogistic(DichotomousItemModel):
 
             if item_idx is not None:
                 z = a[item_idx] * (theta_1d - b[item_idx])
-                return 1.0 / (1.0 + np.exp(-z))
+                return sigmoid(z)
 
             z = a[None, :] * (theta_1d[:, None] - b[None, :])
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         else:
             if item_idx is not None:
                 z = np.dot(theta, a[item_idx]) - a[item_idx].sum() * b[item_idx]
-                return 1.0 / (1.0 + np.exp(-z))
+                return sigmoid(z)
 
             z = np.dot(theta, a.T) - np.sum(a, axis=1) * b
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
     def information(
         self,
@@ -149,11 +151,11 @@ class ThreeParameterLogistic(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_star = 1.0 / (1.0 + np.exp(-z))
+            p_star = sigmoid(z)
             return c[item_idx] + (1.0 - c[item_idx]) * p_star
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_star = 1.0 / (1.0 + np.exp(-z))
+        p_star = sigmoid(z)
         return c[None, :] + (1.0 - c[None, :]) * p_star
 
     def information(
@@ -171,11 +173,11 @@ class ThreeParameterLogistic(DichotomousItemModel):
             a_val = a[item_idx]
             c_val = c[item_idx]
             numerator = (a_val**2) * ((p - c_val) ** 2)
-            denominator = ((1 - c_val) ** 2) * p * (1 - p) + 1e-10
+            denominator = ((1 - c_val) ** 2) * p * (1 - p) + PROB_EPSILON
             return numerator / denominator
 
         numerator = (a[None, :] ** 2) * ((p - c[None, :]) ** 2)
-        denominator = ((1 - c[None, :]) ** 2) * p * (1 - p) + 1e-10
+        denominator = ((1 - c[None, :]) ** 2) * p * (1 - p) + PROB_EPSILON
         return numerator / denominator
 
 
@@ -231,11 +233,11 @@ class FourParameterLogistic(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            p_star = 1.0 / (1.0 + np.exp(-z))
+            p_star = sigmoid(z)
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_star = 1.0 / (1.0 + np.exp(-z))
+        p_star = sigmoid(z)
         return c[None, :] + (d[None, :] - c[None, :]) * p_star
 
     def information(
@@ -255,13 +257,13 @@ class FourParameterLogistic(DichotomousItemModel):
             c_val = c[item_idx]
             d_val = d[item_idx]
             numerator = (a_val**2) * ((p - c_val) ** 2) * ((d_val - p) ** 2)
-            denominator = ((d_val - c_val) ** 2) * p * (1 - p) + 1e-10
+            denominator = ((d_val - c_val) ** 2) * p * (1 - p) + PROB_EPSILON
             return numerator / denominator
 
         numerator = (
             (a[None, :] ** 2) * ((p - c[None, :]) ** 2) * ((d[None, :] - p) ** 2)
         )
-        denominator = ((d[None, :] - c[None, :]) ** 2) * p * (1 - p) + 1e-10
+        denominator = ((d[None, :] - c[None, :]) ** 2) * p * (1 - p) + PROB_EPSILON
         return numerator / denominator
 
 
@@ -368,7 +370,7 @@ class UnipolarLogLogistic(DichotomousItemModel):
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
         p = self.probability(theta, item_idx)
-        p = np.clip(p, 1e-10, 1.0 - 1e-10)
+        p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
 
         h = 1e-5
         theta_plus = theta + h
@@ -379,7 +381,7 @@ class UnipolarLogLogistic(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        return (dp**2) / (p * (1 - p) + 1e-10)
+        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
 
 
 class FiveParameterLogistic(DichotomousItemModel):
@@ -480,12 +482,12 @@ class FiveParameterLogistic(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            logistic = 1.0 / (1.0 + np.exp(-z))
+            logistic = sigmoid(z)
             p_star = np.power(logistic, e[item_idx])
             return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        logistic = 1.0 / (1.0 + np.exp(-z))
+        logistic = sigmoid(z)
         p_star = np.power(logistic, e[None, :])
         return c[None, :] + (d[None, :] - c[None, :]) * p_star
 
@@ -506,7 +508,7 @@ class FiveParameterLogistic(DichotomousItemModel):
 
         dp = (p_plus - p_minus) / (2 * h)
 
-        return (dp**2) / (p * (1 - p) + 1e-10)
+        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
 
 
 class ComplementaryLogLog(DichotomousItemModel):
@@ -606,7 +608,7 @@ class ComplementaryLogLog(DichotomousItemModel):
 
             dp = a[item_idx] * exp_z * exp_neg_exp_z
 
-            return (dp**2) / (p * q + 1e-10)
+            return (dp**2) / (p * q + PROB_EPSILON)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         exp_z = np.exp(z)
@@ -616,7 +618,7 @@ class ComplementaryLogLog(DichotomousItemModel):
 
         dp = a[None, :] * exp_z * exp_neg_exp_z
 
-        return (dp**2) / (p * q + 1e-10)
+        return (dp**2) / (p * q + PROB_EPSILON)
 
 
 class NegativeLogLog(DichotomousItemModel):
@@ -695,7 +697,7 @@ class NegativeLogLog(DichotomousItemModel):
 
             dp = a[item_idx] * exp_z * p
 
-            return (dp**2) / (p * q + 1e-10)
+            return (dp**2) / (p * q + PROB_EPSILON)
 
         z = -a[None, :] * (theta_1d[:, None] - b[None, :])
         exp_z = np.exp(z)
@@ -704,4 +706,4 @@ class NegativeLogLog(DichotomousItemModel):
 
         dp = a[None, :] * exp_z * p
 
-        return (dp**2) / (p * q + 1e-10)
+        return (dp**2) / (p * q + PROB_EPSILON)

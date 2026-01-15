@@ -7,6 +7,9 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
 
@@ -146,7 +149,7 @@ class ResponseTimeGibbsSampler:
             raise ValueError("responses and response_times must have same shape")
 
         n_persons, n_items = responses.shape
-        log_rt = np.log(response_times + 1e-10)
+        log_rt = np.log(response_times + PROB_EPSILON)
 
         rng = np.random.default_rng(self.seed)
 
@@ -352,15 +355,15 @@ class ResponseTimeGibbsSampler:
                     z_curr = disc[j] * (theta[i] - diff[j])
                     z_prop = disc[j] * (theta_prop - diff[j])
 
-                    p_curr = 1.0 / (1.0 + np.exp(-z_curr))
-                    p_prop = 1.0 / (1.0 + np.exp(-z_prop))
+                    p_curr = sigmoid(z_curr)
+                    p_prop = sigmoid(z_prop)
 
                     if guess is not None:
                         p_curr = guess[j] + (1 - guess[j]) * p_curr
                         p_prop = guess[j] + (1 - guess[j]) * p_prop
 
-                    p_curr = np.clip(p_curr, 1e-10, 1 - 1e-10)
-                    p_prop = np.clip(p_prop, 1e-10, 1 - 1e-10)
+                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
+                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     if responses[i, j] == 1:
                         log_like_curr += np.log(p_curr)
@@ -421,11 +424,11 @@ class ResponseTimeGibbsSampler:
                     z_curr = disc[j] * (theta[i] - diff[j])
                     z_prop = disc_prop * (theta[i] - diff_prop)
 
-                    p_curr = 1.0 / (1.0 + np.exp(-z_curr))
-                    p_prop = 1.0 / (1.0 + np.exp(-z_prop))
+                    p_curr = sigmoid(z_curr)
+                    p_prop = sigmoid(z_prop)
 
-                    p_curr = np.clip(p_curr, 1e-10, 1 - 1e-10)
-                    p_prop = np.clip(p_prop, 1e-10, 1 - 1e-10)
+                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
+                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     if responses[i, j] == 1:
                         log_like_curr += np.log(p_curr)
@@ -486,13 +489,13 @@ class ResponseTimeGibbsSampler:
             for i in range(n_persons):
                 if responses[i, j] >= 0:
                     z = disc[j] * (theta[i] - diff[j])
-                    p_star = 1.0 / (1.0 + np.exp(-z))
+                    p_star = sigmoid(z)
 
                     p_curr = guess[j] + (1 - guess[j]) * p_star
                     p_prop = guess_prop + (1 - guess_prop) * p_star
 
-                    p_curr = np.clip(p_curr, 1e-10, 1 - 1e-10)
-                    p_prop = np.clip(p_prop, 1e-10, 1 - 1e-10)
+                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
+                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     if responses[i, j] == 1:
                         log_like_curr += np.log(p_curr)

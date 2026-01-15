@@ -38,6 +38,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -381,7 +383,7 @@ class CustomItemModel:
 
             dp = (p_plus - p_minus) / (2 * h)
 
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
             info = dp**2 / (p * (1 - p))
 
             return info
@@ -411,7 +413,7 @@ class CustomItemModel:
             Log-likelihood for each person, shape (n_persons,)
         """
         probs = self.probability(theta)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         valid = responses >= 0
         ll = np.where(

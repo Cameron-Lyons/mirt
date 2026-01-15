@@ -11,6 +11,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -270,7 +272,7 @@ def _compute_log_likelihood(
 ) -> float:
     """Compute log-likelihood for responses given model and theta."""
     probs = model.probability(theta)
-    probs = np.clip(probs, 1e-10, 1 - 1e-10)
+    probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
     mask = ~np.isnan(responses)
     ll = np.sum(

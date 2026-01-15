@@ -15,6 +15,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -96,7 +98,7 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
             prob = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[item_idx, k] * (theta[:, k] - b[item_idx, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
 
                 prob *= np.power(p_k, c[item_idx, k])
 
@@ -106,7 +108,7 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
         for j in range(self.n_items):
             for k in range(self.n_factors):
                 z_k = a[j, k] * (theta[:, k] - b[j, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
                 probs[:, j] *= np.power(p_k, c[j, k])
 
         return probs
@@ -132,7 +134,7 @@ class PartiallyCompensatoryModel(DichotomousItemModel):
             p_minus = self.probability(theta_minus, item_idx)
 
             dp_k = (p_plus - p_minus) / (2 * h)
-            info += (dp_k**2) / (p * (1 - p) + 1e-10)
+            info += (dp_k**2) / (p * (1 - p) + PROB_EPSILON)
 
         return info
 
@@ -188,7 +190,7 @@ class NoncompensatoryModel(DichotomousItemModel):
             prob = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[item_idx, k] * (theta[:, k] - b[item_idx, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
                 prob *= p_k
             return prob
 
@@ -196,7 +198,7 @@ class NoncompensatoryModel(DichotomousItemModel):
         for j in range(self.n_items):
             for k in range(self.n_factors):
                 z_k = a[j, k] * (theta[:, k] - b[j, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
                 probs[:, j] *= p_k
 
         return probs
@@ -222,7 +224,7 @@ class NoncompensatoryModel(DichotomousItemModel):
             p_minus = self.probability(theta_minus, item_idx)
 
             dp_k = (p_plus - p_minus) / (2 * h)
-            info += (dp_k**2) / (p * (1 - p) + 1e-10)
+            info += (dp_k**2) / (p * (1 - p) + PROB_EPSILON)
 
         return info
 
@@ -279,7 +281,7 @@ class DisjunctiveModel(DichotomousItemModel):
             p_fail_all = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[item_idx, k] * (theta[:, k] - b[item_idx, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
                 p_fail_all *= 1 - p_k
             return 1 - p_fail_all
 
@@ -288,7 +290,7 @@ class DisjunctiveModel(DichotomousItemModel):
             p_fail_all = np.ones(n_persons)
             for k in range(self.n_factors):
                 z_k = a[j, k] * (theta[:, k] - b[j, k])
-                p_k = 1.0 / (1.0 + np.exp(-z_k))
+                p_k = sigmoid(z_k)
                 p_fail_all *= 1 - p_k
             probs[:, j] = 1 - p_fail_all
 
@@ -315,6 +317,6 @@ class DisjunctiveModel(DichotomousItemModel):
             p_minus = self.probability(theta_minus, item_idx)
 
             dp_k = (p_plus - p_minus) / (2 * h)
-            info += (dp_k**2) / (p * (1 - p) + 1e-10)
+            info += (dp_k**2) / (p * (1 - p) + PROB_EPSILON)
 
         return info

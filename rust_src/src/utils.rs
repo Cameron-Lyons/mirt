@@ -149,6 +149,31 @@ pub fn fisher_info_2pl_items(theta: f64, discrimination: &[f64], difficulty: &[f
         .collect()
 }
 
+#[inline]
+pub fn grm_category_probability(
+    theta: f64,
+    discrimination: f64,
+    thresholds: &[f64],
+    category: usize,
+    n_categories: usize,
+) -> f64 {
+    if category == 0 {
+        let z = discrimination * (theta - thresholds[0]);
+        let p_above = sigmoid(z);
+        (1.0 - p_above).max(EPSILON)
+    } else if category == n_categories - 1 {
+        let z = discrimination * (theta - thresholds[category - 1]);
+        let p_above = sigmoid(z);
+        p_above.max(EPSILON)
+    } else {
+        let z_upper = discrimination * (theta - thresholds[category - 1]);
+        let z_lower = discrimination * (theta - thresholds[category]);
+        let p_upper = sigmoid(z_upper);
+        let p_lower = sigmoid(z_lower);
+        (p_upper - p_lower).max(EPSILON)
+    }
+}
+
 /// Gauss-Hermite quadrature nodes and weights
 pub fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
     match n {

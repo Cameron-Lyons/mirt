@@ -16,6 +16,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -342,7 +344,7 @@ def _compute_srmsr(
 
                 num = p_ij - p_i * p_j
                 denom = np.sqrt(p_i * (1 - p_i) * p_j * (1 - p_j))
-                if denom > 1e-10:
+                if denom > PROB_EPSILON:
                     exp_corr[i, j] = num / denom
 
     residuals = []

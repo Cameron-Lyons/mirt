@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -508,7 +511,7 @@ class LongitudinalIRTModel:
             a = self.discrimination[item_idx]
             b = self.difficulty[item_idx]
             z = a * (theta - b)
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         probs = np.zeros((len(theta), self.n_items))
         for j in range(self.n_items):
@@ -682,12 +685,12 @@ class StateSpaceIRT:
                     z = self.discrimination[valid] * (
                         mean_pred - self.difficulty[valid]
                     )
-                    p = 1.0 / (1.0 + np.exp(-z))
+                    p = sigmoid(z)
 
                     if self.base_model == "3PL":
                         p = self.guessing[valid] + (1 - self.guessing[valid]) * p
 
-                    p = np.clip(p, 1e-10, 1 - 1e-10)
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     H = self.discrimination[valid] * p * (1 - p)
                     R_inv = p * (1 - p)
@@ -747,7 +750,7 @@ class StateSpaceIRT:
         for i in range(n_persons):
             for t in range(self.n_timepoints):
                 z = self.discrimination * (theta[i, t] - self.difficulty)
-                p = 1.0 / (1.0 + np.exp(-z))
+                p = sigmoid(z)
 
                 if self.base_model == "3PL":
                     p = self.guessing + (1 - self.guessing) * p
@@ -1443,7 +1446,7 @@ class GrowthMixtureModel:
 
         posteriors = likelihoods * self.class_proportions
         row_sums = posteriors.sum(axis=1, keepdims=True)
-        posteriors /= np.maximum(row_sums, 1e-10)
+        posteriors /= np.maximum(row_sums, PROB_EPSILON)
 
         return np.argmax(posteriors, axis=1)
 
@@ -1470,7 +1473,7 @@ class GrowthMixtureModel:
 
         posteriors = likelihoods * self.class_proportions
         row_sums = posteriors.sum(axis=1, keepdims=True)
-        posteriors /= np.maximum(row_sums, 1e-10)
+        posteriors /= np.maximum(row_sums, PROB_EPSILON)
 
         return posteriors
 
@@ -1566,7 +1569,7 @@ class GrowthMixtureModel:
 
             for k in range(self.n_classes):
                 weights = posteriors[:, k]
-                if np.sum(weights) < 1e-10:
+                if np.sum(weights) < PROB_EPSILON:
                     continue
 
                 X = np.column_stack([np.ones(len(time_values)), time_values])
@@ -1601,7 +1604,7 @@ class GrowthMixtureModel:
 
         likelihoods = self.class_likelihood(observations, time_values)
         total_likelihood = np.sum(likelihoods * self.class_proportions, axis=1)
-        log_likelihood = np.sum(np.log(total_likelihood + 1e-10))
+        log_likelihood = np.sum(np.log(total_likelihood + PROB_EPSILON))
 
         return {
             "classifications": classifications,
@@ -1633,7 +1636,7 @@ class GrowthMixtureModel:
             Entropy value.
         """
         posteriors = self.posterior_probabilities(observations, time_values)
-        posteriors = np.clip(posteriors, 1e-10, 1 - 1e-10)
+        posteriors = np.clip(posteriors, PROB_EPSILON, 1 - PROB_EPSILON)
         return -np.mean(np.sum(posteriors * np.log(posteriors), axis=1))
 
 

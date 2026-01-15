@@ -17,6 +17,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -143,7 +145,7 @@ class GaussianDensity(LatentDensity):
                 axis=0,
             )
             self.cov = (self.cov + self.cov.T) / 2
-            self.cov += 1e-6 * np.eye(self.n_dimensions)
+            self.cov += REGULARIZATION_EPSILON * np.eye(self.n_dimensions)
 
         self._update_precision()
 
@@ -200,7 +202,7 @@ class EmpiricalHistogram(LatentDensity):
     ) -> None:
         self._initialize(len(weights))
         self._probs = weights / weights.sum()
-        self._probs = np.clip(self._probs, 1e-10, None)
+        self._probs = np.clip(self._probs, PROB_EPSILON, None)
         self._probs = self._probs / self._probs.sum()
 
     @property
@@ -267,7 +269,7 @@ class EmpiricalHistogramWoods(LatentDensity):
         if n < 5:
             return probs
 
-        log_probs = np.log(np.clip(probs, 1e-10, None))
+        log_probs = np.log(np.clip(probs, PROB_EPSILON, None))
 
         n_interior = max(3, n // 3)
         lower_idx = n_interior
@@ -296,7 +298,7 @@ class EmpiricalHistogramWoods(LatentDensity):
                 upper_idx:
             ] + alpha * upper_extrap
 
-            extrap_probs = np.clip(extrap_probs, 1e-10, None)
+            extrap_probs = np.clip(extrap_probs, PROB_EPSILON, None)
             extrap_probs = extrap_probs / extrap_probs.sum()
 
             return extrap_probs
@@ -316,11 +318,11 @@ class EmpiricalHistogramWoods(LatentDensity):
         self._initialize(len(weights), theta_points)
 
         raw_probs = weights / weights.sum()
-        raw_probs = np.clip(raw_probs, 1e-10, None)
+        raw_probs = np.clip(raw_probs, PROB_EPSILON, None)
 
         self._probs = self._extrapolate_tails(raw_probs)
 
-        self._probs = np.clip(self._probs, 1e-10, None)
+        self._probs = np.clip(self._probs, PROB_EPSILON, None)
         self._probs = self._probs / self._probs.sum()
 
     @property
@@ -440,7 +442,7 @@ class DavidianCurve(LatentDensity):
             HtWH = H.T @ W @ H
             HtWy = H.T @ W @ target
 
-            reg = 1e-6 * np.eye(self.degree + 1)
+            reg = REGULARIZATION_EPSILON * np.eye(self.degree + 1)
             self._coeffs = np.linalg.solve(HtWH + reg, HtWy)
 
             if self._coeffs[0] < 0:
@@ -527,7 +529,7 @@ class MixtureDensity(LatentDensity):
 
         for k in range(self.n_components):
             nk = weighted_resp[:, k].sum()
-            if nk > 1e-10:
+            if nk > PROB_EPSILON:
                 self.means[k] = np.sum(weighted_resp[:, k] * theta) / nk
                 self.variances[k] = (
                     np.sum(weighted_resp[:, k] * (theta - self.means[k]) ** 2) / nk

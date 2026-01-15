@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -597,7 +599,7 @@ def plot_se(
     theta = np.linspace(theta_range[0], theta_range[1], n_points).reshape(-1, 1)
 
     info = model.information(theta).sum(axis=1)
-    se = 1 / np.sqrt(np.maximum(info, 1e-10))
+    se = 1 / np.sqrt(np.maximum(info, PROB_EPSILON))
 
     ax.plot(theta.ravel(), se, linewidth=2, **kwargs)
 

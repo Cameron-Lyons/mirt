@@ -9,6 +9,7 @@ from numpy.typing import NDArray
 from scipy import stats
 from scipy.integrate import trapezoid
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import extract_item_se, fit_group_models, split_groups
 
 if TYPE_CHECKING:
@@ -176,7 +177,7 @@ def _dif_wald(
             focal_se = extract_item_se(focal_se_full, item_idx)
 
             pooled_var = ref_se**2 + focal_se**2
-            valid = pooled_var > 1e-10
+            valid = pooled_var > PROB_EPSILON
 
             if np.any(valid):
                 diff = ref_val - focal_val

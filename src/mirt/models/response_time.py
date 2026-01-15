@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -112,7 +115,7 @@ class ResponseTimeModel:
             a = self.discrimination[item_idx]
             b = self.difficulty[item_idx]
             z = a * (theta - b)
-            p = 1.0 / (1.0 + np.exp(-z))
+            p = sigmoid(z)
 
             if self.accuracy_model == "3PL":
                 c = self.guessing[item_idx]
@@ -197,7 +200,7 @@ class ResponseTimeModel:
         ll = np.zeros(n_persons)
 
         probs = self.accuracy_probability(theta)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         for i in range(n_persons):
             for j in range(n_items):

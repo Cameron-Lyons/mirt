@@ -7,7 +7,7 @@ from typing import Any
 
 import numpy as np
 
-PROB_CLIP_MIN = 1e-10
+from mirt.constants import PROB_EPSILON
 
 
 def load_dataset(name: str) -> dict[str, Any]:
@@ -559,7 +559,7 @@ def _load_attitude() -> dict[str, Any]:
                 p[k] = p_star[k - 1] - p_star[k]
             p[n_categories - 1] = p_star[n_categories - 2]
 
-            p = np.clip(p, PROB_CLIP_MIN, 1)
+            p = np.clip(p, PROB_EPSILON, 1)
             p = p / p.sum()
             data[i, j] = rng.choice(n_categories, p=p)
 

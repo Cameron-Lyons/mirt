@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import split_groups
 
 
@@ -97,7 +98,7 @@ def sibtest(
     else:
         raise ValueError(f"Unknown SIBTEST method: {method}")
 
-    if beta_se > 1e-10:
+    if beta_se > PROB_EPSILON:
         z = beta / beta_se
         p_value = 2 * (1 - stats.norm.cdf(abs(z)))
     else:
@@ -110,7 +111,7 @@ def sibtest(
         (np.var(suspect_scores_ref, ddof=1) + np.var(suspect_scores_focal, ddof=1)) / 2
     )
 
-    if pooled_sd > 1e-10:
+    if pooled_sd > PROB_EPSILON:
         effect_size = beta / pooled_sd
     else:
         effect_size = np.nan
@@ -248,7 +249,7 @@ def _regression_correction(
         ]
     )
 
-    if np.var(all_scores) > 1e-10:
+    if np.var(all_scores) > PROB_EPSILON:
         slope = np.cov(all_scores, all_suspect)[0, 1] / np.var(all_scores)
     else:
         slope = 0

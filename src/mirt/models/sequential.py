@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
 from mirt.models.base import PolytomousItemModel
 
 
@@ -98,7 +99,7 @@ class SequentialResponseModel(PolytomousItemModel):
         b = self._parameters["thresholds"][item_idx, step_idx]
 
         z = a * (theta - b)
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def category_probability(
         self,
@@ -225,7 +226,7 @@ class ContinuationRatioModel(PolytomousItemModel):
         cr_probs = []
         for k in range(n_cat - 1):
             z = a * (theta_1d - b[k])
-            cr_probs.append(1.0 / (1.0 + np.exp(-z)))
+            cr_probs.append(sigmoid(z))
 
         if category == 0:
             return 1.0 - cr_probs[0]

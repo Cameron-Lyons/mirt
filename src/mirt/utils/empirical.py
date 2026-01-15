@@ -10,12 +10,15 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import (
+    PROB_CLIP_MAX,
+    PROB_CLIP_MIN,
+    PROB_EPSILON,
+)
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-EPSILON = 1e-10
-PROB_CLIP_MIN = 0.01
-PROB_CLIP_MAX = 0.99
 SILVERMAN_CONSTANT = 1.06
 SILVERMAN_EXPONENT = -1 / 5
 
@@ -659,12 +662,12 @@ def itemGAM(
 
         for i, t in enumerate(theta_grid):
             weights = np.exp(-0.5 * ((theta_valid - t) / bandwidth) ** 2)
-            weights = weights / (np.sum(weights) + EPSILON)
+            weights = weights / (np.sum(weights) + PROB_EPSILON)
 
             smoothed_probs[i] = np.sum(weights * item_resp_valid)
 
             if se:
-                n_eff = 1 / (np.sum(weights**2) + EPSILON)
+                n_eff = 1 / (np.sum(weights**2) + PROB_EPSILON)
                 p = smoothed_probs[i]
                 p = np.clip(p, PROB_CLIP_MIN, PROB_CLIP_MAX)
                 se_val = np.sqrt(p * (1 - p) / n_eff)
