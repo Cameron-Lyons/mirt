@@ -1,5 +1,7 @@
 //! Core utility functions for IRT computations.
 
+use ndarray::ArrayView1;
+
 pub const LOG_2_PI: f64 = 1.8378770664093453;
 pub const EPSILON: f64 = 1e-10;
 
@@ -68,8 +70,55 @@ pub fn log_likelihood_2pl_single(
 }
 
 #[inline]
+pub fn log_likelihood_2pl_view(
+    responses: ArrayView1<i32>,
+    theta: f64,
+    discrimination: &[f64],
+    difficulty: &[f64],
+) -> f64 {
+    let mut ll = 0.0;
+    for (j, &resp) in responses.iter().enumerate() {
+        if resp < 0 {
+            continue;
+        }
+        let z = discrimination[j] * (theta - difficulty[j]);
+        if resp == 1 {
+            ll += log_sigmoid(z);
+        } else {
+            ll += log_sigmoid(-z);
+        }
+    }
+    ll
+}
+
+#[inline]
 pub fn log_likelihood_3pl_single(
     responses: &[i32],
+    theta: f64,
+    discrimination: &[f64],
+    difficulty: &[f64],
+    guessing: &[f64],
+) -> f64 {
+    let mut ll = 0.0;
+    for (j, &resp) in responses.iter().enumerate() {
+        if resp < 0 {
+            continue;
+        }
+        let p_star = sigmoid(discrimination[j] * (theta - difficulty[j]));
+        let p = guessing[j] + (1.0 - guessing[j]) * p_star;
+        let p_clipped = clip(p, EPSILON, 1.0 - EPSILON);
+        if resp == 1 {
+            ll += p_clipped.ln();
+        } else {
+            ll += (1.0 - p_clipped).ln();
+        }
+    }
+    ll
+}
+
+#[inline]
+pub fn log_likelihood_3pl_view(
+    responses: ArrayView1<i32>,
     theta: f64,
     discrimination: &[f64],
     difficulty: &[f64],

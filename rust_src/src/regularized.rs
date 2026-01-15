@@ -38,6 +38,7 @@ fn soft_threshold(x: f64, lambda: f64) -> f64 {
 /// * `max_iter` - Maximum coordinate descent iterations
 /// * `tol` - Convergence tolerance
 #[pyfunction]
+#[pyo3(signature = (r_k, n_k, quad_points, loadings, intercepts, adaptive_weights, lambda_val, alpha, max_iter, tol))]
 #[allow(clippy::too_many_arguments)]
 pub fn coordinate_descent_mstep_regularized<'py>(
     py: Python<'py>,
@@ -166,6 +167,7 @@ pub fn coordinate_descent_mstep_regularized<'py>(
 ///
 /// Processes items in parallel while maintaining sequential factor updates.
 #[pyfunction]
+#[pyo3(signature = (r_k, n_k, quad_points, loadings, intercepts, adaptive_weights, lambda_val, alpha, max_iter, tol))]
 #[allow(clippy::too_many_arguments)]
 pub fn coordinate_descent_parallel<'py>(
     py: Python<'py>,
@@ -305,6 +307,7 @@ pub fn coordinate_descent_parallel<'py>(
 
 /// Compute elastic net penalty value.
 #[pyfunction]
+#[pyo3(signature = (loadings, adaptive_weights, lambda_val, alpha))]
 pub fn compute_elastic_net_penalty(
     loadings: PyReadonlyArray2<f64>,
     adaptive_weights: PyReadonlyArray2<f64>,
@@ -333,6 +336,7 @@ pub fn compute_elastic_net_penalty(
 
 /// Count non-zero loadings above threshold.
 #[pyfunction]
+#[pyo3(signature = (loadings, threshold))]
 pub fn count_nonzero_loadings(loadings: PyReadonlyArray2<f64>, threshold: f64) -> usize {
     let loadings = loadings.as_array();
     loadings.iter().filter(|&&x| x.abs() > threshold).count()
@@ -340,6 +344,7 @@ pub fn count_nonzero_loadings(loadings: PyReadonlyArray2<f64>, threshold: f64) -
 
 /// Compute gradient of penalized log-likelihood.
 #[pyfunction]
+#[pyo3(signature = (r_k, n_k, quad_points, loadings, intercepts, adaptive_weights, lambda_val, alpha))]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_penalized_gradient<'py>(
     py: Python<'py>,

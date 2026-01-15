@@ -3,6 +3,14 @@ from typing import Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._gpu_backend import (
+    GPU_AVAILABLE,
+    get_gpu_device_name,
+    get_gpu_memory_info,
+    is_gpu_available,  # noqa: F401
+    is_torch_available,
+)
+from mirt._rust_backend import RUST_AVAILABLE, is_rust_available  # noqa: F401
 from mirt._version import __version__
 from mirt.cat import CATEngine, CATResult, CATState
 from mirt.diagnostics.comparison import (
@@ -825,3 +833,123 @@ if _HAS_PLOTTING:
             "plot_se",
         ]
     )
+
+__all__.extend(
+    [
+        "GPU_AVAILABLE",
+        "RUST_AVAILABLE",
+        "is_gpu_available",
+        "is_rust_available",
+        "is_torch_available",
+        "get_gpu_device_name",
+        "get_gpu_memory_info",
+        "get_backend_info",
+        "set_backend",
+        "get_backend",
+    ]
+)
+
+
+_CURRENT_BACKEND: Literal["auto", "gpu", "rust", "numpy"] = "auto"
+
+
+def set_backend(backend: Literal["auto", "gpu", "rust", "numpy"]) -> None:
+    """Set the computational backend for IRT operations.
+
+    Parameters
+    ----------
+    backend : {"auto", "gpu", "rust", "numpy"}
+        Backend to use:
+
+        - "auto": Automatically select the fastest available backend.
+          Priority: GPU > Rust > NumPy
+        - "gpu": Use PyTorch GPU acceleration (requires torch with CUDA).
+        - "rust": Use Rust backend (requires compiled extension).
+        - "numpy": Use pure NumPy implementation (always available).
+
+    Raises
+    ------
+    ValueError
+        If requested backend is not available.
+
+    Examples
+    --------
+    >>> import mirt
+    >>> mirt.set_backend("gpu")  # Use GPU if available
+    >>> mirt.set_backend("auto")  # Auto-select best backend
+    """
+    global _CURRENT_BACKEND
+
+    if backend not in ("auto", "gpu", "rust", "numpy"):
+        raise ValueError(
+            f"Invalid backend '{backend}'. Must be one of: 'auto', 'gpu', 'rust', 'numpy'"
+        )
+
+    if backend == "gpu" and not GPU_AVAILABLE:
+        raise ValueError(
+            "GPU backend requested but not available. "
+            "Install PyTorch with CUDA support: pip install torch"
+        )
+
+    if backend == "rust" and not RUST_AVAILABLE:
+        raise ValueError(
+            "Rust backend requested but not available. "
+            "Ensure the package was installed with Rust extension."
+        )
+
+    _CURRENT_BACKEND = backend
+
+
+def get_backend() -> Literal["auto", "gpu", "rust", "numpy"]:
+    """Get the currently configured backend.
+
+    Returns
+    -------
+    str
+        Current backend setting.
+    """
+    return _CURRENT_BACKEND
+
+
+def get_backend_info() -> dict[str, Any]:
+    """Get information about available computational backends.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        - current_backend: Currently selected backend
+        - effective_backend: Backend that will actually be used (for "auto")
+        - gpu_available: Whether GPU acceleration is available
+        - gpu_device: Name of GPU device (if available)
+        - gpu_memory: GPU memory info (if available)
+        - rust_available: Whether Rust backend is available
+        - torch_available: Whether PyTorch is installed
+
+    Examples
+    --------
+    >>> import mirt
+    >>> info = mirt.get_backend_info()
+    >>> print(f"Using: {info['effective_backend']}")
+    >>> if info['gpu_available']:
+    ...     print(f"GPU: {info['gpu_device']}")
+    """
+    effective = _CURRENT_BACKEND
+    if effective == "auto":
+        if GPU_AVAILABLE:
+            effective = "gpu"
+        elif RUST_AVAILABLE:
+            effective = "rust"
+        else:
+            effective = "numpy"
+
+    return {
+        "current_backend": _CURRENT_BACKEND,
+        "effective_backend": effective,
+        "gpu_available": GPU_AVAILABLE,
+        "gpu_device": get_gpu_device_name(),
+        "gpu_memory": get_gpu_memory_info(),
+        "rust_available": RUST_AVAILABLE,
+        "torch_available": is_torch_available(),
+    }

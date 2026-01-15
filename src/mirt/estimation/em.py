@@ -6,6 +6,13 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._gpu_backend import (
+    GPU_AVAILABLE,
+    compute_log_likelihoods_2pl_gpu,
+    compute_log_likelihoods_3pl_gpu,
+    compute_log_likelihoods_gpcm_gpu,
+    compute_log_likelihoods_grm_gpu,
+)
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -31,6 +38,7 @@ class EMEstimator(BaseEstimator):
         item_optim_ftol: float = 1e-6,
         se_step_size: float = 1e-5,
         n_jobs: int = 1,
+        use_gpu: bool | Literal["auto"] = "auto",
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -43,9 +51,17 @@ class EMEstimator(BaseEstimator):
         self.item_optim_ftol = item_optim_ftol
         self.se_step_size = se_step_size
         self.n_jobs = n_jobs
+        self.use_gpu = use_gpu
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
+
+    @property
+    def _should_use_gpu(self) -> bool:
+        """Determine if GPU should be used based on settings and availability."""
+        if self.use_gpu == "auto":
+            return GPU_AVAILABLE
+        return bool(self.use_gpu) and GPU_AVAILABLE
 
     def fit(
         self,
@@ -142,15 +158,7 @@ class EMEstimator(BaseEstimator):
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
 
-        if hasattr(model, "log_likelihood_batch"):
-            log_likelihoods = model.log_likelihood_batch(responses, quad_points)
-        else:
-            n_persons = responses.shape[0]
-            n_quad = len(quad_weights)
-            log_likelihoods = np.zeros((n_persons, n_quad))
-            for q in range(n_quad):
-                theta_q = quad_points[q : q + 1]
-                log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
+        log_likelihoods = self._compute_log_likelihoods(model, responses, quad_points)
 
         log_prior = self._latent_density.log_density(quad_points)
 
@@ -163,6 +171,89 @@ class EMEstimator(BaseEstimator):
         marginal_ll = np.exp(log_marginal.ravel())
 
         return posterior_weights, marginal_ll
+
+    def _compute_log_likelihoods(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        quad_points: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute log-likelihoods, using GPU if available and appropriate."""
+        if self._should_use_gpu and model.n_factors == 1:
+            return self._compute_log_likelihoods_gpu(model, responses, quad_points)
+
+        if hasattr(model, "log_likelihood_batch"):
+            return model.log_likelihood_batch(responses, quad_points)
+
+        n_persons = responses.shape[0]
+        n_quad = quad_points.shape[0]
+        log_likelihoods = np.zeros((n_persons, n_quad))
+        for q in range(n_quad):
+            theta_q = quad_points[q : q + 1]
+            log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
+        return log_likelihoods
+
+    def _compute_log_likelihoods_gpu(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        quad_points: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute log-likelihoods using GPU acceleration."""
+        params = model.parameters
+
+        if model.model_name == "2PL":
+            discrimination = params["discrimination"]
+            difficulty = params["difficulty"]
+            return compute_log_likelihoods_2pl_gpu(
+                responses,
+                quad_points.ravel(),
+                discrimination,
+                difficulty,
+            )
+
+        if model.model_name == "3PL":
+            discrimination = params["discrimination"]
+            difficulty = params["difficulty"]
+            guessing = params["guessing"]
+            return compute_log_likelihoods_3pl_gpu(
+                responses,
+                quad_points.ravel(),
+                discrimination,
+                difficulty,
+                guessing,
+            )
+
+        if model.model_name == "GRM":
+            discrimination = params["discrimination"]
+            thresholds = params["thresholds"]
+            return compute_log_likelihoods_grm_gpu(
+                responses,
+                quad_points.ravel(),
+                discrimination,
+                thresholds,
+            )
+
+        if model.model_name == "GPCM":
+            discrimination = params["discrimination"]
+            thresholds = params["thresholds"]
+            return compute_log_likelihoods_gpcm_gpu(
+                responses,
+                quad_points.ravel(),
+                discrimination,
+                thresholds,
+            )
+
+        if hasattr(model, "log_likelihood_batch"):
+            return model.log_likelihood_batch(responses, quad_points)
+
+        n_persons = responses.shape[0]
+        n_quad = quad_points.shape[0]
+        log_likelihoods = np.zeros((n_persons, n_quad))
+        for q in range(n_quad):
+            theta_q = quad_points[q : q + 1]
+            log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
+        return log_likelihoods
 
     def _m_step(
         self,

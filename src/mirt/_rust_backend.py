@@ -27,6 +27,91 @@ def is_rust_available() -> bool:
     return RUST_AVAILABLE
 
 
+def _ensure_f64(arr: NDArray[np.floating] | None) -> NDArray[np.float64] | None:
+    """Convert array to float64 using no-copy if already correct dtype."""
+    if arr is None:
+        return None
+    if arr.dtype == np.float64:
+        return arr
+    return arr.astype(np.float64)
+
+
+def _ensure_i32(arr: NDArray[np.integer] | None) -> NDArray[np.int32] | None:
+    """Convert array to int32 using no-copy if already correct dtype."""
+    if arr is None:
+        return None
+    if arr.dtype == np.int32:
+        return arr
+    return arr.astype(np.int32)
+
+
+def _ensure_i64(arr: NDArray[np.integer] | None) -> NDArray[np.int64] | None:
+    """Convert array to int64 using no-copy if already correct dtype."""
+    if arr is None:
+        return None
+    if arr.dtype == np.int64:
+        return arr
+    return arr.astype(np.int64)
+
+
+class PreparedArrays:
+    """Pre-converted arrays for EM estimation to avoid repeated conversions."""
+
+    __slots__ = (
+        "responses_i32",
+        "quad_points_f64",
+        "quad_weights_f64",
+        "discrimination_f64",
+        "difficulty_f64",
+        "guessing_f64",
+        "thresholds_f64",
+        "n_categories_i32",
+    )
+
+    def __init__(
+        self,
+        responses: NDArray[np.integer] | None = None,
+        quad_points: NDArray[np.floating] | None = None,
+        quad_weights: NDArray[np.floating] | None = None,
+        discrimination: NDArray[np.floating] | None = None,
+        difficulty: NDArray[np.floating] | None = None,
+        guessing: NDArray[np.floating] | None = None,
+        thresholds: NDArray[np.floating] | None = None,
+        n_categories: NDArray[np.integer] | None = None,
+    ):
+        """Pre-convert arrays once for use in EM iteration loops.
+
+        Use this to avoid repeated dtype conversions when calling Rust functions
+        multiple times with the same arrays (e.g., in EM iterations where only
+        parameters change).
+        """
+        self.responses_i32 = _ensure_i32(responses)
+        self.quad_points_f64 = _ensure_f64(quad_points)
+        self.quad_weights_f64 = _ensure_f64(quad_weights)
+        self.discrimination_f64 = _ensure_f64(discrimination)
+        self.difficulty_f64 = _ensure_f64(difficulty)
+        self.guessing_f64 = _ensure_f64(guessing)
+        self.thresholds_f64 = _ensure_f64(thresholds)
+        self.n_categories_i32 = _ensure_i32(n_categories)
+
+    def update_params(
+        self,
+        discrimination: NDArray[np.floating] | None = None,
+        difficulty: NDArray[np.floating] | None = None,
+        guessing: NDArray[np.floating] | None = None,
+        thresholds: NDArray[np.floating] | None = None,
+    ) -> None:
+        """Update parameter arrays (used during M-step)."""
+        if discrimination is not None:
+            self.discrimination_f64 = _ensure_f64(discrimination)
+        if difficulty is not None:
+            self.difficulty_f64 = _ensure_f64(difficulty)
+        if guessing is not None:
+            self.guessing_f64 = _ensure_f64(guessing)
+        if thresholds is not None:
+            self.thresholds_f64 = _ensure_f64(thresholds)
+
+
 def compute_log_likelihoods_2pl(
     responses: NDArray[np.int_],
     quad_points: NDArray[np.float64],
@@ -53,10 +138,10 @@ def compute_log_likelihoods_2pl(
     """
     if RUST_AVAILABLE:
         return mirt_rs.compute_log_likelihoods_2pl(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     n_persons, n_items = responses.shape
@@ -92,11 +177,11 @@ def compute_log_likelihoods_3pl(
     """Compute log-likelihoods for 3PL model at all quadrature points."""
     if RUST_AVAILABLE:
         return mirt_rs.compute_log_likelihoods_3pl(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
-            guessing.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            _ensure_f64(guessing),
         )
 
     n_persons, n_items = responses.shape
@@ -132,10 +217,10 @@ def compute_log_likelihoods_mirt(
     """Compute log-likelihoods for multidimensional IRT model."""
     if RUST_AVAILABLE:
         return mirt_rs.compute_log_likelihoods_mirt(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     n_persons = responses.shape[0]
@@ -181,11 +266,11 @@ def e_step_complete(
     """
     if RUST_AVAILABLE:
         return mirt_rs.e_step_complete(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
             float(prior_mean),
             float(prior_var),
         )
@@ -217,9 +302,10 @@ def compute_expected_counts(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute expected counts for dichotomous items."""
     if RUST_AVAILABLE:
+        resp = _ensure_i32(responses)
         return mirt_rs.compute_expected_counts(
-            responses.astype(np.int32).ravel(),
-            posterior_weights.astype(np.float64),
+            resp.ravel() if resp is not None else responses.astype(np.int32).ravel(),
+            _ensure_f64(posterior_weights),
         )
 
     n_persons = len(responses)
@@ -245,9 +331,10 @@ def compute_expected_counts_polytomous(
 ) -> NDArray[np.float64]:
     """Compute expected counts per category for polytomous items."""
     if RUST_AVAILABLE:
+        resp = _ensure_i32(responses)
         return mirt_rs.compute_expected_counts_polytomous(
-            responses.astype(np.int32).ravel(),
-            posterior_weights.astype(np.float64),
+            resp.ravel() if resp is not None else responses.astype(np.int32).ravel(),
+            _ensure_f64(posterior_weights),
             n_categories,
         )
 
@@ -801,11 +888,11 @@ def compute_eap_scores(
     """Compute EAP scores with standard errors."""
     if RUST_AVAILABLE:
         return mirt_rs.compute_eap_scores(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     n_persons = responses.shape[0]
@@ -857,7 +944,7 @@ def em_fit_2pl(
     """
     if RUST_AVAILABLE:
         return mirt_rs.em_fit_2pl(
-            responses.astype(np.int32),
+            _ensure_i32(responses),
             n_quadpts,
             max_iter,
             tol,
@@ -887,7 +974,7 @@ def gibbs_sample_2pl(
 
     if RUST_AVAILABLE:
         return mirt_rs.gibbs_sample_2pl(
-            responses.astype(np.int32),
+            _ensure_i32(responses),
             n_iter,
             burnin,
             thin,
@@ -916,7 +1003,7 @@ def mhrm_fit_2pl(
 
     if RUST_AVAILABLE:
         return mirt_rs.mhrm_fit_2pl(
-            responses.astype(np.int32),
+            _ensure_i32(responses),
             n_cycles,
             burnin,
             proposal_sd,
@@ -946,7 +1033,7 @@ def bootstrap_fit_2pl(
 
     if RUST_AVAILABLE:
         return mirt_rs.bootstrap_fit_2pl(
-            responses.astype(np.int32),
+            _ensure_i32(responses),
             n_bootstrap,
             n_quadpts,
             max_iter,
@@ -983,9 +1070,9 @@ def lord_wingersky_recursion(
     """
     if RUST_AVAILABLE:
         return mirt_rs.lord_wingersky_recursion(
-            theta.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_f64(theta),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     return None
@@ -1012,7 +1099,7 @@ def lord_wingersky_polytomous(
     """
     if RUST_AVAILABLE:
         return mirt_rs.lord_wingersky_polytomous(
-            item_probs.astype(np.float64),
+            _ensure_f64(item_probs),
             max_score,
         )
 
@@ -1044,8 +1131,8 @@ def cat_compute_item_info(
     if RUST_AVAILABLE:
         return mirt_rs.cat_compute_item_info(
             float(theta),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     z = discrimination * (theta - difficulty)
@@ -1081,8 +1168,8 @@ def cat_select_max_info(
     if RUST_AVAILABLE:
         return mirt_rs.cat_select_max_info(
             float(theta),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
             available_mask.astype(np.bool_),
         )
 
@@ -1123,12 +1210,12 @@ def cat_eap_update(
     """
     if RUST_AVAILABLE:
         theta, se = mirt_rs.cat_eap_update(
-            administered_items.astype(np.int32),
-            responses.astype(np.int32),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_i32(administered_items),
+            _ensure_i32(responses),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
         )
         return float(theta[0]), float(se[0])
 
@@ -1219,11 +1306,11 @@ def cat_simulate_batch(
 
     if RUST_AVAILABLE:
         return mirt_rs.cat_simulate_batch(
-            true_thetas.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(true_thetas),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             float(se_threshold),
             int(max_items),
             int(min_items),
@@ -1290,11 +1377,11 @@ def cat_conditional_mse(
 
     if RUST_AVAILABLE:
         return mirt_rs.cat_conditional_mse(
-            eval_thetas.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(eval_thetas),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             float(se_threshold),
             int(max_items),
             int(min_items),
@@ -1330,11 +1417,14 @@ def compute_standardized_residuals(
         Standardized residuals (n_persons, n_items)
     """
     if RUST_AVAILABLE:
+        theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_standardized_residuals(
-            responses.astype(np.int32),
-            theta.astype(np.float64).ravel(),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            theta_f64.ravel()
+            if theta_f64 is not None
+            else theta.astype(np.float64).ravel(),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     n_persons, n_items = responses.shape
@@ -1379,11 +1469,14 @@ def compute_q3_matrix(
         Q3 correlation matrix (n_items, n_items)
     """
     if RUST_AVAILABLE:
+        theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_q3_matrix(
-            responses.astype(np.int32),
-            theta.astype(np.float64).ravel(),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            theta_f64.ravel()
+            if theta_f64 is not None
+            else theta.astype(np.float64).ravel(),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     residuals = compute_standardized_residuals(
@@ -1433,11 +1526,14 @@ def compute_ld_chi2_matrix(
         LD chi-square matrix (n_items, n_items)
     """
     if RUST_AVAILABLE:
+        theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_ld_chi2_matrix(
-            responses.astype(np.int32),
-            theta.astype(np.float64).ravel(),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            theta_f64.ravel()
+            if theta_f64 is not None
+            else theta.astype(np.float64).ravel(),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     n_persons, n_items = responses.shape
@@ -1532,12 +1628,17 @@ def m_step_dichotomous_parallel(
         (new_discrimination, new_difficulty)
     """
     if RUST_AVAILABLE:
+        qp = _ensure_f64(quad_points)
+        disc = _ensure_f64(discrimination)
+        diff = _ensure_f64(difficulty)
         return mirt_rs.m_step_dichotomous_parallel(
-            responses.astype(np.int32),
-            posterior_weights.astype(np.float64),
-            quad_points.astype(np.float64).ravel(),
-            discrimination.astype(np.float64).ravel(),
-            difficulty.astype(np.float64).ravel(),
+            _ensure_i32(responses),
+            _ensure_f64(posterior_weights),
+            qp.ravel() if qp is not None else quad_points.astype(np.float64).ravel(),
+            disc.ravel()
+            if disc is not None
+            else discrimination.astype(np.float64).ravel(),
+            diff.ravel() if diff is not None else difficulty.astype(np.float64).ravel(),
             max_iter,
             tol,
             disc_bounds,
@@ -1614,12 +1715,17 @@ def compute_item_se_parallel(
         (se_discrimination, se_difficulty)
     """
     if RUST_AVAILABLE:
+        qp = _ensure_f64(quad_points)
+        disc = _ensure_f64(discrimination)
+        diff = _ensure_f64(difficulty)
         return mirt_rs.compute_item_se_parallel(
-            responses.astype(np.int32),
-            posterior_weights.astype(np.float64),
-            quad_points.astype(np.float64).ravel(),
-            discrimination.astype(np.float64).ravel(),
-            difficulty.astype(np.float64).ravel(),
+            _ensure_i32(responses),
+            _ensure_f64(posterior_weights),
+            qp.ravel() if qp is not None else quad_points.astype(np.float64).ravel(),
+            disc.ravel()
+            if disc is not None
+            else discrimination.astype(np.float64).ravel(),
+            diff.ravel() if diff is not None else difficulty.astype(np.float64).ravel(),
             h,
         )
 
@@ -1690,12 +1796,17 @@ def compute_hessian_block_diagonal(
         Hessian matrix (n_params, n_params) where n_params = n_items * 2
     """
     if RUST_AVAILABLE:
+        qp = _ensure_f64(quad_points)
+        disc = _ensure_f64(discrimination)
+        diff = _ensure_f64(difficulty)
         return mirt_rs.compute_hessian_block_diagonal(
-            responses.astype(np.int32),
-            posterior_weights.astype(np.float64),
-            quad_points.astype(np.float64).ravel(),
-            discrimination.astype(np.float64).ravel(),
-            difficulty.astype(np.float64).ravel(),
+            _ensure_i32(responses),
+            _ensure_f64(posterior_weights),
+            qp.ravel() if qp is not None else quad_points.astype(np.float64).ravel(),
+            disc.ravel()
+            if disc is not None
+            else discrimination.astype(np.float64).ravel(),
+            diff.ravel() if diff is not None else difficulty.astype(np.float64).ravel(),
             h,
         )
 
@@ -3159,6 +3270,179 @@ def compute_growth_trajectory(
             growth_factors.astype(np.float64),
             time_values.astype(np.float64),
             growth_model,
+        )
+
+    return None
+
+
+def em_iteration_2pl(
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    prior_mean: float = 0.0,
+    prior_var: float = 1.0,
+    max_m_iter: int = 10,
+    m_tol: float = 1e-4,
+    disc_bounds: tuple[float, float] = (0.1, 5.0),
+    diff_bounds: tuple[float, float] = (-6.0, 6.0),
+    damping: float = 0.5,
+    regularization: float = 0.01,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], float] | None:
+    """Single EM iteration for 2PL model (batched E+M step).
+
+    Performs both E-step and M-step in a single call to reduce FFI overhead.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    discrimination : NDArray
+        Current discrimination parameters (n_items,)
+    difficulty : NDArray
+        Current difficulty parameters (n_items,)
+    prior_mean : float
+        Prior mean for theta distribution
+    prior_var : float
+        Prior variance for theta distribution
+    max_m_iter : int
+        Maximum Newton-Raphson iterations in M-step
+    m_tol : float
+        Convergence tolerance for M-step
+    disc_bounds : tuple
+        (min, max) bounds for discrimination
+    diff_bounds : tuple
+        (min, max) bounds for difficulty
+    damping : float
+        Damping factor for parameter updates
+    regularization : float
+        Regularization strength
+
+    Returns
+    -------
+    tuple or None
+        (new_discrimination, new_difficulty, posterior_weights, log_likelihood)
+        Returns None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.em_iteration_2pl(
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            float(prior_mean),
+            float(prior_var),
+            max_m_iter,
+            m_tol,
+            disc_bounds,
+            diff_bounds,
+            damping,
+            regularization,
+        )
+
+    return None
+
+
+def em_iteration_3pl(
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+    prior_mean: float = 0.0,
+    prior_var: float = 1.0,
+    max_m_iter: int = 10,
+    m_tol: float = 1e-4,
+    disc_bounds: tuple[float, float] = (0.1, 5.0),
+    diff_bounds: tuple[float, float] = (-6.0, 6.0),
+    guess_bounds: tuple[float, float] = (0.0, 0.35),
+    damping_ab: float = 0.5,
+    damping_c: float = 0.3,
+    regularization: float = 0.01,
+    regularization_c: float = 0.1,
+) -> (
+    tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        float,
+    ]
+    | None
+):
+    """Single EM iteration for 3PL model (batched E+M step).
+
+    Performs both E-step and M-step in a single call to reduce FFI overhead.
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative
+    quad_points : NDArray
+        Quadrature points (n_quad,)
+    quad_weights : NDArray
+        Quadrature weights (n_quad,)
+    discrimination : NDArray
+        Current discrimination parameters (n_items,)
+    difficulty : NDArray
+        Current difficulty parameters (n_items,)
+    guessing : NDArray
+        Current guessing parameters (n_items,)
+    prior_mean : float
+        Prior mean for theta distribution
+    prior_var : float
+        Prior variance for theta distribution
+    max_m_iter : int
+        Maximum Newton-Raphson iterations in M-step
+    m_tol : float
+        Convergence tolerance for M-step
+    disc_bounds : tuple
+        (min, max) bounds for discrimination
+    diff_bounds : tuple
+        (min, max) bounds for difficulty
+    guess_bounds : tuple
+        (min, max) bounds for guessing
+    damping_ab : float
+        Damping factor for a and b updates
+    damping_c : float
+        Damping factor for c updates
+    regularization : float
+        Regularization strength for a and b
+    regularization_c : float
+        Regularization strength for c
+
+    Returns
+    -------
+    tuple or None
+        (new_discrimination, new_difficulty, new_guessing, posterior_weights, log_likelihood)
+        Returns None if Rust unavailable
+    """
+    if RUST_AVAILABLE:
+        return mirt_rs.em_iteration_3pl(
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
+            _ensure_f64(guessing),
+            float(prior_mean),
+            float(prior_var),
+            max_m_iter,
+            m_tol,
+            disc_bounds,
+            diff_bounds,
+            guess_bounds,
+            damping_ab,
+            damping_c,
+            regularization,
+            regularization_c,
         )
 
     return None
