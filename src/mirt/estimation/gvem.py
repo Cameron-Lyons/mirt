@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._gpu_backend import (
+    GPU_AVAILABLE,
+    gvem_compute_elbo_gpu,
+    gvem_e_step_gpu,
+    gvem_m_step_gpu,
+)
 from mirt._rust_backend import (
     gvem_compute_elbo as _rust_gvem_compute_elbo,
 )
@@ -14,6 +20,7 @@ from mirt._rust_backend import (
 from mirt._rust_backend import (
     gvem_m_step as _rust_gvem_m_step,
 )
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation.base import BaseEstimator
 
 if TYPE_CHECKING:
@@ -68,6 +75,7 @@ class GVEMEstimator(BaseEstimator):
         verbose: bool = False,
         n_inner_iter: int = 3,
         se_step_size: float = 1e-5,
+        use_gpu: bool | Literal["auto"] = "auto",
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -76,6 +84,7 @@ class GVEMEstimator(BaseEstimator):
 
         self.n_inner_iter = n_inner_iter
         self.se_step_size = se_step_size
+        self.use_gpu = use_gpu
 
         self._mu: NDArray[np.float64] | None = None
         self._sigma: NDArray[np.float64] | None = None
@@ -84,6 +93,13 @@ class GVEMEstimator(BaseEstimator):
 
         self._slopes: NDArray[np.float64] | None = None
         self._intercepts: NDArray[np.float64] | None = None
+
+    @property
+    def _should_use_gpu(self) -> bool:
+        """Determine if GPU should be used based on settings and availability."""
+        if self.use_gpu == "auto":
+            return GPU_AVAILABLE
+        return bool(self.use_gpu) and GPU_AVAILABLE
 
     def fit(
         self,
@@ -200,7 +216,7 @@ class GVEMEstimator(BaseEstimator):
         if model.n_factors == 1:
             a = self._slopes.ravel()
             d = self._intercepts
-            b = -d / (a + 1e-10)
+            b = -d / (a + PROB_EPSILON)
 
             model._parameters["discrimination"] = a
             model._parameters["difficulty"] = b
@@ -208,7 +224,7 @@ class GVEMEstimator(BaseEstimator):
             a = self._slopes
             d = self._intercepts
             a_sum = np.sum(a, axis=1)
-            b = -d / (a_sum + 1e-10)
+            b = -d / (a_sum + PROB_EPSILON)
 
             model._parameters["discrimination"] = a
             model._parameters["difficulty"] = b
@@ -252,6 +268,21 @@ class GVEMEstimator(BaseEstimator):
     ) -> None:
         """E-step: update variational parameters with closed-form updates."""
         prior_cov_inv = np.linalg.inv(prior_cov)
+
+        if self._should_use_gpu:
+            gpu_result = gvem_e_step_gpu(
+                responses,
+                self._slopes,
+                self._intercepts,
+                prior_cov_inv,
+                self._mu,
+                self._sigma,
+                self._xi,
+                self.n_inner_iter,
+            )
+            if gpu_result is not None:
+                self._mu, self._sigma, self._xi = gpu_result
+                return
 
         rust_result = _rust_gvem_e_step(
             responses,
@@ -336,6 +367,21 @@ class GVEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
     ) -> None:
         """M-step: update item parameters with closed-form updates."""
+        if self._should_use_gpu:
+            gpu_result = gvem_m_step_gpu(
+                responses,
+                self._mu,
+                self._sigma,
+                self._xi,
+                self._slopes,
+                self._intercepts,
+            )
+            if gpu_result is not None:
+                self._slopes, self._intercepts = gpu_result
+                if model.model_name == "1PL":
+                    self._slopes[:] = 1.0
+                return
+
         rust_result = _rust_gvem_m_step(
             responses,
             self._mu,
@@ -385,7 +431,7 @@ class GVEMEstimator(BaseEstimator):
             coeffs = y_valid - 0.5 - 2 * lam_valid * d_j
             b_j = np.einsum("i,ik->k", coeffs, mu_valid)
 
-            A_j += 1e-6 * np.eye(n_factors)
+            A_j += REGULARIZATION_EPSILON * np.eye(n_factors)
 
             try:
                 a_j_new = np.linalg.solve(A_j, b_j)
@@ -401,7 +447,7 @@ class GVEMEstimator(BaseEstimator):
             d_numerator = np.sum(y_valid - 0.5 - 2 * lam_valid * linear_terms)
             d_denominator = 2 * np.sum(lam_valid)
 
-            if d_denominator > 1e-10:
+            if d_denominator > PROB_EPSILON:
                 d_j_new = d_numerator / d_denominator
             else:
                 d_j_new = 0.0
@@ -420,6 +466,20 @@ class GVEMEstimator(BaseEstimator):
 
         ELBO = E_q[log p(y|theta)] + E_q[log p(theta)] - E_q[log q(theta)]
         """
+        if self._should_use_gpu:
+            gpu_result = gvem_compute_elbo_gpu(
+                responses,
+                self._slopes,
+                self._intercepts,
+                prior_mean,
+                prior_cov,
+                self._mu,
+                self._sigma,
+                self._xi,
+            )
+            if gpu_result is not None:
+                return gpu_result
+
         rust_result = _rust_gvem_compute_elbo(
             responses,
             self._slopes,

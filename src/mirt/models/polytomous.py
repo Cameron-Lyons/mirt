@@ -1,11 +1,13 @@
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
 from mirt._rust_backend import (
     RUST_AVAILABLE,
     compute_log_likelihoods_gpcm,
     compute_log_likelihoods_grm,
 )
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import PolytomousItemModel
 
 
@@ -54,7 +56,7 @@ class GradedResponseModel(PolytomousItemModel):
             a_item = a[item_idx]
             z = np.dot(theta, a_item) - np.sum(a_item) * b
 
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def category_probability(
         self,
@@ -106,7 +108,7 @@ class GradedResponseModel(PolytomousItemModel):
 
             dp_k = a_val * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
 
-            info += np.where(p_k > 1e-10, (dp_k**2) / p_k, 0.0)
+            info += np.where(p_k > PROB_EPSILON, (dp_k**2) / p_k, 0.0)
 
         return info
 
@@ -536,7 +538,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         tau_k = self._parameters["thresholds"][threshold_idx]
 
         z = a * (theta_1d - b_j - tau_k)
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def category_probability(
         self,
@@ -583,7 +585,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
 
             dp_k = a * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
 
-            info += np.where(p_k > 1e-10, (dp_k**2) / p_k, 0.0)
+            info += np.where(p_k > PROB_EPSILON, (dp_k**2) / p_k, 0.0)
 
         return info
 

@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.estimation.mcmc import MCMCResult
     from mirt.models.base import BaseItemModel
@@ -197,7 +199,7 @@ def _pareto_k_estimate(log_weights: NDArray[np.float64], min_tail: int = 10) -> 
     if tail_shifted.max() == 0:
         return 0.0
 
-    log_tail = np.log(tail_shifted[tail_shifted > 0] + 1e-10)
+    log_tail = np.log(tail_shifted[tail_shifted > 0] + PROB_EPSILON)
 
     k = np.mean(log_tail) - log_tail[0] if len(log_tail) > 1 else 0.0
     k = max(0.0, k)
@@ -673,7 +675,7 @@ def compute_pointwise_log_lik(
             theta = np.zeros((n_persons, model.n_factors))
 
         probs = model.probability(theta)
-        probs = np.clip(probs, 1e-10, 1 - 1e-10)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
         if by == "person":
             for i in range(n_persons):

@@ -14,6 +14,9 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -608,8 +611,8 @@ class LongitudinalGibbsSampler:
                     if responses[i, t, j] >= 0:
                         p_curr = model.probability(np.array([theta[i, t]]), j)[0]
                         p_prop = model.probability(np.array([theta_prop]), j)[0]
-                        p_curr = np.clip(p_curr, 1e-10, 1 - 1e-10)
-                        p_prop = np.clip(p_prop, 1e-10, 1 - 1e-10)
+                        p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
+                        p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
 
                         if responses[i, t, j] == 1:
                             ll_curr += np.log(p_curr)
@@ -688,11 +691,11 @@ class LongitudinalGibbsSampler:
                         z_curr = a_curr * (theta - b_curr)
                         z_prop = a_prop * (theta - b_prop)
 
-                        p_curr = 1.0 / (1.0 + np.exp(-z_curr))
-                        p_prop = 1.0 / (1.0 + np.exp(-z_prop))
+                        p_curr = sigmoid(z_curr)
+                        p_prop = sigmoid(z_prop)
 
-                        p_curr = np.clip(p_curr, 1e-10, 1 - 1e-10)
-                        p_prop = np.clip(p_prop, 1e-10, 1 - 1e-10)
+                        p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
+                        p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
 
                         if responses[i, t, j] == 1:
                             ll_curr += np.log(p_curr)
@@ -811,7 +814,7 @@ class LongitudinalGibbsSampler:
                         p = model.probability(np.array([theta_trajectories[i, t]]), j)[
                             0
                         ]
-                        p = np.clip(p, 1e-10, 1 - 1e-10)
+                        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                         if responses[i, t, j] == 1:
                             ll += np.log(p)

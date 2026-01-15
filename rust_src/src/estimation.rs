@@ -723,11 +723,419 @@ pub fn bootstrap_fit_2pl<'py>(
     (disc_samples.to_pyarray(py), diff_samples.to_pyarray(py))
 }
 
+/// Single EM iteration for 2PL model (combined E+M step to reduce FFI overhead)
+///
+/// Returns new parameters, posterior weights, and log-likelihood in a single call.
+#[pyfunction]
+#[pyo3(signature = (responses, quad_points, quad_weights, discrimination, difficulty, prior_mean, prior_var, max_m_iter, m_tol, disc_bounds, diff_bounds, damping, regularization))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn em_iteration_2pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    quad_points: numpy::PyReadonlyArray1<f64>,
+    quad_weights: numpy::PyReadonlyArray1<f64>,
+    discrimination: numpy::PyReadonlyArray1<f64>,
+    difficulty: numpy::PyReadonlyArray1<f64>,
+    prior_mean: f64,
+    prior_var: f64,
+    max_m_iter: usize,
+    m_tol: f64,
+    disc_bounds: (f64, f64),
+    diff_bounds: (f64, f64),
+    damping: f64,
+    regularization: f64,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    f64,
+) {
+    let responses = responses.as_array();
+    let quad_points = quad_points.as_array().to_vec();
+    let quad_weights = quad_weights.as_array().to_vec();
+    let disc_init = discrimination.as_array().to_vec();
+    let diff_init = difficulty.as_array().to_vec();
+
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+    let n_quad = quad_points.len();
+
+    let log_weights = compute_log_weights(&quad_weights);
+
+    let log_prior: Vec<f64> = quad_points
+        .iter()
+        .map(|&theta| {
+            let z = (theta - prior_mean) / prior_var.sqrt();
+            -0.5 * (std::f64::consts::TAU * prior_var).ln() - 0.5 * z * z
+        })
+        .collect();
+
+    let e_step_results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let mut log_joint = vec![0.0; n_quad];
+
+            for q in 0..n_quad {
+                let theta = quad_points[q];
+                let mut ll = 0.0;
+
+                for j in 0..n_items {
+                    let resp = responses[[i, j]];
+                    if resp < 0 {
+                        continue;
+                    }
+                    let z = disc_init[j] * (theta - diff_init[j]);
+                    if resp == 1 {
+                        ll += log_sigmoid(z);
+                    } else {
+                        ll += log_sigmoid(-z);
+                    }
+                }
+
+                log_joint[q] = ll + log_prior[q] + log_weights[q];
+            }
+
+            let log_marginal = logsumexp(&log_joint);
+            let posterior: Vec<f64> = log_joint
+                .iter()
+                .map(|&lj| (lj - log_marginal).exp())
+                .collect();
+
+            (posterior, log_marginal)
+        })
+        .collect();
+
+    let posterior_weights: Vec<Vec<f64>> = e_step_results.iter().map(|(p, _)| p.clone()).collect();
+    let log_likelihood: f64 = e_step_results.iter().map(|(_, lm)| lm).sum();
+
+    let new_params: Vec<(f64, f64)> = (0..n_items)
+        .into_par_iter()
+        .map(|j| {
+            let mut r_k = vec![0.0; n_quad];
+            let mut n_k = vec![0.0; n_quad];
+
+            for i in 0..n_persons {
+                let resp = responses[[i, j]];
+                if resp < 0 {
+                    continue;
+                }
+                for q in 0..n_quad {
+                    let w = posterior_weights[i][q];
+                    n_k[q] += w;
+                    if resp == 1 {
+                        r_k[q] += w;
+                    }
+                }
+            }
+
+            let mut a = disc_init[j];
+            let mut b = diff_init[j];
+
+            for _ in 0..max_m_iter {
+                let mut grad_a = 0.0;
+                let mut grad_b = 0.0;
+                let mut hess_aa = 0.0;
+                let mut hess_bb = 0.0;
+                let mut hess_ab = 0.0;
+
+                for q in 0..n_quad {
+                    if n_k[q] < EPSILON {
+                        continue;
+                    }
+                    let theta = quad_points[q];
+                    let z = a * (theta - b);
+                    let p = sigmoid(z);
+                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
+
+                    let residual = r_k[q] - n_k[q] * p_clipped;
+
+                    grad_a += residual * (theta - b);
+                    grad_b += -residual * a;
+
+                    let info = n_k[q] * p_clipped * (1.0 - p_clipped);
+                    hess_aa += -info * (theta - b) * (theta - b);
+                    hess_bb += -info * a * a;
+                    hess_ab += info * a * (theta - b);
+                }
+
+                hess_aa -= regularization;
+                hess_bb -= regularization;
+
+                let det = hess_aa * hess_bb - hess_ab * hess_ab;
+                if det.abs() < EPSILON {
+                    break;
+                }
+
+                let delta_a = (hess_bb * grad_a - hess_ab * grad_b) / det;
+                let delta_b = (-hess_ab * grad_a + hess_aa * grad_b) / det;
+
+                a = (a - delta_a * damping).clamp(disc_bounds.0, disc_bounds.1);
+                b = (b - delta_b * damping).clamp(diff_bounds.0, diff_bounds.1);
+
+                if delta_a.abs() < m_tol && delta_b.abs() < m_tol {
+                    break;
+                }
+            }
+
+            (a, b)
+        })
+        .collect();
+
+    let disc_new: Array1<f64> = new_params
+        .iter()
+        .map(|(a, _)| *a)
+        .collect::<Vec<_>>()
+        .into();
+    let diff_new: Array1<f64> = new_params
+        .iter()
+        .map(|(_, b)| *b)
+        .collect::<Vec<_>>()
+        .into();
+
+    let mut posterior_arr = ndarray::Array2::zeros((n_persons, n_quad));
+    for (i, pw) in posterior_weights.iter().enumerate() {
+        for (q, &w) in pw.iter().enumerate() {
+            posterior_arr[[i, q]] = w;
+        }
+    }
+
+    (
+        disc_new.to_pyarray(py),
+        diff_new.to_pyarray(py),
+        posterior_arr.to_pyarray(py),
+        log_likelihood,
+    )
+}
+
+/// Single EM iteration for 3PL model (combined E+M step)
+#[pyfunction]
+#[pyo3(signature = (responses, quad_points, quad_weights, discrimination, difficulty, guessing, prior_mean, prior_var, max_m_iter, m_tol, disc_bounds, diff_bounds, guess_bounds, damping_ab, damping_c, regularization, regularization_c))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn em_iteration_3pl<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    quad_points: numpy::PyReadonlyArray1<f64>,
+    quad_weights: numpy::PyReadonlyArray1<f64>,
+    discrimination: numpy::PyReadonlyArray1<f64>,
+    difficulty: numpy::PyReadonlyArray1<f64>,
+    guessing: numpy::PyReadonlyArray1<f64>,
+    prior_mean: f64,
+    prior_var: f64,
+    max_m_iter: usize,
+    m_tol: f64,
+    disc_bounds: (f64, f64),
+    diff_bounds: (f64, f64),
+    guess_bounds: (f64, f64),
+    damping_ab: f64,
+    damping_c: f64,
+    regularization: f64,
+    regularization_c: f64,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<f64>>,
+    f64,
+) {
+    let responses = responses.as_array();
+    let quad_points = quad_points.as_array().to_vec();
+    let quad_weights = quad_weights.as_array().to_vec();
+    let disc_init = discrimination.as_array().to_vec();
+    let diff_init = difficulty.as_array().to_vec();
+    let guess_init = guessing.as_array().to_vec();
+
+    let n_persons = responses.nrows();
+    let n_items = responses.ncols();
+    let n_quad = quad_points.len();
+
+    let log_weights = compute_log_weights(&quad_weights);
+
+    let log_prior: Vec<f64> = quad_points
+        .iter()
+        .map(|&theta| {
+            let z = (theta - prior_mean) / prior_var.sqrt();
+            -0.5 * (std::f64::consts::TAU * prior_var).ln() - 0.5 * z * z
+        })
+        .collect();
+
+    let e_step_results: Vec<(Vec<f64>, f64)> = (0..n_persons)
+        .into_par_iter()
+        .map(|i| {
+            let mut log_joint = vec![0.0; n_quad];
+
+            for q in 0..n_quad {
+                let theta = quad_points[q];
+                let mut ll = 0.0;
+
+                for j in 0..n_items {
+                    let resp = responses[[i, j]];
+                    if resp < 0 {
+                        continue;
+                    }
+                    let z = disc_init[j] * (theta - diff_init[j]);
+                    let p_star = sigmoid(z);
+                    let p = guess_init[j] + (1.0 - guess_init[j]) * p_star;
+                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
+                    if resp == 1 {
+                        ll += p_clipped.ln();
+                    } else {
+                        ll += (1.0 - p_clipped).ln();
+                    }
+                }
+
+                log_joint[q] = ll + log_prior[q] + log_weights[q];
+            }
+
+            let log_marginal = logsumexp(&log_joint);
+            let posterior: Vec<f64> = log_joint
+                .iter()
+                .map(|&lj| (lj - log_marginal).exp())
+                .collect();
+
+            (posterior, log_marginal)
+        })
+        .collect();
+
+    let posterior_weights: Vec<Vec<f64>> = e_step_results.iter().map(|(p, _)| p.clone()).collect();
+    let log_likelihood: f64 = e_step_results.iter().map(|(_, lm)| lm).sum();
+
+    let new_params: Vec<(f64, f64, f64)> = (0..n_items)
+        .into_par_iter()
+        .map(|j| {
+            let mut r_k = vec![0.0; n_quad];
+            let mut n_k = vec![0.0; n_quad];
+
+            for i in 0..n_persons {
+                let resp = responses[[i, j]];
+                if resp < 0 {
+                    continue;
+                }
+                for q in 0..n_quad {
+                    let w = posterior_weights[i][q];
+                    n_k[q] += w;
+                    if resp == 1 {
+                        r_k[q] += w;
+                    }
+                }
+            }
+
+            let mut a = disc_init[j];
+            let mut b = diff_init[j];
+            let mut c = guess_init[j];
+
+            for _ in 0..max_m_iter {
+                let mut grad_a = 0.0;
+                let mut grad_b = 0.0;
+                let mut hess_aa = 0.0;
+                let mut hess_bb = 0.0;
+
+                for q in 0..n_quad {
+                    if n_k[q] < EPSILON {
+                        continue;
+                    }
+                    let theta = quad_points[q];
+                    let z = a * (theta - b);
+                    let p_star = sigmoid(z);
+                    let p = c + (1.0 - c) * p_star;
+                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
+
+                    let dp_da = (1.0 - c) * p_star * (1.0 - p_star) * (theta - b);
+                    let dp_db = -(1.0 - c) * p_star * (1.0 - p_star) * a;
+
+                    let residual = r_k[q] - n_k[q] * p_clipped;
+
+                    grad_a += residual * dp_da / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                    grad_b += residual * dp_db / (p_clipped * (1.0 - p_clipped) + EPSILON);
+
+                    let info = n_k[q] * p_clipped * (1.0 - p_clipped);
+                    hess_aa -= info * dp_da * dp_da / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                    hess_bb -= info * dp_db * dp_db / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                }
+
+                hess_aa -= regularization;
+                hess_bb -= regularization;
+
+                if hess_aa.abs() > EPSILON {
+                    a = (a - grad_a / hess_aa * damping_ab).clamp(disc_bounds.0, disc_bounds.1);
+                }
+                if hess_bb.abs() > EPSILON {
+                    b = (b - grad_b / hess_bb * damping_ab).clamp(diff_bounds.0, diff_bounds.1);
+                }
+
+                let mut grad_c = 0.0;
+                let mut hess_cc = 0.0;
+
+                for q in 0..n_quad {
+                    if n_k[q] < EPSILON {
+                        continue;
+                    }
+                    let theta = quad_points[q];
+                    let z = a * (theta - b);
+                    let p_star = sigmoid(z);
+                    let p = c + (1.0 - c) * p_star;
+                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
+
+                    let dp_dc = 1.0 - p_star;
+                    let residual = r_k[q] - n_k[q] * p_clipped;
+
+                    grad_c += residual * dp_dc / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                    hess_cc -= n_k[q] * dp_dc * dp_dc / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                }
+
+                hess_cc -= regularization_c;
+
+                if hess_cc.abs() > EPSILON {
+                    c = (c - grad_c / hess_cc * damping_c).clamp(guess_bounds.0, guess_bounds.1);
+                }
+
+                if grad_a.abs() < m_tol && grad_b.abs() < m_tol && grad_c.abs() < m_tol {
+                    break;
+                }
+            }
+
+            (a, b, c)
+        })
+        .collect();
+
+    let disc_new: Array1<f64> = new_params
+        .iter()
+        .map(|(a, _, _)| *a)
+        .collect::<Vec<_>>()
+        .into();
+    let diff_new: Array1<f64> = new_params
+        .iter()
+        .map(|(_, b, _)| *b)
+        .collect::<Vec<_>>()
+        .into();
+    let guess_new: Array1<f64> = new_params
+        .iter()
+        .map(|(_, _, c)| *c)
+        .collect::<Vec<_>>()
+        .into();
+
+    let mut posterior_arr = ndarray::Array2::zeros((n_persons, n_quad));
+    for (i, pw) in posterior_weights.iter().enumerate() {
+        for (q, &w) in pw.iter().enumerate() {
+            posterior_arr[[i, q]] = w;
+        }
+    }
+
+    (
+        disc_new.to_pyarray(py),
+        diff_new.to_pyarray(py),
+        guess_new.to_pyarray(py),
+        posterior_arr.to_pyarray(py),
+        log_likelihood,
+    )
+}
+
 /// Register estimation functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(em_fit_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(gibbs_sample_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(mhrm_fit_2pl, m)?)?;
     m.add_function(wrap_pyfunction!(bootstrap_fit_2pl, m)?)?;
+    m.add_function(wrap_pyfunction!(em_iteration_2pl, m)?)?;
+    m.add_function(wrap_pyfunction!(em_iteration_3pl, m)?)?;
     Ok(())
 }

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -132,7 +134,7 @@ def MDIFF(
     else:
         intercept = np.zeros(disc.shape[0])
 
-    mdiff = -intercept / np.maximum(mdisc, 1e-10)
+    mdiff = -intercept / np.maximum(mdisc, PROB_EPSILON)
     return _select_items(mdiff, item_idx)
 
 
@@ -167,7 +169,7 @@ def direction_cosines(
     """
     disc = _get_discrimination_matrix(model)
     mdisc = np.sqrt(np.sum(disc**2, axis=1, keepdims=True))
-    cosines = disc / np.maximum(mdisc, 1e-10)
+    cosines = disc / np.maximum(mdisc, PROB_EPSILON)
     return _select_items(cosines, item_idx)
 
 

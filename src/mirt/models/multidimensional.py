@@ -3,6 +3,8 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 
@@ -69,10 +71,10 @@ class MultidimensionalModel(DichotomousItemModel):
 
         if item_idx is not None:
             z = np.dot(theta, a[item_idx]) + d[item_idx]
-            return 1.0 / (1.0 + np.exp(-z))
+            return sigmoid(z)
 
         z = np.dot(theta, a.T) + d[None, :]
-        return 1.0 / (1.0 + np.exp(-z))
+        return sigmoid(z)
 
     def information(
         self,
@@ -98,7 +100,7 @@ class MultidimensionalModel(DichotomousItemModel):
         d = self._parameters["intercepts"]
 
         a_sum = np.sum(a, axis=1)
-        b = -d / (a_sum + 1e-10)
+        b = -d / (a_sum + PROB_EPSILON)
 
         return {
             "discrimination": a.copy(),

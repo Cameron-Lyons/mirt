@@ -67,6 +67,9 @@ docs = [
 plot = [
     "matplotlib>=3.10.8",
 ]
+gpu = [
+    "torch>=2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/Cameron-Lyons/mirt"

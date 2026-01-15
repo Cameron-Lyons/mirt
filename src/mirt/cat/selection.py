@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -297,9 +299,8 @@ class KullbackLeibler(ItemSelectionStrategy):
         q: NDArray[np.float64],
     ) -> float:
         """Compute KL divergence D(p || q)."""
-        eps = 1e-10
-        p = np.clip(p.ravel(), eps, 1 - eps)
-        q = np.clip(q.ravel(), eps, 1 - eps)
+        p = np.clip(p.ravel(), PROB_EPSILON, 1 - PROB_EPSILON)
+        q = np.clip(q.ravel(), PROB_EPSILON, 1 - PROB_EPSILON)
 
         if len(p) == 1:
             p_full = np.array([p[0], 1 - p[0]])

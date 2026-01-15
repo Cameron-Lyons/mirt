@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -96,7 +98,7 @@ class RegularizedMIRTResult:
             row = f"{item_names[i]:<15}"
             for f in range(n_factors):
                 val = self.loadings[i, f]
-                if abs(val) < 1e-6:
+                if abs(val) < REGULARIZATION_EPSILON:
                     row += f"{'---':>10}"
                 else:
                     row += f"{val:>10.4f}"
@@ -240,7 +242,9 @@ class RegularizedMIRTEstimator(BaseEstimator):
                 latent_density,
                 max_iter=50,
             )
-            self._adaptive_weights = 1.0 / (np.abs(init_loadings) + 1e-6)
+            self._adaptive_weights = 1.0 / (
+                np.abs(init_loadings) + REGULARIZATION_EPSILON
+            )
         else:
             self._adaptive_weights = np.ones_like(loadings)
 
@@ -278,7 +282,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
         model.set_parameters(slopes=loadings, intercepts=intercepts)
         model._is_fitted = True
 
-        n_nonzero = int(np.sum(np.abs(loadings) > 1e-6))
+        n_nonzero = int(np.sum(np.abs(loadings) > REGULARIZATION_EPSILON))
         n_params = n_nonzero + n_items
 
         aic = -2 * current_ll + 2 * n_params
@@ -364,8 +368,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
         for q in range(n_quad):
             theta_q = quad_points[q]
             z = np.dot(theta_q, loadings.T) + intercepts
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = sigmoid(z)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
             valid = responses >= 0
             ll = np.zeros(n_persons)
@@ -449,8 +453,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
                     partial_z = np.dot(quad_points, new_loadings[j]) + new_intercepts[j]
                     partial_z -= quad_points[:, k] * new_loadings[j, k]
 
-                    p_partial = 1.0 / (1.0 + np.exp(-partial_z))
-                    p_partial = np.clip(p_partial, 1e-10, 1 - 1e-10)
+                    p_partial = sigmoid(partial_z)
+                    p_partial = np.clip(p_partial, PROB_EPSILON, 1 - PROB_EPSILON)
 
                     residual = r_k - n_k * p_partial
                     x_k = quad_points[:, k]
@@ -458,7 +462,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
                     gradient = np.sum(residual * x_k)
                     hessian = -np.sum(n_k * p_partial * (1 - p_partial) * x_k * x_k)
 
-                    if abs(hessian) < 1e-10:
+                    if abs(hessian) < PROB_EPSILON:
                         continue
 
                     unpenalized = new_loadings[j, k] - gradient / hessian
@@ -483,14 +487,14 @@ class RegularizedMIRTEstimator(BaseEstimator):
                         new_loadings[j, k] = shrunk / (1 + 2 * ridge_part / (-hessian))
 
                 z = np.dot(quad_points, new_loadings[j]) + new_intercepts[j]
-                p = 1.0 / (1.0 + np.exp(-z))
-                p = np.clip(p, 1e-10, 1 - 1e-10)
+                p = sigmoid(z)
+                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 residual = r_k - n_k * p
                 gradient = np.sum(residual)
                 hessian = -np.sum(n_k * p * (1 - p))
 
-                if abs(hessian) > 1e-10:
+                if abs(hessian) > PROB_EPSILON:
                     new_intercepts[j] -= gradient / hessian
 
             if np.max(np.abs(new_loadings - loadings_old)) < self.cd_tol:
@@ -559,8 +563,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
             n_k = np.sum(posterior_weights[valid], axis=0)
 
             z = intercepts[j]
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = sigmoid(z)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
             residual = r_k - n_k * p
 

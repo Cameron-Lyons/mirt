@@ -6,6 +6,9 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     pass
 
@@ -454,8 +457,8 @@ class IRTreeModel:
                 b = self._parameters["difficulty"][item_idx, node_idx]
 
                 z = a * (theta[:, trait_idx] - b)
-                p_node = 1.0 / (1.0 + np.exp(-z))
-                p_node = np.clip(p_node, 1e-10, 1 - 1e-10)
+                p_node = sigmoid(z)
+                p_node = np.clip(p_node, PROB_EPSILON, 1 - PROB_EPSILON)
 
                 if decision == 1:
                     cat_prob *= p_node
@@ -494,7 +497,7 @@ class IRTreeModel:
                 resp = responses[i, j]
                 if resp >= 0:
                     p = probs[i, j, resp]
-                    ll[i] += np.log(np.clip(p, 1e-10, 1.0))
+                    ll[i] += np.log(np.clip(p, PROB_EPSILON, 1.0))
 
         return ll
 

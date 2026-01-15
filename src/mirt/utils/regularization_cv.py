@@ -6,6 +6,8 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.estimation.regularized import RegularizedMIRTEstimator, RegularizedMIRTResult
 
 
@@ -227,8 +229,8 @@ def _compute_test_ll(
                 continue
 
             z = np.dot(theta, loadings[j]) + intercepts[j]
-            p = 1.0 / (1.0 + np.exp(-z))
-            p = np.clip(p, 1e-10, 1 - 1e-10)
+            p = sigmoid(z)
+            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
             if test_data[i, j] == 1:
                 ll += np.log(p)

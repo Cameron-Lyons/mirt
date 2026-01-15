@@ -3,6 +3,14 @@ from typing import Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._gpu_backend import (
+    GPU_AVAILABLE,
+    get_gpu_device_name,
+    get_gpu_memory_info,
+    is_gpu_available,  # noqa: F401
+    is_torch_available,
+)
+from mirt._rust_backend import RUST_AVAILABLE, is_rust_available  # noqa: F401
 from mirt._version import __version__
 from mirt.cat import CATEngine, CATResult, CATState
 from mirt.diagnostics.comparison import (
@@ -15,6 +23,57 @@ from mirt.diagnostics.drf import compute_drf, compute_item_drf, reliability_inva
 from mirt.diagnostics.dtf import compute_dtf
 from mirt.diagnostics.modelfit import compute_fit_indices, compute_m2
 from mirt.diagnostics.sibtest import sibtest, sibtest_items
+from mirt.equating import (
+    AnchorDiagnostics,
+    ChainLinkingResult,
+    DriftResult,
+    LinkingConstants,
+    LinkingFitStatistics,
+    LinkingResult,
+    PolytomousLinkingResult,
+    ProcrustesResult,
+    ScoreEquatingResult,
+    TimePointModel,
+    accumulate_constants,
+    bootstrap_linking_se,
+    chain_link,
+    chain_linking_summary,
+    compare_linking_methods,
+    compute_linking_fit,
+    compute_mirt_linking_fit,
+    compute_see,
+    concurrent_link,
+    delta_method_se,
+    detect_drift,
+    detect_longitudinal_drift,
+    equipercentile_equating,
+    factor_congruence_coefficient,
+    link,
+    link_gpcm,
+    link_grm,
+    link_mirt,
+    link_nrm,
+    linking_summary,
+    lord_wingersky_recursion,
+    match_factors,
+    mirt_linking_summary,
+    oblique_procrustes_rotation,
+    observed_score_equating,
+    orthogonal_procrustes_rotation,
+    parameter_recovery_summary,
+    purify_anchors,
+    score_equating_summary,
+    score_to_theta,
+    signed_area_difference,
+    target_rotation,
+    theta_to_score,
+    transform_mirt_parameters,
+    transform_parameters,
+    transform_polytomous_parameters,
+    transform_theta_to_reference,
+    transform_to_reference,
+    true_score_equating,
+)
 from mirt.estimation.bl import BLEstimator
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import EmpiricalHistogramWoods
@@ -709,6 +768,56 @@ __all__ = [
     "InvarianceTestResult",
     "ParameterLink",
     "invariance_lrt",
+    # Equating and linking
+    "link",
+    "transform_parameters",
+    "LinkingConstants",
+    "LinkingResult",
+    "LinkingFitStatistics",
+    "AnchorDiagnostics",
+    "detect_drift",
+    "purify_anchors",
+    "signed_area_difference",
+    "DriftResult",
+    "bootstrap_linking_se",
+    "delta_method_se",
+    "compute_linking_fit",
+    "linking_summary",
+    "compare_linking_methods",
+    "parameter_recovery_summary",
+    "link_grm",
+    "link_gpcm",
+    "link_nrm",
+    "transform_polytomous_parameters",
+    "PolytomousLinkingResult",
+    "link_mirt",
+    "orthogonal_procrustes_rotation",
+    "oblique_procrustes_rotation",
+    "transform_mirt_parameters",
+    "factor_congruence_coefficient",
+    "match_factors",
+    "compute_mirt_linking_fit",
+    "target_rotation",
+    "mirt_linking_summary",
+    "ProcrustesResult",
+    "true_score_equating",
+    "observed_score_equating",
+    "lord_wingersky_recursion",
+    "equipercentile_equating",
+    "score_to_theta",
+    "theta_to_score",
+    "score_equating_summary",
+    "compute_see",
+    "ScoreEquatingResult",
+    "chain_link",
+    "accumulate_constants",
+    "transform_to_reference",
+    "transform_theta_to_reference",
+    "concurrent_link",
+    "chain_linking_summary",
+    "detect_longitudinal_drift",
+    "ChainLinkingResult",
+    "TimePointModel",
 ]
 
 if _HAS_PLOTTING:
@@ -724,3 +833,123 @@ if _HAS_PLOTTING:
             "plot_se",
         ]
     )
+
+__all__.extend(
+    [
+        "GPU_AVAILABLE",
+        "RUST_AVAILABLE",
+        "is_gpu_available",
+        "is_rust_available",
+        "is_torch_available",
+        "get_gpu_device_name",
+        "get_gpu_memory_info",
+        "get_backend_info",
+        "set_backend",
+        "get_backend",
+    ]
+)
+
+
+_CURRENT_BACKEND: Literal["auto", "gpu", "rust", "numpy"] = "auto"
+
+
+def set_backend(backend: Literal["auto", "gpu", "rust", "numpy"]) -> None:
+    """Set the computational backend for IRT operations.
+
+    Parameters
+    ----------
+    backend : {"auto", "gpu", "rust", "numpy"}
+        Backend to use:
+
+        - "auto": Automatically select the fastest available backend.
+          Priority: GPU > Rust > NumPy
+        - "gpu": Use PyTorch GPU acceleration (requires torch with CUDA).
+        - "rust": Use Rust backend (requires compiled extension).
+        - "numpy": Use pure NumPy implementation (always available).
+
+    Raises
+    ------
+    ValueError
+        If requested backend is not available.
+
+    Examples
+    --------
+    >>> import mirt
+    >>> mirt.set_backend("gpu")  # Use GPU if available
+    >>> mirt.set_backend("auto")  # Auto-select best backend
+    """
+    global _CURRENT_BACKEND
+
+    if backend not in ("auto", "gpu", "rust", "numpy"):
+        raise ValueError(
+            f"Invalid backend '{backend}'. Must be one of: 'auto', 'gpu', 'rust', 'numpy'"
+        )
+
+    if backend == "gpu" and not GPU_AVAILABLE:
+        raise ValueError(
+            "GPU backend requested but not available. "
+            "Install PyTorch with CUDA support: pip install torch"
+        )
+
+    if backend == "rust" and not RUST_AVAILABLE:
+        raise ValueError(
+            "Rust backend requested but not available. "
+            "Ensure the package was installed with Rust extension."
+        )
+
+    _CURRENT_BACKEND = backend
+
+
+def get_backend() -> Literal["auto", "gpu", "rust", "numpy"]:
+    """Get the currently configured backend.
+
+    Returns
+    -------
+    str
+        Current backend setting.
+    """
+    return _CURRENT_BACKEND
+
+
+def get_backend_info() -> dict[str, Any]:
+    """Get information about available computational backends.
+
+    Returns
+    -------
+    dict
+        Dictionary containing:
+
+        - current_backend: Currently selected backend
+        - effective_backend: Backend that will actually be used (for "auto")
+        - gpu_available: Whether GPU acceleration is available
+        - gpu_device: Name of GPU device (if available)
+        - gpu_memory: GPU memory info (if available)
+        - rust_available: Whether Rust backend is available
+        - torch_available: Whether PyTorch is installed
+
+    Examples
+    --------
+    >>> import mirt
+    >>> info = mirt.get_backend_info()
+    >>> print(f"Using: {info['effective_backend']}")
+    >>> if info['gpu_available']:
+    ...     print(f"GPU: {info['gpu_device']}")
+    """
+    effective = _CURRENT_BACKEND
+    if effective == "auto":
+        if GPU_AVAILABLE:
+            effective = "gpu"
+        elif RUST_AVAILABLE:
+            effective = "rust"
+        else:
+            effective = "numpy"
+
+    return {
+        "current_backend": _CURRENT_BACKEND,
+        "effective_backend": effective,
+        "gpu_available": GPU_AVAILABLE,
+        "gpu_device": get_gpu_device_name(),
+        "gpu_memory": get_gpu_memory_info(),
+        "rust_available": RUST_AVAILABLE,
+        "torch_available": is_torch_available(),
+    }

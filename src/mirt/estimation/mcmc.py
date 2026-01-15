@@ -16,6 +16,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -319,7 +321,7 @@ class MHRMEstimator(BaseEstimator):
             resp_j = responses[valid, j]
 
             prob = model.probability(theta_j, j)
-            prob = np.clip(prob, 1e-10, 1 - 1e-10)
+            prob = np.clip(prob, PROB_EPSILON, 1 - PROB_EPSILON)
 
             residual = resp_j - prob
 

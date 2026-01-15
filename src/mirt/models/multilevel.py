@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Literal, Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.constants import PROB_EPSILON
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -485,11 +487,11 @@ class CrossedRandomEffectsModel:
             rater_effect = self._rater_effects[rater_idx]
 
             if base_prob.ndim == 1:
-                log_odds = np.log(base_prob / (1 - base_prob + 1e-10))
+                log_odds = np.log(base_prob / (1 - base_prob + PROB_EPSILON))
                 adjusted_log_odds = log_odds + rater_effect
                 base_prob = 1 / (1 + np.exp(-adjusted_log_odds))
             else:
-                log_odds = np.log(base_prob / (1 - base_prob + 1e-10))
+                log_odds = np.log(base_prob / (1 - base_prob + PROB_EPSILON))
                 adjusted_log_odds = log_odds + rater_effect
                 base_prob = 1 / (1 + np.exp(-adjusted_log_odds))
 
