@@ -9,7 +9,13 @@ from mirt.diagnostics.bayesian import (
     psis_loo,
     waic,
 )
-from mirt.diagnostics.dif import compute_dif, flag_dif_items
+from mirt.diagnostics.dif import (
+    compute_dif,
+    compute_grdif,
+    compute_pairwise_rdif,
+    flag_dif_items,
+    grdif_effect_size,
+)
 from mirt.diagnostics.itemfit import compute_itemfit
 from mirt.diagnostics.ld import (
     LDResult,
@@ -32,6 +38,9 @@ __all__ = [
     "compute_itemfit",
     "compute_personfit",
     "compute_dif",
+    "compute_grdif",
+    "compute_pairwise_rdif",
+    "grdif_effect_size",
     "flag_dif_items",
     "compute_ld_statistics",
     "compute_q3",

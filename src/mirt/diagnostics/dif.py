@@ -76,7 +76,7 @@ def compute_dif(
     elif method == "wald":
         return _dif_wald(ref_result, focal_result, n_items)
     elif method == "lord":
-        return _dif_lord(ref_result, focal_result, n_items)
+        return _dif_wald(ref_result, focal_result, n_items)  # Lord's test uses Wald
     elif method == "raju":
         return _dif_raju(ref_result, focal_result, n_items)
     else:
@@ -201,15 +201,6 @@ def _dif_wald(
         "effect_size": effect_sizes,
         "classification": classification,
     }
-
-
-def _dif_lord(
-    ref_result: FitResult,
-    focal_result: FitResult,
-    n_items: int,
-) -> dict[str, NDArray[np.float64]]:
-    """Lord's chi-square test for DIF."""
-    return _dif_wald(ref_result, focal_result, n_items)
 
 
 def _dif_raju(
