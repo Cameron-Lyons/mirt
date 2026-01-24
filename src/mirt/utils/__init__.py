@@ -102,21 +102,16 @@ from mirt.utils.transform import (
 )
 
 __all__ = [
-    # Core utilities
     "sigmoid",
-    # Simulation
     "simdata",
-    # Data validation
     "validate_responses",
     "set_dataframe_backend",
-    # Rotation
     "rotate_loadings",
     "varimax",
     "promax",
     "oblimin",
     "apply_rotation_to_model",
     "get_rotated_loadings",
-    # Cross-validation
     "cross_validate",
     "CVResult",
     "Splitter",
@@ -127,11 +122,9 @@ __all__ = [
     "LogLikelihoodScorer",
     "AICScorer",
     "BICScorer",
-    # Batch fitting
     "fit_models",
     "fit_model_grid",
     "BatchFitResult",
-    # Information functions
     "testinfo",
     "iteminfo",
     "areainfo",
@@ -140,33 +133,27 @@ __all__ = [
     "expected_test_score",
     "gen_difficulty",
     "theta_for_score",
-    # Reliability
     "marginal_rxx",
     "empirical_rxx",
     "sem",
-    # Classical test theory
     "traditional",
     "TraditionalStats",
     "item_fit_chisq",
-    # Statistical tests
     "wald",
     "lagrange",
     "likelihood_ratio",
     "WaldTestResult",
     "LagrangeTestResult",
-    # Model extraction
     "mod2values",
     "extract_item",
     "coef",
     "itemplot_data",
     "ModelValues",
     "ItemParameters",
-    # Multidimensional indices
     "MDIFF",
     "MDISC",
     "direction_cosines",
     "composite_score_weights",
-    # Empirical analysis
     "empirical_ES",
     "empirical_plot",
     "empirical_rmsea",
@@ -175,27 +162,22 @@ __all__ = [
     "weighted_RMSD_DIF",
     "DIFEffectSize",
     "EmpiricalPlotData",
-    # Clinical utilities
     "RCI",
     "RCIResult",
     "clinical_significance",
-    # Residuals
     "residuals",
     "ResidualResult",
     "Q3",
     "LD_X2",
-    # Calibration and equating
     "fixed_calib",
     "equate",
     "transform_theta",
     "CalibrationResult",
     "EquatingResult",
-    # Confidence intervals
     "PLCI",
     "PLCIResult",
     "score_CI",
     "delta_method",
-    # Data transformation
     "key2binary",
     "poly2dich",
     "reverse_score",
@@ -203,12 +185,10 @@ __all__ = [
     "collapse_table",
     "recode_responses",
     "likert2int",
-    # Parameter sampling
     "draw_parameters",
     "ParameterSamples",
     "posterior_summary",
     "sample_expected_scores",
-    # Mixed model predictions
     "randef",
     "fixef",
     "predict_mixed",
