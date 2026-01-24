@@ -106,32 +106,27 @@ from mirt.equating.vertical import (
 )
 
 __all__ = [
-    # Core linking
     "link",
     "transform_parameters",
     "LinkingConstants",
     "LinkingResult",
     "LinkingFitStatistics",
     "AnchorDiagnostics",
-    # Drift detection
     "detect_drift",
     "purify_anchors",
     "signed_area_difference",
     "DriftResult",
-    # Diagnostics
     "bootstrap_linking_se",
     "delta_method_se",
     "compute_linking_fit",
     "linking_summary",
     "compare_linking_methods",
     "parameter_recovery_summary",
-    # Polytomous linking
     "link_grm",
     "link_gpcm",
     "link_nrm",
     "transform_polytomous_parameters",
     "PolytomousLinkingResult",
-    # Multidimensional linking
     "link_mirt",
     "orthogonal_procrustes_rotation",
     "oblique_procrustes_rotation",
@@ -142,7 +137,6 @@ __all__ = [
     "target_rotation",
     "mirt_linking_summary",
     "ProcrustesResult",
-    # Score equating
     "true_score_equating",
     "observed_score_equating",
     "lord_wingersky_recursion",
@@ -152,7 +146,6 @@ __all__ = [
     "score_equating_summary",
     "compute_see",
     "ScoreEquatingResult",
-    # Chain linking
     "chain_link",
     "accumulate_constants",
     "transform_to_reference",
@@ -162,7 +155,6 @@ __all__ = [
     "detect_longitudinal_drift",
     "ChainLinkingResult",
     "TimePointModel",
-    # Vertical scaling
     "vertical_scale",
     "compute_vertical_diagnostics",
     "vertical_scale_summary",

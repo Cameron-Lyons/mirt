@@ -76,7 +76,7 @@ def compute_dif(
     elif method == "wald":
         return _dif_wald(ref_result, focal_result, n_items)
     elif method == "lord":
-        return _dif_wald(ref_result, focal_result, n_items)  # Lord's test uses Wald
+        return _dif_wald(ref_result, focal_result, n_items)
     elif method == "raju":
         return _dif_raju(ref_result, focal_result, n_items)
     else:
