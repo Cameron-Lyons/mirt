@@ -115,7 +115,6 @@ from mirt.cat.stopping import (
 )
 
 __all__ = [
-    # Unidimensional CAT
     "CATEngine",
     "CATResult",
     "CATState",
@@ -135,7 +134,6 @@ __all__ = [
     "ClassificationStop",
     "CombinedStop",
     "create_stopping_rule",
-    # Multidimensional CAT
     "MCATEngine",
     "MCATResult",
     "MCATState",
@@ -156,7 +154,6 @@ __all__ = [
     "ThetaChangeMCATStop",
     "CombinedMCATStop",
     "create_mcat_stopping_rule",
-    # Shared
     "ExposureControl",
     "NoExposureControl",
     "SympsonHetter",

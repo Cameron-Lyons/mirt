@@ -768,7 +768,6 @@ __all__ = [
     "InvarianceTestResult",
     "ParameterLink",
     "invariance_lrt",
-    # Equating and linking
     "link",
     "transform_parameters",
     "LinkingConstants",
