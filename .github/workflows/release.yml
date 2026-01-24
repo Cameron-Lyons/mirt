@@ -189,7 +189,7 @@ jobs:
           print(f'MIRT version: {mirt.__version__}')
 
           # Test basic imports
-          from mirt import Model2PL, Model3PL, GradedResponseModel
+          from mirt import TwoParameterLogistic, ThreeParameterLogistic, GradedResponseModel
           from mirt import EMEstimator
 
           # Test Rust backend is loaded
@@ -198,7 +198,7 @@ jobs:
 
           # Test basic model creation
           import numpy as np
-          model = Model2PL(n_items=10, n_factors=1)
+          model = TwoParameterLogistic(n_items=10, n_factors=1)
           print('Model creation successful')
 
           print('All smoke tests passed!')
