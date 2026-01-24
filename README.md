@@ -33,12 +33,14 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Stopping rules: SE threshold, max items, classification
 - Exposure control: Sympson-Hetter, randomesque, progressive
 - Content balancing: Blueprint constraints
+- **MCAT**: Multidimensional CAT with D-optimality and trace criteria
 
 ### Diagnostics & DIF
 - **Item fit**: Infit, outfit, S-X2
 - **Person fit**: Zh, lz, infit/outfit
 - **Model fit**: M2, RMSEA, CFI, TLI, SRMSR
 - **DIF analysis**: Likelihood ratio, Wald, Lord, Raju
+- **GRDIF**: Generalized Residual DIF for multiple groups with robust scaling (MAD/IQR)
 - **DTF/DRF**: Differential test/response functioning
 - **SIBTEST**: Simultaneous item bias test
 - **Local dependence**: Q3, chi-square residuals
@@ -52,9 +54,11 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Plotting (ICC, information, Wright maps, DIF)
 - DataFrame output (pandas or polars)
 - Fixed-item calibration and test equating
+- **Vertical scaling**: Grade-level linking with growth constraints
 - Reliable Change Index (RCI) for clinical significance
 - Profile-likelihood confidence intervals
 - Posterior parameter sampling
+- **HTML reports**: Automated IRT analysis report generation
 
 ## Installation
 
@@ -173,6 +177,17 @@ dif_lr = mirt.dif(responses, groups, method="likelihood_ratio")
 dif_wald = mirt.dif(responses, groups, method="wald")
 dif_lord = mirt.dif(responses, groups, method="lord")
 dif_raju = mirt.dif(responses, groups, method="raju")
+
+# GRDIF for multiple groups (3+ groups supported)
+from mirt.diagnostics.dif import compute_grdif
+
+groups_multi = np.array(["A"] * 200 + ["B"] * 200 + ["C"] * 200)
+grdif_result = compute_grdif(
+    responses, groups_multi,
+    model="2PL",
+    scaling_method="mad",  # Robust to outliers (or "mean", "iqr")
+)
+print(f"Flagged items: {np.where(grdif_result['flagged_rs'])[0]}")
 ```
 
 ### Multiple Group Analysis
@@ -211,6 +226,18 @@ while not state.is_complete:
 
 final = cat.get_result()
 print(final.summary())
+
+# Multidimensional CAT (MCAT)
+from mirt.cat import MCATEngine
+
+mcat = MCATEngine(
+    mirt_model,  # Multidimensional model
+    selection_method="D-optimality",  # or "A-optimality", "trace"
+    max_items=30,
+)
+mcat_result = mcat.run_simulation(true_theta=np.array([0.5, -0.3]))
+print(f"Estimated theta: {mcat_result.theta}")
+print(f"Covariance: {mcat_result.theta_cov}")
 ```
 
 ### Advanced Models
@@ -277,6 +304,35 @@ print(f"Scale transformation: theta_new = {equating.A:.3f} * theta_old + {equati
 q3_matrix = Q3(result.model, responses, scores.theta)
 resid = residuals(result.model, responses, scores.theta)
 print(f"Max Q3 (off-diagonal): {np.max(np.abs(np.triu(q3_matrix, 1))):.3f}")
+```
+
+### Vertical Scaling
+
+```python
+from mirt.equating import vertical_scale, GradeData, compute_vertical_diagnostics
+
+# Define grade-level data with anchor items
+grade_data = [
+    GradeData("Grade 3", responses_g3, anchor_items_above=[0, 1, 2, 3, 4]),
+    GradeData("Grade 4", responses_g4, anchor_items_below=[10, 11, 12, 13, 14],
+              anchor_items_above=[0, 1, 2, 3, 4]),
+    GradeData("Grade 5", responses_g5, anchor_items_below=[10, 11, 12, 13, 14]),
+]
+
+# Create vertical scale
+result = vertical_scale(
+    grade_data,
+    method="chain",  # or "concurrent", "fixed_anchor", "floating_anchor"
+    enforce_monotonicity=True,
+)
+
+# View growth curve
+print(f"Grade means: {result.grade_means}")
+print(f"Growth curve: {result.growth_curve}")
+
+# Diagnostics
+diagnostics = compute_vertical_diagnostics(result, grade_data)
+print(f"Grade separation (effect sizes): {diagnostics.grade_separation}")
 ```
 
 ### Plotting
@@ -360,6 +416,8 @@ plot_person_item_map(result.model, scores.theta)
 | `compute_dtf()` | Differential test functioning |
 | `compute_drf()` | Differential response functioning |
 | `sibtest()` | SIBTEST DIF detection |
+| `compute_grdif()` | Multi-group GRDIF with robust scaling |
+| `vertical_scale()` | Vertical scaling for grade linking |
 
 ### Utility Functions
 
@@ -413,9 +471,11 @@ plot_person_item_map(result.model, scores.theta)
 | Cognitive diagnostic | mirtCAT separate | Built-in (DINA, DINO) |
 | Estimation | EM, MHRM, MCMC | EM, GVEM, Sparse Bayesian, MHRM, MCMC |
 | Automatic structure discovery | No | Yes (spike-slab LASSO) |
-| CAT | mirtCAT package | Built-in |
-| DIF | Yes | Yes (LR, Wald, Lord, Raju) |
+| CAT | mirtCAT package | Built-in (unidimensional + MCAT) |
+| DIF | Yes | Yes (LR, Wald, Lord, Raju, GRDIF) |
 | Multiple groups | Full support | Full support |
+| Vertical scaling | plink package | Built-in |
+| HTML reports | No | Built-in |
 | Rust acceleration | No | Yes (see below) |
 
 ## Rust Acceleration
