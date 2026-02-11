@@ -378,7 +378,12 @@ class DavidianCurve(LatentDensity):
         g(x) = sum_k c_k * H_k(x), the integral is sum_k c_k^2 * k!
         due to orthogonality of Hermite polynomials.
         """
-        factorials = np.array([np.math.factorial(k) for k in range(self.degree + 1)])
+        factorials = np.array(
+            [
+                int(np.prod(np.arange(1, k + 1))) if k > 0 else 1
+                for k in range(self.degree + 1)
+            ]
+        )
         norm_sq = np.sum(self._coeffs**2 * factorials)
         if norm_sq > 0:
             self._coeffs = self._coeffs / np.sqrt(norm_sq)
