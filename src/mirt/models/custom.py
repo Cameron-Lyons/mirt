@@ -459,9 +459,7 @@ STANDARD_3PL = create_item_type(
 
 LOGISTIC_DEVIATION = create_item_type(
     name="LogisticDeviation",
-    icc_function=lambda theta, alpha, delta: (
-        1 / (1 + np.exp(-(alpha + delta * theta)))
-    ),
+    icc_function=lambda theta, alpha, delta: 1 / (1 + np.exp(-(alpha + delta * theta))),
     par_names=["alpha", "delta"],
     par_bounds={"alpha": (-5.0, 5.0), "delta": (0.01, 5.0)},
     par_defaults={"alpha": 0.0, "delta": 1.0},
