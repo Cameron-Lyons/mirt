@@ -162,7 +162,13 @@ def cv_select_lambda(
                     score = -result.ebic
 
                 scores_for_lambda.append(score)
-            except Exception:
+            except (
+                ValueError,
+                RuntimeError,
+                ArithmeticError,
+                FloatingPointError,
+                np.linalg.LinAlgError,
+            ):
                 scores_for_lambda.append(np.nan)
 
         fold_scores[lam_idx] = scores_for_lambda

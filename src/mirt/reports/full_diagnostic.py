@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -96,8 +97,18 @@ class FullDiagnosticReport(ReportBuilder):
                     self.fit_result.model, self.responses, self.theta
                 )
                 sections.append(self._build_ld_section(ld_results))
-            except Exception:
-                pass
+            except (
+                ImportError,
+                ValueError,
+                RuntimeError,
+                ArithmeticError,
+                np.linalg.LinAlgError,
+            ) as exc:
+                warnings.warn(
+                    f"Skipping local dependence section due to diagnostic error: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         sections.append(section("Visualizations", ""))
 

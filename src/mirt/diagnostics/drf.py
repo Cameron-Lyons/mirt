@@ -319,7 +319,13 @@ def reliability_invariance(
             boot_rel_focal = _compute_marginal_reliability(boot_focal.model, (-4, 4))
 
             boot_diffs.append(boot_rel_ref - boot_rel_focal)
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
             continue
 
     if len(boot_diffs) < 10:

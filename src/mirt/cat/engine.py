@@ -327,7 +327,13 @@ class CATEngine:
             )
             self._current_theta = float(result.theta.ravel()[0])
             self._current_se = float(result.standard_error.ravel()[0])
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
             self._current_theta = self._simple_theta_estimate()
             self._current_se = self._simple_se_estimate()
 

@@ -275,7 +275,13 @@ def fit_model_grid(
 
                     if verbose:
                         print(f"  BIC={result.bic:.2f}, converged={result.converged}")
-                except Exception as e:
+                except (
+                    ValueError,
+                    RuntimeError,
+                    ArithmeticError,
+                    FloatingPointError,
+                    np.linalg.LinAlgError,
+                ) as e:
                     if verbose:
                         print(f"  Failed: {e}")
                     continue

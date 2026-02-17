@@ -8,6 +8,7 @@ This module provides nonparametric bootstrap procedures for:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
@@ -113,7 +114,19 @@ def bootstrap_se(
                         boot_estimates[name] = []
                     boot_estimates[name].append(np.asarray(values))
 
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ) as exc:
+            if verbose:
+                warnings.warn(
+                    f"Bootstrap replicate failed and was skipped: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             continue
 
     se_results: dict[str, NDArray[np.float64]] = {}
@@ -235,7 +248,19 @@ def bootstrap_ci(
                     if name in boot_estimates:
                         boot_estimates[name].append(np.asarray(values))
 
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ) as exc:
+            if verbose:
+                warnings.warn(
+                    f"Bootstrap CI replicate failed and was skipped: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             continue
 
     ci_results: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
@@ -292,7 +317,13 @@ def bootstrap_ci(
                         mask[i] = False
                         padded[mask] = scores.theta.ravel()
                         jackknife_estimates.append(padded)
-                except Exception:
+                except (
+                    ValueError,
+                    RuntimeError,
+                    ArithmeticError,
+                    FloatingPointError,
+                    np.linalg.LinAlgError,
+                ):
                     pass
 
             if len(jackknife_estimates) > 10:
@@ -439,7 +470,19 @@ def parametric_bootstrap(
                 if name not in boot_estimates:
                     boot_estimates[name] = []
                 boot_estimates[name].append(values.copy())
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ) as exc:
+            if verbose:
+                warnings.warn(
+                    f"Parametric bootstrap replicate failed and was skipped: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             continue
 
     se_results: dict[str, NDArray[np.float64]] = {}

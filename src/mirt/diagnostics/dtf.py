@@ -198,7 +198,13 @@ def _bootstrap_dtf_se(
 
             boot_dtf.append(dtf)
 
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
             continue
 
     if len(boot_dtf) < 10:
