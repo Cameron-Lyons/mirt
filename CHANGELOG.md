@@ -11,10 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Minimum Python version lowered from 3.14 to 3.11 for broader compatibility
 - Development status updated to Production/Stable
 - CI now tests on Python 3.11, 3.12, 3.13, and 3.14
+- Top-level API now lazy-loads heavy equating/multigroup/plotting/report symbols to reduce import overhead
+- Dataset constants in `mirt.utils.datasets` are now lazily materialized on first access instead of import time
+- Replaced broad `except Exception` handlers with narrower recoverable exception classes in reliability-critical modules
 
 ### Added
 - Custom exception hierarchy for better error handling
 - Improved docstring coverage across all modules
+- CI performance smoke-test job and weekly scheduled slow-test job
+- Performance regression smoke tests for import time and small-model fit time
 
 ## [0.1.11] - 2025-01-08
 

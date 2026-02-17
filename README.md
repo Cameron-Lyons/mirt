@@ -538,20 +538,27 @@ mirt.set_dataframe_backend("pandas")  # or "polars"
 # Clone and install
 git clone https://github.com/Cameron-Lyons/mirt.git
 cd mirt
-pip install -e ".[dev]"
+uv venv
+uv pip install -e ".[dev]"
 
 # Build Rust extension
-maturin develop --release
+uv run maturin develop --release
 
 # Run tests
-pytest
+uv run pytest
 
 # Type checking
-mypy src/mirt
+uv run mypy src/mirt
 
 # Formatting
-black src tests
-ruff check src tests
+uv run ruff format src tests
+uv run ruff check src tests
+
+# Slow tests (scheduled in CI)
+uv run pytest -m slow
+
+# Performance smoke tests
+uv run pytest tests/test_performance_smoke.py
 ```
 
 ## API Stability (v1.0)
