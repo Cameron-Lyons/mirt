@@ -168,7 +168,13 @@ def _impute_em(
             result = fit_mirt(imputed, model=model, verbose=False)
             scores = fscores(result.model, imputed, method="EAP")
             theta = scores.theta
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
             return _impute_random(responses, missing_mask, rng)
 
         old_imputed = imputed.copy()
@@ -219,7 +225,13 @@ def _impute_multiple(
 
     try:
         result = fit_mirt(initial, model=model, verbose=False)
-    except Exception:
+    except (
+        ValueError,
+        RuntimeError,
+        ArithmeticError,
+        FloatingPointError,
+        np.linalg.LinAlgError,
+    ):
         return [
             _impute_random(responses, missing_mask, rng) for _ in range(n_imputations)
         ]

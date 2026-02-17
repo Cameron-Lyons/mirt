@@ -359,7 +359,13 @@ class MCATEngine:
 
             self._current_covariance = np.diag(se_arr**2)
 
-        except Exception:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
             pass
 
     def get_result(self) -> MCATResult:

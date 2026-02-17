@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Run weekly slow-test suite on Sundays at 08:00 UTC
+    - cron: "0 8 * * 0"
 
 jobs:
   lint:
@@ -165,3 +168,99 @@ jobs:
         with:
           files: coverage.xml
           fail_ci_if_error: false
+
+  performance:
+    name: Performance Smoke Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-performance-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-performance-
+
+      - name: Cache UV
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-performance-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-performance-
+
+      - name: Install dependencies and build
+        run: |
+          uv venv
+          uv pip install maturin
+          uv pip install -e ".[dev]"
+          uv run maturin develop --release
+
+      - name: Run performance regression smoke tests
+        env:
+          MIRT_IMPORT_THRESHOLD_SECONDS: "2.5"
+          MIRT_FIT_THRESHOLD_SECONDS: "12.0"
+        run: uv run pytest tests/test_performance_smoke.py -v --tb=short
+
+  slow-tests:
+    name: Slow Test Suite
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-slow-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-slow-
+
+      - name: Cache UV
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/uv
+          key: ${{ runner.os }}-uv-slow-${{ hashFiles('**/pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-uv-slow-
+
+      - name: Install dependencies and build
+        run: |
+          uv venv
+          uv pip install maturin
+          uv pip install -e ".[dev]"
+          uv run maturin develop --release
+
+      - name: Run slow tests
+        run: uv run pytest tests/ -v -m slow --tb=short

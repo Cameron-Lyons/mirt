@@ -210,7 +210,13 @@ def _fit_single_start(args: tuple) -> tuple[float, FitResult] | tuple[float, Non
     try:
         result = estimator.fit(trial_model, responses)
         return (result.log_likelihood, result)
-    except Exception:
+    except (
+        ValueError,
+        RuntimeError,
+        ArithmeticError,
+        FloatingPointError,
+        np.linalg.LinAlgError,
+    ):
         return (-np.inf, None)
 
 
@@ -289,7 +295,13 @@ def multi_start_fit(
                     best_ll = result.log_likelihood
                     best_result = result
 
-            except Exception as e:
+            except (
+                ValueError,
+                RuntimeError,
+                ArithmeticError,
+                FloatingPointError,
+                np.linalg.LinAlgError,
+            ) as e:
                 if verbose:
                     print(f"Start {i + 1}/{n_starts}: Failed ({e})")
 

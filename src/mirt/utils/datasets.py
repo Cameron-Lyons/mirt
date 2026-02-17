@@ -9,6 +9,20 @@ import numpy as np
 
 from mirt.constants import PROB_EPSILON
 
+_DATASET_LOADERS: dict[str, Any] = {
+    "LSAT6": lambda: _load_lsat6(),
+    "LSAT7": lambda: _load_lsat7(),
+    "SAT12": lambda: _load_sat12(),
+    "Science": lambda: _load_science(),
+    "verbal_aggression": lambda: _load_verbal_aggression(),
+    "fraction_subtraction": lambda: _load_fraction_subtraction(),
+    "ASVAB": lambda: _load_asvab(),
+    "Attitude": lambda: _load_attitude(),
+    "Bock1997": lambda: _load_bock1997(),
+    "deAyala": lambda: _load_deayala(),
+    "SLF": lambda: _load_slf(),
+}
+
 
 def load_dataset(name: str) -> dict[str, Any]:
     """Load a sample dataset by name.
@@ -40,44 +54,18 @@ def load_dataset(name: str) -> dict[str, Any]:
         - 'source': Citation/reference
         - Additional metadata depending on dataset
     """
-    datasets = {
-        "LSAT6": _load_lsat6,
-        "LSAT7": _load_lsat7,
-        "SAT12": _load_sat12,
-        "Science": _load_science,
-        "verbal_aggression": _load_verbal_aggression,
-        "fraction_subtraction": _load_fraction_subtraction,
-        "ASVAB": _load_asvab,
-        "Attitude": _load_attitude,
-        "Bock1997": _load_bock1997,
-        "deAyala": _load_deayala,
-        "SLF": _load_slf,
-    }
-
     name_lower = name.lower()
-    for key, loader in datasets.items():
+    for key, loader in _DATASET_LOADERS.items():
         if key.lower() == name_lower:
             return loader()
 
-    available = ", ".join(datasets.keys())
+    available = ", ".join(_DATASET_LOADERS.keys())
     raise ValueError(f"Unknown dataset: {name}. Available: {available}")
 
 
 def list_datasets() -> list[str]:
     """List available dataset names."""
-    return [
-        "LSAT6",
-        "LSAT7",
-        "SAT12",
-        "Science",
-        "verbal_aggression",
-        "fraction_subtraction",
-        "ASVAB",
-        "Attitude",
-        "Bock1997",
-        "deAyala",
-        "SLF",
-    ]
+    return list(_DATASET_LOADERS.keys())
 
 
 def _load_lsat6() -> dict[str, Any]:
@@ -744,14 +732,9 @@ def _load_slf() -> dict[str, Any]:
     }
 
 
-LSAT6: dict[str, Any] = _load_lsat6()
-LSAT7: dict[str, Any] = _load_lsat7()
-SAT12: dict[str, Any] = _load_sat12()
-Science: dict[str, Any] = _load_science()
-verbal_aggression: dict[str, Any] = _load_verbal_aggression()
-fraction_subtraction: dict[str, Any] = _load_fraction_subtraction()
-ASVAB: dict[str, Any] = _load_asvab()
-Attitude: dict[str, Any] = _load_attitude()
-Bock1997: dict[str, Any] = _load_bock1997()
-deAyala: dict[str, Any] = _load_deayala()
-SLF: dict[str, Any] = _load_slf()
+def __getattr__(name: str) -> dict[str, Any]:
+    if name in _DATASET_LOADERS:
+        dataset = _DATASET_LOADERS[name]()
+        globals()[name] = dataset
+        return dataset
+    raise AttributeError(f"module 'mirt.utils.datasets' has no attribute '{name}'")

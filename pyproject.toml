@@ -76,17 +76,12 @@ Homepage = "https://github.com/Cameron-Lyons/mirt"
 Documentation = "https://github.com/Cameron-Lyons/mirt#readme"
 Repository = "https://github.com/Cameron-Lyons/mirt"
 
-[tool.setuptools.dynamic]
-version = {attr = "mirt._version.__version__"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short -m 'not slow'"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "performance: marks performance regression smoke tests",
 ]
 
 [tool.black]
@@ -127,10 +122,4 @@ disable_error_code = [
     "index",
     "dict-item",
     "list-item",
-]
-
-[dependency-groups]
-dev = [
-    "mypy>=1.19.1",
-    "pytest>=9.0.2",
 ]

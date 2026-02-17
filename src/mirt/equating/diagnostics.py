@@ -438,7 +438,12 @@ def compare_linking_methods(
                 if result.anchor_diagnostics
                 else 0,
             }
-        except Exception as e:
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            np.linalg.LinAlgError,
+        ) as e:
             results[method] = {"error": str(e)}
 
     return results

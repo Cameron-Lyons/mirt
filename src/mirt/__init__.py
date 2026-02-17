@@ -1,3 +1,4 @@
+import importlib
 from typing import Any, Literal
 
 import numpy as np
@@ -23,57 +24,6 @@ from mirt.diagnostics.drf import compute_drf, compute_item_drf, reliability_inva
 from mirt.diagnostics.dtf import compute_dtf
 from mirt.diagnostics.modelfit import compute_fit_indices, compute_m2
 from mirt.diagnostics.sibtest import sibtest, sibtest_items
-from mirt.equating import (
-    AnchorDiagnostics,
-    ChainLinkingResult,
-    DriftResult,
-    LinkingConstants,
-    LinkingFitStatistics,
-    LinkingResult,
-    PolytomousLinkingResult,
-    ProcrustesResult,
-    ScoreEquatingResult,
-    TimePointModel,
-    accumulate_constants,
-    bootstrap_linking_se,
-    chain_link,
-    chain_linking_summary,
-    compare_linking_methods,
-    compute_linking_fit,
-    compute_mirt_linking_fit,
-    compute_see,
-    concurrent_link,
-    delta_method_se,
-    detect_drift,
-    detect_longitudinal_drift,
-    equipercentile_equating,
-    factor_congruence_coefficient,
-    link,
-    link_gpcm,
-    link_grm,
-    link_mirt,
-    link_nrm,
-    linking_summary,
-    lord_wingersky_recursion,
-    match_factors,
-    mirt_linking_summary,
-    oblique_procrustes_rotation,
-    observed_score_equating,
-    orthogonal_procrustes_rotation,
-    parameter_recovery_summary,
-    purify_anchors,
-    score_equating_summary,
-    score_to_theta,
-    signed_area_difference,
-    target_rotation,
-    theta_to_score,
-    transform_mirt_parameters,
-    transform_parameters,
-    transform_polytomous_parameters,
-    transform_theta_to_reference,
-    transform_to_reference,
-    true_score_equating,
-)
 from mirt.estimation.bl import BLEstimator
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import EmpiricalHistogramWoods
@@ -127,20 +77,6 @@ from mirt.models.unfolding import (
     IdealPointModel,
 )
 from mirt.models.zeroinflated import HurdleIRT, ZeroInflated2PL, ZeroInflated3PL
-from mirt.multigroup import (
-    GroupLatentDistribution,
-    InvarianceSpec,
-    InvarianceTestResult,
-    MultigroupEMEstimator,
-    MultigroupFitResult,
-    MultigroupLatentDensity,
-    MultigroupModel,
-    ParameterLink,
-    compare_invariance,
-    fit_multigroup,
-    invariance_lrt,
-    test_invariance_hierarchy,
-)
 from mirt.results.fit_result import FitResult
 from mirt.results.score_result import ScoreResult
 from mirt.scoring import fscores
@@ -198,34 +134,8 @@ from mirt.utils.transform import (
     reverse_score,
 )
 
-try:
-    from mirt.plotting import (  # noqa: F401
-        plot_ability_distribution,
-        plot_dif,
-        plot_expected_score,
-        plot_icc,
-        plot_information,
-        plot_itemfit,
-        plot_person_item_map,
-        plot_se,
-    )
-
-    _HAS_PLOTTING = True
-except ImportError:
-    _HAS_PLOTTING = False
-
-try:
-    from mirt.reports import (  # noqa: F401
-        DIFAnalysisReport,
-        FullDiagnosticReport,
-        ItemAnalysisReport,
-        ModelFitReport,
-        generate_report,
-    )
-
-    _HAS_REPORTS = True
-except ImportError:
-    _HAS_REPORTS = False
+_HAS_PLOTTING = importlib.util.find_spec("matplotlib") is not None
+_HAS_REPORTS = _HAS_PLOTTING
 
 
 def fit_mirt(
@@ -847,6 +757,146 @@ __all__.extend(
         "get_backend",
     ]
 )
+
+__all__.extend(
+    [
+        "cat",
+        "diagnostics",
+        "equating",
+        "estimation",
+        "models",
+        "multigroup",
+        "results",
+        "utils",
+    ]
+)
+
+_EQUATING_EXPORTS = [
+    "AnchorDiagnostics",
+    "ChainLinkingResult",
+    "DriftResult",
+    "LinkingConstants",
+    "LinkingFitStatistics",
+    "LinkingResult",
+    "PolytomousLinkingResult",
+    "ProcrustesResult",
+    "ScoreEquatingResult",
+    "TimePointModel",
+    "accumulate_constants",
+    "bootstrap_linking_se",
+    "chain_link",
+    "chain_linking_summary",
+    "compare_linking_methods",
+    "compute_linking_fit",
+    "compute_mirt_linking_fit",
+    "compute_see",
+    "concurrent_link",
+    "delta_method_se",
+    "detect_drift",
+    "detect_longitudinal_drift",
+    "equipercentile_equating",
+    "factor_congruence_coefficient",
+    "link",
+    "link_gpcm",
+    "link_grm",
+    "link_mirt",
+    "link_nrm",
+    "linking_summary",
+    "lord_wingersky_recursion",
+    "match_factors",
+    "mirt_linking_summary",
+    "oblique_procrustes_rotation",
+    "observed_score_equating",
+    "orthogonal_procrustes_rotation",
+    "parameter_recovery_summary",
+    "purify_anchors",
+    "score_equating_summary",
+    "score_to_theta",
+    "signed_area_difference",
+    "target_rotation",
+    "theta_to_score",
+    "transform_mirt_parameters",
+    "transform_parameters",
+    "transform_polytomous_parameters",
+    "transform_theta_to_reference",
+    "transform_to_reference",
+    "true_score_equating",
+]
+
+_MULTIGROUP_EXPORTS = [
+    "GroupLatentDistribution",
+    "InvarianceSpec",
+    "InvarianceTestResult",
+    "MultigroupEMEstimator",
+    "MultigroupFitResult",
+    "MultigroupLatentDensity",
+    "MultigroupModel",
+    "ParameterLink",
+    "compare_invariance",
+    "fit_multigroup",
+    "invariance_lrt",
+    "test_invariance_hierarchy",
+]
+
+_PLOTTING_EXPORTS = [
+    "plot_ability_distribution",
+    "plot_dif",
+    "plot_expected_score",
+    "plot_icc",
+    "plot_information",
+    "plot_itemfit",
+    "plot_person_item_map",
+    "plot_se",
+]
+
+_REPORT_EXPORTS = [
+    "DIFAnalysisReport",
+    "FullDiagnosticReport",
+    "ItemAnalysisReport",
+    "ModelFitReport",
+    "generate_report",
+]
+
+_MODULE_EXPORTS = {
+    "cat": "mirt.cat",
+    "diagnostics": "mirt.diagnostics",
+    "equating": "mirt.equating",
+    "estimation": "mirt.estimation",
+    "models": "mirt.models",
+    "multigroup": "mirt.multigroup",
+    "results": "mirt.results",
+    "utils": "mirt.utils",
+}
+
+_LAZY_IMPORTS = {
+    **{name: ("mirt.equating", name) for name in _EQUATING_EXPORTS},
+    **{name: ("mirt.multigroup", name) for name in _MULTIGROUP_EXPORTS},
+    **{name: ("mirt.plotting", name) for name in _PLOTTING_EXPORTS},
+    **{name: ("mirt.reports", name) for name in _REPORT_EXPORTS},
+}
+
+if _HAS_REPORTS:
+    __all__.extend(_REPORT_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    if name in _MODULE_EXPORTS:
+        module = importlib.import_module(_MODULE_EXPORTS[name])
+        globals()[name] = module
+        return module
+
+    if name in _LAZY_IMPORTS:
+        module_name, symbol_name = _LAZY_IMPORTS[name]
+        module = importlib.import_module(module_name)
+        value = getattr(module, symbol_name)
+        globals()[name] = value
+        return value
+
+    raise AttributeError(f"module 'mirt' has no attribute '{name}'")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
 
 
 _CURRENT_BACKEND: Literal["auto", "gpu", "rust", "numpy"] = "auto"
