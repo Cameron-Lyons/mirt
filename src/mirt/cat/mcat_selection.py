@@ -196,7 +196,67 @@ def _compute_posterior_covariance_update(
     return post_cov
 
 
-class DOptimality(MCATSelectionStrategy):
+def _select_best_item_by_criterion(
+    strategy: MCATSelectionStrategy,
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    covariance: NDArray[np.float64],
+    available_items: set[int],
+) -> int:
+    """Select the available item with the highest criterion value."""
+    if not available_items:
+        raise ValueError("No available items to select from")
+
+    best_item = -1
+    best_criterion = -np.inf
+
+    for item_idx in available_items:
+        criterion = strategy._compute_criterion(model, theta, covariance, item_idx)
+        if criterion > best_criterion:
+            best_criterion = criterion
+            best_item = item_idx
+
+    return best_item
+
+
+class _CriterionSelectionStrategy(MCATSelectionStrategy):
+    """Base class for strategies that rank by a scalar item criterion."""
+
+    def select_item(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> int:
+        _ = administered_items, responses
+        return _select_best_item_by_criterion(
+            self, model, theta, covariance, available_items
+        )
+
+
+class _PosteriorCovarianceCriterion(_CriterionSelectionStrategy):
+    """Base class for criteria computed from posterior covariance updates."""
+
+    @abstractmethod
+    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
+        """Map posterior covariance to selection criterion value."""
+
+    def _compute_criterion(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        item_idx: int,
+    ) -> float:
+        item_info = _compute_item_information_matrix(model, theta, item_idx)
+        post_cov = _compute_posterior_covariance_update(covariance, item_info)
+        return self._criterion_from_post_cov(post_cov)
+
+
+class DOptimality(_PosteriorCovarianceCriterion):
     """D-optimality item selection for MCAT.
 
     Selects the item that maximizes the determinant of the posterior
@@ -213,43 +273,11 @@ class DOptimality(MCATSelectionStrategy):
     Psychometrika, 61(2), 331-354.
     """
 
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        best_item = -1
-        best_criterion = -np.inf
-
-        for item_idx in available_items:
-            criterion = self._compute_criterion(model, theta, covariance, item_idx)
-            if criterion > best_criterion:
-                best_criterion = criterion
-                best_item = item_idx
-
-        return best_item
-
-    def _compute_criterion(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        item_idx: int,
-    ) -> float:
-        item_info = _compute_item_information_matrix(model, theta, item_idx)
-        post_cov = _compute_posterior_covariance_update(covariance, item_info)
-        det_post = np.linalg.det(post_cov)
-        return -det_post
+    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
+        return float(-np.linalg.det(post_cov))
 
 
-class AOptimality(MCATSelectionStrategy):
+class AOptimality(_PosteriorCovarianceCriterion):
     """A-optimality item selection for MCAT.
 
     Selects the item that minimizes the trace of the posterior covariance
@@ -263,43 +291,11 @@ class AOptimality(MCATSelectionStrategy):
     Psychometrika, 74(2), 273-296.
     """
 
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        best_item = -1
-        best_criterion = -np.inf
-
-        for item_idx in available_items:
-            criterion = self._compute_criterion(model, theta, covariance, item_idx)
-            if criterion > best_criterion:
-                best_criterion = criterion
-                best_item = item_idx
-
-        return best_item
-
-    def _compute_criterion(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        item_idx: int,
-    ) -> float:
-        item_info = _compute_item_information_matrix(model, theta, item_idx)
-        post_cov = _compute_posterior_covariance_update(covariance, item_info)
-        trace_post = np.trace(post_cov)
-        return -trace_post
+    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
+        return float(-np.trace(post_cov))
 
 
-class COptimality(MCATSelectionStrategy):
+class COptimality(_PosteriorCovarianceCriterion):
     """C-optimality item selection for MCAT.
 
     Selects the item that minimizes variance along a specified direction
@@ -322,59 +318,18 @@ class COptimality(MCATSelectionStrategy):
     def __init__(self, weights: NDArray[np.float64] | None = None):
         self.weights = weights
 
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        n_factors = theta.shape[0]
+    def _normalized_weights(self, n_factors: int) -> NDArray[np.float64]:
         if self.weights is None:
-            weights = np.ones(n_factors) / np.sqrt(n_factors)
-        else:
-            weights = self.weights / np.linalg.norm(self.weights)
+            return np.ones(n_factors) / np.sqrt(n_factors)
+        return self.weights / np.linalg.norm(self.weights)
 
-        best_item = -1
-        best_criterion = -np.inf
-
-        for item_idx in available_items:
-            item_info = _compute_item_information_matrix(model, theta, item_idx)
-            post_cov = _compute_posterior_covariance_update(covariance, item_info)
-            composite_var = float(weights @ post_cov @ weights)
-            criterion = -composite_var
-
-            if criterion > best_criterion:
-                best_criterion = criterion
-                best_item = item_idx
-
-        return best_item
-
-    def _compute_criterion(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        item_idx: int,
-    ) -> float:
-        n_factors = theta.shape[0]
-        if self.weights is None:
-            weights = np.ones(n_factors) / np.sqrt(n_factors)
-        else:
-            weights = self.weights / np.linalg.norm(self.weights)
-
-        item_info = _compute_item_information_matrix(model, theta, item_idx)
-        post_cov = _compute_posterior_covariance_update(covariance, item_info)
+    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
+        weights = self._normalized_weights(post_cov.shape[0])
         composite_var = float(weights @ post_cov @ weights)
         return -composite_var
 
 
-class KullbackLeiblerMCAT(MCATSelectionStrategy):
+class KullbackLeiblerMCAT(_CriterionSelectionStrategy):
     """Kullback-Leibler divergence item selection for MCAT.
 
     Selects the item that maximizes the expected KL divergence between
@@ -396,29 +351,6 @@ class KullbackLeiblerMCAT(MCATSelectionStrategy):
     def __init__(self, n_integration_points: int = 5):
         self.n_integration_points = n_integration_points
 
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        best_item = -1
-        best_criterion = -np.inf
-
-        for item_idx in available_items:
-            criterion = self._compute_criterion(model, theta, covariance, item_idx)
-            if criterion > best_criterion:
-                best_criterion = criterion
-                best_item = item_idx
-
-        return best_item
-
     def _compute_criterion(
         self,
         model: BaseItemModel,
@@ -431,7 +363,7 @@ class KullbackLeiblerMCAT(MCATSelectionStrategy):
         return trace_info_cov
 
 
-class BayesianMCAT(MCATSelectionStrategy):
+class BayesianMCAT(_PosteriorCovarianceCriterion):
     """Bayesian (minimum expected posterior variance) selection for MCAT.
 
     Selects the item that minimizes the expected posterior variance,
@@ -446,42 +378,8 @@ class BayesianMCAT(MCATSelectionStrategy):
     American Statistical Association, 70(350), 351-356.
     """
 
-    def select_item(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        available_items: set[int],
-        administered_items: list[int] | None = None,
-        responses: list[int] | None = None,
-    ) -> int:
-        if not available_items:
-            raise ValueError("No available items to select from")
-
-        best_item = -1
-        best_criterion = -np.inf
-
-        for item_idx in available_items:
-            criterion = self._compute_criterion(model, theta, covariance, item_idx)
-            if criterion > best_criterion:
-                best_criterion = criterion
-                best_item = item_idx
-
-        return best_item
-
-    def _compute_criterion(
-        self,
-        model: BaseItemModel,
-        theta: NDArray[np.float64],
-        covariance: NDArray[np.float64],
-        item_idx: int,
-    ) -> float:
-        item_info = _compute_item_information_matrix(model, theta, item_idx)
-        post_cov = _compute_posterior_covariance_update(covariance, item_info)
-
-        expected_trace = np.trace(post_cov)
-
-        return -expected_trace
+    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
+        return float(-np.trace(post_cov))
 
 
 class RandomMCATSelection(MCATSelectionStrategy):

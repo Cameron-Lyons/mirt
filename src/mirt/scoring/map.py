@@ -7,6 +7,11 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
 from mirt.results.score_result import ScoreResult
+from mirt.scoring._common import (
+    finite_difference_se,
+    resolve_prior_distribution,
+    score_responses_parallel,
+)
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -31,68 +36,38 @@ class MAPScorer:
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
-        import os
-        from concurrent.futures import ThreadPoolExecutor
-
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
         responses = np.asarray(responses)
-        n_persons = responses.shape[0]
         n_factors = model.n_factors
 
-        prior_mean = self.prior_mean
-        prior_cov = self.prior_cov
-
-        if prior_mean is None:
-            prior_mean = np.zeros(n_factors)
-        if prior_cov is None:
-            prior_cov = np.eye(n_factors)
+        prior_mean, prior_cov = resolve_prior_distribution(
+            n_factors=n_factors,
+            prior_mean=self.prior_mean,
+            prior_cov=self.prior_cov,
+        )
 
         prior_prec = np.linalg.inv(prior_cov)
 
-        theta_map = np.zeros((n_persons, n_factors))
-        theta_se = np.zeros((n_persons, n_factors))
-
-        n_jobs = self.n_jobs
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
-
-        def score_person(i):
+        def score_person(
+            i: int,
+        ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:
             person_responses = responses[i : i + 1, :]
             if n_factors == 1:
                 return self._score_unidimensional(
                     model, person_responses, prior_mean[0], prior_cov[0, 0]
                 )
-            else:
-                return self._score_multidimensional(
-                    model, person_responses, prior_mean, prior_prec
-                )
+            return self._score_multidimensional(
+                model, person_responses, prior_mean, prior_prec
+            )
 
-        if n_jobs == 1:
-            for i in range(n_persons):
-                theta_est, se_est = score_person(i)
-                if n_factors == 1:
-                    theta_map[i, 0] = theta_est
-                    theta_se[i, 0] = se_est
-                else:
-                    theta_map[i] = theta_est
-                    theta_se[i] = se_est
-        else:
-            with ThreadPoolExecutor(max_workers=min(n_jobs, n_persons)) as executor:
-                results = list(executor.map(score_person, range(n_persons)))
-
-            for i, (theta_est, se_est) in enumerate(results):
-                if n_factors == 1:
-                    theta_map[i, 0] = theta_est
-                    theta_se[i, 0] = se_est
-                else:
-                    theta_map[i] = theta_est
-                    theta_se[i] = se_est
-
-        if n_factors == 1:
-            theta_map = theta_map.ravel()
-            theta_se = theta_se.ravel()
+        theta_map, theta_se = score_responses_parallel(
+            model=model,
+            responses=responses,
+            n_jobs=self.n_jobs,
+            score_person=score_person,
+        )
 
         return ScoreResult(
             theta=theta_map,
@@ -120,18 +95,7 @@ class MAPScorer:
         )
 
         theta_est = result.x
-
-        h = 1e-5
-        f_plus = neg_log_posterior(theta_est + h)
-        f_minus = neg_log_posterior(theta_est - h)
-        f_center = neg_log_posterior(theta_est)
-
-        hessian = (f_plus - 2 * f_center + f_minus) / (h**2)
-
-        if hessian > 0:
-            se_est = np.sqrt(1.0 / hessian)
-        else:
-            se_est = np.nan
+        se_est = finite_difference_se(neg_log_posterior, theta_est)
 
         return theta_est, se_est
 

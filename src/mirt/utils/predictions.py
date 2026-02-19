@@ -187,6 +187,7 @@ def predict_mixed(
     >>> new_theta = np.array([[-1], [0], [1]])
     >>> probs = predict_mixed(result, new_theta)
     """
+    _ = new_covariates
     if new_theta is None:
         new_theta = result.theta if hasattr(result, "theta") else np.zeros((1, 1))
 

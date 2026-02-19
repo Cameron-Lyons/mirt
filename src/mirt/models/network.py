@@ -489,6 +489,8 @@ def fit_ising(
     """
     responses = np.asarray(responses)
     n_samples, n_nodes = responses.shape
+    inv_n_samples = 1.0 / n_samples
+    responses_t = responses.T
 
     model = IsingModel(n_nodes=n_nodes)
 
@@ -501,14 +503,13 @@ def fit_ising(
 
         for i in range(n_nodes):
             y = responses[:, i]
-            X = np.column_stack([np.ones(n_samples), responses])
-            X[:, i + 1] = 0
 
             p = 1 / (1 + np.exp(-(thresholds[i] + responses @ interactions[i, :])))
             p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
-            grad_threshold = np.mean(y - p)
-            grad_interactions = np.mean((y - p)[:, None] * responses, axis=0)
+            residual = y - p
+            grad_threshold = float(np.sum(residual) * inv_n_samples)
+            grad_interactions = (responses_t @ residual) * inv_n_samples
             grad_interactions[i] = 0
 
             step_size = 0.5
@@ -524,11 +525,10 @@ def fit_ising(
                     interactions[i, j] = new_val
                     interactions[j, i] = new_val
 
-        model.set_thresholds(thresholds)
-        model.set_interactions(interactions)
-        psl = model.pseudo_likelihood(responses)
-
         if verbose:
+            model.set_thresholds(thresholds)
+            model.set_interactions(interactions)
+            psl = model.pseudo_likelihood(responses)
             print(f"Iteration {iteration + 1}: PSL = {psl:.4f}")
 
         thresh_change = np.max(np.abs(thresholds - prev_thresholds))
@@ -537,6 +537,8 @@ def fit_ising(
         if max(thresh_change, inter_change) < tol:
             break
 
+    model.set_thresholds(thresholds)
+    model.set_interactions(interactions)
     model._is_fitted = True
     return model, model.pseudo_likelihood(responses)
 

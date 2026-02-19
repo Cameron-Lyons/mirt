@@ -48,6 +48,52 @@ class ResidualResult:
     summary: dict
 
 
+def _coerce_responses_theta(
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Normalize response/theta inputs used by residual utilities."""
+    responses_f = np.asarray(responses, dtype=np.float64)
+    theta_2d = np.atleast_1d(theta)
+    if theta_2d.ndim == 1:
+        theta_2d = theta_2d.reshape(-1, 1)
+    return responses_f, theta_2d
+
+
+def _prepare_rust_payload(
+    model: "BaseItemModel",
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    use_rust: bool,
+) -> tuple[
+    bool,
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+    NDArray[np.int32] | None,
+]:
+    """Build shared payload for Rust residual/local-dependence calls."""
+    can_use_rust = (
+        use_rust
+        and RUST_AVAILABLE
+        and hasattr(model, "discrimination")
+        and hasattr(model, "difficulty")
+    )
+
+    if not can_use_rust:
+        return False, None, None, None, None
+
+    disc = np.asarray(model.discrimination, dtype=np.float64)
+    diff = np.asarray(model.difficulty, dtype=np.float64)
+    if disc.ndim > 1:
+        disc = disc[:, 0]
+
+    theta_1d = theta[:, 0].astype(np.float64)
+    responses_int = np.where(np.isnan(responses), -1, responses).astype(np.int32)
+
+    return True, disc, diff, theta_1d, responses_int
+
+
 def residuals(
     model: "BaseItemModel",
     responses: NDArray[np.float64],
@@ -89,28 +135,18 @@ def residuals(
     >>> resid = residuals(result.model, responses, result.theta)
     >>> print(f"Mean absolute residual: {np.mean(np.abs(resid.raw)):.3f}")
     """
-    responses = np.asarray(responses, dtype=np.float64)
-    theta = np.atleast_1d(theta)
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    theta_1d = theta[:, 0].astype(np.float64)
-
-    can_use_rust = (
-        use_rust
-        and RUST_AVAILABLE
-        and hasattr(model, "discrimination")
-        and hasattr(model, "difficulty")
-        and type in ("standardized", "pearson")
+    responses, theta = _coerce_responses_theta(responses, theta)
+    rust_ready, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
+        model, responses, theta, use_rust
     )
 
-    if can_use_rust:
-        disc = np.asarray(model.discrimination, dtype=np.float64)
-        diff = np.asarray(model.difficulty, dtype=np.float64)
-        if disc.ndim > 1:
-            disc = disc[:, 0]
+    can_use_rust = rust_ready and type in ("standardized", "pearson")
 
-        responses_int = np.where(np.isnan(responses), -1, responses).astype(np.int32)
+    if can_use_rust:
+        assert disc is not None
+        assert diff is not None
+        assert theta_1d is not None
+        assert responses_int is not None
 
         standardized = compute_standardized_residuals(
             responses_int, theta_1d, disc, diff
@@ -247,26 +283,16 @@ def Q3(
     equating performance of the three-parameter logistic model.
     Applied Psychological Measurement, 8(2), 125-145.
     """
-    responses = np.asarray(responses, dtype=np.float64)
-    theta = np.atleast_1d(theta)
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    can_use_rust = (
-        use_rust
-        and RUST_AVAILABLE
-        and hasattr(model, "discrimination")
-        and hasattr(model, "difficulty")
+    responses, theta = _coerce_responses_theta(responses, theta)
+    can_use_rust, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
+        model, responses, theta, use_rust
     )
 
     if can_use_rust:
-        disc = np.asarray(model.discrimination, dtype=np.float64)
-        diff = np.asarray(model.difficulty, dtype=np.float64)
-        if disc.ndim > 1:
-            disc = disc[:, 0]
-
-        theta_1d = theta[:, 0].astype(np.float64)
-        responses_int = np.where(np.isnan(responses), -1, responses).astype(np.int32)
+        assert disc is not None
+        assert diff is not None
+        assert theta_1d is not None
+        assert responses_int is not None
 
         q3_matrix = compute_q3_matrix(responses_int, theta_1d, disc, diff)
         np.fill_diagonal(q3_matrix, 1.0)
@@ -312,26 +338,16 @@ def LD_X2(
     """
     from scipy import stats
 
-    responses = np.asarray(responses, dtype=np.float64)
-    theta = np.atleast_1d(theta)
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    can_use_rust = (
-        use_rust
-        and RUST_AVAILABLE
-        and hasattr(model, "discrimination")
-        and hasattr(model, "difficulty")
+    responses, theta = _coerce_responses_theta(responses, theta)
+    can_use_rust, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
+        model, responses, theta, use_rust
     )
 
     if can_use_rust:
-        disc = np.asarray(model.discrimination, dtype=np.float64)
-        diff = np.asarray(model.difficulty, dtype=np.float64)
-        if disc.ndim > 1:
-            disc = disc[:, 0]
-
-        theta_1d = theta[:, 0].astype(np.float64)
-        responses_int = np.where(np.isnan(responses), -1, responses).astype(np.int32)
+        assert disc is not None
+        assert diff is not None
+        assert theta_1d is not None
+        assert responses_int is not None
 
         ld_x2 = compute_ld_chi2_matrix(responses_int, theta_1d, disc, diff)
 

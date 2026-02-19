@@ -16,15 +16,18 @@ from mirt._rust_backend import (
 from mirt._rust_backend import (
     cat_simulate_batch as rust_cat_simulate_batch,
 )
-from mirt.cat.content import (
-    ContentConstraint,
-    NoContentConstraint,
+from mirt.cat._engine_common import (
+    configure_content_constraint,
+    configure_exposure_control,
+    consume_pending_item,
+    finalize_administered_item,
+    reset_session_state,
+    run_simulation_loop,
 )
+from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
-    NoExposureControl,
     Randomesque,
-    create_exposure_control,
 )
 from mirt.cat.results import CATResult, CATState
 from mirt.cat.selection import (
@@ -144,17 +147,8 @@ class CATEngine:
         else:
             self._stopping = base_rule
 
-        if exposure_control is None:
-            self._exposure = NoExposureControl()
-        elif isinstance(exposure_control, str):
-            self._exposure = create_exposure_control(exposure_control, seed=seed)
-        else:
-            self._exposure = exposure_control
-
-        if content_constraint is None:
-            self._content = NoContentConstraint()
-        else:
-            self._content = content_constraint
+        self._exposure = configure_exposure_control(exposure_control, seed=seed)
+        self._content = configure_content_constraint(content_constraint)
 
         self._current_theta = initial_theta
         self._current_se = float("inf")
@@ -171,20 +165,11 @@ class CATEngine:
         """Reset the engine for a new examinee."""
         self._current_theta = self.initial_theta
         self._current_se = float("inf")
-        self._items_administered = []
-        self._responses = []
-        self._available_items = set(range(self.model.n_items))
-        self._theta_history = []
-        self._se_history = []
-        self._info_history = []
-        self._is_complete = False
-        self._stopping_reason = ""
-
-        self._exposure.reset()
-        self._content.reset()
-
-        if hasattr(self._stopping, "reset"):
-            self._stopping.reset()
+        reset_session_state(
+            self,
+            n_items=self.model.n_items,
+            history_attrs=("_theta_history", "_se_history", "_info_history"),
+        )
 
     def get_current_state(self) -> CATState:
         """Get the current state of the CAT session.
@@ -277,11 +262,7 @@ class CATEngine:
         if self._is_complete:
             raise RuntimeError("CAT session is already complete")
 
-        if not hasattr(self, "_pending_item"):
-            self._pending_item = self._select_next_item()
-
-        item_idx = self._pending_item
-        delattr(self, "_pending_item")
+        item_idx = consume_pending_item(self)
 
         theta_arr = np.array([[self._current_theta]])
         item_info = float(self.model.information(theta_arr, item_idx=item_idx).sum())
@@ -299,13 +280,7 @@ class CATEngine:
         self._se_history.append(self._current_se)
 
         state = self.get_current_state()
-        if self._stopping.should_stop(state):
-            self._is_complete = True
-            self._stopping_reason = self._stopping.get_reason()
-
-        if not self._available_items and not self._is_complete:
-            self._is_complete = True
-            self._stopping_reason = "Item pool exhausted"
+        finalize_administered_item(self, state)
 
         return self.get_current_state()
 
@@ -410,20 +385,11 @@ class CATEngine:
         CATResult
             Result of the simulated CAT session.
         """
-        self.reset()
-
-        while not self._is_complete:
-            item_idx = self.select_next_item()
-            self._pending_item = item_idx
-
-            if response_generator is not None:
-                response = response_generator(item_idx, true_theta)
-            else:
-                response = self._generate_response(item_idx, true_theta)
-
-            self.administer_item(response)
-
-        return self.get_result()
+        return run_simulation_loop(
+            self,
+            float(true_theta),
+            response_generator=response_generator,
+        )
 
     def _generate_response(self, item_idx: int, true_theta: float) -> int:
         """Generate a probabilistic response based on true ability.
@@ -513,6 +479,27 @@ class CATEngine:
         quad = GaussHermiteQuadrature(self.n_quadpts, n_dimensions=1)
         return quad.nodes.ravel(), quad.weights.ravel()
 
+    def _get_stopping_parameters(self) -> tuple[float, int, int]:
+        """Get stop-rule parameters used by Rust simulation helpers."""
+        se_threshold = 0.3
+        max_items = self.model.n_items
+        min_items = 1
+
+        if hasattr(self._stopping, "threshold"):
+            se_threshold = float(self._stopping.threshold)
+        if hasattr(self._stopping, "max_items"):
+            max_items = int(self._stopping.max_items)
+        if hasattr(self._stopping, "min_items"):
+            min_items = int(self._stopping.min_items)
+
+        return se_threshold, max_items, min_items
+
+    def _resolve_seed(self) -> int:
+        """Resolve a deterministic seed value for Rust calls."""
+        if self.seed is not None:
+            return int(self.seed)
+        return int(np.random.default_rng().integers(0, 2**31))
+
     def _run_batch_rust(
         self,
         true_thetas: NDArray[np.float64],
@@ -524,23 +511,8 @@ class CATEngine:
         diff = params["difficulty"].astype(np.float64)
 
         quad_points, quad_weights = self._get_quadrature()
-
-        se_threshold = 0.3
-        max_items = self.model.n_items
-        min_items = 1
-
-        if hasattr(self._stopping, "threshold"):
-            se_threshold = self._stopping.threshold
-        if hasattr(self._stopping, "max_items"):
-            max_items = self._stopping.max_items
-        if hasattr(self._stopping, "min_items"):
-            min_items = self._stopping.min_items
-
-        seed = (
-            self.seed
-            if self.seed is not None
-            else np.random.default_rng().integers(0, 2**31)
-        )
+        se_threshold, max_items, min_items = self._get_stopping_parameters()
+        seed = self._resolve_seed()
         result = rust_cat_simulate_batch(
             true_thetas,
             disc,
@@ -621,23 +593,8 @@ class CATEngine:
             diff = params["difficulty"].astype(np.float64)
 
             quad_points, quad_weights = self._get_quadrature()
-
-            se_threshold = 0.3
-            max_items = self.model.n_items
-            min_items = 1
-
-            if hasattr(self._stopping, "threshold"):
-                se_threshold = self._stopping.threshold
-            if hasattr(self._stopping, "max_items"):
-                max_items = self._stopping.max_items
-            if hasattr(self._stopping, "min_items"):
-                min_items = self._stopping.min_items
-
-            seed = (
-                self.seed
-                if self.seed is not None
-                else np.random.default_rng().integers(0, 2**31)
-            )
+            se_threshold, max_items, min_items = self._get_stopping_parameters()
+            seed = self._resolve_seed()
             result = rust_cat_conditional_mse(
                 thetas,
                 disc,

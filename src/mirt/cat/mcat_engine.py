@@ -7,11 +7,17 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.cat.content import ContentConstraint, NoContentConstraint
+from mirt.cat._engine_common import (
+    configure_content_constraint,
+    configure_exposure_control,
+    consume_pending_item,
+    finalize_administered_item,
+    reset_session_state,
+    run_simulation_loop,
+)
+from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
-    NoExposureControl,
-    create_exposure_control,
 )
 from mirt.cat.mcat_selection import (
     MCATSelectionStrategy,
@@ -163,17 +169,8 @@ class MCATEngine:
         else:
             self._stopping = base_rule
 
-        if exposure_control is None:
-            self._exposure = NoExposureControl()
-        elif isinstance(exposure_control, str):
-            self._exposure = create_exposure_control(exposure_control, seed=seed)
-        else:
-            self._exposure = exposure_control
-
-        if content_constraint is None:
-            self._content = NoContentConstraint()
-        else:
-            self._content = content_constraint
+        self._exposure = configure_exposure_control(exposure_control, seed=seed)
+        self._content = configure_content_constraint(content_constraint)
 
         self._current_theta = self.initial_theta.copy()
         self._current_covariance = self.initial_covariance.copy()
@@ -191,21 +188,16 @@ class MCATEngine:
         """Reset the engine for a new examinee."""
         self._current_theta = self.initial_theta.copy()
         self._current_covariance = self.initial_covariance.copy()
-        self._items_administered = []
-        self._responses = []
-        self._available_items = set(range(self.model.n_items))
-        self._theta_history = []
-        self._se_history = []
-        self._covariance_history = []
-        self._info_history = []
-        self._is_complete = False
-        self._stopping_reason = ""
-
-        self._exposure.reset()
-        self._content.reset()
-
-        if hasattr(self._stopping, "reset"):
-            self._stopping.reset()
+        reset_session_state(
+            self,
+            n_items=self.model.n_items,
+            history_attrs=(
+                "_theta_history",
+                "_se_history",
+                "_covariance_history",
+                "_info_history",
+            ),
+        )
 
     @property
     def current_standard_error(self) -> NDArray[np.float64]:
@@ -296,11 +288,7 @@ class MCATEngine:
         if self._is_complete:
             raise RuntimeError("MCAT session is already complete")
 
-        if not hasattr(self, "_pending_item"):
-            self._pending_item = self._select_next_item()
-
-        item_idx = self._pending_item
-        delattr(self, "_pending_item")
+        item_idx = consume_pending_item(self)
 
         theta_arr = self._current_theta.reshape(1, -1)
         item_info = float(self.model.information(theta_arr, item_idx=item_idx).sum())
@@ -319,13 +307,7 @@ class MCATEngine:
         self._covariance_history.append(self._current_covariance.copy())
 
         state = self.get_current_state()
-        if self._stopping.should_stop(state):
-            self._is_complete = True
-            self._stopping_reason = self._stopping.get_reason()
-
-        if not self._available_items and not self._is_complete:
-            self._is_complete = True
-            self._stopping_reason = "Item pool exhausted"
+        finalize_administered_item(self, state)
 
         return self.get_current_state()
 
@@ -427,18 +409,12 @@ class MCATEngine:
                 f"got {true_theta.shape}"
             )
 
-        while not self._is_complete:
-            item_idx = self.select_next_item()
-            self._pending_item = item_idx
-
-            if response_generator is not None:
-                response = response_generator(item_idx, true_theta)
-            else:
-                response = self._generate_response(item_idx, true_theta)
-
-            self.administer_item(response)
-
-        return self.get_result()
+        return run_simulation_loop(
+            self,
+            true_theta,
+            response_generator=response_generator,
+            reset=False,
+        )
 
     def _generate_response(self, item_idx: int, true_theta: NDArray[np.float64]) -> int:
         """Generate a probabilistic response based on true abilities.

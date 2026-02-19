@@ -278,6 +278,7 @@ class LogLikelihoodScorer(Scorer):
         """Compute log-likelihood on test data."""
         from mirt.scoring import fscores
 
+        _ = train_responses
         scores = fscores(result.model, test_responses, method="EAP")
         theta = scores.theta
         if theta.ndim == 1:
@@ -316,6 +317,7 @@ class AbilityRMSEScorer(Scorer):
         """Compute RMSE between estimated and true abilities."""
         from mirt.scoring import fscores
 
+        _ = train_responses
         scores = fscores(result.model, test_responses, method="EAP")
         estimated = scores.theta.ravel()
 
@@ -347,6 +349,7 @@ class AICScorer(Scorer):
         test_indices: NDArray[np.intp] | None = None,
     ) -> float:
         """Return negative AIC (higher is better)."""
+        _ = train_responses, test_responses, test_indices
         return -result.aic
 
 
@@ -370,6 +373,7 @@ class BICScorer(Scorer):
         test_indices: NDArray[np.intp] | None = None,
     ) -> float:
         """Return negative BIC (higher is better)."""
+        _ = train_responses, test_responses, test_indices
         return -result.bic
 
 
