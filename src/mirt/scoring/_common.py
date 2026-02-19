@@ -114,7 +114,9 @@ def score_responses_parallel(
 
     for i, (theta_est, se_est) in enumerate(results):
         if n_factors == 1:
-            theta_values[i, 0] = float(np.asarray(theta_est, dtype=np.float64).ravel()[0])
+            theta_values[i, 0] = float(
+                np.asarray(theta_est, dtype=np.float64).ravel()[0]
+            )
             se_values[i, 0] = float(np.asarray(se_est, dtype=np.float64).ravel()[0])
         else:
             theta_values[i] = np.asarray(theta_est, dtype=np.float64).reshape(n_factors)

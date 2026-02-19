@@ -490,7 +490,9 @@ class EMEstimator(BaseEstimator):
 
             eps = self.prob_epsilon
 
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+            def neg_expected_log_likelihood_polytomous(
+                params: NDArray[np.float64],
+            ) -> float:
                 self._set_item_params(model, item_idx, params)
 
                 probs = model.probability(quad_points, item_idx)
@@ -501,7 +503,7 @@ class EMEstimator(BaseEstimator):
                 return -ll
 
             result = minimize(
-                neg_expected_log_likelihood,
+                neg_expected_log_likelihood_polytomous,
                 x0=current_params,
                 method="L-BFGS-B",
                 bounds=bounds,
@@ -547,7 +549,9 @@ class EMEstimator(BaseEstimator):
 
         eps = self.prob_epsilon
 
-        def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+        def neg_expected_log_likelihood_dichotomous(
+            params: NDArray[np.float64],
+        ) -> float:
             self._set_item_params(model, item_idx, params)
 
             probs = model.probability(quad_points, item_idx)
@@ -558,7 +562,7 @@ class EMEstimator(BaseEstimator):
             return -ll
 
         result = minimize(
-            neg_expected_log_likelihood,
+            neg_expected_log_likelihood_dichotomous,
             x0=current_params,
             method="L-BFGS-B",
             bounds=bounds,
