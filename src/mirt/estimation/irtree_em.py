@@ -382,8 +382,8 @@ class IRTreeEMEstimator(BaseEstimator):
     def _update_trait_distribution(
         self,
         posterior_weights: NDArray[np.float64],
-        current_mean: NDArray[np.float64],
-        current_cov: NDArray[np.float64],
+        _current_mean: NDArray[np.float64],
+        _current_cov: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Update trait mean and covariance from posterior."""
         quad_points = self._quadrature.nodes

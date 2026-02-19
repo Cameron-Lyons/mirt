@@ -121,6 +121,7 @@ def empirical_ES(
     >>> print(f"Signed ES: {es.signed_es:.3f}")
     >>> print(f"ETS Classification: {es.classification}")
     """
+    _ = focal_weight
     theta = np.linspace(theta_range[0], theta_range[1], n_points)
     theta_2d = theta.reshape(-1, 1)
 

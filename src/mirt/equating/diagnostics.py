@@ -71,6 +71,7 @@ def bootstrap_linking_se(
     tuple[float, float, NDArray, NDArray]
         SE of A, SE of B, bootstrap A samples, bootstrap B samples.
     """
+    _ = responses_old, responses_new
     rng = np.random.default_rng(seed)
 
     disc_old = np.asarray(model_old.discrimination)[anchors_old]
@@ -151,6 +152,7 @@ def delta_method_se(
     tuple[float, float]
         Standard errors for A and B.
     """
+    _ = vcov_new, anchors_new
     n_anchors = len(anchors_old)
     A = linking_result.constants.A
 

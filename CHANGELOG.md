@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Sphinx quickstart and API reference examples now match current public symbols (`fit_mirt`, `fscores`, and `*ParameterLogistic` classes)
 - Integration/scoring tests now use backend-tolerant convergence and correlation expectations to reduce brittleness across runtime configurations
 - Removed spurious test warnings by hardening network correlation edge-cases, avoiding eager divide-by-zero in GRM information, and marking `TestletModel` as non-test for pytest collection
+- Reduced dead/duplicate implementation noise by removing an unused Ising fitting variable, consolidating duplicated EM log-likelihood fallback logic, and clarifying intentionally-unused compatibility parameters
+- Refactored duplicated residual utility pre-processing into shared helpers and added direct tests for `mirt.utils.residuals` Q3/LD_X2 paths
+- Refactored MCAT selection strategies to share criterion-based base classes, removing duplicated selection/criterion scaffolding while preserving behavior
+- Consolidated shared CAT/MCAT engine session/exposure/content/simulation workflow into reusable helper utilities to reduce duplicated adaptive-engine orchestration code
+- Consolidated shared scoring helper logic across `ML`/`MAP`/`EAP`/`EAPsum` for prior normalization, quadrature setup, and per-person parallel scoring flow
+- Optimized `fit_ising` by vectorizing interaction-gradient computation and skipping per-iteration pseudo-likelihood evaluation when not verbose
+- Optimized EM dichotomous item updates with analytic gradients (`1PL`/`2PL`/`3PL`/`4PL`), reducing dependence on costly numerical differentiation
+- Reduced EM analytic-gradient overhead further by avoiding unnecessary per-evaluation model parameter mutation during item optimization
 
 ### Added
 - Custom exception hierarchy for better error handling

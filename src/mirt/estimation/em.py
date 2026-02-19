@@ -6,6 +6,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._core import sigmoid
 from mirt._gpu_backend import (
     GPU_AVAILABLE,
     compute_log_likelihoods_2pl_gpu,
@@ -185,6 +186,15 @@ class EMEstimator(BaseEstimator):
         if hasattr(model, "log_likelihood_batch"):
             return model.log_likelihood_batch(responses, quad_points)
 
+        return self._compute_log_likelihoods_python(model, responses, quad_points)
+
+    def _compute_log_likelihoods_python(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        quad_points: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Pure-Python log-likelihood fallback used by CPU/GPU paths."""
         n_persons = responses.shape[0]
         n_quad = quad_points.shape[0]
         log_likelihoods = np.zeros((n_persons, n_quad))
@@ -247,13 +257,7 @@ class EMEstimator(BaseEstimator):
         if hasattr(model, "log_likelihood_batch"):
             return model.log_likelihood_batch(responses, quad_points)
 
-        n_persons = responses.shape[0]
-        n_quad = quad_points.shape[0]
-        log_likelihoods = np.zeros((n_persons, n_quad))
-        for q in range(n_quad):
-            theta_q = quad_points[q : q + 1]
-            log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
-        return log_likelihoods
+        return self._compute_log_likelihoods_python(model, responses, quad_points)
 
     def _m_step(
         self,
@@ -334,7 +338,126 @@ class EMEstimator(BaseEstimator):
             for item_idx, optimal_params in results:
                 self._set_item_params(model, item_idx, optimal_params)
 
-    def _optimize_item(
+    def _supports_analytic_dichotomous_gradient(self, model: BaseItemModel) -> bool:
+        """Return whether analytic item gradients are implemented for this model."""
+        return model.model_name in {"1PL", "2PL", "3PL", "4PL"}
+
+    def _neg_expected_loglik_with_grad_dichotomous(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+        quad_points: NDArray[np.float64],
+        n_k_valid: NDArray[np.float64],
+        r_k: NDArray[np.float64],
+        params: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        """Compute negative expected log-likelihood and analytic gradient."""
+        eps = self.prob_epsilon
+        theta = quad_points
+        theta_1d = theta[:, 0]
+        model_name = model.model_name
+
+        if model_name == "1PL":
+            a = float(model._parameters["discrimination"][item_idx])
+            b = float(params[0])
+
+            z = a * (theta_1d - b)
+            p_star = sigmoid(z)
+            p = np.clip(p_star, eps, 1 - eps)
+
+            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
+            score = r_k / p - (n_k_valid - r_k) / (1 - p)
+            dp_dz = p_star * (1 - p_star)
+
+            grad_b = np.sum(score * dp_dz * (-a))
+            grad = np.array([grad_b], dtype=np.float64)
+            return -float(ll), -grad
+
+        if model_name == "2PL":
+            if model.n_factors == 1:
+                a = float(params[0])
+                b = float(params[1])
+                z = a * (theta_1d - b)
+                p_star = sigmoid(z)
+                p = np.clip(p_star, eps, 1 - eps)
+
+                ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
+                score = r_k / p - (n_k_valid - r_k) / (1 - p)
+                dp_dz = p_star * (1 - p_star)
+
+                common = score * dp_dz
+                grad_a = np.sum(common * (theta_1d - b))
+                grad_b = np.sum(common * (-a))
+                grad = np.array([grad_a, grad_b], dtype=np.float64)
+                return -float(ll), -grad
+
+            a_vec = np.asarray(params[:-1], dtype=np.float64)
+            b = float(params[-1])
+
+            z = theta @ a_vec - np.sum(a_vec) * b
+            p_star = sigmoid(z)
+            p = np.clip(p_star, eps, 1 - eps)
+
+            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
+            score = r_k / p - (n_k_valid - r_k) / (1 - p)
+            dp_dz = p_star * (1 - p_star)
+
+            common = score * dp_dz
+            grad_a = (theta - b).T @ common
+            grad_b = np.sum(common * (-np.sum(a_vec)))
+
+            grad = np.concatenate([grad_a, np.array([grad_b], dtype=np.float64)])
+            return -float(ll), -grad
+
+        if model_name == "3PL":
+            a = float(params[0])
+            b = float(params[1])
+            c = float(params[2])
+
+            z = a * (theta_1d - b)
+            p_star = sigmoid(z)
+            p = c + (1.0 - c) * p_star
+            p = np.clip(p, eps, 1 - eps)
+
+            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
+            score = r_k / p - (n_k_valid - r_k) / (1 - p)
+            dp_dz = (1.0 - c) * p_star * (1.0 - p_star)
+            common = score * dp_dz
+
+            grad_a = np.sum(common * (theta_1d - b))
+            grad_b = np.sum(common * (-a))
+            grad_c = np.sum(score * (1.0 - p_star))
+
+            grad = np.array([grad_a, grad_b, grad_c], dtype=np.float64)
+            return -float(ll), -grad
+
+        if model_name == "4PL":
+            a = float(params[0])
+            b = float(params[1])
+            c = float(params[2])
+            d = float(params[3])
+
+            z = a * (theta_1d - b)
+            p_star = sigmoid(z)
+            p = c + (d - c) * p_star
+            p = np.clip(p, eps, 1 - eps)
+
+            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
+            score = r_k / p - (n_k_valid - r_k) / (1 - p)
+            dp_dz = (d - c) * p_star * (1.0 - p_star)
+            common = score * dp_dz
+
+            grad_a = np.sum(common * (theta_1d - b))
+            grad_b = np.sum(common * (-a))
+            grad_c = np.sum(score * (1.0 - p_star))
+            grad_d = np.sum(score * p_star)
+
+            grad = np.array([grad_a, grad_b, grad_c, grad_d], dtype=np.float64)
+            return -float(ll), -grad
+
+        raise ValueError(f"Analytic gradient not implemented for {model_name}")
+
+    def _optimize_item_params(
         self,
         model: BaseItemModel,
         item_idx: int,
@@ -345,7 +468,8 @@ class EMEstimator(BaseEstimator):
         valid_mask: NDArray[np.bool_] | None = None,
         r_k: NDArray[np.float64] | None = None,
         n_k_valid: NDArray[np.float64] | None = None,
-    ) -> None:
+    ) -> NDArray[np.float64]:
+        """Optimize item parameters and return optimal parameter vector."""
         item_responses = responses[:, item_idx]
         if valid_mask is None:
             valid_mask = item_responses >= 0
@@ -376,23 +500,62 @@ class EMEstimator(BaseEstimator):
 
                 return -ll
 
-        else:
-            if r_k is None:
-                r_k = np.sum(
-                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                    axis=0,
+            result = minimize(
+                neg_expected_log_likelihood,
+                x0=current_params,
+                method="L-BFGS-B",
+                bounds=bounds,
+                options={
+                    "maxiter": self.item_optim_maxiter,
+                    "ftol": self.item_optim_ftol,
+                },
+            )
+            return result.x
+
+        if r_k is None:
+            r_k = np.sum(
+                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                axis=0,
+            )
+
+        if self._supports_analytic_dichotomous_gradient(model):
+
+            def neg_ll_and_grad(
+                params: NDArray[np.float64],
+            ) -> tuple[float, NDArray[np.float64]]:
+                return self._neg_expected_loglik_with_grad_dichotomous(
+                    model,
+                    item_idx,
+                    quad_points,
+                    n_k_valid,
+                    r_k,
+                    params,
                 )
-            eps = self.prob_epsilon
 
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_item_params(model, item_idx, params)
+            result = minimize(
+                neg_ll_and_grad,
+                x0=current_params,
+                method="L-BFGS-B",
+                jac=True,
+                bounds=bounds,
+                options={
+                    "maxiter": self.item_optim_maxiter,
+                    "ftol": self.item_optim_ftol,
+                },
+            )
+            return result.x
 
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
+        eps = self.prob_epsilon
 
-                ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+        def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
+            self._set_item_params(model, item_idx, params)
 
-                return -ll
+            probs = model.probability(quad_points, item_idx)
+            probs = np.clip(probs, eps, 1 - eps)
+
+            ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+
+            return -ll
 
         result = minimize(
             neg_expected_log_likelihood,
@@ -402,7 +565,32 @@ class EMEstimator(BaseEstimator):
             options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
         )
 
-        self._set_item_params(model, item_idx, result.x)
+        return result.x
+
+    def _optimize_item(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+        responses: NDArray[np.int_],
+        posterior_weights: NDArray[np.float64],
+        quad_points: NDArray[np.float64],
+        n_k: NDArray[np.float64],
+        valid_mask: NDArray[np.bool_] | None = None,
+        r_k: NDArray[np.float64] | None = None,
+        n_k_valid: NDArray[np.float64] | None = None,
+    ) -> None:
+        optimal = self._optimize_item_params(
+            model,
+            item_idx,
+            responses,
+            posterior_weights,
+            quad_points,
+            n_k,
+            valid_mask,
+            r_k,
+            n_k_valid,
+        )
+        self._set_item_params(model, item_idx, optimal)
 
     def _optimize_item_return(
         self,
@@ -417,63 +605,17 @@ class EMEstimator(BaseEstimator):
         n_k_valid: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Optimize item parameters and return the result (for parallel execution)."""
-        item_responses = responses[:, item_idx]
-        if valid_mask is None:
-            valid_mask = item_responses >= 0
-
-        if n_k_valid is None:
-            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
-
-        current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
-
-        if model.is_polytomous:
-            n_categories = model._n_categories[item_idx]
-            n_quad = len(n_k)
-
-            r_kc = np.zeros((n_quad, n_categories))
-            for c in range(n_categories):
-                cat_mask = valid_mask & (item_responses == c)
-                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
-
-            eps = self.prob_epsilon
-
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_item_params(model, item_idx, params)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-
-                ll = np.sum(r_kc * np.log(probs))
-
-                return -ll
-
-        else:
-            if r_k is None:
-                r_k = np.sum(
-                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                    axis=0,
-                )
-            eps = self.prob_epsilon
-
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_item_params(model, item_idx, params)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-
-                ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
-
-                return -ll
-
-        result = minimize(
-            neg_expected_log_likelihood,
-            x0=current_params,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
+        return self._optimize_item_params(
+            model,
+            item_idx,
+            responses,
+            posterior_weights,
+            quad_points,
+            n_k,
+            valid_mask,
+            r_k,
+            n_k_valid,
         )
-
-        return result.x
 
     def _compute_standard_errors(
         self,

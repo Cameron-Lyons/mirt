@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.results.score_result import ScoreResult
+from mirt.scoring._common import build_quadrature
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -121,23 +121,12 @@ class EAPSumScorer:
             return self._lookup_table
 
         n_factors = model.n_factors
-        prior_mean = self.prior_mean
-        prior_cov = self.prior_cov
-
-        if prior_mean is None:
-            prior_mean = np.zeros(n_factors)
-        if prior_cov is None:
-            prior_cov = np.eye(n_factors)
-
-        quadrature = GaussHermiteQuadrature(
-            n_points=self.n_quadpts,
-            n_dimensions=n_factors,
-            mean=prior_mean,
-            cov=prior_cov,
+        quad_points, quad_weights = build_quadrature(
+            n_quadpts=self.n_quadpts,
+            n_factors=n_factors,
+            prior_mean=self.prior_mean,
+            prior_cov=self.prior_cov,
         )
-
-        quad_points = quadrature.nodes
-        quad_weights = quadrature.weights
 
         if model.is_polytomous:
             max_score = sum(model._n_categories[i] - 1 for i in range(model.n_items))

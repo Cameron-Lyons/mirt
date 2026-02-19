@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.results.score_result import ScoreResult
+from mirt.scoring._common import build_quadrature
 from mirt.utils.numeric import logsumexp_axis1
 
 if TYPE_CHECKING:
@@ -39,23 +39,12 @@ class EAPScorer:
         n_persons = responses.shape[0]
         n_factors = model.n_factors
 
-        prior_mean = self.prior_mean
-        prior_cov = self.prior_cov
-
-        if prior_mean is None:
-            prior_mean = np.zeros(n_factors)
-        if prior_cov is None:
-            prior_cov = np.eye(n_factors)
-
-        quadrature = GaussHermiteQuadrature(
-            n_points=self.n_quadpts,
-            n_dimensions=n_factors,
-            mean=prior_mean,
-            cov=prior_cov,
+        quad_points, quad_weights = build_quadrature(
+            n_quadpts=self.n_quadpts,
+            n_factors=n_factors,
+            prior_mean=self.prior_mean,
+            prior_cov=self.prior_cov,
         )
-
-        quad_points = quadrature.nodes
-        quad_weights = quadrature.weights
         n_quad = len(quad_weights)
 
         log_likes = np.zeros((n_persons, n_quad))

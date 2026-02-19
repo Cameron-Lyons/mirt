@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
 from mirt.results.score_result import ScoreResult
+from mirt.scoring._common import finite_difference_se, score_responses_parallel
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -27,54 +28,26 @@ class MLScorer:
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> ScoreResult:
-        import os
-        from concurrent.futures import ThreadPoolExecutor
-
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
         responses = np.asarray(responses)
-        n_persons = responses.shape[0]
         n_factors = model.n_factors
 
-        theta_ml = np.zeros((n_persons, n_factors))
-        theta_se = np.zeros((n_persons, n_factors))
-
-        n_jobs = self.n_jobs
-        if n_jobs == -1:
-            n_jobs = os.cpu_count() or 1
-
-        def score_person(i):
+        def score_person(
+            i: int,
+        ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:
             person_responses = responses[i : i + 1, :]
             if n_factors == 1:
                 return self._score_unidimensional(model, person_responses)
-            else:
-                return self._score_multidimensional(model, person_responses)
+            return self._score_multidimensional(model, person_responses)
 
-        if n_jobs == 1:
-            for i in range(n_persons):
-                theta_est, se_est = score_person(i)
-                if n_factors == 1:
-                    theta_ml[i, 0] = theta_est
-                    theta_se[i, 0] = se_est
-                else:
-                    theta_ml[i] = theta_est
-                    theta_se[i] = se_est
-        else:
-            with ThreadPoolExecutor(max_workers=min(n_jobs, n_persons)) as executor:
-                results = list(executor.map(score_person, range(n_persons)))
-
-            for i, (theta_est, se_est) in enumerate(results):
-                if n_factors == 1:
-                    theta_ml[i, 0] = theta_est
-                    theta_se[i, 0] = se_est
-                else:
-                    theta_ml[i] = theta_est
-                    theta_se[i] = se_est
-
-        if n_factors == 1:
-            theta_ml = theta_ml.ravel()
-            theta_se = theta_se.ravel()
+        theta_ml, theta_se = score_responses_parallel(
+            model=model,
+            responses=responses,
+            n_jobs=self.n_jobs,
+            score_person=score_person,
+        )
 
         return ScoreResult(
             theta=theta_ml,
@@ -116,16 +89,7 @@ class MLScorer:
         if info > 0:
             se_est = 1.0 / np.sqrt(info)
         else:
-            h = 1e-5
-            f_plus = neg_log_likelihood(theta_est + h)
-            f_minus = neg_log_likelihood(theta_est - h)
-            f_center = neg_log_likelihood(theta_est)
-            hessian = (f_plus - 2 * f_center + f_minus) / (h**2)
-
-            if hessian > 0:
-                se_est = np.sqrt(1.0 / hessian)
-            else:
-                se_est = np.nan
+            se_est = finite_difference_se(neg_log_likelihood, theta_est)
 
         return theta_est, se_est
 
