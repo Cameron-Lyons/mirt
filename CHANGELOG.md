@@ -14,12 +14,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Top-level API now lazy-loads heavy equating/multigroup/plotting/report symbols to reduce import overhead
 - Dataset constants in `mirt.utils.datasets` are now lazily materialized on first access instead of import time
 - Replaced broad `except Exception` handlers with narrower recoverable exception classes in reliability-critical modules
+- Sphinx quickstart and API reference examples now match current public symbols (`fit_mirt`, `fscores`, and `*ParameterLogistic` classes)
+- Integration/scoring tests now use backend-tolerant convergence and correlation expectations to reduce brittleness across runtime configurations
+- Removed spurious test warnings by hardening network correlation edge-cases, avoiding eager divide-by-zero in GRM information, and marking `TestletModel` as non-test for pytest collection
 
 ### Added
 - Custom exception hierarchy for better error handling
 - Improved docstring coverage across all modules
 - CI performance smoke-test job and weekly scheduled slow-test job
 - Performance regression smoke tests for import time and small-model fit time
+- Documentation regression tests to prevent stale API symbol references in docs
 
 ## [0.1.11] - 2025-01-08
 

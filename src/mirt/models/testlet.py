@@ -36,6 +36,8 @@ class TestletModel(DichotomousItemModel):
 
     model_name = "Testlet"
     supports_multidimensional = True
+    # Prevent pytest from trying to collect this class as a test case.
+    __test__ = False
 
     def __init__(
         self,

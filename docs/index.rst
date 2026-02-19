@@ -26,22 +26,20 @@ Quick Start
 
 .. code-block:: python
 
-   import numpy as np
-   from mirt import Model2PL, EMEstimator
+   import mirt
 
-   # Load your response data (items x respondents)
-   responses = np.random.randint(0, 2, size=(100, 20))
+   # Load sample response data (rows: respondents, columns: items)
+   dataset = mirt.load_dataset("LSAT7")
+   responses = dataset["data"]
 
-   # Create a 2PL model
-   model = Model2PL(n_items=20, n_factors=1)
+   # Fit a 2PL model
+   result = mirt.fit_mirt(responses, model="2PL")
+   print(result.summary())
 
-   # Fit the model using EM estimation
-   estimator = EMEstimator()
-   results = estimator.fit(model, responses)
-
-   # View results
-   print(results.item_parameters)
-   print(results.person_parameters)
+   # Score respondents
+   scores = mirt.fscores(result, responses, method="EAP")
+   print(scores.theta[:5])
+   print(scores.standard_error[:5])
 
 Features
 --------

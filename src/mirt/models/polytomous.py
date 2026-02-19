@@ -107,8 +107,12 @@ class GradedResponseModel(PolytomousItemModel):
             p_star_k1 = cum_probs[:, k + 1]
 
             dp_k = a_val * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
-
-            info += np.where(p_k > PROB_EPSILON, (dp_k**2) / p_k, 0.0)
+            info += np.divide(
+                dp_k**2,
+                p_k,
+                out=np.zeros_like(dp_k),
+                where=p_k > PROB_EPSILON,
+            )
 
         return info
 
