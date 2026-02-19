@@ -1,7 +1,7 @@
 Quick Start Guide
 =================
 
-This guide will walk you through the basics of using MIRT for IRT analysis.
+This guide walks through a minimal end-to-end IRT workflow with MIRT.
 
 Basic Usage
 -----------
@@ -9,34 +9,35 @@ Basic Usage
 1. **Prepare your data**: Response data should be a 2D NumPy array where rows
    are respondents and columns are items.
 
-2. **Choose a model**: Select an IRT model appropriate for your data.
+2. **Fit a model**: Use ``fit_mirt()`` with an appropriate model type.
 
-3. **Estimate parameters**: Use an estimation method to fit the model.
+3. **Score respondents**: Use ``fscores()`` to estimate person abilities.
 
-4. **Analyze results**: Examine item and person parameters, fit statistics, etc.
+4. **Analyze fit**: Use item and person fit diagnostics.
 
 Example: 2PL Model
 ------------------
 
 .. code-block:: python
 
-   import numpy as np
-   from mirt import Model2PL, EMEstimator
+   import mirt
 
-   # Simulated response data: 500 respondents, 20 items
-   np.random.seed(42)
-   responses = np.random.randint(0, 2, size=(500, 20))
+   # Load sample data
+   dataset = mirt.load_dataset("LSAT7")
+   responses = dataset["data"]
 
-   # Create model
-   model = Model2PL(n_items=20, n_factors=1)
+   # Fit a 2PL model
+   result = mirt.fit_mirt(responses, model="2PL", max_iter=200)
+   print(result.summary())
 
-   # Fit with EM algorithm
-   estimator = EMEstimator(max_iter=100, tol=1e-4)
-   results = estimator.fit(model, responses)
+   # Access fitted item parameters
+   print("Discrimination:", result.model.parameters["discrimination"])
+   print("Difficulty:", result.model.parameters["difficulty"])
 
-   # Access parameters
-   print("Discrimination parameters:", results.item_parameters["a"])
-   print("Difficulty parameters:", results.item_parameters["b"])
+   # Score respondents
+   scores = mirt.fscores(result, responses, method="EAP")
+   print("Theta estimates:", scores.theta[:5])
+   print("SE estimates:", scores.standard_error[:5])
 
 Example: Graded Response Model
 ------------------------------
@@ -45,13 +46,14 @@ For polytomous items (Likert scales, etc.):
 
 .. code-block:: python
 
-   from mirt import GradedResponseModel, EMEstimator
+   import mirt
 
-   # Responses with 5 categories (0-4)
-   responses = np.random.randint(0, 5, size=(500, 15))
+   data = mirt.load_dataset("verbal_aggression")
+   responses = data["data"]
 
-   model = GradedResponseModel(n_items=15, n_categories=5)
-   results = EMEstimator().fit(model, responses)
+   # verbal_aggression has categories 0, 1, 2 (with -1 for missing)
+   result = mirt.fit_mirt(responses, model="GRM", n_categories=3)
+   print(result.summary())
 
 Scoring
 -------
@@ -60,20 +62,39 @@ After fitting a model, you can score new respondents:
 
 .. code-block:: python
 
-   from mirt.scoring import EAPScorer
+   import mirt
 
-   scorer = EAPScorer()
-   theta_estimates = scorer.score(results, new_responses)
+   dataset = mirt.load_dataset("LSAT7")
+   responses = dataset["data"]
+   result = mirt.fit_mirt(responses, model="2PL")
+
+   # Score a new batch with MAP
+   new_responses = responses[:10]
+   score_result = mirt.fscores(result, new_responses, method="MAP")
+   print(score_result.theta)
 
 Model Fit
 ---------
 
 Evaluate model fit with various diagnostics:
 
+.. note::
+
+   ``itemfit()`` and ``personfit()`` return DataFrame objects. Install either
+   pandas or polars (for example, ``pip install mirt[pandas]``) to use these
+   outputs.
+
 .. code-block:: python
 
-   from mirt.diagnostics import ItemFit
+   import mirt
 
-   fit = ItemFit(results)
-   print(fit.infit)
-   print(fit.outfit)
+   dataset = mirt.load_dataset("LSAT7")
+   responses = dataset["data"]
+   result = mirt.fit_mirt(responses, model="2PL")
+
+   item_stats = mirt.itemfit(result, responses, statistics=["infit", "outfit"])
+   person_stats = mirt.personfit(
+       result, responses, statistics=["infit", "outfit", "Zh"]
+   )
+   print(item_stats.head())
+   print(person_stats.head())

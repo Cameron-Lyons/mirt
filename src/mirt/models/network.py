@@ -650,14 +650,28 @@ def compare_networks(
     if model1.n_nodes != model2.n_nodes:
         raise ValueError("Models must have the same number of nodes")
 
+    def _safe_correlation(x: NDArray[np.float64], y: NDArray[np.float64]) -> float:
+        """Return Pearson correlation, or NaN when undefined."""
+        x = np.asarray(x, dtype=np.float64).ravel()
+        y = np.asarray(y, dtype=np.float64).ravel()
+
+        if x.size != y.size or x.size < 2:
+            return np.nan
+
+        eps = np.finfo(np.float64).eps
+        if np.std(x) <= eps or np.std(y) <= eps:
+            return np.nan
+
+        return float(np.corrcoef(x, y)[0, 1])
+
     edges1 = model1.edge_weights().flatten()
     edges2 = model2.edge_weights().flatten()
 
-    edge_corr = np.corrcoef(edges1, edges2)[0, 1] if len(edges1) > 1 else np.nan
+    edge_corr = _safe_correlation(edges1, edges2)
 
     deg1 = model1.degree_centrality()
     deg2 = model2.degree_centrality()
-    deg_corr = np.corrcoef(deg1, deg2)[0, 1]
+    deg_corr = _safe_correlation(deg1, deg2)
 
     edge_diff = np.abs(edges1 - edges2)
 

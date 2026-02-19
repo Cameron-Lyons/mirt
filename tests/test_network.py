@@ -473,6 +473,7 @@ class TestCompareNetworks:
         assert "degree_correlation" in result
         assert "mean_edge_difference" in result
         assert "max_edge_difference" in result
+        assert np.isnan(result["degree_correlation"])
 
     def test_compare_ggm(self):
         """Test comparing GGM models."""
