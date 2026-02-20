@@ -21,8 +21,11 @@ from mirt.cat._engine_common import (
     configure_exposure_control,
     consume_pending_item,
     finalize_administered_item,
+    initialize_common_engine,
+    record_item_administration,
     reset_session_state,
     run_simulation_loop,
+    score_administered_responses,
 )
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
@@ -114,16 +117,17 @@ class CATEngine:
         theta_bounds: tuple[float, float] = (-4.0, 4.0),
         seed: int | None = None,
     ):
-        if not model.is_fitted:
-            raise ValueError("Model must be fitted before use in CAT")
+        initialize_common_engine(
+            self,
+            model=model,
+            scoring_method=scoring_method,
+            n_quadpts=n_quadpts,
+            theta_bounds=theta_bounds,
+            seed=seed,
+            engine_name="CAT",
+        )
 
-        self.model = model
-        self.scoring_method = scoring_method
         self.initial_theta = initial_theta
-        self.n_quadpts = n_quadpts
-        self.theta_bounds = theta_bounds
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
 
         if isinstance(item_selection, str):
             self._selection = create_selection_strategy(item_selection)
@@ -265,14 +269,12 @@ class CATEngine:
         item_idx = consume_pending_item(self)
 
         theta_arr = np.array([[self._current_theta]])
-        item_info = float(self.model.information(theta_arr, item_idx=item_idx).sum())
-        self._info_history.append(item_info)
-
-        self._items_administered.append(item_idx)
-        self._responses.append(response)
-        self._available_items.discard(item_idx)
-
-        self._exposure.update(item_idx)
+        record_item_administration(
+            self,
+            item_idx=item_idx,
+            response=response,
+            theta_arr=theta_arr,
+        )
 
         self._update_theta()
 
@@ -286,18 +288,9 @@ class CATEngine:
 
     def _update_theta(self) -> None:
         """Update ability estimate based on administered items."""
-        from mirt.scoring import fscores
-
-        responses = np.full((1, self.model.n_items), -1, dtype=np.int_)
-        for item_idx, resp in zip(self._items_administered, self._responses):
-            responses[0, item_idx] = resp
-
         try:
-            result = fscores(
-                self.model,
-                responses,
-                method=self.scoring_method,
-                n_quadpts=self.n_quadpts,
+            result = score_administered_responses(
+                self,
                 bounds=self.theta_bounds,
             )
             self._current_theta = float(result.theta.ravel()[0])
@@ -534,7 +527,7 @@ class CATEngine:
                     results.append(res)
             return results
 
-        theta_est, se_est, n_items, true_theta_out = result
+        theta_est, se_est, n_items, _ = result
 
         results = []
         for i in range(len(theta_est)):
