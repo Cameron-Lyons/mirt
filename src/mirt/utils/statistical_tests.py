@@ -67,6 +67,23 @@ class LagrangeTestResult:
     scores: NDArray[np.float64]
 
 
+def _flatten_model_parameters(model: "BaseItemModel") -> NDArray[np.float64]:
+    """Flatten model parameters into a single vector."""
+    if hasattr(model, "parameters"):
+        params = model.parameters
+        all_params_list: list[float] = []
+        for key in sorted(params.keys()):
+            all_params_list.extend(np.asarray(params[key]).ravel())
+        return np.array(all_params_list)
+
+    return np.concatenate(
+        [
+            np.asarray(model.discrimination).ravel(),
+            np.asarray(model.difficulty).ravel(),
+        ]
+    )
+
+
 def wald(
     model: "BaseItemModel",
     param_indices: list[int] | NDArray[np.intp],
@@ -106,19 +123,7 @@ def wald(
     param_indices = np.asarray(param_indices)
     n_params = len(param_indices)
 
-    if hasattr(model, "parameters"):
-        params = model.parameters
-        all_params_list: list[float] = []
-        for key in sorted(params.keys()):
-            all_params_list.extend(np.asarray(params[key]).ravel())
-        all_params = np.array(all_params_list)
-    else:
-        all_params = np.concatenate(
-            [
-                np.asarray(model.discrimination).ravel(),
-                np.asarray(model.difficulty).ravel(),
-            ]
-        )
+    all_params = _flatten_model_parameters(model)
     estimates = all_params[param_indices]
 
     if constraint_values is None:
@@ -216,19 +221,7 @@ def lagrange(
     probs = model.probability(theta)
     residuals = responses - probs
 
-    if hasattr(model, "parameters"):
-        params = model.parameters
-        all_params_list: list[float] = []
-        for key in sorted(params.keys()):
-            all_params_list.extend(np.asarray(params[key]).ravel())
-        all_params = np.array(all_params_list)
-    else:
-        all_params = np.concatenate(
-            [
-                np.asarray(model.discrimination).ravel(),
-                np.asarray(model.difficulty).ravel(),
-            ]
-        )
+    all_params = _flatten_model_parameters(model)
     n_total_params = len(all_params)
 
     scores = np.zeros(n_total_params)

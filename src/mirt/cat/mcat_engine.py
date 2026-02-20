@@ -12,8 +12,11 @@ from mirt.cat._engine_common import (
     configure_exposure_control,
     consume_pending_item,
     finalize_administered_item,
+    initialize_common_engine,
+    record_item_administration,
     reset_session_state,
     run_simulation_loop,
+    score_administered_responses,
 )
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
@@ -109,8 +112,15 @@ class MCATEngine:
         theta_bounds: tuple[float, float] = (-4.0, 4.0),
         seed: int | None = None,
     ):
-        if not model.is_fitted:
-            raise ValueError("Model must be fitted before use in MCAT")
+        initialize_common_engine(
+            self,
+            model=model,
+            scoring_method=scoring_method,
+            n_quadpts=n_quadpts,
+            theta_bounds=theta_bounds,
+            seed=seed,
+            engine_name="MCAT",
+        )
 
         if model.n_factors < 2:
             raise ValueError(
@@ -118,13 +128,7 @@ class MCATEngine:
                 f"got n_factors={model.n_factors}. Use CATEngine for unidimensional models."
             )
 
-        self.model = model
         self.n_factors = model.n_factors
-        self.scoring_method = scoring_method
-        self.n_quadpts = n_quadpts
-        self.theta_bounds = theta_bounds
-        self.seed = seed
-        self.rng = np.random.default_rng(seed)
 
         if initial_theta is None:
             self.initial_theta = np.zeros(self.n_factors)
@@ -291,14 +295,12 @@ class MCATEngine:
         item_idx = consume_pending_item(self)
 
         theta_arr = self._current_theta.reshape(1, -1)
-        item_info = float(self.model.information(theta_arr, item_idx=item_idx).sum())
-        self._info_history.append(item_info)
-
-        self._items_administered.append(item_idx)
-        self._responses.append(response)
-        self._available_items.discard(item_idx)
-
-        self._exposure.update(item_idx)
+        record_item_administration(
+            self,
+            item_idx=item_idx,
+            response=response,
+            theta_arr=theta_arr,
+        )
 
         self._update_theta()
 
@@ -313,19 +315,8 @@ class MCATEngine:
 
     def _update_theta(self) -> None:
         """Update ability estimates based on administered items."""
-        from mirt.scoring import fscores
-
-        responses = np.full((1, self.model.n_items), -1, dtype=np.int_)
-        for item_idx, resp in zip(self._items_administered, self._responses):
-            responses[0, item_idx] = resp
-
         try:
-            result = fscores(
-                self.model,
-                responses,
-                method=self.scoring_method,
-                n_quadpts=self.n_quadpts,
-            )
+            result = score_administered_responses(self)
             theta = result.theta
             se = result.standard_error
 
