@@ -19,6 +19,18 @@ from mirt.models.cdm import BaseCDM
 
 ReducedModelType = Literal["DINA", "DINO", "ACDM", "LLM", "RRUM", "saturated"]
 
+_REDUCED_MODEL_TO_CODE: dict[ReducedModelType, int] = {
+    "DINA": 0,
+    "DINO": 1,
+    "ACDM": 2,
+    "LLM": 3,
+    "RRUM": 4,
+    "saturated": 5,
+}
+_REDUCED_CODE_TO_MODEL: dict[int, ReducedModelType] = {
+    code: name for name, code in _REDUCED_MODEL_TO_CODE.items()
+}
+
 
 @dataclass
 class AttributeHierarchy:
@@ -185,8 +197,10 @@ class GDINA(BaseCDM):
         self._initialize_gdina_parameters()
 
     def _initialize_parameters(self) -> None:
-        """Initialize parameters (called by parent class)."""
-        pass
+        """Initialize model parameters and latent grouping structures."""
+        if not hasattr(self, "_reduced_models"):
+            self._reduced_models = ["saturated"] * self.n_items
+        self._initialize_gdina_parameters()
 
     def _initialize_gdina_parameters(self) -> None:
         """Initialize delta parameters for each item."""
@@ -227,6 +241,28 @@ class GDINA(BaseCDM):
 
             self._delta_params.append(delta)
 
+        self._sync_parameter_cache()
+
+    def _sync_parameter_cache(self) -> None:
+        """Synchronize generic parameter cache with item-specific deltas."""
+        max_params = max((len(delta) for delta in self._delta_params), default=1)
+        delta_matrix = np.full((self.n_items, max_params), np.nan, dtype=np.float64)
+        n_delta_params = np.zeros(self.n_items, dtype=np.float64)
+
+        for j, delta in enumerate(self._delta_params):
+            n_params = len(delta)
+            delta_matrix[j, :n_params] = delta
+            n_delta_params[j] = float(n_params)
+
+        reduced_model_code = np.array(
+            [_REDUCED_MODEL_TO_CODE[model] for model in self._reduced_models],
+            dtype=np.float64,
+        )
+
+        self._parameters["delta"] = delta_matrix
+        self._parameters["delta_n_params"] = n_delta_params
+        self._parameters["reduced_model_code"] = reduced_model_code
+
     @property
     def reduced_models(self) -> list[ReducedModelType]:
         """Reduced model type for each item."""
@@ -248,6 +284,64 @@ class GDINA(BaseCDM):
             )
 
         self._delta_params[item_idx] = delta
+        self._sync_parameter_cache()
+        return self
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set model parameters using the generic BaseItemModel interface."""
+        allowed = {"delta", "delta_n_params", "reduced_model_code"}
+        unknown = set(params) - allowed
+        if unknown:
+            valid = ", ".join(sorted(allowed))
+            unknown_s = ", ".join(sorted(unknown))
+            raise ValueError(f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}")
+
+        if "reduced_model_code" in params:
+            reduced_codes = np.asarray(params["reduced_model_code"], dtype=np.float64)
+            if reduced_codes.shape != (self.n_items,):
+                raise ValueError(
+                    f"Shape mismatch for reduced_model_code: expected ({self.n_items},), "
+                    f"got {reduced_codes.shape}"
+                )
+            self._reduced_models = []
+            for code in reduced_codes:
+                rounded = int(np.rint(code))
+                if rounded not in _REDUCED_CODE_TO_MODEL:
+                    raise ValueError(f"Unknown reduced model code: {code}")
+                self._reduced_models.append(_REDUCED_CODE_TO_MODEL[rounded])
+
+        if "delta" in params:
+            delta_matrix = np.asarray(params["delta"], dtype=np.float64)
+            if delta_matrix.ndim != 2 or delta_matrix.shape[0] != self.n_items:
+                raise ValueError(
+                    f"Shape mismatch for delta: expected ({self.n_items}, n_params), "
+                    f"got {delta_matrix.shape}"
+                )
+        else:
+            delta_matrix = self._parameters["delta"]
+
+        if "delta_n_params" in params:
+            n_delta_params = np.asarray(params["delta_n_params"], dtype=np.float64)
+            if n_delta_params.shape != (self.n_items,):
+                raise ValueError(
+                    f"Shape mismatch for delta_n_params: expected ({self.n_items},), "
+                    f"got {n_delta_params.shape}"
+                )
+        else:
+            n_delta_params = self._parameters["delta_n_params"]
+
+        max_params = delta_matrix.shape[1]
+        updated_delta_params: list[NDArray[np.float64]] = []
+        for j in range(self.n_items):
+            n_params = int(np.rint(n_delta_params[j]))
+            if n_params < 1 or n_params > max_params:
+                raise ValueError(
+                    f"Invalid number of delta parameters for item {j}: {n_params}"
+                )
+            updated_delta_params.append(delta_matrix[j, :n_params].astype(np.float64).copy())
+
+        self._delta_params = updated_delta_params
+        self._sync_parameter_cache()
         return self
 
     def _latent_group_idx(
@@ -528,6 +622,7 @@ class GDINA(BaseCDM):
             delta[-1] = 0.6
 
         self._delta_params[item_idx] = delta
+        self._sync_parameter_cache()
 
     def copy(self) -> Self:
         """Create a deep copy of this model."""
@@ -542,6 +637,7 @@ class GDINA(BaseCDM):
         new_model._delta_params = [d.copy() for d in self._delta_params]
         new_model._latent_groups = [g.copy() for g in self._latent_groups]
         new_model._is_fitted = self._is_fitted
+        new_model._sync_parameter_cache()
 
         return new_model
 
@@ -608,9 +704,18 @@ class HigherOrderCDM(BaseCDM):
         else:
             self._valid_patterns = self._attribute_patterns
 
+        self._sync_parameter_cache()
+
     def _initialize_parameters(self) -> None:
-        """Initialize parameters (called by parent class)."""
-        pass
+        """Initialize higher-order parameters."""
+        self._loadings = np.ones(self._n_attributes, dtype=np.float64)
+        self._thresholds = np.zeros(self._n_attributes, dtype=np.float64)
+        self._sync_parameter_cache()
+
+    def _sync_parameter_cache(self) -> None:
+        """Synchronize generic parameter cache with higher-order parameters."""
+        self._parameters["loadings"] = self._loadings.copy()
+        self._parameters["thresholds"] = self._thresholds.copy()
 
     @property
     def hierarchy(self) -> AttributeHierarchy | None:
@@ -651,6 +756,37 @@ class HigherOrderCDM(BaseCDM):
 
         self._loadings = loadings
         self._thresholds = thresholds
+        self._sync_parameter_cache()
+        return self
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set higher-order parameters using the generic BaseItemModel interface."""
+        allowed = {"loadings", "thresholds"}
+        unknown = set(params) - allowed
+        if unknown:
+            valid = ", ".join(sorted(allowed))
+            unknown_s = ", ".join(sorted(unknown))
+            raise ValueError(f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}")
+
+        if "loadings" in params:
+            loadings = np.asarray(params["loadings"], dtype=np.float64)
+            if loadings.shape != (self._n_attributes,):
+                raise ValueError(
+                    f"Shape mismatch for loadings: expected ({self._n_attributes},), "
+                    f"got {loadings.shape}"
+                )
+            self._loadings = loadings
+
+        if "thresholds" in params:
+            thresholds = np.asarray(params["thresholds"], dtype=np.float64)
+            if thresholds.shape != (self._n_attributes,):
+                raise ValueError(
+                    f"Shape mismatch for thresholds: expected ({self._n_attributes},), "
+                    f"got {thresholds.shape}"
+                )
+            self._thresholds = thresholds
+
+        self._sync_parameter_cache()
         return self
 
     def attribute_probability(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -853,6 +989,7 @@ class HigherOrderCDM(BaseCDM):
         new_model._base_cdm = self._base_cdm.copy()
         new_model._valid_patterns = self._valid_patterns.copy()
         new_model._is_fitted = self._is_fitted
+        new_model._sync_parameter_cache()
 
         return new_model
 
@@ -954,5 +1091,6 @@ def fit_gdina(
 
         prev_ll = current_ll
 
+    model._sync_parameter_cache()
     model._is_fitted = True
     return model, class_probs

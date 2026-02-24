@@ -52,11 +52,11 @@ class ExposureControl(ABC):
         selected_item : int
             Index of the item that was selected.
         """
-        pass
+        return None
 
     def reset(self) -> None:
         """Reset exposure control for a new examinee."""
-        pass
+        return None
 
 
 class NoExposureControl(ExposureControl):
