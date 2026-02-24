@@ -191,11 +191,11 @@ def predict_mixed(
     if new_theta is None:
         new_theta = result.theta if hasattr(result, "theta") else np.zeros((1, 1))
 
-    new_theta = np.atleast_2d(new_theta)
-    if new_theta.shape[1] == 1 and new_theta.shape[0] > 1:
-        pass
-    elif new_theta.ndim == 1:
+    new_theta = np.asarray(new_theta, dtype=np.float64)
+    if new_theta.ndim == 1:
         new_theta = new_theta.reshape(-1, 1)
+    elif new_theta.ndim != 2:
+        raise ValueError(f"new_theta must be 1D or 2D, got {new_theta.ndim}D")
 
     model = result.model
     probs = model.probability(new_theta)
