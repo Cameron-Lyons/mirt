@@ -73,7 +73,7 @@ class ContentConstraint(ABC):
 
     def reset(self) -> None:
         """Reset constraint state for a new examinee."""
-        pass
+        return None
 
 
 class NoContentConstraint(ContentConstraint):
