@@ -54,6 +54,24 @@ def _ensure_i64(arr: NDArray[np.integer] | None) -> NDArray[np.int64] | None:
     return arr.astype(np.int64)
 
 
+_MAX_VECTOR_CHUNK_ENTRIES = 1_000_000
+
+
+def _prepare_binary_response_components(
+    responses: NDArray[np.int_],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Prepare binary response matrices used by vectorized log-likelihood code."""
+    response_matrix = np.asarray(responses)
+    valid = (response_matrix >= 0).astype(np.float64)
+    correct = (response_matrix == 1).astype(np.float64)
+    return correct, valid
+
+
+def _quad_chunk_size(n_quad: int, n_items: int) -> int:
+    """Select a quadrature chunk size with bounded temporary memory."""
+    return max(1, min(n_quad, _MAX_VECTOR_CHUNK_ENTRIES // max(1, n_items)))
+
+
 class PreparedArrays:
     """Pre-converted arrays for EM estimation to avoid repeated conversions."""
 
@@ -144,25 +162,32 @@ def compute_log_likelihoods_2pl(
             _ensure_f64(difficulty),
         )
 
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
 
-    for q in range(n_quad):
-        theta = quad_points[q]
-        z = discrimination * (theta - difficulty)
+    n_persons, n_items = responses.shape
+    n_quad = quad_points.shape[0]
+    chunk_size = _quad_chunk_size(n_quad, n_items)
+
+    correct, valid = _prepare_binary_response_components(responses)
+    log_likes = np.empty((n_persons, n_quad), dtype=np.float64)
+
+    for start in range(0, n_quad, chunk_size):
+        stop = min(start + chunk_size, n_quad)
+        theta_chunk = quad_points[start:stop]
+
+        z = discrimination[None, :] * (theta_chunk[:, None] - difficulty[None, :])
         probs = sigmoid(z)
         probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    if responses[i, j] == 1:
-                        ll += np.log(probs[j])
-                    else:
-                        ll += np.log(1 - probs[j])
-            log_likes[i, q] = ll
+        log_p1 = np.log(probs)
+        log_p0 = np.log1p(-probs)
+
+        log_likes[:, start:stop] = (
+            correct @ log_p1.T + (valid - correct) @ log_p0.T
+        )
 
     return log_likes
 
@@ -184,26 +209,34 @@ def compute_log_likelihoods_3pl(
             _ensure_f64(guessing),
         )
 
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
+    guessing = np.asarray(guessing, dtype=np.float64)
 
-    for q in range(n_quad):
-        theta = quad_points[q]
-        z = discrimination * (theta - difficulty)
+    n_persons, n_items = responses.shape
+    n_quad = quad_points.shape[0]
+    chunk_size = _quad_chunk_size(n_quad, n_items)
+
+    correct, valid = _prepare_binary_response_components(responses)
+    log_likes = np.empty((n_persons, n_quad), dtype=np.float64)
+
+    for start in range(0, n_quad, chunk_size):
+        stop = min(start + chunk_size, n_quad)
+        theta_chunk = quad_points[start:stop]
+
+        z = discrimination[None, :] * (theta_chunk[:, None] - difficulty[None, :])
         p_star = sigmoid(z)
-        probs = guessing + (1 - guessing) * p_star
+        probs = guessing[None, :] + (1 - guessing[None, :]) * p_star
         probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    if responses[i, j] == 1:
-                        ll += np.log(probs[j])
-                    else:
-                        ll += np.log(1 - probs[j])
-            log_likes[i, q] = ll
+        log_p1 = np.log(probs)
+        log_p0 = np.log1p(-probs)
+
+        log_likes[:, start:stop] = (
+            correct @ log_p1.T + (valid - correct) @ log_p0.T
+        )
 
     return log_likes
 
@@ -223,27 +256,39 @@ def compute_log_likelihoods_mirt(
             _ensure_f64(difficulty),
         )
 
-    n_persons = responses.shape[0]
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
+
+    if quad_points.ndim == 1:
+        quad_points = quad_points.reshape(-1, 1)
+    if discrimination.ndim == 1:
+        discrimination = discrimination.reshape(-1, 1)
+
+    n_persons, n_items = responses.shape
     n_quad = quad_points.shape[0]
+    chunk_size = _quad_chunk_size(n_quad, n_items)
 
-    disc_sums = discrimination.sum(axis=1)
-    log_likes = np.zeros((n_persons, n_quad))
+    correct, valid = _prepare_binary_response_components(responses)
+    log_likes = np.empty((n_persons, n_quad), dtype=np.float64)
 
-    for q in range(n_quad):
-        theta_q = quad_points[q]
-        z = np.dot(discrimination, theta_q) - disc_sums * difficulty
+    item_offsets = discrimination.sum(axis=1) * difficulty
 
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(responses.shape[1]):
-                if responses[i, j] >= 0:
-                    p = sigmoid(z[j])
-                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-                    if responses[i, j] == 1:
-                        ll += np.log(p)
-                    else:
-                        ll += np.log(1 - p)
-            log_likes[i, q] = ll
+    for start in range(0, n_quad, chunk_size):
+        stop = min(start + chunk_size, n_quad)
+        theta_chunk = quad_points[start:stop]
+
+        z = theta_chunk @ discrimination.T - item_offsets[None, :]
+        probs = sigmoid(z)
+        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
+
+        log_p1 = np.log(probs)
+        log_p0 = np.log1p(-probs)
+
+        log_likes[:, start:stop] = (
+            correct @ log_p1.T + (valid - correct) @ log_p0.T
+        )
 
     return log_likes
 
