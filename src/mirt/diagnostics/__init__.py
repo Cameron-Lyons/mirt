@@ -63,7 +63,10 @@ _LAZY_IMPORTS = {
         "mirt.diagnostics.bayesian",
         "posterior_predictive_check",
     ),
-    "compute_pointwise_log_lik": ("mirt.diagnostics.bayesian", "compute_pointwise_log_lik"),
+    "compute_pointwise_log_lik": (
+        "mirt.diagnostics.bayesian",
+        "compute_pointwise_log_lik",
+    ),
     "compare_models": ("mirt.diagnostics.bayesian", "compare_models"),
     "PSISResult": ("mirt.diagnostics.bayesian", "PSISResult"),
     "WAICResult": ("mirt.diagnostics.bayesian", "WAICResult"),
