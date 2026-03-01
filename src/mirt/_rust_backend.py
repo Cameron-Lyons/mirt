@@ -185,9 +185,7 @@ def compute_log_likelihoods_2pl(
         log_p1 = np.log(probs)
         log_p0 = np.log1p(-probs)
 
-        log_likes[:, start:stop] = (
-            correct @ log_p1.T + (valid - correct) @ log_p0.T
-        )
+        log_likes[:, start:stop] = correct @ log_p1.T + (valid - correct) @ log_p0.T
 
     return log_likes
 
@@ -234,9 +232,7 @@ def compute_log_likelihoods_3pl(
         log_p1 = np.log(probs)
         log_p0 = np.log1p(-probs)
 
-        log_likes[:, start:stop] = (
-            correct @ log_p1.T + (valid - correct) @ log_p0.T
-        )
+        log_likes[:, start:stop] = correct @ log_p1.T + (valid - correct) @ log_p0.T
 
     return log_likes
 
@@ -286,9 +282,7 @@ def compute_log_likelihoods_mirt(
         log_p1 = np.log(probs)
         log_p0 = np.log1p(-probs)
 
-        log_likes[:, start:stop] = (
-            correct @ log_p1.T + (valid - correct) @ log_p0.T
-        )
+        log_likes[:, start:stop] = correct @ log_p1.T + (valid - correct) @ log_p0.T
 
     return log_likes
 

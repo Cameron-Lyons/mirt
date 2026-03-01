@@ -294,7 +294,9 @@ class GDINA(BaseCDM):
         if unknown:
             valid = ", ".join(sorted(allowed))
             unknown_s = ", ".join(sorted(unknown))
-            raise ValueError(f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}")
+            raise ValueError(
+                f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}"
+            )
 
         if "reduced_model_code" in params:
             reduced_codes = np.asarray(params["reduced_model_code"], dtype=np.float64)
@@ -338,7 +340,9 @@ class GDINA(BaseCDM):
                 raise ValueError(
                     f"Invalid number of delta parameters for item {j}: {n_params}"
                 )
-            updated_delta_params.append(delta_matrix[j, :n_params].astype(np.float64).copy())
+            updated_delta_params.append(
+                delta_matrix[j, :n_params].astype(np.float64).copy()
+            )
 
         self._delta_params = updated_delta_params
         self._sync_parameter_cache()
@@ -766,7 +770,9 @@ class HigherOrderCDM(BaseCDM):
         if unknown:
             valid = ", ".join(sorted(allowed))
             unknown_s = ", ".join(sorted(unknown))
-            raise ValueError(f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}")
+            raise ValueError(
+                f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}"
+            )
 
         if "loadings" in params:
             loadings = np.asarray(params["loadings"], dtype=np.float64)
