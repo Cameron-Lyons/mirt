@@ -163,7 +163,7 @@ jobs:
         run: uv run pytest tests/ -v --cov=src/mirt --cov-report=xml
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         if: matrix.python-version == '3.14'
         with:
           files: coverage.xml
