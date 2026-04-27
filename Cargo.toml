@@ -14,7 +14,7 @@ path = "rust_src/src/lib.rs"
 pyo3 = { version = "0.28.2", features = ["extension-module", "abi3-py311"] }
 numpy = "0.28.0"
 ndarray = { version = "0.17.2", features = ["rayon"] }
-rayon = "1.11.0"
+rayon = "1.12.0"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 rand_pcg = "0.10.2"
