@@ -33,11 +33,22 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy --component rustfmt
           rustup default stable
 
+      - name: Prepare Cargo manifest path
+        run: |
+          manifest="${{ matrix.manifest }}"
+          dir="$(dirname "$manifest")"
+          base="$(basename "$manifest")"
+          if [ "$base" != "Cargo.toml" ]; then
+            ln -sf "$base" "$dir/Cargo.toml"
+            manifest="$dir/Cargo.toml"
+          fi
+          echo "CARGO_MANIFEST_PATH=$manifest" >> "$GITHUB_ENV"
+
       - name: Check formatting
-        run: cargo fmt --all --manifest-path "${{ matrix.manifest }}" -- --check
+        run: cargo fmt --all --manifest-path "$CARGO_MANIFEST_PATH" -- --check
 
       - name: Build with warnings denied
-        run: cargo build --manifest-path "${{ matrix.manifest }}" --all-targets --all-features
+        run: cargo build --manifest-path "$CARGO_MANIFEST_PATH" --all-targets --all-features
 
       - name: Run clippy with warnings denied
-        run: cargo clippy --manifest-path "${{ matrix.manifest }}" --all-targets --all-features -- -D warnings
+        run: cargo clippy --manifest-path "$CARGO_MANIFEST_PATH" --all-targets --all-features -- -D warnings
