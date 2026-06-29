@@ -32,7 +32,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache Rust build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -43,7 +43,7 @@ jobs:
             ${{ runner.os }}-cargo-lint-
 
       - name: Cache UV
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-lint-${{ hashFiles('**/pyproject.toml') }}
@@ -86,7 +86,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -97,7 +97,7 @@ jobs:
             ${{ runner.os }}-cargo-typecheck-
 
       - name: Cache UV
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-typecheck-${{ hashFiles('**/pyproject.toml') }}
@@ -135,7 +135,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -147,7 +147,7 @@ jobs:
             ${{ runner.os }}-cargo-test-
 
       - name: Cache UV
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-test-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
@@ -190,7 +190,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -201,7 +201,7 @@ jobs:
             ${{ runner.os }}-cargo-performance-
 
       - name: Cache UV
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-performance-${{ hashFiles('**/pyproject.toml') }}
@@ -240,7 +240,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -251,7 +251,7 @@ jobs:
             ${{ runner.os }}-cargo-slow-
 
       - name: Cache UV
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/uv
           key: ${{ runner.os }}-uv-slow-${{ hashFiles('**/pyproject.toml') }}
