@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
     mirt_rs,
 )
+
 
 def fixed_calib_em(
     responses: NDArray[np.int_],
@@ -97,6 +98,7 @@ def fixed_calib_em(
         )
 
     raise RuntimeError("Rust backend required for fixed_calib_em")
+
 
 def stocking_lord_criterion(
     disc_old: NDArray[np.float64],

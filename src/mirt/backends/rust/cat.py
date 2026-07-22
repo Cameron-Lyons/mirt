@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
+    mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def cat_compute_item_info(
     theta: float,
@@ -47,6 +48,7 @@ def cat_compute_item_info(
     p = sigmoid(z)
     q = 1.0 - p
     return (discrimination**2) * p * q
+
 
 def cat_select_max_info(
     theta: float,
@@ -83,6 +85,7 @@ def cat_select_max_info(
     info = cat_compute_item_info(theta, discrimination, difficulty)
     info = np.where(available_mask, info, -np.inf)
     return int(np.argmax(info))
+
 
 def cat_eap_update(
     administered_items: NDArray[np.int32],
@@ -158,6 +161,7 @@ def cat_eap_update(
 
     return float(theta_eap), float(se)
 
+
 def cat_simulate_batch(
     true_thetas: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -224,6 +228,7 @@ def cat_simulate_batch(
         )
 
     return None
+
 
 def cat_conditional_mse(
     eval_thetas: NDArray[np.float64],

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
     mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def compute_log_likelihoods_grm(
     responses: NDArray[np.int_],
@@ -80,6 +81,7 @@ def compute_log_likelihoods_grm(
 
     return log_likes
 
+
 def compute_log_likelihoods_gpcm(
     responses: NDArray[np.int_],
     quad_points: NDArray[np.float64],
@@ -142,6 +144,7 @@ def compute_log_likelihoods_gpcm(
 
     return log_likes
 
+
 def compute_alpha_if_deleted(
     responses: NDArray[np.float64],
 ) -> NDArray[np.float64]:
@@ -194,4 +197,3 @@ def compute_alpha_if_deleted(
             alpha_if_deleted[j] = 0.0
 
     return alpha_if_deleted
-

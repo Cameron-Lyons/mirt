@@ -10,6 +10,7 @@ from mirt.backends.rust._helpers import (
     mirt_rs,
 )
 
+
 def gvem_e_step(
     responses: NDArray[np.int_],
     loadings: NDArray[np.float64],
@@ -60,6 +61,7 @@ def gvem_e_step(
 
     return None
 
+
 def gvem_m_step(
     responses: NDArray[np.int_],
     mu: NDArray[np.float64],
@@ -101,6 +103,7 @@ def gvem_m_step(
         )
 
     return None
+
 
 def gvem_compute_elbo(
     responses: NDArray[np.int_],

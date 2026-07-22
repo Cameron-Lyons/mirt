@@ -7,9 +7,10 @@ from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
+    mirt_rs,
 )
+
 
 def lord_wingersky_recursion(
     theta: NDArray[np.float64],
@@ -44,6 +45,7 @@ def lord_wingersky_recursion(
 
     return None
 
+
 def lord_wingersky_polytomous(
     item_probs: NDArray[np.float64],
     max_score: int,
@@ -70,6 +72,7 @@ def lord_wingersky_polytomous(
         )
 
     return None
+
 
 def eapsum_from_distribution(
     log_p_score_theta: NDArray[np.float64],

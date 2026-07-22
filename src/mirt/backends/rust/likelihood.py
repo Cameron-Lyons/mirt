@@ -4,17 +4,18 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
     _prepare_binary_response_components,
     _quad_chunk_size,
+    mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def compute_log_likelihoods_2pl(
     responses: NDArray[np.int_],
@@ -75,6 +76,7 @@ def compute_log_likelihoods_2pl(
 
     return log_likes
 
+
 def compute_log_likelihoods_3pl(
     responses: NDArray[np.int_],
     quad_points: NDArray[np.float64],
@@ -120,6 +122,7 @@ def compute_log_likelihoods_3pl(
         log_likes[:, start:stop] = correct @ log_p1.T + (valid - correct) @ log_p0.T
 
     return log_likes
+
 
 def compute_log_likelihoods_mirt(
     responses: NDArray[np.int_],

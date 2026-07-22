@@ -7,10 +7,12 @@ from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
+    mirt_rs,
 )
+from mirt.backends.rust.likelihood import compute_log_likelihoods_2pl
+
 
 def e_step_complete(
     responses: NDArray[np.int_],
@@ -59,6 +61,7 @@ def e_step_complete(
 
     return posterior_weights, marginal_ll
 
+
 def compute_expected_counts(
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
@@ -86,6 +89,7 @@ def compute_expected_counts(
 
     return r_k, n_k
 
+
 def compute_expected_counts_polytomous(
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
@@ -108,6 +112,7 @@ def compute_expected_counts_polytomous(
             r_kc[:, resp] += posterior_weights[i]
 
     return r_kc
+
 
 def compute_expected_counts_parallel(
     responses: NDArray[np.int_],
