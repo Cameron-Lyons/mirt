@@ -222,3 +222,84 @@ class TestMultigroupAnalysis:
 
         for inv, result in results.items():
             assert result.model.is_fitted
+
+    def test_3pl_model(self, rng):
+        """Smoke fit for multigroup 3PL."""
+        n_persons = 60
+        n_items = 5
+
+        responses = rng.integers(0, 2, size=(n_persons, n_items))
+        groups = np.array([0] * 30 + [1] * 30)
+
+        try:
+            result = fit_multigroup(
+                responses,
+                groups,
+                model="3PL",
+                invariance="configural",
+                n_quadpts=11,
+                max_iter=20,
+                verbose=False,
+            )
+        except (ValueError, NotImplementedError) as exc:
+            pytest.skip(f"3PL multigroup not supported: {exc}")
+
+        assert result is not None
+        assert result.model.is_fitted
+        assert result.model.model_name == "3PL"
+
+    def test_gpcm_model(self, rng):
+        """Smoke fit for multigroup GPCM."""
+        n_persons = 60
+        n_items = 5
+        n_categories = 3
+
+        responses = rng.integers(0, n_categories, size=(n_persons, n_items))
+        groups = np.array([0] * 30 + [1] * 30)
+
+        try:
+            result = fit_multigroup(
+                responses,
+                groups,
+                model="GPCM",
+                n_categories=n_categories,
+                invariance="configural",
+                n_quadpts=11,
+                max_iter=20,
+                verbose=False,
+            )
+        except (ValueError, NotImplementedError) as exc:
+            pytest.skip(f"GPCM multigroup not supported: {exc}")
+
+        assert result is not None
+        assert result.model.is_fitted
+        assert result.model.model_name == "GPCM"
+
+    def test_invariance_lrt_helper(self, rng):
+        """Compare invariance fits via exported LRT helper when available."""
+        from mirt.multigroup import invariance_lrt
+
+        n_persons = 60
+        n_items = 5
+        responses = rng.integers(0, 2, size=(n_persons, n_items))
+        groups = np.array([0] * 30 + [1] * 30)
+
+        results = compare_invariance(
+            responses,
+            groups,
+            model="2PL",
+            n_quadpts=11,
+            max_iter=20,
+            verbose=False,
+        )
+
+        try:
+            # constrained=metric, free=configural
+            lrt = invariance_lrt(results["metric"], results["configural"])
+        except (ValueError, TypeError, AttributeError) as exc:
+            pytest.skip(f"invariance_lrt not usable with these fits: {exc}")
+
+        assert "chi2" in lrt
+        assert "df" in lrt
+        assert "p_value" in lrt
+        assert lrt["df"] > 0

@@ -16,6 +16,7 @@ from mirt._gpu_backend import (
 )
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.exceptions import MirtValidationError
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -44,7 +45,12 @@ class EMEstimator(BaseEstimator):
         super().__init__(max_iter, tol, verbose)
 
         if n_quadpts < 5:
-            raise ValueError("n_quadpts should be at least 5")
+            raise MirtValidationError(
+                "n_quadpts should be at least 5",
+                parameter="n_quadpts",
+                value=n_quadpts,
+                expected=">= 5",
+            )
 
         self.n_quadpts = n_quadpts
         self.prob_epsilon = prob_epsilon

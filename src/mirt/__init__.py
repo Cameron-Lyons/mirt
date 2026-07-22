@@ -137,7 +137,7 @@ def fit_mirt(
     model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
     n_factors: int = 1,
     n_categories: int | None = None,
-    estimation: Literal["EM"] = "EM",
+    estimation: Literal["EM", "MHRM", "MCMC", "Gibbs"] = "EM",
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
@@ -147,8 +147,9 @@ def fit_mirt(
 ) -> FitResult:
     """Fit an Item Response Theory model to response data.
 
-    This is the main function for estimating IRT model parameters using
-    the EM algorithm with marginal maximum likelihood estimation.
+    This is the main function for estimating IRT model parameters.
+    Default estimation uses the EM algorithm with marginal maximum
+    likelihood; MHRM and Gibbs/MCMC are also available.
 
     Parameters
     ----------
@@ -173,14 +174,17 @@ def fit_mirt(
     n_categories : int, optional
         Number of response categories for polytomous models.
         If None, inferred from data.
-    estimation : {"EM"}, default="EM"
-        Estimation method. Currently only EM is supported.
+    estimation : {"EM", "MHRM", "MCMC", "Gibbs"}, default="EM"
+        Estimation method. "MCMC" and "Gibbs" are aliases for Gibbs sampling;
+        results are returned as a FitResult with posterior-mean parameters and
+        chain standard deviations as standard errors.
     n_quadpts : int, default=21
-        Number of quadrature points for numerical integration.
+        Number of quadrature points for numerical integration (EM only).
     max_iter : int, default=500
-        Maximum number of EM iterations.
+        Maximum number of EM iterations (EM) or MHRM cycles / MCMC iterations
+        depending on method.
     tol : float, default=1e-4
-        Convergence tolerance for parameter change.
+        Convergence tolerance for parameter change (EM).
     verbose : bool, default=False
         Print iteration progress.
     item_names : list of str, optional
@@ -202,8 +206,13 @@ def fit_mirt(
 
     Raises
     ------
-    ValueError
-        If data is not 2D or model type is unknown.
+    MirtDataError
+        If data is not 2D.
+    MirtValidationError
+        If model type or estimation method is unknown, or polytomous
+        category count is invalid.
+    MirtModelError
+        If the requested model cannot be constructed.
 
     Examples
     --------
@@ -215,12 +224,17 @@ def fit_mirt(
     >>> print(f"Log-likelihood: {result.log_likelihood:.2f}")
     >>> print(result.model.parameters)
     """
-    from mirt._rust_backend import em_fit_2pl
+    from mirt._rust_backend import (
+        compute_item_se_parallel,
+        e_step_complete,
+        em_fit_2pl,
+    )
+    from mirt.typing import EstimationMethod
 
     data = np.asarray(data)
 
     if data.ndim != 2:
-        raise ValueError(f"data must be 2D, got {data.ndim}D")
+        raise MirtDataError(f"data must be 2D, got {data.ndim}D")
 
     n_persons, n_items = data.shape
 
@@ -233,14 +247,21 @@ def fit_mirt(
         if n_categories is None:
             n_categories = int(data[data >= 0].max()) + 1
         if n_categories < 2:
-            raise ValueError("n_categories must be at least 2")
+            raise MirtValidationError(
+                "n_categories must be at least 2",
+                parameter="n_categories",
+                value=n_categories,
+                expected=">= 2",
+            )
+
+    estimation_method: EstimationMethod = estimation  # type: ignore[assignment]
 
     if (
         use_rust
         and RUST_AVAILABLE
         and model == "2PL"
         and n_factors == 1
-        and estimation == "EM"
+        and estimation_method == "EM"
     ):
         discrimination, difficulty, log_likelihood, n_iterations, converged = (
             em_fit_2pl(data, n_quadpts=n_quadpts, max_iter=max_iter, tol=tol)
@@ -249,11 +270,29 @@ def fit_mirt(
         irt_model = TwoParameterLogistic(
             n_items=n_items, n_factors=n_factors, item_names=item_names
         )
+        discrimination = np.asarray(discrimination)
+        difficulty = np.asarray(difficulty)
         irt_model._parameters = {
-            "discrimination": np.asarray(discrimination),
-            "difficulty": np.asarray(difficulty),
+            "discrimination": discrimination,
+            "difficulty": difficulty,
         }
         irt_model._is_fitted = True
+
+        quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
+        posterior_weights, _ = e_step_complete(
+            data,
+            quad.nodes.ravel(),
+            quad.weights.ravel(),
+            discrimination,
+            difficulty,
+        )
+        se_a, se_b = compute_item_se_parallel(
+            data,
+            posterior_weights,
+            quad.nodes.ravel(),
+            discrimination,
+            difficulty,
+        )
 
         n_params = 2 * n_items
         aic = -2 * log_likelihood + 2 * n_params
@@ -265,8 +304,8 @@ def fit_mirt(
             n_iterations=n_iterations,
             converged=converged,
             standard_errors={
-                "discrimination": np.full(n_items, np.nan),
-                "difficulty": np.full(n_items, np.nan),
+                "discrimination": np.asarray(se_a),
+                "difficulty": np.asarray(se_b),
             },
             aic=aic,
             bic=bic,
@@ -316,21 +355,76 @@ def fit_mirt(
             item_names=item_names,
         )
     else:
-        raise ValueError(f"Unknown model: {model}")
+        raise MirtModelError(f"Unknown model: {model}", model_type=str(model))
 
-    if estimation == "EM":
+    if estimation_method == "EM":
         estimator = EMEstimator(
             n_quadpts=n_quadpts,
             max_iter=max_iter,
             tol=tol,
             verbose=verbose,
         )
-    else:
-        raise ValueError(f"Unknown estimation method: {estimation}")
+        return estimator.fit(irt_model, data)
 
-    result = estimator.fit(irt_model, data)
+    if estimation_method == "MHRM":
+        return MHRMEstimator(
+            n_cycles=max_iter,
+            verbose=verbose,
+            use_rust=use_rust,
+        ).fit(irt_model, data)
 
-    return result
+    if estimation_method in ("MCMC", "Gibbs"):
+        burnin = min(1000, max(max_iter // 5, 1))
+        n_iter = max(max_iter, burnin + 10)
+        mcmc = GibbsSampler(
+            n_iter=n_iter,
+            burnin=burnin,
+            verbose=verbose,
+            use_rust=use_rust,
+        ).fit(irt_model, data)
+        return _mcmc_result_to_fit_result(mcmc, n_persons)
+
+    raise MirtValidationError(
+        f"Unknown estimation method: {estimation}",
+        parameter="estimation",
+        value=estimation,
+        expected="EM, MHRM, MCMC, or Gibbs",
+    )
+
+
+def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
+    """Adapt MCMCResult to FitResult for a uniform fit_mirt return type."""
+    model = mcmc.model
+    n_params = model.n_parameters
+    standard_errors: dict[str, NDArray[np.float64]] = {}
+    for name, chain in mcmc.chains.items():
+        if name in ("theta", "log_likelihood"):
+            continue
+        arr = np.asarray(chain, dtype=np.float64)
+        if arr.ndim >= 2:
+            standard_errors[name] = np.std(arr, axis=0, ddof=1)
+        else:
+            standard_errors[name] = np.array([float(np.std(arr, ddof=1))])
+
+    for name, values in model.parameters.items():
+        if name not in standard_errors:
+            standard_errors[name] = np.full(values.shape, np.nan)
+
+    aic = -2 * mcmc.log_likelihood + 2 * n_params
+    bic = -2 * mcmc.log_likelihood + np.log(max(n_persons, 1)) * n_params
+    converged = bool(mcmc.rhat) and all(r < 1.1 for r in mcmc.rhat.values())
+
+    return FitResult(
+        model=model,
+        log_likelihood=mcmc.log_likelihood,
+        n_iterations=mcmc.n_iterations,
+        converged=converged,
+        standard_errors=standard_errors,
+        aic=aic,
+        bic=bic,
+        n_observations=n_persons,
+        n_parameters=n_params,
+    )
 
 
 def itemfit(

@@ -269,3 +269,51 @@ pub fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sigmoid_at_zero_is_half() {
+        assert!((sigmoid(0.0) - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sigmoid_saturates_at_extremes() {
+        assert!((sigmoid(50.0) - 1.0).abs() < 1e-12);
+        assert!(sigmoid(-50.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn logsumexp_of_equal_values() {
+        let expected = 1.0 + 3.0_f64.ln();
+        assert!((logsumexp(&[1.0, 1.0, 1.0]) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn clip_bounds_values() {
+        assert!((clip(0.5, 0.0, 1.0) - 0.5).abs() < 1e-12);
+        assert!((clip(-1.0, 0.0, 1.0) - 0.0).abs() < 1e-12);
+        assert!((clip(2.0, 0.0, 1.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn log_likelihood_2pl_all_correct_is_finite_negative() {
+        let responses = [1, 1, 1];
+        let discrimination = [1.0, 1.0, 1.0];
+        let difficulty = [0.0, 0.0, 0.0];
+        let ll = log_likelihood_2pl_single(&responses, 0.0, &discrimination, &difficulty);
+        assert!(ll.is_finite());
+        assert!(ll < 0.0);
+        // Three items at P=0.5 => 3 * ln(0.5)
+        assert!((ll - 3.0 * 0.5_f64.ln()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn fisher_info_2pl_at_difficulty() {
+        // At theta = b with a = 1: I = a^2 * p * (1-p) = 0.25 per item
+        let info = fisher_info_2pl(0.0, &[1.0, 1.0], &[0.0, 0.0]);
+        assert!((info - 0.5).abs() < 1e-12);
+    }
+}

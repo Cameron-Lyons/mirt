@@ -202,14 +202,35 @@ class MHRMEstimator(BaseEstimator):
             aic = -2 * log_likelihood + 2 * n_params
             bic = -2 * log_likelihood + np.log(n_persons) * n_params
 
+            from mirt._rust_backend import compute_item_se_parallel, e_step_complete
+            from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+            disc = np.asarray(discrimination)
+            diff = np.asarray(difficulty)
+            quad = GaussHermiteQuadrature(n_points=21, n_dimensions=1)
+            posterior_weights, _ = e_step_complete(
+                responses,
+                quad.nodes.ravel(),
+                quad.weights.ravel(),
+                disc,
+                diff,
+            )
+            se_a, se_b = compute_item_se_parallel(
+                responses,
+                posterior_weights,
+                quad.nodes.ravel(),
+                disc,
+                diff,
+            )
+
             return FitResult(
                 model=model,
                 log_likelihood=log_likelihood,
                 n_iterations=self.n_cycles,
                 converged=True,
                 standard_errors={
-                    "discrimination": np.full(n_items, np.nan),
-                    "difficulty": np.full(n_items, np.nan),
+                    "discrimination": np.asarray(se_a),
+                    "difficulty": np.asarray(se_b),
                 },
                 aic=aic,
                 bic=bic,

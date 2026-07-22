@@ -70,7 +70,7 @@ class MirtError(Exception):
         return self.message
 
 
-class MirtValidationError(MirtError):
+class MirtValidationError(MirtError, ValueError):
     """Raised when input validation fails.
 
     This exception is raised when function arguments or data do not meet
@@ -116,7 +116,7 @@ class MirtValidationError(MirtError):
         super().__init__(message, **kwargs)
 
 
-class MirtEstimationError(MirtError):
+class MirtEstimationError(MirtError, RuntimeError):
     """Raised when model estimation fails.
 
     This exception is raised when the estimation algorithm encounters
@@ -200,7 +200,7 @@ class MirtConvergenceError(MirtEstimationError):
         super().__init__(message, **kwargs)
 
 
-class MirtModelError(MirtError):
+class MirtModelError(MirtError, ValueError):
     """Raised when there are issues with model specification.
 
     This exception is raised when a model is incorrectly specified
@@ -234,7 +234,7 @@ class MirtModelError(MirtError):
         super().__init__(message, **kwargs)
 
 
-class MirtDataError(MirtError):
+class MirtDataError(MirtError, ValueError):
     """Raised when there are issues with input data.
 
     This exception is raised when the input data has problems that

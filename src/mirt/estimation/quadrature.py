@@ -4,6 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.special import roots_hermite
 
+from mirt.exceptions import MirtValidationError
+
 
 class GaussHermiteQuadrature:
     def __init__(
@@ -14,9 +16,19 @@ class GaussHermiteQuadrature:
         cov: NDArray[np.float64] | None = None,
     ) -> None:
         if n_points < 1:
-            raise ValueError("n_points must be at least 1")
+            raise MirtValidationError(
+                "n_points must be at least 1",
+                parameter="n_points",
+                value=n_points,
+                expected=">= 1",
+            )
         if n_dimensions < 1:
-            raise ValueError("n_dimensions must be at least 1")
+            raise MirtValidationError(
+                "n_dimensions must be at least 1",
+                parameter="n_dimensions",
+                value=n_dimensions,
+                expected=">= 1",
+            )
 
         self.n_points = n_points
         self.n_dimensions = n_dimensions
@@ -26,15 +38,23 @@ class GaussHermiteQuadrature:
         else:
             self._mean = np.asarray(mean)
             if self._mean.shape != (n_dimensions,):
-                raise ValueError(f"mean must have shape ({n_dimensions},)")
+                raise MirtValidationError(
+                    f"mean must have shape ({n_dimensions},)",
+                    parameter="mean",
+                    value=self._mean.shape,
+                    expected=f"({n_dimensions},)",
+                )
 
         if cov is None:
             self._cov = np.eye(n_dimensions)
         else:
             self._cov = np.asarray(cov)
             if self._cov.shape != (n_dimensions, n_dimensions):
-                raise ValueError(
-                    f"cov must have shape ({n_dimensions}, {n_dimensions})"
+                raise MirtValidationError(
+                    f"cov must have shape ({n_dimensions}, {n_dimensions})",
+                    parameter="cov",
+                    value=self._cov.shape,
+                    expected=f"({n_dimensions}, {n_dimensions})",
                 )
 
         self._nodes, self._weights = self._compute_quadrature()
