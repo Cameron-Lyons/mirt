@@ -432,9 +432,7 @@ class CATEngine:
         """
         thetas = np.asarray(true_thetas).ravel()
 
-        can_use_rust = (
-            should_use_rust(use_rust) and self._can_use_rust_simulation()
-        )
+        can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
 
         if can_use_rust:
             return self._run_batch_rust(thetas, n_replications)
@@ -578,9 +576,7 @@ class CATEngine:
         """
         thetas = np.asarray(true_thetas).ravel()
 
-        can_use_rust = (
-            should_use_rust(use_rust) and self._can_use_rust_simulation()
-        )
+        can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
 
         if can_use_rust:
             params = self.model.parameters
