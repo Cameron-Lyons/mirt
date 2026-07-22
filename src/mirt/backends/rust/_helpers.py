@@ -17,6 +17,8 @@ Each wrapper module declares ``FALLBACK_MODE`` as one of:
 
 from __future__ import annotations
 
+from typing import NoReturn
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -47,7 +49,7 @@ def rust_enabled() -> bool:
     return get_backend_preference() != "numpy"
 
 
-def rust_required(name: str) -> None:
+def rust_required(name: str) -> NoReturn:
     """Raise a consistent error for accelerated-only entry points."""
     raise RuntimeError(
         f"Rust backend required for {name}. "

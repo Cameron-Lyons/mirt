@@ -27,9 +27,9 @@ except ImportError:
     def should_use_rust(use_rust: bool = True) -> bool:
         return False
 
-    compute_ld_chi2_matrix = None  # type: ignore[assignment]
-    compute_q3_matrix = None  # type: ignore[assignment]
-    compute_standardized_residuals = None  # type: ignore[assignment]
+    compute_ld_chi2_matrix = None
+    compute_q3_matrix = None
+    compute_standardized_residuals = None
 
 
 @dataclass
