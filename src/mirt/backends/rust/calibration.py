@@ -1,4 +1,7 @@
-"""Rust backend: calibration."""
+"""Rust backend: calibration.
+
+Fallback mode: mixed. fixed_calib_em is required; stocking_lord_criterion has a NumPy fallback.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +10,12 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
+    rust_required,
 )
+
+FALLBACK_MODE = "mixed"
 
 
 def fixed_calib_em(
@@ -77,7 +83,7 @@ def fixed_calib_em(
     tuple
         (new_disc, new_diff, theta, log_likelihood, n_iterations, converged)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.fixed_calib_em(
             responses.astype(np.int32),
             anchor_items,
@@ -97,7 +103,7 @@ def fixed_calib_em(
             min_valid_points,
         )
 
-    raise RuntimeError("Rust backend required for fixed_calib_em")
+    rust_required("fixed_calib_em")
 
 
 def stocking_lord_criterion(
@@ -133,7 +139,7 @@ def stocking_lord_criterion(
     float
         Criterion value (sum of squared probability differences)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.stocking_lord_criterion(
             disc_old.astype(np.float64),
             diff_old.astype(np.float64),

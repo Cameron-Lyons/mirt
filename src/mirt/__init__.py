@@ -7,7 +7,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
-from mirt._backend_config import get_backend, get_backend_info, set_backend
+from mirt._backend_config import (
+    get_backend,
+    get_backend_info,
+    set_backend,
+    should_use_rust,
+)
 from mirt._gpu_backend import (
     GPU_AVAILABLE,
     get_gpu_device_name,
@@ -257,8 +262,7 @@ def fit_mirt(
     estimation_method: EstimationMethod = estimation
 
     if (
-        use_rust
-        and RUST_AVAILABLE
+        should_use_rust(use_rust)
         and model == "2PL"
         and n_factors == 1
         and estimation_method == "EM"

@@ -1,4 +1,4 @@
-.PHONY: lint fmt test test-rust docs develop
+.PHONY: lint fmt test test-rust test-slow bench docs develop
 
 lint:
 	uv run ruff check src tests
@@ -12,8 +12,14 @@ fmt:
 test:
 	uv run pytest
 
+test-slow:
+	uv run pytest -m slow
+
 test-rust:
 	cargo test --all-features
+
+bench:
+	uv run python benchmarks/run_benchmarks.py
 
 docs:
 	cd docs && uv run sphinx-build -b html . _build/html

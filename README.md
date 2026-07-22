@@ -497,7 +497,29 @@ When the Rust backend is available (automatically built during installation), th
 | **Plausible Values** | Posterior sampling, MCMC generation |
 | **MCMC** | Gibbs sampling for 2PL, MHRM estimation |
 
-All Rust functions fall back to pure Python implementations if the extension is not available. The Rust backend provides significant speedups for large datasets (1000+ persons) due to:
+### Fallback contract
+
+Rust wrappers declare one of four modes (see each module's `FALLBACK_MODE`):
+
+| Mode | Behavior when Rust is unavailable or disabled |
+|------|-----------------------------------------------|
+| **numpy** | Pure NumPy implementation runs automatically |
+| **optional** | Returns `None`; the public caller supplies a Python path |
+| **required** | Raises `RuntimeError` (accelerated-only entry point; use the public Python estimator instead) |
+| **mixed** | Module contains more than one of the modes above |
+
+Most hot paths (likelihood, E-step, scoring, diagnostics, simulation) are **numpy**. A few full-fit helpers such as `em_fit_2pl` are **required** — `fit_mirt(..., estimation="EM")` still works without Rust via `EMEstimator`.
+
+Disable Rust globally with:
+
+```python
+import mirt
+mirt.set_backend("numpy")  # force NumPy even if the extension is installed
+```
+
+Per-call `use_rust=False` also disables Rust for that call. `mirt.should_use_rust()` reports the effective decision.
+
+The Rust backend provides significant speedups for large datasets (1000+ persons) due to:
 
 - **Rayon parallelization**: Computation across persons or items runs in parallel
 - **SIMD optimizations**: Vectorized arithmetic where available
@@ -505,8 +527,9 @@ All Rust functions fall back to pure Python implementations if the extension is 
 
 To check if Rust acceleration is available:
 ```python
-from mirt._rust_backend import RUST_AVAILABLE
-print(f"Rust backend: {'enabled' if RUST_AVAILABLE else 'disabled'}")
+import mirt
+print(mirt.get_backend_info())
+print(f"Rust extension: {mirt.is_rust_available()}")
 ```
 
 ## Requirements
@@ -559,11 +582,15 @@ uv run pytest -m slow
 
 # Performance smoke tests
 uv run pytest tests/test_performance_smoke.py
+
+# Benchmarks (timing harness, not part of default pytest)
+uv run python benchmarks/run_benchmarks.py
 ```
 
-## API Stability (v1.0)
+## API Stability (v1.1)
 
 Starting with v1.0, this package follows [semantic versioning](https://semver.org/).
+The current release is **1.1.0**.
 
 ### Stable Public API
 
@@ -576,10 +603,11 @@ The following are guaranteed stable and will not have breaking changes in v1.x r
 - **Diagnostics**: `compare_models()`, `anova_irt()`, `compute_fit_indices()`, `sibtest()`
 - **Utilities**: `bootstrap_se()`, `bootstrap_ci()`, `generate_plausible_values()`, `cross_validate()`, `fit_models()`
 - **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`
+- **Backend selection**: `set_backend()`, `get_backend()`, `get_backend_info()`, `should_use_rust()`, `is_rust_available()`
 
 ### Experimental (may change in minor releases)
 
-- Internal `_rust_backend` module functions (use public wrappers instead)
+- Internal `_rust_backend` / `backends.rust` module functions (use public wrappers instead)
 - MCMC samplers (`GibbsSampler`, `MHRMEstimator`) - API may be refined
 - Cognitive Diagnostic Models (`DINA`, `DINO`, `fit_cdm()`) - under active development
 

@@ -400,7 +400,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
         valid_masks: list[NDArray[np.bool_]],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """M-step with penalization via coordinate descent."""
-        from mirt._rust_backend import RUST_AVAILABLE
+        from mirt._backend_config import should_use_rust
 
         quad_points = self._quadrature.nodes
         n_items = responses.shape[1]
@@ -418,7 +418,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
             )
             n_k_all[j] = np.sum(posterior_weights[valid], axis=0)
 
-        if RUST_AVAILABLE:
+        if should_use_rust():
             try:
                 from mirt._rust_backend import coordinate_descent_mstep_regularized
 

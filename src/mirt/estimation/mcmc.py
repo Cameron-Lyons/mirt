@@ -172,12 +172,13 @@ class MHRMEstimator(BaseEstimator):
         FitResult
             Fitted model result
         """
-        from mirt._rust_backend import RUST_AVAILABLE, mhrm_fit_2pl
+        from mirt._backend_config import should_use_rust
+        from mirt._rust_backend import mhrm_fit_2pl
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 
-        if self.use_rust and RUST_AVAILABLE and _is_2pl_unidimensional(model):
+        if should_use_rust(self.use_rust) and _is_2pl_unidimensional(model):
             seed = (
                 self.seed
                 if self.seed is not None
@@ -467,12 +468,13 @@ class GibbsSampler(BaseEstimator):
         MCMCResult
             MCMC estimation result with chains and diagnostics
         """
-        from mirt._rust_backend import RUST_AVAILABLE, gibbs_sample_2pl
+        from mirt._backend_config import should_use_rust
+        from mirt._rust_backend import gibbs_sample_2pl
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 
-        if self.use_rust and RUST_AVAILABLE and _is_2pl_unidimensional(model):
+        if should_use_rust(self.use_rust) and _is_2pl_unidimensional(model):
             seed = (
                 self.seed
                 if self.seed is not None

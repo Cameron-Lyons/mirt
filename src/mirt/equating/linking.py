@@ -15,11 +15,6 @@ from scipy import optimize, stats
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-try:
-    from mirt._rust_backend import RUST_AVAILABLE
-except ImportError:
-    RUST_AVAILABLE = False
-
 
 @dataclass
 class LinkingConstants:

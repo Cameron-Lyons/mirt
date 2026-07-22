@@ -1,4 +1,7 @@
-"""Rust backend: mstep."""
+"""Rust backend: mstep.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,14 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def m_step_dichotomous_parallel(
@@ -62,7 +67,7 @@ def m_step_dichotomous_parallel(
     tuple
         (new_discrimination, new_difficulty)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         qp = _ensure_f64(quad_points)
         disc = _ensure_f64(discrimination)
         diff = _ensure_f64(difficulty)

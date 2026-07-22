@@ -241,6 +241,7 @@ BACKEND_EXPORTS = [
     "get_backend_info",
     "set_backend",
     "get_backend",
+    "should_use_rust",
 ]
 
 MODULE_NAMESPACE_EXPORTS = [

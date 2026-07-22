@@ -1,4 +1,7 @@
-"""Rust backend: likelihood."""
+"""Rust backend: likelihood.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,14 +10,16 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     _prepare_binary_response_components,
     _quad_chunk_size,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def compute_log_likelihoods_2pl(
@@ -41,7 +46,7 @@ def compute_log_likelihoods_2pl(
     NDArray
         Log-likelihoods (n_persons, n_quad)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_log_likelihoods_2pl(
             _ensure_i32(responses),
             _ensure_f64(quad_points),
@@ -85,7 +90,7 @@ def compute_log_likelihoods_3pl(
     guessing: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute log-likelihoods for 3PL model at all quadrature points."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_log_likelihoods_3pl(
             _ensure_i32(responses),
             _ensure_f64(quad_points),
@@ -131,7 +136,7 @@ def compute_log_likelihoods_mirt(
     difficulty: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute log-likelihoods for multidimensional IRT model."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_log_likelihoods_mirt(
             _ensure_i32(responses),
             _ensure_f64(quad_points),

@@ -6,8 +6,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._backend_config import should_use_rust
 from mirt._rust_backend import (
-    RUST_AVAILABLE,
     multigroup_e_step_2pl,
     multigroup_e_step_3pl,
     multigroup_e_step_gpcm,
@@ -209,7 +209,7 @@ class MultigroupEMEstimator:
         quad_weights = self._quadrature.weights
         n_quad = len(quad_weights)
 
-        if RUST_AVAILABLE and self._can_use_rust_e_step(model):
+        if should_use_rust() and self._can_use_rust_e_step(model):
             return self._e_step_rust(model, responses)
 
         posterior_weights = []

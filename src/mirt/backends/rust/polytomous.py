@@ -1,4 +1,7 @@
-"""Rust backend: polytomous."""
+"""Rust backend: polytomous.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +10,12 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def compute_log_likelihoods_grm(
@@ -40,7 +45,7 @@ def compute_log_likelihoods_grm(
     NDArray
         Log-likelihoods (n_persons, n_quad)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_log_likelihoods_grm(
             responses.astype(np.int32),
             quad_points.astype(np.float64),
@@ -109,7 +114,7 @@ def compute_log_likelihoods_gpcm(
     NDArray
         Log-likelihoods (n_persons, n_quad)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_log_likelihoods_gpcm(
             responses.astype(np.int32),
             quad_points.astype(np.float64),
@@ -160,7 +165,7 @@ def compute_alpha_if_deleted(
     NDArray
         Alpha-if-deleted for each item (n_items,)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_alpha_if_deleted(
             responses.astype(np.float64),
         )

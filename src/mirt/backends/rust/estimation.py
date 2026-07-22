@@ -1,4 +1,7 @@
-"""Rust backend: estimation."""
+"""Rust backend: estimation.
+
+Fallback mode: mixed. em_fit_2pl / gibbs_sample_2pl / mhrm_fit_2pl / bootstrap_fit_2pl are required; em_iteration_2pl / em_iteration_3pl are optional.
+"""
 
 from __future__ import annotations
 
@@ -6,11 +9,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
+    rust_required,
 )
+
+FALLBACK_MODE = "mixed"
 
 
 def em_fit_2pl(
@@ -26,7 +32,7 @@ def em_fit_2pl(
     tuple
         (discrimination, difficulty, log_likelihood, n_iterations, converged)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.em_fit_2pl(
             _ensure_i32(responses),
             n_quadpts,
@@ -34,7 +40,7 @@ def em_fit_2pl(
             tol,
         )
 
-    raise RuntimeError("Rust backend required for em_fit_2pl")
+    rust_required("em_fit_2pl")
 
 
 def gibbs_sample_2pl(
@@ -56,7 +62,7 @@ def gibbs_sample_2pl(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.gibbs_sample_2pl(
             _ensure_i32(responses),
             n_iter,
@@ -65,7 +71,7 @@ def gibbs_sample_2pl(
             int(seed),
         )
 
-    raise RuntimeError("Rust backend required for gibbs_sample_2pl")
+    rust_required("gibbs_sample_2pl")
 
 
 def mhrm_fit_2pl(
@@ -85,7 +91,7 @@ def mhrm_fit_2pl(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.mhrm_fit_2pl(
             _ensure_i32(responses),
             n_cycles,
@@ -94,7 +100,7 @@ def mhrm_fit_2pl(
             int(seed),
         )
 
-    raise RuntimeError("Rust backend required for mhrm_fit_2pl")
+    rust_required("mhrm_fit_2pl")
 
 
 def bootstrap_fit_2pl(
@@ -115,7 +121,7 @@ def bootstrap_fit_2pl(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bootstrap_fit_2pl(
             _ensure_i32(responses),
             n_bootstrap,
@@ -125,7 +131,7 @@ def bootstrap_fit_2pl(
             int(seed),
         )
 
-    raise RuntimeError("Rust backend required for bootstrap_fit_2pl")
+    rust_required("bootstrap_fit_2pl")
 
 
 def em_iteration_2pl(
@@ -182,7 +188,7 @@ def em_iteration_2pl(
         (new_discrimination, new_difficulty, posterior_weights, log_likelihood)
         Returns None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.em_iteration_2pl(
             _ensure_i32(responses),
             _ensure_f64(quad_points),
@@ -277,7 +283,7 @@ def em_iteration_3pl(
         (new_discrimination, new_difficulty, new_guessing, posterior_weights, log_likelihood)
         Returns None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.em_iteration_3pl(
             _ensure_i32(responses),
             _ensure_f64(quad_points),

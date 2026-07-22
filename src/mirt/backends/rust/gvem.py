@@ -1,4 +1,7 @@
-"""Rust backend: gvem."""
+"""Rust backend: gvem.
+
+Fallback mode: optional. Returns None when Rust is unavailable; callers own Python paths.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +9,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "optional"
 
 
 def gvem_e_step(
@@ -47,7 +52,7 @@ def gvem_e_step(
     tuple or None
         (mu, sigma, xi) updated arrays, or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.gvem_e_step(
             responses.astype(np.int32),
             loadings.astype(np.float64),
@@ -92,7 +97,7 @@ def gvem_m_step(
     tuple or None
         (loadings, intercepts) updated arrays, or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.gvem_m_step(
             responses.astype(np.int32),
             mu.astype(np.float64),
@@ -141,7 +146,7 @@ def gvem_compute_elbo(
     float or None
         ELBO value, or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.gvem_compute_elbo(
             responses.astype(np.int32),
             loadings.astype(np.float64),

@@ -1,4 +1,19 @@
-"""Shared helpers and Rust availability for the mirt Rust backend."""
+"""Shared helpers and Rust availability for the mirt Rust backend.
+
+Fallback contract
+-----------------
+Each wrapper module declares ``FALLBACK_MODE`` as one of:
+
+* ``"numpy"`` — pure NumPy implementation runs when Rust is unavailable or
+  disabled via ``mirt.set_backend("numpy")``.
+* ``"optional"`` — returns ``None`` when Rust cannot be used; callers must
+  provide their own Python path.
+* ``"required"`` — raises :class:`RuntimeError` when Rust cannot be used
+  (accelerated-only entry points; higher-level public APIs still have Python
+  estimators).
+* ``"mixed"`` — module contains more than one of the modes above; see the
+  module docstring for per-function notes.
+"""
 
 from __future__ import annotations
 
@@ -15,8 +30,30 @@ except ImportError:
 
 
 def is_rust_available() -> bool:
-    """Check if the Rust backend is available."""
+    """Check if the Rust extension module is importable."""
     return RUST_AVAILABLE
+
+
+def rust_enabled() -> bool:
+    """Whether Rust wrappers should dispatch to the extension.
+
+    Returns ``False`` when the extension is missing or the global backend
+    preference is ``"numpy"`` (see :func:`mirt.set_backend`).
+    """
+    if not RUST_AVAILABLE:
+        return False
+    from mirt._backend_state import get_backend_preference
+
+    return get_backend_preference() != "numpy"
+
+
+def rust_required(name: str) -> None:
+    """Raise a consistent error for accelerated-only entry points."""
+    raise RuntimeError(
+        f"Rust backend required for {name}. "
+        "Build the extension (`maturin develop --release`) or use the "
+        "corresponding public Python estimator API instead."
+    )
 
 
 def _ensure_f64(arr: NDArray[np.floating] | None) -> NDArray[np.float64] | None:

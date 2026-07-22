@@ -1,4 +1,7 @@
-"""Rust backend: multigroup."""
+"""Rust backend: multigroup.
+
+Fallback mode: optional. Returns None when Rust is unavailable; callers own Python paths.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +9,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "optional"
 
 
 def multigroup_e_step_2pl(
@@ -48,7 +53,7 @@ def multigroup_e_step_2pl(
         - posterior_weights: list of (n_persons_g, n_quad) arrays
         - group_log_likelihoods: (n_groups,) array
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         disc_float = [d.astype(np.float64) for d in disc_list]
         diff_float = [d.astype(np.float64) for d in diff_list]
@@ -102,7 +107,7 @@ def multigroup_e_step_3pl(
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         disc_float = [d.astype(np.float64) for d in disc_list]
         diff_float = [d.astype(np.float64) for d in diff_list]
@@ -160,7 +165,7 @@ def multigroup_e_step_grm(
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         disc_float = [d.astype(np.float64) for d in disc_list]
         thresh_float = [t.astype(np.float64) for t in thresh_list]
@@ -218,7 +223,7 @@ def multigroup_e_step_gpcm(
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         disc_float = [d.astype(np.float64) for d in disc_list]
         steps_float = [s.astype(np.float64) for s in steps_list]
@@ -276,7 +281,7 @@ def multigroup_e_step_nrm(
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         slopes_float = [s.astype(np.float64) for s in slopes_list]
         intercepts_float = [i.astype(np.float64) for i in intercepts_list]
@@ -316,7 +321,7 @@ def multigroup_expected_counts(
         - r_k_list: list of (n_items, n_quad) expected correct counts
         - n_k_list: list of (n_items, n_quad) expected total counts
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         responses_int = [r.astype(np.int32) for r in responses_list]
         weights_float = [w.astype(np.float64) for w in posterior_weights_list]
 

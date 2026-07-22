@@ -1,4 +1,7 @@
-"""Rust backend: scoring."""
+"""Rust backend: scoring.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,14 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def compute_eap_scores(
@@ -23,7 +28,7 @@ def compute_eap_scores(
     difficulty: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute EAP scores with standard errors."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_eap_scores(
             _ensure_i32(responses),
             _ensure_f64(quad_points),

@@ -1,4 +1,7 @@
-"""Rust backend: eapsum."""
+"""Rust backend: eapsum.
+
+Fallback mode: optional. Returns None when Rust is unavailable; callers own Python paths.
+"""
 
 from __future__ import annotations
 
@@ -6,10 +9,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "optional"
 
 
 def lord_wingersky_recursion(
@@ -36,7 +41,7 @@ def lord_wingersky_recursion(
         Log probability distribution, shape (max_score + 1, n_quad).
         Returns None if Rust backend not available.
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.lord_wingersky_recursion(
             _ensure_f64(theta),
             _ensure_f64(discrimination),
@@ -65,7 +70,7 @@ def lord_wingersky_polytomous(
         Log probability distribution, shape (max_score + 1, n_quad).
         Returns None if Rust backend not available.
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.lord_wingersky_polytomous(
             _ensure_f64(item_probs),
             max_score,
@@ -98,7 +103,7 @@ def eapsum_from_distribution(
     tuple or None
         (theta_estimates, standard_errors) or None if Rust not available.
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.eapsum_from_distribution(
             log_p_score_theta.astype(np.float64),
             log_prior.astype(np.float64),
