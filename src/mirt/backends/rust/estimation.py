@@ -7,10 +7,11 @@ from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
+    mirt_rs,
 )
+
 
 def em_fit_2pl(
     responses: NDArray[np.int_],
@@ -34,6 +35,7 @@ def em_fit_2pl(
         )
 
     raise RuntimeError("Rust backend required for em_fit_2pl")
+
 
 def gibbs_sample_2pl(
     responses: NDArray[np.int_],
@@ -65,6 +67,7 @@ def gibbs_sample_2pl(
 
     raise RuntimeError("Rust backend required for gibbs_sample_2pl")
 
+
 def mhrm_fit_2pl(
     responses: NDArray[np.int_],
     n_cycles: int = 2000,
@@ -92,6 +95,7 @@ def mhrm_fit_2pl(
         )
 
     raise RuntimeError("Rust backend required for mhrm_fit_2pl")
+
 
 def bootstrap_fit_2pl(
     responses: NDArray[np.int_],
@@ -122,6 +126,7 @@ def bootstrap_fit_2pl(
         )
 
     raise RuntimeError("Rust backend required for bootstrap_fit_2pl")
+
 
 def em_iteration_2pl(
     responses: NDArray[np.int_],
@@ -195,6 +200,7 @@ def em_iteration_2pl(
         )
 
     return None
+
 
 def em_iteration_3pl(
     responses: NDArray[np.int_],

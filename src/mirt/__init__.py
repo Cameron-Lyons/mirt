@@ -254,7 +254,7 @@ def fit_mirt(
                 expected=">= 2",
             )
 
-    estimation_method: EstimationMethod = estimation  # type: ignore[assignment]
+    estimation_method: EstimationMethod = estimation
 
     if (
         use_rust

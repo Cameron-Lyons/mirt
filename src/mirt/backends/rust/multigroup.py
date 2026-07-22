@@ -10,6 +10,7 @@ from mirt.backends.rust._helpers import (
     mirt_rs,
 )
 
+
 def multigroup_e_step_2pl(
     responses_list: list[NDArray[np.int_]],
     quad_points: NDArray[np.float64],
@@ -63,6 +64,7 @@ def multigroup_e_step_2pl(
         )
 
     return None
+
 
 def multigroup_e_step_3pl(
     responses_list: list[NDArray[np.int_]],
@@ -118,6 +120,7 @@ def multigroup_e_step_3pl(
         )
 
     return None
+
 
 def multigroup_e_step_grm(
     responses_list: list[NDArray[np.int_]],
@@ -176,6 +179,7 @@ def multigroup_e_step_grm(
 
     return None
 
+
 def multigroup_e_step_gpcm(
     responses_list: list[NDArray[np.int_]],
     quad_points: NDArray[np.float64],
@@ -233,6 +237,7 @@ def multigroup_e_step_gpcm(
 
     return None
 
+
 def multigroup_e_step_nrm(
     responses_list: list[NDArray[np.int_]],
     quad_points: NDArray[np.float64],
@@ -289,6 +294,7 @@ def multigroup_e_step_nrm(
         )
 
     return None
+
 
 def multigroup_expected_counts(
     responses_list: list[NDArray[np.int_]],

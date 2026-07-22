@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
+    mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def compute_eap_scores(
     responses: NDArray[np.int_],

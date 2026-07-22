@@ -10,6 +10,7 @@ from mirt.backends.rust._helpers import (
     mirt_rs,
 )
 
+
 def coordinate_descent_mstep_regularized(
     r_k: NDArray[np.float64],
     n_k: NDArray[np.float64],

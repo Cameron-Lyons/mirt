@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
-    mirt_rs,
     _ensure_f64,
     _ensure_i32,
+    mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def sibtest_compute_beta(
     ref_data: NDArray[np.int_],
@@ -62,6 +63,7 @@ def sibtest_compute_beta(
     se = np.sqrt(weighted_var / n_total)
 
     return beta, se, beta_k, n_k
+
 
 def sibtest_all_items(
     data: NDArray[np.int_],
@@ -122,6 +124,7 @@ def sibtest_all_items(
 
     return betas, zs, p_values
 
+
 def compute_standardized_residuals(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
@@ -172,6 +175,7 @@ def compute_standardized_residuals(
         )
 
     return residuals
+
 
 def compute_q3_matrix(
     responses: NDArray[np.int_],
@@ -228,6 +232,7 @@ def compute_q3_matrix(
                 q3_matrix[j, i] = q3
 
     return q3_matrix
+
 
 def compute_ld_chi2_matrix(
     responses: NDArray[np.int_],
@@ -306,6 +311,7 @@ def compute_ld_chi2_matrix(
             chi2_matrix[j, i] = chi2
 
     return chi2_matrix
+
 
 def compute_item_se_parallel(
     responses: NDArray[np.int_],
@@ -389,6 +395,7 @@ def compute_item_se_parallel(
 
     return se_disc, se_diff
 
+
 def compute_hessian_block_diagonal(
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
@@ -453,6 +460,7 @@ def compute_hessian_block_diagonal(
 
     return hessian
 
+
 def compute_fit_statistics(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
@@ -511,6 +519,7 @@ def compute_fit_statistics(
 
     return item_outfit, item_infit, person_outfit, person_infit
 
+
 def compute_probabilities_batch(
     theta: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -541,6 +550,7 @@ def compute_probabilities_batch(
 
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
     return sigmoid(z)
+
 
 def compute_probabilities_batch_3pl(
     theta: NDArray[np.float64],
@@ -577,6 +587,7 @@ def compute_probabilities_batch_3pl(
     z = discrimination[None, :] * (theta[:, None] - difficulty[None, :])
     p_star = sigmoid(z)
     return guessing[None, :] + (1 - guessing[None, :]) * p_star
+
 
 def compute_expected_variance_batch(
     theta: NDArray[np.float64],

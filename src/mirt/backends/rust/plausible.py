@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
     mirt_rs,
 )
+from mirt.constants import PROB_EPSILON
+
 
 def generate_plausible_values_posterior(
     responses: NDArray[np.int_],
@@ -71,6 +72,7 @@ def generate_plausible_values_posterior(
             pvs[i, p] = quad_points[idx] + rng.normal(0, jitter_sd)
 
     return pvs
+
 
 def generate_plausible_values_mcmc(
     responses: NDArray[np.int_],
@@ -140,6 +142,7 @@ def generate_plausible_values_mcmc(
 
     return pvs
 
+
 def compute_observed_margins(
     responses: NDArray[np.int_],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -164,6 +167,7 @@ def compute_observed_margins(
                 obs_bi[j, i] = obs_bi[i, j]
 
     return obs_uni, obs_bi
+
 
 def compute_expected_margins(
     quad_points: NDArray[np.float64],
@@ -198,6 +202,7 @@ def compute_expected_margins(
 
     return exp_uni, exp_bi
 
+
 def generate_bootstrap_indices(
     n_persons: int,
     n_bootstrap: int,
@@ -213,6 +218,7 @@ def generate_bootstrap_indices(
     rng = np.random.default_rng(seed)
     return rng.integers(0, n_persons, size=(n_bootstrap, n_persons))
 
+
 def resample_responses(
     responses: NDArray[np.int_],
     indices: NDArray[np.int64],
@@ -225,6 +231,7 @@ def resample_responses(
         )
 
     return responses[indices]
+
 
 def impute_from_probabilities(
     responses: NDArray[np.int_],
@@ -260,6 +267,7 @@ def impute_from_probabilities(
                 imputed[i, j] = 1 if rng.random() < p else 0
 
     return imputed
+
 
 def multiple_imputation(
     responses: NDArray[np.int_],

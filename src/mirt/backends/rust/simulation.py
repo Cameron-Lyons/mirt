@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import numpy as np
 from numpy.typing import NDArray
-from mirt._core import sigmoid
 
+from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
     mirt_rs,
 )
+
 
 def simulate_grm(
     theta: NDArray[np.float64],
@@ -56,6 +57,7 @@ def simulate_grm(
 
     return responses
 
+
 def simulate_gpcm(
     theta: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -98,6 +100,7 @@ def simulate_gpcm(
             responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
 
     return responses
+
 
 def simulate_dichotomous(
     theta: NDArray[np.float64],
