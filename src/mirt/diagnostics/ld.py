@@ -238,7 +238,7 @@ def compute_q3(
     NDArray
         Matrix of Q3 statistics
     """
-    from mirt._rust_backend import RUST_AVAILABLE
+    from mirt._backend_config import should_use_rust
     from mirt._rust_backend import compute_q3_matrix as rust_compute_q3
 
     responses = np.asarray(responses)
@@ -256,7 +256,7 @@ def compute_q3(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    if RUST_AVAILABLE and not model.is_polytomous:
+    if should_use_rust() and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
         if disc is not None and diff is not None:
@@ -293,7 +293,7 @@ def compute_ld_chi2(
     p_value_matrix : NDArray
         Matrix of p-values
     """
-    from mirt._rust_backend import RUST_AVAILABLE
+    from mirt._backend_config import should_use_rust
     from mirt._rust_backend import compute_ld_chi2_matrix as rust_compute_chi2
 
     responses = np.asarray(responses)
@@ -311,7 +311,7 @@ def compute_ld_chi2(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    if RUST_AVAILABLE and not model.is_polytomous:
+    if should_use_rust() and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
         if disc is not None and diff is not None:
@@ -340,9 +340,10 @@ def _compute_residuals(
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute standardized residuals for each person-item combination."""
-    from mirt._rust_backend import RUST_AVAILABLE, compute_standardized_residuals
+    from mirt._backend_config import should_use_rust
+    from mirt._rust_backend import compute_standardized_residuals
 
-    if RUST_AVAILABLE and not model.is_polytomous:
+    if should_use_rust() and not model.is_polytomous:
         disc = model.parameters.get("discrimination")
         diff = model.parameters.get("difficulty")
         if disc is not None and diff is not None:

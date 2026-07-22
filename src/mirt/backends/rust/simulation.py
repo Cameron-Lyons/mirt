@@ -1,4 +1,7 @@
-"""Rust backend: simulation."""
+"""Rust backend: simulation.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,9 +10,11 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "numpy"
 
 
 def simulate_grm(
@@ -25,7 +30,7 @@ def simulate_grm(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.simulate_grm(
             theta.astype(np.float64),
             discrimination.astype(np.float64),
@@ -71,7 +76,7 @@ def simulate_gpcm(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.simulate_gpcm(
             theta.astype(np.float64),
             discrimination.astype(np.float64),
@@ -113,7 +118,7 @@ def simulate_dichotomous(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.simulate_dichotomous(
             theta.astype(np.float64).ravel(),
             discrimination.astype(np.float64),

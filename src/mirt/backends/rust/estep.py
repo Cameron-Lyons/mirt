@@ -1,4 +1,7 @@
-"""Rust backend: estep."""
+"""Rust backend: estep.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -6,12 +9,14 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.backends.rust.likelihood import compute_log_likelihoods_2pl
+
+FALLBACK_MODE = "numpy"
 
 
 def e_step_complete(
@@ -30,7 +35,7 @@ def e_step_complete(
     tuple
         (posterior_weights, marginal_likelihood)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.e_step_complete(
             _ensure_i32(responses),
             _ensure_f64(quad_points),
@@ -67,7 +72,7 @@ def compute_expected_counts(
     posterior_weights: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute expected counts for dichotomous items."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         resp = _ensure_i32(responses)
         return mirt_rs.compute_expected_counts(
             resp.ravel() if resp is not None else responses.astype(np.int32).ravel(),
@@ -96,7 +101,7 @@ def compute_expected_counts_polytomous(
     n_categories: int,
 ) -> NDArray[np.float64]:
     """Compute expected counts per category for polytomous items."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         resp = _ensure_i32(responses)
         return mirt_rs.compute_expected_counts_polytomous(
             resp.ravel() if resp is not None else responses.astype(np.int32).ravel(),
@@ -132,7 +137,7 @@ def compute_expected_counts_parallel(
     tuple
         (r_k_all, n_k_all) both shape (n_items, n_quad)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_expected_counts_parallel(
             responses.astype(np.int32),
             posterior_weights.astype(np.float64),

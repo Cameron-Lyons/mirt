@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # Project information
 project = "MIRT"
-copyright = "2024, Cameron Lyons"
+copyright = "2026, Cameron Lyons"
 author = "Cameron Lyons"
 
 # Get version from package

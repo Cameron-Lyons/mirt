@@ -1,4 +1,7 @@
-"""Rust backend: cat."""
+"""Rust backend: cat.
+
+Fallback mode: mixed. cat_compute_item_info / cat_select_max_info / cat_eap_update are numpy; cat_simulate_batch / cat_conditional_mse are optional.
+"""
 
 from __future__ import annotations
 
@@ -7,19 +10,21 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "mixed"
 
 
 def cat_compute_item_info(
     theta: float,
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
-) -> NDArray[np.float64] | None:
+) -> NDArray[np.float64]:
     """Compute Fisher information for all items at a given theta.
 
     Parameters
@@ -33,11 +38,10 @@ def cat_compute_item_info(
 
     Returns
     -------
-    ndarray or None
+    ndarray
         Fisher information for each item, shape (n_items,).
-        Returns None if Rust backend not available.
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.cat_compute_item_info(
             float(theta),
             _ensure_f64(discrimination),
@@ -74,7 +78,7 @@ def cat_select_max_info(
     int
         Index of selected item, or -1 if no items available.
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.cat_select_max_info(
             float(theta),
             _ensure_f64(discrimination),
@@ -117,7 +121,7 @@ def cat_eap_update(
     tuple[float, float]
         (theta_estimate, standard_error).
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         theta, se = mirt_rs.cat_eap_update(
             _ensure_i32(administered_items),
             _ensure_i32(responses),
@@ -213,7 +217,7 @@ def cat_simulate_batch(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.cat_simulate_batch(
             _ensure_f64(true_thetas),
             _ensure_f64(discrimination),
@@ -284,7 +288,7 @@ def cat_conditional_mse(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.cat_conditional_mse(
             _ensure_f64(eval_thetas),
             _ensure_f64(discrimination),

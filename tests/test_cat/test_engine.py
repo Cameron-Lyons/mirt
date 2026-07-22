@@ -307,6 +307,15 @@ class TestCATEngineSimulation:
         for result in results:
             assert result.n_items_administered <= 5
 
+    @pytest.mark.slow
+    def test_batch_simulation_many_examinees(self, fitted_2pl_model):
+        """Larger CAT batch for the weekly slow suite."""
+        model = fitted_2pl_model.model
+        cat = CATEngine(model, max_items=8, se_threshold=0.4, seed=7)
+        true_thetas = np.linspace(-2.0, 2.0, 40)
+        results = cat.run_batch_simulation(true_thetas, n_replications=2, use_rust=True)
+        assert len(results) == 80
+
 
 class TestCATEngineGetResult:
     """Tests for getting CAT results."""

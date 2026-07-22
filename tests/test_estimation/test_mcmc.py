@@ -49,6 +49,14 @@ class TestMHRMEstimator:
         assert "discrimination" in result.model._parameters
         assert "difficulty" in result.model._parameters
 
+    @pytest.mark.slow
+    def test_fit_longer_chain(self, dichotomous_responses):
+        """Longer MHRM chain for the weekly slow suite."""
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        estimator = MHRMEstimator(n_cycles=200, burnin=50, seed=7)
+        result = estimator.fit(model, dichotomous_responses["responses"])
+        assert np.isfinite(result.log_likelihood)
+
     def test_fit_returns_fit_result(self, dichotomous_responses):
         """Test that MHRM fit returns FitResult."""
         model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])

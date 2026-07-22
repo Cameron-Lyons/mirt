@@ -84,7 +84,7 @@ markers = [
 ]
 
 [tool.coverage.report]
-fail_under = 55
+fail_under = 59
 
 [tool.ruff]
 line-length = 88
@@ -124,10 +124,17 @@ disable_error_code = [
     "list-item",
 ]
 
-# Stricter checking on public error/result surfaces; package-wide arg-type/return-value
-# remain disabled until the broader API is gradually tightened.
+# Stricter checking on public error/result surfaces and backend selection;
+# package-wide arg-type/return-value remain disabled until the broader API
+# is gradually tightened.
 [[tool.mypy.overrides]]
-module = ["mirt.exceptions", "mirt.results.*"]
+module = [
+    "mirt.exceptions",
+    "mirt.results.*",
+    "mirt._backend_config",
+    "mirt._backend_state",
+    "mirt.backends.rust._helpers",
+]
 disable_error_code = [
     "import-not-found",
     "import-untyped",

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
+import mirt
 import mirt._rust_backend as rb
+import mirt.backends.rust._helpers as helpers
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 
@@ -101,65 +103,81 @@ def _slow_log_likelihoods_mirt(
     return log_likes
 
 
-def test_2pl_vectorized_fallback_matches_reference(monkeypatch) -> None:
-    monkeypatch.setattr(rb, "RUST_AVAILABLE", False)
-    monkeypatch.setattr(rb, "_MAX_VECTOR_CHUNK_ENTRIES", 20)
-
-    rng = np.random.default_rng(123)
-    responses = rng.integers(0, 3, size=(25, 7), dtype=np.int32)
-    responses[rng.random(size=responses.shape) < 0.15] = -1
-    quad_points = np.linspace(-3.5, 3.5, 17)
-    discrimination = rng.uniform(0.4, 2.2, size=7)
-    difficulty = rng.normal(0, 1, size=7)
-
-    expected = _slow_log_likelihoods_2pl(
-        responses, quad_points, discrimination, difficulty
-    )
-    actual = rb.compute_log_likelihoods_2pl(
-        responses, quad_points, discrimination, difficulty
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+def _with_numpy_backend_and_chunk(chunk: int):
+    previous = mirt.get_backend()
+    old_chunk = helpers._MAX_VECTOR_CHUNK_ENTRIES
+    mirt.set_backend("numpy")
+    helpers._MAX_VECTOR_CHUNK_ENTRIES = chunk
+    return previous, old_chunk
 
 
-def test_3pl_vectorized_fallback_matches_reference(monkeypatch) -> None:
-    monkeypatch.setattr(rb, "RUST_AVAILABLE", False)
-    monkeypatch.setattr(rb, "_MAX_VECTOR_CHUNK_ENTRIES", 18)
-
-    rng = np.random.default_rng(321)
-    responses = rng.integers(0, 2, size=(20, 6), dtype=np.int32)
-    responses[rng.random(size=responses.shape) < 0.2] = -1
-    quad_points = np.linspace(-4.0, 4.0, 19)
-    discrimination = rng.uniform(0.5, 2.0, size=6)
-    difficulty = rng.normal(0, 1, size=6)
-    guessing = rng.uniform(0.05, 0.35, size=6)
-
-    expected = _slow_log_likelihoods_3pl(
-        responses, quad_points, discrimination, difficulty, guessing
-    )
-    actual = rb.compute_log_likelihoods_3pl(
-        responses, quad_points, discrimination, difficulty, guessing
-    )
-
-    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+def _restore(previous: str, old_chunk: int) -> None:
+    helpers._MAX_VECTOR_CHUNK_ENTRIES = old_chunk
+    mirt.set_backend(previous)  # type: ignore[arg-type]
 
 
-def test_mirt_vectorized_fallback_matches_reference(monkeypatch) -> None:
-    monkeypatch.setattr(rb, "RUST_AVAILABLE", False)
-    monkeypatch.setattr(rb, "_MAX_VECTOR_CHUNK_ENTRIES", 24)
+def test_2pl_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(20)
+    try:
+        rng = np.random.default_rng(123)
+        responses = rng.integers(0, 3, size=(25, 7), dtype=np.int32)
+        responses[rng.random(size=responses.shape) < 0.15] = -1
+        quad_points = np.linspace(-3.5, 3.5, 17)
+        discrimination = rng.uniform(0.4, 2.2, size=7)
+        difficulty = rng.normal(0, 1, size=7)
 
-    rng = np.random.default_rng(456)
-    responses = rng.integers(0, 2, size=(18, 5), dtype=np.int32)
-    responses[rng.random(size=responses.shape) < 0.1] = -1
-    quad_points = rng.normal(size=(23, 2))
-    discrimination = rng.uniform(0.2, 1.6, size=(5, 2))
-    difficulty = rng.normal(0, 1, size=5)
+        expected = _slow_log_likelihoods_2pl(
+            responses, quad_points, discrimination, difficulty
+        )
+        actual = rb.compute_log_likelihoods_2pl(
+            responses, quad_points, discrimination, difficulty
+        )
 
-    expected = _slow_log_likelihoods_mirt(
-        responses, quad_points, discrimination, difficulty
-    )
-    actual = rb.compute_log_likelihoods_mirt(
-        responses, quad_points, discrimination, difficulty
-    )
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
 
-    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+
+def test_3pl_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(18)
+    try:
+        rng = np.random.default_rng(321)
+        responses = rng.integers(0, 2, size=(20, 6), dtype=np.int32)
+        responses[rng.random(size=responses.shape) < 0.2] = -1
+        quad_points = np.linspace(-4.0, 4.0, 19)
+        discrimination = rng.uniform(0.5, 2.0, size=6)
+        difficulty = rng.normal(0, 1, size=6)
+        guessing = rng.uniform(0.05, 0.35, size=6)
+
+        expected = _slow_log_likelihoods_3pl(
+            responses, quad_points, discrimination, difficulty, guessing
+        )
+        actual = rb.compute_log_likelihoods_3pl(
+            responses, quad_points, discrimination, difficulty, guessing
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_mirt_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(24)
+    try:
+        rng = np.random.default_rng(456)
+        responses = rng.integers(0, 2, size=(18, 5), dtype=np.int32)
+        responses[rng.random(size=responses.shape) < 0.1] = -1
+        quad_points = rng.normal(size=(23, 2))
+        discrimination = rng.uniform(0.2, 1.6, size=(5, 2))
+        difficulty = rng.normal(0, 1, size=5)
+
+        expected = _slow_log_likelihoods_mirt(
+            responses, quad_points, discrimination, difficulty
+        )
+        actual = rb.compute_log_likelihoods_mirt(
+            responses, quad_points, discrimination, difficulty
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)

@@ -10,6 +10,10 @@ powered by a Rust backend for computational efficiency.
 
    installation
    quickstart
+   guides/cat
+   guides/dif
+   guides/multigroup
+   guides/equating
    api/index
 
 Installation

@@ -37,7 +37,18 @@ uv run pytest -m performance
 # or: uv run pytest tests/test_performance_smoke.py
 ```
 
-Convenience targets: `make lint`, `make fmt`, `make test`, `make develop`.
+Convenience targets: `make lint`, `make fmt`, `make test`, `make test-slow`, `make bench`, `make develop`.
+
+## Rust backend contract
+
+Wrappers live under `src/mirt/backends/rust/`. Each module declares `FALLBACK_MODE`:
+
+- `numpy` — pure NumPy path when Rust is missing or `mirt.set_backend("numpy")`
+- `optional` — returns `None`; callers keep a Python implementation
+- `required` — raises; use the public Python estimator instead
+- `mixed` — more than one mode in the same module
+
+Prefer public APIs and `mirt.should_use_rust()` over private `_rust_backend` symbols.
 
 ## Rust checks
 
@@ -58,6 +69,8 @@ uv pip install -e ".[docs]"
 make docs
 # opens docs/_build/html
 ```
+
+User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
 ## Experimental APIs
 

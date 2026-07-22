@@ -16,14 +16,20 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 try:
+    from mirt._backend_config import should_use_rust
     from mirt._rust_backend import (
-        RUST_AVAILABLE,
         compute_ld_chi2_matrix,
         compute_q3_matrix,
         compute_standardized_residuals,
     )
 except ImportError:
-    RUST_AVAILABLE = False
+
+    def should_use_rust(use_rust: bool = True) -> bool:
+        return False
+
+    compute_ld_chi2_matrix = None  # type: ignore[assignment]
+    compute_q3_matrix = None  # type: ignore[assignment]
+    compute_standardized_residuals = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -74,8 +80,7 @@ def _prepare_rust_payload(
 ]:
     """Build shared payload for Rust residual/local-dependence calls."""
     can_use_rust = (
-        use_rust
-        and RUST_AVAILABLE
+        should_use_rust(use_rust)
         and hasattr(model, "discrimination")
         and hasattr(model, "difficulty")
     )

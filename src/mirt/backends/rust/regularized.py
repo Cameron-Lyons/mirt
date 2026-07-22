@@ -1,4 +1,7 @@
-"""Rust backend: regularized."""
+"""Rust backend: regularized.
+
+Fallback mode: optional. Returns None when Rust is unavailable; callers own Python paths.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +9,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "optional"
 
 
 def coordinate_descent_mstep_regularized(
@@ -53,7 +58,7 @@ def coordinate_descent_mstep_regularized(
     tuple or None
         (new_loadings, new_intercepts) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.coordinate_descent_mstep_regularized(
             r_k.astype(np.float64),
             n_k.astype(np.float64),

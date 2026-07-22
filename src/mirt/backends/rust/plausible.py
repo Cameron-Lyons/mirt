@@ -1,4 +1,7 @@
-"""Rust backend: plausible."""
+"""Rust backend: plausible.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +10,12 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def generate_plausible_values_posterior(
@@ -27,7 +32,7 @@ def generate_plausible_values_posterior(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.generate_plausible_values_posterior(
             responses.astype(np.int32),
             quad_points.astype(np.float64),
@@ -87,7 +92,7 @@ def generate_plausible_values_mcmc(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.generate_plausible_values_mcmc(
             responses.astype(np.int32),
             discrimination.astype(np.float64),
@@ -147,7 +152,7 @@ def compute_observed_margins(
     responses: NDArray[np.int_],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute observed univariate and bivariate margins."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_observed_margins(responses.astype(np.int32))
 
     n_persons, n_items = responses.shape
@@ -176,7 +181,7 @@ def compute_expected_margins(
     difficulty: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute expected margins under the model."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_expected_margins(
             quad_points.astype(np.float64),
             quad_weights.astype(np.float64),
@@ -212,7 +217,7 @@ def generate_bootstrap_indices(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.generate_bootstrap_indices(n_persons, n_bootstrap, int(seed))
 
     rng = np.random.default_rng(seed)
@@ -224,7 +229,7 @@ def resample_responses(
     indices: NDArray[np.int64],
 ) -> NDArray[np.int_]:
     """Resample responses matrix."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.resample_responses(
             responses.astype(np.int32),
             indices.astype(np.int64),
@@ -245,7 +250,7 @@ def impute_from_probabilities(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.impute_from_probabilities(
             responses.astype(np.int32),
             theta.astype(np.float64).ravel(),
@@ -283,7 +288,7 @@ def multiple_imputation(
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.multiple_imputation(
             responses.astype(np.int32),
             theta_mean.astype(np.float64).ravel(),

@@ -1,4 +1,7 @@
-"""Rust backend: diagnostics."""
+"""Rust backend: diagnostics.
+
+Fallback mode: numpy. All functions provide NumPy fallbacks.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +10,14 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     _ensure_f64,
     _ensure_i32,
     mirt_rs,
+    rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
+
+FALLBACK_MODE = "numpy"
 
 
 def sibtest_compute_beta(
@@ -23,7 +28,7 @@ def sibtest_compute_beta(
     suspect_items: NDArray[np.int_],
 ) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64]]:
     """Compute SIBTEST beta statistic."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.sibtest_compute_beta(
             ref_data.astype(np.int32),
             focal_data.astype(np.int32),
@@ -71,7 +76,7 @@ def sibtest_all_items(
     anchor_items: NDArray[np.int_] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Run SIBTEST for all items in parallel."""
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.sibtest_all_items(
             data.astype(np.int32),
             groups.astype(np.int32),
@@ -149,7 +154,7 @@ def compute_standardized_residuals(
     NDArray
         Standardized residuals (n_persons, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_standardized_residuals(
             _ensure_i32(responses),
@@ -201,7 +206,7 @@ def compute_q3_matrix(
     NDArray
         Q3 correlation matrix (n_items, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_q3_matrix(
             _ensure_i32(responses),
@@ -258,7 +263,7 @@ def compute_ld_chi2_matrix(
     NDArray
         LD chi-square matrix (n_items, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_ld_chi2_matrix(
             _ensure_i32(responses),
@@ -345,7 +350,7 @@ def compute_item_se_parallel(
     tuple
         (se_discrimination, se_difficulty)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         qp = _ensure_f64(quad_points)
         disc = _ensure_f64(discrimination)
         diff = _ensure_f64(difficulty)
@@ -426,7 +431,7 @@ def compute_hessian_block_diagonal(
     NDArray
         Hessian matrix (n_params, n_params) where n_params = n_items * 2
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         qp = _ensure_f64(quad_points)
         disc = _ensure_f64(discrimination)
         diff = _ensure_f64(difficulty)
@@ -487,7 +492,7 @@ def compute_fit_statistics(
     tuple
         (item_outfit, item_infit, person_outfit, person_infit)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_fit_statistics(
             responses.astype(np.int32),
             theta.astype(np.float64).ravel(),
@@ -541,7 +546,7 @@ def compute_probabilities_batch(
     NDArray
         Probabilities (n_persons, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_probabilities_batch(
             theta.astype(np.float64).ravel(),
             discrimination.astype(np.float64).ravel(),
@@ -576,7 +581,7 @@ def compute_probabilities_batch_3pl(
     NDArray
         Probabilities (n_persons, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_probabilities_batch_3pl(
             theta.astype(np.float64).ravel(),
             discrimination.astype(np.float64).ravel(),
@@ -610,7 +615,7 @@ def compute_expected_variance_batch(
     tuple
         (expected, variance) both shape (n_persons, n_items)
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_expected_variance_batch(
             theta.astype(np.float64).ravel(),
             discrimination.astype(np.float64).ravel(),

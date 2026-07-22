@@ -7,31 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Documented Rust fallback contract (`numpy` / `optional` / `required` / `mixed`)
+- `should_use_rust()` honors global `set_backend("numpy")` alongside per-call flags
+- Rust↔Python numerical parity tests for likelihood, E-step, scoring, and diagnostics
+- User guides for CAT, DIF, multigroup, and equating; curated `examples/` scripts
+- Benchmark harness under `benchmarks/` for EM fit, scoring, and CAT
+- Expanded `@pytest.mark.slow` coverage for MCMC / high-cost paths
+
+### Changed
+- Modular Rust wrappers under `mirt.backends.rust` ( `_rust_backend` remains a shim)
+- Coverage gate raised from 55% toward Production/Stable expectations (now 59%)
+- Stricter mypy checking on additional public modules
+
+## [1.1.0] - 2026-07-01
+
+### Added
+- Custom exception hierarchy for better error handling
+- CI performance smoke-test job and weekly scheduled slow-test job
+- Performance regression smoke tests for import time and small-model fit time
+- Documentation regression tests to prevent stale API symbol references in docs
+- Improved docstring coverage across modules
+
 ### Changed
 - Minimum Python version lowered from 3.14 to 3.11 for broader compatibility
 - Development status updated to Production/Stable
 - CI now tests on Python 3.11, 3.12, 3.13, and 3.14
-- Top-level API now lazy-loads heavy equating/multigroup/plotting/report symbols to reduce import overhead
-- Dataset constants in `mirt.utils.datasets` are now lazily materialized on first access instead of import time
-- Replaced broad `except Exception` handlers with narrower recoverable exception classes in reliability-critical modules
-- Sphinx quickstart and API reference examples now match current public symbols (`fit_mirt`, `fscores`, and `*ParameterLogistic` classes)
-- Integration/scoring tests now use backend-tolerant convergence and correlation expectations to reduce brittleness across runtime configurations
-- Removed spurious test warnings by hardening network correlation edge-cases, avoiding eager divide-by-zero in GRM information, and marking `TestletModel` as non-test for pytest collection
-- Reduced dead/duplicate implementation noise by removing an unused Ising fitting variable, consolidating duplicated EM log-likelihood fallback logic, and clarifying intentionally-unused compatibility parameters
-- Refactored duplicated residual utility pre-processing into shared helpers and added direct tests for `mirt.utils.residuals` Q3/LD_X2 paths
-- Refactored MCAT selection strategies to share criterion-based base classes, removing duplicated selection/criterion scaffolding while preserving behavior
-- Consolidated shared CAT/MCAT engine session/exposure/content/simulation workflow into reusable helper utilities to reduce duplicated adaptive-engine orchestration code
-- Consolidated shared scoring helper logic across `ML`/`MAP`/`EAP`/`EAPsum` for prior normalization, quadrature setup, and per-person parallel scoring flow
-- Optimized `fit_ising` by vectorizing interaction-gradient computation and skipping per-iteration pseudo-likelihood evaluation when not verbose
-- Optimized EM dichotomous item updates with analytic gradients (`1PL`/`2PL`/`3PL`/`4PL`), reducing dependence on costly numerical differentiation
-- Reduced EM analytic-gradient overhead further by avoiding unnecessary per-evaluation model parameter mutation during item optimization
+- Top-level API now lazy-loads heavy equating/multigroup/plotting/report symbols
+- Dataset constants in `mirt.utils.datasets` are lazily materialized on first access
+- Replaced broad `except Exception` handlers with narrower recoverable exception classes
+- Sphinx quickstart and API reference examples now match current public symbols
+- Integration/scoring tests use backend-tolerant convergence and correlation expectations
+- Reduced dead/duplicate implementation noise across EM, CAT/MCAT, scoring, and residuals
+- Optimized EM dichotomous item updates with analytic gradients (`1PL`/`2PL`/`3PL`/`4PL`)
+- Optimized `fit_ising` interaction-gradient computation
+
+## [1.0.0] - 2026-01-15
 
 ### Added
-- Custom exception hierarchy for better error handling
-- Improved docstring coverage across all modules
-- CI performance smoke-test job and weekly scheduled slow-test job
-- Performance regression smoke tests for import time and small-model fit time
-- Documentation regression tests to prevent stale API symbol references in docs
+- Stable public API policy for v1.x (see README API Stability)
+- Computerized Adaptive Testing (CAT) module with:
+  - Multiple item selection strategies (MFI, MEI, KL, Urry, random, a-stratified)
+  - Configurable stopping rules (SE threshold, max/min items)
+  - Exposure control methods (Sympson-Hetter, randomesque)
+  - Content balancing constraints
+  - CAT simulation and batch evaluation functions
+- DIF analysis (LR, Wald, Lord, Raju), DTF/DRF, SIBTEST, GRDIF
+- Multigroup IRT with invariance testing; bifactor models
+- Zero-inflated, unfolding, testlet, CDM, and mixture IRT models
+- GVEM and sparse Bayesian estimation paths
+- HTML report generation, vertical scaling, fixed-item calibration / equating
+
+### Changed
+- Declared Production/Stable for core public API
+- Refactored Rust backend into modular structure
+- Consolidated duplicate code patterns with shared utility functions
 
 ## [0.1.11] - 2025-01-08
 

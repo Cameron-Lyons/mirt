@@ -1,14 +1,18 @@
 """Python interface to the Rust backend for MIRT.
 
-This package provides a clean interface to the high-performance Rust
-implementations. It automatically falls back to pure Python implementations
-if the Rust extension is not available.
+This package wraps the ``mirt.mirt_rs`` extension. Each submodule declares
+``FALLBACK_MODE`` as ``\"numpy\"``, ``\"optional\"``, ``\"required\"``, or
+``\"mixed\"`` — see :mod:`mirt.backends.rust._helpers` for the contract.
+
+Global ``mirt.set_backend(\"numpy\")`` disables Rust dispatch even when the
+extension is installed.
 """
 
 from mirt.backends.rust._helpers import (
     RUST_AVAILABLE,
     PreparedArrays,
     is_rust_available,
+    rust_enabled,
 )
 from mirt.backends.rust.calibration import (
     fixed_calib_em,
@@ -115,6 +119,7 @@ __all__ = [
     "PreparedArrays",
     "RUST_AVAILABLE",
     "is_rust_available",
+    "rust_enabled",
     "compute_log_likelihoods_2pl",
     "compute_log_likelihoods_3pl",
     "compute_log_likelihoods_mirt",

@@ -1,4 +1,7 @@
-"""Rust backend: dynamic."""
+"""Rust backend: dynamic.
+
+Fallback mode: optional. Returns None when Rust is unavailable; callers own Python paths.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +9,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
-    RUST_AVAILABLE,
     mirt_rs,
+    rust_enabled,
 )
+
+FALLBACK_MODE = "optional"
 
 
 def bkt_forward(
@@ -44,7 +49,7 @@ def bkt_forward(
     tuple or None
         (alpha, scaling) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_forward(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -91,7 +96,7 @@ def bkt_backward(
     NDArray or None
         beta array or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_backward(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -138,7 +143,7 @@ def bkt_forward_backward_batch(
     tuple or None
         (gamma, log_likelihoods) or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_forward_backward_batch(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -185,7 +190,7 @@ def bkt_viterbi(
     NDArray or None
         Most likely state sequence or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_viterbi(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -235,7 +240,7 @@ def bkt_ffbs(
     NDArray or None
         Sampled state sequence or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_ffbs(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -286,7 +291,7 @@ def bkt_ffbs_batch(
     NDArray or None
         Sampled state sequences or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.bkt_ffbs_batch(
             responses.astype(np.int32),
             skill_assignments.astype(np.int32),
@@ -325,7 +330,7 @@ def longitudinal_log_likelihood(
     float or None
         Log-likelihood or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.longitudinal_log_likelihood(
             responses.astype(np.int32),
             theta.astype(np.float64),
@@ -357,7 +362,7 @@ def compute_growth_trajectory(
     NDArray or None
         Trajectory predictions or None if Rust unavailable
     """
-    if RUST_AVAILABLE:
+    if rust_enabled():
         return mirt_rs.compute_growth_trajectory(
             growth_factors.astype(np.float64),
             time_values.astype(np.float64),
