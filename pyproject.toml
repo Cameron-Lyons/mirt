@@ -52,7 +52,6 @@ polars = ["polars>=0.20"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
-    "black>=23.0",
     "ruff>=0.1",
     "mypy>=1.0",
     "pandas>=1.5",
@@ -73,7 +72,7 @@ gpu = [
 
 [project.urls]
 Homepage = "https://github.com/Cameron-Lyons/mirt"
-Documentation = "https://github.com/Cameron-Lyons/mirt#readme"
+Documentation = "https://cameron-lyons.github.io/mirt/"
 Repository = "https://github.com/Cameron-Lyons/mirt"
 
 [tool.pytest.ini_options]
@@ -84,9 +83,8 @@ markers = [
     "performance: marks performance regression smoke tests",
 ]
 
-[tool.black]
-line-length = 88
-target-version = ["py311", "py312", "py313", "py314"]
+[tool.coverage.report]
+fail_under = 70
 
 [tool.ruff]
 line-length = 88
@@ -104,7 +102,9 @@ check_untyped_defs = true
 disallow_incomplete_defs = true
 # Disabled codes explanation:
 # - import-not-found/import-untyped: optional deps (matplotlib, polars) and scipy stubs
-# - arg-type, return-value, assignment: numpy dtype variance issues common in scientific code
+# - arg-type, return-value: numpy dtype variance; re-enabled package-wide causes hundreds
+#   of errors — public APIs should gradually tighten (see overrides below)
+# - assignment: numpy dtype variance issues common in scientific code
 # - union-attr, attr-defined: numpy array attribute access patterns
 # - override: numpy subclass method signatures
 # - operator, index: numpy indexing/operator overloads
@@ -114,6 +114,23 @@ disable_error_code = [
     "import-untyped",
     "arg-type",
     "return-value",
+    "assignment",
+    "union-attr",
+    "attr-defined",
+    "override",
+    "operator",
+    "index",
+    "dict-item",
+    "list-item",
+]
+
+# Stricter checking on public error/result surfaces; package-wide arg-type/return-value
+# remain disabled until the broader API is gradually tightened.
+[[tool.mypy.overrides]]
+module = ["mirt.exceptions", "mirt.results.*"]
+disable_error_code = [
+    "import-not-found",
+    "import-untyped",
     "assignment",
     "union-attr",
     "attr-defined",

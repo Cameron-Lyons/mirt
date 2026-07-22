@@ -64,11 +64,10 @@ class MonotonicSplineModel(DichotomousItemModel):
     ) -> None:
         if n_factors != 1:
             raise ValueError("Spline model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
         self.n_knots = n_knots
         self.degree = degree
         self._n_basis = n_knots + degree + 1
+        super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["log_weights"] = np.zeros((self.n_items, self._n_basis))
@@ -225,9 +224,8 @@ class MonotonicPolynomialModel(DichotomousItemModel):
     ) -> None:
         if n_factors != 1:
             raise ValueError("Polynomial model only supports unidimensional")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
         self.degree = degree
+        super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["log_coefficients"] = np.zeros((self.n_items, self.degree + 1))
@@ -350,11 +348,10 @@ class KernelSmoothingModel(DichotomousItemModel):
     ) -> None:
         if n_factors != 1:
             raise ValueError("Kernel smoothing only supports unidimensional")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
         self.bandwidth = bandwidth
         self._theta_grid: NDArray[np.float64] | None = None
         self._irf_values: NDArray[np.float64] | None = None
+        super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._theta_grid = np.linspace(-4, 4, 81)

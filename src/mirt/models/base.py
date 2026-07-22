@@ -5,6 +5,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
 
 
 class BaseItemModel(ABC):
@@ -19,12 +20,24 @@ class BaseItemModel(ABC):
         item_names: list[str] | None = None,
     ) -> None:
         if n_items <= 0:
-            raise ValueError("n_items must be positive")
+            raise MirtValidationError(
+                "n_items must be positive",
+                parameter="n_items",
+                value=n_items,
+                expected="> 0",
+            )
         if n_factors <= 0:
-            raise ValueError("n_factors must be positive")
+            raise MirtValidationError(
+                "n_factors must be positive",
+                parameter="n_factors",
+                value=n_factors,
+                expected="> 0",
+            )
         if n_factors > 1 and not self.supports_multidimensional:
-            raise ValueError(
-                f"{self.model_name} does not support multidimensional models"
+            raise MirtModelError(
+                f"{self.model_name} does not support multidimensional models",
+                model_type=self.model_name,
+                n_factors=n_factors,
             )
 
         self.n_items = n_items
@@ -32,8 +45,11 @@ class BaseItemModel(ABC):
         self.item_names = item_names or [f"Item_{i}" for i in range(n_items)]
 
         if len(self.item_names) != n_items:
-            raise ValueError(
-                f"Length of item_names ({len(self.item_names)}) must match n_items ({n_items})"
+            raise MirtValidationError(
+                f"Length of item_names ({len(self.item_names)}) must match n_items ({n_items})",
+                parameter="item_names",
+                value=len(self.item_names),
+                expected=str(n_items),
             )
 
         self._parameters: dict[str, NDArray[np.float64]] = {}
@@ -84,14 +100,19 @@ class BaseItemModel(ABC):
         for name, value in params.items():
             if name not in self._parameters:
                 valid_params = ", ".join(self._parameters.keys())
-                raise ValueError(
-                    f"Unknown parameter: {name}. Valid parameters: {valid_params}"
+                raise MirtValidationError(
+                    f"Unknown parameter: {name}. Valid parameters: {valid_params}",
+                    parameter=name,
+                    expected=valid_params,
                 )
             value_arr = np.asarray(value, dtype=np.float64)
             if value_arr.shape != self._parameters[name].shape:
-                raise ValueError(
+                raise MirtValidationError(
                     f"Shape mismatch for {name}: expected {self._parameters[name].shape}, "
-                    f"got {value_arr.shape}"
+                    f"got {value_arr.shape}",
+                    parameter=name,
+                    value=value_arr.shape,
+                    expected=str(self._parameters[name].shape),
                 )
             self._parameters[name] = value_arr
         return self
@@ -127,14 +148,16 @@ class BaseItemModel(ABC):
 
         Raises:
             IndexError: If item_idx is out of range.
-            ValueError: If param_name is not a valid parameter.
+            MirtValidationError: If param_name is not a valid parameter.
         """
         if item_idx < 0 or item_idx >= self.n_items:
             raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
         if param_name not in self._parameters:
             valid_params = ", ".join(self._parameters.keys())
-            raise ValueError(
-                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}"
+            raise MirtValidationError(
+                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}",
+                parameter=param_name,
+                expected=valid_params,
             )
 
         values = self._parameters[param_name]
@@ -143,17 +166,28 @@ class BaseItemModel(ABC):
         elif values.ndim == 2 and values.shape[0] == self.n_items:
             values[item_idx] = np.asarray(value, dtype=np.float64)
         else:
-            raise ValueError(f"Parameter {param_name} does not have per-item values")
+            raise MirtValidationError(
+                f"Parameter {param_name} does not have per-item values",
+                parameter=param_name,
+            )
 
     def _ensure_theta_2d(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         theta = np.asarray(theta, dtype=np.float64)
         if theta.ndim == 1:
             theta = theta.reshape(-1, 1)
         if theta.ndim != 2:
-            raise ValueError(f"theta must be 1D or 2D, got {theta.ndim}D")
+            raise MirtValidationError(
+                f"theta must be 1D or 2D, got {theta.ndim}D",
+                parameter="theta",
+                value=theta.ndim,
+                expected="1 or 2",
+            )
         if theta.shape[1] != self.n_factors:
-            raise ValueError(
-                f"theta has {theta.shape[1]} factors, expected {self.n_factors}"
+            raise MirtValidationError(
+                f"theta has {theta.shape[1]} factors, expected {self.n_factors}",
+                parameter="theta",
+                value=theta.shape[1],
+                expected=str(self.n_factors),
             )
         return theta
 
@@ -195,8 +229,9 @@ class DichotomousItemModel(BaseItemModel):
         theta = self._ensure_theta_2d(theta)
 
         if responses.shape[1] != self.n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {self.n_items}"
+            raise MirtDataError(
+                f"responses has {responses.shape[1]} items, expected {self.n_items}",
+                n_items=responses.shape[1],
             )
 
         p = self.probability(theta)
@@ -280,14 +315,22 @@ class PolytomousItemModel(BaseItemModel):
             self._n_categories = [n_categories] * n_items
         else:
             if len(n_categories) != n_items:
-                raise ValueError(
-                    f"Length of n_categories ({len(n_categories)}) must match n_items ({n_items})"
+                raise MirtValidationError(
+                    f"Length of n_categories ({len(n_categories)}) must match n_items ({n_items})",
+                    parameter="n_categories",
+                    value=len(n_categories),
+                    expected=str(n_items),
                 )
             self._n_categories = list(n_categories)
 
         for i, n_cat in enumerate(self._n_categories):
             if n_cat < 2:
-                raise ValueError(f"Item {i} has {n_cat} categories; minimum is 2")
+                raise MirtValidationError(
+                    f"Item {i} has {n_cat} categories; minimum is 2",
+                    parameter="n_categories",
+                    value=n_cat,
+                    expected=">= 2",
+                )
 
         super().__init__(n_items, n_factors, item_names)
 

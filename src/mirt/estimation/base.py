@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.exceptions import MirtDataError, MirtValidationError
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
@@ -19,9 +21,19 @@ class BaseEstimator(ABC):
         verbose: bool = False,
     ) -> None:
         if max_iter < 1:
-            raise ValueError("max_iter must be at least 1")
+            raise MirtValidationError(
+                "max_iter must be at least 1",
+                parameter="max_iter",
+                value=max_iter,
+                expected=">= 1",
+            )
         if tol <= 0:
-            raise ValueError("tol must be positive")
+            raise MirtValidationError(
+                "tol must be positive",
+                parameter="tol",
+                value=tol,
+                expected="> 0",
+            )
 
         self.max_iter = max_iter
         self.tol = tol
@@ -55,11 +67,15 @@ class BaseEstimator(ABC):
         responses = np.asarray(responses)
 
         if responses.ndim != 2:
-            raise ValueError(f"responses must be 2D, got {responses.ndim}D")
+            raise MirtDataError(
+                f"responses must be 2D, got {responses.ndim}D",
+                n_items=n_items,
+            )
 
         if responses.shape[1] != n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {n_items}"
+            raise MirtDataError(
+                f"responses has {responses.shape[1]} items, expected {n_items}",
+                n_items=responses.shape[1],
             )
 
         return responses

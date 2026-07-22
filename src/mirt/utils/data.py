@@ -3,6 +3,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.exceptions import MirtDataError
+
 
 def validate_responses(
     responses: NDArray[Any] | list[Any],
@@ -35,7 +37,7 @@ def validate_responses(
 
     Raises
     ------
-    ValueError
+    MirtDataError
         If responses are not 2D, empty, have wrong number of items,
         or contain invalid values.
 
@@ -55,28 +57,38 @@ def validate_responses(
     responses = np.asarray(responses)
 
     if responses.ndim != 2:
-        raise ValueError(f"responses must be 2D array, got {responses.ndim}D")
+        raise MirtDataError(
+            f"responses must be 2D array, got {responses.ndim}D",
+        )
 
     n_persons, n_cols = responses.shape
 
     if n_persons == 0:
-        raise ValueError("responses cannot be empty")
+        raise MirtDataError("responses cannot be empty", n_persons=0, n_items=n_cols)
 
     if n_items is not None and n_cols != n_items:
-        raise ValueError(f"responses has {n_cols} items, expected {n_items}")
+        raise MirtDataError(
+            f"responses has {n_cols} items, expected {n_items}",
+            n_persons=n_persons,
+            n_items=n_cols,
+        )
 
     responses = responses.astype(np.int_)
 
     if not allow_missing:
         if np.any(responses < 0):
-            raise ValueError(
-                "responses contains negative values (missing data not allowed)"
+            raise MirtDataError(
+                "responses contains negative values (missing data not allowed)",
+                n_persons=n_persons,
+                n_items=n_cols,
             )
 
     valid_mask = responses != missing_code
     if np.any(responses[valid_mask] < 0):
-        raise ValueError(
-            f"responses contains negative values other than missing code ({missing_code})"
+        raise MirtDataError(
+            f"responses contains negative values other than missing code ({missing_code})",
+            n_persons=n_persons,
+            n_items=n_cols,
         )
 
     return responses

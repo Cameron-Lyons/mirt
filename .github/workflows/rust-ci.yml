@@ -52,3 +52,6 @@ jobs:
 
       - name: Run clippy with warnings denied
         run: cargo clippy --manifest-path "$CARGO_MANIFEST_PATH" --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: cargo test --manifest-path "$CARGO_MANIFEST_PATH" --all-features

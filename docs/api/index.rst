@@ -33,6 +33,11 @@ Models
    GeneralizedPartialCredit
    PartialCreditModel
    NominalResponseModel
+   BifactorModel
+   MixtureIRT
+   TestletModel
+   DINA
+   DINO
 
 Estimation
 ----------
@@ -68,3 +73,74 @@ Scoring
    :nosignatures:
 
    fscores
+
+CAT
+---
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   CATEngine
+   CATResult
+   CATState
+
+Equating
+--------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   link
+   true_score_equating
+   observed_score_equating
+   equipercentile_equating
+   chain_link
+   link_mirt
+   link_grm
+   link_gpcm
+
+Multigroup
+----------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   fit_multigroup
+   compare_invariance
+
+Utils
+-----
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   simdata
+   validate_responses
+   itemstats
+   traditional
+
+Exceptions
+----------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   MirtError
+   MirtValidationError
+   MirtDataError
+   MirtConvergenceError
+
+Results
+-------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   FitResult
+   ScoreResult
