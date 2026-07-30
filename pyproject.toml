@@ -93,21 +93,15 @@ target-version = "py311"
 select = ["E", "F", "I", "W", "UP"]
 ignore = ["E501"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/mirt/__init__.py" = ["F401"]
+
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = false
 warn_unused_ignores = true
 check_untyped_defs = true
 disallow_incomplete_defs = true
-# Disabled codes explanation:
-# - import-not-found/import-untyped: optional deps (matplotlib, polars) and scipy stubs
-# - arg-type, return-value: numpy dtype variance; re-enabled package-wide causes hundreds
-#   of errors — public APIs should gradually tighten (see overrides below)
-# - assignment: numpy dtype variance issues common in scientific code
-# - union-attr, attr-defined: numpy array attribute access patterns
-# - override: numpy subclass method signatures
-# - operator, index: numpy indexing/operator overloads
-# - dict-item, list-item: container type variance with numpy arrays
 disable_error_code = [
     "import-not-found",
     "import-untyped",
@@ -123,9 +117,6 @@ disable_error_code = [
     "list-item",
 ]
 
-# Stricter checking on public error/result surfaces and backend selection;
-# package-wide arg-type/return-value remain disabled until the broader API
-# is gradually tightened.
 [[tool.mypy.overrides]]
 module = [
     "mirt.exceptions",

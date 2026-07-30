@@ -8,12 +8,12 @@ from mirt.scoring import fscores
 from mirt.scoring.eap import EAPScorer
 
 try:
-    import pandas  # noqa: F401
+    import pandas as pandas
 
     HAS_DATAFRAME = True
 except ImportError:
     try:
-        import polars  # noqa: F401
+        import polars as polars
 
         HAS_DATAFRAME = True
     except ImportError:

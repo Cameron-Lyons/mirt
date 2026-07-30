@@ -9,7 +9,6 @@ on ability.
    import mirt
    import numpy as np
 
-   # data: (n_persons, n_items); groups: length n_persons
    result = mirt.dif(data, groups, model="2PL", method="likelihood_ratio")
    print(result)
 

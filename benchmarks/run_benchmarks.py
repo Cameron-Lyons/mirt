@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Timing harness for EM fit, scoring, and CAT (not run in default pytest)."""
 
 from __future__ import annotations

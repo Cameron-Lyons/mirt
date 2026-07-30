@@ -1,5 +1,3 @@
-# ruff: noqa: F401
-
 import importlib
 from typing import Any, Literal
 
@@ -17,10 +15,10 @@ from mirt._gpu_backend import (
     GPU_AVAILABLE,
     get_gpu_device_name,
     get_gpu_memory_info,
-    is_gpu_available,  # noqa: F401
+    is_gpu_available,
     is_torch_available,
 )
-from mirt._rust_backend import RUST_AVAILABLE, is_rust_available  # noqa: F401
+from mirt._rust_backend import RUST_AVAILABLE, is_rust_available
 from mirt._version import __version__
 from mirt.cat import CATEngine, CATResult, CATState
 from mirt.estimation.bl import BLEstimator

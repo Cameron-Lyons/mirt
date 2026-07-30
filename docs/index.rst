@@ -32,15 +32,12 @@ Quick Start
 
    import mirt
 
-   # Load sample response data (rows: respondents, columns: items)
    dataset = mirt.load_dataset("LSAT7")
    responses = dataset["data"]
 
-   # Fit a 2PL model
    result = mirt.fit_mirt(responses, model="2PL")
    print(result.summary())
 
-   # Score respondents
    scores = mirt.fscores(result, responses, method="EAP")
    print(scores.theta[:5])
    print(scores.standard_error[:5])

@@ -12,7 +12,6 @@ cd mirt
 uv venv
 uv pip install -e ".[dev]"
 
-# Build the Rust extension into the active environment
 uv run maturin develop --release
 ```
 
@@ -21,20 +20,15 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 ## Python checks
 
 ```bash
-# Format / lint
 uv run ruff format src tests
 uv run ruff check src tests
 
-# Type check
 uv run mypy src/mirt --ignore-missing-imports
 
-# Tests (skips @pytest.mark.slow by default)
 uv run pytest
 
-# Slow / performance markers
 uv run pytest -m slow
 uv run pytest -m performance
-# or: uv run pytest tests/test_performance_smoke.py
 ```
 
 Convenience targets: `make lint`, `make fmt`, `make test`, `make test-slow`, `make bench`, `make develop`.
@@ -67,7 +61,6 @@ Or: `make test-rust` / `make fmt`.
 ```bash
 uv pip install -e ".[docs]"
 make docs
-# opens docs/_build/html
 ```
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.

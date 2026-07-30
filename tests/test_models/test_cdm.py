@@ -118,14 +118,14 @@ class TestDINA:
 
         assert ll.shape == (1,)
         assert np.isfinite(ll[0])
-        assert ll[0] < 0  # Log-likelihood should be negative
+        assert ll[0] < 0
 
     def test_log_likelihood_with_missing(self, q_matrix):
         """Test log-likelihood with missing data."""
         model = DINA(n_items=6, n_attributes=3, q_matrix=q_matrix)
         model._initialize_parameters()
 
-        responses = np.array([[1, -1, 1, 1, -1, 1]])  # -1 indicates missing
+        responses = np.array([[1, -1, 1, 1, -1, 1]])
         alpha = np.array([[1, 1, 1]])
 
         ll = model.log_likelihood(responses, alpha)
@@ -159,7 +159,7 @@ class TestDINA:
         model = DINA(n_items=6, n_attributes=3, q_matrix=q_matrix)
 
         patterns = model.attribute_patterns
-        assert patterns.shape == (8, 3)  # 2^3 = 8 patterns
+        assert patterns.shape == (8, 3)
         assert np.all((patterns == 0) | (patterns == 1))
 
     def test_slip_guess_properties(self, q_matrix):
@@ -433,7 +433,7 @@ class TestCDMEdgeCases:
         probs = model.probability(alpha)
 
         assert probs.shape == (2, n_items)
-        assert np.all(probs[0] > probs[1])  # Mastery should have higher prob
+        assert np.all(probs[0] > probs[1])
 
     def test_many_attributes(self):
         """Test CDM with many attributes."""
@@ -475,7 +475,7 @@ class TestCDMEdgeCases:
         """Test CDM with dense Q-matrix (items require multiple attributes)."""
         n_items = 4
         n_attrs = 3
-        q_matrix = np.ones((n_items, n_attrs), dtype=int)  # All items need all attrs
+        q_matrix = np.ones((n_items, n_attrs), dtype=int)
 
         model = DINA(n_items=n_items, n_attributes=n_attrs, q_matrix=q_matrix)
         model._initialize_parameters()
@@ -492,7 +492,7 @@ class TestCDMEdgeCases:
         """Test DINO with item requiring no attributes (edge case)."""
         n_items = 4
         n_attrs = 2
-        q_matrix = np.array([[1, 0], [0, 1], [1, 1], [0, 0]])  # Last item requires none
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1], [0, 0]])
 
         model = DINO(n_items=n_items, n_attributes=n_attrs, q_matrix=q_matrix)
         model._initialize_parameters()

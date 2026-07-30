@@ -29,7 +29,7 @@ def test_set_backend_numpy_and_auto(restore_backend) -> None:
 
 def test_set_backend_invalid() -> None:
     with pytest.raises(ValueError, match="Invalid backend"):
-        mirt.set_backend("jax")  # type: ignore[arg-type]
+        mirt.set_backend("jax")
 
 
 def test_set_backend_rust_when_unavailable(monkeypatch, restore_backend) -> None:

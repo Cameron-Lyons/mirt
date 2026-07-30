@@ -257,7 +257,7 @@ class TestBoundConstraint:
         disc = fitted_model.parameters["discrimination"]
         assert disc[0] == 0.5
         assert disc[1] == 0.5
-        assert disc[2] == 1.0  # Unchanged
+        assert disc[2] == 1.0
 
     def test_is_satisfied_true(self, fitted_model):
         """Test is_satisfied when within bounds."""
@@ -392,7 +392,7 @@ class TestCustomConstraint:
 
         constraint = CustomConstraint("custom", check_func=is_first_one)
 
-        assert constraint.is_satisfied(fitted_model)  # It is 1.0
+        assert constraint.is_satisfied(fitted_model)
 
         fitted_model._parameters["discrimination"][0] = 2.0
         assert not constraint.is_satisfied(fitted_model)
@@ -405,7 +405,7 @@ class TestCustomConstraint:
 
         constraint = CustomConstraint("custom", penalty_func=compute_penalty)
 
-        assert constraint.penalty(fitted_model) == 0.0  # Already 1.0
+        assert constraint.penalty(fitted_model) == 0.0
 
         fitted_model._parameters["discrimination"][0] = 2.0
         assert constraint.penalty(fitted_model) == 1.0

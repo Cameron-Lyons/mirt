@@ -68,9 +68,9 @@ pip install mirt
 
 With optional dependencies:
 ```bash
-pip install mirt[pandas]    # DataFrame support via pandas
-pip install mirt[polars]    # DataFrame support via polars
-pip install mirt[dev]       # Development tools
+pip install mirt[pandas]
+pip install mirt[polars]
+pip install mirt[dev]
 ```
 
 For plotting support:
@@ -83,15 +83,12 @@ pip install matplotlib
 ```python
 import mirt
 
-# Load a sample dataset
 dataset = mirt.load_dataset("LSAT7")
 responses = dataset["data"]
 
-# Fit a 2PL model
 result = mirt.fit_mirt(responses, model="2PL")
 print(result.summary())
 
-# Score respondents
 scores = mirt.fscores(result, responses, method="EAP")
 print(scores.to_dataframe().head())
 ```
@@ -104,63 +101,51 @@ print(scores.to_dataframe().head())
 import mirt
 import numpy as np
 
-# Basic simulation
 responses = mirt.simdata(model="2PL", n_persons=500, n_items=20, seed=42)
 
-# With specific parameters
 a = np.random.lognormal(0, 0.3, size=20)
 b = np.random.normal(0, 1, size=20)
 responses = mirt.simdata(model="2PL", discrimination=a, difficulty=b, n_persons=1000)
 
-# Polytomous data
 likert_data = mirt.simdata(model="GRM", n_categories=5, n_persons=500, n_items=15)
 ```
 
 ### Fitting Models
 
 ```python
-# Dichotomous models
 result_1pl = mirt.fit_mirt(responses, model="1PL")
 result_2pl = mirt.fit_mirt(responses, model="2PL")
 result_3pl = mirt.fit_mirt(responses, model="3PL")
 
-# Polytomous models
 result_grm = mirt.fit_mirt(likert_data, model="GRM", n_categories=5)
 result_gpcm = mirt.fit_mirt(likert_data, model="GPCM", n_categories=5)
 
-# Multidimensional
 result_mirt = mirt.fit_mirt(responses, model="2PL", n_factors=2)
 ```
 
 ### Person Scoring
 
 ```python
-# Different methods
 eap = mirt.fscores(result, responses, method="EAP")
 map_scores = mirt.fscores(result, responses, method="MAP")
 ml = mirt.fscores(result, responses, method="ML")
 
-# Access estimates
-print(eap.theta)            # Ability estimates
-print(eap.standard_error)   # Standard errors
+print(eap.theta)
+print(eap.standard_error)
 ```
 
 ### Diagnostics
 
 ```python
-# Item fit
 item_fit = mirt.itemfit(result, responses)
 print(item_fit)
 
-# Person fit
 person_fit = mirt.personfit(result, responses)
 aberrant = person_fit[person_fit["Zh"] < -2]
 
-# Model fit indices
 fit_indices = mirt.compute_fit_indices(result.model, responses)
 print(fit_indices)
 
-# Model comparison
 results = [result_1pl, result_2pl, result_3pl]
 comparison = mirt.compare_models(results)
 ```
@@ -170,22 +155,19 @@ comparison = mirt.compare_models(results)
 ```python
 groups = np.array([0] * 250 + [1] * 250)
 
-# Likelihood ratio test
 dif_lr = mirt.dif(responses, groups, method="likelihood_ratio")
 
-# Other methods
 dif_wald = mirt.dif(responses, groups, method="wald")
 dif_lord = mirt.dif(responses, groups, method="lord")
 dif_raju = mirt.dif(responses, groups, method="raju")
 
-# GRDIF for multiple groups (3+ groups supported)
 from mirt.diagnostics.dif import compute_grdif
 
 groups_multi = np.array(["A"] * 200 + ["B"] * 200 + ["C"] * 200)
 grdif_result = compute_grdif(
     responses, groups_multi,
     model="2PL",
-    scaling_method="mad",  # Robust to outliers (or "mean", "iqr")
+    scaling_method="mad",
 )
 print(f"Flagged items: {np.where(grdif_result['flagged_rs'])[0]}")
 ```
@@ -195,12 +177,9 @@ print(f"Flagged items: {np.where(grdif_result['flagged_rs'])[0]}")
 ```python
 from mirt.multigroup import fit_multigroup, compare_invariance
 
-# Fit with specific invariance level
 result = fit_multigroup(responses, groups, model="2PL", invariance="metric")
 
-# Compare all invariance levels
 results = compare_invariance(responses, groups, model="2PL", verbose=True)
-# Returns: {'configural': ..., 'metric': ..., 'scalar': ..., 'strict': ...}
 ```
 
 ### Computerized Adaptive Testing
@@ -208,31 +187,27 @@ results = compare_invariance(responses, groups, model="2PL", verbose=True)
 ```python
 from mirt.cat import CATEngine
 
-# Create CAT engine
 cat = CATEngine(result.model, se_threshold=0.3, max_items=20)
 
-# Run a simulation
 sim_results = cat.run_batch_simulation(
     true_thetas=np.linspace(-2, 2, 11),
     n_replications=100,
 )
 
-# Interactive session
 state = cat.get_current_state()
 while not state.is_complete:
     item = state.next_item
-    response = get_examinee_response(item)  # Your function
+    response = get_examinee_response(item)
     state = cat.administer_item(response)
 
 final = cat.get_result()
 print(final.summary())
 
-# Multidimensional CAT (MCAT)
 from mirt.cat import MCATEngine
 
 mcat = MCATEngine(
-    mirt_model,  # Multidimensional model
-    selection_method="D-optimality",  # or "A-optimality", "trace"
+    mirt_model,
+    selection_method="D-optimality",
     max_items=30,
 )
 mcat_result = mcat.run_simulation(true_theta=np.array([0.5, -0.3]))
@@ -243,16 +218,13 @@ print(f"Covariance: {mcat_result.theta_cov}")
 ### Advanced Models
 
 ```python
-# Cognitive Diagnostic Models
 from mirt import fit_cdm
 q_matrix = np.array([[1, 0], [1, 1], [0, 1], [1, 1]])
 cdm_result = fit_cdm(responses, q_matrix, model="DINA")
 
-# Mixture IRT
 from mirt import fit_mixture_irt
 mix_result = fit_mixture_irt(responses, n_classes=2, model="2PL")
 
-# Testlet Model
 from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
 ```
@@ -263,16 +235,14 @@ testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5]
 from mirt import TwoParameterLogistic
 from mirt.estimation import SparseBayesianEstimator, GVEMEstimator
 
-# Sparse Bayesian MIRT - automatically discovers factor structure
-model = TwoParameterLogistic(n_items=20, n_factors=5)  # Specify max factors
+model = TwoParameterLogistic(n_items=20, n_factors=5)
 estimator = SparseBayesianEstimator(k_max=5, lambda_0=0.04, lambda_1=1.0)
 result = estimator.fit(model, responses)
 
 print(f"Effective dimensions: {result.effective_dimensionality}")
 print(f"Sparsity ratio: {1 - result.sparsity_pattern.mean():.1%}")
-print(result.loading_table())  # Sparse loading matrix
+print(result.loading_table())
 
-# GVEM - fast variational EM for high-dimensional models
 estimator = GVEMEstimator(max_iter=200, tol=1e-4)
 result = estimator.fit(model, responses)
 ```
@@ -282,25 +252,22 @@ result = estimator.fit(model, responses)
 ```python
 from mirt.utils import fixed_calib, equate, Q3, residuals
 
-# Fixed-item calibration: calibrate new items to existing scale
 calib_result = fixed_calib(
     responses=combined_responses,
     anchor_model=existing_model,
-    anchor_items=[0, 1, 2, 3, 4],  # Items with known parameters
+    anchor_items=[0, 1, 2, 3, 4],
 )
 print(f"New item difficulties: {calib_result.new_difficulty}")
 
-# Test form equating
 equating = equate(
     model_old=form_a_model,
     model_new=form_b_model,
     anchor_items_old=[0, 1, 2],
     anchor_items_new=[0, 1, 2],
-    method="stocking_lord",  # or "haebara", "mean_sigma", "mean_mean"
+    method="stocking_lord",
 )
 print(f"Scale transformation: theta_new = {equating.A:.3f} * theta_old + {equating.B:.3f}")
 
-# Local dependence analysis
 q3_matrix = Q3(result.model, responses, scores.theta)
 resid = residuals(result.model, responses, scores.theta)
 print(f"Max Q3 (off-diagonal): {np.max(np.abs(np.triu(q3_matrix, 1))):.3f}")
@@ -311,7 +278,6 @@ print(f"Max Q3 (off-diagonal): {np.max(np.abs(np.triu(q3_matrix, 1))):.3f}")
 ```python
 from mirt.equating import vertical_scale, GradeData, compute_vertical_diagnostics
 
-# Define grade-level data with anchor items
 grade_data = [
     GradeData("Grade 3", responses_g3, anchor_items_above=[0, 1, 2, 3, 4]),
     GradeData("Grade 4", responses_g4, anchor_items_below=[10, 11, 12, 13, 14],
@@ -319,18 +285,15 @@ grade_data = [
     GradeData("Grade 5", responses_g5, anchor_items_below=[10, 11, 12, 13, 14]),
 ]
 
-# Create vertical scale
 result = vertical_scale(
     grade_data,
-    method="chain",  # or "concurrent", "fixed_anchor", "floating_anchor"
+    method="chain",
     enforce_monotonicity=True,
 )
 
-# View growth curve
 print(f"Grade means: {result.grade_means}")
 print(f"Growth curve: {result.growth_curve}")
 
-# Diagnostics
 diagnostics = compute_vertical_diagnostics(result, grade_data)
 print(f"Grade separation (effect sizes): {diagnostics.grade_separation}")
 ```
@@ -340,13 +303,10 @@ print(f"Grade separation (effect sizes): {diagnostics.grade_separation}")
 ```python
 from mirt import plot_icc, plot_information, plot_person_item_map
 
-# Item characteristic curves
 plot_icc(result.model, item_idx=[0, 1, 2])
 
-# Test information function
 plot_information(result.model)
 
-# Wright map
 plot_person_item_map(result.model, scores.theta)
 ```
 
@@ -514,7 +474,7 @@ Disable Rust globally with:
 
 ```python
 import mirt
-mirt.set_backend("numpy")  # force NumPy even if the extension is installed
+mirt.set_backend("numpy")
 ```
 
 Per-call `use_rust=False` also disables Rust for that call. `mirt.should_use_rust()` reports the effective decision.
@@ -552,38 +512,30 @@ When neither pandas nor polars is installed, functions that return DataFrames wi
 To set your preferred DataFrame backend explicitly:
 ```python
 import mirt
-mirt.set_dataframe_backend("pandas")  # or "polars"
+mirt.set_dataframe_backend("pandas")
 ```
 
 ## Development
 
 ```bash
-# Clone and install
 git clone https://github.com/Cameron-Lyons/mirt.git
 cd mirt
 uv venv
 uv pip install -e ".[dev]"
 
-# Build Rust extension
 uv run maturin develop --release
 
-# Run tests
 uv run pytest
 
-# Type checking
 uv run mypy src/mirt
 
-# Formatting
 uv run ruff format src tests
 uv run ruff check src tests
 
-# Slow tests (scheduled in CI)
 uv run pytest -m slow
 
-# Performance smoke tests
 uv run pytest tests/test_performance_smoke.py
 
-# Benchmarks (timing harness, not part of default pytest)
 uv run python benchmarks/run_benchmarks.py
 ```
 
