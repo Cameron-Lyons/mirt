@@ -3,8 +3,7 @@
 use ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
-use rand::prelude::*;
-use rand_pcg::Pcg64;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{
@@ -160,7 +159,7 @@ fn cat_simulate_single(
     items: &ItemBank,
     quad: &Quadrature,
     stopping: &StoppingRule,
-    rng: &mut Pcg64,
+    rng: &mut StdRng,
 ) -> (f64, f64, usize, Vec<i32>, Vec<i32>) {
     let n_items = items.discrimination.len();
     let n_quad = quad.points.len();
@@ -290,7 +289,7 @@ pub fn cat_simulate_batch<'py>(
             let task_seed = seed
                 .wrapping_add(*theta_idx as u64 * 1000)
                 .wrapping_add(*rep as u64);
-            let mut rng = Pcg64::seed_from_u64(task_seed);
+            let mut rng = StdRng::seed_from_u64(task_seed);
 
             let items = ItemBank {
                 discrimination: &disc,
@@ -380,7 +379,7 @@ pub fn cat_conditional_mse<'py>(
                 let task_seed = seed
                     .wrapping_add(t_idx as u64 * 10000)
                     .wrapping_add(rep as u64);
-                let mut rng = Pcg64::seed_from_u64(task_seed);
+                let mut rng = StdRng::seed_from_u64(task_seed);
 
                 let (est_theta, _, n_items, _, _) =
                     cat_simulate_single(true_theta, &items, &quad, &stopping, &mut rng);

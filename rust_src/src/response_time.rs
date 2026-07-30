@@ -6,9 +6,10 @@
 use ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, sigmoid};
+use crate::utils::{EPSILON, NormalSampler, sigmoid};
 
 /// Log-normal density.
 #[inline]
@@ -181,9 +182,6 @@ pub fn rt_sample_person_params<'py>(
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<i32>>,
 ) {
-    use rand::SeedableRng;
-    use rand_distr::{Distribution, Normal, Uniform};
-
     let responses = responses.as_array();
     let log_rt = log_rt.as_array();
     let theta = theta_current.as_array();
@@ -201,9 +199,8 @@ pub fn rt_sample_person_params<'py>(
     let results: Vec<(f64, f64, i32)> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed + i as u64);
-            let normal = Normal::new(0.0, proposal_sd).unwrap();
-            let uniform = Uniform::new(0.0f64, 1.0).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
+            let mut normal = NormalSampler::new(0.0, proposal_sd);
 
             let theta_prop = theta[i] + normal.sample(&mut rng);
             let tau_prop = tau[i] + normal.sample(&mut rng);
@@ -254,7 +251,7 @@ pub fn rt_sample_person_params<'py>(
 
             let log_accept = (log_like_prop + log_prior_prop) - (log_like_curr + log_prior_curr);
 
-            if uniform.sample(&mut rng).ln() < log_accept {
+            if rng.random::<f64>().ln() < log_accept {
                 (theta_prop, tau_prop, 1)
             } else {
                 (theta[i], tau[i], 0)

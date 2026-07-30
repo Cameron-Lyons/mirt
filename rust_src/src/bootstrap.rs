@@ -3,12 +3,10 @@
 use ndarray::{Array2, Array3};
 use numpy::{PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use rand::prelude::*;
-use rand_distr::Normal;
-use rand_pcg::Pcg64;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::utils::sigmoid;
+use crate::utils::{NormalSampler, sigmoid};
 
 /// Generate bootstrap sample indices
 #[pyfunction]
@@ -21,7 +19,7 @@ pub fn generate_bootstrap_indices<'py>(
     let indices: Vec<Vec<i64>> = (0..n_bootstrap)
         .into_par_iter()
         .map(|b| {
-            let mut rng = Pcg64::seed_from_u64(seed + b as u64);
+            let mut rng = StdRng::seed_from_u64(seed + b as u64);
             (0..n_persons)
                 .map(|_| rng.random_range(0..n_persons as i64))
                 .collect()
@@ -86,7 +84,7 @@ pub fn impute_from_probabilities<'py>(
     let imputed: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
             let theta_i = theta[i];
 
             (0..n_items)
@@ -147,10 +145,10 @@ pub fn multiple_imputation<'py>(
 
             (0..n_persons)
                 .map(|i| {
-                    let mut rng = Pcg64::seed_from_u64(base_seed + i as u64);
+                    let mut rng = StdRng::seed_from_u64(base_seed + i as u64);
 
-                    let normal = Normal::new(0.0, 1.0).unwrap();
-                    let theta_i = theta_mean[i] + rng.sample(normal) * theta_se[i];
+                    let mut normal = NormalSampler::new(0.0, 1.0);
+                    let theta_i = theta_mean[i] + normal.sample(&mut rng) * theta_se[i];
 
                     (0..n_items)
                         .map(|j| {

@@ -3,13 +3,12 @@
 use ndarray::{Array1, Array2, Array3};
 use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use rand::prelude::*;
-use rand_distr::Normal;
-use rand_pcg::Pcg64;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{
-    EPSILON, compute_log_weights, gauss_hermite_quadrature, log_sigmoid, logsumexp, sigmoid,
+    EPSILON, NormalSampler, compute_log_weights, gauss_hermite_quadrature, log_sigmoid, logsumexp,
+    sigmoid,
 };
 
 /// EM algorithm for 2PL model fitting
@@ -276,9 +275,9 @@ pub fn gibbs_sample_2pl<'py>(
     let mut theta_chain: Vec<Vec<f64>> = Vec::with_capacity(n_samples);
     let mut ll_chain: Vec<f64> = Vec::with_capacity(n_samples);
 
-    let mut rng = Pcg64::seed_from_u64(seed);
-    let proposal_theta = Normal::new(0.0, 0.5).unwrap();
-    let proposal_param = Normal::new(0.0, 0.1).unwrap();
+    let mut rng = StdRng::seed_from_u64(seed);
+    let proposal_theta_sd = 0.5;
+    let mut proposal_param = NormalSampler::new(0.0, 0.1);
 
     for iter in 0..n_iter {
         theta = sample_theta_mh(
@@ -289,7 +288,7 @@ pub fn gibbs_sample_2pl<'py>(
             n_persons,
             n_items,
             &mut rng,
-            &proposal_theta,
+            proposal_theta_sd,
         );
 
         discrimination = sample_discrimination_mh(
@@ -299,7 +298,7 @@ pub fn gibbs_sample_2pl<'py>(
             &difficulty,
             n_items,
             &mut rng,
-            &proposal_param,
+            &mut proposal_param,
         );
 
         difficulty = sample_difficulty_mh(
@@ -309,7 +308,7 @@ pub fn gibbs_sample_2pl<'py>(
             &difficulty,
             n_items,
             &mut rng,
-            &proposal_param,
+            &mut proposal_param,
         );
 
         if iter >= burnin && (iter - burnin).is_multiple_of(thin) {
@@ -365,18 +364,19 @@ fn sample_theta_mh(
     difficulty: &[f64],
     n_persons: usize,
     n_items: usize,
-    rng: &mut Pcg64,
-    proposal: &Normal<f64>,
+    rng: &mut StdRng,
+    proposal_sd: f64,
 ) -> Vec<f64> {
     let seeds: Vec<u64> = (0..n_persons).map(|_| rng.random()).collect();
 
     let new_theta: Vec<f64> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut local_rng = Pcg64::seed_from_u64(seeds[i]);
+            let mut local_rng = StdRng::seed_from_u64(seeds[i]);
+            let mut proposal = NormalSampler::new(0.0, proposal_sd);
 
             let current = theta[i];
-            let proposed = current + local_rng.sample(proposal);
+            let proposed = current + proposal.sample(&mut local_rng);
 
             let mut ll_current = 0.0;
             let mut ll_proposed = 0.0;
@@ -420,15 +420,15 @@ fn sample_discrimination_mh(
     discrimination: &[f64],
     difficulty: &[f64],
     n_items: usize,
-    rng: &mut Pcg64,
-    proposal: &Normal<f64>,
+    rng: &mut StdRng,
+    proposal: &mut NormalSampler,
 ) -> Vec<f64> {
     let n_persons = theta.len();
     let mut new_disc = discrimination.to_vec();
 
     for j in 0..n_items {
         let current = discrimination[j];
-        let proposed = (current + rng.sample(proposal)).clamp(0.1, 5.0);
+        let proposed = (current + proposal.sample(rng)).clamp(0.1, 5.0);
 
         let mut ll_current = 0.0;
         let mut ll_proposed = 0.0;
@@ -469,15 +469,15 @@ fn sample_difficulty_mh(
     discrimination: &[f64],
     difficulty: &[f64],
     n_items: usize,
-    rng: &mut Pcg64,
-    proposal: &Normal<f64>,
+    rng: &mut StdRng,
+    proposal: &mut NormalSampler,
 ) -> Vec<f64> {
     let n_persons = theta.len();
     let mut new_diff = difficulty.to_vec();
 
     for j in 0..n_items {
         let current = difficulty[j];
-        let proposed = (current + rng.sample(proposal)).clamp(-6.0, 6.0);
+        let proposed = (current + proposal.sample(rng)).clamp(-6.0, 6.0);
 
         let mut ll_current = 0.0;
         let mut ll_proposed = 0.0;
@@ -559,8 +559,7 @@ pub fn mhrm_fit_2pl<'py>(
     let mut difficulty: Vec<f64> = vec![0.0; n_items];
     let mut theta: Vec<f64> = vec![0.0; n_persons];
 
-    let mut rng = Pcg64::seed_from_u64(seed);
-    let proposal = Normal::new(0.0, proposal_sd).unwrap();
+    let mut rng = StdRng::seed_from_u64(seed);
 
     for cycle in 0..n_cycles {
         theta = sample_theta_mh(
@@ -571,7 +570,7 @@ pub fn mhrm_fit_2pl<'py>(
             n_persons,
             n_items,
             &mut rng,
-            &proposal,
+            proposal_sd,
         );
 
         let gain = 1.0 / (cycle as f64 + 1.0);
@@ -640,7 +639,7 @@ pub fn bootstrap_fit_2pl<'py>(
     let results: Vec<(Vec<f64>, Vec<f64>)> = (0..n_bootstrap)
         .into_par_iter()
         .map(|b| {
-            let mut rng = Pcg64::seed_from_u64(seed + b as u64);
+            let mut rng = StdRng::seed_from_u64(seed + b as u64);
 
             let indices: Vec<usize> = (0..n_persons)
                 .map(|_| rng.random_range(0..n_persons))

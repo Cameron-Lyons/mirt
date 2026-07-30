@@ -3,8 +3,7 @@
 use ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use rand::prelude::*;
-use rand_pcg::Pcg64;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{EPSILON, sigmoid};
@@ -32,7 +31,7 @@ pub fn simulate_grm<'py>(
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
             let theta_i = theta[[i, 0]];
 
             (0..n_items)
@@ -107,7 +106,7 @@ pub fn simulate_gpcm<'py>(
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
             let theta_i = theta[[i, 0]];
 
             (0..n_items)
@@ -174,7 +173,7 @@ pub fn simulate_dichotomous<'py>(
     let responses: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
             let theta_i = theta[i];
 
             (0..n_items)
