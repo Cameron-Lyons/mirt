@@ -28,7 +28,6 @@ extensions = [
     "sphinx.ext.intersphinx",
     "sphinx.ext.napoleon",
     "sphinx.ext.viewcode",
-    "numpydoc",
 ]
 
 templates_path = ["_templates"]
@@ -47,9 +46,6 @@ autosummary_generate = True
 napoleon_google_docstring = True
 napoleon_numpy_docstring = True
 napoleon_include_init_with_doc = True
-
-# Numpydoc settings
-numpydoc_show_class_members = False
 
 # Intersphinx mapping
 intersphinx_mapping = {

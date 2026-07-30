@@ -3,12 +3,10 @@
 use ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
-use rand::prelude::*;
-use rand_distr::Normal;
-use rand_pcg::Pcg64;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, log_likelihood_2pl_single};
+use crate::utils::{EPSILON, NormalSampler, log_likelihood_2pl_single};
 
 /// Generate plausible values using posterior sampling
 #[pyfunction]
@@ -43,8 +41,8 @@ pub fn generate_plausible_values_posterior<'py>(
     let pvs: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
-            let normal = Normal::new(0.0, jitter_sd).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
+            let mut normal = NormalSampler::new(0.0, jitter_sd);
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
             let log_likes: Vec<f64> = (0..n_quad)
@@ -80,7 +78,7 @@ pub fn generate_plausible_values_posterior<'py>(
                             break;
                         }
                     }
-                    quad_vec[idx] + rng.sample(normal)
+                    quad_vec[idx] + normal.sample(&mut rng)
                 })
                 .collect()
         })
@@ -121,8 +119,8 @@ pub fn generate_plausible_values_mcmc<'py>(
     let pvs: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = Pcg64::seed_from_u64(seed + i as u64);
-            let proposal_dist = Normal::new(0.0, proposal_sd).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
+            let mut proposal_dist = NormalSampler::new(0.0, proposal_sd);
             let resp_row: Vec<i32> = responses.row(i).to_vec();
 
             let mut theta = 0.0;
@@ -130,7 +128,7 @@ pub fn generate_plausible_values_mcmc<'py>(
 
             for _p in 0..n_plausible {
                 for _ in 0..n_iter {
-                    let proposal = theta + rng.sample(proposal_dist);
+                    let proposal = theta + proposal_dist.sample(&mut rng);
 
                     let ll_current =
                         log_likelihood_2pl_single(&resp_row, theta, &disc_vec, &diff_vec);

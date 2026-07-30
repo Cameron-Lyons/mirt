@@ -821,7 +821,6 @@ dev = [
     { name = "ruff" },
 ]
 docs = [
-    { name = "numpydoc" },
     { name = "sphinx" },
     { name = "sphinx-rtd-theme" },
 ]
@@ -844,7 +843,6 @@ requires-dist = [
     { name = "maturin", marker = "extra == 'dev'", specifier = ">=1.4" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "numpy", specifier = ">=1.24" },
-    { name = "numpydoc", marker = "extra == 'docs'", specifier = ">=1.5" },
     { name = "pandas", marker = "extra == 'dev'", specifier = ">=1.5" },
     { name = "pandas", marker = "extra == 'pandas'", specifier = ">=1.5" },
     { name = "polars", marker = "extra == 'dev'", specifier = ">=0.20" },
@@ -1002,18 +1000,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/63/09/3d8aeb809c0332c3f642da812ac2e3d74fc9252b3021f8c30c82e99e3f3d/numpy-2.4.0-pp311-pypy311_pp73-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:32ed06d0fe9cae27d8fb5f400c63ccee72370599c75e683a6358dd3a4fb50aaf", size = 14535119, upload-time = "2025-12-20T16:18:12.105Z" },
     { url = "https://files.pythonhosted.org/packages/fd/7f/68f0fc43a2cbdc6bb239160c754d87c922f60fbaa0fa3cd3d312b8a7f5ee/numpy-2.4.0-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:57c540ed8fb1f05cb997c6761cd56db72395b0d6985e90571ff660452ade4f98", size = 16475815, upload-time = "2025-12-20T16:18:14.433Z" },
     { url = "https://files.pythonhosted.org/packages/11/73/edeacba3167b1ca66d51b1a5a14697c2c40098b5ffa01811c67b1785a5ab/numpy-2.4.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:a39fb973a726e63223287adc6dafe444ce75af952d711e400f3bf2b36ef55a7b", size = 12489376, upload-time = "2025-12-20T16:18:16.524Z" },
-]
-
-[[package]]
-name = "numpydoc"
-version = "1.10.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "sphinx" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/e9/3c/dfccc9e7dee357fb2aa13c3890d952a370dd0ed071e0f7ed62ed0df567c1/numpydoc-1.10.0.tar.gz", hash = "sha256:3f7970f6eee30912260a6b31ac72bba2432830cd6722569ec17ee8d3ef5ffa01", size = 94027, upload-time = "2025-12-02T16:39:12.937Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/62/5e/3a6a3e90f35cea3853c45e5d5fb9b7192ce4384616f932cf7591298ab6e1/numpydoc-1.10.0-py3-none-any.whl", hash = "sha256:3149da9874af890bcc2a82ef7aae5484e5aa81cb2778f08e3c307ba6d963721b", size = 69255, upload-time = "2025-12-02T16:39:11.561Z" },
 ]
 
 [[package]]

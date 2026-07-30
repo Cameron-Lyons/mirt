@@ -8,6 +8,7 @@
 use ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
+use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{EPSILON, sigmoid};
@@ -556,9 +557,6 @@ pub fn bkt_ffbs<'py>(
     p_guess: PyReadonlyArray1<f64>,
     seed: u64,
 ) -> Bound<'py, PyArray1<i32>> {
-    use rand::SeedableRng;
-    use rand_distr::{Distribution, Uniform};
-
     let responses = responses.as_array();
     let skills = skill_assignments.as_array();
     let p_init = p_init.as_array();
@@ -579,13 +577,12 @@ pub fn bkt_ffbs<'py>(
         p_guess.as_slice().unwrap(),
     );
 
-    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    let uniform = Uniform::new(0.0f64, 1.0).unwrap();
+    let mut rng = StdRng::seed_from_u64(seed);
 
     let mut states = Array1::<i32>::zeros(n_trials);
 
     let p_learned = alpha[[n_trials - 1, 1]];
-    states[n_trials - 1] = if uniform.sample(&mut rng) < p_learned {
+    states[n_trials - 1] = if rng.random::<f64>() < p_learned {
         1
     } else {
         0
@@ -610,7 +607,7 @@ pub fn bkt_ffbs<'py>(
             p_state[1] /= sum;
         }
 
-        states[t] = if uniform.sample(&mut rng) < p_state[1] {
+        states[t] = if rng.random::<f64>() < p_state[1] {
             1
         } else {
             0
@@ -634,9 +631,6 @@ pub fn bkt_ffbs_batch<'py>(
     p_guess: PyReadonlyArray1<f64>,
     seed: u64,
 ) -> Bound<'py, PyArray2<i32>> {
-    use rand::SeedableRng;
-    use rand_distr::{Distribution, Uniform};
-
     let responses = responses.as_array();
     let skills = skill_assignments.as_array();
     let p_init = p_init.as_array();
@@ -651,8 +645,7 @@ pub fn bkt_ffbs_batch<'py>(
     let results: Vec<Vec<i32>> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut rng = rand::rngs::StdRng::seed_from_u64(seed + i as u64);
-            let uniform = Uniform::new(0.0f64, 1.0).unwrap();
+            let mut rng = StdRng::seed_from_u64(seed + i as u64);
 
             let person_responses: Vec<i32> = (0..n_trials).map(|t| responses[[i, t]]).collect();
 
@@ -669,7 +662,7 @@ pub fn bkt_ffbs_batch<'py>(
             let mut states = vec![0i32; n_trials];
 
             let p_learned = alpha[[n_trials - 1, 1]];
-            states[n_trials - 1] = if uniform.sample(&mut rng) < p_learned {
+            states[n_trials - 1] = if rng.random::<f64>() < p_learned {
                 1
             } else {
                 0
@@ -694,7 +687,7 @@ pub fn bkt_ffbs_batch<'py>(
                     p_state[1] /= sum;
                 }
 
-                states[t] = if uniform.sample(&mut rng) < p_state[1] {
+                states[t] = if rng.random::<f64>() < p_state[1] {
                     1
                 } else {
                     0

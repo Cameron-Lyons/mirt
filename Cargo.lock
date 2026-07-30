@@ -98,7 +98,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
- "rand_core",
  "wasip2",
  "wasip3",
 ]
@@ -197,8 +196,6 @@ dependencies = [
  "numpy",
  "pyo3",
  "rand",
- "rand_distr",
- "rand_pcg",
  "rayon",
 ]
 
@@ -215,7 +212,6 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "rawpointer",
- "rayon",
 ]
 
 [[package]]
@@ -243,7 +239,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
- "libm",
 ]
 
 [[package]]
@@ -390,25 +385,6 @@ name = "rand_core"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c8d0fd677905edcbeedbf2edb6494d676f0e98d54d5cf9bda0b061cb8fb8aba"
-
-[[package]]
-name = "rand_distr"
-version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
-dependencies = [
- "num-traits",
- "rand",
-]
-
-[[package]]
-name = "rand_pcg"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
-dependencies = [
- "rand_core",
-]
 
 [[package]]
 name = "rawpointer"

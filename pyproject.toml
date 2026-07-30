@@ -61,7 +61,6 @@ dev = [
 docs = [
     "sphinx>=6.0",
     "sphinx-rtd-theme>=1.0",
-    "numpydoc>=1.5",
 ]
 plot = [
     "matplotlib>=3.10.8",

@@ -1,9 +1,61 @@
 //! Core utility functions for IRT computations.
 
 use ndarray::ArrayView1;
+use rand::{Rng, RngExt};
 
 pub const LOG_2_PI: f64 = 1.8378770664093453;
 pub const EPSILON: f64 = 1e-10;
+
+/// Normal-distribution sampler backed only by the core `rand` crate.
+///
+/// Marsaglia's polar method produces samples in pairs. Caching the second
+/// sample keeps repeated MCMC and imputation draws efficient while avoiding a
+/// separate distribution dependency.
+#[derive(Clone, Debug)]
+pub struct NormalSampler {
+    mean: f64,
+    std_dev: f64,
+    spare: Option<f64>,
+}
+
+impl NormalSampler {
+    pub fn new(mean: f64, std_dev: f64) -> Self {
+        assert!(mean.is_finite(), "normal mean must be finite");
+        assert!(
+            std_dev.is_finite() && std_dev >= 0.0,
+            "normal standard deviation must be finite and non-negative"
+        );
+        Self {
+            mean,
+            std_dev,
+            spare: None,
+        }
+    }
+
+    #[inline]
+    pub fn sample<R: Rng + ?Sized>(&mut self, rng: &mut R) -> f64 {
+        if self.std_dev == 0.0 {
+            return self.mean;
+        }
+
+        if let Some(standard_normal) = self.spare.take() {
+            return self.mean + self.std_dev * standard_normal;
+        }
+
+        loop {
+            let u = 2.0 * rng.random::<f64>() - 1.0;
+            let v = 2.0 * rng.random::<f64>() - 1.0;
+            let radius_squared = u * u + v * v;
+            if radius_squared == 0.0 || radius_squared >= 1.0 {
+                continue;
+            }
+
+            let scale = (-2.0 * radius_squared.ln() / radius_squared).sqrt();
+            self.spare = Some(v * scale);
+            return self.mean + self.std_dev * u * scale;
+        }
+    }
+}
 
 #[inline]
 pub fn logsumexp(arr: &[f64]) -> f64 {
@@ -273,6 +325,7 @@ pub fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
     #[test]
     fn sigmoid_at_zero_is_half() {
@@ -315,5 +368,44 @@ mod tests {
         // At theta = b with a = 1: I = a^2 * p * (1-p) = 0.25 per item
         let info = fisher_info_2pl(0.0, &[1.0, 1.0], &[0.0, 0.0]);
         assert!((info - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normal_sampler_is_reproducible() {
+        let mut first_rng = StdRng::seed_from_u64(42);
+        let mut second_rng = StdRng::seed_from_u64(42);
+        let mut first = NormalSampler::new(1.5, 0.75);
+        let mut second = NormalSampler::new(1.5, 0.75);
+
+        let first_samples: Vec<f64> = (0..16).map(|_| first.sample(&mut first_rng)).collect();
+        let second_samples: Vec<f64> = (0..16).map(|_| second.sample(&mut second_rng)).collect();
+
+        assert_eq!(first_samples, second_samples);
+    }
+
+    #[test]
+    fn normal_sampler_has_expected_moments() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut normal = NormalSampler::new(2.0, 3.0);
+        let samples: Vec<f64> = (0..100_000).map(|_| normal.sample(&mut rng)).collect();
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let variance = samples
+            .iter()
+            .map(|sample| (sample - mean).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64;
+
+        assert!((mean - 2.0).abs() < 0.04);
+        assert!((variance - 9.0).abs() < 0.12);
+    }
+
+    #[test]
+    fn zero_deviation_normal_does_not_advance_rng() {
+        let mut sampled_rng = StdRng::seed_from_u64(99);
+        let mut untouched_rng = StdRng::seed_from_u64(99);
+        let mut normal = NormalSampler::new(-3.0, 0.0);
+
+        assert_eq!(normal.sample(&mut sampled_rng), -3.0);
+        assert_eq!(sampled_rng.random::<u64>(), untouched_rng.random::<u64>());
     }
 }
