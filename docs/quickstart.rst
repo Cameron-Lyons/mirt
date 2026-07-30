@@ -22,19 +22,15 @@ Example: 2PL Model
 
    import mirt
 
-   # Load sample data
    dataset = mirt.load_dataset("LSAT7")
    responses = dataset["data"]
 
-   # Fit a 2PL model
    result = mirt.fit_mirt(responses, model="2PL", max_iter=200)
    print(result.summary())
 
-   # Access fitted item parameters
    print("Discrimination:", result.model.parameters["discrimination"])
    print("Difficulty:", result.model.parameters["difficulty"])
 
-   # Score respondents
    scores = mirt.fscores(result, responses, method="EAP")
    print("Theta estimates:", scores.theta[:5])
    print("SE estimates:", scores.standard_error[:5])
@@ -51,7 +47,6 @@ For polytomous items (Likert scales, etc.):
    data = mirt.load_dataset("verbal_aggression")
    responses = data["data"]
 
-   # verbal_aggression has categories 0, 1, 2 (with -1 for missing)
    result = mirt.fit_mirt(responses, model="GRM", n_categories=3)
    print(result.summary())
 
@@ -68,7 +63,6 @@ After fitting a model, you can score new respondents:
    responses = dataset["data"]
    result = mirt.fit_mirt(responses, model="2PL")
 
-   # Score a new batch with MAP
    new_responses = responses[:10]
    score_result = mirt.fscores(result, new_responses, method="MAP")
    print(score_result.theta)

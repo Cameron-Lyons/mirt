@@ -294,7 +294,6 @@ class TestMultigroupAnalysis:
         )
 
         try:
-            # constrained=metric, free=configural
             lrt = invariance_lrt(results["metric"], results["configural"])
         except (ValueError, TypeError, AttributeError) as exc:
             pytest.skip(f"invariance_lrt not usable with these fits: {exc}")

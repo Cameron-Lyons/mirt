@@ -1,6 +1,5 @@
 version: 2
 updates:
-  # Python dependencies (pip)
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
@@ -18,7 +17,6 @@ updates:
           - "minor"
           - "patch"
 
-  # Rust dependencies (cargo)
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -36,7 +34,6 @@ updates:
           - "minor"
           - "patch"
 
-  # GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

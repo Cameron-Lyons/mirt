@@ -21,14 +21,14 @@ def get_dataframe_backend() -> str:
         return _DATAFRAME_BACKEND
 
     try:
-        import polars  # noqa: F401
+        import polars as polars
 
         return "polars"
     except ImportError:
         pass
 
     try:
-        import pandas  # noqa: F401
+        import pandas as pandas
 
         return "pandas"
     except ImportError:

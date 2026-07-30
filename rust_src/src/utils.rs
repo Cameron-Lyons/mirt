@@ -359,13 +359,11 @@ mod tests {
         let ll = log_likelihood_2pl_single(&responses, 0.0, &discrimination, &difficulty);
         assert!(ll.is_finite());
         assert!(ll < 0.0);
-        // Three items at P=0.5 => 3 * ln(0.5)
         assert!((ll - 3.0 * 0.5_f64.ln()).abs() < 1e-10);
     }
 
     #[test]
     fn fisher_info_2pl_at_difficulty() {
-        // At theta = b with a = 1: I = a^2 * p * (1-p) = 0.25 per item
         let info = fisher_info_2pl(0.0, &[1.0, 1.0], &[0.0, 0.0]);
         assert!((info - 0.5).abs() < 1e-12);
     }

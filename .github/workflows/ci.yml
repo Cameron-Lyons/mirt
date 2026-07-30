@@ -9,7 +9,6 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Run weekly slow-test suite on Sundays at 08:00 UTC
     - cron: "0 8 * * 0"
 
 jobs:

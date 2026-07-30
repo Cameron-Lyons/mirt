@@ -153,7 +153,7 @@ class TestMHRMEstimator:
         assert result.bic is not None
         assert result.aic > 0
         assert result.bic > 0
-        assert result.bic > result.aic  # BIC penalizes more for n > e^2
+        assert result.bic > result.aic
 
     def test_with_missing_data(self, responses_with_missing):
         """Test MHRM with missing data."""
@@ -285,8 +285,8 @@ class TestGibbsSampler:
         result1 = sampler_thin1.fit(model1, dichotomous_responses["responses"])
         result2 = sampler_thin2.fit(model2, dichotomous_responses["responses"])
 
-        assert result1.chains["discrimination"].shape[0] == 40  # (60-20)/1
-        assert result2.chains["discrimination"].shape[0] == 20  # (60-20)/2
+        assert result1.chains["discrimination"].shape[0] == 40
+        assert result2.chains["discrimination"].shape[0] == 20
 
     def test_with_missing_data(self, responses_with_missing):
         """Test Gibbs sampler with missing data."""

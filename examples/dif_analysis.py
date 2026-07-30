@@ -12,7 +12,6 @@ def main() -> None:
     n_persons, n_items = 400, 15
     a = rng.uniform(0.7, 1.8, size=n_items)
     b = rng.normal(0.0, 1.0, size=n_items)
-    # Focal group faces a harder item 3
     b_focal = b.copy()
     b_focal[3] += 0.8
 

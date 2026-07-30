@@ -113,7 +113,7 @@ def _with_numpy_backend_and_chunk(chunk: int):
 
 def _restore(previous: str, old_chunk: int) -> None:
     helpers._MAX_VECTOR_CHUNK_ENTRIES = old_chunk
-    mirt.set_backend(previous)  # type: ignore[arg-type]
+    mirt.set_backend(previous)
 
 
 def test_2pl_vectorized_fallback_matches_reference() -> None:
