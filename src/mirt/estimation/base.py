@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.exceptions import MirtDataError, MirtValidationError
+from mirt.exceptions import MirtValidationError
+from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -64,21 +65,7 @@ class BaseEstimator(ABC):
         responses: NDArray[np.int_],
         n_items: int,
     ) -> NDArray[np.int_]:
-        responses = np.asarray(responses)
-
-        if responses.ndim != 2:
-            raise MirtDataError(
-                f"responses must be 2D, got {responses.ndim}D",
-                n_items=n_items,
-            )
-
-        if responses.shape[1] != n_items:
-            raise MirtDataError(
-                f"responses has {responses.shape[1]} items, expected {n_items}",
-                n_items=responses.shape[1],
-            )
-
-        return responses
+        return validate_responses(responses, n_items=n_items)
 
     def _log_iteration(
         self,

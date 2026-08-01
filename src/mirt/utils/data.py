@@ -28,7 +28,8 @@ def validate_responses(
     allow_missing : bool, default=True
         Whether to allow missing responses coded as missing_code.
     missing_code : int, default=-1
-        Value used to represent missing responses.
+        Value used to represent missing responses in the returned array. Any
+        negative input value is treated as missing and normalized to this code.
 
     Returns
     -------
@@ -64,7 +65,18 @@ def validate_responses(
     n_persons, n_cols = responses.shape
 
     if n_persons == 0:
-        raise MirtDataError("responses cannot be empty", n_persons=0, n_items=n_cols)
+        raise MirtDataError(
+            "responses must contain at least one person",
+            n_persons=0,
+            n_items=n_cols,
+        )
+
+    if n_cols == 0:
+        raise MirtDataError(
+            "responses must contain at least one item",
+            n_persons=n_persons,
+            n_items=0,
+        )
 
     if n_items is not None and n_cols != n_items:
         raise MirtDataError(
@@ -73,23 +85,51 @@ def validate_responses(
             n_items=n_cols,
         )
 
-    responses = responses.astype(np.int_)
+    dtype_kind = responses.dtype.kind
+    if dtype_kind not in "biuf":
+        raise MirtDataError(
+            "response data must be numeric",
+            n_persons=n_persons,
+            n_items=n_cols,
+        )
 
-    if not allow_missing:
-        if np.any(responses < 0):
+    if dtype_kind == "f":
+        if not np.all(np.isfinite(responses)):
+            raise MirtDataError(
+                "finite response codes are required; values must be finite integer values",
+                n_persons=n_persons,
+                n_items=n_cols,
+            )
+        if not np.all(responses == np.trunc(responses)):
+            raise MirtDataError(
+                "integer response codes are required; values must be integer-valued response codes",
+                n_persons=n_persons,
+                n_items=n_cols,
+            )
+
+    int_bounds = np.iinfo(np.int_)
+    if dtype_kind in "fu" and (
+        np.any(responses < int_bounds.min) or np.any(responses > int_bounds.max)
+    ):
+        raise MirtDataError(
+            "response codes exceed the supported integer range",
+            n_persons=n_persons,
+            n_items=n_cols,
+        )
+
+    responses = responses.astype(np.int_, copy=False)
+
+    missing_mask = responses < 0
+    if np.any(missing_mask):
+        if not allow_missing:
             raise MirtDataError(
                 "responses contains negative values (missing data not allowed)",
                 n_persons=n_persons,
                 n_items=n_cols,
             )
-
-    valid_mask = responses != missing_code
-    if np.any(responses[valid_mask] < 0):
-        raise MirtDataError(
-            f"responses contains negative values other than missing code ({missing_code})",
-            n_persons=n_persons,
-            n_items=n_cols,
-        )
+        if np.any(responses[missing_mask] != missing_code):
+            responses = responses.copy()
+            responses[missing_mask] = missing_code
 
     return responses
 
