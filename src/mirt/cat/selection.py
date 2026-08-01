@@ -57,6 +57,8 @@ class ItemSelectionStrategy(ABC):
         model: BaseItemModel,
         theta: float,
         available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
     ) -> dict[int, float]:
         """Get selection criterion values for all available items.
 
@@ -68,6 +70,10 @@ class ItemSelectionStrategy(ABC):
             Current ability estimate.
         available_items : set[int]
             Set of available item indices.
+        administered_items : list[int] | None
+            List of already administered item indices.
+        responses : list[int] | None
+            Responses to the administered items.
 
         Returns
         -------
@@ -164,6 +170,8 @@ class MaxExpectedInformation(ItemSelectionStrategy):
     ----------
     n_quadpts : int, optional
         Number of quadrature points for integration. Default is 21.
+    theta_bounds : tuple[float, float], optional
+        Bounds for posterior integration. Default is (-4.0, 4.0).
 
     References
     ----------
@@ -171,8 +179,42 @@ class MaxExpectedInformation(ItemSelectionStrategy):
     for adaptive testing. Psychometrika, 63(2), 201-216.
     """
 
-    def __init__(self, n_quadpts: int = 21):
-        self.n_quadpts = n_quadpts
+    def __init__(
+        self,
+        n_quadpts: int = 21,
+        theta_bounds: tuple[float, float] = (-4.0, 4.0),
+    ) -> None:
+        if (
+            isinstance(n_quadpts, bool)
+            or not isinstance(n_quadpts, (int, np.integer))
+            or n_quadpts < 5
+        ):
+            raise ValueError("n_quadpts must be an integer of at least 5")
+
+        try:
+            lower, upper = theta_bounds
+            lower = float(lower)
+            upper = float(upper)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("theta_bounds must contain two finite values") from exc
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            raise ValueError(
+                "theta_bounds must contain finite values with lower < upper"
+            )
+
+        self.n_quadpts = int(n_quadpts)
+        self.theta_bounds = (lower, upper)
+
+        raw_nodes, raw_weights = np.polynomial.legendre.leggauss(self.n_quadpts)
+        half_width = (upper - lower) / 2.0
+        midpoint = (upper + lower) / 2.0
+        self._theta_nodes = midpoint + half_width * raw_nodes
+        integration_weights = half_width * raw_weights
+        self._log_prior_mass = (
+            np.log(integration_weights)
+            - 0.5 * np.square(self._theta_nodes)
+            - 0.5 * np.log(2.0 * np.pi)
+        )
 
     def select_item(
         self,
@@ -185,30 +227,183 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         if not available_items:
             raise ValueError("No available items to select from")
 
-        theta_arr = np.array([[theta]])
-        best_item = -1
-        best_expected_info = -np.inf
+        criteria = self.get_item_criteria(
+            model,
+            theta,
+            available_items,
+            administered_items=administered_items,
+            responses=responses,
+        )
+        return max(criteria, key=criteria.__getitem__)
 
-        for item_idx in available_items:
-            expected_info = self._compute_expected_information(
-                model, theta_arr, item_idx
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Compute history-aware expected information for available items."""
+        if model.n_factors != 1:
+            raise ValueError("MEI only supports unidimensional models")
+        if not np.isfinite(theta):
+            raise ValueError("theta must be finite")
+
+        administered, observed_responses = self._validate_history(
+            model, administered_items, responses
+        )
+        history_log_mass = self._history_log_mass(
+            model, administered, observed_responses
+        )
+        return {
+            item_idx: self._compute_expected_information(
+                model,
+                theta,
+                item_idx,
+                administered,
+                history_log_mass,
+            )
+            for item_idx in available_items
+        }
+
+    @staticmethod
+    def _validate_history(
+        model: BaseItemModel,
+        administered_items: list[int] | None,
+        responses: list[int] | None,
+    ) -> tuple[list[int], list[int]]:
+        if administered_items is None and responses is None:
+            return [], []
+        if administered_items is None and responses is not None and len(responses) == 0:
+            return [], []
+        if (
+            responses is None
+            and administered_items is not None
+            and len(administered_items) == 0
+        ):
+            return [], []
+        if administered_items is None or responses is None:
+            raise ValueError(
+                "administered_items and responses must be provided together"
             )
 
-            if expected_info > best_expected_info:
-                best_expected_info = expected_info
-                best_item = item_idx
+        administered = list(administered_items)
+        observed_responses = list(responses)
+        if len(administered) != len(observed_responses):
+            raise ValueError("administered_items and responses must have equal length")
 
-        return best_item
+        normalized_items: list[int] = []
+        normalized_responses: list[int] = []
+        for item_idx, response in zip(administered, observed_responses, strict=True):
+            if isinstance(item_idx, bool) or not isinstance(
+                item_idx, (int, np.integer)
+            ):
+                raise ValueError("administered item indices must be integers")
+            item_idx = int(item_idx)
+            if item_idx < 0 or item_idx >= model.n_items:
+                raise ValueError(f"administered item {item_idx} is out of range")
+            if isinstance(response, bool) or not isinstance(
+                response, (int, np.integer)
+            ):
+                raise ValueError("each response must be an integer category")
+            response = int(response)
+            n_categories = model._n_categories[item_idx] if model.is_polytomous else 2
+            if response < 0 or response >= n_categories:
+                raise ValueError(
+                    f"response {response} is outside the category range for item {item_idx}"
+                )
+            normalized_items.append(item_idx)
+            normalized_responses.append(response)
+
+        if len(set(normalized_items)) != len(normalized_items):
+            raise ValueError("administered_items must not contain duplicates")
+        return normalized_items, normalized_responses
+
+    def _history_log_mass(
+        self,
+        model: BaseItemModel,
+        administered_items: list[int],
+        responses: list[int],
+    ) -> NDArray[np.float64]:
+        if not administered_items:
+            return self._log_prior_mass.copy()
+
+        response_matrix = np.full((1, model.n_items), -1, dtype=np.int_)
+        response_matrix[0, administered_items] = responses
+        log_likelihood = np.asarray(
+            model.log_likelihood_batch(
+                response_matrix,
+                self._theta_nodes[:, None],
+            ),
+            dtype=np.float64,
+        ).ravel()
+        return log_likelihood + self._log_prior_mass
 
     def _compute_expected_information(
         self,
         model: BaseItemModel,
-        theta: NDArray[np.float64],
+        theta: float,
         item_idx: int,
+        administered_items: list[int],
+        history_log_mass: NDArray[np.float64],
     ) -> float:
-        """Compute expected information for an item."""
-        info = model.information(theta, item_idx=item_idx)
-        return float(info.sum())
+        """Compute information after each hypothetical response to an item."""
+        current_probabilities = self._response_probabilities(model, theta, item_idx)
+        node_probabilities = self._node_response_probabilities(model, item_idx)
+        clipped_probabilities = np.clip(
+            node_probabilities,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+
+        log_mass = history_log_mass[:, None] + np.log(clipped_probabilities)
+        log_mass -= np.max(log_mass, axis=0, keepdims=True)
+        posterior_mass = np.exp(log_mass)
+        posterior_mass /= posterior_mass.sum(axis=0, keepdims=True)
+        hypothetical_theta = posterior_mass.T @ self._theta_nodes
+
+        theta_values = hypothetical_theta[:, None]
+        test_information = np.zeros(len(current_probabilities), dtype=np.float64)
+        for provisional_item in (*administered_items, item_idx):
+            information = np.asarray(
+                model.information(theta_values, item_idx=provisional_item),
+                dtype=np.float64,
+            )
+            test_information += information.reshape(len(current_probabilities), -1).sum(
+                axis=1
+            )
+
+        return float(current_probabilities @ test_information)
+
+    @staticmethod
+    def _response_probabilities(
+        model: BaseItemModel,
+        theta: float,
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        probabilities = np.asarray(
+            model.probability(np.array([[theta]]), item_idx=item_idx),
+            dtype=np.float64,
+        ).ravel()
+        if model.is_polytomous:
+            return probabilities
+        probability_correct = probabilities[0]
+        return np.array([1.0 - probability_correct, probability_correct])
+
+    def _node_response_probabilities(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        probabilities = np.asarray(
+            model.probability(self._theta_nodes[:, None], item_idx=item_idx),
+            dtype=np.float64,
+        )
+        if model.is_polytomous:
+            return probabilities.reshape(self.n_quadpts, -1)
+        probability_correct = probabilities.ravel()
+        return np.column_stack((1.0 - probability_correct, probability_correct))
 
     def _compute_criterion(
         self,
@@ -216,7 +411,14 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        return self._compute_expected_information(model, theta, item_idx)
+        history_log_mass = self._history_log_mass(model, [], [])
+        return self._compute_expected_information(
+            model,
+            float(theta[0, 0]),
+            item_idx,
+            [],
+            history_log_mass,
+        )
 
 
 class KullbackLeibler(ItemSelectionStrategy):

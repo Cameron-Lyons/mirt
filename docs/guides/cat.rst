@@ -30,9 +30,15 @@ Item selection
 Common strategies (pass a string or strategy object):
 
 * ``"MFI"`` — maximum Fisher information
-* ``"MEI"`` — maximum expected information
+* ``"MEI"`` — maximum expected information under the bounded posterior
 * ``"KL"`` — Kullback–Leibler
 * ``"random"`` / ``"a_stratified"`` / ``"urry"``
+
+MEI uses the complete response history to evaluate the posterior ability after
+every possible response to each candidate item. The engine's ``n_quadpts`` and
+``theta_bounds`` settings control this integration. This makes MEI sensitive to
+posterior uncertainty and allows it to choose differently from point-estimate
+MFI selection.
 
 Stopping rules
 --------------

@@ -128,7 +128,15 @@ class CATEngine:
         self.initial_theta = initial_theta
 
         if isinstance(item_selection, str):
-            self._selection = create_selection_strategy(item_selection)
+            selection_kwargs: dict[str, Any] = {}
+            if item_selection.upper() == "MEI":
+                selection_kwargs = {
+                    "n_quadpts": n_quadpts,
+                    "theta_bounds": theta_bounds,
+                }
+            self._selection = create_selection_strategy(
+                item_selection, **selection_kwargs
+            )
         else:
             self._selection = item_selection
 
@@ -227,7 +235,11 @@ class CATEngine:
 
         if isinstance(self._exposure, Randomesque):
             criteria = self._selection.get_item_criteria(
-                self.model, self._current_theta, exposure_eligible
+                self.model,
+                self._current_theta,
+                exposure_eligible,
+                administered_items=self._items_administered,
+                responses=self._responses,
             )
             ranked = sorted(criteria.items(), key=lambda x: x[1], reverse=True)
             return self._exposure.select_from_ranked(ranked)
