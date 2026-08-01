@@ -234,10 +234,11 @@ def fit_mirt(
     )
     from mirt.typing import EstimationMethod
 
-    data = np.asarray(data)
+    supported_models = ("1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM")
+    if model not in supported_models:
+        raise MirtModelError(f"Unknown model: {model}", model_type=str(model))
 
-    if data.ndim != 2:
-        raise MirtDataError(f"data must be 2D, got {data.ndim}D")
+    data = validate_responses(data)
 
     n_persons, n_items = data.shape
 
@@ -248,7 +249,14 @@ def fit_mirt(
 
     if is_polytomous:
         if n_categories is None:
-            n_categories = int(data[data >= 0].max()) + 1
+            observed = data[data >= 0]
+            if observed.size == 0:
+                raise MirtValidationError(
+                    "n_categories is required when all responses are missing",
+                    parameter="n_categories",
+                    expected=">= 2",
+                )
+            n_categories = int(observed.max()) + 1
         if n_categories < 2:
             raise MirtValidationError(
                 "n_categories must be at least 2",
@@ -256,6 +264,18 @@ def fit_mirt(
                 value=n_categories,
                 expected=">= 2",
             )
+        if np.any(data[data >= 0] >= n_categories):
+            raise MirtDataError(
+                "polytomous response codes must be below n_categories",
+                n_persons=n_persons,
+                n_items=n_items,
+            )
+    elif np.any(data[data >= 0] > 1):
+        raise MirtDataError(
+            "dichotomous responses must be coded as 0 or 1",
+            n_persons=n_persons,
+            n_items=n_items,
+        )
 
     estimation_method: EstimationMethod = estimation
 
@@ -356,9 +376,6 @@ def fit_mirt(
             n_factors=n_factors,
             item_names=item_names,
         )
-    else:
-        raise MirtModelError(f"Unknown model: {model}", model_type=str(model))
-
     if estimation_method == "EM":
         estimator = EMEstimator(
             n_quadpts=n_quadpts,
