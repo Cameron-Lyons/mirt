@@ -1,135 +1,17 @@
-import importlib
-from typing import Any, Literal
+from __future__ import annotations
 
-import numpy as np
-from numpy.typing import NDArray
+import importlib
+from typing import TYPE_CHECKING, Any, Literal
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
-from mirt._backend_config import (
-    get_backend,
-    get_backend_info,
-    set_backend,
-    should_use_rust,
-)
-from mirt._gpu_backend import (
-    GPU_AVAILABLE,
-    get_gpu_device_name,
-    get_gpu_memory_info,
-    is_gpu_available,
-    is_torch_available,
-)
-from mirt._rust_backend import RUST_AVAILABLE, is_rust_available
 from mirt._version import __version__
-from mirt.cat import CATEngine, CATResult, CATState
-from mirt.estimation.bl import BLEstimator
-from mirt.estimation.em import EMEstimator
-from mirt.estimation.latent_density import EmpiricalHistogramWoods
-from mirt.estimation.mcmc import GibbsSampler, MCMCResult, MHRMEstimator
-from mirt.estimation.mixed import LLTM, MixedEffectsFitResult, MixedEffectsIRT
-from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.estimation.se_methods import SEMethod, compute_se
-from mirt.exceptions import (
-    MirtConvergenceError,
-    MirtDataError,
-    MirtError,
-    MirtEstimationError,
-    MirtModelError,
-    MirtValidationError,
-)
-from mirt.models.base import BaseItemModel
-from mirt.models.bifactor import BifactorModel
-from mirt.models.cdm import DINA, DINO, BaseCDM, fit_cdm
-from mirt.models.custom import (
-    CustomGroupModel,
-    CustomItemModel,
-    GroupSpec,
-    ItemTypeSpec,
-    create_item_type,
-    createGroup,
-    get_standard_item_type,
-    list_standard_item_types,
-)
-from mirt.models.dichotomous import (
-    FourParameterLogistic,
-    OneParameterLogistic,
-    Rasch,
-    ThreeParameterLogistic,
-    ThreeParameterLogisticUpper,
-    TwoParameterLogistic,
-    UnipolarLogLogistic,
-)
-from mirt.models.mixture import MixtureIRT, fit_mixture_irt
-from mirt.models.multidimensional import MultidimensionalModel
-from mirt.models.polytomous import (
-    GeneralizedPartialCredit,
-    GradedRatingScaleModel,
-    GradedResponseModel,
-    NominalResponseModel,
-    PartialCreditModel,
-)
-from mirt.models.testlet import TestletModel, create_testlet_structure
-from mirt.models.unfolding import (
-    GeneralizedGradedUnfolding,
-    HyperbolicCosineModel,
-    IdealPointModel,
-)
-from mirt.models.zeroinflated import HurdleIRT, ZeroInflated2PL, ZeroInflated3PL
-from mirt.results.fit_result import FitResult
-from mirt.results.score_result import ScoreResult
-from mirt.scoring import fscores
-from mirt.utils.batch import BatchFitResult, fit_models
-from mirt.utils.bootstrap import bootstrap_ci, bootstrap_se, parametric_bootstrap
-from mirt.utils.calibration import equate, fixed_calib
-from mirt.utils.classical import ItemStats, TraditionalStats, itemstats, traditional
-from mirt.utils.clinical import RCI, clinical_significance
-from mirt.utils.collapse import CollapsedData, collapse_patterns
-from mirt.utils.confidence import PLCI, score_CI
-from mirt.utils.cv import CVResult, KFold, LeaveOneOut, StratifiedKFold, cross_validate
-from mirt.utils.data import validate_responses
-from mirt.utils.dataframe import set_dataframe_backend
-from mirt.utils.datasets import list_datasets, load_dataset
-from mirt.utils.empirical import (
-    RMSD_DIF,
-    ItemGAMResult,
-    empirical_ES,
-    empirical_plot,
-    itemGAM,
-)
-from mirt.utils.extraction import coef, estfun, estfun_summary, extract_item, mod2values
-from mirt.utils.imputation import (
-    MIResult,
-    analyze_missing,
-    averageMI,
-    impute_responses,
-    listwise_deletion,
-)
-from mirt.utils.information import (
-    areainfo,
-    gen_difficulty,
-    iteminfo,
-    probtrace,
-    testinfo,
-)
-from mirt.utils.multidimensional import MDIFF, MDISC
-from mirt.utils.plausible import (
-    combine_plausible_values,
-    generate_plausible_values,
-    plausible_value_regression,
-    plausible_value_statistics,
-)
-from mirt.utils.predictions import fixef, randef
-from mirt.utils.reliability import empirical_rxx, marginal_rxx, sem
-from mirt.utils.residuals import Q3, residuals
-from mirt.utils.sampling import draw_parameters
-from mirt.utils.simulation import generate_item_parameters, simdata
-from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
-from mirt.utils.statistical_tests import lagrange, wald
-from mirt.utils.transform import (
-    expand_table,
-    key2binary,
-    poly2dich,
-    reverse_score,
-)
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+
+    from mirt.estimation.mcmc import MCMCResult
+    from mirt.results.fit_result import FitResult
 
 _HAS_PLOTTING = importlib.util.find_spec("matplotlib") is not None
 _HAS_REPORTS = _HAS_PLOTTING
@@ -227,12 +109,33 @@ def fit_mirt(
     >>> print(f"Log-likelihood: {result.log_likelihood:.2f}")
     >>> print(result.model.parameters)
     """
+    import numpy as np
+
+    from mirt._backend_config import should_use_rust
     from mirt._rust_backend import (
         compute_item_se_parallel,
         e_step_complete,
         em_fit_2pl,
     )
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+    from mirt.models.polytomous import (
+        GeneralizedPartialCredit,
+        GradedResponseModel,
+        NominalResponseModel,
+        PartialCreditModel,
+    )
+    from mirt.results.fit_result import FitResult
     from mirt.typing import EstimationMethod
+    from mirt.utils.data import validate_responses
 
     supported_models = ("1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM")
     if model not in supported_models:
@@ -413,6 +316,10 @@ def fit_mirt(
 
 def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
     """Adapt MCMCResult to FitResult for a uniform fit_mirt return type."""
+    import numpy as np
+
+    from mirt.results.fit_result import FitResult
+
     model = mcmc.model
     n_params = model.n_parameters
     standard_errors: dict[str, NDArray[np.float64]] = {}
@@ -553,6 +460,7 @@ def personfit(
     >>> print(f"Flagged {len(aberrant)} aberrant responders")
     """
     from mirt.diagnostics.personfit import compute_personfit
+    from mirt.scoring import fscores
     from mirt.utils.dataframe import create_dataframe
 
     if statistics is None:
