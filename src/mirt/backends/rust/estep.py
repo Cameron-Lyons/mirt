@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
@@ -52,12 +53,13 @@ def e_step_complete(
         responses, quad_points, discrimination, difficulty
     )
 
-    log_prior = (
-        -0.5 * np.log(2 * np.pi * prior_var)
-        - 0.5 * ((quad_points - prior_mean) ** 2) / prior_var
+    log_prior_mass = gaussian_log_quadrature_mass(
+        quad_points,
+        quad_weights,
+        np.array([prior_mean]),
+        np.array([[prior_var]]),
     )
-
-    log_joint = log_likes + log_prior[None, :] + np.log(quad_weights + 1e-300)[None, :]
+    log_joint = log_likes + log_prior_mass[None, :]
     log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
     log_posterior = log_joint - log_marginal
 

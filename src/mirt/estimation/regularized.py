@@ -381,8 +381,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
             log_likelihoods[:, q] = ll
 
-        log_prior = latent_density.log_density(quad_points)
-        log_joint = log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
+        log_prior_mass = latent_density.log_quadrature_mass(quad_points, quad_weights)
+        log_joint = log_likelihoods + log_prior_mass[None, :]
         log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
         log_posterior = log_joint - log_marginal
 

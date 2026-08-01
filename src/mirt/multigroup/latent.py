@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 
 if TYPE_CHECKING:
@@ -75,6 +76,16 @@ class GroupLatentDistribution:
         diff = theta - self.mean
         mahal = np.sum(diff @ self._precision * diff, axis=1)
         return self._log_norm - 0.5 * mahal
+
+    def log_quadrature_mass(
+        self,
+        theta: NDArray[np.float64],
+        quadrature_weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return normalized group-prior masses on standard-normal GH nodes."""
+        return gaussian_log_quadrature_mass(
+            theta, quadrature_weights, self.mean, self.cov
+        )
 
     @property
     def n_factors(self) -> int:
@@ -171,6 +182,19 @@ class MultigroupLatentDensity:
         if group_idx < 0 or group_idx >= self.n_groups:
             raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
         return self.distributions[group_idx].log_density(theta)
+
+    def log_quadrature_mass(
+        self,
+        theta: NDArray[np.float64],
+        quadrature_weights: NDArray[np.float64],
+        group_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return normalized prior masses for one group."""
+        if group_idx < 0 or group_idx >= self.n_groups:
+            raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
+        return self.distributions[group_idx].log_quadrature_mass(
+            theta, quadrature_weights
+        )
 
     def update(
         self,

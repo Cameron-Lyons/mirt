@@ -6,16 +6,15 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use crate::utils::{grm_category_probability, logsumexp};
+use crate::utils::{grm_category_probability, logsumexp, normalized_log_gaussian_adjustment};
 
-fn compute_log_prior(quad_points: &[f64], prior_mean: f64, prior_var: f64) -> Vec<f64> {
-    quad_points
-        .iter()
-        .map(|&theta| {
-            let diff = theta - prior_mean;
-            -0.5 * (2.0 * std::f64::consts::PI * prior_var).ln() - 0.5 * diff * diff / prior_var
-        })
-        .collect()
+fn compute_log_prior(
+    quad_points: &[f64],
+    quad_weights: &[f64],
+    prior_mean: f64,
+    prior_var: f64,
+) -> Vec<f64> {
+    normalized_log_gaussian_adjustment(quad_points, quad_weights, prior_mean, prior_var)
 }
 
 fn compute_log_quad_weights(quad_weights: &[f64]) -> Vec<f64> {
@@ -125,6 +124,7 @@ pub fn multigroup_e_step_2pl<'py>(
             let diff_vec = Arc::new(diff_arr.to_vec());
             let log_prior = Arc::new(compute_log_prior(
                 &quad_points,
+                &quad_weights,
                 prior_means[g],
                 prior_vars[g],
             ));
@@ -261,6 +261,7 @@ pub fn multigroup_e_step_3pl<'py>(
             let guess_vec = Arc::new(guess_arr.to_vec());
             let log_prior = Arc::new(compute_log_prior(
                 &quad_points,
+                &quad_weights,
                 prior_means[g],
                 prior_vars[g],
             ));
@@ -535,6 +536,7 @@ pub fn multigroup_e_step_grm<'py>(
             let n_cats_vec_arc = Arc::new(n_cats_vec);
             let log_prior = Arc::new(compute_log_prior(
                 &quad_points,
+                &quad_weights,
                 prior_means[g],
                 prior_vars[g],
             ));
@@ -785,6 +787,7 @@ pub fn multigroup_e_step_gpcm<'py>(
             let n_cats_vec_arc = Arc::new(n_cats_vec);
             let log_prior = Arc::new(compute_log_prior(
                 &quad_points,
+                &quad_weights,
                 prior_means[g],
                 prior_vars[g],
             ));
@@ -968,6 +971,7 @@ pub fn multigroup_e_step_nrm<'py>(
             let n_cats_vec_arc = Arc::new(n_cats_vec);
             let log_prior = Arc::new(compute_log_prior(
                 &quad_points,
+                &quad_weights,
                 prior_means[g],
                 prior_vars[g],
             ));

@@ -151,8 +151,7 @@ def cat_eap_update(
                     ll += np.log(1 - p)
         log_likes[q] = ll
 
-    log_prior = -0.5 * quad_points**2 - 0.5 * np.log(2 * np.pi)
-    log_posterior = log_likes + log_prior + np.log(quad_weights + 1e-300)
+    log_posterior = log_likes + np.log(quad_weights + 1e-300)
 
     log_norm = np.max(log_posterior) + np.log(
         np.sum(np.exp(log_posterior - np.max(log_posterior)))

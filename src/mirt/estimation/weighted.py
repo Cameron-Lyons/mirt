@@ -19,6 +19,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -199,9 +200,11 @@ class WeightedEMEstimator(EMEstimator):
             theta_q = np.tile(quad_points[q], (n_persons, 1))
             log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
 
-        log_prior = self._log_multivariate_normal(quad_points, prior_mean, prior_cov)
+        log_prior_mass = gaussian_log_quadrature_mass(
+            quad_points, quad_weights, prior_mean, prior_cov
+        )
 
-        log_joint = log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
+        log_joint = log_likelihoods + log_prior_mass[None, :]
 
         log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
         log_posterior = log_joint - log_marginal

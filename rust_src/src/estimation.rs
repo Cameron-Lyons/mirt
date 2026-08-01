@@ -69,7 +69,10 @@ pub fn em_fit_2pl<'py>(
             n_quadpts,
         );
 
-        let current_ll: f64 = marginal_ll.iter().map(|&x| (x + EPSILON).ln()).sum();
+        let current_ll: f64 = marginal_ll
+            .iter()
+            .map(|&value| value.max(f64::MIN_POSITIVE).ln())
+            .sum();
 
         if (current_ll - prev_ll).abs() < tol {
             converged = true;
@@ -89,13 +92,28 @@ pub fn em_fit_2pl<'py>(
         );
     }
 
+    let (_, final_marginal) = e_step_2pl_internal(
+        &responses,
+        &quad_points,
+        &quad_weights,
+        &discrimination,
+        &difficulty,
+        n_persons,
+        n_items,
+        n_quadpts,
+    );
+    let final_log_likelihood = final_marginal
+        .iter()
+        .map(|&value| value.max(f64::MIN_POSITIVE).ln())
+        .sum();
+
     let disc_arr: Array1<f64> = discrimination.into();
     let diff_arr: Array1<f64> = difficulty.into();
 
     (
         disc_arr.to_pyarray(py),
         diff_arr.to_pyarray(py),
-        prev_ll,
+        final_log_likelihood,
         iteration,
         converged,
     )
@@ -635,6 +653,7 @@ pub fn bootstrap_fit_2pl<'py>(
     let responses = responses.as_array();
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
+    let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
 
     let results: Vec<(Vec<f64>, Vec<f64>)> = (0..n_bootstrap)
         .into_par_iter()
@@ -652,7 +671,6 @@ pub fn bootstrap_fit_2pl<'py>(
                 }
             }
 
-            let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
             let mut discrimination: Vec<f64> = vec![1.0; n_items];
             let mut difficulty: Vec<f64> = vec![0.0; n_items];
 
@@ -686,7 +704,10 @@ pub fn bootstrap_fit_2pl<'py>(
                     n_quadpts,
                 );
 
-                let current_ll: f64 = marginal_ll.iter().map(|&x| (x + EPSILON).ln()).sum();
+                let current_ll: f64 = marginal_ll
+                    .iter()
+                    .map(|&value| value.max(f64::MIN_POSITIVE).ln())
+                    .sum();
 
                 if (current_ll - prev_ll).abs() < tol {
                     break;
@@ -761,13 +782,12 @@ pub fn em_iteration_2pl<'py>(
 
     let log_weights = compute_log_weights(&quad_weights);
 
-    let log_prior: Vec<f64> = quad_points
-        .iter()
-        .map(|&theta| {
-            let z = (theta - prior_mean) / prior_var.sqrt();
-            -0.5 * (std::f64::consts::TAU * prior_var).ln() - 0.5 * z * z
-        })
-        .collect();
+    let log_prior_adjustment = crate::utils::normalized_log_gaussian_adjustment(
+        &quad_points,
+        &quad_weights,
+        prior_mean,
+        prior_var,
+    );
 
     let e_step_results: Vec<(Vec<f64>, f64)> = (0..n_persons)
         .into_par_iter()
@@ -791,7 +811,7 @@ pub fn em_iteration_2pl<'py>(
                     }
                 }
 
-                log_joint[q] = ll + log_prior[q] + log_weights[q];
+                log_joint[q] = ll + log_prior_adjustment[q] + log_weights[q];
             }
 
             let log_marginal = logsumexp(&log_joint);
@@ -949,13 +969,12 @@ pub fn em_iteration_3pl<'py>(
 
     let log_weights = compute_log_weights(&quad_weights);
 
-    let log_prior: Vec<f64> = quad_points
-        .iter()
-        .map(|&theta| {
-            let z = (theta - prior_mean) / prior_var.sqrt();
-            -0.5 * (std::f64::consts::TAU * prior_var).ln() - 0.5 * z * z
-        })
-        .collect();
+    let log_prior_adjustment = crate::utils::normalized_log_gaussian_adjustment(
+        &quad_points,
+        &quad_weights,
+        prior_mean,
+        prior_var,
+    );
 
     let e_step_results: Vec<(Vec<f64>, f64)> = (0..n_persons)
         .into_par_iter()
@@ -982,7 +1001,7 @@ pub fn em_iteration_3pl<'py>(
                     }
                 }
 
-                log_joint[q] = ll + log_prior[q] + log_weights[q];
+                log_joint[q] = ll + log_prior_adjustment[q] + log_weights[q];
             }
 
             let log_marginal = logsumexp(&log_joint);

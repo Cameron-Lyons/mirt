@@ -232,11 +232,10 @@ class MultigroupEMEstimator:
                         group_responses, theta_q
                     )
 
-            log_prior = self._latent_density.log_density(quad_points, g)
-
-            log_joint = (
-                log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
+            log_prior_mass = self._latent_density.log_quadrature_mass(
+                quad_points, quad_weights, g
             )
+            log_joint = log_likelihoods + log_prior_mass[None, :]
 
             log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
             log_posterior = log_joint - log_marginal
@@ -511,10 +510,10 @@ class MultigroupEMEstimator:
                         group_responses, theta_q
                     )
 
-            log_prior = self._latent_density.log_density(quad_points, g)
-            log_joint = (
-                log_likelihoods + log_prior[None, :] + np.log(quad_weights)[None, :]
+            log_prior_mass = self._latent_density.log_quadrature_mass(
+                quad_points, quad_weights, g
             )
+            log_joint = log_likelihoods + log_prior_mass[None, :]
             log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
             log_posterior = log_joint - log_marginal
 

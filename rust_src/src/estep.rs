@@ -6,7 +6,9 @@ use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::sync::Arc;
 
-use crate::utils::{LOG_2_PI, compute_log_weights, log_likelihood_2pl_view, logsumexp};
+use crate::utils::{
+    compute_log_weights, log_likelihood_2pl_view, logsumexp, normalized_log_gaussian_adjustment,
+};
 
 /// Complete E-step computation with posterior weights
 #[pyfunction]
@@ -37,15 +39,9 @@ pub fn e_step_complete<'py>(
     let weight_vec: Vec<f64> = quad_weights.to_vec();
     let responses_owned = responses.to_owned();
 
-    let log_prior: Vec<f64> = quad_vec
-        .iter()
-        .map(|&theta| {
-            let z = (theta - prior_mean) / prior_var.sqrt();
-            -0.5 * (LOG_2_PI + prior_var.ln() + z * z)
-        })
-        .collect();
-
     let log_weights = compute_log_weights(&weight_vec);
+    let log_prior_adjustment =
+        normalized_log_gaussian_adjustment(&quad_vec, &weight_vec, prior_mean, prior_var);
 
     let (posterior_weights, marginal_ll) = py.detach(|| {
         let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
@@ -58,7 +54,7 @@ pub fn e_step_complete<'py>(
                 let log_joint: Vec<f64> = (0..n_quad)
                     .map(|q| {
                         let ll = log_likelihood_2pl_view(resp_row, quad_vec[q], &disc, &diff);
-                        ll + log_prior[q] + log_weights[q]
+                        ll + log_prior_adjustment[q] + log_weights[q]
                     })
                     .collect();
 

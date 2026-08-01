@@ -17,6 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt._prior_mass import log_density_quadrature_mass, normalize_log_mass
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 
 if TYPE_CHECKING:
@@ -45,6 +46,27 @@ class LatentDensity(ABC):
     def density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute density at theta points."""
         return np.exp(self.log_density(theta))
+
+    def log_quadrature_mass(
+        self,
+        theta: NDArray[np.float64],
+        quadrature_weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return normalized prior masses on standard-normal GH nodes.
+
+        ``GaussHermiteQuadrature`` weights already integrate against a
+        standard-normal reference measure. A target density therefore enters
+        through its density ratio to that reference, not as an additional
+        density factor.
+        """
+        points = np.asarray(theta, dtype=np.float64)
+        if points.ndim == 1:
+            points = points[:, None]
+        return log_density_quadrature_mass(
+            points,
+            quadrature_weights,
+            self.log_density(points),
+        )
 
     @abstractmethod
     def update(
@@ -195,6 +217,16 @@ class EmpiricalHistogram(LatentDensity):
             raise ValueError("Histogram not initialized. Call update() first.")
         return np.log(np.clip(self._probs, 1e-300, None))
 
+    def log_quadrature_mass(
+        self,
+        theta: NDArray[np.float64],
+        quadrature_weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return the histogram's discrete masses without GH reweighting."""
+        weights = np.asarray(quadrature_weights, dtype=np.float64).reshape(-1)
+        self._initialize(len(weights))
+        return normalize_log_mass(self.log_density(theta))
+
     def update(
         self,
         theta_points: NDArray[np.float64],
@@ -309,6 +341,16 @@ class EmpiricalHistogramWoods(LatentDensity):
         if self._probs is None:
             raise ValueError("Histogram not initialized. Call update() first.")
         return np.log(np.clip(self._probs, 1e-300, None))
+
+    def log_quadrature_mass(
+        self,
+        theta: NDArray[np.float64],
+        quadrature_weights: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return the histogram's discrete masses without GH reweighting."""
+        weights = np.asarray(quadrature_weights, dtype=np.float64).reshape(-1)
+        self._initialize(len(weights), np.asarray(theta))
+        return normalize_log_mass(self.log_density(theta))
 
     def update(
         self,
