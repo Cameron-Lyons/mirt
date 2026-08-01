@@ -23,9 +23,11 @@ def _run_probe(source: str) -> dict[str, object]:
 def test_plain_import_defers_heavy_dependencies_and_subpackages() -> None:
     loaded = _run_probe(
         """
+        import importlib
         import json
         import sys
 
+        importlib.__dict__.pop("util", None)
         import mirt
 
         deferred = (

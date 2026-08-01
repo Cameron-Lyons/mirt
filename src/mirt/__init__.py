@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, Literal
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from mirt.estimation.mcmc import MCMCResult
     from mirt.results.fit_result import FitResult
 
-_HAS_PLOTTING = importlib.util.find_spec("matplotlib") is not None
+_HAS_PLOTTING = find_spec("matplotlib") is not None
 _HAS_REPORTS = _HAS_PLOTTING
 
 
