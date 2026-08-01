@@ -41,8 +41,21 @@ def lord_wingersky_recursion(
         Log probability distribution, shape (max_score + 1, n_quad).
         Returns None if Rust backend not available.
     """
+    theta = np.asarray(theta, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
+    if theta.ndim != 1:
+        raise ValueError(f"theta must be 1D, got {theta.ndim}D")
+    if discrimination.ndim != 1 or difficulty.ndim != 1:
+        raise ValueError("discrimination and difficulty must be 1D")
+    if discrimination.shape != difficulty.shape:
+        raise ValueError(
+            "discrimination and difficulty must have equal lengths, "
+            f"got {len(discrimination)} and {len(difficulty)}"
+        )
+
     if rust_enabled():
-        return mirt_rs.lord_wingersky_recursion(
+        return mirt_rs.eapsum_lord_wingersky_recursion(
             _ensure_f64(theta),
             _ensure_f64(discrimination),
             _ensure_f64(difficulty),
