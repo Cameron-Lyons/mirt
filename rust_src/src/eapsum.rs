@@ -2,6 +2,7 @@
 
 use ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::utils::{EPSILON, compute_eap_with_se, log_sigmoid, logsumexp, normalize_log_posterior};
@@ -12,15 +13,23 @@ use crate::utils::{EPSILON, compute_eap_with_se, log_sigmoid, logsumexp, normali
 /// For dichotomous items, computes P(sum_score = s | theta) for all s and theta.
 /// Returns log probabilities for numerical stability.
 #[pyfunction]
-pub fn lord_wingersky_recursion<'py>(
+pub fn eapsum_lord_wingersky_recursion<'py>(
     py: Python<'py>,
     theta: PyReadonlyArray1<'py, f64>,
     discrimination: PyReadonlyArray1<'py, f64>,
     difficulty: PyReadonlyArray1<'py, f64>,
-) -> Bound<'py, PyArray2<f64>> {
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let theta = theta.as_array();
     let discrimination = discrimination.as_array();
     let difficulty = difficulty.as_array();
+
+    if discrimination.len() != difficulty.len() {
+        return Err(PyValueError::new_err(format!(
+            "discrimination and difficulty must have equal lengths, got {} and {}",
+            discrimination.len(),
+            difficulty.len()
+        )));
+    }
 
     let n_quad = theta.len();
     let n_items = discrimination.len();
@@ -69,7 +78,7 @@ pub fn lord_wingersky_recursion<'py>(
         log_dist = new_log_dist;
     }
 
-    log_dist.to_pyarray(py)
+    Ok(log_dist.to_pyarray(py))
 }
 
 /// Lord-Wingersky recursion for polytomous items (GRM/GPCM).
@@ -174,7 +183,7 @@ pub fn eapsum_from_distribution<'py>(
 
 /// Register EAPsum functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(lord_wingersky_recursion, m)?)?;
+    m.add_function(wrap_pyfunction!(eapsum_lord_wingersky_recursion, m)?)?;
     m.add_function(wrap_pyfunction!(lord_wingersky_polytomous, m)?)?;
     m.add_function(wrap_pyfunction!(eapsum_from_distribution, m)?)?;
     Ok(())
