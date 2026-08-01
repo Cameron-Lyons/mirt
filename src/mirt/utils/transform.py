@@ -65,7 +65,7 @@ def key2binary(
 
 def poly2dich(
     responses: NDArray[np.float64],
-    cutoff: int | float | list[int] | list[float] | None = None,
+    cutoff: int | float | list[int] | list[float] | NDArray | None = None,
     method: str = "threshold",
 ) -> NDArray[np.float64]:
     """Convert polytomous responses to dichotomous.
@@ -75,10 +75,11 @@ def poly2dich(
     responses : NDArray[np.float64]
         Polytomous response matrix. Shape: (n_persons, n_items).
         Values should be 0, 1, 2, ..., n_categories-1.
-    cutoff : int or list of int, optional
+    cutoff : scalar or array-like, optional
         Threshold for dichotomization. Responses >= cutoff become 1.
         If None, uses median split for each item.
-        If list, specifies cutoff per item.
+        A scalar applies to every item; an array-like value must provide one
+        cutoff per item. Only used when ``method="threshold"``.
     method : str
         Dichotomization method:
         - "threshold": Simple threshold at cutoff
@@ -101,45 +102,60 @@ def poly2dich(
      [1. 0. 1.]]
     """
     responses = np.asarray(responses, dtype=np.float64)
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
+
     n_persons, n_items = responses.shape
+    if n_persons == 0 or n_items == 0:
+        raise ValueError("responses must contain at least one person and one item")
+    if np.any(np.isinf(responses)):
+        raise ValueError("responses must contain finite values or NaN")
 
-    if method == "threshold":
-        if cutoff is None:
-            cutoff = [np.nanmedian(responses[:, j]) for j in range(n_items)]
-        elif isinstance(cutoff, int):
-            cutoff = [cutoff] * n_items
+    if method in ("threshold", "median"):
+        if method == "median" or cutoff is None:
+            cutoff_values = np.nanmedian(responses, axis=0)
+        else:
+            try:
+                cutoff_values = np.asarray(cutoff, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("cutoff must contain numeric values") from exc
 
-        binary = np.zeros((n_persons, n_items), dtype=np.float64)
-        for j in range(n_items):
-            mask = ~np.isnan(responses[:, j])
-            binary[mask, j] = (responses[mask, j] >= cutoff[j]).astype(float)
-            binary[~mask, j] = np.nan
+            if cutoff_values.ndim == 0:
+                cutoff_values = np.full(n_items, cutoff_values.item())
+            elif cutoff_values.shape != (n_items,):
+                raise ValueError(
+                    f"cutoff must be a scalar or one value per item; expected {n_items}"
+                )
+            if not np.all(np.isfinite(cutoff_values)):
+                raise ValueError("cutoff must contain only finite values")
 
-    elif method == "median":
-        binary = np.zeros((n_persons, n_items), dtype=np.float64)
-        for j in range(n_items):
-            median = np.nanmedian(responses[:, j])
-            mask = ~np.isnan(responses[:, j])
-            binary[mask, j] = (responses[mask, j] >= median).astype(float)
-            binary[~mask, j] = np.nan
+        binary = np.empty((n_persons, n_items), dtype=np.float64)
+        np.greater_equal(responses, cutoff_values, out=binary)
+        binary[np.isnan(responses)] = np.nan
+        return binary
 
-    elif method == "adjacent":
-        n_categories = int(np.nanmax(responses)) + 1
-        n_new_items = n_items * (n_categories - 1)
-        binary = np.zeros((n_persons, n_new_items), dtype=np.float64)
+    if method == "adjacent":
+        observed = responses[~np.isnan(responses)]
+        if observed.size == 0:
+            raise ValueError(
+                "adjacent conversion requires at least one observed response"
+            )
+        if np.any(observed < 0) or np.any(observed != np.trunc(observed)):
+            raise ValueError(
+                "adjacent conversion requires non-negative integer category codes"
+            )
 
-        idx = 0
-        for j in range(n_items):
-            for k in range(1, n_categories):
-                mask = ~np.isnan(responses[:, j])
-                binary[mask, idx] = (responses[mask, j] >= k).astype(float)
-                binary[~mask, idx] = np.nan
-                idx += 1
+        n_categories = int(observed.max()) + 1
+        if n_categories < 2:
+            raise ValueError("adjacent conversion requires at least two categories")
 
-    else:
-        raise ValueError(f"Unknown method: {method}")
+        thresholds = np.arange(1, n_categories, dtype=np.float64)
+        expanded = np.empty((n_persons, n_items, n_categories - 1), dtype=np.float64)
+        np.greater_equal(responses[:, :, None], thresholds, out=expanded)
+        expanded[np.isnan(responses)] = np.nan
+        return expanded.reshape(n_persons, -1)
 
-    return binary
+    raise ValueError(f"Unknown method: {method}")
 
 
 def reverse_score(
