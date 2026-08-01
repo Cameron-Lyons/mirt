@@ -7,8 +7,7 @@ use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{
-    LOG_2_PI, compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior,
-    sigmoid,
+    compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior, sigmoid,
 };
 
 /// Item parameters for 2PL model
@@ -136,10 +135,7 @@ pub fn cat_eap_update<'py>(
     }
 
     let log_posterior: Vec<f64> = (0..n_quad)
-        .map(|q| {
-            let log_prior = -0.5 * nodes[q] * nodes[q] - 0.5 * LOG_2_PI;
-            log_likes[q] + log_prior + weights[q].ln()
-        })
+        .map(|q| log_likes[q] + weights[q].ln())
         .collect();
 
     let posterior = normalize_log_posterior(&log_posterior);
@@ -224,10 +220,7 @@ fn cat_simulate_single(
         }
 
         let log_posterior: Vec<f64> = (0..n_quad)
-            .map(|q| {
-                let log_prior = -0.5 * quad.points[q] * quad.points[q];
-                log_likes[q] + log_prior + quad.weights[q].ln()
-            })
+            .map(|q| log_likes[q] + quad.weights[q].ln())
             .collect();
 
         let posterior = normalize_log_posterior(&log_posterior);

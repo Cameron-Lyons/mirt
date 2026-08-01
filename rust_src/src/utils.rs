@@ -220,10 +220,48 @@ pub fn compute_eap_with_se(posterior: &[f64], quad_points: &[f64]) -> (f64, f64)
     (theta_eap, variance.sqrt())
 }
 
-/// Compute log weights from weights with EPSILON protection
+/// Compute log weights without inflating small Gauss-Hermite masses.
 #[inline]
 pub fn compute_log_weights(weights: &[f64]) -> Vec<f64> {
-    weights.iter().map(|&w| (w + EPSILON).ln()).collect()
+    weights
+        .iter()
+        .map(|&w| w.max(f64::MIN_POSITIVE).ln())
+        .collect()
+}
+
+/// Density-ratio adjustment for normalized Gaussian masses on standard-normal GH nodes.
+pub fn normalized_log_gaussian_adjustment(
+    quad_points: &[f64],
+    quad_weights: &[f64],
+    prior_mean: f64,
+    prior_var: f64,
+) -> Vec<f64> {
+    assert_eq!(quad_points.len(), quad_weights.len());
+    assert!(prior_mean.is_finite());
+    assert!(prior_var.is_finite() && prior_var > 0.0);
+
+    let adjustment: Vec<f64> = quad_points
+        .iter()
+        .map(|&theta| {
+            let centered = theta - prior_mean;
+            let log_target = -0.5 * (LOG_2_PI + prior_var.ln() + centered * centered / prior_var);
+            let log_reference = -0.5 * (LOG_2_PI + theta * theta);
+            log_target - log_reference
+        })
+        .collect();
+    let log_weights = compute_log_weights(quad_weights);
+    let log_total = logsumexp(
+        &log_weights
+            .iter()
+            .zip(adjustment.iter())
+            .map(|(log_weight, correction)| log_weight + correction)
+            .collect::<Vec<_>>(),
+    );
+
+    adjustment
+        .into_iter()
+        .map(|correction| correction - log_total)
+        .collect()
 }
 
 /// Compute Fisher information for 2PL at a single theta
@@ -277,49 +315,61 @@ pub fn grm_category_probability(
 
 /// Gauss-Hermite quadrature nodes and weights
 pub fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
-    match n {
-        15 => {
-            let nodes = vec![
-                -4.49999, -3.66995, -2.96716, -2.32573, -1.71999, -1.13612, -0.56506, 0.0, 0.56506,
-                1.13612, 1.71999, 2.32573, 2.96716, 3.66995, 4.49999,
-            ];
-            let weights = vec![
-                1.5e-09, 1.5e-06, 3.9e-04, 0.00494, 0.03204, 0.11094, 0.21181, 0.22418, 0.21181,
-                0.11094, 0.03204, 0.00494, 3.9e-04, 1.5e-06, 1.5e-09,
-            ];
-            let sum: f64 = weights.iter().sum();
-            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
-            (nodes, weights)
-        }
-        21 => {
-            let nodes = vec![
-                -5.38748, -4.60368, -3.94477, -3.34785, -2.78881, -2.25497, -1.73854, -1.23408,
-                -0.73747, -0.24535, 0.24535, 0.73747, 1.23408, 1.73854, 2.25497, 2.78881, 3.34785,
-                3.94477, 4.60368, 5.38748, 0.0,
-            ];
-            let weights = vec![
-                2.1e-13, 4.4e-10, 1.1e-07, 7.8e-06, 2.3e-04, 3.5e-03, 3.1e-02, 1.5e-01, 4.3e-01,
-                7.2e-01, 7.2e-01, 4.3e-01, 1.5e-01, 3.1e-02, 3.5e-03, 2.3e-04, 7.8e-06, 1.1e-07,
-                4.4e-10, 2.1e-13, 1.0,
-            ];
-            let sum: f64 = weights.iter().sum();
-            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
-            (nodes, weights)
-        }
-        _ => {
-            let mut nodes = Vec::with_capacity(n);
-            let mut weights = Vec::with_capacity(n);
-            let step = 8.0 / (n - 1) as f64;
-            for i in 0..n {
-                let x = -4.0 + i as f64 * step;
-                nodes.push(x);
-                weights.push((-x * x / 2.0).exp());
-            }
-            let sum: f64 = weights.iter().sum();
-            let weights: Vec<f64> = weights.iter().map(|&w| w / sum).collect();
-            (nodes, weights)
-        }
+    assert!(n > 0, "quadrature requires at least one point");
+    if n == 1 {
+        return (vec![0.0], vec![1.0]);
     }
+
+    let n_symmetric = n.div_ceil(2);
+    let mut nodes = vec![0.0; n];
+    let mut weights = vec![0.0; n];
+    let mut positive_roots = Vec::with_capacity(n_symmetric);
+    let mut root = 0.0;
+
+    for index in 0..n_symmetric {
+        root = match index {
+            0 => {
+                let order = 2.0 * n as f64 + 1.0;
+                order.sqrt() - 1.85575 * order.powf(-1.0 / 6.0)
+            }
+            1 => root - 1.14 * (n as f64).powf(0.426) / root,
+            2 => 1.86 * root - 0.86 * positive_roots[0],
+            3 => 1.91 * root - 0.91 * positive_roots[1],
+            _ => 2.0 * root - positive_roots[index - 2],
+        };
+
+        let mut derivative = 0.0;
+        for _ in 0..50 {
+            let mut polynomial = std::f64::consts::PI.powf(-0.25);
+            let mut previous = 0.0;
+            for degree in 1..=n {
+                let older = previous;
+                previous = polynomial;
+                polynomial = root * (2.0 / degree as f64).sqrt() * previous
+                    - ((degree - 1) as f64 / degree as f64).sqrt() * older;
+            }
+            derivative = (2.0 * n as f64).sqrt() * previous;
+            let old_root = root;
+            root -= polynomial / derivative;
+            if (root - old_root).abs() < 1e-14 {
+                break;
+            }
+        }
+
+        positive_roots.push(root);
+        let symmetric = n - 1 - index;
+        nodes[index] = -std::f64::consts::SQRT_2 * root;
+        nodes[symmetric] = std::f64::consts::SQRT_2 * root;
+        let weight = 2.0 / (derivative * derivative * std::f64::consts::PI.sqrt());
+        weights[index] = weight;
+        weights[symmetric] = weight;
+    }
+
+    let total: f64 = weights.iter().sum();
+    for weight in &mut weights {
+        *weight /= total;
+    }
+    (nodes, weights)
 }
 
 #[cfg(test)]
@@ -342,6 +392,53 @@ mod tests {
     fn logsumexp_of_equal_values() {
         let expected = 1.0 + 3.0_f64.ln();
         assert!((logsumexp(&[1.0, 1.0, 1.0]) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normalized_gaussian_adjustment_preserves_reference_mass() {
+        let points = [-1.0, 0.0, 1.0];
+        let weights = [0.25, 0.5, 0.25];
+        let adjustment = normalized_log_gaussian_adjustment(&points, &weights, 0.0, 1.0);
+        assert!(adjustment.iter().all(|value| value.abs() < 1e-15));
+        let total: f64 = compute_log_weights(&weights)
+            .iter()
+            .zip(adjustment.iter())
+            .map(|(log_weight, correction)| (log_weight + correction).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn shifted_gaussian_adjustment_is_normalized() {
+        let points = [-2.0, -1.0, 0.0, 1.0, 2.0];
+        let weights = [0.05, 0.2, 0.5, 0.2, 0.05];
+        let adjustment = normalized_log_gaussian_adjustment(&points, &weights, 0.7, 0.8);
+        let total: f64 = compute_log_weights(&weights)
+            .iter()
+            .zip(adjustment.iter())
+            .map(|(log_weight, correction)| (log_weight + correction).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn gauss_hermite_quadrature_has_standard_normal_moments() {
+        for order in [9, 15, 21, 31] {
+            let (nodes, weights) = gauss_hermite_quadrature(order);
+            let mean: f64 = nodes
+                .iter()
+                .zip(weights.iter())
+                .map(|(node, weight)| node * weight)
+                .sum();
+            let variance: f64 = nodes
+                .iter()
+                .zip(weights.iter())
+                .map(|(node, weight)| node * node * weight)
+                .sum();
+            assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-14);
+            assert!(mean.abs() < 1e-14);
+            assert!((variance - 1.0).abs() < 1e-13);
+        }
     }
 
     #[test]

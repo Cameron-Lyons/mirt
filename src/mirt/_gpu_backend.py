@@ -367,12 +367,15 @@ def e_step_complete_gpu(
     ll_per_item = torch.where(valid, ll_per_item, torch.zeros_like(ll_per_item))
     log_likes = ll_per_item.sum(dim=2)
 
-    log_prior = (
+    log_reference = -0.5 * (np.log(2 * np.pi) + theta**2)
+    log_target = (
         -0.5 * np.log(2 * np.pi * prior_var)
         - 0.5 * ((theta - prior_mean) ** 2) / prior_var
     )
+    log_prior_mass = torch.log(weights + 1e-300) + log_target - log_reference
+    log_prior_mass -= torch.logsumexp(log_prior_mass, dim=0)
 
-    log_joint = log_likes + log_prior[None, :] + torch.log(weights + 1e-300)[None, :]
+    log_joint = log_likes + log_prior_mass[None, :]
 
     log_marginal = torch.logsumexp(log_joint, dim=1, keepdim=True)
     log_posterior = log_joint - log_marginal
