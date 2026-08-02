@@ -34,6 +34,7 @@ BASE_EXPORTS = [
     "GradedRatingScaleModel",
     "GeneralizedPartialCredit",
     "PartialCreditModel",
+    "RatingScaleModel",
     "NominalResponseModel",
     "MultidimensionalModel",
     "BifactorModel",
@@ -391,6 +392,7 @@ TOP_LEVEL_IMPORT_GROUPS = {
         "GradedResponseModel",
         "NominalResponseModel",
         "PartialCreditModel",
+        "RatingScaleModel",
     ),
     "mirt.models.testlet": ("TestletModel", "create_testlet_structure"),
     "mirt.models.unfolding": (

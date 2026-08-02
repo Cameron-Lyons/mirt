@@ -350,6 +350,20 @@ class PolytomousItemModel(BaseItemModel):
         category: int,
     ) -> NDArray[np.float64]: ...
 
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all category probabilities for one item."""
+        n_cat = self._n_categories[item_idx]
+        probabilities = np.empty((theta.shape[0], n_cat), dtype=np.float64)
+        for category in range(n_cat):
+            probabilities[:, category] = self.category_probability(
+                theta, item_idx, category
+            )
+        return probabilities
+
     def probability(
         self,
         theta: NDArray[np.float64],
@@ -359,19 +373,14 @@ class PolytomousItemModel(BaseItemModel):
         n_persons = theta.shape[0]
 
         if item_idx is not None:
-            n_cat = self._n_categories[item_idx]
-            probs = np.zeros((n_persons, n_cat))
-            for k in range(n_cat):
-                probs[:, k] = self.category_probability(theta, item_idx, k)
-            return probs
+            return self._category_probabilities(theta, item_idx)
 
         max_cat = max(self._n_categories)
         probs = np.zeros((n_persons, self.n_items, max_cat))
 
         for i in range(self.n_items):
             n_cat = self._n_categories[i]
-            for k in range(n_cat):
-                probs[:, i, k] = self.category_probability(theta, i, k)
+            probs[:, i, :n_cat] = self._category_probabilities(theta, i)
 
         return probs
 
@@ -409,10 +418,8 @@ class PolytomousItemModel(BaseItemModel):
 
         if item_idx is not None:
             n_cat = self._n_categories[item_idx]
-            expected = np.zeros(n_persons)
-            for k in range(n_cat):
-                expected += k * self.category_probability(theta, item_idx, k)
-            return expected
+            probabilities = self._category_probabilities(theta, item_idx)
+            return probabilities @ np.arange(n_cat)
 
         total_expected = np.zeros(n_persons)
         for i in range(self.n_items):
@@ -425,34 +432,78 @@ class PolytomousItemModel(BaseItemModel):
         item_idx: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
-        n_cat = self._n_categories[item_idx]
+        return self._category_probabilities(theta, item_idx)
 
-        curves = np.zeros((n_persons, n_cat))
-        for k in range(n_cat):
-            curves[:, k] = self.category_probability(theta, item_idx, k)
+    def _validate_polytomous_responses(
+        self,
+        responses: NDArray[np.int_],
+    ) -> NDArray:
+        """Validate a polytomous response matrix for likelihood evaluation."""
+        responses = np.asarray(responses)
+        if responses.ndim != 2:
+            raise MirtDataError(f"responses must be 2D, got {responses.ndim}D")
+        if responses.shape[1] != self.n_items:
+            raise MirtDataError(
+                f"responses has {responses.shape[1]} items, expected {self.n_items}",
+                n_items=responses.shape[1],
+            )
+        if responses.dtype.kind not in "biuf":
+            raise MirtDataError("responses must contain numeric category codes")
 
-        return curves
+        observed = responses >= 0
+        if responses.dtype.kind == "f" and np.any(
+            observed & (~np.isfinite(responses) | (responses != np.trunc(responses)))
+        ):
+            raise MirtDataError("responses must contain integer category codes")
+
+        n_categories = np.asarray(self._n_categories)
+        invalid = observed & (responses >= n_categories[None, :])
+        if np.any(invalid):
+            item_idx = int(np.flatnonzero(np.any(invalid, axis=0))[0])
+            raise MirtDataError(
+                f"responses for item {item_idx} must be below "
+                f"{self._n_categories[item_idx]}"
+            )
+        return responses
 
     def log_likelihood(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
+        responses = self._validate_polytomous_responses(responses)
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
+        n_response_rows = responses.shape[0]
+        n_theta_rows = theta.shape[0]
 
-        ll = np.zeros(n_persons)
+        if (
+            n_response_rows != n_theta_rows
+            and n_response_rows != 1
+            and n_theta_rows != 1
+        ):
+            raise MirtDataError(
+                "responses and theta must have matching row counts or a single row"
+            )
 
-        for i in range(self.n_items):
-            for person in range(n_persons):
-                resp = responses[person, i]
-                if resp >= 0:
-                    prob = self.category_probability(
-                        theta[person : person + 1], i, resp
-                    )
-                    ll[person] += np.log(prob[0] + PROB_EPSILON)
+        n_rows = max(n_response_rows, n_theta_rows)
+        ll = np.zeros(n_rows, dtype=np.float64)
+        row_indices = np.arange(n_rows)
+
+        for item_idx in range(self.n_items):
+            item_responses = np.broadcast_to(responses[:, item_idx], (n_rows,))
+            valid = item_responses >= 0
+            if not np.any(valid):
+                continue
+
+            probabilities = self._category_probabilities(theta, item_idx)
+            probabilities = np.broadcast_to(
+                probabilities, (n_rows, probabilities.shape[1])
+            )
+            response_indices = np.where(valid, item_responses, 0).astype(
+                np.intp, copy=False
+            )
+            selected = probabilities[row_indices[valid], response_indices[valid]]
+            ll[valid] += np.log(np.clip(selected, PROB_EPSILON, 1.0))
 
         return ll
 
@@ -475,7 +526,7 @@ class PolytomousItemModel(BaseItemModel):
         ndarray of shape (n_persons, n_theta)
             Log-likelihood for each person at each theta point.
         """
-        responses = np.asarray(responses)
+        responses = self._validate_polytomous_responses(responses)
         theta = self._ensure_theta_2d(theta)
         n_persons = responses.shape[0]
         n_theta = theta.shape[0]
@@ -483,19 +534,15 @@ class PolytomousItemModel(BaseItemModel):
         ll = np.zeros((n_persons, n_theta))
 
         for item_idx in range(self.n_items):
-            n_cat = self._n_categories[item_idx]
-            probs = np.zeros((n_theta, n_cat))
-            for k in range(n_cat):
-                probs[:, k] = self.category_probability(theta, item_idx, k)
+            probs = self._category_probabilities(theta, item_idx)
             probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             log_probs = np.log(probs)
 
             item_resp = responses[:, item_idx]
             valid_mask = item_resp >= 0
 
-            for c in range(n_cat):
-                cat_mask = valid_mask & (item_resp == c)
-                if np.any(cat_mask):
-                    ll[cat_mask, :] += log_probs[None, :, c]
+            if np.any(valid_mask):
+                response_indices = item_resp[valid_mask].astype(np.intp, copy=False)
+                ll[valid_mask, :] += log_probs[:, response_indices].T
 
         return ll
