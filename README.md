@@ -414,6 +414,8 @@ plot_person_item_map(result.model, scores.theta)
 | `posterior_summary()` | Summarize sampled parameter uncertainty |
 | `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
+| `predict_mixed()` | Response probabilities from abilities or person covariates |
+| `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
 
 ### Data Transformation Functions
 
