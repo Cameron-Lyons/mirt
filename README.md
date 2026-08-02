@@ -396,6 +396,8 @@ plot_person_item_map(result.model, scores.theta)
 | `RCI()` | Reliable Change Index for clinical significance |
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
+| `posterior_summary()` | Summarize sampled parameter uncertainty |
+| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
 
 ### Data Transformation Functions
