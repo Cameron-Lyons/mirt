@@ -267,30 +267,19 @@ class DichotomousItemModel(BaseItemModel):
         """
         responses = np.asarray(responses)
         theta = self._ensure_theta_2d(theta)
-        n_persons = responses.shape[0]
-        n_theta = theta.shape[0]
 
         p = self.probability(theta)
         p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
         log_p = np.log(p)
-        log_1_minus_p = np.log(1 - p)
+        log_1_minus_p = np.log1p(-p)
 
         valid = responses >= 0
+        response_values = np.where(valid, responses, 0).astype(np.float64, copy=False)
+        observed = valid.astype(np.float64)
 
-        ll = np.zeros((n_persons, n_theta))
-        for j in range(self.n_items):
-            item_valid = valid[:, j]
-            item_resp = responses[:, j]
-
-            ll_correct = log_p[:, j]
-            ll_incorrect = log_1_minus_p[:, j]
-
-            ll[item_valid, :] += (
-                item_resp[item_valid, None] * ll_correct[None, :]
-                + (1 - item_resp[item_valid, None]) * ll_incorrect[None, :]
-            )
-
-        return ll
+        return (
+            response_values @ log_p.T + (observed - response_values) @ log_1_minus_p.T
+        )
 
     def expected_score(
         self,
