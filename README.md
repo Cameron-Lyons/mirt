@@ -108,6 +108,21 @@ b = np.random.normal(0, 1, size=20)
 responses = mirt.simdata(model="2PL", discrimination=a, difficulty=b, n_persons=1000)
 
 likert_data = mirt.simdata(model="GRM", n_categories=5, n_persons=500, n_items=15)
+
+pcm_params = mirt.generate_item_parameters(
+    n_items=15, model="PCM", n_categories=5, seed=42
+)
+pcm_data = mirt.simdata(
+    model="PCM", n_persons=500, n_items=15, n_categories=5, **pcm_params
+)
+
+nrm_params = mirt.generate_item_parameters(
+    n_items=10, model="NRM", n_categories=4, n_factors=2, seed=42
+)
+nrm_data = mirt.simdata(
+    model="NRM", n_persons=500, n_items=10, n_categories=4,
+    n_factors=2, **nrm_params
+)
 ```
 
 ### Fitting Models
