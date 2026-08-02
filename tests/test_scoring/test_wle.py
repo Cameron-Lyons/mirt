@@ -41,6 +41,39 @@ class TestWLEScorerInitialization:
 class TestWLEScorerScoring:
     """Tests for WLEScorer scoring."""
 
+    def test_information_uses_vectorized_dichotomous_path(
+        self, fitted_2pl_model, monkeypatch
+    ):
+        """Test that dichotomous information is computed in one bulk call."""
+        model = fitted_2pl_model.model
+        original_information = model.information
+        item_indices = []
+
+        def record_information(theta, item_idx=None):
+            item_indices.append(item_idx)
+            return original_information(theta, item_idx)
+
+        monkeypatch.setattr(model, "information", record_information)
+
+        mask = np.zeros(model.n_items, dtype=bool)
+        mask[:2] = True
+        WLEScorer()._test_information(model, np.array([[0.0]]), mask)
+
+        assert item_indices == [None]
+
+    def test_information_uses_observed_polytomous_items(self):
+        """Test itemwise fallback for sparse polytomous responses."""
+        from mirt.models.polytomous import GradedResponseModel
+
+        model = GradedResponseModel(n_items=3, n_categories=4)
+        theta = np.array([[-0.5], [0.0], [0.5]])
+        observed_mask = np.array([True, False, True])
+
+        actual = WLEScorer()._test_information(model, theta, observed_mask)
+        expected = model.information(theta, 0) + model.information(theta, 2)
+
+        assert_allclose(actual, expected)
+
     def test_basic_scoring(self, fitted_2pl_model, dichotomous_responses):
         """Test basic WLE scoring."""
         model = fitted_2pl_model.model
