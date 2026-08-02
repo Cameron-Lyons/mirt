@@ -12,7 +12,9 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
+
+from mirt.exceptions import MirtDataError
+from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -41,15 +43,15 @@ def generate_plausible_values(
     responses : NDArray
         Response matrix (n_persons, n_items)
     n_plausible : int
-        Number of plausible values to generate per person
+        Positive number of plausible values to generate per person
     method : str
         Generation method:
         - 'posterior': Direct sampling from posterior using quadrature
         - 'mcmc': MCMC sampling (slower but more flexible)
     n_quadpts : int
-        Number of quadrature points (for posterior method)
+        Positive number of quadrature points (for posterior method)
     n_iter : int
-        Number of MCMC iterations (for mcmc method)
+        Positive number of MCMC iterations between draws (for mcmc method)
     seed : int, optional
         Random seed
 
@@ -58,22 +60,59 @@ def generate_plausible_values(
     NDArray
         Plausible values with shape (n_persons, n_factors, n_plausible)
         For unidimensional models: (n_persons, 1, n_plausible)
+
+    Raises
+    ------
+    ValueError
+        If the model is unfitted or a generation parameter is invalid.
+    MirtDataError
+        If the response matrix shape or category codes are invalid.
     """
     from mirt.results.fit_result import FitResult
 
     if isinstance(model, FitResult):
         model = model.model
 
+    if not model.is_fitted:
+        raise ValueError("Model must be fitted before generating plausible values")
+    if isinstance(n_plausible, bool) or not isinstance(n_plausible, (int, np.integer)):
+        raise ValueError("n_plausible must be a positive integer")
+    if n_plausible < 1:
+        raise ValueError("n_plausible must be a positive integer")
+    if method not in ("posterior", "mcmc"):
+        raise ValueError(f"Unknown method: {method}")
+    if method == "posterior" and (
+        isinstance(n_quadpts, bool)
+        or not isinstance(n_quadpts, (int, np.integer))
+        or n_quadpts < 1
+    ):
+        raise ValueError("n_quadpts must be a positive integer")
+    if method == "mcmc" and (
+        isinstance(n_iter, bool)
+        or not isinstance(n_iter, (int, np.integer))
+        or n_iter < 1
+    ):
+        raise ValueError("n_iter must be a positive integer")
+
+    responses = validate_responses(responses, n_items=model.n_items)
+    observed = responses >= 0
+    if model.is_polytomous:
+        categories = np.asarray(model.n_categories)
+        invalid = observed & (responses >= categories[None, :])
+        if np.any(invalid):
+            item_idx = int(np.flatnonzero(np.any(invalid, axis=0))[0])
+            raise MirtDataError(
+                f"responses for item {item_idx} must be below {categories[item_idx]}"
+            )
+    elif np.any(responses[observed] > 1):
+        raise MirtDataError("dichotomous responses must be coded as 0 or 1")
+
     rng = np.random.default_rng(seed)
-    responses = np.asarray(responses)
-    responses.shape[0]
 
     if method == "posterior":
         pvs = _generate_pv_posterior(model, responses, n_plausible, n_quadpts, rng)
-    elif method == "mcmc":
-        pvs = _generate_pv_mcmc(model, responses, n_plausible, rng, n_iter)
     else:
-        raise ValueError(f"Unknown method: {method}")
+        pvs = _generate_pv_mcmc(model, responses, n_plausible, rng, n_iter)
 
     return pvs
 
@@ -95,30 +134,21 @@ def _generate_pv_posterior(
     nodes = quad.nodes
     weights = quad.weights
 
-    pvs = np.zeros((n_persons, n_factors, n_plausible))
+    log_likes = model.log_likelihood_batch(responses, nodes)
+    log_posterior = log_likes + np.log(weights + 1e-300)[None, :]
+    log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
+    posterior = np.exp(log_posterior)
+    posterior /= posterior.sum(axis=1, keepdims=True)
 
-    for i in range(n_persons):
-        resp_i = responses[i : i + 1]
+    cumulative = np.cumsum(posterior, axis=1)
+    cumulative[:, -1] = 1.0
 
-        log_likes = np.zeros(len(nodes))
-        for q, node in enumerate(nodes):
-            theta_q = node.reshape(1, -1)
-            log_likes[q] = model.log_likelihood(resp_i, theta_q)[0]
-
-        log_posterior = log_likes + np.log(weights + 1e-300)
-
-        log_posterior = log_posterior - np.max(log_posterior)
-        posterior = np.exp(log_posterior)
-        posterior = posterior / posterior.sum()
-
-        for p in range(n_plausible):
-            idx = rng.choice(len(nodes), p=posterior)
-            theta_sample = nodes[idx].copy()
-
-            jitter_sd = 0.3
-            theta_sample += rng.normal(0, jitter_sd, n_factors)
-
-            pvs[i, :, p] = theta_sample
+    pvs = np.empty((n_persons, n_factors, n_plausible))
+    for p in range(n_plausible):
+        uniforms = rng.random(n_persons)
+        indices = np.sum(uniforms[:, None] > cumulative, axis=1)
+        jitter = rng.normal(0, 0.3, size=(n_persons, n_factors))
+        pvs[:, :, p] = nodes[indices] + jitter
 
     return pvs
 
@@ -142,30 +172,26 @@ def _generate_pv_mcmc(
         resp_i = responses[i : i + 1]
 
         theta = np.zeros(n_factors)
+        current_log_density = float(
+            model.log_likelihood(resp_i, theta.reshape(1, -1))[0]
+            - 0.5 * np.dot(theta, theta)
+        )
 
         for p in range(n_plausible):
-            for iteration in range(n_iter):
+            for _ in range(n_iter):
                 proposal = theta + rng.normal(0, proposal_sd, n_factors)
 
-                ll_current = model.log_likelihood(resp_i, theta.reshape(1, -1))[0]
                 ll_proposal = model.log_likelihood(resp_i, proposal.reshape(1, -1))[0]
-
-                prior_current = stats.norm.logpdf(theta).sum()
-                prior_proposal = stats.norm.logpdf(proposal).sum()
-
-                log_alpha = (ll_proposal + prior_proposal) - (
-                    ll_current + prior_current
+                proposal_log_density = float(
+                    ll_proposal - 0.5 * np.dot(proposal, proposal)
                 )
+                log_alpha = proposal_log_density - current_log_density
 
                 if np.log(rng.random()) < log_alpha:
                     theta = proposal
+                    current_log_density = proposal_log_density
 
-            if p == 0:
-                continue
-
-            pvs[i, :, p] = theta.copy()
-
-        pvs[i, :, 0] = theta.copy()
+            pvs[i, :, p] = theta
 
     return pvs
 
