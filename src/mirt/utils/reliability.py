@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.information import testinfo
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -56,20 +57,19 @@ def marginal_rxx(
     theta = np.linspace(theta_range[0], theta_range[1], n_points)
     theta_2d = theta.reshape(-1, 1)
 
-    item_info = model.information(theta_2d)
-    test_info = np.sum(item_info, axis=1)
-
-    if density == "norm":
-        weights = stats.norm.pdf(theta)
-    else:
-        weights = stats.norm.pdf(theta)
+    if density != "norm":
+        raise ValueError("density must be 'norm'")
+    test_info = testinfo(model, theta_2d)
+    weights = stats.norm.pdf(theta)
 
     weights = weights / np.sum(weights)
 
     se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
     expected_var_error = np.sum(weights * se_theta**2)
+    theta_mean = np.sum(weights * theta)
+    theta_variance = np.sum(weights * (theta - theta_mean) ** 2)
 
-    rxx = 1.0 - expected_var_error
+    rxx = 1.0 - expected_var_error / max(theta_variance, PROB_EPSILON)
     return float(np.clip(rxx, 0.0, 1.0))
 
 
@@ -109,21 +109,17 @@ def empirical_rxx(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
+    if method not in {"posterior_variance", "information"}:
+        raise ValueError("method must be 'posterior_variance' or 'information'")
+
     observed_var = np.var(theta[:, 0])
 
     if observed_var < PROB_EPSILON:
         return 0.0
 
-    if method == "posterior_variance":
-        item_info = model.information(theta)
-        test_info = np.sum(item_info, axis=1)
-        se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
-        avg_error_var = np.mean(se_theta**2)
-    else:
-        item_info = model.information(theta)
-        test_info = np.sum(item_info, axis=1)
-        se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
-        avg_error_var = np.mean(se_theta**2)
+    test_info = testinfo(model, theta)
+    se_theta = 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
+    avg_error_var = np.mean(se_theta**2)
 
     true_var = observed_var - avg_error_var
     true_var = max(true_var, 0.0)
@@ -163,7 +159,6 @@ def sem(
     if theta_arr.ndim == 1:
         theta_arr = theta_arr.reshape(-1, 1)
 
-    item_info = model.information(theta_arr)
-    test_info = np.sum(item_info, axis=1)
+    test_info = testinfo(model, theta_arr)
 
     return 1.0 / np.sqrt(np.maximum(test_info, PROB_EPSILON))
