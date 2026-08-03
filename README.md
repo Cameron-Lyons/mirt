@@ -370,7 +370,7 @@ plot_person_item_map(result.model, scores.theta)
 
 | Function | Description |
 |----------|-------------|
-| `compute_fit_indices()` | M2, RMSEA, CFI, TLI |
+| `compute_fit_indices()` | M2/M2* score moments, RMSEA, CFI, TLI, SRMSR |
 | `compare_models()` | AIC/BIC comparison |
 | `anova_irt()` | Likelihood ratio tests |
 | `compute_dtf()` | Differential test functioning |
