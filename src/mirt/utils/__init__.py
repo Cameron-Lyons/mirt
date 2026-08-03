@@ -1,3 +1,5 @@
+from typing import Any
+
 from mirt._core import sigmoid
 from mirt.utils.batch import BatchFitResult, fit_model_grid, fit_models
 from mirt.utils.calibration import (
@@ -136,6 +138,9 @@ __all__ = [
     "marginal_rxx",
     "empirical_rxx",
     "sem",
+    "cv_select_lambda",
+    "information_criteria_path",
+    "RegularizationCVResult",
     "traditional",
     "TraditionalStats",
     "item_fit_chisq",
@@ -197,3 +202,27 @@ __all__ = [
     "RandomEffects",
     "FixedEffects",
 ]
+
+_LAZY_EXPORTS = {
+    "RegularizationCVResult": "mirt.utils.regularization_cv",
+    "cv_select_lambda": "mirt.utils.regularization_cv",
+    "information_criteria_path": "mirt.utils.regularization_cv",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load estimation-backed utilities without creating import cycles."""
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Include lazy utility exports in interactive discovery."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
