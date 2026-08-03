@@ -213,6 +213,36 @@ class TestEAPScorerConsistency:
 class TestEAPScorerPolytomous:
     """Tests for EAP with polytomous models."""
 
+    def test_response_patterns_receive_distinct_scores(self):
+        """EAP evaluates each respondent's complete response pattern."""
+        from mirt.models.polytomous import GradedResponseModel
+
+        model = GradedResponseModel(n_items=3, n_categories=[3, 4, 5])
+        model.set_parameters(
+            discrimination=np.array([0.8, 1.1, 1.4]),
+            thresholds=np.array(
+                [
+                    [-1.0, 1.0, 0.0, 0.0],
+                    [-1.5, 0.0, 1.5, 0.0],
+                    [-2.0, -0.6, 0.6, 2.0],
+                ]
+            ),
+        )
+        model._is_fitted = True
+        responses = np.array(
+            [
+                [0, 0, 0],
+                [2, 3, 4],
+                [-1, -1, -1],
+            ]
+        )
+
+        scores = EAPScorer(n_quadpts=21).score(model, responses)
+
+        assert scores.theta[0] < -0.5
+        assert scores.theta[1] > 0.5
+        assert scores.theta[2] == pytest.approx(0.0, abs=1e-12)
+
     def test_polytomous_scoring(self, polytomous_responses):
         """Test EAP scoring with polytomous model."""
         from mirt import fit_mirt

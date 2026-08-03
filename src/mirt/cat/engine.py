@@ -19,6 +19,7 @@ from mirt.cat._engine_common import (
     configure_exposure_control,
     consume_pending_item,
     finalize_administered_item,
+    get_pending_item,
     initialize_common_engine,
     record_item_administration,
     reset_session_state,
@@ -191,8 +192,12 @@ class CATEngine:
         """
         next_item = None
         if not self._is_complete and self._available_items:
-            next_item = self._select_next_item()
+            next_item = get_pending_item(self)
 
+        return self._build_state(next_item)
+
+    def _build_state(self, next_item: int | None) -> CATState:
+        """Create a state snapshot with an explicitly resolved next item."""
         return CATState(
             theta=self._current_theta,
             standard_error=self._current_se,
@@ -221,7 +226,7 @@ class CATEngine:
         if not self._available_items:
             raise RuntimeError("No items available for selection")
 
-        return self._select_next_item()
+        return get_pending_item(self)
 
     def _select_next_item(self) -> int:
         """Internal item selection with constraint handling."""
@@ -291,8 +296,7 @@ class CATEngine:
         self._theta_history.append(self._current_theta)
         self._se_history.append(self._current_se)
 
-        state = self.get_current_state()
-        finalize_administered_item(self, state)
+        finalize_administered_item(self, self._build_state(next_item=None))
 
         return self.get_current_state()
 

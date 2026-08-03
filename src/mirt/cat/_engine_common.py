@@ -72,6 +72,8 @@ def reset_session_state(
         setattr(engine, attr, [])
     engine._is_complete = False
     engine._stopping_reason = ""
+    if hasattr(engine, "_pending_item"):
+        delattr(engine, "_pending_item")
 
     engine._exposure.reset()
     engine._content.reset()
@@ -80,12 +82,17 @@ def reset_session_state(
         engine._stopping.reset()
 
 
-def consume_pending_item(engine: Any) -> int:
-    """Pop the pending item if present, else select one."""
+def get_pending_item(engine: Any) -> int:
+    """Select an item once and retain it until a response is recorded."""
     if not hasattr(engine, "_pending_item"):
         engine._pending_item = engine._select_next_item()
 
-    item_idx = int(engine._pending_item)
+    return int(engine._pending_item)
+
+
+def consume_pending_item(engine: Any) -> int:
+    """Pop the pending item if present, else select one."""
+    item_idx = get_pending_item(engine)
     delattr(engine, "_pending_item")
     return item_idx
 
@@ -99,6 +106,9 @@ def finalize_administered_item(engine: Any, state: Any) -> None:
     if not engine._available_items and not engine._is_complete:
         engine._is_complete = True
         engine._stopping_reason = "Item pool exhausted"
+
+    if engine._is_complete and hasattr(engine, "_pending_item"):
+        delattr(engine, "_pending_item")
 
 
 def run_simulation_loop(

@@ -8,11 +8,11 @@ from scipy.optimize import minimize
 
 from mirt._core import sigmoid
 from mirt._gpu_backend import (
-    GPU_AVAILABLE,
     compute_log_likelihoods_2pl_gpu,
     compute_log_likelihoods_3pl_gpu,
     compute_log_likelihoods_gpcm_gpu,
     compute_log_likelihoods_grm_gpu,
+    is_gpu_available,
 )
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -66,9 +66,9 @@ class EMEstimator(BaseEstimator):
     @property
     def _should_use_gpu(self) -> bool:
         """Determine if GPU should be used based on settings and availability."""
-        if self.use_gpu == "auto":
-            return GPU_AVAILABLE
-        return bool(self.use_gpu) and GPU_AVAILABLE
+        if self.use_gpu is False:
+            return False
+        return is_gpu_available()
 
     def fit(
         self,

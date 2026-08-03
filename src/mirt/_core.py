@@ -26,5 +26,10 @@ def sigmoid(x: NDArray[np.floating] | float) -> NDArray[np.floating] | float:
         Sigmoid of input, same shape as input.
     """
     x = np.asarray(x)
-    result = np.where(x >= 0, 1.0 / (1.0 + np.exp(-x)), np.exp(x) / (1.0 + np.exp(x)))
+    exp_negative_abs = np.exp(-np.abs(x))
+    result = np.where(
+        x >= 0,
+        1.0 / (1.0 + exp_negative_abs),
+        exp_negative_abs / (1.0 + exp_negative_abs),
+    )
     return float(result) if result.ndim == 0 else result

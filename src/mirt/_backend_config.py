@@ -10,9 +10,9 @@ from mirt._backend_state import (
     set_backend_preference,
 )
 from mirt._gpu_backend import (
-    GPU_AVAILABLE,
     get_gpu_device_name,
     get_gpu_memory_info,
+    is_gpu_available,
     is_torch_available,
 )
 from mirt._rust_backend import RUST_AVAILABLE
@@ -34,7 +34,7 @@ def set_backend(backend: BackendChoice) -> None:
             f"Invalid backend '{backend}'. Must be one of: 'auto', 'gpu', 'rust', 'numpy'"
         )
 
-    if backend == "gpu" and not GPU_AVAILABLE:
+    if backend == "gpu" and not is_gpu_available():
         raise ValueError(
             "GPU backend requested but not available. "
             "Install PyTorch with CUDA support: pip install torch"
@@ -81,8 +81,9 @@ def get_backend_info() -> dict[str, Any]:
     """Get information about available computational backends."""
     current: BackendName = get_backend_preference()
     effective: BackendChoice = current
+    gpu_available = is_gpu_available()
     if effective == "auto":
-        if GPU_AVAILABLE:
+        if gpu_available:
             effective = "gpu"
         elif RUST_AVAILABLE:
             effective = "rust"
@@ -92,7 +93,7 @@ def get_backend_info() -> dict[str, Any]:
     return {
         "current_backend": current,
         "effective_backend": effective,
-        "gpu_available": GPU_AVAILABLE,
+        "gpu_available": gpu_available,
         "gpu_device": get_gpu_device_name(),
         "gpu_memory": get_gpu_memory_info(),
         "rust_available": RUST_AVAILABLE,
