@@ -7,7 +7,14 @@ from mirt.utils.calibration import (
     fixed_calib,
     transform_theta,
 )
-from mirt.utils.classical import TraditionalStats, item_fit_chisq, traditional
+from mirt.utils.classical import (
+    ItemStats,
+    TraditionalStats,
+    item_fit_chisq,
+    itemstats,
+    itemstats_to_dataframe,
+    traditional,
+)
 from mirt.utils.clinical import RCI, RCIResult, clinical_significance
 from mirt.utils.confidence import PLCI, PLCIResult, delta_method, score_CI
 from mirt.utils.cv import (
@@ -139,6 +146,9 @@ __all__ = [
     "traditional",
     "TraditionalStats",
     "item_fit_chisq",
+    "itemstats",
+    "ItemStats",
+    "itemstats_to_dataframe",
     "wald",
     "lagrange",
     "likelihood_ratio",
