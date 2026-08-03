@@ -258,7 +258,7 @@ class MCATEngine:
         )
 
         exposure_eligible = self._exposure.filter_items(
-            content_eligible, self.model, float(self._current_theta[0])
+            content_eligible, self.model, self._current_theta
         )
 
         return self._selection.select_item(
