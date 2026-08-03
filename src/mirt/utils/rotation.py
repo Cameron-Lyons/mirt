@@ -13,27 +13,43 @@ References
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
+
+import numpy as np
+from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-import numpy as np
-from numpy.typing import NDArray
-from scipy.linalg import svd
-from scipy.optimize import minimize
+
+RotationMethod = Literal[
+    "varimax", "quartimax", "equamax", "oblimin", "promax", "geomin", "none"
+]
+RotationObjective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
+_VALID_ROTATIONS = frozenset(
+    {"varimax", "quartimax", "equamax", "oblimin", "promax", "geomin", "none"}
+)
+
+
+def _is_finite_real(value: object) -> bool:
+    """Return whether a runtime control is a finite, non-boolean real scalar."""
+    return bool(
+        not isinstance(value, (bool, np.bool_))
+        and isinstance(value, (int, float, np.integer, np.floating))
+        and np.isfinite(value)
+    )
 
 
 def rotate_loadings(
     loadings: NDArray[np.float64],
-    method: Literal[
-        "varimax", "quartimax", "equamax", "oblimin", "promax", "geomin", "none"
-    ] = "varimax",
+    method: RotationMethod = "varimax",
     gamma: float | None = None,
     kappa: float = 4.0,
     max_iter: int = 1000,
     tol: float = 1e-6,
     normalize: bool = True,
+    geomin_epsilon: float = 0.01,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]:
     """Rotate factor loadings for interpretability.
 
@@ -60,6 +76,8 @@ def rotate_loadings(
         Convergence tolerance
     normalize : bool
         Kaiser normalization before rotation. Default True.
+    geomin_epsilon : float
+        Positive stabilization constant for geomin rotation. Default 0.01.
 
     Returns
     -------
@@ -71,12 +89,47 @@ def rotate_loadings(
         Factor correlation matrix for oblique rotations, None for orthogonal
     """
     loadings = np.asarray(loadings, dtype=np.float64)
+    if loadings.ndim != 2:
+        raise ValueError("loadings must be a 2D matrix")
     n_items, n_factors = loadings.shape
+    if n_items == 0 or n_factors == 0:
+        raise ValueError("loadings must contain at least one item and one factor")
+    if n_items < n_factors:
+        raise ValueError("loadings must contain at least as many items as factors")
+    if not np.all(np.isfinite(loadings)):
+        raise ValueError("loadings must contain only finite values")
+
+    if not isinstance(method, str):
+        raise ValueError("method must be a string")
+    normalized_method = method.lower()
+    if normalized_method not in _VALID_ROTATIONS:
+        raise ValueError(f"Unknown rotation method: {method}")
+    if isinstance(max_iter, (bool, np.bool_)) or not isinstance(
+        max_iter, (int, np.integer)
+    ):
+        raise ValueError("max_iter must be an integer")
+    max_iter = int(max_iter)
+    if max_iter < 1:
+        raise ValueError("max_iter must be at least 1")
+    if not _is_finite_real(tol) or tol <= 0:
+        raise ValueError("tol must be a finite positive value")
+    tol = float(tol)
+    if not isinstance(normalize, (bool, np.bool_)):
+        raise ValueError("normalize must be a boolean")
+
+    if gamma is not None and not _is_finite_real(gamma):
+        raise ValueError("gamma must be a finite value")
+    if normalized_method == "promax" and (not _is_finite_real(kappa) or kappa <= 1):
+        raise ValueError("kappa must be a finite value greater than 1")
+    if normalized_method == "geomin" and (
+        not _is_finite_real(geomin_epsilon) or geomin_epsilon <= 0
+    ):
+        raise ValueError("geomin_epsilon must be a finite positive value")
 
     if n_factors == 1:
         return loadings.copy(), np.eye(1), None
 
-    if method == "none":
+    if normalized_method == "none":
         return loadings.copy(), np.eye(n_factors), None
 
     if normalize:
@@ -88,31 +141,33 @@ def rotate_loadings(
         normalized = loadings
         h = np.ones((n_items, 1))
 
-    if method == "varimax":
+    if normalized_method == "varimax":
         rotated, T = _varimax(normalized, max_iter, tol)
         factor_corr = None
 
-    elif method == "quartimax":
+    elif normalized_method == "quartimax":
         rotated, T = _quartimax(normalized, max_iter, tol)
         factor_corr = None
 
-    elif method == "equamax":
+    elif normalized_method == "equamax":
         rotated, T = _equamax(normalized, max_iter, tol)
         factor_corr = None
 
-    elif method == "oblimin":
+    elif normalized_method == "oblimin":
         if gamma is None:
             gamma = 0.0
-        rotated, T, factor_corr = _oblimin(normalized, gamma, max_iter, tol)
+        rotated, T, factor_corr = _oblimin(normalized, float(gamma), max_iter, tol)
 
-    elif method == "promax":
-        rotated, T, factor_corr = _promax(normalized, kappa, max_iter, tol)
+    elif normalized_method == "promax":
+        rotated, T, factor_corr = _promax(normalized, float(kappa), max_iter, tol)
 
-    elif method == "geomin":
-        rotated, T, factor_corr = _geomin(normalized, max_iter, tol)
+    elif normalized_method == "geomin":
+        rotated, T, factor_corr = _geomin(
+            normalized, max_iter, tol, float(geomin_epsilon)
+        )
 
-    else:
-        raise ValueError(f"Unknown rotation method: {method}")
+    else:  # pragma: no cover - guarded by validation above
+        raise AssertionError("unreachable rotation method")
 
     if normalize:
         rotated = rotated * h
@@ -129,26 +184,7 @@ def _varimax(
 
     Maximizes variance of squared loadings within factors.
     """
-    n, p = A.shape
-    T = np.eye(p)
-
-    for _ in range(max_iter):
-        B = A @ T
-
-        B2 = B**2
-        col_means = B2.mean(axis=0, keepdims=True)
-        U = B * (B2 - col_means)
-
-        U_tilde, _, Vt = svd(A.T @ U, full_matrices=False)
-        T_new = U_tilde @ Vt
-
-        if np.max(np.abs(T_new - T)) < tol:
-            T = T_new
-            break
-
-        T = T_new
-
-    return A @ T, T
+    return _orthomax(A, gamma=1.0, max_iter=max_iter, tol=tol)
 
 
 def _quartimax(
@@ -160,25 +196,7 @@ def _quartimax(
 
     Simplifies rows (items) rather than columns (factors).
     """
-    n, p = A.shape
-    T = np.eye(p)
-
-    for _ in range(max_iter):
-        B = A @ T
-
-        B2 = B**2
-        U = B * B2
-
-        U_tilde, _, Vt = svd(A.T @ U, full_matrices=False)
-        T_new = U_tilde @ Vt
-
-        if np.max(np.abs(T_new - T)) < tol:
-            T = T_new
-            break
-
-        T = T_new
-
-    return A @ T, T
+    return _orthomax(A, gamma=0.0, max_iter=max_iter, tol=tol)
 
 
 def _equamax(
@@ -190,29 +208,36 @@ def _equamax(
 
     Compromise between varimax and quartimax with gamma = p/2.
     """
-    n, p = A.shape
-    gamma = p / 2
+    return _orthomax(A, gamma=A.shape[1] / 2, max_iter=max_iter, tol=tol)
 
-    T = np.eye(p)
+
+def _orthomax(
+    A: NDArray[np.float64],
+    gamma: float,
+    max_iter: int,
+    tol: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Optimize the orthomax family with an SVD fixed-point update."""
+    n_items, n_factors = A.shape
+    rotation = np.eye(n_factors)
+    objective = 0.0
 
     for _ in range(max_iter):
-        B = A @ T
+        basis = A @ rotation
+        column_sums = np.sum(basis**2, axis=0, keepdims=True)
+        transformed = A.T @ (basis**3 - (gamma / n_items) * basis * column_sums)
+        left, singular_values, right_transpose = np.linalg.svd(
+            transformed, full_matrices=False
+        )
+        updated_rotation = left @ right_transpose
+        updated_objective = float(np.sum(singular_values))
+        rotation = updated_rotation
 
-        B2 = B**2
-        col_means = B2.mean(axis=0, keepdims=True)
-
-        U = B * (B2 - gamma * col_means / n)
-
-        U_tilde, _, Vt = svd(A.T @ U, full_matrices=False)
-        T_new = U_tilde @ Vt
-
-        if np.max(np.abs(T_new - T)) < tol:
-            T = T_new
+        if objective > 0 and updated_objective <= objective * (1 + tol):
             break
+        objective = updated_objective
 
-        T = T_new
-
-    return A @ T, T
+    return A @ rotation, rotation
 
 
 def _oblimin(
@@ -227,45 +252,166 @@ def _oblimin(
     gamma = 0.5: Biquartimin
     gamma = 1: Covarimin
     """
-    n, p = A.shape
 
-    T = np.eye(p)
-    alpha = 1.0
+    def objective(
+        loadings: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        return _oblimin_objective(loadings, gamma)
 
-    N = np.ones((p, p)) - np.eye(p)
+    return _oblique_gradient_projection(A, objective, max_iter, tol)
+
+
+def _oblimin_objective(
+    loadings: NDArray[np.float64],
+    gamma: float,
+) -> tuple[float, NDArray[np.float64]]:
+    """Return the oblimin-family criterion and loading gradient."""
+    squared = loadings**2
+    cross_products = squared.sum(axis=1, keepdims=True) - squared
+    if gamma != 0:
+        cross_products = cross_products - (
+            gamma / loadings.shape[0]
+        ) * cross_products.sum(axis=0, keepdims=True)
+
+    gradient = loadings * cross_products
+    criterion = float(np.sum(squared * cross_products) / 4)
+    return criterion, gradient
+
+
+def _geomin_objective(
+    loadings: NDArray[np.float64],
+    epsilon: float,
+) -> tuple[float, NDArray[np.float64]]:
+    """Return the geomin criterion and loading gradient."""
+    stabilized = loadings**2 + epsilon
+    geometric_means = np.exp(np.mean(np.log(stabilized), axis=1))
+    gradient = (
+        (2.0 / loadings.shape[1]) * (loadings / stabilized) * geometric_means[:, None]
+    )
+    return float(np.sum(geometric_means)), gradient
+
+
+def _oblique_gradient_projection(
+    A: NDArray[np.float64],
+    objective: RotationObjective,
+    max_iter: int,
+    tol: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Minimize an oblique criterion using gradient projection."""
+    n_factors = A.shape[1]
+    factor_transform = np.eye(n_factors)
+    inverse_transform = np.eye(n_factors)
+    rotated = A.copy()
+    criterion, loading_gradient = objective(rotated)
+    gradient = -(rotated.T @ loading_gradient @ inverse_transform).T
+    step_size = 1.0
 
     for _ in range(max_iter):
-        Ti = np.linalg.inv(T)
-        L = A @ Ti.T
-
-        L2 = L**2
-
-        C = L2.T @ L2 / n
-
-        if gamma == 0:
-            G = L * (L2 @ N)
-        else:
-            G = L * (L2 @ N - gamma * np.diag(C).reshape(1, -1) * L2 / n)
-
-        grad = -A.T @ G @ Ti.T
-
-        T_new = T - alpha * grad
-
-        U, _, Vt = svd(T_new, full_matrices=False)
-        T_new = U @ Vt
-
-        if np.max(np.abs(T_new - T)) < tol:
-            T = T_new
+        column_inner_products = np.sum(factor_transform * gradient, axis=0)
+        projected_gradient = gradient - factor_transform * column_inner_products
+        gradient_norm = float(np.linalg.norm(projected_gradient))
+        if gradient_norm < tol:
             break
 
-        T = T_new
+        step_size *= 2.0
+        accepted: (
+            tuple[
+                NDArray[np.float64],
+                NDArray[np.float64],
+                NDArray[np.float64],
+                float,
+                NDArray[np.float64],
+            ]
+            | None
+        ) = None
+        fallback: (
+            tuple[
+                NDArray[np.float64],
+                NDArray[np.float64],
+                NDArray[np.float64],
+                float,
+                NDArray[np.float64],
+            ]
+            | None
+        ) = None
 
-    Ti = np.linalg.inv(T)
-    rotated = A @ Ti.T
+        for _ in range(12):
+            candidate_transform = factor_transform - step_size * projected_gradient
+            column_norms = np.linalg.norm(candidate_transform, axis=0)
+            if np.any(column_norms <= np.finfo(np.float64).eps):
+                step_size /= 2.0
+                continue
+            candidate_transform = candidate_transform / column_norms
 
-    factor_corr = Ti @ Ti.T
+            try:
+                candidate_inverse = np.linalg.inv(candidate_transform)
+            except np.linalg.LinAlgError:
+                step_size /= 2.0
+                continue
 
-    return rotated, Ti.T, factor_corr
+            candidate_loadings = A @ candidate_inverse.T
+            candidate_criterion, candidate_loading_gradient = objective(
+                candidate_loadings
+            )
+            if not np.isfinite(candidate_criterion) or not np.all(
+                np.isfinite(candidate_loading_gradient)
+            ):
+                step_size /= 2.0
+                continue
+
+            proposal = (
+                candidate_transform,
+                candidate_inverse,
+                candidate_loadings,
+                candidate_criterion,
+                candidate_loading_gradient,
+            )
+            if candidate_criterion < criterion:
+                fallback = proposal
+            improvement = criterion - candidate_criterion
+            if improvement > 0.5 * gradient_norm**2 * step_size:
+                accepted = proposal
+                break
+            step_size /= 2.0
+
+        if accepted is None:
+            accepted = fallback
+        if accepted is None:
+            break
+
+        (
+            factor_transform,
+            inverse_transform,
+            rotated,
+            criterion,
+            loading_gradient,
+        ) = accepted
+        gradient = -(rotated.T @ loading_gradient @ inverse_transform).T
+
+    direct_rotation = inverse_transform.T
+    return _standardize_oblique_solution(A, direct_rotation)
+
+
+def _standardize_oblique_solution(
+    A: NDArray[np.float64],
+    rotation: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Scale an oblique solution so its factor covariance is a correlation."""
+    try:
+        inverse_rotation = np.linalg.inv(rotation)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("oblique rotation produced a singular transform") from exc
+
+    factor_correlation = inverse_rotation @ inverse_rotation.T
+    scales = np.sqrt(np.diag(factor_correlation))
+    if not np.all(np.isfinite(scales)) or np.any(scales <= 0):
+        raise ValueError("oblique rotation produced invalid factor scales")
+
+    standardized_rotation = rotation * scales[None, :]
+    factor_correlation = factor_correlation / np.outer(scales, scales)
+    factor_correlation = (factor_correlation + factor_correlation.T) / 2
+    np.fill_diagonal(factor_correlation, 1.0)
+    return A @ standardized_rotation, standardized_rotation, factor_correlation
 
 
 def _promax(
@@ -280,24 +426,14 @@ def _promax(
     """
     varimax_rotated, T_varimax = _varimax(A, max_iter, tol)
 
-    P = varimax_rotated.copy()
-    signs = np.sign(P)
-    P = signs * (np.abs(P) ** kappa)
-
+    target = np.sign(varimax_rotated) * np.abs(varimax_rotated) ** kappa
     try:
-        T_oblique = np.linalg.lstsq(varimax_rotated, P, rcond=None)[0]
+        oblique_transform = np.linalg.lstsq(varimax_rotated, target, rcond=None)[0]
     except np.linalg.LinAlgError:
-        T_oblique = np.linalg.pinv(varimax_rotated) @ P
+        oblique_transform = np.linalg.pinv(varimax_rotated) @ target
 
-    D = np.diag(1 / np.sqrt(np.diag(T_oblique.T @ T_oblique)))
-    T_oblique = T_oblique @ D
-
-    rotated = A @ T_varimax @ T_oblique
-
-    Ti = np.linalg.inv(T_oblique)
-    factor_corr = Ti @ Ti.T
-
-    return rotated, T_varimax @ T_oblique, factor_corr
+    rotation = T_varimax @ oblique_transform
+    return _standardize_oblique_solution(A, rotation)
 
 
 def _geomin(
@@ -310,42 +446,13 @@ def _geomin(
 
     Minimizes sum of geometric means of squared loadings.
     """
-    n, p = A.shape
 
-    def geomin_criterion(t_flat: NDArray[np.float64]) -> float:
-        T = t_flat.reshape(p, p)
-        try:
-            Ti = np.linalg.inv(T)
-        except np.linalg.LinAlgError:
-            return 1e10
+    def objective(
+        loadings: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        return _geomin_objective(loadings, epsilon)
 
-        L = A @ Ti.T
-        L2 = L**2 + epsilon
-
-        log_L2 = np.log(L2)
-        geo_means = np.exp(log_L2.mean(axis=1))
-
-        return np.sum(geo_means)
-
-    T0 = np.eye(p).flatten()
-    result = minimize(
-        geomin_criterion,
-        T0,
-        method="L-BFGS-B",
-        options={"maxiter": max_iter, "ftol": tol},
-    )
-
-    T = result.x.reshape(p, p)
-
-    U, _, Vt = svd(T, full_matrices=False)
-    T = U @ Vt
-
-    Ti = np.linalg.inv(T)
-    rotated = A @ Ti.T
-
-    factor_corr = Ti @ Ti.T
-
-    return rotated, Ti.T, factor_corr
+    return _oblique_gradient_projection(A, objective, max_iter, tol)
 
 
 def apply_rotation_to_model(
@@ -357,27 +464,75 @@ def apply_rotation_to_model(
 
     Parameters
     ----------
-    model : MultidimensionalModel
-        A fitted exploratory MIRT model
+    model : BaseItemModel
+        A fitted exploratory model with a freely rotatable two-dimensional
+        loading or slope matrix. Structured bifactor and confirmatory models
+        cannot be updated in place.
     rotation_matrix : ndarray
         Rotation matrix from rotate_loadings()
     factor_correlation : ndarray, optional
         Factor correlation matrix for oblique rotations
     """
+    if getattr(model, "model_type", None) == "confirmatory":
+        raise ValueError("rotation can only be applied to exploratory models")
+
     params = model.parameters
-
     if "loadings" in params:
-        loadings = params["loadings"]
-        rotated_loadings = loadings @ rotation_matrix
-        model.set_parameters(loadings=rotated_loadings)
-
+        parameter_name = "loadings"
+    elif "slopes" in params:
+        parameter_name = "slopes"
     elif "general_loadings" in params:
-        gen_loadings = params["general_loadings"]
-        rotated = gen_loadings @ rotation_matrix
-        model.set_parameters(general_loadings=rotated)
+        raise ValueError(
+            "structured bifactor loadings cannot be updated by a dense rotation"
+        )
+    else:
+        raise ValueError("Model does not have freely rotatable loadings")
 
-    model._rotation_matrix = rotation_matrix
-    model._factor_correlation = factor_correlation
+    loadings = np.asarray(params[parameter_name], dtype=np.float64)
+    rotation = np.asarray(rotation_matrix, dtype=np.float64)
+    if loadings.ndim != 2:
+        raise ValueError("model loadings must be a 2D matrix")
+    expected_shape = (loadings.shape[1], loadings.shape[1])
+    if rotation.shape != expected_shape:
+        raise ValueError(
+            f"rotation_matrix must have shape {expected_shape}, got {rotation.shape}"
+        )
+    if not np.all(np.isfinite(rotation)):
+        raise ValueError("rotation_matrix must contain only finite values")
+    condition_number = float(np.linalg.cond(rotation))
+    if (
+        not np.isfinite(condition_number)
+        or condition_number >= 1 / np.finfo(np.float64).eps
+    ):
+        raise ValueError("rotation_matrix must be nonsingular")
+
+    correlation: NDArray[np.float64] | None
+    if factor_correlation is None:
+        correlation = None
+    else:
+        correlation = np.asarray(factor_correlation, dtype=np.float64)
+        if correlation.shape != expected_shape:
+            raise ValueError(
+                f"factor_correlation must have shape {expected_shape}, "
+                f"got {correlation.shape}"
+            )
+        if not np.all(np.isfinite(correlation)):
+            raise ValueError("factor_correlation must contain only finite values")
+        if not np.allclose(correlation, correlation.T, atol=1e-8, rtol=1e-8):
+            raise ValueError("factor_correlation must be symmetric")
+        if not np.allclose(np.diag(correlation), 1.0, atol=1e-8, rtol=1e-8):
+            raise ValueError("factor_correlation must have ones on its diagonal")
+        if np.min(np.linalg.eigvalsh(correlation)) <= 0:
+            raise ValueError("factor_correlation must be positive definite")
+        inverse_rotation = np.linalg.inv(rotation)
+        implied_correlation = inverse_rotation @ inverse_rotation.T
+        if not np.allclose(correlation, implied_correlation, atol=1e-7, rtol=1e-7):
+            raise ValueError("factor_correlation is inconsistent with rotation_matrix")
+
+    rotated_loadings = loadings @ rotation
+    model.set_parameters(**{parameter_name: rotated_loadings})
+    model._rotation_matrix = rotation.copy()
+    model._factor_correlation = None if correlation is None else correlation.copy()
 
 
 def get_rotated_loadings(
@@ -389,8 +544,9 @@ def get_rotated_loadings(
 
     Parameters
     ----------
-    model : MultidimensionalModel
-        A fitted exploratory MIRT model
+    model : BaseItemModel
+        A fitted model exposing a loading matrix. Structured bifactor models
+        are supported for reading and rotation without in-place mutation.
     method : str
         Rotation method
     **kwargs
@@ -407,8 +563,10 @@ def get_rotated_loadings(
 
     if "loadings" in params:
         loadings = params["loadings"]
-    elif "general_loadings" in params:
-        loadings = params["general_loadings"]
+    elif "slopes" in params:
+        loadings = params["slopes"]
+    elif callable(getattr(model, "get_loading_matrix", None)):
+        loadings = np.asarray(model.get_loading_matrix(), dtype=np.float64)
     else:
         raise ValueError("Model does not have loadings to rotate")
 

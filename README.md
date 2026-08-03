@@ -419,6 +419,7 @@ plot_person_item_map(result.model, scores.theta)
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
 | `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
 | `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
+| `rotate_loadings()` | Varimax, quartimax, equamax, oblimin, promax, and geomin rotations |
 
 ### Data Transformation Functions
 
