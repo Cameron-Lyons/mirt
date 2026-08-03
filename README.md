@@ -75,7 +75,7 @@ pip install mirt[dev]
 
 For plotting support:
 ```bash
-pip install matplotlib
+pip install "mirt[plot]"
 ```
 
 ## Quick Start
@@ -301,11 +301,19 @@ print(f"Grade separation (effect sizes): {diagnostics.grade_separation}")
 ### Plotting
 
 ```python
-from mirt import plot_icc, plot_information, plot_person_item_map
+from mirt import (
+    plot_category_curves,
+    plot_icc,
+    plot_information,
+    plot_person_item_map,
+)
 
 plot_icc(result.model, item_idx=[0, 1, 2])
 
 plot_information(result.model)
+
+# Polytomous category response curves
+plot_category_curves(result.model, item_idx=0)
 
 plot_person_item_map(result.model, scores.theta)
 ```
@@ -503,7 +511,7 @@ print(f"Rust extension: {mirt.is_rust_available()}")
 
 | Package | Purpose | Installation |
 |---------|---------|--------------|
-| **matplotlib** | Plotting (ICC, information curves, Wright maps, DIF) | `pip install matplotlib` |
+| **matplotlib** | Plotting (ICC, category and information curves, Wright maps, DIF) | `pip install "mirt[plot]"` |
 | **pandas** | DataFrame output for results | `pip install mirt[pandas]` |
 | **polars** | DataFrame output (faster, preferred when both installed) | `pip install mirt[polars]` |
 

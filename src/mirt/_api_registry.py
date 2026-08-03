@@ -221,6 +221,7 @@ BASE_EXPORTS = [
 
 PLOTTING_EXPORTS = [
     "plot_icc",
+    "plot_category_curves",
     "plot_information",
     "plot_ability_distribution",
     "plot_itemfit",
