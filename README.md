@@ -19,6 +19,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
 - **Nonparametric**: Monotonic spline IRFs
+- **Network Psychometrics**: Ising and sparse Gaussian graphical models
 
 ### Estimation Methods
 - **EM Algorithm**: Gauss-Hermite quadrature (with Rust acceleration)

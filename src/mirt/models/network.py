@@ -1,9 +1,4 @@
-"""Network Psychometrics Models.
-
-This module provides:
-- IsingModel for binary network models
-- GaussianGraphicalModel for continuous/ordinal data
-"""
+"""Network psychometrics models for binary and continuous observations."""
 
 from __future__ import annotations
 
@@ -13,24 +8,166 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtDataError, MirtValidationError
+
+FloatArray = NDArray[np.float64]
+IntArray = NDArray[np.int64]
+
+
+def _validate_node_metadata(
+    n_nodes: int, node_names: list[str] | None
+) -> tuple[int, list[str]]:
+    if isinstance(n_nodes, bool) or not isinstance(n_nodes, (int, np.integer)):
+        raise MirtValidationError(
+            "n_nodes must be an integer", parameter="n_nodes", value=n_nodes
+        )
+    n_nodes = int(n_nodes)
+    if n_nodes < 2:
+        raise MirtValidationError(
+            "n_nodes must be at least 2",
+            parameter="n_nodes",
+            value=n_nodes,
+            expected=">= 2",
+        )
+
+    names = (
+        [f"X{i}" for i in range(n_nodes)] if node_names is None else list(node_names)
+    )
+    if len(names) != n_nodes:
+        raise MirtValidationError(
+            f"node_names length ({len(names)}) must match n_nodes ({n_nodes})",
+            parameter="node_names",
+        )
+    if any(not isinstance(name, str) or not name.strip() for name in names):
+        raise MirtValidationError(
+            "node_names must contain non-empty strings", parameter="node_names"
+        )
+    names = [name.strip() for name in names]
+    if len(names) != len(set(names)):
+        raise MirtValidationError(
+            "node_names must be unique", parameter="node_names", value=names
+        )
+    return n_nodes, names
+
+
+def _validate_node_index(node_idx: int, n_nodes: int) -> int:
+    if isinstance(node_idx, bool) or not isinstance(node_idx, (int, np.integer)):
+        raise MirtValidationError(
+            "node_idx must be an integer", parameter="node_idx", value=node_idx
+        )
+    node_idx = int(node_idx)
+    if node_idx < 0 or node_idx >= n_nodes:
+        raise IndexError(f"Node index {node_idx} out of range [0, {n_nodes})")
+    return node_idx
+
+
+def _validate_count(name: str, value: int, *, allow_zero: bool) -> int:
+    minimum = 0 if allow_zero else 1
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, np.integer))
+        or value < minimum
+    ):
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise MirtValidationError(
+            f"{name} must be a {qualifier} integer", parameter=name, value=value
+        )
+    return int(value)
+
+
+def _validate_optimizer_options(
+    regularization: float, max_iter: int, tol: float
+) -> tuple[float, int, float]:
+    regularization = float(regularization)
+    tol = float(tol)
+    max_iter = _validate_count("max_iter", max_iter, allow_zero=False)
+    if not np.isfinite(regularization) or regularization < 0.0:
+        raise MirtValidationError(
+            "regularization must be finite and non-negative",
+            parameter="regularization",
+            value=regularization,
+        )
+    if not np.isfinite(tol) or tol <= 0.0:
+        raise MirtValidationError(
+            "tol must be finite and positive", parameter="tol", value=tol
+        )
+    return regularization, max_iter, tol
+
+
+def _validate_binary_responses(
+    responses: NDArray[np.int_],
+    *,
+    n_nodes: int | None = None,
+    minimum_observations: int = 1,
+) -> IntArray:
+    values = np.asarray(responses)
+    if values.ndim != 2:
+        raise MirtDataError(
+            "responses must be a two-dimensional matrix",
+            value=values.ndim,
+            expected="2 dimensions",
+        )
+    if n_nodes is not None and values.shape[1] != n_nodes:
+        raise MirtDataError(
+            f"responses has {values.shape[1]} nodes, expected {n_nodes}",
+            n_items=values.shape[1],
+        )
+    if values.shape[1] < 2:
+        raise MirtDataError("responses must contain at least two nodes")
+    if values.shape[0] < minimum_observations:
+        raise MirtDataError(
+            f"responses must contain at least {minimum_observations} observations"
+        )
+    if not np.issubdtype(values.dtype, np.number) or not np.all(np.isfinite(values)):
+        raise MirtDataError("responses must contain finite binary values")
+    integer_values = values.astype(np.int64)
+    if not np.array_equal(values, integer_values) or np.any(
+        (integer_values != 0) & (integer_values != 1)
+    ):
+        raise MirtDataError("responses must contain only 0 and 1")
+    return integer_values
+
+
+def _validate_continuous_data(
+    data: NDArray[np.float64],
+    *,
+    n_nodes: int | None = None,
+    minimum_observations: int = 1,
+) -> FloatArray:
+    values = np.asarray(data, dtype=np.float64)
+    if values.ndim != 2:
+        raise MirtDataError(
+            "data must be a two-dimensional matrix",
+            value=values.ndim,
+            expected="2 dimensions",
+        )
+    if n_nodes is not None and values.shape[1] != n_nodes:
+        raise MirtDataError(
+            f"data has {values.shape[1]} nodes, expected {n_nodes}",
+            n_items=values.shape[1],
+        )
+    if values.shape[1] < 2:
+        raise MirtDataError("data must contain at least two nodes")
+    if values.shape[0] < minimum_observations:
+        raise MirtDataError(
+            f"data must contain at least {minimum_observations} observations"
+        )
+    if not np.all(np.isfinite(values)):
+        raise MirtDataError("data must contain only finite values")
+    return values
+
+
+def _stable_sigmoid(values: FloatArray) -> FloatArray:
+    return np.exp(-np.logaddexp(0.0, -values))
+
+
+def _soft_threshold(values: FloatArray, threshold: float) -> FloatArray:
+    return np.sign(values) * np.maximum(np.abs(values) - threshold, 0.0)
 
 
 @dataclass
 class NetworkResult:
-    """Results from network model estimation.
-
-    Attributes
-    ----------
-    model : IsingModel or GaussianGraphicalModel
-        Fitted model.
-    log_pseudo_likelihood : float
-        Log-pseudolikelihood at convergence.
-    n_iterations : int
-        Number of iterations.
-    converged : bool
-        Whether estimation converged.
-    """
+    """Summary of a network model fit."""
 
     model: IsingModel | GaussianGraphicalModel
     log_pseudo_likelihood: float
@@ -39,26 +176,11 @@ class NetworkResult:
 
 
 class IsingModel:
-    """Binary network model for item responses.
+    """Binary network with thresholds and symmetric pairwise interactions.
 
-    The Ising model represents binary variables as nodes in a network,
-    with thresholds (main effects) and pairwise interactions (edges).
+    The model uses the 0/1 parameterization
 
-    P(X = x) ∝ exp(Σ_i τ_i x_i + Σ_{i<j} ω_{ij} x_i x_j)
-
-    Parameters
-    ----------
-    n_nodes : int
-        Number of nodes (items/variables).
-    node_names : list of str, optional
-        Names for nodes.
-
-    Attributes
-    ----------
-    thresholds : NDArray
-        Node threshold parameters (n_nodes,).
-    interactions : NDArray
-        Pairwise interaction matrix (n_nodes, n_nodes), symmetric.
+    ``P(X=x) ∝ exp(thresholds @ x + 0.5 * x.T @ interactions @ x)``.
     """
 
     def __init__(
@@ -66,21 +188,13 @@ class IsingModel:
         n_nodes: int,
         node_names: list[str] | None = None,
     ) -> None:
-        if n_nodes < 2:
-            raise ValueError("n_nodes must be at least 2")
-
-        self._n_nodes = n_nodes
-        self._node_names = node_names or [f"X{i}" for i in range(n_nodes)]
-
-        if len(self._node_names) != n_nodes:
-            raise ValueError(
-                f"node_names length ({len(self._node_names)}) "
-                f"must match n_nodes ({n_nodes})"
-            )
-
-        self._thresholds = np.zeros(n_nodes, dtype=np.float64)
-        self._interactions = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+        self._n_nodes, self._node_names = _validate_node_metadata(n_nodes, node_names)
+        self._thresholds = np.zeros(self._n_nodes, dtype=np.float64)
+        self._interactions = np.zeros((self._n_nodes, self._n_nodes), dtype=np.float64)
         self._is_fitted = False
+        self._n_iterations = 0
+        self._converged = False
+        self._objective_history: list[float] = []
 
     @property
     def n_nodes(self) -> int:
@@ -88,202 +202,220 @@ class IsingModel:
 
     @property
     def node_names(self) -> list[str]:
-        return list(self._node_names)
+        return self._node_names.copy()
 
     @property
-    def thresholds(self) -> NDArray[np.float64]:
+    def thresholds(self) -> FloatArray:
         return self._thresholds.copy()
 
     @property
-    def interactions(self) -> NDArray[np.float64]:
+    def interactions(self) -> FloatArray:
         return self._interactions.copy()
 
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    @property
+    def n_iterations(self) -> int:
+        return self._n_iterations
+
+    @property
+    def converged(self) -> bool:
+        return self._converged
+
+    @property
+    def objective_history(self) -> FloatArray:
+        return np.asarray(self._objective_history, dtype=np.float64)
+
     def set_thresholds(self, thresholds: NDArray[np.float64]) -> Self:
-        thresholds = np.asarray(thresholds, dtype=np.float64)
-        if thresholds.shape != (self._n_nodes,):
-            raise ValueError(
-                f"thresholds shape {thresholds.shape} != ({self._n_nodes},)"
+        values = np.asarray(thresholds, dtype=np.float64)
+        if values.shape != (self._n_nodes,):
+            raise MirtValidationError(
+                f"thresholds shape {values.shape} != ({self._n_nodes},)",
+                parameter="thresholds",
             )
-        self._thresholds = thresholds
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                "thresholds must contain only finite values",
+                parameter="thresholds",
+            )
+        self._thresholds = values.copy()
         return self
 
     def set_interactions(self, interactions: NDArray[np.float64]) -> Self:
-        interactions = np.asarray(interactions, dtype=np.float64)
-        if interactions.shape != (self._n_nodes, self._n_nodes):
-            raise ValueError(
-                f"interactions shape {interactions.shape} != "
-                f"({self._n_nodes}, {self._n_nodes})"
+        values = np.asarray(interactions, dtype=np.float64)
+        expected = (self._n_nodes, self._n_nodes)
+        if values.shape != expected:
+            raise MirtValidationError(
+                f"interactions shape {values.shape} != {expected}",
+                parameter="interactions",
             )
-
-        interactions = (interactions + interactions.T) / 2
-        np.fill_diagonal(interactions, 0)
-
-        self._interactions = interactions
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                "interactions must contain only finite values",
+                parameter="interactions",
+            )
+        values = (values + values.T) / 2.0
+        np.fill_diagonal(values, 0.0)
+        self._interactions = values
         return self
+
+    def _linear_predictors(self, responses: IntArray) -> FloatArray:
+        return self._thresholds + responses @ self._interactions.T
+
+    def conditional_probabilities(self, responses: NDArray[np.int_]) -> FloatArray:
+        """Return every node's full-conditional success probability."""
+
+        values = _validate_binary_responses(responses, n_nodes=self._n_nodes)
+        return _stable_sigmoid(self._linear_predictors(values))
 
     def conditional_probability(
         self,
         node_idx: int,
         other_values: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Compute P(X_i = 1 | X_{-i}).
+    ) -> FloatArray:
+        """Compute ``P(X_i=1 | X_-i)`` for one node."""
 
-        Parameters
-        ----------
-        node_idx : int
-            Index of node to compute probability for.
-        other_values : NDArray
-            Values of other nodes (n_samples, n_nodes).
-
-        Returns
-        -------
-        NDArray
-            Probability X_i = 1 given other nodes (n_samples,).
-        """
-        other_values = np.asarray(other_values)
-        if other_values.ndim == 1:
-            other_values = other_values.reshape(1, -1)
-
-        linear_pred = self._thresholds[node_idx]
-        linear_pred = linear_pred + np.dot(
-            other_values, self._interactions[node_idx, :]
-        )
-
-        return 1 / (1 + np.exp(-linear_pred))
+        node_idx = _validate_node_index(node_idx, self._n_nodes)
+        return self.conditional_probabilities(other_values)[:, node_idx]
 
     def pseudo_likelihood(self, responses: NDArray[np.int_]) -> float:
-        """Compute log-pseudolikelihood.
+        """Compute mean log-pseudolikelihood across observations."""
 
-        The pseudolikelihood is the product of full conditionals.
+        values = _validate_binary_responses(responses, n_nodes=self._n_nodes)
+        linear = self._linear_predictors(values)
+        log_terms = values * linear - np.logaddexp(0.0, linear)
+        return float(np.sum(log_terms) / values.shape[0])
 
-        Parameters
-        ----------
-        responses : NDArray
-            Binary response matrix (n_samples, n_nodes).
+    def log_partition_function(self, max_nodes: int = 16) -> float:
+        """Compute the exact log partition function for a small network.
 
-        Returns
-        -------
-        float
-            Log-pseudolikelihood.
+        Exact enumeration grows exponentially, so the default guard rejects
+        networks larger than 16 nodes. Increase ``max_nodes`` explicitly when
+        the memory and runtime cost is acceptable.
         """
-        responses = np.asarray(responses)
-        n_samples = responses.shape[0]
 
-        log_psl = 0.0
-        for i in range(self._n_nodes):
-            p_i = self.conditional_probability(i, responses)
-            p_i = np.clip(p_i, PROB_EPSILON, 1 - PROB_EPSILON)
-            log_psl += np.sum(
-                responses[:, i] * np.log(p_i) + (1 - responses[:, i]) * np.log(1 - p_i)
+        max_nodes = _validate_count("max_nodes", max_nodes, allow_zero=False)
+        if self._n_nodes > max_nodes:
+            raise MirtValidationError(
+                f"Exact enumeration requires {2**self._n_nodes:,} states",
+                parameter="max_nodes",
+                value=max_nodes,
+                expected=f">= {self._n_nodes}",
             )
+        state_ids = np.arange(2**self._n_nodes, dtype=np.uint64)[:, None]
+        bit_positions = np.arange(self._n_nodes, dtype=np.uint64)
+        states = ((state_ids >> bit_positions) & 1).astype(np.float64)
+        energies = states @ self._thresholds + 0.5 * np.einsum(
+            "bi,ij,bj->b", states, self._interactions, states, optimize=True
+        )
+        return float(np.logaddexp.reduce(energies))
 
-        return log_psl / n_samples
+    def log_probability(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        max_nodes: int = 16,
+    ) -> FloatArray:
+        """Compute exact normalized log probabilities for small networks."""
+
+        values = _validate_binary_responses(responses, n_nodes=self._n_nodes)
+        energies = values @ self._thresholds + 0.5 * np.einsum(
+            "bi,ij,bj->b", values, self._interactions, values, optimize=True
+        )
+        return energies - self.log_partition_function(max_nodes=max_nodes)
+
+    def probability(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        max_nodes: int = 16,
+    ) -> FloatArray:
+        """Compute exact normalized probabilities for small networks."""
+
+        return np.exp(self.log_probability(responses, max_nodes=max_nodes))
 
     def sample(
         self,
         n_samples: int,
         n_burnin: int = 1000,
         seed: int | None = None,
-    ) -> NDArray[np.int_]:
-        """Generate samples using Gibbs sampling.
+        thin: int = 1,
+    ) -> IntArray:
+        """Generate Gibbs samples, optionally retaining every ``thin`` sweep."""
 
-        Parameters
-        ----------
-        n_samples : int
-            Number of samples to generate.
-        n_burnin : int
-            Number of burn-in iterations.
-        seed : int, optional
-            Random seed.
+        n_samples = _validate_count("n_samples", n_samples, allow_zero=True)
+        n_burnin = _validate_count("n_burnin", n_burnin, allow_zero=True)
+        thin = _validate_count("thin", thin, allow_zero=False)
+        samples = np.zeros((n_samples, self._n_nodes), dtype=np.int64)
+        if n_samples == 0:
+            return samples
 
-        Returns
-        -------
-        NDArray
-            Binary samples (n_samples, n_nodes).
-        """
         rng = np.random.default_rng(seed)
-
-        current = rng.binomial(1, 0.5, self._n_nodes)
-        samples = np.zeros((n_samples, self._n_nodes), dtype=np.int_)
-
-        for t in range(n_burnin + n_samples):
-            for i in range(self._n_nodes):
-                p_i = self.conditional_probability(i, current.reshape(1, -1))[0]
-                current[i] = rng.binomial(1, p_i)
-
-            if t >= n_burnin:
-                samples[t - n_burnin] = current
-
+        current = rng.binomial(1, 0.5, self._n_nodes).astype(np.int64)
+        linear = self._thresholds + self._interactions @ current
+        sample_idx = 0
+        total_sweeps = n_burnin + n_samples * thin
+        for sweep in range(total_sweeps):
+            for node in range(self._n_nodes):
+                node_linear = linear[node]
+                if node_linear >= 0.0:
+                    probability = 1.0 / (1.0 + np.exp(-node_linear))
+                else:
+                    exponential = np.exp(node_linear)
+                    probability = exponential / (1.0 + exponential)
+                updated = int(rng.random() < probability)
+                change = updated - current[node]
+                if change:
+                    current[node] = updated
+                    linear += self._interactions[:, node] * change
+            if sweep >= n_burnin and (sweep - n_burnin) % thin == 0:
+                samples[sample_idx] = current
+                sample_idx += 1
         return samples
 
-    def edge_weights(self) -> NDArray[np.float64]:
-        """Get edge weight matrix (upper triangle only)."""
+    def edge_weights(self) -> FloatArray:
+        """Return the interaction matrix's upper triangle."""
+
         return np.triu(self._interactions, k=1)
 
-    def degree_centrality(self) -> NDArray[np.float64]:
-        """Compute degree centrality for each node."""
+    def degree_centrality(self) -> FloatArray:
+        """Return normalized absolute node strength."""
+
         return np.sum(np.abs(self._interactions), axis=1) / (self._n_nodes - 1)
 
-    def expected_influence(self) -> NDArray[np.float64]:
-        """Compute expected influence for each node.
+    def expected_influence(self) -> FloatArray:
+        """Return signed node strength."""
 
-        Sum of all edge weights connected to each node.
-        """
         return np.sum(self._interactions, axis=1)
 
     def copy(self) -> Self:
-        new_model = IsingModel(
-            n_nodes=self._n_nodes,
-            node_names=list(self._node_names),
-        )
-        new_model._thresholds = self._thresholds.copy()
-        new_model._interactions = self._interactions.copy()
-        new_model._is_fitted = self._is_fitted
-        return new_model
+        copied = self.__class__(self._n_nodes, self._node_names)
+        copied._thresholds = self._thresholds.copy()
+        copied._interactions = self._interactions.copy()
+        copied._is_fitted = self._is_fitted
+        copied._n_iterations = self._n_iterations
+        copied._converged = self._converged
+        copied._objective_history = self._objective_history.copy()
+        return copied
 
 
 class GaussianGraphicalModel:
-    """Gaussian Graphical Model for continuous/ordinal data.
-
-    Models the conditional independence structure using a precision
-    matrix (inverse covariance). Partial correlations indicate
-    direct associations after controlling for all other variables.
-
-    Parameters
-    ----------
-    n_nodes : int
-        Number of nodes (variables).
-    node_names : list of str, optional
-        Names for nodes.
-
-    Attributes
-    ----------
-    means : NDArray
-        Node means (n_nodes,).
-    precision_matrix : NDArray
-        Precision matrix (n_nodes, n_nodes).
-    """
+    """Gaussian network represented by a positive-definite precision matrix."""
 
     def __init__(
         self,
         n_nodes: int,
         node_names: list[str] | None = None,
     ) -> None:
-        if n_nodes < 2:
-            raise ValueError("n_nodes must be at least 2")
-
-        self._n_nodes = n_nodes
-        self._node_names = node_names or [f"X{i}" for i in range(n_nodes)]
-
-        if len(self._node_names) != n_nodes:
-            raise ValueError(
-                f"node_names length ({len(self._node_names)}) "
-                f"must match n_nodes ({n_nodes})"
-            )
-
-        self._means = np.zeros(n_nodes, dtype=np.float64)
-        self._precision = np.eye(n_nodes, dtype=np.float64)
+        self._n_nodes, self._node_names = _validate_node_metadata(n_nodes, node_names)
+        self._means = np.zeros(self._n_nodes, dtype=np.float64)
+        self._precision = np.eye(self._n_nodes, dtype=np.float64)
         self._is_fitted = False
+        self._n_iterations = 0
+        self._converged = False
+        self._objective_history: list[float] = []
 
     @property
     def n_nodes(self) -> int:
@@ -291,59 +423,80 @@ class GaussianGraphicalModel:
 
     @property
     def node_names(self) -> list[str]:
-        return list(self._node_names)
+        return self._node_names.copy()
 
     @property
-    def means(self) -> NDArray[np.float64]:
+    def means(self) -> FloatArray:
         return self._means.copy()
 
     @property
-    def precision_matrix(self) -> NDArray[np.float64]:
+    def precision_matrix(self) -> FloatArray:
         return self._precision.copy()
 
     @property
-    def covariance_matrix(self) -> NDArray[np.float64]:
-        """Covariance matrix (inverse of precision)."""
-        return np.linalg.inv(self._precision)
+    def covariance_matrix(self) -> FloatArray:
+        """Return the inverse precision matrix."""
+
+        return np.linalg.solve(self._precision, np.eye(self._n_nodes))
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    @property
+    def n_iterations(self) -> int:
+        return self._n_iterations
+
+    @property
+    def converged(self) -> bool:
+        return self._converged
+
+    @property
+    def objective_history(self) -> FloatArray:
+        return np.asarray(self._objective_history, dtype=np.float64)
 
     def set_means(self, means: NDArray[np.float64]) -> Self:
-        means = np.asarray(means, dtype=np.float64)
-        if means.shape != (self._n_nodes,):
-            raise ValueError(f"means shape {means.shape} != ({self._n_nodes},)")
-        self._means = means
+        values = np.asarray(means, dtype=np.float64)
+        if values.shape != (self._n_nodes,):
+            raise MirtValidationError(
+                f"means shape {values.shape} != ({self._n_nodes},)",
+                parameter="means",
+            )
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                "means must contain only finite values", parameter="means"
+            )
+        self._means = values.copy()
         return self
 
     def set_precision_matrix(self, precision: NDArray[np.float64]) -> Self:
-        precision = np.asarray(precision, dtype=np.float64)
-        if precision.shape != (self._n_nodes, self._n_nodes):
-            raise ValueError(
-                f"precision shape {precision.shape} != "
-                f"({self._n_nodes}, {self._n_nodes})"
+        values = np.asarray(precision, dtype=np.float64)
+        expected = (self._n_nodes, self._n_nodes)
+        if values.shape != expected:
+            raise MirtValidationError(
+                f"precision shape {values.shape} != {expected}",
+                parameter="precision",
             )
-
-        precision = (precision + precision.T) / 2
-
-        eigvals = np.linalg.eigvalsh(precision)
-        if np.any(eigvals <= 0):
-            raise ValueError("precision matrix must be positive definite")
-
-        self._precision = precision
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                "precision must contain only finite values", parameter="precision"
+            )
+        values = (values + values.T) / 2.0
+        try:
+            np.linalg.cholesky(values)
+        except np.linalg.LinAlgError as error:
+            raise MirtValidationError(
+                "precision matrix must be positive definite",
+                parameter="precision",
+            ) from error
+        self._precision = values
         return self
 
-    def partial_correlations(self) -> NDArray[np.float64]:
-        """Compute partial correlation matrix.
+    def partial_correlations(self) -> FloatArray:
+        """Return standardized negative off-diagonal precision entries."""
 
-        Partial correlations are standardized off-diagonal elements
-        of the negative precision matrix.
-
-        Returns
-        -------
-        NDArray
-            Partial correlation matrix (n_nodes, n_nodes).
-        """
-        d = np.sqrt(np.diag(self._precision))
-        d_inv = 1 / d
-        partial = -self._precision * np.outer(d_inv, d_inv)
+        scale = np.sqrt(np.diag(self._precision))
+        partial = -self._precision / np.outer(scale, scale)
         np.fill_diagonal(partial, 1.0)
         return partial
 
@@ -351,113 +504,116 @@ class GaussianGraphicalModel:
         self,
         node_idx: int,
         other_values: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Compute E[X_i | X_{-i}].
+    ) -> FloatArray:
+        """Compute a node's conditional mean.
 
-        Parameters
-        ----------
-        node_idx : int
-            Index of node.
-        other_values : NDArray
-            Values of other nodes (n_samples, n_nodes).
-
-        Returns
-        -------
-        NDArray
-            Conditional mean (n_samples,).
+        ``other_values`` may contain all nodes or only the ``n_nodes - 1``
+        conditioning nodes in their original order.
         """
-        other_values = np.asarray(other_values)
-        if other_values.ndim == 1:
-            other_values = other_values.reshape(1, -1)
 
-        prec_ii = self._precision[node_idx, node_idx]
-        prec_i_neg_i = np.delete(self._precision[node_idx, :], node_idx)
-        other_centered = np.delete(other_values - self._means, node_idx, axis=1)
+        node_idx = _validate_node_index(node_idx, self._n_nodes)
+        values = np.asarray(other_values, dtype=np.float64)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim != 2 or values.shape[1] not in (
+            self._n_nodes,
+            self._n_nodes - 1,
+        ):
+            raise MirtDataError(
+                f"other_values must have {self._n_nodes} or {self._n_nodes - 1} columns"
+            )
+        if not np.all(np.isfinite(values)):
+            raise MirtDataError("other_values must contain only finite values")
 
-        cond_mean = (
-            self._means[node_idx] - np.dot(other_centered, prec_i_neg_i) / prec_ii
+        other_means = np.delete(self._means, node_idx)
+        if values.shape[1] == self._n_nodes:
+            centered = np.delete(values, node_idx, axis=1) - other_means
+        else:
+            centered = values - other_means
+        precision_row = np.delete(self._precision[node_idx], node_idx)
+        return (
+            self._means[node_idx]
+            - centered @ precision_row / self._precision[node_idx, node_idx]
         )
-        return cond_mean
 
     def conditional_variance(self, node_idx: int) -> float:
-        """Compute Var[X_i | X_{-i}]."""
-        return 1 / self._precision[node_idx, node_idx]
+        """Compute a node's conditional variance."""
+
+        node_idx = _validate_node_index(node_idx, self._n_nodes)
+        return float(1.0 / self._precision[node_idx, node_idx])
 
     def log_likelihood(self, data: NDArray[np.float64]) -> float:
-        """Compute log-likelihood.
+        """Compute the Gaussian log likelihood."""
 
-        Parameters
-        ----------
-        data : NDArray
-            Data matrix (n_samples, n_nodes).
-
-        Returns
-        -------
-        float
-            Log-likelihood.
-        """
-        data = np.asarray(data)
-        n_samples = data.shape[0]
-
-        centered = data - self._means
-        sign, log_det = np.linalg.slogdet(self._precision)
-
-        if sign <= 0:
-            return -np.inf
-
-        quad_form = np.sum(centered @ self._precision * centered)
-
-        ll = (
-            -0.5 * n_samples * self._n_nodes * np.log(2 * np.pi)
-            + 0.5 * n_samples * log_det
-            - 0.5 * quad_form
+        values = _validate_continuous_data(data, n_nodes=self._n_nodes)
+        centered = values - self._means
+        log_det = 2.0 * np.log(np.diag(np.linalg.cholesky(self._precision))).sum()
+        quadratic = np.einsum(
+            "bi,ij,bj->", centered, self._precision, centered, optimize=True
         )
-
-        return ll
+        return float(
+            -0.5 * values.shape[0] * self._n_nodes * np.log(2.0 * np.pi)
+            + 0.5 * values.shape[0] * log_det
+            - 0.5 * quadratic
+        )
 
     def sample(
         self,
         n_samples: int,
         seed: int | None = None,
-    ) -> NDArray[np.float64]:
-        """Generate samples from the model.
+    ) -> FloatArray:
+        """Generate multivariate normal samples."""
 
-        Parameters
-        ----------
-        n_samples : int
-            Number of samples.
-        seed : int, optional
-            Random seed.
-
-        Returns
-        -------
-        NDArray
-            Samples (n_samples, n_nodes).
-        """
+        n_samples = _validate_count("n_samples", n_samples, allow_zero=True)
+        if n_samples == 0:
+            return np.empty((0, self._n_nodes), dtype=np.float64)
         rng = np.random.default_rng(seed)
-        cov = self.covariance_matrix
-        return rng.multivariate_normal(self._means, cov, size=n_samples)
+        return rng.multivariate_normal(
+            self._means, self.covariance_matrix, size=n_samples
+        )
 
-    def edge_weights(self) -> NDArray[np.float64]:
-        """Get edge weight matrix (partial correlations, upper triangle)."""
-        partial = self.partial_correlations()
-        return np.triu(partial, k=1)
+    def edge_weights(self) -> FloatArray:
+        """Return upper-triangular partial correlations."""
 
-    def degree_centrality(self) -> NDArray[np.float64]:
-        """Compute degree centrality based on partial correlations."""
+        return np.triu(self.partial_correlations(), k=1)
+
+    def degree_centrality(self) -> FloatArray:
+        """Return normalized absolute node strength."""
+
         partial = self.partial_correlations()
-        np.fill_diagonal(partial, 0)
+        np.fill_diagonal(partial, 0.0)
         return np.sum(np.abs(partial), axis=1) / (self._n_nodes - 1)
 
+    def expected_influence(self) -> FloatArray:
+        """Return signed partial-correlation strength."""
+
+        partial = self.partial_correlations()
+        np.fill_diagonal(partial, 0.0)
+        return np.sum(partial, axis=1)
+
     def copy(self) -> Self:
-        new_model = GaussianGraphicalModel(
-            n_nodes=self._n_nodes,
-            node_names=list(self._node_names),
-        )
-        new_model._means = self._means.copy()
-        new_model._precision = self._precision.copy()
-        new_model._is_fitted = self._is_fitted
-        return new_model
+        copied = self.__class__(self._n_nodes, self._node_names)
+        copied._means = self._means.copy()
+        copied._precision = self._precision.copy()
+        copied._is_fitted = self._is_fitted
+        copied._n_iterations = self._n_iterations
+        copied._converged = self._converged
+        copied._objective_history = self._objective_history.copy()
+        return copied
+
+
+def _ising_objective(
+    responses: IntArray,
+    thresholds: FloatArray,
+    interactions: FloatArray,
+    regularization: float,
+) -> float:
+    linear = thresholds + responses @ interactions.T
+    log_pseudo_likelihood = (
+        np.sum(responses * linear - np.logaddexp(0.0, linear)) / responses.shape[0]
+    )
+    penalty = regularization * np.sum(np.abs(np.triu(interactions, k=1)))
+    return float(log_pseudo_likelihood - penalty)
 
 
 def fit_ising(
@@ -466,81 +622,103 @@ def fit_ising(
     max_iter: int = 100,
     tol: float = 1e-4,
     verbose: bool = False,
+    node_names: list[str] | None = None,
 ) -> tuple[IsingModel, float]:
-    """Fit Ising model using pseudolikelihood with L1 regularization.
+    """Fit a symmetric Ising network by penalized pseudolikelihood.
 
-    Parameters
-    ----------
-    responses : NDArray
-        Binary response matrix (n_samples, n_nodes).
-    regularization : float
-        L1 regularization parameter (LASSO-like sparsity).
-    max_iter : int
-        Maximum iterations.
-    tol : float
-        Convergence tolerance.
-    verbose : bool
-        Whether to print progress.
-
-    Returns
-    -------
-    tuple
-        (fitted_model, log_pseudo_likelihood)
+    A vectorized proximal-gradient update optimizes all thresholds and unique
+    symmetric edges together. L1 regularization is applied only to edges.
     """
-    responses = np.asarray(responses)
-    n_samples, n_nodes = responses.shape
-    inv_n_samples = 1.0 / n_samples
-    responses_t = responses.T
 
-    model = IsingModel(n_nodes=n_nodes)
+    values = _validate_binary_responses(responses, minimum_observations=2)
+    regularization, max_iter, tol = _validate_optimizer_options(
+        regularization, max_iter, tol
+    )
+    n_samples, n_nodes = values.shape
+    model = IsingModel(n_nodes, node_names)
 
-    thresholds = np.zeros(n_nodes)
-    interactions = np.zeros((n_nodes, n_nodes))
+    probabilities = np.clip(values.mean(axis=0), 1e-6, 1.0 - 1e-6)
+    thresholds = np.log(probabilities / (1.0 - probabilities))
+    interactions = np.zeros((n_nodes, n_nodes), dtype=np.float64)
+    objective = _ising_objective(values, thresholds, interactions, regularization)
+    history = [objective]
+    step_size = 1.0 / (n_nodes + 1.0)
+    converged = False
 
-    for iteration in range(max_iter):
-        prev_thresholds = thresholds.copy()
-        prev_interactions = interactions.copy()
+    for iteration in range(1, max_iter + 1):
+        linear = thresholds + values @ interactions.T
+        residual = values - _stable_sigmoid(linear)
+        threshold_gradient = residual.mean(axis=0)
+        raw_gradient = residual.T @ values / n_samples
+        interaction_gradient = raw_gradient + raw_gradient.T
+        np.fill_diagonal(interaction_gradient, 0.0)
 
-        for i in range(n_nodes):
-            y = responses[:, i]
+        accepted = False
+        trial_step = step_size
+        for _ in range(40):
+            candidate_thresholds = thresholds + trial_step * threshold_gradient
+            candidate_interactions = _soft_threshold(
+                interactions + trial_step * interaction_gradient,
+                trial_step * regularization,
+            )
+            candidate_interactions = (
+                candidate_interactions + candidate_interactions.T
+            ) / 2.0
+            np.fill_diagonal(candidate_interactions, 0.0)
+            candidate_objective = _ising_objective(
+                values,
+                candidate_thresholds,
+                candidate_interactions,
+                regularization,
+            )
+            if candidate_objective >= objective - 1e-12:
+                accepted = True
+                break
+            trial_step *= 0.5
 
-            p = 1 / (1 + np.exp(-(thresholds[i] + responses @ interactions[i, :])))
-            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
+        if not accepted:
+            break
 
-            residual = y - p
-            grad_threshold = float(np.sum(residual) * inv_n_samples)
-            grad_interactions = (responses_t @ residual) * inv_n_samples
-            grad_interactions[i] = 0
-
-            step_size = 0.5
-            thresholds[i] += step_size * grad_threshold
-
-            for j in range(n_nodes):
-                if j != i:
-                    new_val = interactions[i, j] + step_size * grad_interactions[j]
-                    if regularization > 0:
-                        new_val = np.sign(new_val) * max(
-                            0, abs(new_val) - step_size * regularization
-                        )
-                    interactions[i, j] = new_val
-                    interactions[j, i] = new_val
+        parameter_change = max(
+            float(np.max(np.abs(candidate_thresholds - thresholds))),
+            float(np.max(np.abs(candidate_interactions - interactions))),
+        )
+        thresholds = candidate_thresholds
+        interactions = candidate_interactions
+        objective = candidate_objective
+        history.append(objective)
+        step_size = min(trial_step * 1.05, 1.0)
 
         if verbose:
-            model.set_thresholds(thresholds)
-            model.set_interactions(interactions)
-            psl = model.pseudo_likelihood(responses)
-            print(f"Iteration {iteration + 1}: PSL = {psl:.4f}")
-
-        thresh_change = np.max(np.abs(thresholds - prev_thresholds))
-        inter_change = np.max(np.abs(interactions - prev_interactions))
-
-        if max(thresh_change, inter_change) < tol:
+            print(f"Iteration {iteration}: objective = {objective:.6f}")
+        if parameter_change < tol:
+            converged = True
             break
 
     model.set_thresholds(thresholds)
     model.set_interactions(interactions)
     model._is_fitted = True
-    return model, model.pseudo_likelihood(responses)
+    model._n_iterations = len(history) - 1
+    model._converged = converged
+    model._objective_history = history
+    return model, model.pseudo_likelihood(values)
+
+
+def _ggm_objective(
+    sample_covariance: FloatArray,
+    precision: FloatArray,
+    regularization: float,
+) -> float:
+    sign, log_determinant = np.linalg.slogdet(precision)
+    if sign <= 0:
+        return -np.inf
+    off_diagonal = precision.copy()
+    np.fill_diagonal(off_diagonal, 0.0)
+    return float(
+        log_determinant
+        - np.sum(sample_covariance * precision)
+        - regularization * np.sum(np.abs(off_diagonal))
+    )
 
 
 def fit_ggm(
@@ -549,137 +727,176 @@ def fit_ggm(
     max_iter: int = 100,
     tol: float = 1e-6,
     verbose: bool = False,
+    node_names: list[str] | None = None,
 ) -> tuple[GaussianGraphicalModel, float]:
-    """Fit Gaussian Graphical Model with graphical LASSO.
+    """Fit a Gaussian graphical model with an off-diagonal L1 penalty.
 
-    Parameters
-    ----------
-    data : NDArray
-        Data matrix (n_samples, n_nodes).
-    regularization : float
-        L1 regularization parameter.
-    max_iter : int
-        Maximum iterations.
-    tol : float
-        Convergence tolerance.
-    verbose : bool
-        Whether to print progress.
-
-    Returns
-    -------
-    tuple
-        (fitted_model, log_likelihood)
+    Regularized fits use an adaptive ADMM solver whose precision update is
+    positive definite by construction. When ``regularization`` is zero, the
+    sample covariance must be invertible.
     """
-    data = np.asarray(data, dtype=np.float64)
-    n_samples, n_nodes = data.shape
 
-    means = np.mean(data, axis=0)
-    sample_cov = np.cov(data, rowvar=False, ddof=0)
+    values = _validate_continuous_data(data, minimum_observations=2)
+    regularization, max_iter, tol = _validate_optimizer_options(
+        regularization, max_iter, tol
+    )
+    _, n_nodes = values.shape
+    model = GaussianGraphicalModel(n_nodes, node_names)
 
-    if sample_cov.ndim == 0:
-        sample_cov = np.array([[sample_cov]])
+    means = values.mean(axis=0)
+    centered = values - means
+    sample_covariance = centered.T @ centered / values.shape[0]
+    scale = max(float(np.trace(sample_covariance) / n_nodes), 1.0)
+    eigenvalue_floor = np.finfo(np.float64).eps * scale * n_nodes
 
-    precision = np.linalg.inv(sample_cov + regularization * np.eye(n_nodes))
+    if regularization == 0.0:
+        if np.min(np.linalg.eigvalsh(sample_covariance)) <= eigenvalue_floor:
+            raise MirtValidationError(
+                "sample covariance is singular; use regularization > 0",
+                parameter="regularization",
+                value=regularization,
+            )
+        precision = np.linalg.solve(sample_covariance, np.eye(n_nodes))
+        history = [_ggm_objective(sample_covariance, precision, 0.0)]
+        converged = True
+        n_iterations = 0
+    else:
+        regularized_covariance = sample_covariance + regularization * np.eye(n_nodes)
+        precision = np.linalg.solve(regularized_covariance, np.eye(n_nodes))
+        sparse_precision = precision.copy()
+        scaled_dual = np.zeros_like(precision)
+        penalty_scale = 1.0
+        history = [_ggm_objective(sample_covariance, precision, regularization)]
+        converged = False
 
-    if regularization > 0:
-        for iteration in range(max_iter):
-            prev_precision = precision.copy()
+        for iteration in range(1, max_iter + 1):
+            update_matrix = (
+                penalty_scale * (sparse_precision - scaled_dual) - sample_covariance
+            )
+            eigenvalues, eigenvectors = np.linalg.eigh(update_matrix)
+            updated_eigenvalues = (
+                eigenvalues + np.sqrt(eigenvalues**2 + 4.0 * penalty_scale)
+            ) / (2.0 * penalty_scale)
+            precision = (eigenvectors * updated_eigenvalues) @ eigenvectors.T
 
-            cov = np.linalg.inv(precision)
+            previous_sparse = sparse_precision.copy()
+            threshold_input = precision + scaled_dual
+            sparse_precision = _soft_threshold(
+                threshold_input, regularization / penalty_scale
+            )
+            np.fill_diagonal(sparse_precision, np.diag(threshold_input))
+            sparse_precision = (sparse_precision + sparse_precision.T) / 2.0
+            scaled_dual += precision - sparse_precision
 
-            for j in range(n_nodes):
-                idx_not_j = np.arange(n_nodes) != j
-                W_jj = cov[j, j]
-                s_j = sample_cov[idx_not_j, j]
-                W_not_j = cov[np.ix_(idx_not_j, idx_not_j)]
-
-                try:
-                    beta = np.linalg.solve(W_not_j, s_j)
-                except np.linalg.LinAlgError:
-                    beta = np.zeros(n_nodes - 1)
-
-                for k in range(len(beta)):
-                    beta[k] = np.sign(beta[k]) * max(
-                        0, abs(beta[k]) - regularization / (2 * n_samples)
-                    )
-
-                cov[j, idx_not_j] = W_jj * beta
-                cov[idx_not_j, j] = W_jj * beta
-
-            try:
-                precision = np.linalg.inv(cov)
-            except np.linalg.LinAlgError:
-                precision = np.linalg.pinv(cov)
+            primal_residual = float(np.linalg.norm(precision - sparse_precision))
+            dual_residual = float(
+                penalty_scale * np.linalg.norm(sparse_precision - previous_sparse)
+            )
+            primal_tolerance = n_nodes * tol + tol * max(
+                float(np.linalg.norm(precision)),
+                float(np.linalg.norm(sparse_precision)),
+            )
+            dual_tolerance = n_nodes * tol + tol * penalty_scale * float(
+                np.linalg.norm(scaled_dual)
+            )
+            history.append(_ggm_objective(sample_covariance, precision, regularization))
 
             if verbose:
-                print(f"Iteration {iteration + 1}")
-
-            if np.max(np.abs(precision - prev_precision)) < tol:
+                print(
+                    f"Iteration {iteration}: objective = {history[-1]:.6f}, "
+                    f"primal = {primal_residual:.3e}, dual = {dual_residual:.3e}"
+                )
+            if primal_residual <= primal_tolerance and dual_residual <= dual_tolerance:
+                converged = True
                 break
 
-    model = GaussianGraphicalModel(n_nodes=n_nodes)
+            if primal_residual > 10.0 * dual_residual:
+                penalty_scale *= 2.0
+                scaled_dual /= 2.0
+            elif dual_residual > 10.0 * primal_residual:
+                penalty_scale /= 2.0
+                scaled_dual *= 2.0
+        n_iterations = len(history) - 1
+
+        if converged:
+            try:
+                np.linalg.cholesky(sparse_precision)
+            except np.linalg.LinAlgError:
+                pass
+            else:
+                precision = sparse_precision
+
     model.set_means(means)
-
-    try:
-        model.set_precision_matrix(precision)
-    except ValueError:
-        precision = precision + 0.01 * np.eye(n_nodes)
-        model.set_precision_matrix(precision)
-
+    model.set_precision_matrix(precision)
     model._is_fitted = True
-    return model, model.log_likelihood(data)
+    model._n_iterations = n_iterations
+    model._converged = converged
+    model._objective_history = history
+    return model, model.log_likelihood(values)
+
+
+def _network_weight_matrix(
+    model: IsingModel | GaussianGraphicalModel,
+) -> FloatArray:
+    if isinstance(model, IsingModel):
+        return model.interactions
+    partial = model.partial_correlations()
+    np.fill_diagonal(partial, 0.0)
+    return partial
 
 
 def compare_networks(
     model1: IsingModel | GaussianGraphicalModel,
     model2: IsingModel | GaussianGraphicalModel,
-) -> dict:
-    """Compare two network models.
+    *,
+    edge_threshold: float = 1e-8,
+) -> dict[str, float]:
+    """Compare corresponding edges and node strengths in two networks."""
 
-    Parameters
-    ----------
-    model1, model2 : IsingModel or GaussianGraphicalModel
-        Models to compare.
-
-    Returns
-    -------
-    dict
-        Comparison metrics including edge correlation, degree correlation.
-    """
     if not isinstance(model1, type(model2)):
-        raise ValueError("Models must be of the same type")
-
+        raise MirtValidationError("Models must be of the same type")
     if model1.n_nodes != model2.n_nodes:
-        raise ValueError("Models must have the same number of nodes")
+        raise MirtValidationError("Models must have the same number of nodes")
+    edge_threshold = float(edge_threshold)
+    if not np.isfinite(edge_threshold) or edge_threshold < 0.0:
+        raise MirtValidationError(
+            "edge_threshold must be finite and non-negative",
+            parameter="edge_threshold",
+            value=edge_threshold,
+        )
+    if set(model1.node_names) != set(model2.node_names):
+        raise MirtValidationError("Models must contain the same node names")
 
-    def _safe_correlation(x: NDArray[np.float64], y: NDArray[np.float64]) -> float:
-        """Return Pearson correlation, or NaN when undefined."""
-        x = np.asarray(x, dtype=np.float64).ravel()
-        y = np.asarray(y, dtype=np.float64).ravel()
+    model2_order = np.asarray(
+        [model2.node_names.index(name) for name in model1.node_names]
+    )
+    weights1 = _network_weight_matrix(model1)
+    weights2 = _network_weight_matrix(model2)[np.ix_(model2_order, model2_order)]
+    upper = np.triu_indices(model1.n_nodes, k=1)
+    edges1 = weights1[upper]
+    edges2 = weights2[upper]
 
-        if x.size != y.size or x.size < 2:
+    degree1 = np.sum(np.abs(weights1), axis=1) / (model1.n_nodes - 1)
+    degree2 = np.sum(np.abs(weights2), axis=1) / (model2.n_nodes - 1)
+    edge_difference = np.abs(edges1 - edges2)
+    present1 = np.abs(edges1) > edge_threshold
+    present2 = np.abs(edges2) > edge_threshold
+    union = np.count_nonzero(present1 | present2)
+    intersection = np.count_nonzero(present1 & present2)
+
+    def safe_correlation(left: FloatArray, right: FloatArray) -> float:
+        if left.size < 2:
             return np.nan
-
-        eps = np.finfo(np.float64).eps
-        if np.std(x) <= eps or np.std(y) <= eps:
+        scale = np.finfo(np.float64).eps
+        if np.std(left) <= scale or np.std(right) <= scale:
             return np.nan
-
-        return float(np.corrcoef(x, y)[0, 1])
-
-    edges1 = model1.edge_weights().flatten()
-    edges2 = model2.edge_weights().flatten()
-
-    edge_corr = _safe_correlation(edges1, edges2)
-
-    deg1 = model1.degree_centrality()
-    deg2 = model2.degree_centrality()
-    deg_corr = _safe_correlation(deg1, deg2)
-
-    edge_diff = np.abs(edges1 - edges2)
+        return float(np.corrcoef(left, right)[0, 1])
 
     return {
-        "edge_correlation": edge_corr,
-        "degree_correlation": deg_corr,
-        "mean_edge_difference": np.mean(edge_diff),
-        "max_edge_difference": np.max(edge_diff),
+        "edge_correlation": safe_correlation(edges1, edges2),
+        "degree_correlation": safe_correlation(degree1, degree2),
+        "mean_edge_difference": float(np.mean(edge_difference)),
+        "max_edge_difference": float(np.max(edge_difference)),
+        "frobenius_difference": float(np.linalg.norm(weights1 - weights2)),
+        "edge_jaccard": float(intersection / union) if union else 1.0,
     }
