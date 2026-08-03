@@ -36,7 +36,13 @@ class TestContentArea:
 
     def test_initialization_with_target(self):
         """Test initialization with target_items."""
-        area = ContentArea(name="Test", min_items=1, max_items=5, target_items=3)
+        area = ContentArea(
+            name="Test",
+            items={0, 1, 2},
+            min_items=1,
+            max_items=5,
+            target_items=3,
+        )
 
         assert area.target_items == 3
 
@@ -53,12 +59,24 @@ class TestContentArea:
     def test_validation_target_less_than_min(self):
         """Test that target_items < min_items raises error."""
         with pytest.raises(ValueError, match="target_items must be >= min_items"):
-            ContentArea(name="Test", min_items=5, max_items=10, target_items=3)
+            ContentArea(
+                name="Test",
+                items=set(range(10)),
+                min_items=5,
+                max_items=10,
+                target_items=3,
+            )
 
     def test_validation_target_greater_than_max(self):
         """Test that target_items > max_items raises error."""
         with pytest.raises(ValueError, match="target_items must be <= max_items"):
-            ContentArea(name="Test", min_items=1, max_items=5, target_items=10)
+            ContentArea(
+                name="Test",
+                items=set(range(10)),
+                min_items=1,
+                max_items=5,
+                target_items=10,
+            )
 
 
 class TestNoContentConstraint:
@@ -134,7 +152,7 @@ class TestContentBlueprint:
     def test_filter_items_at_max(self, blueprint_areas):
         """Test filtering when area is at max."""
         blueprint = ContentBlueprint(blueprint_areas)
-        available = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+        available = {3, 6, 7, 8, 9}
         administered = [0, 1, 2]
 
         filtered = blueprint.filter_items(available, administered)
@@ -145,7 +163,7 @@ class TestContentBlueprint:
     def test_filter_items_priority_items(self, blueprint_areas):
         """Test filtering returns priority items when needed."""
         blueprint = ContentBlueprint(blueprint_areas)
-        available = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+        available = {3, 6, 7, 8, 9}
         administered = [0, 1, 2, 4, 5]
 
         filtered = blueprint.filter_items(available, administered)
