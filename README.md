@@ -397,6 +397,8 @@ plot_person_item_map(result.model, scores.theta)
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
+| `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
+| `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
 
 ### Data Transformation Functions
 
