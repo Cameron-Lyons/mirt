@@ -9,17 +9,246 @@ This module provides nonparametric bootstrap procedures for:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtModelError, MirtValidationError
+from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+
+_BOOTSTRAP_EXCEPTIONS = (
+    ValueError,
+    RuntimeError,
+    ArithmeticError,
+    FloatingPointError,
+    np.linalg.LinAlgError,
+)
+_CI_METHODS = ("percentile", "BCa", "basic")
+_STATISTICS = ("parameters", "theta")
+
+
+def _validate_resample_count(n_bootstrap: int) -> None:
+    if (
+        not isinstance(n_bootstrap, (int, np.integer))
+        or isinstance(n_bootstrap, (bool, np.bool_))
+        or n_bootstrap < 2
+    ):
+        raise MirtValidationError(
+            "n_bootstrap must be an integer of at least 2",
+            parameter="n_bootstrap",
+            value=n_bootstrap,
+        )
+
+
+def _validate_statistic(statistic: str | Callable[..., Any]) -> None:
+    if isinstance(statistic, str):
+        if statistic not in _STATISTICS:
+            raise MirtValidationError(
+                "Unknown bootstrap statistic",
+                parameter="statistic",
+                value=statistic,
+                expected="'parameters', 'theta', or a callable",
+            )
+    elif not callable(statistic):
+        raise MirtValidationError(
+            "statistic must be 'parameters', 'theta', or a callable",
+            parameter="statistic",
+            value=statistic,
+        )
+
+
+def _validate_ci_configuration(alpha: float, method: str) -> None:
+    if method not in _CI_METHODS:
+        raise MirtValidationError(
+            "Unknown bootstrap confidence interval method",
+            parameter="method",
+            value=method,
+            expected=", ".join(_CI_METHODS),
+        )
+    if (
+        not isinstance(alpha, (int, float, np.integer, np.floating))
+        or isinstance(alpha, (bool, np.bool_))
+        or not np.isfinite(alpha)
+        or not 0 < float(alpha) < 1
+    ):
+        raise MirtValidationError(
+            "alpha must be a finite number between 0 and 1",
+            parameter="alpha",
+            value=alpha,
+        )
+
+
+def _prepare_bootstrap_model(
+    model: BaseItemModel,
+    original_params: Mapping[str, NDArray[np.float64]],
+    warm_start: bool,
+) -> BaseItemModel:
+    boot_model = model.copy()
+    if warm_start:
+        boot_model._parameters = {
+            name: values.copy() for name, values in original_params.items()
+        }
+    else:
+        boot_model._parameters.clear()
+        boot_model._initialize_parameters()
+    boot_model._is_fitted = False
+    return boot_model
+
+
+def _as_statistic_mapping(result: Any) -> dict[str, NDArray[np.float64]]:
+    if not isinstance(result, Mapping) or not result:
+        raise MirtValidationError(
+            "A custom bootstrap statistic must return a non-empty mapping"
+        )
+
+    converted: dict[str, NDArray[np.float64]] = {}
+    for name, values in result.items():
+        if not isinstance(name, str):
+            raise MirtValidationError("Bootstrap statistic names must be strings")
+        try:
+            converted[name] = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"Bootstrap statistic {name!r} must be numeric"
+            ) from exc
+    return converted
+
+
+def _elementwise_percentile(
+    samples: NDArray[np.float64], quantiles: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    flat_samples = samples.reshape(samples.shape[0], -1)
+    flat_quantiles = np.asarray(quantiles, dtype=np.float64).reshape(-1)
+    values = np.fromiter(
+        (
+            np.percentile(flat_samples[:, index], 100 * quantile)
+            for index, quantile in enumerate(flat_quantiles)
+        ),
+        dtype=np.float64,
+        count=flat_quantiles.size,
+    )
+    return values.reshape(samples.shape[1:])
+
+
+def _bca_interval(
+    samples: NDArray[np.float64],
+    original: NDArray[np.float64],
+    jackknife: list[NDArray[np.float64]],
+    alpha: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    from scipy import stats
+
+    prop_below = np.mean(samples < original, axis=0)
+    z0 = stats.norm.ppf(np.clip(prop_below, 0.001, 0.999))
+
+    acceleration = np.zeros_like(original, dtype=np.float64)
+    if len(jackknife) >= 3:
+        jack_stacked = np.stack(jackknife, axis=0)
+        jack_mean = jack_stacked.mean(axis=0)
+        jack_diff = jack_mean - jack_stacked
+        numerator = np.sum(jack_diff**3, axis=0)
+        denominator = 6 * np.sum(jack_diff**2, axis=0) ** 1.5
+        acceleration = np.divide(
+            numerator,
+            denominator,
+            out=np.zeros_like(numerator),
+            where=denominator > PROB_EPSILON,
+        )
+
+    z_lower = stats.norm.ppf(alpha / 2)
+    z_upper = stats.norm.ppf(1 - alpha / 2)
+
+    def adjusted_quantile(z_alpha: float) -> NDArray[np.float64]:
+        numerator = z0 + z_alpha
+        denominator = 1 - acceleration * numerator
+        denominator = np.where(
+            np.abs(denominator) < PROB_EPSILON,
+            np.copysign(PROB_EPSILON, denominator),
+            denominator,
+        )
+        return np.clip(stats.norm.cdf(z0 + numerator / denominator), 0.001, 0.999)
+
+    lower = _elementwise_percentile(samples, adjusted_quantile(z_lower))
+    upper = _elementwise_percentile(samples, adjusted_quantile(z_upper))
+    return lower, upper
+
+
+def _simulate_model_responses(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> NDArray[np.int_]:
+    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
+    n_persons = theta.shape[0]
+
+    if probabilities.ndim == 1:
+        probabilities = probabilities.reshape(-1, 1)
+
+    if probabilities.ndim == 2:
+        expected_shape = (n_persons, model.n_items)
+        if probabilities.shape != expected_shape:
+            raise MirtModelError(
+                "Binary probability output has an unexpected shape",
+                model_type=model.model_name,
+                value=probabilities.shape,
+                expected=str(expected_shape),
+            )
+        if not np.all(np.isfinite(probabilities)) or np.any(
+            (probabilities < -PROB_EPSILON) | (probabilities > 1 + PROB_EPSILON)
+        ):
+            raise MirtModelError(
+                "Binary probabilities must be finite and within [0, 1]"
+            )
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+        return (rng.random(expected_shape) < probabilities).astype(np.int_)
+
+    if probabilities.ndim != 3 or probabilities.shape[:2] != (
+        n_persons,
+        model.n_items,
+    ):
+        raise MirtModelError(
+            "Categorical probability output has an unexpected shape",
+            model_type=model.model_name,
+            value=probabilities.shape,
+            expected=f"({n_persons}, {model.n_items}, n_categories)",
+        )
+    if not np.all(np.isfinite(probabilities)) or np.any(probabilities < -PROB_EPSILON):
+        raise MirtModelError("Categorical probabilities must be finite and nonnegative")
+
+    probabilities = np.maximum(probabilities, 0.0)
+    totals = probabilities.sum(axis=2, keepdims=True)
+    if np.any(totals <= PROB_EPSILON):
+        raise MirtModelError("Each categorical probability row must have positive mass")
+    normalized = probabilities / totals
+    cumulative = np.cumsum(normalized, axis=2)
+
+    category_counts = getattr(model, "n_categories", None)
+    if category_counts is None:
+        category_counts = [probabilities.shape[2]] * model.n_items
+    elif isinstance(category_counts, int):
+        category_counts = [category_counts] * model.n_items
+    if len(category_counts) != model.n_items:
+        raise MirtModelError("Category counts must match the number of items")
+    for item_idx, n_categories in enumerate(category_counts):
+        if (
+            not isinstance(n_categories, (int, np.integer))
+            or n_categories < 2
+            or n_categories > probabilities.shape[2]
+        ):
+            raise MirtModelError(
+                "Category counts must be valid for the probability output"
+            )
+        cumulative[:, item_idx, n_categories - 1 :] = 1.0
+
+    uniforms = rng.random((n_persons, model.n_items, 1))
+    return (uniforms > cumulative).sum(axis=2).astype(np.int_)
 
 
 def bootstrap_se(
@@ -65,9 +294,12 @@ def bootstrap_se(
     if isinstance(model, FitResult):
         model = model.model
 
+    _validate_resample_count(n_bootstrap)
+    _validate_statistic(statistic)
+
     rng = np.random.default_rng(seed)
-    responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+    responses = validate_responses(responses, n_items=model.n_items)
+    n_persons = responses.shape[0]
 
     boot_estimates: dict[str, list[NDArray]] = {}
 
@@ -83,12 +315,7 @@ def bootstrap_se(
         indices = rng.integers(0, n_persons, size=n_persons)
         boot_responses = responses[indices]
 
-        boot_model = model.copy()
-
-        if warm_start:
-            for name, values in original_params.items():
-                boot_model._parameters[name] = values.copy()
-            boot_model._is_fitted = False
+        boot_model = _prepare_bootstrap_model(model, original_params, warm_start)
 
         try:
             result = estimator.fit(boot_model, boot_responses)
@@ -102,25 +329,21 @@ def bootstrap_se(
             elif statistic == "theta":
                 from mirt.scoring import fscores
 
-                scores = fscores(result.model, boot_responses, method="EAP")
+                scores = fscores(result.model, responses, method="EAP")
                 if "theta" not in boot_estimates:
                     boot_estimates["theta"] = []
                 boot_estimates["theta"].append(scores.theta.copy())
 
             elif callable(statistic):
-                custom_result = statistic(result.model, boot_responses)
+                custom_result = _as_statistic_mapping(
+                    statistic(result.model, boot_responses)
+                )
                 for name, values in custom_result.items():
                     if name not in boot_estimates:
                         boot_estimates[name] = []
-                    boot_estimates[name].append(np.asarray(values))
+                    boot_estimates[name].append(values)
 
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ) as exc:
+        except _BOOTSTRAP_EXCEPTIONS as exc:
             if verbose:
                 warnings.warn(
                     f"Bootstrap replicate failed and was skipped: {exc}",
@@ -135,7 +358,7 @@ def bootstrap_se(
             stacked = np.stack(estimates, axis=0)
             se_results[name] = np.std(stacked, axis=0, ddof=1)
         else:
-            se_results[name] = np.full_like(estimates[0], np.nan)
+            se_results[name] = np.full_like(estimates[0], np.nan, dtype=np.float64)
 
     return se_results
 
@@ -191,24 +414,31 @@ def bootstrap_ci(
     else:
         original_model = model
 
-    rng = np.random.default_rng(seed)
-    responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+    _validate_resample_count(n_bootstrap)
+    _validate_statistic(statistic)
+    _validate_ci_configuration(alpha, method)
 
-    original_estimates: dict[str, NDArray] = {}
+    rng = np.random.default_rng(seed)
+    responses = validate_responses(responses, n_items=original_model.n_items)
+    n_persons = responses.shape[0]
+
+    original_estimates: dict[str, NDArray[np.float64]] = {}
     if statistic == "parameters":
-        original_estimates = {k: v.copy() for k, v in original_model.parameters.items()}
+        original_estimates = {
+            name: np.asarray(values, dtype=np.float64)
+            for name, values in original_model.parameters.items()
+        }
     elif statistic == "theta":
         from mirt.scoring import fscores
 
         scores = fscores(original_model, responses, method="EAP")
-        original_estimates["theta"] = scores.theta.copy()
+        original_estimates["theta"] = np.asarray(scores.theta, dtype=np.float64)
     elif callable(statistic):
-        original_estimates = {
-            k: np.asarray(v) for k, v in statistic(original_model, responses).items()
-        }
+        original_estimates = _as_statistic_mapping(statistic(original_model, responses))
 
-    boot_estimates: dict[str, list[NDArray]] = {k: [] for k in original_estimates}
+    boot_estimates: dict[str, list[NDArray[np.float64]]] = {
+        name: [] for name in original_estimates
+    }
 
     original_params = {k: v.copy() for k, v in original_model.parameters.items()}
 
@@ -221,40 +451,43 @@ def bootstrap_ci(
 
         indices = rng.integers(0, n_persons, size=n_persons)
         boot_responses = responses[indices]
-        boot_model = original_model.copy()
-
-        if warm_start:
-            for name, values in original_params.items():
-                boot_model._parameters[name] = values.copy()
-            boot_model._is_fitted = False
+        boot_model = _prepare_bootstrap_model(
+            original_model, original_params, warm_start
+        )
 
         try:
             result = estimator.fit(boot_model, boot_responses)
 
             if statistic == "parameters":
                 for name, values in result.model.parameters.items():
-                    if name in boot_estimates:
-                        boot_estimates[name].append(values.copy())
+                    if (
+                        name in boot_estimates
+                        and values.shape == original_estimates[name].shape
+                    ):
+                        boot_estimates[name].append(
+                            np.asarray(values, dtype=np.float64)
+                        )
 
             elif statistic == "theta":
                 from mirt.scoring import fscores
 
-                scores = fscores(result.model, boot_responses, method="EAP")
-                boot_estimates["theta"].append(scores.theta.copy())
+                scores = fscores(result.model, responses, method="EAP")
+                values = np.asarray(scores.theta, dtype=np.float64)
+                if values.shape == original_estimates["theta"].shape:
+                    boot_estimates["theta"].append(values)
 
             elif callable(statistic):
-                custom_result = statistic(result.model, boot_responses)
+                custom_result = _as_statistic_mapping(
+                    statistic(result.model, boot_responses)
+                )
                 for name, values in custom_result.items():
-                    if name in boot_estimates:
-                        boot_estimates[name].append(np.asarray(values))
+                    if (
+                        name in boot_estimates
+                        and values.shape == original_estimates[name].shape
+                    ):
+                        boot_estimates[name].append(values)
 
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ) as exc:
+        except _BOOTSTRAP_EXCEPTIONS as exc:
             if verbose:
                 warnings.warn(
                     f"Bootstrap CI replicate failed and was skipped: {exc}",
@@ -263,14 +496,55 @@ def bootstrap_ci(
                 )
             continue
 
+    jackknife_estimates: dict[str, list[NDArray[np.float64]]] = {
+        name: [] for name in original_estimates
+    }
+    if method == "BCa" and any(
+        len(estimates) >= 10 for estimates in boot_estimates.values()
+    ):
+        max_jack = min(20, n_persons)
+        jack_indices = rng.choice(n_persons, size=max_jack, replace=False)
+        for index in jack_indices:
+            jack_responses = np.delete(responses, index, axis=0)
+            jack_model = _prepare_bootstrap_model(
+                original_model, original_params, warm_start
+            )
+            try:
+                jack_result = estimator.fit(jack_model, jack_responses)
+                if statistic == "parameters":
+                    values_by_name = {
+                        name: np.asarray(values, dtype=np.float64)
+                        for name, values in jack_result.model.parameters.items()
+                    }
+                elif statistic == "theta":
+                    from mirt.scoring import fscores
+
+                    scores = fscores(jack_result.model, responses, method="EAP")
+                    values_by_name = {
+                        "theta": np.asarray(scores.theta, dtype=np.float64)
+                    }
+                else:
+                    values_by_name = _as_statistic_mapping(
+                        statistic(jack_result.model, jack_responses)
+                    )
+
+                for name, values in values_by_name.items():
+                    if (
+                        name in jackknife_estimates
+                        and values.shape == original_estimates[name].shape
+                    ):
+                        jackknife_estimates[name].append(values)
+            except _BOOTSTRAP_EXCEPTIONS:
+                continue
+
     ci_results: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
 
     for name, estimates in boot_estimates.items():
         if len(estimates) < 10:
             original = original_estimates[name]
             ci_results[name] = (
-                np.full_like(original, np.nan),
-                np.full_like(original, np.nan),
+                np.full_like(original, np.nan, dtype=np.float64),
+                np.full_like(original, np.nan, dtype=np.float64),
             )
             continue
 
@@ -287,89 +561,13 @@ def bootstrap_ci(
             lower = 2 * original - upper_pct
             upper = 2 * original - lower_pct
 
-        elif method == "BCa":
-            from scipy import stats
-
-            prop_below = np.mean(stacked < original, axis=0)
-            z0 = stats.norm.ppf(np.clip(prop_below, 0.001, 0.999))
-
-            max_jack = min(20, n_persons)
-            jack_indices = rng.choice(n_persons, size=max_jack, replace=False)
-
-            jackknife_estimates = []
-            for i in jack_indices:
-                jack_responses = np.delete(responses, i, axis=0)
-                jack_model = original_model.copy()
-                try:
-                    jack_result = estimator.fit(jack_model, jack_responses)
-                    if statistic == "parameters":
-                        jackknife_estimates.append(
-                            jack_result.model.parameters[name].copy()
-                        )
-                    elif statistic == "theta":
-                        from mirt.scoring import fscores
-
-                        scores = fscores(
-                            jack_result.model, jack_responses, method="EAP"
-                        )
-                        padded = np.full(n_persons, np.nan)
-                        mask = np.ones(n_persons, dtype=bool)
-                        mask[i] = False
-                        padded[mask] = scores.theta.ravel()
-                        jackknife_estimates.append(padded)
-                except (
-                    ValueError,
-                    RuntimeError,
-                    ArithmeticError,
-                    FloatingPointError,
-                    np.linalg.LinAlgError,
-                ):
-                    pass
-
-            if len(jackknife_estimates) > 10:
-                jack_stacked = np.stack(jackknife_estimates, axis=0)
-                jack_mean = np.nanmean(jack_stacked, axis=0)
-                jack_diff = jack_mean - jack_stacked
-                a = np.nansum(jack_diff**3, axis=0) / (
-                    6 * np.nansum(jack_diff**2, axis=0) ** 1.5 + PROB_EPSILON
-                )
-            else:
-                a = np.zeros_like(original)
-
-            z_alpha = stats.norm.ppf(alpha / 2)
-            z_1_alpha = stats.norm.ppf(1 - alpha / 2)
-
-            adj_lower = stats.norm.cdf(
-                z0 + (z0 + z_alpha) / (1 - a * (z0 + z_alpha) + PROB_EPSILON)
+        else:  # method == "BCa", validated before fitting
+            lower, upper = _bca_interval(
+                stacked,
+                original,
+                jackknife_estimates[name],
+                alpha,
             )
-            adj_upper = stats.norm.cdf(
-                z0 + (z0 + z_1_alpha) / (1 - a * (z0 + z_1_alpha) + PROB_EPSILON)
-            )
-
-            adj_lower = np.clip(adj_lower, 0.001, 0.999)
-            adj_upper = np.clip(adj_upper, 0.001, 0.999)
-
-            lower = np.array(
-                [
-                    np.percentile(
-                        stacked[:, i] if stacked.ndim > 1 else stacked,
-                        100 * adj_lower.flat[i],
-                    )
-                    for i in range(original.size)
-                ]
-            ).reshape(original.shape)
-            upper = np.array(
-                [
-                    np.percentile(
-                        stacked[:, i] if stacked.ndim > 1 else stacked,
-                        100 * adj_upper.flat[i],
-                    )
-                    for i in range(original.size)
-                ]
-            ).reshape(original.shape)
-
-        else:
-            raise ValueError(f"Unknown CI method: {method}")
 
         ci_results[name] = (lower.astype(np.float64), upper.astype(np.float64))
 
@@ -411,13 +609,23 @@ def parametric_bootstrap(
     """
     from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
-    from mirt.utils.simulation import simdata
 
     if isinstance(model, FitResult):
         model = model.model
 
+    _validate_resample_count(n_bootstrap)
     if n_persons is None:
         n_persons = 500
+    if (
+        not isinstance(n_persons, (int, np.integer))
+        or isinstance(n_persons, (bool, np.bool_))
+        or n_persons < 1
+    ):
+        raise MirtValidationError(
+            "n_persons must be a positive integer",
+            parameter="n_persons",
+            value=n_persons,
+        )
 
     rng = np.random.default_rng(seed)
     boot_estimates: dict[str, list[NDArray]] = {}
@@ -425,43 +633,15 @@ def parametric_bootstrap(
     max_iter = 100 if warm_start else 200
     estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
 
-    params = model.parameters
-    model_name = model.model_name
-    original_params = {k: v.copy() for k, v in params.items()}
+    original_params = {k: v.copy() for k, v in model.parameters.items()}
 
     for b in range(n_bootstrap):
         if verbose and (b + 1) % 50 == 0:
             print(f"Parametric bootstrap {b + 1}/{n_bootstrap}")
 
-        theta = rng.standard_normal(n_persons)
-
-        if model_name in ("1PL", "2PL", "3PL", "4PL", "Rasch"):
-            discrimination = params.get("discrimination", np.ones(model.n_items))
-            difficulty = params["difficulty"]
-            guessing = params.get("guessing", np.zeros(model.n_items))
-
-            sim_data = simdata(
-                model=model_name,
-                n_persons=n_persons,
-                n_items=model.n_items,
-                discrimination=discrimination,
-                difficulty=difficulty,
-                guessing=guessing,
-                theta=theta,
-                seed=rng.integers(0, 2**31),
-            )
-        else:
-            probs = model.probability(theta.reshape(-1, 1))
-            if probs.ndim == 1:
-                probs = probs.reshape(-1, model.n_items)
-            sim_data = (rng.random((n_persons, model.n_items)) < probs).astype(np.int_)
-
-        boot_model = model.copy()
-
-        if warm_start:
-            for name, values in original_params.items():
-                boot_model._parameters[name] = values.copy()
-            boot_model._is_fitted = False
+        theta = rng.standard_normal((n_persons, model.n_factors))
+        sim_data = _simulate_model_responses(model, theta, rng)
+        boot_model = _prepare_bootstrap_model(model, original_params, warm_start)
 
         try:
             result = estimator.fit(boot_model, sim_data)
@@ -470,13 +650,7 @@ def parametric_bootstrap(
                 if name not in boot_estimates:
                     boot_estimates[name] = []
                 boot_estimates[name].append(values.copy())
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ) as exc:
+        except _BOOTSTRAP_EXCEPTIONS as exc:
             if verbose:
                 warnings.warn(
                     f"Parametric bootstrap replicate failed and was skipped: {exc}",
@@ -490,5 +664,7 @@ def parametric_bootstrap(
         if len(estimates) > 1:
             stacked = np.stack(estimates, axis=0)
             se_results[name] = np.std(stacked, axis=0, ddof=1)
+        else:
+            se_results[name] = np.full_like(estimates[0], np.nan, dtype=np.float64)
 
     return se_results
