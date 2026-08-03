@@ -66,6 +66,29 @@ class TestTwoParameterLogistic:
         assert ll.shape == (2,)
         assert np.all(ll <= 0)
 
+    def test_log_likelihood_batch_matches_pointwise_with_missing_data(self):
+        """Batch likelihoods match independently evaluated theta points."""
+        model = TwoParameterLogistic(n_items=4, n_factors=2)
+        model.set_parameters(
+            discrimination=np.array([[0.8, 0.2], [0.1, 1.4], [1.1, 0.7], [0.6, 1.0]]),
+            difficulty=np.array([-1.0, -0.2, 0.5, 1.3]),
+        )
+        responses = np.array([[1, 0, -1, 1], [0, 1, 1, -1], [1, 1, 0, 0]])
+        theta = np.array([[-1.5, 0.2], [0.0, 0.0], [1.2, -0.7]])
+
+        actual = model.log_likelihood_batch(responses, theta)
+        expected = np.column_stack(
+            [
+                model.log_likelihood(
+                    responses,
+                    np.broadcast_to(point, (responses.shape[0], model.n_factors)),
+                )
+                for point in theta
+            ]
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
     def test_information(self):
         """Test Fisher information computation."""
         model = TwoParameterLogistic(n_items=5)
