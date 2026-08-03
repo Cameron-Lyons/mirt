@@ -387,6 +387,9 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_ci()` | Bootstrap confidence intervals |
 | `generate_plausible_values()` | Plausible values |
 | `impute_responses()` | Missing data imputation |
+| `gen_random_pars()` | Valid random starting values that preserve model constraints |
+| `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
+| `calc_null()` | Independence and pooled-intercept baseline fit statistics |
 | `set_dataframe_backend()` | Choose pandas/polars |
 | `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
 | `Q3()` | Yen's Q3 local dependence statistic |

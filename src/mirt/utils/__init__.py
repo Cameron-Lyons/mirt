@@ -84,6 +84,7 @@ from mirt.utils.sampling import (
     sample_expected_scores,
 )
 from mirt.utils.simulation import simdata
+from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
 from mirt.utils.statistical_tests import (
     LagrangeTestResult,
     WaldTestResult,
@@ -196,4 +197,7 @@ __all__ = [
     "shrinkage_estimates",
     "RandomEffects",
     "FixedEffects",
+    "gen_random_pars",
+    "calc_null",
+    "multi_start_fit",
 ]
