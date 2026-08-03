@@ -8,18 +8,70 @@ This module provides methods for handling missing responses:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.constants import PROB_EPSILON
-
-if TYPE_CHECKING:
-    pass
+from mirt.exceptions import MirtDataError, MirtValidationError
+from mirt.utils.data import validate_responses
 
 LARGE_DF = 1e10
+_PAIRWISE_BLOCK_SIZE = np.iinfo(np.uint8).max
+_IMPUTATION_METHODS = ("mean", "mode", "random", "EM", "multiple")
+
+
+def _prepare_response_matrix(
+    responses: NDArray[np.int_], missing_code: int
+) -> NDArray[np.int_]:
+    if not isinstance(missing_code, (int, np.integer)) or isinstance(
+        missing_code, (bool, np.bool_)
+    ):
+        raise MirtValidationError(
+            "missing_code must be an integer",
+            parameter="missing_code",
+            value=missing_code,
+        )
+
+    int_bounds = np.iinfo(np.int_)
+    if missing_code < int_bounds.min or missing_code > int_bounds.max:
+        raise MirtValidationError(
+            "missing_code exceeds the supported integer range",
+            parameter="missing_code",
+            value=missing_code,
+        )
+
+    return validate_responses(
+        responses,
+        allow_missing=True,
+        missing_code=int(missing_code),
+    )
+
+
+def _draw_categorical(
+    probabilities: NDArray[np.float64], rng: np.random.Generator
+) -> NDArray[np.int_]:
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    if probabilities.ndim != 2 or probabilities.shape[1] == 0:
+        raise MirtDataError(
+            "categorical probabilities must have shape (n_persons, n_categories)"
+        )
+
+    safe_probabilities = np.nan_to_num(probabilities, nan=0.0, posinf=0.0, neginf=0.0)
+    safe_probabilities = np.maximum(safe_probabilities, 0.0)
+    totals = safe_probabilities.sum(axis=1, keepdims=True)
+    normalized = np.divide(
+        safe_probabilities,
+        totals,
+        out=np.full_like(safe_probabilities, 1.0 / probabilities.shape[1]),
+        where=totals > 0,
+    )
+    cumulative = np.cumsum(normalized, axis=1)
+    cumulative[:, -1] = 1.0
+    draws = (rng.random(probabilities.shape[0])[:, None] > cumulative).sum(axis=1)
+    return draws.astype(np.int_, copy=False)
 
 
 def impute_responses(
@@ -57,9 +109,26 @@ def impute_responses(
     NDArray or list of NDArray
         Imputed response matrix (or list for multiple imputation)
     """
+    if method not in _IMPUTATION_METHODS:
+        raise MirtValidationError(
+            "Unknown imputation method",
+            parameter="method",
+            value=method,
+            expected=", ".join(_IMPUTATION_METHODS),
+        )
+    if method == "multiple" and (
+        not isinstance(n_imputations, (int, np.integer))
+        or isinstance(n_imputations, (bool, np.bool_))
+        or n_imputations < 1
+    ):
+        raise MirtValidationError(
+            "n_imputations must be a positive integer",
+            parameter="n_imputations",
+            value=n_imputations,
+        )
+
     rng = np.random.default_rng(seed)
-    responses = np.asarray(responses).copy()
-    n_persons, n_items = responses.shape
+    responses = _prepare_response_matrix(responses, missing_code).copy()
 
     missing_mask = responses == missing_code
 
@@ -68,27 +137,30 @@ def impute_responses(
             return [responses.copy() for _ in range(n_imputations)]
         return responses
 
+    all_missing_items = np.flatnonzero(missing_mask.all(axis=0))
+    if all_missing_items.size:
+        raise MirtDataError(
+            "Cannot impute items with no observed responses",
+            item_indices=all_missing_items.tolist(),
+        )
+
     if method == "mean":
         return _impute_mean(responses, missing_mask)
 
-    elif method == "mode":
+    if method == "mode":
         return _impute_mode(responses, missing_mask)
 
-    elif method == "random":
+    if method == "random":
         return _impute_random(responses, missing_mask, rng)
 
-    elif method == "EM":
+    if method == "EM":
         if model is None:
             model = "2PL"
         return _impute_em(responses, missing_mask, model, rng)
 
-    elif method == "multiple":
-        if model is None:
-            model = "2PL"
-        return _impute_multiple(responses, missing_mask, model, n_imputations, rng)
-
-    else:
-        raise ValueError(f"Unknown imputation method: {method}")
+    if model is None:
+        model = "2PL"
+    return _impute_multiple(responses, missing_mask, model, n_imputations, rng)
 
 
 def _impute_mean(
@@ -159,11 +231,11 @@ def _impute_em(
     from mirt.scoring import fscores
 
     imputed = responses.copy()
-    n_persons, n_items = responses.shape
+    n_items = responses.shape[1]
 
     imputed = _impute_mode(responses, missing_mask)
 
-    for iteration in range(10):
+    for _ in range(10):
         try:
             result = fit_mirt(imputed, model=model, verbose=False)
             scores = fscores(result.model, imputed, method="EAP")
@@ -191,17 +263,14 @@ def _impute_em(
             probs = result.model.probability(theta_missing, j)
 
             if probs.ndim > 1:
-                n_missing = probs.shape[0]
-                for i in range(n_missing):
-                    imputed[np.where(item_missing)[0][i], j] = rng.choice(
-                        len(probs[i]), p=probs[i]
-                    )
+                missing_rows = np.flatnonzero(item_missing)
+                imputed[missing_rows, j] = _draw_categorical(probs, rng)
             else:
                 imputed[item_missing, j] = (
                     rng.random(item_missing.sum()) < probs
                 ).astype(np.int_)
 
-        if np.allclose(old_imputed, imputed):
+        if np.array_equal(old_imputed[missing_mask], imputed[missing_mask]):
             break
 
     return imputed
@@ -225,6 +294,7 @@ def _impute_multiple(
 
     try:
         result = fit_mirt(initial, model=model, verbose=False)
+        scores = fscores(result.model, initial, method="EAP")
     except (
         ValueError,
         RuntimeError,
@@ -236,12 +306,11 @@ def _impute_multiple(
             _impute_random(responses, missing_mask, rng) for _ in range(n_imputations)
         ]
 
-    for m in range(n_imputations):
-        imputed = responses.copy()
+    theta_mean = scores.theta
+    theta_se = scores.standard_error
 
-        scores = fscores(result.model, initial, method="EAP")
-        theta_mean = scores.theta
-        theta_se = scores.standard_error
+    for _ in range(n_imputations):
+        imputed = responses.copy()
 
         if theta_mean.ndim == 1:
             theta_draw = theta_mean + rng.standard_normal(n_persons) * theta_se
@@ -258,11 +327,8 @@ def _impute_multiple(
             probs = result.model.probability(theta_missing, j)
 
             if probs.ndim > 1:
-                n_missing = probs.shape[0]
-                for i in range(n_missing):
-                    p = np.clip(probs[i], PROB_EPSILON, 1 - PROB_EPSILON)
-                    p = p / p.sum()
-                    imputed[np.where(item_missing)[0][i], j] = rng.choice(len(p), p=p)
+                missing_rows = np.flatnonzero(item_missing)
+                imputed[missing_rows, j] = _draw_categorical(probs, rng)
             else:
                 imputed[item_missing, j] = (
                     rng.random(item_missing.sum()) < probs
@@ -276,7 +342,7 @@ def _impute_multiple(
 def analyze_missing(
     responses: NDArray[np.int_],
     missing_code: int = -1,
-) -> dict[str, NDArray[np.float64] | float]:
+) -> dict[str, NDArray[np.float64] | float | int]:
     """Analyze missing data patterns.
 
     Parameters
@@ -296,9 +362,8 @@ def analyze_missing(
         - 'n_complete_cases': Number of persons with no missing
         - 'n_complete_items': Number of items with no missing
     """
-    responses = np.asarray(responses)
+    responses = _prepare_response_matrix(responses, missing_code)
     missing_mask = responses == missing_code
-    n_persons, n_items = responses.shape
 
     return {
         "total_missing_rate": float(missing_mask.mean()),
@@ -327,7 +392,7 @@ def listwise_deletion(
     NDArray
         Response matrix with complete cases only
     """
-    responses = np.asarray(responses)
+    responses = _prepare_response_matrix(responses, missing_code)
     missing_mask = responses == missing_code
     complete_mask = ~missing_mask.any(axis=1)
     return responses[complete_mask]
@@ -355,16 +420,19 @@ def pairwise_available(
         - n_available: (n_items,) count of valid responses per item
         - joint_available: (n_items, n_items) count of valid pairs
     """
-    responses = np.asarray(responses)
+    responses = _prepare_response_matrix(responses, missing_code)
     n_items = responses.shape[1]
     valid = responses != missing_code
 
-    n_available = valid.sum(axis=0)
+    n_available = valid.sum(axis=0, dtype=np.int_)
     joint_available = np.zeros((n_items, n_items), dtype=np.int_)
 
-    for i in range(n_items):
-        for j in range(n_items):
-            joint_available[i, j] = (valid[:, i] & valid[:, j]).sum()
+    # A uint8 product is substantially faster than pairwise Python loops. Keep
+    # blocks at 255 rows so each partial count remains within uint8 range, then
+    # accumulate into platform-sized integers without overflow.
+    for start in range(0, len(valid), _PAIRWISE_BLOCK_SIZE):
+        block = valid[start : start + _PAIRWISE_BLOCK_SIZE].astype(np.uint8)
+        joint_available += block.T @ block
 
     return n_available, joint_available
 
@@ -404,9 +472,9 @@ class MIResult:
 
 
 def averageMI(
-    estimates: list[float | NDArray[np.float64]],
-    variances: list[float | NDArray[np.float64]] | None = None,
-    standard_errors: list[float | NDArray[np.float64]] | None = None,
+    estimates: Sequence[float | NDArray[np.float64]],
+    variances: Sequence[float | NDArray[np.float64]] | None = None,
+    standard_errors: Sequence[float | NDArray[np.float64]] | None = None,
 ) -> MIResult:
     """Combine results from multiple imputation using Rubin's rules.
 
@@ -420,11 +488,11 @@ def averageMI(
         Point estimates from each imputation. Each element should be
         the same shape (scalar, 1D array, or 2D array).
     variances : list of float or ndarray, optional
-        Variance estimates from each imputation. If None, must provide
-        standard_errors.
+        Variance estimates from each imputation. Provide exactly one of
+        variances or standard_errors.
     standard_errors : list of float or ndarray, optional
-        Standard errors from each imputation. Squared to get variances.
-        If None, must provide variances.
+        Standard errors from each imputation. Squared to get variances. Provide
+        exactly one of standard_errors or variances.
 
     Returns
     -------
@@ -460,45 +528,89 @@ def averageMI(
     - Within variance: U_bar = mean(U_m)
     - Between variance: B = var(Q_m)
     - Total variance: T = U_bar + (1 + 1/m) * B
-    - Degrees of freedom: Based on Barnard & Rubin (1999)
+    - Degrees of freedom: Rubin's large-sample approximation
     """
-    if variances is None and standard_errors is None:
-        raise ValueError("Must provide either variances or standard_errors")
+    if (variances is None) == (standard_errors is None):
+        raise MirtValidationError("Provide exactly one of variances or standard_errors")
 
     m = len(estimates)
     if m < 2:
-        raise ValueError("Need at least 2 imputations to combine")
+        raise MirtValidationError("Need at least 2 imputations to combine")
 
-    estimates_arr = [np.asarray(e) for e in estimates]
+    try:
+        estimates_arr = [np.asarray(e, dtype=np.float64) for e in estimates]
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError("estimates must contain numeric values") from exc
+
+    estimate_shape = estimates_arr[0].shape
+    if any(estimate.shape != estimate_shape for estimate in estimates_arr):
+        raise MirtValidationError("All estimates must have the same shape")
+    estimates_stacked = np.stack(estimates_arr, axis=0)
+    if not np.all(np.isfinite(estimates_stacked)):
+        raise MirtValidationError("All estimates must be finite")
+
+    uncertainty_values = variances if variances is not None else standard_errors
+    assert uncertainty_values is not None
+    if len(uncertainty_values) != m:
+        raise MirtValidationError(
+            "The number of uncertainty estimates must match the imputations"
+        )
+
+    try:
+        uncertainty_arr = [
+            np.asarray(value, dtype=np.float64) for value in uncertainty_values
+        ]
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "Uncertainty estimates must contain numeric values"
+        ) from exc
+
+    if any(value.shape != estimate_shape for value in uncertainty_arr):
+        raise MirtValidationError("Uncertainty estimates must match the estimate shape")
+    uncertainty_stacked = np.stack(uncertainty_arr, axis=0)
+    if not np.all(np.isfinite(uncertainty_stacked)):
+        raise MirtValidationError("All uncertainty estimates must be finite")
+    if np.any(uncertainty_stacked < 0):
+        kind = "Variances" if variances is not None else "Standard errors"
+        raise MirtValidationError(f"{kind} must be nonnegative")
 
     if variances is not None:
-        variances_arr = [np.asarray(v) for v in variances]
+        variances_stacked = uncertainty_stacked
     else:
-        assert standard_errors is not None
-        variances_arr = [np.asarray(se) ** 2 for se in standard_errors]
+        variances_stacked = uncertainty_stacked**2
 
-    q_bar = np.mean(estimates_arr, axis=0)
-
-    u_bar = np.mean(variances_arr, axis=0)
-
-    deviations = [e - q_bar for e in estimates_arr]
-    b = np.sum([d**2 for d in deviations], axis=0) / (m - 1)
-
-    total_var = u_bar + (1 + 1 / m) * b
+    q_bar = estimates_stacked.mean(axis=0)
+    u_bar = variances_stacked.mean(axis=0)
+    b = estimates_stacked.var(axis=0, ddof=1)
+    extra_variance = (1 + 1 / m) * b
+    total_var = u_bar + extra_variance
 
     se = np.sqrt(total_var)
 
-    r = (1 + 1 / m) * b / (u_bar + PROB_EPSILON)
+    lambda_hat = np.divide(
+        extra_variance,
+        total_var,
+        out=np.zeros_like(total_var),
+        where=total_var > 0,
+    )
+    df_old = np.full_like(total_var, LARGE_DF, dtype=np.float64)
+    has_between_variance = extra_variance > 0
+    relative_within = np.divide(
+        u_bar,
+        extra_variance,
+        out=np.zeros_like(u_bar),
+        where=has_between_variance,
+    )
+    df_old = np.where(
+        has_between_variance,
+        (m - 1) * (1 + relative_within) ** 2,
+        df_old,
+    )
 
-    lambda_hat = (1 + 1 / m) * b / (total_var + PROB_EPSILON)
-
-    df_old = (m - 1) * (1 + 1 / r) ** 2
-    df_old = np.where(np.isinf(df_old) | np.isnan(df_old), LARGE_DF, df_old)
-
-    fmi = (r + 2 / (df_old + 3)) / (r + 1)
+    fmi = lambda_hat + 2 / (df_old + 3) * (1 - lambda_hat)
     fmi = np.clip(fmi, 0, 1)
 
-    if np.isscalar(q_bar):
+    if q_bar.ndim == 0:
         return MIResult(
             estimate=float(q_bar),
             within_variance=float(u_bar),
