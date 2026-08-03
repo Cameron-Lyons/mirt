@@ -14,6 +14,7 @@ powered by a Rust backend for computational efficiency.
    guides/dif
    guides/multigroup
    guides/equating
+   guides/results
    api/index
 
 Installation
@@ -49,6 +50,7 @@ Features
 * **Estimation Methods**: EM, MCMC, MHRM, Mixed estimation
 * **Diagnostics**: Item fit, model fit, DIF analysis, SIBTEST
 * **Scoring**: EAP, MAP, ML scoring methods
+* **Results**: Validated inference, confidence intervals, and portable exports
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
 * **High Performance**: Rust-powered backend for fast computation
 

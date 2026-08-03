@@ -58,6 +58,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Reliable Change Index (RCI) for clinical significance
 - Profile-likelihood confidence intervals
 - Posterior parameter sampling
+- **Result objects**: Validated uncertainty, confidence intervals, and portable exports
 - **HTML reports**: Automated IRT analysis report generation
 
 ## Installation
