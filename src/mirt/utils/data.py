@@ -149,7 +149,8 @@ def check_response_pattern(
         Response matrix with missing data coded as negative values.
     n_categories : int or list of int, optional
         Number of response categories. If int, applies to all items.
-        If list, specifies categories per item. If None, inferred from data.
+        If list, specifies categories per item. If None, each item's maximum
+        category is inferred independently from its observed responses.
 
     Returns
     -------
@@ -163,6 +164,15 @@ def check_response_pattern(
         - missing_by_person: Count of missing responses per person
         - extreme_patterns: Counts of all-minimum and all-maximum patterns
 
+        Respondents with no observed responses are excluded from both extreme
+        pattern counts.
+
+    Raises
+    ------
+    ValueError
+        If response data or category definitions are invalid, or an observed
+        response exceeds its declared category range.
+
     Examples
     --------
     >>> from mirt.utils.data import check_response_pattern
@@ -171,27 +181,53 @@ def check_response_pattern(
     >>> stats = check_response_pattern(data)
     >>> print(f"Missing rate: {stats['missing_rate']:.2%}")
     """
-    responses = np.asarray(responses)
+    response_array = np.asarray(responses)
+    if (
+        response_array.ndim == 2
+        and response_array.shape[0] > 0
+        and response_array.shape[1] > 0
+        and response_array.dtype.kind in "bi"
+    ):
+        responses = response_array.astype(np.int_, copy=False)
+    else:
+        responses = validate_responses(response_array)
     n_persons, n_items = responses.shape
 
     missing_mask = responses < 0
     missing_rate = missing_mask.mean()
     missing_by_item = missing_mask.mean(axis=0)
     missing_by_person = missing_mask.sum(axis=1)
-
-    valid_responses = np.where(missing_mask, np.nan, responses)
+    observed_by_person = (~missing_mask).any(axis=1)
 
     if n_categories is None:
-        max_resp = int(np.nanmax(valid_responses))
-        n_categories = max_resp + 1
-
-    if isinstance(n_categories, int):
-        max_response = n_categories - 1
+        max_response = responses.max(axis=0)
+    elif isinstance(n_categories, (int, np.integer)) and not isinstance(
+        n_categories, bool
+    ):
+        if n_categories < 1:
+            raise ValueError("n_categories must be positive")
+        max_response = np.full(n_items, int(n_categories) - 1, dtype=np.int_)
     else:
-        max_response = max(n_categories) - 1
+        categories = np.asarray(n_categories)
+        if categories.ndim != 1 or categories.shape[0] != n_items:
+            raise ValueError(f"n_categories must contain {n_items} values")
+        if categories.dtype.kind not in "iuf" or not np.all(np.isfinite(categories)):
+            raise ValueError("n_categories must contain finite integers")
+        if not np.all(categories == np.trunc(categories)):
+            raise ValueError("n_categories must contain integers")
+        categories = categories.astype(np.int_, copy=False)
+        if np.any(categories < 1):
+            raise ValueError("n_categories values must be positive")
+        max_response = categories - 1
 
-    all_min = np.all((responses == 0) | (responses < 0), axis=1)
-    all_max = np.all((responses == max_response) | (responses < 0), axis=1)
+    if np.any((~missing_mask) & (responses > max_response[None, :])):
+        raise ValueError("responses contain values outside n_categories")
+
+    all_min = observed_by_person & np.all((responses == 0) | missing_mask, axis=1)
+    all_max = observed_by_person & np.all(
+        (responses == max_response[None, :]) | missing_mask,
+        axis=1,
+    )
 
     return {
         "n_persons": n_persons,
