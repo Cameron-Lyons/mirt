@@ -231,7 +231,7 @@ class TestDavidianCurve:
         d = DavidianCurve(degree=4)
         coeffs_before = d._coeffs.copy()
         theta = np.linspace(-3, 3, 30)
-        weights = np.exp(-0.5 * theta**2)
+        weights = np.exp(-0.5 * (theta - 0.8) ** 2)
         weights /= weights.sum()
         d.update(theta, weights)
         assert not np.allclose(d._coeffs, coeffs_before)
