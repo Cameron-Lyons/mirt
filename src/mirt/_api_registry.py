@@ -35,6 +35,9 @@ BASE_EXPORTS = [
     "GeneralizedPartialCredit",
     "PartialCreditModel",
     "NominalResponseModel",
+    "TwoPLNestedLogit",
+    "ThreePLNestedLogit",
+    "FourPLNestedLogit",
     "MultidimensionalModel",
     "BifactorModel",
     "BaseCDM",
@@ -385,6 +388,11 @@ TOP_LEVEL_IMPORT_GROUPS = {
     ),
     "mirt.models.mixture": ("MixtureIRT", "fit_mixture_irt"),
     "mirt.models.multidimensional": ("MultidimensionalModel",),
+    "mirt.models.nested": (
+        "FourPLNestedLogit",
+        "ThreePLNestedLogit",
+        "TwoPLNestedLogit",
+    ),
     "mirt.models.polytomous": (
         "GeneralizedPartialCredit",
         "GradedRatingScaleModel",
