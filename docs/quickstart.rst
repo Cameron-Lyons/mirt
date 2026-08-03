@@ -15,6 +15,19 @@ Basic Usage
 
 4. **Analyze fit**: Use item and person fit diagnostics.
 
+Explore the sample datasets without loading response-matrix copies:
+
+.. code-block:: python
+
+   import mirt
+
+   print(mirt.list_datasets())
+   print(mirt.describe_dataset("LSAT7"))
+
+For repeated read-only workflows, ``load_dataset(name, copy=False)`` returns
+arrays backed by the process-local cache. Those arrays are intentionally
+read-only; omit the argument when writable, independent arrays are needed.
+
 Example: 2PL Model
 ------------------
 

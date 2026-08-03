@@ -83,6 +83,7 @@ BASE_EXPORTS = [
     "set_dataframe_backend",
     "load_dataset",
     "list_datasets",
+    "describe_dataset",
     "bootstrap_se",
     "bootstrap_ci",
     "parametric_bootstrap",
@@ -423,7 +424,7 @@ TOP_LEVEL_IMPORT_GROUPS = {
     ),
     "mirt.utils.data": ("validate_responses",),
     "mirt.utils.dataframe": ("set_dataframe_backend",),
-    "mirt.utils.datasets": ("list_datasets", "load_dataset"),
+    "mirt.utils.datasets": ("describe_dataset", "list_datasets", "load_dataset"),
     "mirt.utils.empirical": (
         "ItemGAMResult",
         "RMSD_DIF",
