@@ -397,6 +397,7 @@ plot_person_item_map(result.model, scores.theta)
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
+| `rotate_loadings()` | Varimax, quartimax, equamax, oblimin, promax, and geomin rotations |
 
 ### Data Transformation Functions
 
