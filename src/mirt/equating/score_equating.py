@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import interpolate, stats
+
+from mirt.equating.linking import LinkingResult
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-from mirt.equating.linking import LinkingResult
+
+_PROBABILITY_TOLERANCE = 1e-10
 
 
 @dataclass
@@ -79,54 +81,36 @@ def true_score_equating(
     ScoreEquatingResult
         Score conversion table and diagnostics.
     """
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
+    lower, upper = _validate_theta_range(theta_range)
+    n_theta = _validate_count(n_theta, "n_theta", minimum=2)
+    _validate_model(model_old, "model_old")
+    _validate_model(model_new, "model_new")
+    old_item_indices = _resolve_items(model_old, items_old, "items_old")
+    new_item_indices = _resolve_items(model_new, items_new, "items_new")
 
-    expected_old = _compute_expected_scores(model_old, theta_grid, items_old)
-    expected_new = _compute_expected_scores(model_new, theta_grid, items_new)
+    theta_grid = np.linspace(lower, upper, n_theta)
+    expected_old = _compute_expected_scores(model_old, theta_grid, old_item_indices)
+    expected_new = _compute_expected_scores(model_new, theta_grid, new_item_indices)
 
     if linking_result is not None:
-        A = linking_result.constants.A
-        B = linking_result.constants.B
+        A = float(linking_result.constants.A)
+        B = float(linking_result.constants.B)
+        if not np.isfinite(A) or A <= 0.0:
+            raise ValueError("linking_result.constants.A must be finite and positive")
+        if not np.isfinite(B):
+            raise ValueError("linking_result.constants.B must be finite")
         theta_transformed = A * theta_grid + B
-        expected_new = _compute_expected_scores(model_new, theta_transformed, items_new)
+        expected_new = _compute_expected_scores(
+            model_new, theta_transformed, new_item_indices
+        )
 
-    min_score_old = 0
-    max_score_old = int(np.ceil(np.max(expected_old)))
-    old_scores = np.arange(min_score_old, max_score_old + 1, dtype=np.float64)
+    _validate_expected_score_curve(expected_old, "model_old")
+    _validate_expected_score_curve(expected_new, "model_new")
 
-    new_scores = np.zeros_like(old_scores)
-
-    for i, score in enumerate(old_scores):
-        idx = np.searchsorted(expected_old, score)
-
-        if idx == 0:
-            theta_at_score = theta_grid[0]
-        elif idx >= len(theta_grid):
-            theta_at_score = theta_grid[-1]
-        else:
-            t0 = theta_grid[idx - 1]
-            t1 = theta_grid[idx]
-            e0 = expected_old[idx - 1]
-            e1 = expected_old[idx]
-            if abs(e1 - e0) < 1e-10:
-                theta_at_score = (t0 + t1) / 2
-            else:
-                theta_at_score = t0 + (score - e0) * (t1 - t0) / (e1 - e0)
-
-        theta_at_score = np.clip(theta_at_score, theta_range[0], theta_range[1])
-
-        idx_new = np.searchsorted(theta_grid, theta_at_score)
-        if idx_new == 0:
-            new_scores[i] = expected_new[0]
-        elif idx_new >= len(theta_grid):
-            new_scores[i] = expected_new[-1]
-        else:
-            t0 = theta_grid[idx_new - 1]
-            t1 = theta_grid[idx_new]
-            e0 = expected_new[idx_new - 1]
-            e1 = expected_new[idx_new]
-            frac = (theta_at_score - t0) / max(t1 - t0, 1e-10)
-            new_scores[i] = e0 + frac * (e1 - e0)
+    max_score_old = _maximum_score(model_old, old_item_indices)
+    old_scores = np.arange(max_score_old + 1, dtype=np.float64)
+    theta_at_score = _invert_expected_scores(expected_old, theta_grid, old_scores)
+    new_scores = np.interp(theta_at_score, theta_grid, expected_new)
 
     return ScoreEquatingResult(
         old_scores=old_scores,
@@ -173,12 +157,22 @@ def observed_score_equating(
     ScoreEquatingResult
         Score conversion table.
     """
+    _validate_model(model_old, "model_old")
+    _validate_model(model_new, "model_new")
+    _resolve_items(model_old, items_old, "items_old")
+    _resolve_items(model_new, items_new, "items_new")
+
     if theta_grid is None:
-        theta_grid = np.linspace(-4, 4, n_theta)
+        n_theta = _validate_count(n_theta, "n_theta", minimum=1)
+        theta_grid = np.linspace(-4.0, 4.0, n_theta)
+    else:
+        theta_grid = _validate_vector(theta_grid, "theta_grid")
 
     if theta_distribution is None:
-        theta_distribution = stats.norm.pdf(theta_grid)
-        theta_distribution = theta_distribution / np.sum(theta_distribution)
+        theta_distribution = np.exp(-0.5 * theta_grid**2)
+    theta_distribution = _validate_weights(
+        theta_distribution, len(theta_grid), "theta_distribution"
+    )
 
     score_dist_old = lord_wingersky_recursion(
         model_old, theta_grid, theta_distribution, items_old
@@ -208,8 +202,8 @@ def lord_wingersky_recursion(
 ) -> NDArray[np.float64]:
     """Compute observed score distribution using Lord-Wingersky recursion.
 
-    For dichotomous items, recursively computes P(X=x) for each
-    possible sum score x.
+    Recursively computes P(X=x) for each possible sum score x. Both
+    dichotomous and ordered polytomous items are supported.
 
     Parameters
     ----------
@@ -225,53 +219,34 @@ def lord_wingersky_recursion(
     Returns
     -------
     NDArray
-        Marginal score distribution P(X=x) for x = 0, 1, ..., n_items.
+        Marginal score distribution over every attainable sum score.
     """
-    disc = np.asarray(model.discrimination)
-    diff = np.asarray(model.difficulty)
+    _validate_model(model, "model")
+    theta_grid = _validate_vector(theta_grid, "theta_grid")
+    weights = _validate_weights(theta_weights, len(theta_grid), "theta_weights")
+    item_indices = _resolve_items(model, items, "items")
+    item_probabilities = _item_score_probabilities(model, theta_grid, item_indices)
 
-    if disc.ndim > 1:
-        disc = disc[:, 0]
+    conditional = np.ones((len(theta_grid), 1), dtype=np.float64)
+    for probabilities in item_probabilities:
+        current_width = conditional.shape[1]
+        n_categories = probabilities.shape[1]
+        updated = np.zeros(
+            (len(theta_grid), current_width + n_categories - 1),
+            dtype=np.float64,
+        )
+        for score in range(n_categories):
+            updated[:, score : score + current_width] += (
+                conditional * probabilities[:, score, None]
+            )
+        conditional = updated
 
-    if items is not None:
-        disc = disc[items]
-        diff = diff[items]
-
-    n_items = len(disc)
-    n_theta = len(theta_grid)
-    max_score = n_items
-
-    probs = np.zeros((n_theta, n_items))
-    for j in range(n_items):
-        z = disc[j] * (theta_grid - diff[j])
-        probs[:, j] = 1.0 / (1.0 + np.exp(-z))
-
-    f_prev = np.zeros((n_theta, max_score + 1))
-    f_prev[:, 0] = 1.0
-
-    for j in range(n_items):
-        f_curr = np.zeros((n_theta, max_score + 1))
-
-        p_j = probs[:, j]
-        q_j = 1.0 - p_j
-
-        for x in range(j + 2):
-            if x == 0:
-                f_curr[:, x] = f_prev[:, x] * q_j
-            elif x == j + 1:
-                f_curr[:, x] = f_prev[:, x - 1] * p_j
-            else:
-                f_curr[:, x] = f_prev[:, x] * q_j + f_prev[:, x - 1] * p_j
-
-        f_prev = f_curr
-
-    marginal = np.zeros(max_score + 1)
-    for x in range(max_score + 1):
-        marginal[x] = np.sum(theta_weights * f_prev[:, x])
-
-    marginal = marginal / np.sum(marginal)
-
-    return marginal
+    marginal = weights @ conditional
+    marginal = np.clip(marginal, 0.0, None)
+    total = float(np.sum(marginal))
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("score distribution has zero or non-finite probability mass")
+    return np.asarray(marginal / total, dtype=np.float64)
 
 
 def equipercentile_equating(
@@ -298,55 +273,228 @@ def equipercentile_equating(
     NDArray
         Equivalent scores on new form for each old score.
     """
+    score_dist_old = _validate_distribution(score_dist_old, "score_dist_old")
+    score_dist_new = _validate_distribution(score_dist_new, "score_dist_new")
+
     if smoothing == "loglinear":
         score_dist_old = _loglinear_smooth(score_dist_old)
         score_dist_new = _loglinear_smooth(score_dist_new)
     elif smoothing == "kernel":
         score_dist_old = _kernel_smooth(score_dist_old)
         score_dist_new = _kernel_smooth(score_dist_new)
+    elif smoothing != "none":
+        raise ValueError("smoothing must be one of 'none', 'loglinear', or 'kernel'")
 
-    cum_old = np.cumsum(score_dist_old)
-    cum_new = np.cumsum(score_dist_new)
+    percentiles_old = np.cumsum(score_dist_old) - 0.5 * score_dist_old
+    percentiles_new = np.cumsum(score_dist_new) - 0.5 * score_dist_new
+    new_scores = np.arange(len(score_dist_new), dtype=np.float64)
 
-    n_old = len(score_dist_old)
-    n_new = len(score_dist_new)
+    unique_percentiles, inverse = np.unique(percentiles_new, return_inverse=True)
+    if len(unique_percentiles) != len(percentiles_new):
+        score_sums = np.bincount(inverse, weights=new_scores)
+        counts = np.bincount(inverse)
+        new_scores = score_sums / counts
 
-    percentiles_old = np.zeros(n_old)
-    for x in range(n_old):
-        if x == 0:
-            percentiles_old[x] = score_dist_old[x] / 2
-        else:
-            percentiles_old[x] = cum_old[x - 1] + score_dist_old[x] / 2
+    return np.interp(percentiles_old, unique_percentiles, new_scores)
 
-    new_scores = np.arange(n_new, dtype=np.float64)
-    percentiles_new = np.zeros(n_new)
-    for y in range(n_new):
-        if y == 0:
-            percentiles_new[y] = score_dist_new[y] / 2
-        else:
-            percentiles_new[y] = cum_new[y - 1] + score_dist_new[y] / 2
 
-    equated = np.zeros(n_old)
-    for x in range(n_old):
-        p = percentiles_old[x]
+def _validate_count(value: int, name: str, minimum: int) -> int:
+    """Validate an integer configuration value."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be an integer")
+    result = int(value)
+    if result < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return result
 
-        idx = np.searchsorted(percentiles_new, p)
 
-        if idx == 0:
-            equated[x] = new_scores[0]
-        elif idx >= n_new:
-            equated[x] = new_scores[-1]
-        else:
-            y0 = new_scores[idx - 1]
-            y1 = new_scores[idx]
-            p0 = percentiles_new[idx - 1]
-            p1 = percentiles_new[idx]
-            if abs(p1 - p0) < 1e-10:
-                equated[x] = (y0 + y1) / 2
-            else:
-                equated[x] = y0 + (p - p0) * (y1 - y0) / (p1 - p0)
+def _validate_vector(values: NDArray[np.float64], name: str) -> NDArray[np.float64]:
+    """Return a non-empty, finite one-dimensional float array."""
+    result = np.asarray(values, dtype=np.float64)
+    if result.ndim != 1 or result.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional array")
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must contain only finite values")
+    return result
 
-    return equated
+
+def _validate_theta_range(theta_range: tuple[float, float]) -> tuple[float, float]:
+    """Validate and normalize a theta range."""
+    values = np.asarray(theta_range, dtype=np.float64)
+    if values.shape != (2,) or not np.all(np.isfinite(values)):
+        raise ValueError("theta_range must contain two finite values")
+    lower, upper = float(values[0]), float(values[1])
+    if lower >= upper:
+        raise ValueError("theta_range lower bound must be less than upper bound")
+    return lower, upper
+
+
+def _validate_model(model: "BaseItemModel", name: str) -> None:
+    """Reject models whose score scale cannot be inverted unambiguously."""
+    if model.n_factors != 1:
+        raise ValueError(f"{name} must be unidimensional")
+    if model.n_items < 1:
+        raise ValueError(f"{name} must contain at least one item")
+
+
+def _resolve_items(
+    model: "BaseItemModel",
+    items: list[int] | NDArray[np.intp] | None,
+    name: str,
+) -> NDArray[np.intp]:
+    """Validate item indices and return them in caller-specified order."""
+    if items is None:
+        return np.arange(model.n_items, dtype=np.intp)
+
+    raw = np.asarray(items)
+    if raw.ndim != 1 or raw.size == 0:
+        raise ValueError(f"{name} must be a non-empty one-dimensional sequence")
+    if raw.dtype.kind not in "iu":
+        raise ValueError(f"{name} must contain integer item indices")
+
+    indices = np.asarray(raw, dtype=np.intp)
+    if np.any(indices < 0) or np.any(indices >= model.n_items):
+        raise ValueError(f"{name} contains an item index outside the model")
+    if len(np.unique(indices)) != len(indices):
+        raise ValueError(f"{name} must not contain duplicate item indices")
+    return indices
+
+
+def _validate_weights(
+    weights: NDArray[np.float64], expected_size: int, name: str
+) -> NDArray[np.float64]:
+    """Validate integration weights and normalize their probability mass."""
+    result = _validate_vector(weights, name)
+    if len(result) != expected_size:
+        raise ValueError(f"{name} must have the same length as theta_grid")
+    if np.any(result < 0.0):
+        raise ValueError(f"{name} must be non-negative")
+    total = float(np.sum(result))
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(f"{name} must have positive finite mass")
+    return np.asarray(result / total, dtype=np.float64)
+
+
+def _validate_distribution(
+    distribution: NDArray[np.float64], name: str
+) -> NDArray[np.float64]:
+    """Validate and normalize a discrete score distribution."""
+    result = _validate_vector(distribution, name)
+    if np.any(result < 0.0):
+        raise ValueError(f"{name} must be non-negative")
+    total = float(np.sum(result))
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError(f"{name} must have positive finite mass")
+    return np.asarray(result / total, dtype=np.float64)
+
+
+def _item_score_probabilities(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    item_indices: NDArray[np.intp],
+) -> list[NDArray[np.float64]]:
+    """Return category probabilities for each selected item and theta."""
+    raw_probabilities = np.asarray(model.probability(theta[:, None]), dtype=np.float64)
+    result: list[NDArray[np.float64]] = []
+
+    if model.is_polytomous:
+        category_counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+        if (
+            raw_probabilities.ndim != 3
+            or raw_probabilities.shape[:2] != (len(theta), model.n_items)
+            or category_counts.shape != (model.n_items,)
+        ):
+            raise ValueError("model returned invalid polytomous probabilities")
+        for item_idx in item_indices:
+            n_categories = int(category_counts[item_idx])
+            probabilities = raw_probabilities[:, item_idx, :n_categories]
+            result.append(_validate_item_probabilities(probabilities))
+        return result
+
+    if raw_probabilities.shape != (len(theta), model.n_items):
+        raise ValueError("model returned invalid dichotomous probabilities")
+    selected = raw_probabilities[:, item_indices]
+    if not np.all(np.isfinite(selected)) or np.any(
+        (selected < -_PROBABILITY_TOLERANCE) | (selected > 1.0 + _PROBABILITY_TOLERANCE)
+    ):
+        raise ValueError("model returned probabilities outside [0, 1]")
+    selected = np.clip(selected, 0.0, 1.0)
+    for column in range(selected.shape[1]):
+        correct = selected[:, column]
+        result.append(np.column_stack((1.0 - correct, correct)))
+    return result
+
+
+def _validate_item_probabilities(
+    probabilities: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Validate a theta-by-category probability matrix."""
+    if probabilities.ndim != 2 or probabilities.shape[1] < 2:
+        raise ValueError("model returned an invalid category probability matrix")
+    if not np.all(np.isfinite(probabilities)) or np.any(
+        (probabilities < -_PROBABILITY_TOLERANCE)
+        | (probabilities > 1.0 + _PROBABILITY_TOLERANCE)
+    ):
+        raise ValueError("model returned probabilities outside [0, 1]")
+
+    result = np.clip(probabilities, 0.0, 1.0)
+    row_sums = np.sum(result, axis=1, keepdims=True)
+    if np.any(np.abs(row_sums - 1.0) > 1e-7):
+        raise ValueError("model category probabilities must sum to one")
+    return np.asarray(result / row_sums, dtype=np.float64)
+
+
+def _maximum_score(model: "BaseItemModel", item_indices: NDArray[np.intp]) -> int:
+    """Return the largest attainable sum score for selected items."""
+    if not model.is_polytomous:
+        return len(item_indices)
+    category_counts = np.asarray(getattr(model, "n_categories"), dtype=np.intp)
+    return int(np.sum(category_counts[item_indices] - 1))
+
+
+def _conditional_score_variance(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    item_indices: NDArray[np.intp],
+) -> NDArray[np.float64]:
+    """Compute conditional raw-score variance under local independence."""
+    variance = np.zeros(len(theta), dtype=np.float64)
+    for probabilities in _item_score_probabilities(model, theta, item_indices):
+        scores = np.arange(probabilities.shape[1], dtype=np.float64)
+        first_moment = probabilities @ scores
+        second_moment = probabilities @ (scores**2)
+        variance += np.maximum(second_moment - first_moment**2, 0.0)
+    return variance
+
+
+def _validate_expected_score_curve(
+    expected: NDArray[np.float64], model_name: str
+) -> None:
+    """Require a finite, non-decreasing, identifiable score curve."""
+    if not np.all(np.isfinite(expected)):
+        raise ValueError(f"{model_name} expected score curve must be finite")
+    if np.any(np.diff(expected) < -_PROBABILITY_TOLERANCE):
+        raise ValueError(f"{model_name} expected score curve must be non-decreasing")
+    if float(expected[-1] - expected[0]) <= _PROBABILITY_TOLERANCE:
+        raise ValueError(f"{model_name} expected score curve must vary across theta")
+
+
+def _invert_expected_scores(
+    expected: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    scores: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Invert a validated expected-score curve while preserving input shape."""
+    unique_expected, unique_indices = np.unique(expected, return_index=True)
+    score_array = np.asarray(scores, dtype=np.float64)
+    inverted = np.interp(
+        score_array.reshape(-1),
+        unique_expected,
+        theta[unique_indices],
+        left=float(theta[0]),
+        right=float(theta[-1]),
+    )
+    return np.asarray(inverted.reshape(score_array.shape), dtype=np.float64)
 
 
 def _loglinear_smooth(
@@ -354,22 +502,24 @@ def _loglinear_smooth(
 ) -> NDArray[np.float64]:
     """Apply log-linear smoothing to score distribution."""
     n = len(dist)
-    scores = np.arange(n)
+    if n == 1:
+        return dist.copy()
+    scores = np.linspace(-1.0, 1.0, n)
+    degree = min(degree, n - 1)
 
     dist = np.maximum(dist, 1e-10)
     log_dist = np.log(dist)
 
-    X = np.column_stack([scores**k for k in range(degree + 1)])
+    design = np.vander(scores, N=degree + 1, increasing=True)
 
     try:
-        coeffs = np.linalg.lstsq(X, log_dist, rcond=None)[0]
-        smoothed = np.exp(X @ coeffs)
+        coeffs = np.linalg.lstsq(design, log_dist, rcond=None)[0]
+        fitted = design @ coeffs
+        smoothed = np.exp(fitted - np.max(fitted))
     except np.linalg.LinAlgError:
         return dist
 
-    smoothed = smoothed / np.sum(smoothed)
-
-    return smoothed
+    return np.asarray(smoothed / np.sum(smoothed), dtype=np.float64)
 
 
 def _kernel_smooth(
@@ -378,47 +528,36 @@ def _kernel_smooth(
 ) -> NDArray[np.float64]:
     """Apply kernel smoothing to score distribution."""
     n = len(dist)
-    scores = np.arange(n)
+    if n == 1:
+        return dist.copy()
+    scores = np.arange(n, dtype=np.float64)
 
     if bandwidth is None:
         bandwidth = 0.5
+    if not np.isfinite(bandwidth) or bandwidth <= 0.0:
+        raise ValueError("bandwidth must be finite and positive")
 
-    smoothed = np.zeros(n)
-    for i in range(n):
-        weights = stats.norm.pdf((scores - i) / bandwidth)
-        weights = weights / np.sum(weights)
-        smoothed[i] = np.sum(weights * dist)
-
-    smoothed = smoothed / np.sum(smoothed)
-
-    return smoothed
+    scaled_differences = (scores[:, None] - scores[None, :]) / bandwidth
+    kernel = np.exp(-0.5 * scaled_differences**2)
+    kernel /= np.sum(kernel, axis=1, keepdims=True)
+    smoothed = kernel @ dist
+    return np.asarray(smoothed / np.sum(smoothed), dtype=np.float64)
 
 
 def _compute_expected_scores(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
-    items: list[int] | None = None,
+    items: list[int] | NDArray[np.intp] | None = None,
 ) -> NDArray[np.float64]:
     """Compute expected scores at each theta."""
-    disc = np.asarray(model.discrimination)
-    diff = np.asarray(model.difficulty)
-
-    if disc.ndim > 1:
-        disc = disc[:, 0]
-
-    if items is not None:
-        disc = disc[items]
-        diff = diff[items]
-
-    n_items = len(disc)
-    n_theta = len(theta)
-
-    expected = np.zeros(n_theta)
-    for j in range(n_items):
-        z = disc[j] * (theta - diff[j])
-        p = 1.0 / (1.0 + np.exp(-z))
-        expected += p
-
+    _validate_model(model, "model")
+    theta = _validate_vector(theta, "theta")
+    item_indices = _resolve_items(model, items, "items")
+    item_probabilities = _item_score_probabilities(model, theta, item_indices)
+    expected = np.zeros(len(theta), dtype=np.float64)
+    for probabilities in item_probabilities:
+        scores = np.arange(probabilities.shape[1], dtype=np.float64)
+        expected += probabilities @ scores
     return expected
 
 
@@ -451,18 +590,18 @@ def score_to_theta(
     NDArray
         Theta estimates corresponding to scores.
     """
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    expected = _compute_expected_scores(model, theta_grid, items)
+    lower, upper = _validate_theta_range(theta_range)
+    n_theta = _validate_count(n_theta, "n_theta", minimum=2)
+    _validate_model(model, "model")
+    item_indices = _resolve_items(model, items, "items")
+    scores_array = np.asarray(scores, dtype=np.float64)
+    if not np.all(np.isfinite(scores_array)):
+        raise ValueError("scores must contain only finite values")
 
-    interp_func = interpolate.interp1d(
-        expected,
-        theta_grid,
-        kind="linear",
-        bounds_error=False,
-        fill_value=(theta_range[0], theta_range[1]),
-    )
-
-    return interp_func(scores)
+    theta_grid = np.linspace(lower, upper, n_theta)
+    expected = _compute_expected_scores(model, theta_grid, item_indices)
+    _validate_expected_score_curve(expected, "model")
+    return _invert_expected_scores(expected, theta_grid, scores_array)
 
 
 def theta_to_score(
@@ -486,7 +625,14 @@ def theta_to_score(
     NDArray
         Expected scores at each theta.
     """
-    return _compute_expected_scores(model, theta, items)
+    _validate_model(model, "model")
+    item_indices = _resolve_items(model, items, "items")
+    theta_array = np.asarray(theta, dtype=np.float64)
+    if not np.all(np.isfinite(theta_array)):
+        raise ValueError("theta must contain only finite values")
+    original_shape = theta_array.shape
+    expected = _compute_expected_scores(model, theta_array.reshape(-1), item_indices)
+    return expected.reshape(original_shape)
 
 
 def score_equating_summary(result: ScoreEquatingResult) -> str:
@@ -555,36 +701,12 @@ def compute_see(
     NDArray
         Standard error of equating at each theta.
     """
-    disc_old = np.asarray(model_old.discrimination)
-    diff_old = np.asarray(model_old.difficulty)
-    if disc_old.ndim > 1:
-        disc_old = disc_old[:, 0]
-    if items_old is not None:
-        disc_old = disc_old[items_old]
-        diff_old = diff_old[items_old]
+    _validate_model(model_old, "model_old")
+    _validate_model(model_new, "model_new")
+    theta_grid = _validate_vector(theta_grid, "theta_grid")
+    old_item_indices = _resolve_items(model_old, items_old, "items_old")
+    new_item_indices = _resolve_items(model_new, items_new, "items_new")
 
-    disc_new = np.asarray(model_new.discrimination)
-    diff_new = np.asarray(model_new.difficulty)
-    if disc_new.ndim > 1:
-        disc_new = disc_new[:, 0]
-    if items_new is not None:
-        disc_new = disc_new[items_new]
-        diff_new = diff_new[items_new]
-
-    see = np.zeros(len(theta_grid))
-    for i, theta in enumerate(theta_grid):
-        var_old = 0.0
-        for j in range(len(disc_old)):
-            z = disc_old[j] * (theta - diff_old[j])
-            p = 1.0 / (1.0 + np.exp(-z))
-            var_old += p * (1 - p)
-
-        var_new = 0.0
-        for j in range(len(disc_new)):
-            z = disc_new[j] * (theta - diff_new[j])
-            p = 1.0 / (1.0 + np.exp(-z))
-            var_new += p * (1 - p)
-
-        see[i] = np.sqrt(var_old + var_new)
-
-    return see
+    variance_old = _conditional_score_variance(model_old, theta_grid, old_item_indices)
+    variance_new = _conditional_score_variance(model_new, theta_grid, new_item_indices)
+    return np.sqrt(np.maximum(variance_old + variance_new, 0.0))
