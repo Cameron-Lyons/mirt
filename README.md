@@ -417,6 +417,8 @@ plot_person_item_map(result.model, scores.theta)
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
 | `predict_mixed()` | Response probabilities from abilities or person covariates |
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
+| `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
+| `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
 
 ### Data Transformation Functions
 
