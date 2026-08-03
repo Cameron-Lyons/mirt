@@ -14,6 +14,7 @@ powered by a Rust backend for computational efficiency.
    guides/dif
    guides/multigroup
    guides/equating
+   guides/reports
    api/index
 
 Installation
@@ -48,6 +49,7 @@ Features
 * **Multiple IRT Models**: 1PL, 2PL, 3PL, Graded Response, Partial Credit, and more
 * **Estimation Methods**: EM, MCMC, MHRM, Mixed estimation
 * **Diagnostics**: Item fit, model fit, DIF analysis, SIBTEST
+* **Reports**: Standalone HTML summaries with optional embedded visualizations
 * **Scoring**: EAP, MAP, ML scoring methods
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
 * **High Performance**: Rust-powered backend for fast computation

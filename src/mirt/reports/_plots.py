@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import base64
 import io
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -13,6 +16,7 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+@lru_cache(maxsize=1)
 def _get_pyplot() -> Any:
     """Get matplotlib.pyplot, raising helpful error if unavailable."""
     try:
@@ -27,6 +31,17 @@ def _get_pyplot() -> Any:
             "matplotlib is required for report generation. "
             "Install it with: pip install matplotlib"
         ) from None
+
+
+@contextmanager
+def _figure(figsize: tuple[float, float]) -> Iterator[tuple[Any, Any]]:
+    """Create a figure and guarantee that its resources are released."""
+    plt = _get_pyplot()
+    fig, ax = plt.subplots(figsize=figsize)
+    try:
+        yield fig, ax
+    finally:
+        plt.close(fig)
 
 
 def figure_to_base64(fig: Any, dpi: int = 100, fmt: str = "png") -> str:
@@ -46,10 +61,11 @@ def figure_to_base64(fig: Any, dpi: int = 100, fmt: str = "png") -> str:
     str
         Base64-encoded image data.
     """
-    buf = io.BytesIO()
-    fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white")
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
+    if isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
+        raise ValueError("dpi must be a positive integer")
+    with io.BytesIO() as buf:
+        fig.savefig(buf, format=fmt, dpi=dpi, bbox_inches="tight", facecolor="white")
+        return base64.b64encode(buf.getbuffer()).decode("ascii")
 
 
 def create_icc_plot_base64(
@@ -75,12 +91,9 @@ def create_icc_plot_base64(
     """
     from mirt.plotting import plot_icc
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plot_icc(model, item_idx=item_idx, ax=ax)
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((10, 6)) as (fig, ax):
+        plot_icc(model, item_idx=item_idx, ax=ax)
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_information_plot_base64(
@@ -106,12 +119,9 @@ def create_information_plot_base64(
     """
     from mirt.plotting import plot_information
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plot_information(model, test_info=test_info, ax=ax)
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((10, 6)) as (fig, ax):
+        plot_information(model, test_info=test_info, ax=ax)
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_itemfit_plot_base64(
@@ -140,13 +150,10 @@ def create_itemfit_plot_base64(
     """
     from mirt.plotting import plot_itemfit
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plot_itemfit(fit_stats, statistic=statistic, item_names=item_names, ax=ax)
-    fig.tight_layout()
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((12, 6)) as (fig, ax):
+        plot_itemfit(fit_stats, statistic=statistic, item_names=item_names, ax=ax)
+        fig.tight_layout()
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_wright_map_base64(
@@ -172,12 +179,9 @@ def create_wright_map_base64(
     """
     from mirt.plotting import plot_person_item_map
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 8))
-    plot_person_item_map(model, theta, ax=ax)
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((10, 8)) as (fig, ax):
+        plot_person_item_map(model, theta, ax=ax)
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_dif_plot_base64(
@@ -203,13 +207,10 @@ def create_dif_plot_base64(
     """
     from mirt.plotting import plot_dif
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(12, 6))
-    plot_dif(dif_results, item_names=item_names, ax=ax)
-    fig.tight_layout()
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((12, 6)) as (fig, ax):
+        plot_dif(dif_results, item_names=item_names, ax=ax)
+        fig.tight_layout()
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_ability_distribution_base64(
@@ -235,12 +236,9 @@ def create_ability_distribution_base64(
     """
     from mirt.plotting import plot_ability_distribution
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plot_ability_distribution(theta, se=se, ax=ax)
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((10, 6)) as (fig, ax):
+        plot_ability_distribution(theta, se=se, ax=ax)
+        return figure_to_base64(fig, dpi=dpi)
 
 
 def create_se_plot_base64(model: BaseItemModel, dpi: int = 100) -> str:
@@ -260,9 +258,6 @@ def create_se_plot_base64(model: BaseItemModel, dpi: int = 100) -> str:
     """
     from mirt.plotting import plot_se
 
-    plt = _get_pyplot()
-    fig, ax = plt.subplots(figsize=(10, 6))
-    plot_se(model, ax=ax)
-    result = figure_to_base64(fig, dpi=dpi)
-    plt.close(fig)
-    return result
+    with _figure((10, 6)) as (fig, ax):
+        plot_se(model, ax=ax)
+        return figure_to_base64(fig, dpi=dpi)

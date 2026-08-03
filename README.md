@@ -58,7 +58,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Reliable Change Index (RCI) for clinical significance
 - Profile-likelihood confidence intervals
 - Posterior parameter sampling
-- **HTML reports**: Automated IRT analysis report generation
+- **HTML reports**: Safe standalone summaries with optional embedded plots
 
 ## Installation
 
@@ -75,7 +75,7 @@ pip install mirt[dev]
 
 For plotting support:
 ```bash
-pip install matplotlib
+pip install "mirt[plot]"
 ```
 
 ## Quick Start
@@ -503,7 +503,7 @@ print(f"Rust extension: {mirt.is_rust_available()}")
 
 | Package | Purpose | Installation |
 |---------|---------|--------------|
-| **matplotlib** | Plotting (ICC, information curves, Wright maps, DIF) | `pip install matplotlib` |
+| **matplotlib** | Plotting (ICC, information curves, Wright maps, DIF) | `pip install "mirt[plot]"` |
 | **pandas** | DataFrame output for results | `pip install mirt[pandas]` |
 | **polars** | DataFrame output (faster, preferred when both installed) | `pip install mirt[polars]` |
 

@@ -39,6 +39,9 @@ class FullDiagnosticReport(ReportBuilder):
         Whether to include local dependence analysis. Default True.
     title : str, optional
         Report title.
+    include_plots : bool
+        Embed visualizations in the report. Set to False for a lightweight
+        report that does not require matplotlib. Default True.
 
     Examples
     --------
@@ -59,24 +62,17 @@ class FullDiagnosticReport(ReportBuilder):
         theta: NDArray[np.float64] | None = None,
         include_ld: bool = True,
         title: str | None = None,
+        include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
         self.responses = np.asarray(responses)
         self.theta = theta
         self.include_ld = include_ld
+        self.include_plots = include_plots
 
     def _build_content(self) -> str:
         from mirt.diagnostics.itemfit import compute_itemfit
         from mirt.diagnostics.modelfit import compute_fit_indices
-        from mirt.reports._plots import (
-            create_ability_distribution_base64,
-            create_icc_plot_base64,
-            create_information_plot_base64,
-            create_itemfit_plot_base64,
-            create_se_plot_base64,
-            create_wright_map_base64,
-        )
-        from mirt.reports._templates import embedded_plot, section
 
         sections = []
 
@@ -110,62 +106,84 @@ class FullDiagnosticReport(ReportBuilder):
                     stacklevel=2,
                 )
 
-        sections.append(section("Visualizations", ""))
-
-        icc_base64 = create_icc_plot_base64(self.fit_result.model)
-        sections.append(
-            section(
-                "Item Characteristic Curves",
-                embedded_plot(icc_base64, "ICC"),
-                level=3,
+        if self.include_plots:
+            from mirt.reports._plots import (
+                create_ability_distribution_base64,
+                create_icc_plot_base64,
+                create_information_plot_base64,
+                create_itemfit_plot_base64,
+                create_se_plot_base64,
+                create_wright_map_base64,
             )
-        )
+            from mirt.reports._templates import embedded_plot, section
 
-        info_base64 = create_information_plot_base64(self.fit_result.model)
-        sections.append(
-            section(
-                "Test Information", embedded_plot(info_base64, "Information"), level=3
-            )
-        )
+            sections.append(section("Visualizations", ""))
 
-        se_base64 = create_se_plot_base64(self.fit_result.model)
-        sections.append(
-            section("Standard Error", embedded_plot(se_base64, "SE"), level=3)
-        )
-
-        itemfit_base64 = create_itemfit_plot_base64(
-            fit_stats, item_names=self.fit_result.model.item_names
-        )
-        sections.append(
-            section("Item Fit", embedded_plot(itemfit_base64, "Item Fit"), level=3)
-        )
-
-        if self.theta is not None:
-            ability_base64 = create_ability_distribution_base64(self.theta)
+            icc_base64 = create_icc_plot_base64(self.fit_result.model)
             sections.append(
                 section(
-                    "Ability Distribution",
-                    embedded_plot(ability_base64, "Ability"),
+                    "Item Characteristic Curves",
+                    embedded_plot(icc_base64, "ICC"),
                     level=3,
                 )
             )
 
-            wright_base64 = create_wright_map_base64(self.fit_result.model, self.theta)
+            info_base64 = create_information_plot_base64(self.fit_result.model)
             sections.append(
                 section(
-                    "Wright Map", embedded_plot(wright_base64, "Wright Map"), level=3
+                    "Test Information",
+                    embedded_plot(info_base64, "Information"),
+                    level=3,
                 )
             )
+
+            se_base64 = create_se_plot_base64(self.fit_result.model)
+            sections.append(
+                section("Standard Error", embedded_plot(se_base64, "SE"), level=3)
+            )
+
+            itemfit_base64 = create_itemfit_plot_base64(
+                fit_stats, item_names=self.fit_result.model.item_names
+            )
+            sections.append(
+                section("Item Fit", embedded_plot(itemfit_base64, "Item Fit"), level=3)
+            )
+
+            if self.theta is not None:
+                ability_base64 = create_ability_distribution_base64(self.theta)
+                sections.append(
+                    section(
+                        "Ability Distribution",
+                        embedded_plot(ability_base64, "Ability"),
+                        level=3,
+                    )
+                )
+
+                wright_base64 = create_wright_map_base64(
+                    self.fit_result.model, self.theta
+                )
+                sections.append(
+                    section(
+                        "Wright Map",
+                        embedded_plot(wright_base64, "Wright Map"),
+                        level=3,
+                    )
+                )
 
         return "\n".join(sections)
 
     def _build_model_summary_section(self) -> str:
-        from mirt.reports._templates import format_value, section, summary_box
+        from mirt.reports._templates import (
+            escape_text,
+            format_value,
+            section,
+            summary_box,
+        )
 
         model = self.fit_result.model
         stats = self.fit_result.fit_statistics()
         html = f"""
-        <p><strong>Model Type:</strong> {model.model_name}</p>
+        <p><strong>Model Type:</strong> {escape_text(model.model_name)}</p>
         <p><strong>Items:</strong> {model.n_items} | <strong>Factors:</strong> {model.n_factors}</p>
         <p><strong>Persons:</strong> {stats["n_observations"]} | <strong>Parameters:</strong> {stats["n_parameters"]}</p>
         <p><strong>Log-Likelihood:</strong> {format_value(stats["log_likelihood"], ".2f")}</p>
@@ -269,8 +287,8 @@ class FullDiagnosticReport(ReportBuilder):
         from mirt.reports._templates import section, summary_box, table_from_data
 
         q3_upper = ld_results.q3_matrix[np.triu_indices_from(ld_results.q3_matrix, k=1)]
-        mean_q3 = np.mean(q3_upper)
-        max_q3 = np.max(np.abs(q3_upper))
+        mean_q3 = float(np.mean(q3_upper)) if q3_upper.size else np.nan
+        max_q3 = float(np.max(np.abs(q3_upper))) if q3_upper.size else np.nan
         n_flagged = len(ld_results.q3_flagged)
 
         summary_html = f"""

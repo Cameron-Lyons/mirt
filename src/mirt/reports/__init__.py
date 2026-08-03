@@ -45,7 +45,7 @@ Generate DIF report:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from mirt.reports.dif_analysis import DIFAnalysisReport
 from mirt.reports.full_diagnostic import FullDiagnosticReport
@@ -75,7 +75,7 @@ def generate_report(
     ] = "item_analysis",
     theta: NDArray[np.float64] | None = None,
     output_path: str | Path | None = None,
-    **kwargs: str,
+    **kwargs: Any,
 ) -> str:
     """Generate an IRT report.
 
@@ -99,7 +99,9 @@ def generate_report(
     output_path : str or Path, optional
         If provided, save report to this path.
     **kwargs
-        Additional arguments passed to report builder.
+        Additional arguments passed to the report builder. Use
+        ``include_plots=False`` to generate a lightweight report without
+        importing matplotlib.
 
     Returns
     -------
@@ -132,7 +134,8 @@ def generate_report(
     else:
         report = builder_cls(fit_result, responses, **kwargs)
 
-    if output_path:
-        report.save(output_path)
+    html = report.generate()
+    if output_path is not None:
+        report._write_html(output_path, html)
 
-    return report.generate()
+    return html
