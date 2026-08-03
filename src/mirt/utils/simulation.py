@@ -3,6 +3,7 @@ from typing import Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import sample_categorical_rows
 from mirt._core import sigmoid
 
 
@@ -224,7 +225,7 @@ def _simulate_grm(
     else:
         a = discrimination
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
 
     for i in range(n_items):
         cum_probs = np.ones((n_persons, n_categories))
@@ -237,14 +238,19 @@ def _simulate_grm(
 
             cum_probs[:, k + 1] = sigmoid(z)
 
-        cat_probs = np.diff(
+        cat_probs = -np.diff(
             np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1
         )
         cat_probs = np.maximum(cat_probs, 0)
-        cat_probs = cat_probs / cat_probs.sum(axis=1, keepdims=True)
+        totals = cat_probs.sum(axis=1, keepdims=True)
+        cat_probs = np.divide(
+            cat_probs,
+            totals,
+            out=np.zeros_like(cat_probs),
+            where=totals > 0,
+        )
 
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+        responses[:, i] = sample_categorical_rows(cat_probs, rng)
 
     return responses
 
@@ -272,25 +278,22 @@ def _simulate_gpcm(
     else:
         a = discrimination
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
 
     for i in range(n_items):
-        numerators = np.zeros((n_persons, n_categories))
+        if n_factors == 1:
+            step_logits = a[i] * (theta.ravel()[:, None] - thresholds[i][None, :])
+        else:
+            person_score = np.dot(theta, a[i])
+            step_logits = person_score[:, None] - np.sum(a[i]) * thresholds[i][None, :]
 
-        for k in range(n_categories):
-            cumsum = 0.0
-            for v in range(k):
-                if n_factors == 1:
-                    cumsum += a[i] * (theta.ravel() - thresholds[i, v])
-                else:
-                    cumsum += np.dot(theta, a[i]) - np.sum(a[i]) * thresholds[i, v]
-
-            numerators[:, k] = np.exp(cumsum)
-
+        logits = np.zeros((n_persons, n_categories))
+        logits[:, 1:] = np.cumsum(step_logits, axis=1)
+        logits -= np.max(logits, axis=1, keepdims=True)
+        numerators = np.exp(logits)
         cat_probs = numerators / numerators.sum(axis=1, keepdims=True)
 
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+        responses[:, i] = sample_categorical_rows(cat_probs, rng)
 
     return responses
 
