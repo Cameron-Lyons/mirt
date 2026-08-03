@@ -1,5 +1,7 @@
 """Tests for multidimensional computerized adaptive testing (MCAT)."""
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -438,6 +440,25 @@ class TestMCATEngine:
         item = engine.select_next_item()
 
         assert 0 <= item < fitted_mirt_model.n_items
+
+    def test_disclosed_item_remains_pending_until_response(self, fitted_mirt_model):
+        """MCAT must record a response against the disclosed item."""
+        engine = MCATEngine(
+            fitted_mirt_model,
+            item_selection=RandomMCATSelection(seed=42),
+            max_items=5,
+        )
+
+        with patch.object(
+            engine, "_select_next_item", wraps=engine._select_next_item
+        ) as spy:
+            disclosed_item = engine.get_current_state().next_item
+            assert engine.select_next_item() == disclosed_item
+            assert spy.call_count == 1
+            state = engine.administer_item(1)
+
+        assert state.items_administered == [disclosed_item]
+        assert spy.call_count == 2
 
     def test_administer_item(self, fitted_mirt_model):
         engine = MCATEngine(fitted_mirt_model, max_items=10)

@@ -19,6 +19,7 @@ from scipy.optimize import minimize, minimize_scalar
 
 from mirt.constants import PROB_EPSILON
 from mirt.results.score_result import ScoreResult
+from mirt.scoring._common import observed_test_information
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -166,13 +167,7 @@ class WLEScorer:
         valid_mask: NDArray[np.bool_],
     ) -> NDArray[np.float64]:
         """Compute test information at given theta values."""
-        info = np.zeros(theta.shape[0])
-
-        for j in range(model.n_items):
-            if valid_mask[j]:
-                info += model.information(theta, j)
-
-        return info
+        return observed_test_information(model, theta, valid_mask)
 
     def _score_multidimensional(
         self,

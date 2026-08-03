@@ -1,5 +1,8 @@
 """Tests for item selection strategies."""
 
+from unittest.mock import patch
+
+import numpy as np
 import pytest
 
 from mirt.cat.selection import (
@@ -11,6 +14,7 @@ from mirt.cat.selection import (
     UrryRule,
     create_selection_strategy,
 )
+from mirt.models.polytomous import GradedResponseModel
 
 
 class TestMaxFisherInformation:
@@ -59,6 +63,36 @@ class TestMaxFisherInformation:
         assert isinstance(criteria, dict)
         assert set(criteria.keys()) == available
         assert all(isinstance(v, float) for v in criteria.values())
+
+    def test_vectorizes_information_across_item_bank(self, fitted_2pl_model):
+        """MFI should evaluate a dichotomous bank in one model call."""
+        model = fitted_2pl_model.model
+        mfi = MaxFisherInformation()
+        available = {0, 2, 4}
+        expected = model.information(np.array([[0.25]])).ravel()
+
+        with patch.object(model, "information", wraps=model.information) as spy:
+            criteria = mfi.get_item_criteria(model, 0.25, available)
+
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs == {}
+        assert criteria == {item: float(expected[item]) for item in available}
+
+    def test_preserves_itemwise_fallback_for_polytomous_models(self):
+        """Polytomous total information must not be treated as itemwise."""
+        model = GradedResponseModel(n_items=3, n_categories=[3, 4, 3])
+        mfi = MaxFisherInformation()
+        available = {0, 2}
+
+        expected = {
+            item: float(model.information(np.array([[0.25]]), item_idx=item).sum())
+            for item in available
+        }
+        with patch.object(model, "information", wraps=model.information) as spy:
+            criteria = mfi.get_item_criteria(model, 0.25, available)
+
+        assert spy.call_count == len(available)
+        assert criteria == expected
 
 
 class TestMaxExpectedInformation:
