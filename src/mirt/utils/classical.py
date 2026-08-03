@@ -8,10 +8,88 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt._rust_backend import RUST_AVAILABLE
 from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
+
+
+def _clean_response_matrix(
+    responses: ArrayLike,
+    *,
+    missing_code: float,
+    binary: bool,
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Validate responses and normalize missing values to NaN."""
+    raw = np.asarray(responses)
+    if raw.ndim != 2:
+        raise ValueError(f"responses must be a 2D matrix, got {raw.ndim}D")
+    if raw.shape[0] == 0 or raw.shape[1] == 0:
+        raise ValueError("responses must contain at least one person and one item")
+    if raw.dtype.kind not in "biuf":
+        raise ValueError("responses must contain numeric values")
+
+    values = np.asarray(raw, dtype=np.float64)
+    finite = np.isfinite(values)
+    missing = np.isnan(values) | ((values < 0.0) & finite) | (values == missing_code)
+    observed = values[~missing]
+    if not np.all(np.isfinite(observed)):
+        raise ValueError("observed responses must contain only finite values")
+    if np.any(observed != np.floor(observed)):
+        raise ValueError("observed responses must be integer-valued")
+    if binary and np.any((observed != 0.0) & (observed != 1.0)):
+        raise ValueError("responses must contain only 0, 1, or missing values")
+
+    return np.where(missing, np.nan, values), missing
+
+
+def _sample_variance(
+    values: NDArray[np.float64],
+    *,
+    axis: int | None = None,
+) -> NDArray[np.float64] | float:
+    """Compute sample variance without warnings for sparse columns."""
+    valid = np.isfinite(values)
+    counts = np.sum(valid, axis=axis)
+    sums = np.nansum(values, axis=axis)
+    means = np.divide(
+        sums,
+        counts,
+        out=np.zeros_like(sums, dtype=np.float64),
+        where=counts > 0,
+    )
+    if axis is None:
+        squared_deviations = np.where(valid, (values - means) ** 2, 0.0)
+    else:
+        squared_deviations = np.where(
+            valid,
+            (values - np.expand_dims(means, axis=axis)) ** 2,
+            0.0,
+        )
+    squared_sum = np.sum(squared_deviations, axis=axis)
+    return np.divide(
+        squared_sum,
+        counts - 1,
+        out=np.zeros_like(squared_sum, dtype=np.float64),
+        where=counts > 1,
+    )
+
+
+def _cronbach_alpha(responses: NDArray[np.float64]) -> float:
+    n_items = responses.shape[1]
+    if n_items < 2:
+        return 0.0
+
+    item_variances = np.asarray(_sample_variance(responses, axis=0))
+    total_scores = np.nansum(responses, axis=1)
+    total_scores[np.all(np.isnan(responses), axis=1)] = np.nan
+    total_variance = float(_sample_variance(total_scores))
+    if total_variance <= 0.0:
+        return 0.0
+    return float(
+        (n_items / (n_items - 1))
+        * (1.0 - float(np.sum(item_variances)) / total_variance)
+    )
 
 
 @dataclass
@@ -49,19 +127,23 @@ class TraditionalStats:
 
 
 def traditional(
-    responses: NDArray[np.float64],
+    responses: ArrayLike,
     use_corrected_correlation: bool = True,
+    missing_code: float = -1,
 ) -> TraditionalStats:
     """Compute classical test theory statistics.
 
     Parameters
     ----------
-    responses : NDArray[np.float64]
+    responses : array-like
         Response matrix. Shape: (n_persons, n_items).
-        Values should be 0/1 for dichotomous items.
+        Values must be 0/1 for dichotomous items. Negative values, NaN,
+        and ``missing_code`` are treated as missing.
     use_corrected_correlation : bool
         If True, use corrected item-total correlation
         (excludes the item from the total). Default True.
+    missing_code : float, default=-1
+        Additional value used to identify missing responses.
 
     Returns
     -------
@@ -74,57 +156,89 @@ def traditional(
     >>> print(f"Cronbach's alpha: {stats.alpha:.3f}")
     >>> print(f"Mean difficulty: {np.mean(stats.difficulty):.3f}")
     """
-    responses = np.asarray(responses, dtype=np.float64)
+    if not isinstance(use_corrected_correlation, (bool, np.bool_)):
+        raise ValueError("use_corrected_correlation must be boolean")
+    responses, _ = _clean_response_matrix(
+        responses,
+        missing_code=missing_code,
+        binary=True,
+    )
     n_persons, n_items = responses.shape
+    if n_persons < 2:
+        raise ValueError("traditional requires at least two respondents")
+    if n_items < 2:
+        raise ValueError("traditional requires at least two items")
+    scored = np.any(np.isfinite(responses), axis=1)
+    if np.count_nonzero(scored) < 2:
+        raise ValueError("traditional requires at least two respondents with data")
 
-    difficulty = np.nanmean(responses, axis=0)
+    valid_counts = np.sum(np.isfinite(responses), axis=0)
+    difficulty = np.divide(
+        np.nansum(responses, axis=0),
+        valid_counts,
+        out=np.full(n_items, np.nan),
+        where=valid_counts > 0,
+    )
 
     total_scores = np.nansum(responses, axis=1)
+    total_scores[np.all(np.isnan(responses), axis=1)] = np.nan
 
-    discrimination = np.zeros(n_items)
-    for j in range(n_items):
-        item_responses = responses[:, j]
-        valid = ~np.isnan(item_responses)
-
-        if use_corrected_correlation:
-            corrected_total = total_scores[valid] - item_responses[valid]
-        else:
-            corrected_total = total_scores[valid]
-
-        if np.std(item_responses[valid]) > 0 and np.std(corrected_total) > 0:
-            discrimination[j] = np.corrcoef(item_responses[valid], corrected_total)[
-                0, 1
-            ]
-        else:
-            discrimination[j] = 0.0
-
-    item_variances = np.nanvar(responses, axis=0, ddof=1)
-    total_variance = np.nanvar(total_scores, ddof=1)
-
-    if total_variance > 0:
-        alpha = (n_items / (n_items - 1)) * (
-            1 - np.sum(item_variances) / total_variance
+    valid = np.isfinite(responses)
+    item_values = np.where(valid, responses, 0.0)
+    if use_corrected_correlation:
+        correlation_totals = np.where(
+            valid,
+            total_scores[:, None] - item_values,
+            0.0,
         )
     else:
-        alpha = 0.0
+        correlation_totals = np.where(valid, total_scores[:, None], 0.0)
+
+    counts = np.sum(valid, axis=0)
+    item_sums = np.sum(item_values, axis=0)
+    total_sums = np.sum(correlation_totals, axis=0)
+    covariance_numerator = np.sum(item_values * correlation_totals, axis=0)
+    covariance_numerator -= np.divide(
+        item_sums * total_sums,
+        counts,
+        out=np.zeros(n_items),
+        where=counts > 0,
+    )
+    item_squared = np.sum(item_values**2, axis=0) - np.divide(
+        item_sums**2,
+        counts,
+        out=np.zeros(n_items),
+        where=counts > 0,
+    )
+    total_squared = np.sum(correlation_totals**2, axis=0) - np.divide(
+        total_sums**2,
+        counts,
+        out=np.zeros(n_items),
+        where=counts > 0,
+    )
+    denominator = np.sqrt(np.maximum(item_squared * total_squared, 0.0))
+    discrimination = np.divide(
+        covariance_numerator,
+        denominator,
+        out=np.zeros(n_items),
+        where=denominator > 0.0,
+    )
+
+    scored_responses = responses[scored]
+    alpha = _cronbach_alpha(scored_responses)
 
     if RUST_AVAILABLE:
-        alpha_if_deleted = _rust_alpha_if_deleted(responses)
+        alpha_if_deleted = _rust_alpha_if_deleted(scored_responses)
     else:
-        alpha_if_deleted = np.zeros(n_items)
-        for j in range(n_items):
-            remaining_items = np.delete(responses, j, axis=1)
-            remaining_variances = np.nanvar(remaining_items, axis=0, ddof=1)
-            remaining_total = np.nansum(remaining_items, axis=1)
-            remaining_total_var = np.nanvar(remaining_total, ddof=1)
+        alpha_if_deleted = np.array(
+            [
+                _cronbach_alpha(np.delete(scored_responses, j, axis=1))
+                for j in range(n_items)
+            ]
+        )
 
-            k = n_items - 1
-            if remaining_total_var > 0 and k > 1:
-                alpha_if_deleted[j] = (k / (k - 1)) * (
-                    1 - np.sum(remaining_variances) / remaining_total_var
-                )
-            else:
-                alpha_if_deleted[j] = 0.0
+    valid_scores = total_scores[np.isfinite(total_scores)]
+    score_variance = float(_sample_variance(valid_scores))
 
     return TraditionalStats(
         difficulty=difficulty,
@@ -132,16 +246,19 @@ def traditional(
         alpha=float(alpha),
         n_persons=n_persons,
         n_items=n_items,
-        mean_score=float(np.nanmean(total_scores)),
-        sd_score=float(np.nanstd(total_scores, ddof=1)),
+        mean_score=float(np.mean(valid_scores)),
+        sd_score=float(np.sqrt(score_variance)),
         alpha_if_deleted=alpha_if_deleted,
     )
 
 
 def item_fit_chisq(
-    responses: NDArray[np.float64],
-    expected: NDArray[np.float64],
+    responses: ArrayLike,
+    expected: ArrayLike,
     n_groups: int = 10,
+    grouping: ArrayLike | None = None,
+    min_group_size: int = 5,
+    missing_code: float = -1,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute chi-square item fit statistics.
 
@@ -150,12 +267,20 @@ def item_fit_chisq(
 
     Parameters
     ----------
-    responses : NDArray[np.float64]
+    responses : array-like
         Observed response matrix. Shape: (n_persons, n_items).
-    expected : NDArray[np.float64]
+        Negative values, NaN, and ``missing_code`` are treated as missing.
+    expected : array-like
         Expected probabilities. Shape: (n_persons, n_items).
-    n_groups : int
+    n_groups : int, default=10
         Number of ability groups. Default 10.
+    grouping : array-like, optional
+        Ability estimate used to order respondents. If omitted, observed
+        total scores are used.
+    min_group_size : int, default=5
+        Minimum observed responses required for an item-group contribution.
+    missing_code : float, default=-1
+        Additional value used to identify missing responses.
 
     Returns
     -------
@@ -164,42 +289,98 @@ def item_fit_chisq(
     p_values : NDArray[np.float64]
         P-values for each item.
     """
-    n_persons, n_items = responses.shape
+    responses, missing = _clean_response_matrix(
+        responses,
+        missing_code=missing_code,
+        binary=True,
+    )
+    expected = np.asarray(expected, dtype=np.float64)
+    if expected.shape != responses.shape:
+        raise ValueError(
+            f"expected has shape {expected.shape}, expected {responses.shape}"
+        )
 
-    total_scores = np.nansum(responses, axis=1)
-    group_idx = np.floor(
-        np.argsort(np.argsort(total_scores)) / n_persons * n_groups
-    ).astype(int)
-    group_idx = np.minimum(group_idx, n_groups - 1)
+    n_persons, n_items = responses.shape
+    if (
+        isinstance(n_groups, bool)
+        or not isinstance(n_groups, (int, np.integer))
+        or n_groups < 2
+    ):
+        raise ValueError("n_groups must be an integer greater than or equal to 2")
+    if (
+        isinstance(min_group_size, bool)
+        or not isinstance(min_group_size, (int, np.integer))
+        or min_group_size < 1
+    ):
+        raise ValueError("min_group_size must be a positive integer")
+
+    observed_expected = expected[~missing]
+    if not np.all(np.isfinite(observed_expected)):
+        raise ValueError("expected probabilities must be finite for observed responses")
+    if np.any((observed_expected < 0.0) | (observed_expected > 1.0)):
+        raise ValueError("expected probabilities must be between 0 and 1")
+
+    grouped = np.any(~missing, axis=1)
+    if not np.any(grouped):
+        raise ValueError("responses must contain at least one observed response")
+
+    if grouping is None:
+        grouping_values = np.nansum(responses, axis=1)
+    else:
+        grouping_values = np.asarray(grouping, dtype=np.float64)
+        if grouping_values.ndim != 1 or grouping_values.shape[0] != n_persons:
+            raise ValueError("grouping must contain one value per respondent")
+        if not np.all(np.isfinite(grouping_values[grouped])):
+            raise ValueError("grouping must contain only finite values")
+
+    grouped_indices = np.flatnonzero(grouped)
+    order = grouped_indices[np.argsort(grouping_values[grouped_indices], kind="stable")]
+    group_idx = np.full(n_persons, -1, dtype=np.intp)
+    group_idx[order] = np.minimum(
+        np.arange(order.size) * n_groups // order.size,
+        int(n_groups) - 1,
+    )
 
     chisq = np.zeros(n_items)
-    p_values = np.zeros(n_items)
+    degrees_of_freedom = np.ones(n_items, dtype=np.intp)
 
     for j in range(n_items):
-        chi2 = 0.0
-        valid_groups = 0
+        valid = (group_idx >= 0) & ~missing[:, j]
+        item_groups = group_idx[valid]
+        probabilities = expected[valid, j]
+        group_counts = np.bincount(item_groups, minlength=n_groups)
+        observed_counts = np.bincount(
+            item_groups,
+            weights=responses[valid, j],
+            minlength=n_groups,
+        )
+        expected_counts = np.bincount(
+            item_groups,
+            weights=probabilities,
+            minlength=n_groups,
+        )
+        expected_variances = np.bincount(
+            item_groups,
+            weights=probabilities * (1.0 - probabilities),
+            minlength=n_groups,
+        )
+        contributing = (group_counts >= min_group_size) & (
+            expected_variances > np.finfo(np.float64).eps
+        )
+        residuals = observed_counts - expected_counts
+        chisq[j] = np.sum(
+            np.divide(
+                residuals**2,
+                expected_variances,
+                out=np.zeros(n_groups),
+                where=contributing,
+            )
+        )
+        degrees_of_freedom[j] = max(int(np.count_nonzero(contributing)) - 1, 1)
 
-        for g in range(n_groups):
-            mask = group_idx == g
-            n_g = np.sum(mask)
+    from scipy import stats
 
-            if n_g < 5:
-                continue
-
-            obs = np.nanmean(responses[mask, j])
-            exp = np.nanmean(expected[mask, j])
-
-            if exp > 0.01 and exp < 0.99:
-                chi2 += n_g * (obs - exp) ** 2 / (exp * (1 - exp))
-                valid_groups += 1
-
-        chisq[j] = chi2
-        df = max(valid_groups - 1, 1)
-        from scipy import stats
-
-        p_values[j] = 1 - stats.chi2.cdf(chi2, df)
-
-    return chisq, p_values
+    return chisq, np.asarray(stats.chi2.sf(chisq, degrees_of_freedom))
 
 
 @dataclass
@@ -225,8 +406,8 @@ class ItemStats:
     n_missing : NDArray[np.intp]
         Number of missing values per item.
     pct_missing : NDArray[np.float64]
-        Percentage missing per item.
-    frequencies : list[dict]
+        Proportion missing per item, in the interval [0, 1].
+    frequencies : list[dict[int, int]]
         Response frequency tables per item.
     """
 
@@ -243,8 +424,8 @@ class ItemStats:
 
 
 def itemstats(
-    responses: NDArray[np.float64],
-    missing_code: int = -1,
+    responses: ArrayLike,
+    missing_code: float = -1,
     na_rm: bool = True,
 ) -> ItemStats:
     """Compute generic item summary statistics.
@@ -254,12 +435,15 @@ def itemstats(
 
     Parameters
     ----------
-    responses : NDArray[np.float64]
+    responses : array-like
         Response matrix. Shape: (n_persons, n_items).
-    missing_code : int
-        Code used to indicate missing values. Default -1.
-    na_rm : bool
-        If True, exclude missing values from calculations. Default True.
+        Observed responses must be non-negative integers.
+    missing_code : float, default=-1
+        Additional value used to identify missing responses. All negative
+        values and NaN are also treated as missing.
+    na_rm : bool, default=True
+        If True, exclude missing values from calculations. If False,
+        descriptive statistics are NaN for items containing missing data.
 
     Returns
     -------
@@ -270,7 +454,7 @@ def itemstats(
         - sd: Standard deviation
         - min, max: Range of responses
         - skewness, kurtosis: Distribution shape
-        - n_missing, pct_missing: Missing data info
+        - n_missing, pct_missing: Missing count and proportion
         - frequencies: Response distribution tables
 
     Examples
@@ -286,47 +470,78 @@ def itemstats(
     For binary items, the mean is the proportion correct (p-value).
     For polytomous items, interpret as average category selected.
     """
-    from scipy import stats as sp_stats
-
-    responses = np.asarray(responses, dtype=np.float64)
+    if not isinstance(na_rm, (bool, np.bool_)):
+        raise ValueError("na_rm must be boolean")
+    responses, missing_mask = _clean_response_matrix(
+        responses,
+        missing_code=missing_code,
+        binary=False,
+    )
     n_persons, n_items = responses.shape
 
-    missing_mask = (responses == missing_code) | np.isnan(responses)
+    valid = ~missing_mask
+    n = np.sum(valid, axis=0, dtype=np.intp)
+    n_missing = np.sum(missing_mask, axis=0, dtype=np.intp)
+    pct_missing = n_missing / n_persons
 
-    n = np.zeros(n_items, dtype=np.intp)
-    mean = np.zeros(n_items)
-    sd = np.zeros(n_items)
-    min_val = np.zeros(n_items)
-    max_val = np.zeros(n_items)
+    mean = np.divide(
+        np.nansum(responses, axis=0),
+        n,
+        out=np.full(n_items, np.nan),
+        where=n > 0,
+    )
+    variances = np.asarray(_sample_variance(responses, axis=0))
+    sd = np.sqrt(variances)
+    sd[n == 0] = np.nan
+
+    min_val = np.min(np.where(valid, responses, np.inf), axis=0)
+    max_val = np.max(np.where(valid, responses, -np.inf), axis=0)
+    min_val[n == 0] = np.nan
+    max_val[n == 0] = np.nan
+
+    centered = np.where(valid, responses - mean, 0.0)
+    second_moment = np.divide(
+        np.sum(centered**2, axis=0),
+        n,
+        out=np.zeros(n_items),
+        where=n > 0,
+    )
+    third_moment = np.divide(
+        np.sum(centered**3, axis=0),
+        n,
+        out=np.zeros(n_items),
+        where=n > 0,
+    )
+    fourth_moment = np.divide(
+        np.sum(centered**4, axis=0),
+        n,
+        out=np.zeros(n_items),
+        where=n > 0,
+    )
+    shaped = (n > 2) & (second_moment > 0.0)
     skewness = np.zeros(n_items)
     kurtosis = np.zeros(n_items)
-    n_missing = np.zeros(n_items, dtype=np.intp)
-    pct_missing = np.zeros(n_items)
+    skewness[shaped] = third_moment[shaped] / second_moment[shaped] ** 1.5
+    kurtosis[shaped] = fourth_moment[shaped] / second_moment[shaped] ** 2 - 3.0
+    skewness[n == 0] = np.nan
+    kurtosis[n == 0] = np.nan
+
+    if not na_rm:
+        affected = n_missing > 0
+        for statistic in (
+            mean,
+            sd,
+            min_val,
+            max_val,
+            skewness,
+            kurtosis,
+        ):
+            statistic[affected] = np.nan
+
     frequencies: list[dict[int, int]] = []
 
     for j in range(n_items):
-        item_missing = missing_mask[:, j]
-        n_missing[j] = int(np.sum(item_missing))
-        pct_missing[j] = n_missing[j] / n_persons * 100
-
-        if na_rm:
-            item_data = responses[~item_missing, j]
-        else:
-            item_data = responses[:, j]
-
-        n[j] = len(item_data)
-
-        if n[j] > 0:
-            mean[j] = np.nanmean(item_data)
-            sd[j] = np.nanstd(item_data, ddof=1) if n[j] > 1 else 0.0
-            min_val[j] = np.nanmin(item_data)
-            max_val[j] = np.nanmax(item_data)
-
-            if n[j] > 2 and sd[j] > 0:
-                skewness[j] = float(sp_stats.skew(item_data, nan_policy="omit"))
-                kurtosis[j] = float(sp_stats.kurtosis(item_data, nan_policy="omit"))
-
-        valid_responses = responses[~item_missing, j].astype(int)
+        valid_responses = responses[valid[:, j], j].astype(int)
         unique, counts = np.unique(valid_responses, return_counts=True)
         freq_dict = {int(k): int(v) for k, v in zip(unique, counts)}
         frequencies.append(freq_dict)
@@ -367,6 +582,8 @@ def itemstats_to_dataframe(
     n_items = len(stats.n)
     if item_names is None:
         item_names = [f"Item_{i + 1}" for i in range(n_items)]
+    elif len(item_names) != n_items:
+        raise ValueError(f"item_names has length {len(item_names)}, expected {n_items}")
 
     data = {
         "n": stats.n,
