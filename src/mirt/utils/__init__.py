@@ -16,6 +16,13 @@ from mirt.utils.classical import (
     traditional,
 )
 from mirt.utils.clinical import RCI, RCIResult, clinical_significance
+from mirt.utils.collapse import (
+    CollapsedData,
+    collapse_patterns,
+    collapse_with_groups,
+    compute_pattern_likelihood,
+    weighted_sum_from_collapsed,
+)
 from mirt.utils.confidence import PLCI, PLCIResult, delta_method, score_CI
 from mirt.utils.cv import (
     AICScorer,
@@ -192,6 +199,11 @@ __all__ = [
     "PLCIResult",
     "score_CI",
     "delta_method",
+    "CollapsedData",
+    "collapse_patterns",
+    "collapse_with_groups",
+    "compute_pattern_likelihood",
+    "weighted_sum_from_collapsed",
     "key2binary",
     "poly2dich",
     "reverse_score",

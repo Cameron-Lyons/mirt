@@ -430,6 +430,8 @@ plot_person_item_map(result.model, scores.theta)
 | `reverse_score()` | Reverse score items |
 | `expand_table()` | Expand frequency table to response matrix |
 | `collapse_table()` | Collapse responses to frequency table |
+| `collapse_patterns()` | Collapse duplicate response patterns for efficient estimation |
+| `collapse_with_groups()` | Collapse response patterns independently within groups |
 | `recode_responses()` | Recode response values |
 
 ### Information Functions
