@@ -1,5 +1,7 @@
 """Tests for equating diagnostics."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -11,14 +13,23 @@ from mirt.equating.diagnostics import (
     linking_summary,
     parameter_recovery_summary,
 )
-from mirt.equating.linking import LinkingFitStatistics, link
+from mirt.equating.linking import (
+    LinkingConstants,
+    LinkingFitStatistics,
+    LinkingResult,
+    link,
+)
+from mirt.models.dichotomous import (
+    FiveParameterLogistic,
+    FourParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
+)
 
 
 @pytest.fixture
 def linked_models_pair():
     """Create a pair of linked models for testing."""
-    from mirt.models.dichotomous import TwoParameterLogistic
-
     rng = np.random.default_rng(42)
     n_items = 10
 
@@ -101,7 +112,15 @@ class TestBootstrapLinkingSE:
 
     @pytest.mark.parametrize(
         "method",
-        ["mean_sigma", "mean_mean", "stocking_lord", "haebara"],
+        [
+            "mean_sigma",
+            "mean_mean",
+            "stocking_lord",
+            "haebara",
+            "tcc",
+            "bisector",
+            "orthogonal",
+        ],
     )
     def test_bootstrap_different_methods(self, linked_models_pair, method):
         """Test bootstrap with different linking methods."""
@@ -122,6 +141,155 @@ class TestBootstrapLinkingSE:
         assert se_a > 0
         assert se_b > 0
 
+    @pytest.mark.parametrize("n_bootstrap", [0, 1, 1.5, True])
+    def test_rejects_invalid_replicate_count(self, linked_models_pair, n_bootstrap):
+        """Reject counts that cannot define a sample standard deviation."""
+        model_old, model_new, anchors = linked_models_pair
+
+        with pytest.raises(ValueError, match="n_bootstrap"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                None,
+                None,
+                anchors,
+                anchors,
+                n_bootstrap=n_bootstrap,
+            )
+
+    def test_rejects_unknown_method(self, linked_models_pair):
+        """Do not silently substitute a different estimator."""
+        model_old, model_new, anchors = linked_models_pair
+
+        with pytest.raises(ValueError, match="Unknown linking method"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                None,
+                None,
+                anchors,
+                anchors,
+                method="unknown",
+            )
+
+    @pytest.mark.parametrize(
+        ("anchors_old", "anchors_new"),
+        [([-1, 1], [0, 1]), ([0, 0], [0, 1]), ([0, 1], [0, 1.5])],
+    )
+    def test_rejects_invalid_anchor_pairs(
+        self, linked_models_pair, anchors_old, anchors_new
+    ):
+        """Validate anchor indices before sampling."""
+        model_old, model_new, _ = linked_models_pair
+
+        with pytest.raises(ValueError, match="Anchor"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                None,
+                None,
+                anchors_old,
+                anchors_new,
+            )
+
+    def test_response_bootstrap_requires_explicit_refit(self, linked_models_pair):
+        """Response resampling cannot proceed without recalibration."""
+        model_old, model_new, anchors = linked_models_pair
+        responses = np.zeros((10, model_old.n_items))
+
+        with pytest.raises(ValueError, match="refit is required"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                responses,
+                responses,
+                anchors,
+                anchors,
+            )
+
+        with pytest.raises(ValueError, match="supplied together"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                responses,
+                None,
+                anchors,
+                anchors,
+            )
+
+        with pytest.raises(ValueError, match="refit requires"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                None,
+                None,
+                anchors,
+                anchors,
+                refit=lambda model, _: model,
+            )
+
+    def test_response_bootstrap_resamples_and_refits(self, linked_models_pair):
+        """Use the supplied response matrices rather than ignoring them."""
+        model_old, model_new, anchors = linked_models_pair
+        rng = np.random.default_rng(123)
+        probabilities_old = np.linspace(0.2, 0.8, model_old.n_items)
+        probabilities_new = np.linspace(0.3, 0.7, model_new.n_items)
+        responses_old = rng.binomial(1, probabilities_old, size=(80, model_old.n_items))
+        responses_new = rng.binomial(1, probabilities_new, size=(70, model_new.n_items))
+        sampled_responses = []
+
+        def refit(model, responses):
+            sampled_responses.append(responses.copy())
+            fitted = model.copy()
+            means = np.clip(np.mean(responses, axis=0), 0.05, 0.95)
+            difficulty = np.log((1.0 - means) / means) / fitted.discrimination
+            fitted.set_parameters(difficulty=difficulty)
+            return fitted
+
+        _, se_b, _, b_samples = bootstrap_linking_se(
+            model_old,
+            model_new,
+            responses_old,
+            responses_new,
+            anchors,
+            anchors,
+            method="mean_mean",
+            n_bootstrap=16,
+            seed=42,
+            refit=refit,
+        )
+
+        assert len(sampled_responses) == 32
+        assert se_b > 0
+        assert np.unique(b_samples).size > 1
+
+    def test_response_bootstrap_preserves_missing_values(self, linked_models_pair):
+        """Allow recalibration callbacks to handle missing responses."""
+        model_old, model_new, anchors = linked_models_pair
+        responses = np.zeros((4, model_old.n_items))
+        responses[0, 0] = np.nan
+        observed_missing = []
+
+        def refit(model, sampled):
+            observed_missing.append(bool(np.isnan(sampled).any()))
+            return model
+
+        _, _, a_samples, _ = bootstrap_linking_se(
+            model_old,
+            model_new,
+            responses,
+            responses,
+            anchors,
+            anchors,
+            method="mean_mean",
+            n_bootstrap=4,
+            seed=2,
+            refit=refit,
+        )
+
+        assert a_samples.size == 4
+        assert any(observed_missing)
+
 
 class TestDeltaMethodSE:
     """Tests for delta_method_se function."""
@@ -141,10 +309,200 @@ class TestDeltaMethodSE:
             vcov,
             anchors,
             anchors,
+            model_old=model_old,
+            model_new=model_new,
         )
 
         assert se_a >= 0
         assert se_b >= 0
+
+    def test_requires_models(self, linked_models_pair):
+        """A result alone cannot define the parameter Jacobian."""
+        model_old, model_new, anchors = linked_models_pair
+        linking_result = link(model_old, model_new, anchors, anchors)
+        vcov = np.eye(2 * model_old.n_items)
+
+        with pytest.raises(ValueError, match="model_old and model_new"):
+            delta_method_se(linking_result, vcov, vcov, anchors, anchors)
+
+    def test_matches_mean_mean_analytic_gradient(self, linked_models_pair):
+        """Match the closed-form mean/mean delta calculation."""
+        model_old, model_new, anchors = linked_models_pair
+        old_a = model_old.discrimination[anchors]
+        old_b = model_old.difficulty[anchors]
+        new_a = model_new.discrimination[anchors]
+        new_b = model_new.difficulty[anchors]
+        n_anchors = len(anchors)
+        A = float(np.mean(new_a) / np.mean(old_a))
+        B = float(np.mean(old_b) - A * np.mean(new_b))
+        result = LinkingResult(
+            constants=LinkingConstants(A=A, B=B, method="mean_mean"),
+            anchor_items=anchors,
+        )
+        variance = 0.01
+        vcov = np.eye(2 * model_old.n_items) * variance
+
+        se_a, se_b = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        derivative_a_old = -np.mean(new_a) / (n_anchors * np.mean(old_a) ** 2)
+        derivative_a_new = 1.0 / (n_anchors * np.mean(old_a))
+        gradient_a = np.concatenate(
+            (
+                np.full(n_anchors, derivative_a_old),
+                np.zeros(n_anchors),
+                np.full(n_anchors, derivative_a_new),
+                np.zeros(n_anchors),
+            )
+        )
+        gradient_b = np.concatenate(
+            (
+                np.full(n_anchors, -np.mean(new_b) * derivative_a_old),
+                np.full(n_anchors, 1.0 / n_anchors),
+                np.full(n_anchors, -np.mean(new_b) * derivative_a_new),
+                np.full(n_anchors, -A / n_anchors),
+            )
+        )
+        assert se_a == pytest.approx(np.sqrt(variance * np.sum(gradient_a**2)))
+        assert se_b == pytest.approx(np.sqrt(variance * np.sum(gradient_b**2)))
+
+    def test_new_form_covariance_affects_uncertainty(self, linked_models_pair):
+        """Propagate uncertainty from both calibrations."""
+        model_old, model_new, anchors = linked_models_pair
+        result = LinkingResult(
+            constants=LinkingConstants(A=1.0, B=0.0, method="mean_mean"),
+            anchor_items=anchors,
+        )
+        size = 2 * model_old.n_items
+        zero = np.zeros((size, size))
+        small = np.eye(size) * 0.001
+        large = np.eye(size)
+
+        small_se = delta_method_se(
+            result,
+            zero,
+            small,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+        large_se = delta_method_se(
+            result,
+            zero,
+            large,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        assert large_se[0] > small_se[0]
+        assert large_se[1] > small_se[1]
+
+    @pytest.mark.parametrize("case", ["nonsquare", "small", "asymmetric", "non_psd"])
+    def test_rejects_invalid_covariance(self, linked_models_pair, case):
+        """Reject malformed covariance before differentiation."""
+        model_old, model_new, anchors = linked_models_pair
+        result = LinkingResult(
+            constants=LinkingConstants(A=1.0, B=0.0, method="mean_mean"),
+            anchor_items=anchors,
+        )
+        size = 2 * model_old.n_items
+        invalid = np.eye(size)
+        if case == "nonsquare":
+            invalid = np.ones((size, size - 1))
+        elif case == "small":
+            invalid = np.eye(size - 1)
+        elif case == "asymmetric":
+            invalid[0, 1] = 0.5
+        else:
+            invalid[0, 0] = -1.0
+
+        with pytest.raises(ValueError, match="vcov_old"):
+            delta_method_se(
+                result,
+                invalid,
+                np.eye(size),
+                anchors,
+                anchors,
+                model_old=model_old,
+                model_new=model_new,
+            )
+
+    def test_includes_guessing_covariance(self):
+        """Propagate 3PL lower-asymptote uncertainty into curve linking."""
+        anchors = [0, 1, 2]
+        model_old = ThreeParameterLogistic(n_items=3)
+        model_new = ThreeParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.1, 1.4]),
+            "difficulty": np.array([-1.0, 0.1, 1.2]),
+        }
+        model_old.set_parameters(**common, guessing=np.array([0.1, 0.15, 0.2]))
+        model_new.set_parameters(**common, guessing=np.array([0.2, 0.25, 0.3]))
+        result = LinkingResult(
+            constants=LinkingConstants(A=1.0, B=0.0, method="stocking_lord"),
+            anchor_items=anchors,
+        )
+        size = model_old.n_parameters
+        vcov = np.zeros((size, size))
+        vcov[2 * model_old.n_items :, 2 * model_old.n_items :] = np.eye(3) * 0.01
+
+        se_a, se_b = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        assert se_a > 0
+        assert se_b > 0
+
+    def test_includes_five_parameter_asymmetry_covariance(self):
+        """Propagate 5PL asymmetry uncertainty into curve linking."""
+        anchors = [0, 1, 2]
+        model_old = FiveParameterLogistic(n_items=3)
+        model_new = FiveParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.1, 1.4]),
+            "difficulty": np.array([-1.0, 0.1, 1.2]),
+            "guessing": np.array([0.1, 0.15, 0.2]),
+            "upper": np.array([0.9, 0.92, 0.94]),
+        }
+        model_old.set_parameters(**common, asymmetry=np.array([0.8, 1.0, 1.2]))
+        model_new.set_parameters(**common, asymmetry=np.array([1.1, 1.3, 1.5]))
+        result = LinkingResult(
+            constants=LinkingConstants(A=1.0, B=0.0, method="stocking_lord"),
+            anchor_items=anchors,
+        )
+        size = model_old.n_parameters
+        vcov = np.zeros((size, size))
+        offset = 4 * model_old.n_items
+        vcov[offset:, offset:] = np.eye(3) * 0.01
+
+        se_a, se_b = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        assert se_a > 0
+        assert se_b > 0
 
 
 class TestComputeLinkingFit:
@@ -190,6 +548,118 @@ class TestComputeLinkingFit:
         assert fit_stats.mad_a < 2.0
         assert fit_stats.mad_b < 2.0
 
+    def test_exact_transformation_has_zero_error(self):
+        """Recover a known transformation to numerical precision."""
+        model_old = TwoParameterLogistic(n_items=4)
+        model_new = TwoParameterLogistic(n_items=4)
+        disc_old = np.array([0.7, 1.0, 1.3, 1.6])
+        diff_old = np.array([-1.5, -0.3, 0.4, 1.2])
+        A, B = 1.25, -0.35
+        model_old.set_parameters(discrimination=disc_old, difficulty=diff_old)
+        model_new.set_parameters(
+            discrimination=A * disc_old,
+            difficulty=(diff_old - B) / A,
+        )
+
+        fit_stats = compute_linking_fit(
+            model_old, model_new, [0, 1, 2, 3], [0, 1, 2, 3], A=A, B=B
+        )
+
+        assert fit_stats.rmse_a == pytest.approx(0.0, abs=1e-14)
+        assert fit_stats.rmse_b == pytest.approx(0.0, abs=1e-14)
+        assert fit_stats.tcc_rmse == pytest.approx(0.0, abs=1e-14)
+
+    def test_three_parameter_curves_include_guessing(self):
+        """Detect curve misfit that a/b-only diagnostics miss."""
+        model_old = ThreeParameterLogistic(n_items=3)
+        model_new = ThreeParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.0, 1.2]),
+            "difficulty": np.array([-1.0, 0.0, 1.0]),
+        }
+        model_old.set_parameters(**common, guessing=np.full(3, 0.1))
+        model_new.set_parameters(**common, guessing=np.full(3, 0.4))
+
+        fit_stats = compute_linking_fit(
+            model_old, model_new, [0, 1, 2], [0, 1, 2], A=1.0, B=0.0
+        )
+
+        assert fit_stats.rmse_a == 0.0
+        assert fit_stats.rmse_b == 0.0
+        assert fit_stats.tcc_rmse > 0.0
+
+    def test_four_parameter_curves_include_upper_asymptote(self):
+        """Detect 4PL upper-asymptote differences."""
+        model_old = FourParameterLogistic(n_items=3)
+        model_new = FourParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.0, 1.2]),
+            "difficulty": np.array([-1.0, 0.0, 1.0]),
+            "guessing": np.full(3, 0.1),
+        }
+        model_old.set_parameters(**common, upper=np.full(3, 0.95))
+        model_new.set_parameters(**common, upper=np.full(3, 0.75))
+
+        fit_stats = compute_linking_fit(
+            model_old, model_new, [0, 1, 2], [0, 1, 2], A=1.0, B=0.0
+        )
+
+        assert fit_stats.tcc_rmse > 0.0
+
+    def test_five_parameter_curves_include_asymmetry(self):
+        """Use each model's native curve when computing TCC fit."""
+        model_old = FiveParameterLogistic(n_items=3)
+        model_new = FiveParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.0, 1.2]),
+            "difficulty": np.array([-1.0, 0.0, 1.0]),
+            "guessing": np.full(3, 0.1),
+            "upper": np.full(3, 0.9),
+        }
+        model_old.set_parameters(**common, asymmetry=np.ones(3))
+        model_new.set_parameters(**common, asymmetry=np.full(3, 1.8))
+
+        fit_stats = compute_linking_fit(
+            model_old, model_new, [0, 1, 2], [0, 1, 2], A=1.0, B=0.0
+        )
+
+        assert fit_stats.tcc_rmse > 0.0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"A": 0.0, "B": 0.0}, "A must"),
+            ({"A": 1.0, "B": np.inf}, "B must"),
+            ({"A": 1.0, "B": 0.0, "theta_range": (1.0, -1.0)}, "theta_range"),
+            ({"A": 1.0, "B": 0.0, "n_theta": 1}, "n_theta"),
+        ],
+    )
+    def test_rejects_invalid_fit_configuration(
+        self, linked_models_pair, kwargs, message
+    ):
+        """Reject invalid constants and integration grids."""
+        model_old, model_new, anchors = linked_models_pair
+
+        with pytest.raises(ValueError, match=message):
+            compute_linking_fit(model_old, model_new, anchors, anchors, **kwargs)
+
+    def test_rejects_invalid_fit_weights(self, linked_models_pair):
+        """Require finite, non-negative weights with positive mass."""
+        model_old, model_new, anchors = linked_models_pair
+        weights = np.ones(61)
+        weights[0] = -1.0
+
+        with pytest.raises(ValueError, match="weights"):
+            compute_linking_fit(
+                model_old,
+                model_new,
+                anchors,
+                anchors,
+                A=1.0,
+                B=0.0,
+                weights=weights,
+            )
+
 
 class TestLinkingSummary:
     """Tests for linking_summary function."""
@@ -231,6 +701,20 @@ class TestLinkingSummary:
 
         if linking_result.fit_statistics is not None:
             assert "RMSE" in summary or "Fit" in summary
+
+    def test_summary_states_transformation_direction(self, linked_models_pair):
+        """Make score and item transformations explicit and consistent."""
+        model_old, model_new, anchors = linked_models_pair
+        linking_result = link(model_old, model_new, anchors, anchors)
+
+        summary = linking_summary(linking_result, model_old, model_new)
+
+        assert "Reference model: 2PL (10 items)" in summary
+        assert "New model:       2PL (10 items)" in summary
+        assert "theta_old =" in summary
+        assert "a_new_on_old = a_new /" in summary
+        assert "b_new_on_old =" in summary
+        assert "theta_new =" not in summary
 
 
 class TestCompareLinkingMethods:
@@ -297,6 +781,27 @@ class TestCompareLinkingMethods:
 
         assert len(results) > 2
 
+    def test_comparison_uses_full_model_curves(self):
+        """Report asymptote misfit in method comparisons."""
+        model_old = ThreeParameterLogistic(n_items=3)
+        model_new = ThreeParameterLogistic(n_items=3)
+        common = {
+            "discrimination": np.array([0.8, 1.0, 1.2]),
+            "difficulty": np.array([-1.0, 0.0, 1.0]),
+        }
+        model_old.set_parameters(**common, guessing=np.full(3, 0.1))
+        model_new.set_parameters(**common, guessing=np.full(3, 0.4))
+
+        results = compare_linking_methods(
+            model_old,
+            model_new,
+            [0, 1, 2],
+            [0, 1, 2],
+            methods=["mean_mean"],
+        )
+
+        assert results["mean_mean"]["tcc_rmse"] > 0.0
+
 
 class TestParameterRecoverySummary:
     """Tests for parameter_recovery_summary function."""
@@ -352,6 +857,53 @@ class TestParameterRecoverySummary:
         )
 
         assert "RMSE" in summary
+
+    def test_recovery_rejects_mismatched_anchors(self, linked_models_pair):
+        """Report correspondence errors before array operations."""
+        model_old, model_new, _ = linked_models_pair
+
+        with pytest.raises(ValueError, match="same length"):
+            parameter_recovery_summary(
+                model_old, model_new, [0, 1, 2], [0, 1], A=1.0, B=0.0
+            )
+
+    def test_recovery_rejects_negative_anchor(self, linked_models_pair):
+        """Do not interpret negative indices as valid anchors."""
+        model_old, model_new, _ = linked_models_pair
+
+        with pytest.raises(ValueError, match="out of range"):
+            parameter_recovery_summary(
+                model_old, model_new, [-1, 1], [0, 1], A=1.0, B=0.0
+            )
+
+    def test_recovery_handles_constant_parameters_without_warning(
+        self, linked_models_pair
+    ):
+        """Render undefined correlations explicitly."""
+        model_old, model_new, anchors = linked_models_pair
+        model_old = model_old.copy()
+        model_new = model_new.copy()
+        model_old.set_parameters(discrimination=np.ones(model_old.n_items))
+        model_new.set_parameters(discrimination=np.ones(model_new.n_items))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            summary = parameter_recovery_summary(
+                model_old, model_new, anchors, anchors, A=1.0, B=0.0
+            )
+
+        assert "Corr(a): n/a" in summary
+
+    def test_recovery_displays_paired_anchor_indices(self, linked_models_pair):
+        """Show both form indices for non-identical anchor mappings."""
+        model_old, model_new, _ = linked_models_pair
+
+        summary = parameter_recovery_summary(
+            model_old, model_new, [0, 1], [2, 3], A=1.0, B=0.0
+        )
+
+        assert "     0      2" in summary
+        assert "     1      3" in summary
 
 
 class TestDiagnosticsWithRealModels:
