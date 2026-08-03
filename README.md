@@ -46,6 +46,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Local dependence**: Q3, chi-square residuals
 
 ### Additional Features
+- Custom dichotomous, ordinal, multidimensional, and latent group models
 - Multiple group analysis with invariance testing
 - Bootstrap standard errors and confidence intervals
 - Plausible values for population inference
@@ -227,6 +228,32 @@ mix_result = fit_mixture_irt(responses, n_classes=2, model="2PL")
 
 from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
+```
+
+### Custom Item Models
+
+```python
+import numpy as np
+
+from mirt import CustomItemModel, create_item_type
+
+def adjacent_categories(theta, shift):
+    weights = np.column_stack((
+        np.ones_like(theta),
+        np.exp(theta - shift),
+        np.exp(2 * (theta - shift)),
+    ))
+    return weights / weights.sum(axis=1, keepdims=True)
+
+spec = create_item_type(
+    "AdjacentCategories",
+    adjacent_categories,
+    par_bounds={"shift": (-4, 4)},
+    par_defaults={"shift": 0},
+    n_categories=3,
+)
+model = CustomItemModel(n_items=10, item_type=spec)
+probabilities = model.probability(np.linspace(-3, 3, 61))
 ```
 
 ### Exploratory Factor Analysis with Automatic Structure Discovery

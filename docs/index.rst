@@ -14,6 +14,7 @@ powered by a Rust backend for computational efficiency.
    guides/dif
    guides/multigroup
    guides/equating
+   guides/custom_models
    api/index
 
 Installation
@@ -50,6 +51,7 @@ Features
 * **Diagnostics**: Item fit, model fit, DIF analysis, SIBTEST
 * **Scoring**: EAP, MAP, ML scoring methods
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
+* **Custom Models**: Validated dichotomous, polytomous, multidimensional, and group callbacks
 * **High Performance**: Rust-powered backend for fast computation
 
 Indices and tables
