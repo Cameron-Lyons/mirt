@@ -20,6 +20,32 @@ Methods
 * ``lord`` — Lord's chi-square
 * ``raju`` — Raju area measures
 
+Test-level impact
+-----------------
+
+Differential Test Functioning summarizes the reference-minus-focal expected
+score difference in score units. By default, the score curves are averaged
+over a standard-normal ability distribution. Use ``weighting="uniform"`` or
+provide custom nonnegative grid weights when another target population is
+appropriate.
+
+.. code-block:: python
+
+   dtf = mirt.compute_dtf(
+       data,
+       groups,
+       method="unsigned",
+       focal_group="focal",
+       weighting="normal",
+       n_bootstrap=200,
+       random_state=42,
+   )
+   print(dtf["DTF"], dtf["confidence_interval"])
+
+Set ``n_bootstrap=0`` when only the descriptive score curves and effect size
+are needed. The result reports successful and failed bootstrap replicate
+counts so uncertainty estimates can be audited.
+
 Related utilities
 -----------------
 
