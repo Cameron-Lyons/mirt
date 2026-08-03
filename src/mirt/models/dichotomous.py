@@ -2,8 +2,29 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
+
+_MIN_EXP_INPUT = -745.0
+_MAX_DOUBLE_EXP_INPUT = 50.0
+
+
+def _fisher_information(
+    probability: NDArray[np.float64],
+    derivative: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute Bernoulli Fisher information without unstable tail division."""
+    denominator = probability * (1.0 - probability)
+    return np.divide(
+        derivative**2,
+        denominator,
+        out=np.zeros_like(probability, dtype=np.float64),
+        where=denominator > 0,
+    )
+
+
+def _bounded_exponential(value: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Exponentiate safely for links containing a second exponential."""
+    return np.exp(np.clip(value, _MIN_EXP_INPUT, _MAX_DOUBLE_EXP_INPUT))
 
 
 class TwoParameterLogistic(DichotomousItemModel):
@@ -164,21 +185,23 @@ class ThreeParameterLogistic(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-
+        theta_1d = theta.ravel()
         a = self._parameters["discrimination"]
+        b = self._parameters["difficulty"]
         c = self._parameters["guessing"]
 
         if item_idx is not None:
             a_val = a[item_idx]
             c_val = c[item_idx]
-            numerator = (a_val**2) * ((p - c_val) ** 2)
-            denominator = ((1 - c_val) ** 2) * p * (1 - p) + PROB_EPSILON
-            return numerator / denominator
+            logistic = sigmoid(a_val * (theta_1d - b[item_idx]))
+            probability = c_val + (1.0 - c_val) * logistic
+            derivative = a_val * (1.0 - c_val) * logistic * (1.0 - logistic)
+            return _fisher_information(probability, derivative)
 
-        numerator = (a[None, :] ** 2) * ((p - c[None, :]) ** 2)
-        denominator = ((1 - c[None, :]) ** 2) * p * (1 - p) + PROB_EPSILON
-        return numerator / denominator
+        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
+        probability = c[None, :] + (1.0 - c[None, :]) * logistic
+        derivative = a[None, :] * (1.0 - c[None, :]) * logistic * (1.0 - logistic)
+        return _fisher_information(probability, derivative)
 
 
 class FourParameterLogistic(DichotomousItemModel):
@@ -246,9 +269,9 @@ class FourParameterLogistic(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-
+        theta_1d = theta.ravel()
         a = self._parameters["discrimination"]
+        b = self._parameters["difficulty"]
         c = self._parameters["guessing"]
         d = self._parameters["upper"]
 
@@ -256,15 +279,17 @@ class FourParameterLogistic(DichotomousItemModel):
             a_val = a[item_idx]
             c_val = c[item_idx]
             d_val = d[item_idx]
-            numerator = (a_val**2) * ((p - c_val) ** 2) * ((d_val - p) ** 2)
-            denominator = ((d_val - c_val) ** 2) * p * (1 - p) + PROB_EPSILON
-            return numerator / denominator
+            logistic = sigmoid(a_val * (theta_1d - b[item_idx]))
+            probability = c_val + (d_val - c_val) * logistic
+            derivative = a_val * (d_val - c_val) * logistic * (1.0 - logistic)
+            return _fisher_information(probability, derivative)
 
-        numerator = (
-            (a[None, :] ** 2) * ((p - c[None, :]) ** 2) * ((d[None, :] - p) ** 2)
+        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
+        probability = c[None, :] + (d[None, :] - c[None, :]) * logistic
+        derivative = (
+            a[None, :] * (d[None, :] - c[None, :]) * logistic * (1.0 - logistic)
         )
-        denominator = ((d[None, :] - c[None, :]) ** 2) * p * (1 - p) + PROB_EPSILON
-        return numerator / denominator
+        return _fisher_information(probability, derivative)
 
 
 Rasch = OneParameterLogistic
@@ -356,12 +381,12 @@ class UnipolarLogLogistic(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = np.exp(np.clip(z, -700, 700))
-            return exp_z / ((1.0 + exp_z) ** 2)
+            logistic = sigmoid(z)
+            return logistic * (1.0 - logistic)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = np.exp(np.clip(z, -700, 700))
-        return exp_z / ((1.0 + exp_z) ** 2)
+        logistic = sigmoid(z)
+        return logistic * (1.0 - logistic)
 
     def information(
         self,
@@ -369,19 +394,20 @@ class UnipolarLogLogistic(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-        p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
+        theta_1d = theta.ravel()
+        a = self._parameters["discrimination"]
+        b = self._parameters["difficulty"]
 
-        h = 1e-5
-        theta_plus = theta + h
-        theta_minus = theta - h
+        if item_idx is not None:
+            logistic = sigmoid(a[item_idx] * (theta_1d - b[item_idx]))
+            probability = logistic * (1.0 - logistic)
+            derivative = a[item_idx] * probability * (1.0 - 2.0 * logistic)
+            return _fisher_information(probability, derivative)
 
-        p_plus = self.probability(theta_plus, item_idx)
-        p_minus = self.probability(theta_minus, item_idx)
-
-        dp = (p_plus - p_minus) / (2 * h)
-
-        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
+        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
+        probability = logistic * (1.0 - logistic)
+        derivative = a[None, :] * probability * (1.0 - 2.0 * logistic)
+        return _fisher_information(probability, derivative)
 
 
 class FiveParameterLogistic(DichotomousItemModel):
@@ -497,18 +523,37 @@ class FiveParameterLogistic(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
+        theta_1d = theta.ravel()
+        a = self._parameters["discrimination"]
+        b = self._parameters["difficulty"]
+        c = self._parameters["guessing"]
+        d = self._parameters["upper"]
+        e = self._parameters["asymmetry"]
 
-        h = 1e-5
-        theta_plus = theta + h
-        theta_minus = theta - h
+        if item_idx is not None:
+            logistic = sigmoid(a[item_idx] * (theta_1d - b[item_idx]))
+            powered = np.power(logistic, e[item_idx])
+            probability = c[item_idx] + (d[item_idx] - c[item_idx]) * powered
+            derivative = (
+                a[item_idx]
+                * e[item_idx]
+                * (d[item_idx] - c[item_idx])
+                * powered
+                * (1.0 - logistic)
+            )
+            return _fisher_information(probability, derivative)
 
-        p_plus = self.probability(theta_plus, item_idx)
-        p_minus = self.probability(theta_minus, item_idx)
-
-        dp = (p_plus - p_minus) / (2 * h)
-
-        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
+        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
+        powered = np.power(logistic, e[None, :])
+        probability = c[None, :] + (d[None, :] - c[None, :]) * powered
+        derivative = (
+            a[None, :]
+            * e[None, :]
+            * (d[None, :] - c[None, :])
+            * powered
+            * (1.0 - logistic)
+        )
+        return _fisher_information(probability, derivative)
 
 
 class ComplementaryLogLog(DichotomousItemModel):
@@ -583,10 +628,12 @@ class ComplementaryLogLog(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            return 1.0 - np.exp(-np.exp(z))
+            exp_z = _bounded_exponential(z)
+            return -np.expm1(-exp_z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        return 1.0 - np.exp(-np.exp(z))
+        exp_z = _bounded_exponential(z)
+        return -np.expm1(-exp_z)
 
     def information(
         self,
@@ -601,24 +648,18 @@ class ComplementaryLogLog(DichotomousItemModel):
 
         if item_idx is not None:
             z = a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = np.exp(z)
+            exp_z = _bounded_exponential(z)
             exp_neg_exp_z = np.exp(-exp_z)
-            p = 1.0 - exp_neg_exp_z
-            q = exp_neg_exp_z
-
-            dp = a[item_idx] * exp_z * exp_neg_exp_z
-
-            return (dp**2) / (p * q + PROB_EPSILON)
+            probability = -np.expm1(-exp_z)
+            derivative = a[item_idx] * exp_z * exp_neg_exp_z
+            return _fisher_information(probability, derivative)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = np.exp(z)
+        exp_z = _bounded_exponential(z)
         exp_neg_exp_z = np.exp(-exp_z)
-        p = 1.0 - exp_neg_exp_z
-        q = exp_neg_exp_z
-
-        dp = a[None, :] * exp_z * exp_neg_exp_z
-
-        return (dp**2) / (p * q + PROB_EPSILON)
+        probability = -np.expm1(-exp_z)
+        derivative = a[None, :] * exp_z * exp_neg_exp_z
+        return _fisher_information(probability, derivative)
 
 
 class NegativeLogLog(DichotomousItemModel):
@@ -673,10 +714,10 @@ class NegativeLogLog(DichotomousItemModel):
 
         if item_idx is not None:
             z = -a[item_idx] * (theta_1d - b[item_idx])
-            return np.exp(-np.exp(z))
+            return np.exp(-_bounded_exponential(z))
 
         z = -a[None, :] * (theta_1d[:, None] - b[None, :])
-        return np.exp(-np.exp(z))
+        return np.exp(-_bounded_exponential(z))
 
     def information(
         self,
@@ -691,19 +732,13 @@ class NegativeLogLog(DichotomousItemModel):
 
         if item_idx is not None:
             z = -a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = np.exp(z)
-            p = np.exp(-exp_z)
-            q = 1.0 - p
-
-            dp = a[item_idx] * exp_z * p
-
-            return (dp**2) / (p * q + PROB_EPSILON)
+            exp_z = _bounded_exponential(z)
+            probability = np.exp(-exp_z)
+            derivative = a[item_idx] * exp_z * probability
+            return _fisher_information(probability, derivative)
 
         z = -a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = np.exp(z)
-        p = np.exp(-exp_z)
-        q = 1.0 - p
-
-        dp = a[None, :] * exp_z * p
-
-        return (dp**2) / (p * q + PROB_EPSILON)
+        exp_z = _bounded_exponential(z)
+        probability = np.exp(-exp_z)
+        derivative = a[None, :] * exp_z * probability
+        return _fisher_information(probability, derivative)
