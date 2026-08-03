@@ -387,7 +387,8 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_ci()` | Bootstrap confidence intervals |
 | `generate_plausible_values()` | Plausible values |
 | `impute_responses()` | Missing data imputation |
-| `set_dataframe_backend()` | Choose pandas/polars |
+| `set_dataframe_backend()` | Choose pandas/polars or restore automatic selection |
+| `get_dataframe_backend()` | Inspect the active DataFrame backend |
 | `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
 | `Q3()` | Yen's Q3 local dependence statistic |
 | `LD_X2()` | Chen & Thissen LD chi-square |
@@ -515,6 +516,10 @@ import mirt
 mirt.set_dataframe_backend("pandas")
 ```
 
+Restore automatic selection at any time with
+`mirt.set_dataframe_backend("auto")` (or `None`). Use
+`mirt.get_dataframe_backend()` to inspect the active backend.
+
 ## Development
 
 ```bash
@@ -554,7 +559,7 @@ The following are guaranteed stable and will not have breaking changes in v1.x r
 - **CAT**: `CATEngine`, `CATResult`, `CATState`
 - **Diagnostics**: `compare_models()`, `anova_irt()`, `compute_fit_indices()`, `sibtest()`
 - **Utilities**: `bootstrap_se()`, `bootstrap_ci()`, `generate_plausible_values()`, `cross_validate()`, `fit_models()`
-- **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`
+- **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`, `get_dataframe_backend()`
 - **Backend selection**: `set_backend()`, `get_backend()`, `get_backend_info()`, `should_use_rust()`, `is_rust_available()`
 
 ### Experimental (may change in minor releases)
