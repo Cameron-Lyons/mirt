@@ -11,6 +11,7 @@ Also known as:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -45,6 +46,14 @@ class MixedEffectsFitResult:
         Standard errors for person effects
     item_effect_se : NDArray or None
         Standard errors for item effects
+    theta : NDArray or None
+        Estimated person abilities retained for prediction and extraction
+    theta_se : NDArray or None
+        Standard errors for the estimated person abilities
+    person_intercept, item_intercept : float
+        Intercepts for the person and item covariate regressions
+    person_covariate_names, item_covariate_names : tuple[str, ...]
+        Stable names corresponding to the fitted covariate effects
     """
 
     model: Any
@@ -57,6 +66,14 @@ class MixedEffectsFitResult:
     person_effect_se: NDArray[np.float64] | None = None
     item_effect_se: NDArray[np.float64] | None = None
     residual_variance: float = 1.0
+    theta: NDArray[np.float64] | None = None
+    theta_se: NDArray[np.float64] | None = None
+    person_intercept: float = 0.0
+    item_intercept: float = 0.0
+    person_intercept_se: float = np.nan
+    item_intercept_se: float = np.nan
+    person_covariate_names: tuple[str, ...] = ()
+    item_covariate_names: tuple[str, ...] = ()
 
     def summary(self) -> str:
         """Generate summary of mixed effects results."""
@@ -72,24 +89,46 @@ class MixedEffectsFitResult:
 
         if self.person_effects is not None:
             lines.append("Person Covariate Effects:")
-            for i, (est, se) in enumerate(
-                zip(
-                    self.person_effects,
-                    self.person_effect_se or [np.nan] * len(self.person_effects),
+            lines.append(
+                f"  Intercept: {self.person_intercept:.4f} "
+                f"(SE: {self.person_intercept_se:.4f})"
+            )
+            standard_errors = (
+                self.person_effect_se
+                if self.person_effect_se is not None
+                else np.full(self.person_effects.shape, np.nan)
+            )
+            names = self.person_covariate_names or tuple(
+                f"Covariate {i + 1}" for i in range(len(self.person_effects))
+            )
+            if len(names) != len(self.person_effects):
+                names = tuple(
+                    f"Covariate {i + 1}" for i in range(len(self.person_effects))
                 )
-            ):
-                lines.append(f"  Covariate {i + 1}: {est:.4f} (SE: {se:.4f})")
+            for i, (est, se) in enumerate(zip(self.person_effects, standard_errors)):
+                lines.append(f"  {names[i]}: {est:.4f} (SE: {se:.4f})")
             lines.append("")
 
         if self.item_effects is not None:
             lines.append("Item Covariate Effects:")
-            for i, (est, se) in enumerate(
-                zip(
-                    self.item_effects,
-                    self.item_effect_se or [np.nan] * len(self.item_effects),
+            lines.append(
+                f"  Intercept: {self.item_intercept:.4f} "
+                f"(SE: {self.item_intercept_se:.4f})"
+            )
+            standard_errors = (
+                self.item_effect_se
+                if self.item_effect_se is not None
+                else np.full(self.item_effects.shape, np.nan)
+            )
+            names = self.item_covariate_names or tuple(
+                f"Covariate {i + 1}" for i in range(len(self.item_effects))
+            )
+            if len(names) != len(self.item_effects):
+                names = tuple(
+                    f"Covariate {i + 1}" for i in range(len(self.item_effects))
                 )
-            ):
-                lines.append(f"  Covariate {i + 1}: {est:.4f} (SE: {se:.4f})")
+            for i, (est, se) in enumerate(zip(self.item_effects, standard_errors)):
+                lines.append(f"  {names[i]}: {est:.4f} (SE: {se:.4f})")
 
         return "\n".join(lines)
 
@@ -122,6 +161,8 @@ class MixedEffectsIRT:
         base_model: Literal["1PL", "2PL", "3PL"] = "2PL",
         person_covariates: NDArray[np.float64] | None = None,
         item_covariates: NDArray[np.float64] | None = None,
+        person_covariate_names: Sequence[str] | None = None,
+        item_covariate_names: Sequence[str] | None = None,
     ) -> None:
         """Initialize mixed effects IRT model.
 
@@ -133,18 +174,73 @@ class MixedEffectsIRT:
             Person-level covariates (n_persons x n_person_cov)
         item_covariates : NDArray, optional
             Item-level covariates (n_items x n_item_cov)
+        person_covariate_names : sequence of str, optional
+            Names for the columns of ``person_covariates``
+        item_covariate_names : sequence of str, optional
+            Names for the columns of ``item_covariates``
         """
         self.base_model = base_model
-        self._person_covariates = (
-            np.asarray(person_covariates) if person_covariates is not None else None
+        self._person_covariates = self._prepare_covariates(
+            person_covariates, "person_covariates"
         )
-        self._item_covariates = (
-            np.asarray(item_covariates) if item_covariates is not None else None
+        self._item_covariates = self._prepare_covariates(
+            item_covariates, "item_covariates"
+        )
+        self._person_covariate_names = self._prepare_covariate_names(
+            person_covariate_names,
+            self.n_person_covariates,
+            "person",
+        )
+        self._item_covariate_names = self._prepare_covariate_names(
+            item_covariate_names,
+            self.n_item_covariates,
+            "item",
         )
 
         self._person_effects: NDArray[np.float64] | None = None
         self._item_effects: NDArray[np.float64] | None = None
+        self._person_intercept: float = 0.0
+        self._item_intercept: float = 0.0
         self._residual_variance: float = 1.0
+
+    @staticmethod
+    def _prepare_covariates(
+        covariates: NDArray[np.float64] | None,
+        name: str,
+    ) -> NDArray[np.float64] | None:
+        if covariates is None:
+            return None
+        values = np.asarray(covariates, dtype=np.float64)
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+        if values.ndim != 2:
+            raise ValueError(f"{name} must be one- or two-dimensional")
+        if values.shape[1] == 0:
+            raise ValueError(f"{name} must contain at least one column")
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"{name} must contain only finite values")
+        return values
+
+    @staticmethod
+    def _prepare_covariate_names(
+        names: Sequence[str] | None,
+        n_covariates: int,
+        prefix: str,
+    ) -> tuple[str, ...]:
+        if names is None:
+            return tuple(f"{prefix}_{i}" for i in range(n_covariates))
+        if len(names) != n_covariates:
+            raise ValueError(
+                f"{prefix}_covariate_names has {len(names)} entries, "
+                f"expected {n_covariates}"
+            )
+        if len(set(names)) != len(names):
+            raise ValueError(f"{prefix}_covariate_names must be unique")
+        if any(not isinstance(name, str) or not name or ":" in name for name in names):
+            raise ValueError(
+                f"{prefix}_covariate_names must be non-empty strings without ':'"
+            )
+        return tuple(names)
 
     @property
     def n_person_covariates(self) -> int:
@@ -159,6 +255,16 @@ class MixedEffectsIRT:
         if self._item_covariates is None:
             return 0
         return self._item_covariates.shape[1]
+
+    @property
+    def person_covariate_names(self) -> tuple[str, ...]:
+        """Names corresponding to person covariate columns."""
+        return self._person_covariate_names
+
+    @property
+    def item_covariate_names(self) -> tuple[str, ...]:
+        """Names corresponding to item covariate columns."""
+        return self._item_covariate_names
 
     def fit(
         self,
@@ -193,6 +299,8 @@ class MixedEffectsIRT:
         from mirt.scoring import fscores
 
         responses = np.asarray(responses)
+        if responses.ndim != 2 or responses.shape[0] == 0 or responses.shape[1] == 0:
+            raise ValueError("responses must be a non-empty two-dimensional matrix")
         n_persons, n_items = responses.shape
 
         if self._person_covariates is not None:
@@ -212,11 +320,21 @@ class MixedEffectsIRT:
         if verbose:
             print("Stage 1: Fitting base IRT model...")
 
-        base_result = fit_mirt(responses, model=self.base_model, verbose=False)
-        theta_estimates = fscores(base_result.model, responses, method="EAP").theta
+        base_result = fit_mirt(
+            responses,
+            model=self.base_model,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=False,
+        )
+        score_result = fscores(base_result.model, responses, method="EAP")
+        theta_estimates = score_result.theta
+        theta_se = score_result.standard_error
 
         if theta_estimates.ndim == 2:
             theta_estimates = theta_estimates[:, 0]
+        if theta_se.ndim == 2:
+            theta_se = theta_se[:, 0]
 
         if verbose:
             print("Stage 2: Estimating covariate effects...")
@@ -225,21 +343,35 @@ class MixedEffectsIRT:
         person_se = None
         item_effects = None
         item_se = None
+        person_intercept_se = np.nan
+        item_intercept_se = np.nan
 
         if self._person_covariates is not None:
-            person_effects, person_se, self._residual_variance = (
-                self._estimate_person_effects(theta_estimates)
-            )
+            (
+                self._person_intercept,
+                person_effects,
+                person_intercept_se,
+                person_se,
+                self._residual_variance,
+            ) = self._estimate_person_effects(theta_estimates)
             self._person_effects = person_effects
 
         if self._item_covariates is not None:
-            item_effects, item_se = self._estimate_item_effects(base_result.model)
+            (
+                self._item_intercept,
+                item_effects,
+                item_intercept_se,
+                item_se,
+                _,
+            ) = self._estimate_item_effects(base_result.model)
             self._item_effects = item_effects
 
         ll = base_result.log_likelihood
 
         if person_effects is not None:
-            predicted_theta = self._person_covariates @ person_effects
+            predicted_theta = (
+                self._person_intercept + self._person_covariates @ person_effects
+            )
             residuals = theta_estimates - predicted_theta
             ll += float(
                 np.sum(
@@ -250,9 +382,9 @@ class MixedEffectsIRT:
 
         n_params = sum(v.size for v in base_result.model.parameters.values())
         if person_effects is not None:
-            n_params += len(person_effects) + 1
+            n_params += len(person_effects) + 2
         if item_effects is not None:
-            n_params += len(item_effects)
+            n_params += len(item_effects) + 1
 
         aic = -2 * ll + 2 * n_params
         bic = -2 * ll + np.log(n_persons) * n_params
@@ -268,67 +400,59 @@ class MixedEffectsIRT:
             person_effect_se=person_se,
             item_effect_se=item_se,
             residual_variance=self._residual_variance,
+            theta=np.asarray(theta_estimates, dtype=np.float64),
+            theta_se=np.asarray(theta_se, dtype=np.float64),
+            person_intercept=self._person_intercept,
+            item_intercept=self._item_intercept,
+            person_intercept_se=float(person_intercept_se),
+            item_intercept_se=float(item_intercept_se),
+            person_covariate_names=self._person_covariate_names,
+            item_covariate_names=self._item_covariate_names,
+        )
+
+    @staticmethod
+    def _fit_linear_effects(
+        covariates: NDArray[np.float64],
+        outcomes: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64], float, NDArray[np.float64], float]:
+        """Fit a stable linear effect model with intercept and standard errors."""
+        outcomes = np.asarray(outcomes, dtype=np.float64).reshape(-1)
+        if covariates.shape[0] != outcomes.size:
+            raise ValueError("covariates and outcomes must have the same row count")
+        if not np.all(np.isfinite(outcomes)):
+            raise ValueError("outcomes must contain only finite values")
+        design = np.column_stack([np.ones(len(outcomes)), covariates])
+        coefficients, _, rank, _ = np.linalg.lstsq(design, outcomes, rcond=None)
+        residuals = outcomes - design @ coefficients
+        degrees_of_freedom = max(len(outcomes) - rank, 1)
+        residual_variance = max(
+            float(np.dot(residuals, residuals) / degrees_of_freedom),
+            np.finfo(np.float64).eps,
+        )
+        covariance = residual_variance * np.linalg.pinv(design.T @ design)
+        standard_errors = np.sqrt(np.maximum(np.diag(covariance), 0.0))
+        return (
+            float(coefficients[0]),
+            coefficients[1:],
+            float(standard_errors[0]),
+            standard_errors[1:],
+            residual_variance,
         )
 
     def _estimate_person_effects(
         self,
         theta: NDArray[np.float64],
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+    ) -> tuple[float, NDArray[np.float64], float, NDArray[np.float64], float]:
         """Estimate effects of person covariates on theta."""
-        X = self._person_covariates
-        y = theta
-
-        X_with_intercept = np.column_stack([np.ones(len(y)), X])
-
-        beta, residuals, _, _ = np.linalg.lstsq(X_with_intercept, y, rcond=None)
-
-        effects = beta[1:]
-
-        if len(residuals) > 0:
-            resid_var = residuals[0] / (len(y) - X_with_intercept.shape[1])
-        else:
-            fitted = X_with_intercept @ beta
-            resid_var = np.var(y - fitted, ddof=X_with_intercept.shape[1])
-
-        try:
-            cov_matrix = resid_var * np.linalg.inv(
-                X_with_intercept.T @ X_with_intercept
-            )
-            se = np.sqrt(np.diag(cov_matrix)[1:])
-        except np.linalg.LinAlgError:
-            se = np.full(len(effects), np.nan)
-
-        return effects, se, float(resid_var)
+        return self._fit_linear_effects(self._person_covariates, theta)
 
     def _estimate_item_effects(
         self,
         model: BaseItemModel,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    ) -> tuple[float, NDArray[np.float64], float, NDArray[np.float64], float]:
         """Estimate effects of item covariates on difficulty."""
-        W = self._item_covariates
         b = model.parameters.get("difficulty", np.zeros(model.n_items))
-
-        W_with_intercept = np.column_stack([np.ones(len(b)), W])
-
-        gamma, residuals, _, _ = np.linalg.lstsq(W_with_intercept, b, rcond=None)
-
-        effects = gamma[1:]
-
-        if len(residuals) > 0:
-            resid_var = residuals[0] / (len(b) - W_with_intercept.shape[1])
-        else:
-            fitted = W_with_intercept @ gamma
-            resid_var = np.var(b - fitted, ddof=W_with_intercept.shape[1])
-
-        try:
-            cov_matrix = resid_var * np.linalg.inv(
-                W_with_intercept.T @ W_with_intercept
-            )
-            se = np.sqrt(np.diag(cov_matrix)[1:])
-        except np.linalg.LinAlgError:
-            se = np.full(len(effects), np.nan)
-
-        return effects, se
+        return self._fit_linear_effects(self._item_covariates, b)
 
     def predict_theta(
         self,
@@ -349,11 +473,17 @@ class MixedEffectsIRT:
         if self._person_effects is None:
             raise ValueError("Model has not been fit with person covariates")
 
-        covariates = np.asarray(person_covariates)
+        covariates = np.asarray(person_covariates, dtype=np.float64)
         if covariates.ndim == 1:
             covariates = covariates.reshape(1, -1)
+        if covariates.ndim != 2 or covariates.shape[1] != len(self._person_effects):
+            raise ValueError(
+                f"person_covariates must have {len(self._person_effects)} columns"
+            )
+        if not np.all(np.isfinite(covariates)):
+            raise ValueError("person_covariates must contain only finite values")
 
-        return covariates @ self._person_effects
+        return self._person_intercept + covariates @ self._person_effects
 
     def predict_difficulty(
         self,
@@ -374,11 +504,17 @@ class MixedEffectsIRT:
         if self._item_effects is None:
             raise ValueError("Model has not been fit with item covariates")
 
-        covariates = np.asarray(item_covariates)
+        covariates = np.asarray(item_covariates, dtype=np.float64)
         if covariates.ndim == 1:
             covariates = covariates.reshape(1, -1)
+        if covariates.ndim != 2 or covariates.shape[1] != len(self._item_effects):
+            raise ValueError(
+                f"item_covariates must have {len(self._item_effects)} columns"
+            )
+        if not np.all(np.isfinite(covariates)):
+            raise ValueError("item_covariates must contain only finite values")
 
-        return covariates @ self._item_effects
+        return self._item_intercept + covariates @ self._item_effects
 
 
 class LLTM:

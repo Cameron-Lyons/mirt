@@ -1,5 +1,7 @@
 """Tests for cross-validation module."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -12,6 +14,7 @@ from mirt.utils.cv import (
     LeaveOneOut,
     LogLikelihoodScorer,
     StratifiedKFold,
+    cross_validate,
 )
 
 
@@ -76,6 +79,16 @@ class TestKFold:
         assert max(sizes) - min(sizes) <= 1
         assert sum(sizes) == n_persons
 
+    @pytest.mark.parametrize("n_splits", [0, 1, -1, True, 2.5])
+    def test_invalid_split_count(self, n_splits):
+        with pytest.raises(ValueError, match="n_splits"):
+            KFold(n_splits=n_splits)
+
+    def test_rejects_more_folds_than_persons(self):
+        responses = np.zeros((3, 2), dtype=int)
+        with pytest.raises(ValueError, match="cannot exceed"):
+            list(KFold(n_splits=4).split(responses))
+
 
 class TestStratifiedKFold:
     def test_default_splits(self):
@@ -93,6 +106,19 @@ class TestStratifiedKFold:
         for _, test_idx in skf.split(response_matrix):
             fold_mean = np.mean(sum_scores[test_idx])
             assert abs(fold_mean - global_mean) < 2.0
+
+    def test_sparse_strata_still_produce_balanced_folds(self):
+        responses = np.tri(6, 5, k=-1, dtype=int)
+        splitter = StratifiedKFold(n_splits=3, n_bins=6, random_state=42)
+
+        sizes = [len(test_idx) for _, test_idx in splitter.split(responses)]
+
+        assert sizes == [2, 2, 2]
+
+    @pytest.mark.parametrize("n_bins", [0, -1, True, 2.5])
+    def test_invalid_bin_count(self, n_bins):
+        with pytest.raises(ValueError, match="n_bins"):
+            StratifiedKFold(n_bins=n_bins)
 
 
 class TestLeaveOneOut:
@@ -129,6 +155,10 @@ class TestLeaveOneOut:
         responses = np.zeros((n_persons, 3), dtype=int)
         for train_idx, _ in loo.split(responses):
             assert len(train_idx) == n_persons - 1
+
+    def test_requires_two_persons(self):
+        with pytest.raises(ValueError, match="at least 2"):
+            list(LeaveOneOut().split(np.zeros((1, 3), dtype=int)))
 
 
 class TestLogLikelihoodScorer:
@@ -185,3 +215,110 @@ class TestCVResult:
         summary = result.summary()
         assert "log_likelihood" in summary
         assert "aic" in summary
+
+
+class TestCrossValidate:
+    @staticmethod
+    def _small_responses() -> np.ndarray:
+        rng = np.random.default_rng(2026)
+        theta = rng.normal(size=24)
+        difficulty = np.linspace(-1.0, 1.0, 6)
+        probabilities = 1.0 / (1.0 + np.exp(-(theta[:, None] - difficulty)))
+        return (rng.random(probabilities.shape) < probabilities).astype(int)
+
+    def test_parallel_matches_sequential_results(self):
+        responses = self._small_responses()
+        common = {
+            "model_type": "1PL",
+            "responses": responses,
+            "splitter": KFold(n_splits=2, shuffle=False),
+            "n_quadpts": 11,
+            "max_iter": 2,
+            "return_models": True,
+        }
+
+        sequential = cross_validate(**common, n_jobs=1)
+        parallel = cross_validate(**common, n_jobs=2)
+
+        assert parallel.n_folds == 2
+        assert parallel.fold_results is not None
+        assert len(parallel.fold_results) == 2
+        assert_allclose(
+            parallel.scores["log_likelihood"],
+            sequential.scores["log_likelihood"],
+        )
+
+    @pytest.mark.parametrize("n_jobs", [0, -2, True, 1.5])
+    def test_rejects_invalid_job_counts(self, n_jobs):
+        with pytest.raises(ValueError, match="n_jobs"):
+            cross_validate("1PL", self._small_responses(), n_jobs=n_jobs)
+
+    def test_rejects_invalid_response_shapes(self):
+        with pytest.raises(ValueError, match="responses"):
+            cross_validate("1PL", np.zeros((1, 3), dtype=int))
+        with pytest.raises(ValueError, match="responses"):
+            cross_validate("1PL", np.zeros(5, dtype=int))
+
+    def test_rejects_empty_or_duplicate_scorers(self):
+        responses = self._small_responses()
+        with pytest.raises(ValueError, match="at least one"):
+            cross_validate("1PL", responses, scorers=[])
+        with pytest.raises(ValueError, match="unique"):
+            cross_validate(
+                "1PL",
+                responses,
+                scorers=[LogLikelihoodScorer(), LogLikelihoodScorer()],
+            )
+
+    def test_rejects_overlapping_custom_split(self):
+        class OverlappingSplitter:
+            n_splits = 1
+
+            def split(self, responses):
+                _ = responses
+                yield np.array([0, 1]), np.array([1, 2])
+
+        with pytest.raises(ValueError, match="overlap"):
+            cross_validate(
+                "1PL",
+                self._small_responses(),
+                splitter=OverlappingSplitter(),
+            )
+
+    def test_rejects_non_integer_custom_split_indices(self):
+        class FloatIndexSplitter:
+            n_splits = 1
+
+            def split(self, responses):
+                _ = responses
+                yield np.array([0.0, 1.0]), np.array([2.0])
+
+        with pytest.raises(ValueError, match="integers"):
+            cross_validate(
+                "1PL",
+                self._small_responses(),
+                splitter=FloatIndexSplitter(),
+            )
+
+    def test_uses_materialized_fold_count(self, monkeypatch):
+        class TwoFoldSplitter:
+            n_splits = 99
+
+            def split(self, responses):
+                midpoint = len(responses) // 2
+                yield np.arange(midpoint), np.arange(midpoint, len(responses))
+                yield np.arange(midpoint, len(responses)), np.arange(midpoint)
+
+        monkeypatch.setattr(
+            "mirt.fit_mirt",
+            lambda *args, **kwargs: SimpleNamespace(aic=10.0),
+        )
+        result = cross_validate(
+            "1PL",
+            self._small_responses(),
+            splitter=TwoFoldSplitter(),
+            scorers=[AICScorer()],
+        )
+
+        assert result.n_folds == 2
+        assert result.scores == {"aic": [-10.0, -10.0]}

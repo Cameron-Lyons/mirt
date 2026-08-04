@@ -7,8 +7,22 @@ from mirt.utils.calibration import (
     fixed_calib,
     transform_theta,
 )
-from mirt.utils.classical import TraditionalStats, item_fit_chisq, traditional
+from mirt.utils.classical import (
+    ItemStats,
+    TraditionalStats,
+    item_fit_chisq,
+    itemstats,
+    itemstats_to_dataframe,
+    traditional,
+)
 from mirt.utils.clinical import RCI, RCIResult, clinical_significance
+from mirt.utils.collapse import (
+    CollapsedData,
+    collapse_patterns,
+    collapse_with_groups,
+    compute_pattern_likelihood,
+    weighted_sum_from_collapsed,
+)
 from mirt.utils.confidence import PLCI, PLCIResult, delta_method, score_CI
 from mirt.utils.cv import (
     AICScorer,
@@ -28,9 +42,11 @@ from mirt.utils.empirical import (
     RMSD_DIF,
     DIFEffectSize,
     EmpiricalPlotData,
+    ItemGAMResult,
     empirical_ES,
     empirical_plot,
     empirical_rmsea,
+    itemGAM,
     mantel_haenszel,
     weighted_RMSD_DIF,
 )
@@ -84,6 +100,7 @@ from mirt.utils.sampling import (
     sample_expected_scores,
 )
 from mirt.utils.simulation import simdata
+from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
 from mirt.utils.statistical_tests import (
     LagrangeTestResult,
     WaldTestResult,
@@ -140,6 +157,9 @@ __all__ = [
     "traditional",
     "TraditionalStats",
     "item_fit_chisq",
+    "itemstats",
+    "ItemStats",
+    "itemstats_to_dataframe",
     "wald",
     "lagrange",
     "likelihood_ratio",
@@ -163,6 +183,8 @@ __all__ = [
     "weighted_RMSD_DIF",
     "DIFEffectSize",
     "EmpiricalPlotData",
+    "itemGAM",
+    "ItemGAMResult",
     "RCI",
     "RCIResult",
     "clinical_significance",
@@ -179,6 +201,11 @@ __all__ = [
     "PLCIResult",
     "score_CI",
     "delta_method",
+    "CollapsedData",
+    "collapse_patterns",
+    "collapse_with_groups",
+    "compute_pattern_likelihood",
+    "weighted_sum_from_collapsed",
     "key2binary",
     "poly2dich",
     "reverse_score",
@@ -197,4 +224,7 @@ __all__ = [
     "shrinkage_estimates",
     "RandomEffects",
     "FixedEffects",
+    "gen_random_pars",
+    "calc_null",
+    "multi_start_fit",
 ]
