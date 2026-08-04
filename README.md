@@ -108,6 +108,21 @@ b = np.random.normal(0, 1, size=20)
 responses = mirt.simdata(model="2PL", discrimination=a, difficulty=b, n_persons=1000)
 
 likert_data = mirt.simdata(model="GRM", n_categories=5, n_persons=500, n_items=15)
+
+pcm_params = mirt.generate_item_parameters(
+    n_items=15, model="PCM", n_categories=5, seed=42
+)
+pcm_data = mirt.simdata(
+    model="PCM", n_persons=500, n_items=15, n_categories=5, **pcm_params
+)
+
+nrm_params = mirt.generate_item_parameters(
+    n_items=10, model="NRM", n_categories=4, n_factors=2, seed=42
+)
+nrm_data = mirt.simdata(
+    model="NRM", n_persons=500, n_items=10, n_categories=4,
+    n_factors=2, **nrm_params
+)
 ```
 
 ### Fitting Models
@@ -370,7 +385,7 @@ plot_person_item_map(result.model, scores.theta)
 
 | Function | Description |
 |----------|-------------|
-| `compute_fit_indices()` | M2, RMSEA, CFI, TLI |
+| `compute_fit_indices()` | M2/M2* score moments, RMSEA, CFI, TLI, SRMSR |
 | `compare_models()` | AIC/BIC comparison |
 | `anova_irt()` | Likelihood ratio tests |
 | `compute_dtf()` | Differential test functioning |
@@ -386,7 +401,13 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_se()` | Bootstrap standard errors |
 | `bootstrap_ci()` | Bootstrap confidence intervals |
 | `generate_plausible_values()` | Plausible values |
+| `cross_validate()` | Validated K-fold evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
+| `gen_random_pars()` | Valid random starting values that preserve model constraints |
+| `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
+| `calc_null()` | Independence and pooled-intercept baseline fit statistics |
+| `fit_models()` | Validated sequential or parallel model comparison |
+| `fit_model_grid()` | Hyperparameter grids with retained failure details |
 | `set_dataframe_backend()` | Choose pandas/polars or restore automatic selection |
 | `get_dataframe_backend()` | Inspect the active DataFrame backend |
 | `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
@@ -397,7 +418,14 @@ plot_person_item_map(result.model, scores.theta)
 | `RCI()` | Reliable Change Index for clinical significance |
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
+| `posterior_summary()` | Summarize sampled parameter uncertainty |
+| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
+| `predict_mixed()` | Response probabilities from abilities or person covariates |
+| `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
+| `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
+| `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
+| `rotate_loadings()` | Varimax, quartimax, equamax, oblimin, promax, and geomin rotations |
 
 ### Data Transformation Functions
 
@@ -408,6 +436,8 @@ plot_person_item_map(result.model, scores.theta)
 | `reverse_score()` | Reverse score items |
 | `expand_table()` | Expand frequency table to response matrix |
 | `collapse_table()` | Collapse responses to frequency table |
+| `collapse_patterns()` | Collapse duplicate response patterns for efficient estimation |
+| `collapse_with_groups()` | Collapse response patterns independently within groups |
 | `recode_responses()` | Recode response values |
 
 ### Information Functions

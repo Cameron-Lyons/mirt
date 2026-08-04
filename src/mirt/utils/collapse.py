@@ -8,13 +8,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
-if TYPE_CHECKING:
-    pass
+from mirt.exceptions import MirtDataError, MirtValidationError
+from mirt.utils.data import validate_responses
 
 
 @dataclass
@@ -46,6 +45,22 @@ class CollapsedData:
         """Ratio of patterns to persons (lower = more compression)."""
         return self.n_patterns / self.n_persons
 
+    @property
+    def observations_saved(self) -> int:
+        """Number of redundant person rows removed by collapsing."""
+        return self.n_persons - self.n_patterns
+
+    def _expand(self, pattern_values: ArrayLike) -> NDArray:
+        values = np.asarray(pattern_values)
+        if values.ndim == 0 or values.shape[0] != self.n_patterns:
+            raise MirtValidationError(
+                "pattern_values must have one leading entry per pattern",
+                parameter="pattern_values",
+                value=values.shape,
+                expected=f"first dimension of {self.n_patterns}",
+            )
+        return values[self.indices]
+
     def expand_weights(
         self, pattern_weights: NDArray[np.float64]
     ) -> NDArray[np.float64]:
@@ -61,7 +76,7 @@ class CollapsedData:
         ndarray of shape (n_persons, ...)
             Weights expanded to person level.
         """
-        return pattern_weights[self.indices]
+        return self._expand(pattern_weights)
 
     def expand_scores(self, pattern_scores: NDArray[np.float64]) -> NDArray[np.float64]:
         """Expand pattern-level scores back to person level.
@@ -76,11 +91,76 @@ class CollapsedData:
         ndarray
             Scores expanded to person level.
         """
-        return pattern_scores[self.indices]
+        return self._expand(pattern_scores)
+
+
+def _normalize_responses(
+    responses: ArrayLike,
+    missing_code: int,
+) -> NDArray[np.int_]:
+    """Validate response data and normalize all missing values."""
+    if (
+        isinstance(missing_code, (bool, np.bool_))
+        or not isinstance(missing_code, (int, np.integer))
+        or missing_code >= 0
+        or missing_code < np.iinfo(np.int_).min
+    ):
+        raise MirtValidationError(
+            "missing_code must be a supported negative integer",
+            parameter="missing_code",
+            value=missing_code,
+        )
+
+    try:
+        response_array = np.asarray(responses)
+    except (TypeError, ValueError) as exc:
+        raise MirtDataError("responses must be a rectangular numeric array") from exc
+    if response_array.dtype.kind == "f" and np.any(np.isnan(response_array)):
+        response_array = response_array.copy()
+        response_array[np.isnan(response_array)] = missing_code
+
+    validated = validate_responses(
+        response_array,
+        allow_missing=True,
+        missing_code=int(missing_code),
+    )
+    return np.ascontiguousarray(validated)
+
+
+def _collapse_validated(responses: NDArray[np.int_]) -> CollapsedData:
+    """Collapse an already validated, contiguous response matrix."""
+    n_persons, n_items = responses.shape
+
+    row_dtype = np.dtype((np.void, responses.itemsize * n_items))
+    patterns_flat = responses.view(row_dtype).ravel()
+    _unique_patterns, first_indices, inverse, counts = np.unique(
+        patterns_flat,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    appearance_order = np.argsort(first_indices, kind="stable")
+    first_indices = first_indices[appearance_order]
+    patterns = responses[first_indices].copy()
+    frequencies = counts[appearance_order].astype(np.int_, copy=False)
+    n_patterns = len(first_indices)
+
+    sorted_to_appearance = np.empty(n_patterns, dtype=np.int_)
+    sorted_to_appearance[appearance_order] = np.arange(n_patterns, dtype=np.int_)
+    indices = sorted_to_appearance[inverse]
+
+    return CollapsedData(
+        patterns=patterns,
+        frequencies=frequencies,
+        indices=indices,
+        n_persons=n_persons,
+        n_patterns=n_patterns,
+    )
 
 
 def collapse_patterns(
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     missing_code: int = -1,
 ) -> CollapsedData:
     """Collapse identical response patterns for efficient computation.
@@ -91,8 +171,9 @@ def collapse_patterns(
 
     Parameters
     ----------
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix with missing data coded as missing_code.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. NaN and negative values are treated as missing and
+        normalized to ``missing_code``. Patterns retain first-appearance order.
     missing_code : int
         Value used for missing responses.
 
@@ -112,35 +193,14 @@ def collapse_patterns(
     >>> print(collapsed.frequencies)
     [3 1]
     """
-    responses = np.asarray(responses, dtype=np.int_)
-    n_persons, n_items = responses.shape
-
-    patterns_view = responses.view(dtype=f"S{responses.itemsize * n_items}")
-    patterns_flat = patterns_view.ravel()
-
-    unique_patterns, indices, counts = np.unique(
-        patterns_flat,
-        return_inverse=True,
-        return_counts=True,
-    )
-
-    n_patterns = len(unique_patterns)
-    patterns = unique_patterns.view(responses.dtype).reshape(n_patterns, n_items)
-
-    return CollapsedData(
-        patterns=patterns,
-        frequencies=counts,
-        indices=indices,
-        n_persons=n_persons,
-        n_patterns=n_patterns,
-    )
+    return _collapse_validated(_normalize_responses(responses, missing_code))
 
 
 def collapse_with_groups(
-    responses: NDArray[np.int_],
-    groups: NDArray,
+    responses: ArrayLike,
+    groups: ArrayLike,
     missing_code: int = -1,
-) -> tuple[list[CollapsedData], list[NDArray]]:
+) -> tuple[list[CollapsedData], list[NDArray[np.bool_]]]:
     """Collapse patterns separately for each group.
 
     Parameters
@@ -159,15 +219,43 @@ def collapse_with_groups(
     group_masks : list of ndarray
         Boolean masks for each group.
     """
-    unique_groups = np.unique(groups)
+    responses_array = _normalize_responses(responses, missing_code)
+    try:
+        groups_array = np.asarray(groups)
+    except (TypeError, ValueError) as exc:
+        raise MirtDataError("groups must be a one-dimensional array") from exc
+    if groups_array.ndim != 1:
+        raise MirtDataError(f"groups must be a 1D array, got {groups_array.ndim}D")
+    if len(groups_array) != len(responses_array):
+        raise MirtDataError(
+            "groups must contain one value per person",
+            n_persons=len(responses_array),
+        )
+    has_missing_group = (
+        np.any(np.isnan(groups_array))
+        if groups_array.dtype.kind in "fc"
+        else groups_array.dtype.kind == "O"
+        and any(
+            value is None or isinstance(value, (float, np.floating)) and np.isnan(value)
+            for value in groups_array
+        )
+    )
+    if has_missing_group:
+        raise MirtDataError("groups must not contain missing values")
+
+    try:
+        unique_groups, first_indices = np.unique(groups_array, return_index=True)
+    except TypeError as exc:
+        raise MirtDataError("group values must be mutually comparable") from exc
+    unique_groups = unique_groups[np.argsort(first_indices, kind="stable")]
     collapsed_list = []
     group_masks = []
 
     for g in unique_groups:
-        mask = groups == g
+        mask = groups_array == g
         group_masks.append(mask)
-        group_data = responses[mask]
-        collapsed_list.append(collapse_patterns(group_data, missing_code))
+        group_data = responses_array[mask]
+        collapsed_list.append(_collapse_validated(group_data))
 
     return collapsed_list, group_masks
 
@@ -192,15 +280,23 @@ def compute_pattern_likelihood(
 
     Returns
     -------
-    ndarray of shape (n_patterns,)
-        Log-likelihood for each pattern.
+    ndarray of shape (n_patterns, ...)
+        Log-likelihood values with one leading entry per pattern.
     """
-    return log_likelihood_func(collapsed.patterns, theta)
+    values = np.asarray(log_likelihood_func(collapsed.patterns, theta))
+    if values.ndim == 0 or values.shape[0] != collapsed.n_patterns:
+        raise MirtValidationError(
+            "log_likelihood_func must return one leading entry per pattern",
+            parameter="log_likelihood_func",
+            value=values.shape,
+            expected=f"first dimension of {collapsed.n_patterns}",
+        )
+    return values
 
 
 def weighted_sum_from_collapsed(
     collapsed: CollapsedData,
-    pattern_values: NDArray[np.float64],
+    pattern_values: ArrayLike,
 ) -> float:
     """Compute frequency-weighted sum of pattern-level values.
 
@@ -216,4 +312,12 @@ def weighted_sum_from_collapsed(
     float
         Weighted sum.
     """
-    return float(np.sum(collapsed.frequencies * pattern_values))
+    values = np.asarray(pattern_values, dtype=np.float64)
+    if values.shape != (collapsed.n_patterns,):
+        raise MirtValidationError(
+            "pattern_values must contain one value per pattern",
+            parameter="pattern_values",
+            value=values.shape,
+            expected=f"({collapsed.n_patterns},)",
+        )
+    return float(np.dot(collapsed.frequencies, values))

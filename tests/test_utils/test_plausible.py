@@ -14,6 +14,59 @@ from mirt import (
 class TestGeneratePlausibleValues:
     """Tests for plausible value generation."""
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"n_plausible": 0}, "n_plausible"),
+            ({"n_plausible": 1.5}, "n_plausible"),
+            ({"n_quadpts": 0}, "n_quadpts"),
+            ({"method": "mcmc", "n_iter": 0}, "n_iter"),
+        ],
+    )
+    def test_generation_parameters_must_be_positive_integers(
+        self,
+        fitted_2pl_model,
+        dichotomous_responses,
+        kwargs,
+        message,
+    ):
+        """Reject invalid sample, quadrature, and iteration counts."""
+        with pytest.raises(ValueError, match=message):
+            generate_plausible_values(
+                fitted_2pl_model,
+                dichotomous_responses["responses"],
+                **kwargs,
+            )
+
+    def test_requires_fitted_model(self):
+        """Plausible values require estimated item parameters."""
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        model = TwoParameterLogistic(n_items=2)
+
+        with pytest.raises(ValueError, match="fitted"):
+            generate_plausible_values(model, np.array([[0, 1]]))
+
+    def test_validates_response_shape_and_codes(self, fitted_2pl_model):
+        """Reject malformed and non-dichotomous response matrices."""
+        with pytest.raises(ValueError, match="2D"):
+            generate_plausible_values(fitted_2pl_model, np.array([0, 1]))
+        with pytest.raises(ValueError, match="coded as 0 or 1"):
+            generate_plausible_values(
+                fitted_2pl_model,
+                np.full((1, fitted_2pl_model.model.n_items), 2),
+            )
+
+    def test_validates_polytomous_response_codes(self):
+        """Reject category codes outside an item's configured range."""
+        from mirt.models.polytomous import GradedResponseModel
+
+        model = GradedResponseModel(n_items=2, n_categories=[3, 4])
+        model._is_fitted = True
+
+        with pytest.raises(ValueError, match="item 0 must be below 3"):
+            generate_plausible_values(model, np.array([[3, 0]]))
+
     def test_generate_pv_posterior(self, fitted_2pl_model, dichotomous_responses):
         """Test posterior sampling method."""
         responses = dichotomous_responses["responses"]
@@ -28,6 +81,34 @@ class TestGeneratePlausibleValues:
 
         n_persons = responses.shape[0]
         assert pvs.shape == (n_persons, 1, 3)
+
+    def test_posterior_uses_single_batch_likelihood(
+        self,
+        fitted_2pl_model,
+        dichotomous_responses,
+        monkeypatch,
+    ):
+        """Posterior sampling evaluates every respondent in one batch."""
+        model = fitted_2pl_model.model
+        original = model.log_likelihood_batch
+        call_count = 0
+
+        def counted_batch(responses, theta):
+            nonlocal call_count
+            call_count += 1
+            return original(responses, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", counted_batch)
+
+        generate_plausible_values(
+            model,
+            dichotomous_responses["responses"],
+            n_plausible=3,
+            method="posterior",
+            seed=42,
+        )
+
+        assert call_count == 1
 
     def test_generate_pv_mcmc(self, fitted_2pl_model_small):
         """Test MCMC sampling method."""
@@ -44,6 +125,36 @@ class TestGeneratePlausibleValues:
 
         n_persons = responses.shape[0]
         assert pvs.shape == (n_persons, 1, 3)
+        assert not np.array_equal(pvs[:, :, 0], pvs[:, :, -1])
+
+    def test_mcmc_reuses_current_log_density(
+        self,
+        fitted_2pl_model_small,
+        monkeypatch,
+    ):
+        """MCMC recomputes only proposed states after initialization."""
+        model = fitted_2pl_model_small["result"].model
+        responses = fitted_2pl_model_small["responses"][:2]
+        original = model.log_likelihood
+        call_count = 0
+
+        def counted_likelihood(responses, theta):
+            nonlocal call_count
+            call_count += 1
+            return original(responses, theta)
+
+        monkeypatch.setattr(model, "log_likelihood", counted_likelihood)
+
+        generate_plausible_values(
+            model,
+            responses,
+            n_plausible=3,
+            method="mcmc",
+            n_iter=4,
+            seed=42,
+        )
+
+        assert call_count == responses.shape[0] * (1 + 3 * 4)
 
     def test_pv_variability(self, fitted_2pl_model, dichotomous_responses):
         """Test that PVs show appropriate variability."""
