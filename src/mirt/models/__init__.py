@@ -52,6 +52,7 @@ from mirt.models.explanatory import (
     LLTMResult,
     RaschLLTM,
 )
+from mirt.models.irtree import IRTreeModel, IRTreeSpec, TreeNode
 from mirt.models.mfrm import (
     Facet,
     ManyFacetRaschModel,
@@ -123,6 +124,9 @@ __all__ = [
     "LatentRegressionResult",
     "ExplanatoryIRT",
     "ExplanatoryIRTResult",
+    "TreeNode",
+    "IRTreeSpec",
+    "IRTreeModel",
     "Facet",
     "ManyFacetRaschModel",
     "MFRMResult",

@@ -16,6 +16,7 @@ from mirt.estimation.constraints import (
 )
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.gvem import GVEMEstimator
+from mirt.estimation.irtree_em import IRTreeEMEstimator, IRTreeResult
 from mirt.estimation.latent_density import (
     CustomDensity,
     DavidianCurve,
@@ -66,6 +67,8 @@ __all__ = [
     "BaseEstimator",
     "EMEstimator",
     "GVEMEstimator",
+    "IRTreeEMEstimator",
+    "IRTreeResult",
     "GaussHermiteQuadrature",
     "MCEMEstimator",
     "QMCEMEstimator",

@@ -1,16 +1,16 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from numbers import Integral
+from typing import Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
-
-if TYPE_CHECKING:
-    pass
+from mirt.exceptions import MirtDataError, MirtValidationError
 
 
 @dataclass
@@ -144,8 +144,8 @@ class IRTreeSpec:
 
         Decomposes responses into:
         1. Extreme (0 = non-extreme, 1 = extreme endpoint)
-        2. Direction (0 = low side, 1 = high side)
-        3. Midpoint (0 = not midpoint, 1 = midpoint) - only if non-extreme
+        2. Midpoint (0 = not midpoint, 1 = midpoint) - if non-extreme
+        3. Direction (0 = low side, 1 = high side) - when needed
 
         5-point mapping:
         - 1: Extreme=1, Direction=0
@@ -157,22 +157,10 @@ class IRTreeSpec:
         if n_categories != 5:
             raise ValueError("Extreme-midpoint model requires 5 categories")
 
-        midpoint_low = TreeNode(
-            name="midpoint_low",
-            latent_trait=2,
-            children={0: 1, 1: 2},
-        )
-
-        midpoint_high = TreeNode(
-            name="midpoint_high",
-            latent_trait=2,
-            children={0: 3, 1: 2},
-        )
-
         direction_nonextreme = TreeNode(
             name="direction_nonextreme",
             latent_trait=1,
-            children={0: midpoint_low, 1: midpoint_high},
+            children={0: 1, 1: 3},
         )
 
         direction_extreme = TreeNode(
@@ -181,10 +169,16 @@ class IRTreeSpec:
             children={0: 0, 1: 4},
         )
 
+        midpoint = TreeNode(
+            name="midpoint",
+            latent_trait=2,
+            children={0: direction_nonextreme, 1: 2},
+        )
+
         root = TreeNode(
             name="extreme",
             latent_trait=0,
-            children={0: direction_nonextreme, 1: direction_extreme},
+            children={0: midpoint, 1: direction_extreme},
         )
 
         return cls(
@@ -200,15 +194,19 @@ class IRTreeSpec:
         """Simple two-process direction-intensity model.
 
         Decomposes responses into:
-        1. Direction (0 = disagree, 1 = agree)
-        2. Intensity (0, 1, 2 for mild/moderate/extreme)
+        1. Intensity presence (0 = neutral, 1 = directional response)
+        2. Direction (0 = disagree, 1 = agree)
+        3. Extremity (0 = mild, 1 = extreme)
 
         5-point mapping:
-        - 1: D=0, I=2 (strong disagree)
-        - 2: D=0, I=1 (disagree)
-        - 3: neutral (both directions possible with I=0)
-        - 4: D=1, I=1 (agree)
-        - 5: D=1, I=2 (strong agree)
+        - 1: I=1, D=0, E=1 (strong disagree)
+        - 2: I=1, D=0, E=0 (disagree)
+        - 3: I=0 (neutral)
+        - 4: I=1, D=1, E=0 (agree)
+        - 5: I=1, D=1, E=1 (strong agree)
+
+        The intensity-presence and extremity decisions share the intensity
+        latent trait while retaining separate item parameters.
         """
         if n_categories != 5:
             raise ValueError("Direction-intensity model requires 5 categories")
@@ -216,19 +214,25 @@ class IRTreeSpec:
         intensity_low = TreeNode(
             name="intensity_low",
             latent_trait=1,
-            children={0: 2, 1: 1, 2: 0},
+            children={0: 1, 1: 0},
         )
 
         intensity_high = TreeNode(
             name="intensity_high",
             latent_trait=1,
-            children={0: 2, 1: 3, 2: 4},
+            children={0: 3, 1: 4},
         )
 
-        root = TreeNode(
+        direction = TreeNode(
             name="direction",
             latent_trait=0,
             children={0: intensity_low, 1: intensity_high},
+        )
+
+        root = TreeNode(
+            name="intensity_presence",
+            latent_trait=1,
+            children={0: 2, 1: direction},
         )
 
         return cls(
@@ -244,8 +248,25 @@ class IRTreeSpec:
 
         Returns list of (node, decision) pairs from root to terminal.
         """
+        if (
+            isinstance(category, bool)
+            or not isinstance(category, Integral)
+            or category < 0
+            or category >= self.n_categories
+        ):
+            raise MirtValidationError(
+                f"category must be in [0, {self.n_categories})",
+                parameter="category",
+                value=category,
+                expected=f"integer in [0, {self.n_categories})",
+            )
         path: list[tuple[TreeNode, int]] = []
-        self._find_path(self.root, category, path)
+        if not self._find_path(self.root, int(category), path):
+            raise MirtValidationError(
+                f"category {category} is not reachable in the tree",
+                parameter="category",
+                value=category,
+            )
         return path
 
     def _find_path(
@@ -263,6 +284,125 @@ class IRTreeSpec:
                     return True
                 path.pop()
         return False
+
+    def validate(self) -> None:
+        """Validate that the specification is a complete binary tree.
+
+        IRTree pseudo-items are binary decisions, and deterministic expansion
+        requires every response category to have exactly one terminal path.
+        """
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise MirtValidationError(
+                "name must be a non-empty string", parameter="name", value=self.name
+            )
+        if (
+            isinstance(self.n_categories, bool)
+            or not isinstance(self.n_categories, Integral)
+            or self.n_categories < 2
+        ):
+            raise MirtValidationError(
+                "n_categories must be an integer of at least 2",
+                parameter="n_categories",
+                value=self.n_categories,
+                expected=">= 2",
+            )
+        if (
+            isinstance(self.n_traits, bool)
+            or not isinstance(self.n_traits, Integral)
+            or self.n_traits < 1
+        ):
+            raise MirtValidationError(
+                "n_traits must be a positive integer",
+                parameter="n_traits",
+                value=self.n_traits,
+                expected=">= 1",
+            )
+        if len(self.trait_names) != self.n_traits:
+            raise MirtValidationError(
+                "trait_names length must match n_traits",
+                parameter="trait_names",
+                value=len(self.trait_names),
+                expected=str(self.n_traits),
+            )
+        if any(
+            not isinstance(name, str) or not name.strip() for name in self.trait_names
+        ):
+            raise MirtValidationError(
+                "trait_names must contain non-empty strings",
+                parameter="trait_names",
+            )
+        if len(set(self.trait_names)) != len(self.trait_names):
+            raise MirtValidationError(
+                "trait_names must be unique", parameter="trait_names"
+            )
+        if not isinstance(self.root, TreeNode):
+            raise MirtValidationError(
+                "root must be a TreeNode", parameter="root", value=type(self.root)
+            )
+
+        seen: set[int] = set()
+        active: set[int] = set()
+        terminals: list[int] = []
+
+        def visit(node: TreeNode) -> None:
+            node_id = id(node)
+            if node_id in active:
+                raise MirtValidationError("tree contains a cycle", parameter="root")
+            if node_id in seen:
+                raise MirtValidationError(
+                    "tree nodes cannot be shared across branches", parameter="root"
+                )
+            if not isinstance(node.name, str) or not node.name.strip():
+                raise MirtValidationError(
+                    "node names must be non-empty strings",
+                    parameter="node.name",
+                    value=node.name,
+                )
+            if (
+                isinstance(node.latent_trait, bool)
+                or not isinstance(node.latent_trait, Integral)
+                or node.latent_trait < 0
+                or node.latent_trait >= self.n_traits
+            ):
+                raise MirtValidationError(
+                    f"node {node.name!r} has an invalid latent trait",
+                    parameter="latent_trait",
+                    value=node.latent_trait,
+                    expected=f"integer in [0, {self.n_traits})",
+                )
+            if set(node.children) != {0, 1}:
+                raise MirtValidationError(
+                    f"node {node.name!r} must have decisions 0 and 1",
+                    parameter="children",
+                    value=tuple(node.children),
+                    expected="{0, 1}",
+                )
+
+            active.add(node_id)
+            seen.add(node_id)
+            for child in node.children.values():
+                if isinstance(child, TreeNode):
+                    visit(child)
+                elif isinstance(child, bool) or not isinstance(child, Integral):
+                    raise MirtValidationError(
+                        "terminal values must be integer response categories",
+                        parameter="children",
+                        value=child,
+                    )
+                else:
+                    terminals.append(int(child))
+            active.remove(node_id)
+
+        visit(self.root)
+
+        expected = list(range(self.n_categories))
+        if sorted(terminals) != expected:
+            raise MirtValidationError(
+                "terminal categories must contain each response category exactly once",
+                parameter="children",
+                value=sorted(terminals),
+                expected=str(expected),
+            )
 
 
 class IRTreeModel:
@@ -289,6 +429,18 @@ class IRTreeModel:
     """
 
     model_name = "IRTree"
+    n_items: int
+    n_categories: int
+    correlated_traits: bool
+    item_names: list[str]
+    tree_spec: IRTreeSpec
+    n_traits: int
+    trait_names: list[str]
+    _nodes: tuple[TreeNode, ...]
+    _node_traits: NDArray[np.intp]
+    _path_decisions: NDArray[np.int8]
+    _reach_decisions: NDArray[np.int8]
+    _is_fitted: bool
 
     def __init__(
         self,
@@ -301,10 +453,57 @@ class IRTreeModel:
         item_names: list[str] | None = None,
         correlated_traits: bool = True,
     ) -> None:
-        self.n_items = n_items
-        self.n_categories = n_categories
+        if (
+            isinstance(n_items, bool)
+            or not isinstance(n_items, Integral)
+            or n_items < 1
+        ):
+            raise MirtValidationError(
+                "n_items must be a positive integer",
+                parameter="n_items",
+                value=n_items,
+                expected=">= 1",
+            )
+        if (
+            isinstance(n_categories, bool)
+            or not isinstance(n_categories, Integral)
+            or n_categories < 2
+        ):
+            raise MirtValidationError(
+                "n_categories must be an integer of at least 2",
+                parameter="n_categories",
+                value=n_categories,
+                expected=">= 2",
+            )
+        if not isinstance(correlated_traits, bool):
+            raise MirtValidationError(
+                "correlated_traits must be boolean",
+                parameter="correlated_traits",
+                value=correlated_traits,
+            )
+
+        self.n_items = int(n_items)
+        self.n_categories = int(n_categories)
         self.correlated_traits = correlated_traits
-        self.item_names = item_names or [f"Item_{i}" for i in range(n_items)]
+
+        if item_names is None:
+            self.item_names = [f"Item_{i}" for i in range(self.n_items)]
+        else:
+            if len(item_names) != self.n_items:
+                raise MirtValidationError(
+                    "item_names length must match n_items",
+                    parameter="item_names",
+                    value=len(item_names),
+                    expected=str(self.n_items),
+                )
+            if any(
+                not isinstance(name, str) or not name.strip() for name in item_names
+            ):
+                raise MirtValidationError(
+                    "item_names must contain non-empty strings",
+                    parameter="item_names",
+                )
+            self.item_names = list(item_names)
 
         if isinstance(tree_spec, str):
             if tree_spec == "bockenholt":
@@ -314,12 +513,32 @@ class IRTreeModel:
             elif tree_spec == "direction_intensity":
                 self.tree_spec = IRTreeSpec.simple_direction_intensity(n_categories)
             else:
-                raise ValueError(f"Unknown tree spec: {tree_spec}")
+                raise MirtValidationError(
+                    f"Unknown tree spec: {tree_spec}",
+                    parameter="tree_spec",
+                    value=tree_spec,
+                )
+        elif isinstance(tree_spec, IRTreeSpec):
+            self.tree_spec = deepcopy(tree_spec)
         else:
-            self.tree_spec = tree_spec
+            raise MirtValidationError(
+                "tree_spec must be a built-in name or IRTreeSpec",
+                parameter="tree_spec",
+                value=type(tree_spec),
+            )
+
+        if self.tree_spec.n_categories != self.n_categories:
+            raise MirtValidationError(
+                "tree_spec n_categories must match the model",
+                parameter="n_categories",
+                value=self.n_categories,
+                expected=str(self.tree_spec.n_categories),
+            )
+        self.tree_spec.validate()
 
         self.n_traits = self.tree_spec.n_traits
-        self.trait_names = self.tree_spec.trait_names
+        self.trait_names = list(self.tree_spec.trait_names)
+        self._compile_tree()
 
         self._parameters: dict[str, NDArray[np.float64]] = {}
         self._trait_correlations: NDArray[np.float64] | None = None
@@ -329,17 +548,77 @@ class IRTreeModel:
 
     def _initialize_parameters(self) -> None:
         """Initialize item parameters for each pseudo-item."""
-        n_nodes = self.tree_spec.root.count_nodes()
-
-        self._parameters["discrimination"] = np.ones((self.n_items, n_nodes))
-        self._parameters["difficulty"] = np.zeros((self.n_items, n_nodes))
+        shape = (self.n_items, self.n_nodes)
+        self._parameters["discrimination"] = np.ones(shape, dtype=np.float64)
+        self._parameters["difficulty"] = np.zeros(shape, dtype=np.float64)
 
         if self.correlated_traits:
-            self._trait_correlations = np.eye(self.n_traits)
+            self._trait_correlations = np.eye(self.n_traits, dtype=np.float64)
+
+    def _compile_tree(self) -> None:
+        """Compile stable node indices and category decision paths."""
+        nodes: list[TreeNode] = []
+        category_paths: list[list[tuple[int, int]] | None] = [
+            None for _ in range(self.n_categories)
+        ]
+        reach_paths: list[list[tuple[int, int]]] = []
+
+        def visit(node: TreeNode, prefix: list[tuple[int, int]]) -> None:
+            node_idx = len(nodes)
+            nodes.append(node)
+            reach_paths.append(prefix.copy())
+
+            for decision in (0, 1):
+                child = node.children[decision]
+                child_path = [*prefix, (node_idx, decision)]
+                if isinstance(child, TreeNode):
+                    visit(child, child_path)
+                else:
+                    category_paths[int(child)] = child_path
+
+        visit(self.tree_spec.root, [])
+
+        self._nodes = tuple(nodes)
+        self._node_traits = np.asarray(
+            [node.latent_trait for node in nodes], dtype=np.intp
+        )
+        self._path_decisions = np.full(
+            (self.n_categories, len(nodes)), -1, dtype=np.int8
+        )
+        self._reach_decisions = np.full((len(nodes), len(nodes)), -1, dtype=np.int8)
+
+        for category, path in enumerate(category_paths):
+            assert path is not None
+            for node_idx, decision in path:
+                self._path_decisions[category, node_idx] = decision
+        for target_node, path in enumerate(reach_paths):
+            for node_idx, decision in path:
+                self._reach_decisions[target_node, node_idx] = decision
+
+    @property
+    def n_nodes(self) -> int:
+        """Number of binary decision nodes per item."""
+        return len(self._nodes)
+
+    @property
+    def node_names(self) -> tuple[str, ...]:
+        """Decision-node names in parameter-column order."""
+        return tuple(node.name for node in self._nodes)
 
     @property
     def parameters(self) -> dict[str, NDArray[np.float64]]:
         return {k: v.copy() for k, v in self._parameters.items()}
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._is_fitted
+
+    @property
+    def n_parameters(self) -> int:
+        n_parameters = sum(value.size for value in self._parameters.values())
+        if self._trait_correlations is not None:
+            n_parameters += self.n_traits * (self.n_traits - 1) // 2
+        return n_parameters
 
     @property
     def trait_correlations(self) -> NDArray[np.float64] | None:
@@ -350,57 +629,147 @@ class IRTreeModel:
     def expand_to_pseudo_items(
         self,
         responses: NDArray[np.int_],
-    ) -> tuple[NDArray[np.int_], NDArray[np.int_], NDArray[np.int_]]:
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_], NDArray[np.bool_]]:
         """Expand ordinal responses to binary pseudo-items.
 
         Parameters
         ----------
         responses : NDArray
-            Ordinal response matrix (n_persons, n_items) with values 0 to n_categories-1
+            Ordinal response matrix (n_persons, n_items) with values 0 to
+            n_categories - 1. Negative values and NaN are treated as missing.
 
         Returns
         -------
         tuple
-            - pseudo_responses: Binary responses (n_persons, n_items, max_nodes)
-            - trait_assignments: Trait index for each pseudo-item (n_items, max_nodes)
-            - valid_mask: Which pseudo-items are valid per person (n_persons, n_items, max_nodes)
+            - pseudo_responses: Binary responses (n_persons, n_items, n_nodes)
+            - trait_assignments: Trait index for each pseudo-item (n_items, n_nodes)
+            - valid_mask: Which pseudo-items are valid per person
         """
-
-        n_persons, n_items = responses.shape
-        max_depth = self.tree_spec.root.depth()
-
-        pseudo_responses = np.full((n_persons, n_items, max_depth), -1, dtype=np.int32)
-        trait_assignments = np.zeros((n_items, max_depth), dtype=np.int32)
-        valid_mask = np.zeros((n_persons, n_items, max_depth), dtype=np.bool_)
-
-        for j in range(n_items):
-            node_idx = 0
-
-            def assign_node_traits(node: TreeNode, depth: int) -> None:
-                nonlocal node_idx
-                if depth < max_depth:
-                    trait_assignments[j, node_idx] = node.latent_trait
-                    node_idx += 1
-                    for child in node.children.values():
-                        if isinstance(child, TreeNode):
-                            assign_node_traits(child, depth + 1)
-
-            assign_node_traits(self.tree_spec.root, 0)
-
-        for i in range(n_persons):
-            for j in range(n_items):
-                resp = responses[i, j]
-                if resp < 0:
-                    continue
-
-                path = self.tree_spec.get_path_to_category(int(resp))
-
-                for node_idx, (node, decision) in enumerate(path):
-                    if node_idx < max_depth:
-                        pseudo_responses[i, j, node_idx] = decision
-                        valid_mask[i, j, node_idx] = True
-
+        response_codes, observed = self._validate_responses(responses)
+        decisions = self._path_decisions[response_codes]
+        valid_mask = observed[..., None] & (decisions >= 0)
+        pseudo_responses = np.where(valid_mask, decisions, -1).astype(np.int32)
+        trait_assignments = np.broadcast_to(
+            self._node_traits, (self.n_items, self.n_nodes)
+        ).astype(np.int32, copy=True)
         return pseudo_responses, trait_assignments, valid_mask
+
+    def _validate_theta(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        try:
+            theta_array = np.asarray(theta, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "theta must contain numeric values", parameter="theta"
+            ) from exc
+        if theta_array.ndim == 1:
+            theta_array = theta_array.reshape(1, -1)
+        if theta_array.ndim != 2:
+            raise MirtValidationError(
+                "theta must be one- or two-dimensional",
+                parameter="theta",
+                value=theta_array.ndim,
+                expected="1 or 2 dimensions",
+            )
+        if theta_array.shape[1] != self.n_traits:
+            raise MirtValidationError(
+                "theta trait dimension does not match the model",
+                parameter="theta",
+                value=theta_array.shape,
+                expected=f"(*, {self.n_traits})",
+            )
+        if not np.all(np.isfinite(theta_array)):
+            raise MirtValidationError(
+                "theta must contain only finite values", parameter="theta"
+            )
+        return theta_array
+
+    def _validate_item_idx(self, item_idx: int) -> int:
+        if (
+            isinstance(item_idx, bool)
+            or not isinstance(item_idx, Integral)
+            or item_idx < 0
+            or item_idx >= self.n_items
+        ):
+            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
+        return int(item_idx)
+
+    def _validate_node_idx(self, node_idx: int) -> int:
+        if (
+            isinstance(node_idx, bool)
+            or not isinstance(node_idx, Integral)
+            or node_idx < 0
+            or node_idx >= self.n_nodes
+        ):
+            raise IndexError(f"Node index {node_idx} out of range [0, {self.n_nodes})")
+        return int(node_idx)
+
+    def _validate_responses(
+        self, responses: NDArray[np.int_]
+    ) -> tuple[NDArray[np.intp], NDArray[np.bool_]]:
+        try:
+            response_array = np.asarray(responses, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtDataError("responses must contain numeric values") from exc
+        if response_array.ndim != 2:
+            raise MirtDataError(
+                "responses must be two-dimensional", ndim=response_array.ndim
+            )
+        if response_array.shape[1] != self.n_items:
+            raise MirtDataError(
+                "response item count does not match the model",
+                n_items=response_array.shape[1],
+                expected=self.n_items,
+            )
+
+        missing = np.isnan(response_array) | (response_array < 0)
+        observed = ~missing
+        observed_values = response_array[observed]
+        if not np.all(np.isfinite(observed_values)):
+            raise MirtDataError("observed responses must be finite")
+        if np.any(observed_values != np.floor(observed_values)):
+            raise MirtDataError("observed responses must be integer category codes")
+        if np.any(observed_values >= self.n_categories):
+            raise MirtDataError(f"observed responses must be below {self.n_categories}")
+
+        codes = np.zeros(response_array.shape, dtype=np.intp)
+        codes[observed] = observed_values.astype(np.intp)
+        return codes, observed
+
+    def _node_probabilities(
+        self, theta: NDArray[np.float64], item_idx: int | None
+    ) -> NDArray[np.float64]:
+        if item_idx is None:
+            discrimination = self._parameters["discrimination"]
+            difficulty = self._parameters["difficulty"]
+        else:
+            index = self._validate_item_idx(item_idx)
+            discrimination = self._parameters["discrimination"][index : index + 1]
+            difficulty = self._parameters["difficulty"][index : index + 1]
+
+        trait_values = theta[:, self._node_traits]
+        logits = discrimination[None, :, :] * (
+            trait_values[:, None, :] - difficulty[None, :, :]
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            probabilities = np.asarray(sigmoid(logits), dtype=np.float64)
+        return np.clip(probabilities, PROB_EPSILON, 1.0 - PROB_EPSILON)
+
+    @staticmethod
+    def _combine_decision_probabilities(
+        node_probabilities: NDArray[np.float64],
+        decisions: NDArray[np.int8],
+    ) -> NDArray[np.float64]:
+        log_success = np.log(node_probabilities)
+        log_failure = np.log1p(-node_probabilities)
+        success_mask = (decisions == 1).astype(np.float64)
+        failure_mask = (decisions == 0).astype(np.float64)
+        log_probability = np.einsum(
+            "pin,cn->pic", log_success, success_mask, optimize=True
+        )
+        log_probability += np.einsum(
+            "pin,cn->pic", log_failure, failure_mask, optimize=True
+        )
+        return np.exp(log_probability)
 
     def probability(
         self,
@@ -422,52 +791,89 @@ class IRTreeModel:
             Category probabilities (n_persons, n_categories) or
             (n_persons, n_items, n_categories)
         """
-        if theta.ndim == 1:
-            theta = theta.reshape(1, -1)
-
-        n_persons = theta.shape[0]
-
+        theta_array = self._validate_theta(theta)
+        node_probabilities = self._node_probabilities(theta_array, item_idx)
+        probabilities = self._combine_decision_probabilities(
+            node_probabilities, self._path_decisions
+        )
         if item_idx is not None:
-            probs = np.zeros((n_persons, self.n_categories))
-            self._compute_category_probs(theta, item_idx, probs)
-            return probs
+            return probabilities[:, 0, :]
+        return probabilities
 
-        all_probs = np.zeros((n_persons, self.n_items, self.n_categories))
-        for j in range(self.n_items):
-            self._compute_category_probs(theta, j, all_probs[:, j, :])
-        return all_probs
-
-    def _compute_category_probs(
+    def decision_probability(
         self,
         theta: NDArray[np.float64],
-        item_idx: int,
-        probs: NDArray[np.float64],
-    ) -> None:
-        """Compute category probabilities for a single item."""
-        n_persons = theta.shape[0]
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return conditional probabilities of decision 1 at every tree node."""
+        theta_array = self._validate_theta(theta)
+        probabilities = self._node_probabilities(theta_array, item_idx)
+        if item_idx is not None:
+            return probabilities[:, 0, :]
+        return probabilities
 
-        for cat in range(self.n_categories):
-            path = self.tree_spec.get_path_to_category(cat)
-            cat_prob = np.ones(n_persons)
+    def reach_probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return probabilities of reaching every tree node."""
+        theta_array = self._validate_theta(theta)
+        node_probabilities = self._node_probabilities(theta_array, item_idx)
+        probabilities = self._combine_decision_probabilities(
+            node_probabilities, self._reach_decisions
+        )
+        if item_idx is not None:
+            return probabilities[:, 0, :]
+        return probabilities
 
-            node_idx = 0
-            for node, decision in path:
-                trait_idx = node.latent_trait
-                a = self._parameters["discrimination"][item_idx, node_idx]
-                b = self._parameters["difficulty"][item_idx, node_idx]
+    def expected_score(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute expected response-category scores."""
+        probabilities = self.probability(theta, item_idx)
+        return probabilities @ np.arange(self.n_categories, dtype=np.float64)
 
-                z = a * (theta[:, trait_idx] - b)
-                p_node = sigmoid(z)
-                p_node = np.clip(p_node, PROB_EPSILON, 1 - PROB_EPSILON)
+    def information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute expected Fisher information matrices for the traits.
 
-                if decision == 1:
-                    cat_prob *= p_node
-                else:
-                    cat_prob *= 1 - p_node
+        Returns one diagonal trait-information matrix per person and item.
+        For a single item the item dimension is omitted.
+        """
+        theta_array = self._validate_theta(theta)
+        node_probabilities = self._node_probabilities(theta_array, item_idx)
+        reach = self._combine_decision_probabilities(
+            node_probabilities, self._reach_decisions
+        )
 
-                node_idx += 1
+        if item_idx is None:
+            discrimination = self._parameters["discrimination"]
+        else:
+            index = self._validate_item_idx(item_idx)
+            discrimination = self._parameters["discrimination"][index : index + 1]
 
-            probs[:, cat] = cat_prob
+        node_information = (
+            reach
+            * node_probabilities
+            * (1.0 - node_probabilities)
+            * discrimination[None, :, :] ** 2
+        )
+        trait_selector = np.eye(self.n_traits, dtype=np.float64)[self._node_traits]
+        diagonal = np.einsum(
+            "pin,nt->pit", node_information, trait_selector, optimize=True
+        )
+        matrices = np.zeros((*diagonal.shape, self.n_traits), dtype=np.float64)
+        trait_indices = np.arange(self.n_traits)
+        matrices[..., trait_indices, trait_indices] = diagonal
+        if item_idx is not None:
+            return matrices[:, 0, :, :]
+        return matrices
 
     def log_likelihood(
         self,
@@ -488,33 +894,182 @@ class IRTreeModel:
         NDArray
             Log-likelihoods per person (n_persons,)
         """
-        n_persons = responses.shape[0]
-        probs = self.probability(theta)
+        response_codes, observed = self._validate_responses(responses)
+        theta_array = self._validate_theta(theta)
+        if theta_array.shape[0] != response_codes.shape[0]:
+            raise MirtDataError(
+                "theta and responses must contain the same number of persons",
+                theta_persons=theta_array.shape[0],
+                response_persons=response_codes.shape[0],
+            )
 
-        ll = np.zeros(n_persons)
-        for i in range(n_persons):
-            for j in range(self.n_items):
-                resp = responses[i, j]
-                if resp >= 0:
-                    p = probs[i, j, resp]
-                    ll[i] += np.log(np.clip(p, PROB_EPSILON, 1.0))
+        probabilities = self.probability(theta_array)
+        selected = np.take_along_axis(probabilities, response_codes[..., None], axis=2)[
+            ..., 0
+        ]
+        contributions = np.where(
+            observed,
+            np.log(np.clip(selected, PROB_EPSILON, 1.0)),
+            0.0,
+        )
+        return np.sum(contributions, axis=1)
 
-        return ll
+    def _validate_trait_correlations(
+        self, value: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if not self.correlated_traits:
+            raise MirtValidationError(
+                "trait correlations are disabled for this model",
+                parameter="trait_correlations",
+            )
+        try:
+            array = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "trait_correlations must contain numeric values",
+                parameter="trait_correlations",
+            ) from exc
+        expected_shape = (self.n_traits, self.n_traits)
+        if array.shape != expected_shape:
+            raise MirtValidationError(
+                "trait_correlations has the wrong shape",
+                parameter="trait_correlations",
+                value=array.shape,
+                expected=str(expected_shape),
+            )
+        if not np.all(np.isfinite(array)):
+            raise MirtValidationError(
+                "trait_correlations must be finite",
+                parameter="trait_correlations",
+            )
+        if not np.allclose(array, array.T, atol=1e-10, rtol=0.0):
+            raise MirtValidationError(
+                "trait_correlations must be symmetric",
+                parameter="trait_correlations",
+            )
+        if not np.allclose(np.diag(array), 1.0, atol=1e-10, rtol=0.0):
+            raise MirtValidationError(
+                "trait_correlations must have a unit diagonal",
+                parameter="trait_correlations",
+            )
+        if np.min(np.linalg.eigvalsh(array)) < -1e-10:
+            raise MirtValidationError(
+                "trait_correlations must be positive semidefinite",
+                parameter="trait_correlations",
+            )
+        return array.copy()
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> IRTreeModel:
-        """Set model parameters."""
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Atomically set validated model parameters."""
+        valid_names = {*self._parameters, "trait_correlations"}
+        unknown = set(params) - valid_names
+        if unknown:
+            name = sorted(unknown)[0]
+            raise MirtValidationError(
+                f"Unknown parameter: {name}",
+                parameter=name,
+                expected=", ".join(sorted(valid_names)),
+            )
+
+        updated = {name: value.copy() for name, value in self._parameters.items()}
+        correlations = (
+            None
+            if self._trait_correlations is None
+            else self._trait_correlations.copy()
+        )
+
         for name, value in params.items():
-            if name in self._parameters:
-                self._parameters[name] = np.asarray(value)
-            elif name == "trait_correlations":
-                self._trait_correlations = np.asarray(value)
-            else:
-                raise ValueError(f"Unknown parameter: {name}")
+            if name == "trait_correlations":
+                correlations = self._validate_trait_correlations(value)
+                continue
+            try:
+                array = np.asarray(value, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must contain numeric values", parameter=name
+                ) from exc
+            if array.shape != updated[name].shape:
+                raise MirtValidationError(
+                    f"Shape mismatch for {name}",
+                    parameter=name,
+                    value=array.shape,
+                    expected=str(updated[name].shape),
+                )
+            if not np.all(np.isfinite(array)):
+                raise MirtValidationError(
+                    f"{name} must contain only finite values", parameter=name
+                )
+            if name == "discrimination" and np.any(array <= 0):
+                raise MirtValidationError(
+                    "discrimination values must be positive",
+                    parameter=name,
+                    expected="> 0",
+                )
+            updated[name] = array.copy()
+
+        self._parameters = updated
+        self._trait_correlations = correlations
         return self
 
     def get_item_parameters(self, item_idx: int) -> dict[str, NDArray[np.float64]]:
         """Get parameters for a specific item."""
-        return {name: value[item_idx] for name, value in self._parameters.items()}
+        index = self._validate_item_idx(item_idx)
+        return {name: value[index].copy() for name, value in self._parameters.items()}
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: Literal["discrimination", "difficulty"],
+        value: NDArray[np.float64],
+    ) -> None:
+        """Set all node values for one item."""
+        index = self._validate_item_idx(item_idx)
+        if param_name not in self._parameters:
+            raise MirtValidationError(
+                f"Unknown item parameter: {param_name}", parameter=param_name
+            )
+        array = np.asarray(value, dtype=np.float64)
+        if array.shape != (self.n_nodes,):
+            raise MirtValidationError(
+                f"Shape mismatch for {param_name}",
+                parameter=param_name,
+                value=array.shape,
+                expected=str((self.n_nodes,)),
+            )
+        updated = self._parameters[param_name].copy()
+        updated[index] = array
+        if param_name == "discrimination":
+            self.set_parameters(discrimination=updated)
+        else:
+            self.set_parameters(difficulty=updated)
+
+    def get_node_parameters(self, item_idx: int, node_idx: int) -> dict[str, float]:
+        """Get discrimination and difficulty for one item decision node."""
+        item = self._validate_item_idx(item_idx)
+        node = self._validate_node_idx(node_idx)
+        return {
+            name: float(value[item, node]) for name, value in self._parameters.items()
+        }
+
+    def copy(self) -> Self:
+        """Return an independent model copy with the same specification."""
+        clone = self.__class__(
+            n_items=self.n_items,
+            tree_spec=self.tree_spec,
+            n_categories=self.n_categories,
+            item_names=self.item_names.copy(),
+            correlated_traits=self.correlated_traits,
+        )
+        clone._parameters = {
+            name: value.copy() for name, value in self._parameters.items()
+        }
+        clone._trait_correlations = (
+            None
+            if self._trait_correlations is None
+            else self._trait_correlations.copy()
+        )
+        clone._is_fitted = self._is_fitted
+        return clone
 
     def summary(self) -> str:
         """Generate model summary."""
@@ -529,6 +1084,7 @@ class IRTreeModel:
         lines.append(f"Number of Items:    {self.n_items}")
         lines.append(f"Number of Categories: {self.n_categories}")
         lines.append(f"Number of Traits:   {self.n_traits}")
+        lines.append(f"Decision Nodes:     {self.n_nodes}")
         lines.append(f"Trait Names:        {', '.join(self.trait_names)}")
         lines.append(f"Correlated Traits:  {self.correlated_traits}")
         lines.append(f"Fitted:             {self._is_fitted}")
@@ -548,3 +1104,10 @@ class IRTreeModel:
 
         lines.append("=" * width)
         return "\n".join(lines)
+
+    def __repr__(self) -> str:
+        status = "fitted" if self._is_fitted else "not fitted"
+        return (
+            f"IRTreeModel(n_items={self.n_items}, "
+            f"tree_spec={self.tree_spec.name!r}, {status})"
+        )
