@@ -123,7 +123,10 @@ def compute_hessian_se(
 
     eigenvalues = np.linalg.eigvalsh(hessian)
     scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
-    tolerance = np.finfo(np.float64).eps * n_parameters * scale * 100.0
+    # Finite-difference Hessians are only accurate to roughly sqrt(eps).
+    # Treat smaller or non-positive eigenvalues as numerically singular so
+    # platform FD noise on rank-deficient objectives cannot yield huge SEs.
+    tolerance = np.sqrt(np.finfo(np.float64).eps) * scale
     if np.any(eigenvalues <= tolerance):
         return np.full(n_parameters, np.nan, dtype=np.float64)
 
