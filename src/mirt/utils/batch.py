@@ -6,17 +6,234 @@ and comparing them efficiently.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+import os
+from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
+
+from mirt.exceptions import MirtValidationError
+from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
 ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+OnError = Literal["raise", "skip"]
+ParallelBackend = Literal["thread", "process"]
+
+_SUPPORTED_MODELS = frozenset({"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"})
+_UNIDIMENSIONAL_MODELS = frozenset({"1PL", "3PL", "4PL", "PCM"})
+_FIT_FAILURES = (
+    TypeError,
+    ValueError,
+    RuntimeError,
+    ArithmeticError,
+    np.linalg.LinAlgError,
+)
+
+
+@dataclass(frozen=True)
+class _FitTask:
+    key: str
+    model: ModelType
+    responses: NDArray[np.int_]
+    n_categories: int | None
+    n_factors: int
+    n_quadpts: int
+    max_iter: int
+    tol: float
+
+
+def _validate_models(models: Sequence[ModelType]) -> list[ModelType]:
+    """Validate a non-empty, unique model sequence."""
+    if isinstance(models, (str, bytes)):
+        raise MirtValidationError(
+            "models must be a non-empty sequence of model names",
+            parameter="models",
+        )
+
+    validated = list(models)
+    if not validated:
+        raise MirtValidationError(
+            "models must contain at least one model",
+            parameter="models",
+        )
+
+    invalid = [model for model in validated if model not in _SUPPORTED_MODELS]
+    if invalid:
+        raise MirtValidationError(
+            f"unsupported model type: {invalid[0]}",
+            parameter="models",
+            value=invalid[0],
+        )
+
+    if len(set(validated)) != len(validated):
+        duplicate = next(
+            model for index, model in enumerate(validated) if model in validated[:index]
+        )
+        raise MirtValidationError(
+            f"duplicate model type: {duplicate}",
+            parameter="models",
+            value=duplicate,
+        )
+
+    return [cast(ModelType, model) for model in validated]
+
+
+def _validate_integer_grid(
+    values: Sequence[int] | None,
+    *,
+    name: str,
+    default: int,
+    minimum: int,
+) -> list[int]:
+    """Validate unique positive integer grid values."""
+    validated = [default] if values is None else list(values)
+    if not validated:
+        raise MirtValidationError(
+            f"{name} must contain at least one value",
+            parameter=name,
+        )
+    for value in validated:
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < minimum
+        ):
+            raise MirtValidationError(
+                f"{name} values must be integers greater than or equal to {minimum}",
+                parameter=name,
+                value=value,
+            )
+    normalized = [int(value) for value in validated]
+    if len(set(normalized)) != len(normalized):
+        raise MirtValidationError(
+            f"{name} must not contain duplicate values",
+            parameter=name,
+        )
+    return normalized
+
+
+def _resolve_worker_count(n_jobs: int, n_tasks: int) -> int:
+    """Normalize the requested worker count and cap it to useful work."""
+    if (
+        isinstance(n_jobs, (bool, np.bool_))
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs == 0
+        or n_jobs < -1
+    ):
+        raise MirtValidationError(
+            "n_jobs must be a positive integer or -1",
+            parameter="n_jobs",
+            value=n_jobs,
+        )
+    requested = (os.cpu_count() or 1) if n_jobs == -1 else int(n_jobs)
+    return min(requested, n_tasks)
+
+
+def _validate_on_error(on_error: OnError) -> OnError:
+    if on_error not in ("raise", "skip"):
+        raise MirtValidationError(
+            "on_error must be 'raise' or 'skip'",
+            parameter="on_error",
+            value=on_error,
+        )
+    return on_error
+
+
+def _validate_parallel_backend(backend: ParallelBackend) -> ParallelBackend:
+    if backend not in ("thread", "process"):
+        raise MirtValidationError(
+            "parallel_backend must be 'thread' or 'process'",
+            parameter="parallel_backend",
+            value=backend,
+        )
+    return backend
+
+
+def _fit_task(task: _FitTask) -> FitResult:
+    """Fit one batch task without importing the public API at module load."""
+    from mirt import fit_mirt
+
+    if task.n_factors != 1 and task.model in _UNIDIMENSIONAL_MODELS:
+        raise MirtValidationError(
+            f"{task.model} only supports n_factors=1",
+            parameter="n_factors",
+            value=task.n_factors,
+        )
+
+    result = fit_mirt(
+        task.responses,
+        model=task.model,
+        n_categories=task.n_categories,
+        n_factors=task.n_factors,
+        n_quadpts=task.n_quadpts,
+        max_iter=task.max_iter,
+        tol=task.tol,
+        verbose=False,
+    )
+    fit_statistics = (result.log_likelihood, result.aic, result.bic)
+    if not np.all(np.isfinite(fit_statistics)):
+        raise ArithmeticError("fit returned non-finite likelihood statistics")
+    return result
+
+
+def _execute_tasks(
+    tasks: Sequence[_FitTask],
+    *,
+    n_jobs: int,
+    on_error: OnError,
+    parallel_backend: ParallelBackend,
+) -> tuple[dict[str, FitResult], dict[str, str]]:
+    """Execute independent fits and retain deterministic result ordering."""
+    worker_count = _resolve_worker_count(n_jobs, len(tasks))
+    completed: dict[str, FitResult] = {}
+    failures: dict[str, str] = {}
+
+    def record_failure(task: _FitTask, exc: BaseException) -> None:
+        message = f"{type(exc).__name__}: {exc}"
+        if on_error == "raise":
+            raise RuntimeError(f"fit failed for {task.key}: {message}") from exc
+        failures[task.key] = message
+
+    if worker_count == 1:
+        for task in tasks:
+            try:
+                completed[task.key] = _fit_task(task)
+            except _FIT_FAILURES as exc:
+                record_failure(task, exc)
+    else:
+        executor_type = (
+            ThreadPoolExecutor if parallel_backend == "thread" else ProcessPoolExecutor
+        )
+        try:
+            executor = executor_type(max_workers=worker_count)
+        except OSError as exc:
+            raise RuntimeError(
+                f"{parallel_backend} parallel backend is unavailable; "
+                "use parallel_backend='thread' or n_jobs=1"
+            ) from exc
+        with executor:
+            future_tasks = {executor.submit(_fit_task, task): task for task in tasks}
+            for future in as_completed(future_tasks):
+                task = future_tasks[future]
+                try:
+                    completed[task.key] = future.result()
+                except _FIT_FAILURES as exc:
+                    record_failure(task, exc)
+
+    ordered_results = {
+        task.key: completed[task.key] for task in tasks if task.key in completed
+    }
+    ordered_failures = {
+        task.key: failures[task.key] for task in tasks if task.key in failures
+    }
+    return ordered_results, ordered_failures
 
 
 @dataclass
@@ -28,9 +245,12 @@ class BatchFitResult:
     results : dict[str, FitResult]
         Fitted results keyed by model type.
     comparison : Any
-        DataFrame comparing all models.
+        DataFrame comparing all models when pandas or polars is available;
+        otherwise a dependency-free list of summary records.
     best_model : str
         Name of best model by BIC.
+    failures : dict[str, str]
+        Failed model names and their error details when ``on_error="skip"``.
 
     Examples
     --------
@@ -42,6 +262,7 @@ class BatchFitResult:
     results: dict[str, FitResult]
     comparison: Any
     best_model: str
+    failures: dict[str, str] = field(default_factory=dict)
 
     def __getitem__(self, model: str) -> FitResult:
         """Get result for a specific model.
@@ -68,6 +289,8 @@ class BatchFitResult:
         """
         lines = ["Batch Model Fitting Results", "=" * 60]
         lines.append(f"Models fitted: {len(self.results)}")
+        if self.failures:
+            lines.append(f"Models failed: {len(self.failures)}")
         lines.append(f"Best model (BIC): {self.best_model}")
         lines.append("-" * 60)
         lines.append(
@@ -96,8 +319,42 @@ class BatchFitResult:
         return self.results[self.best_model]
 
 
+class GridFitResult(dict[str, "FitResult"]):
+    """Dictionary-compatible grid results with retained failure details.
+
+    ``GridFitResult`` behaves like the dictionary returned by earlier
+    versions while making skipped combinations inspectable through
+    :attr:`failures`.
+    """
+
+    def __init__(
+        self,
+        results: dict[str, FitResult] | None = None,
+        *,
+        failures: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(results or {})
+        self.failures = failures or {}
+
+
+def _comparison_records(
+    results: dict[str, FitResult],
+) -> list[dict[str, str | float | bool]]:
+    """Build a dependency-free comparison when no dataframe backend exists."""
+    return [
+        {
+            "Model": name,
+            "LogLik": float(result.log_likelihood),
+            "AIC": float(result.aic),
+            "BIC": float(result.bic),
+            "Converged": bool(result.converged),
+        }
+        for name, result in results.items()
+    ]
+
+
 def fit_models(
-    models: list[ModelType],
+    models: Sequence[ModelType],
     responses: NDArray[np.int_],
     n_categories: int | None = None,
     n_factors: int = 1,
@@ -105,6 +362,9 @@ def fit_models(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
+    n_jobs: int = 1,
+    on_error: OnError = "raise",
+    parallel_backend: ParallelBackend = "thread",
 ) -> BatchFitResult:
     """Fit multiple IRT models to the same data.
 
@@ -113,8 +373,8 @@ def fit_models(
 
     Parameters
     ----------
-    models : list[ModelType]
-        List of model types to fit (e.g., ["1PL", "2PL", "3PL"]).
+    models : sequence of ModelType
+        Unique model types to fit (e.g., ["1PL", "2PL", "3PL"]).
     responses : NDArray
         Response matrix (n_persons, n_items).
     n_categories : int, optional
@@ -129,6 +389,15 @@ def fit_models(
         Convergence tolerance.
     verbose : bool, default=False
         Print progress.
+    n_jobs : int, default=1
+        Number of concurrent fits. Use -1 for all available CPUs.
+    on_error : {"raise", "skip"}, default="raise"
+        Raise on the first failed fit or retain failures in the result and
+        continue with successful models.
+    parallel_backend : {"thread", "process"}, default="thread"
+        Standard-library executor used when ``n_jobs`` is greater than one.
+        Threads minimize transfer overhead; processes can improve CPU-bound
+        grids at the cost of copying response data.
 
     Returns
     -------
@@ -152,34 +421,56 @@ def fit_models(
     The best model is determined by BIC (Bayesian Information Criterion),
     which balances model fit with model complexity.
     """
-    from mirt import fit_mirt
     from mirt.diagnostics.comparison import compare_models
 
-    responses = np.asarray(responses)
-
-    results: dict[str, FitResult] = {}
-
-    for model_type in models:
-        if verbose:
-            print(f"Fitting {model_type}...")
-
-        result = fit_mirt(
-            responses,
-            model=model_type,
+    validated_models = _validate_models(models)
+    validated_responses = validate_responses(responses)
+    on_error = _validate_on_error(on_error)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
+    tasks = [
+        _FitTask(
+            key=model,
+            model=model,
+            responses=validated_responses,
             n_categories=n_categories,
             n_factors=n_factors,
             n_quadpts=n_quadpts,
             max_iter=max_iter,
             tol=tol,
-            verbose=False,
         )
-        results[model_type] = result
+        for model in validated_models
+    ]
 
+    for model_type in validated_models:
         if verbose:
-            print(f"  LL={result.log_likelihood:.2f}, converged={result.converged}")
+            print(f"Fitting {model_type}...")
+
+    results, failures = _execute_tasks(
+        tasks,
+        n_jobs=n_jobs,
+        on_error=on_error,
+        parallel_backend=parallel_backend,
+    )
+    if not results:
+        details = "; ".join(f"{key}: {error}" for key, error in failures.items())
+        raise RuntimeError(f"all requested model fits failed: {details}")
+
+    if verbose:
+        for model_type in validated_models:
+            if model_type in failures:
+                print(f"  {model_type} failed: {failures[model_type]}")
+                continue
+            result = results[model_type]
+            print(
+                f"  {model_type}: LL={result.log_likelihood:.2f}, "
+                f"converged={result.converged}"
+            )
 
     result_list = list(results.values())
-    comparison = compare_models(result_list)
+    try:
+        comparison = compare_models(result_list)
+    except ImportError:
+        comparison = _comparison_records(results)
 
     bic_values = {name: r.bic for name, r in results.items()}
     best_model = min(bic_values, key=lambda k: bic_values[k])
@@ -188,19 +479,23 @@ def fit_models(
         results=results,
         comparison=comparison,
         best_model=best_model,
+        failures=failures,
     )
 
 
 def fit_model_grid(
-    models: list[ModelType],
+    models: Sequence[ModelType],
     responses: NDArray[np.int_],
-    n_factors_range: list[int] | None = None,
-    n_quadpts_range: list[int] | None = None,
+    n_factors_range: Sequence[int] | None = None,
+    n_quadpts_range: Sequence[int] | None = None,
     n_categories: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-) -> dict[str, FitResult]:
+    n_jobs: int = 1,
+    on_error: OnError = "skip",
+    parallel_backend: ParallelBackend = "thread",
+) -> GridFitResult:
     """Fit models across a grid of hyperparameters.
 
     This function performs a grid search over model types and
@@ -208,13 +503,13 @@ def fit_model_grid(
 
     Parameters
     ----------
-    models : list[ModelType]
-        Model types to fit.
-    responses : NDArray
+    models : sequence of ModelType
+        Unique model types to fit.
+    responses : ndarray
         Response matrix (n_persons, n_items).
-    n_factors_range : list[int], optional
+    n_factors_range : sequence of int, optional
         Range of factor counts to try (for MIRT). Default: [1].
-    n_quadpts_range : list[int], optional
+    n_quadpts_range : sequence of int, optional
         Range of quadrature points to try. Default: [21].
     n_categories : int, optional
         Number of categories for polytomous models.
@@ -224,11 +519,20 @@ def fit_model_grid(
         Convergence tolerance.
     verbose : bool, default=False
         Print progress.
+    n_jobs : int, default=1
+        Number of concurrent fits. Use -1 for all available CPUs.
+    on_error : {"raise", "skip"}, default="skip"
+        Raise when a combination fails or retain the error in
+        ``result.failures`` and continue.
+    parallel_backend : {"thread", "process"}, default="thread"
+        Standard-library executor used when ``n_jobs`` is greater than one.
 
     Returns
     -------
-    dict[str, FitResult]
-        Results keyed by "model_f{n_factors}_q{n_quadpts}".
+    GridFitResult
+        Dictionary-compatible results keyed by
+        ``"model_f{n_factors}_q{n_quadpts}"``. Skipped combination details
+        are available through ``result.failures``.
 
     Examples
     --------
@@ -241,56 +545,65 @@ def fit_model_grid(
     >>> for key, result in results.items():
     ...     print(f"{key}: BIC={result.bic:.2f}")
     """
-    from mirt import fit_mirt
+    validated_models = _validate_models(models)
+    factors = _validate_integer_grid(
+        n_factors_range,
+        name="n_factors_range",
+        default=1,
+        minimum=1,
+    )
+    quadrature_points = _validate_integer_grid(
+        n_quadpts_range,
+        name="n_quadpts_range",
+        default=21,
+        minimum=5,
+    )
+    validated_responses = validate_responses(responses)
+    on_error = _validate_on_error(on_error)
+    parallel_backend = _validate_parallel_backend(parallel_backend)
+    tasks = [
+        _FitTask(
+            key=f"{model}_f{n_factors}_q{n_quadpts}",
+            model=model,
+            responses=validated_responses,
+            n_categories=n_categories,
+            n_factors=n_factors,
+            n_quadpts=n_quadpts,
+            max_iter=max_iter,
+            tol=tol,
+        )
+        for model in validated_models
+        for n_factors in factors
+        for n_quadpts in quadrature_points
+    ]
 
-    responses = np.asarray(responses)
+    if verbose:
+        for task in tasks:
+            print(f"Fitting {task.key}...")
 
-    if n_factors_range is None:
-        n_factors_range = [1]
-    if n_quadpts_range is None:
-        n_quadpts_range = [21]
+    results, failures = _execute_tasks(
+        tasks,
+        n_jobs=n_jobs,
+        on_error=on_error,
+        parallel_backend=parallel_backend,
+    )
 
-    results: dict[str, FitResult] = {}
+    if verbose:
+        for task in tasks:
+            if task.key in failures:
+                print(f"  {task.key} failed: {failures[task.key]}")
+            else:
+                result = results[task.key]
+                print(
+                    f"  {task.key}: BIC={result.bic:.2f}, converged={result.converged}"
+                )
 
-    for model in models:
-        for n_factors in n_factors_range:
-            for n_quadpts in n_quadpts_range:
-                key = f"{model}_f{n_factors}_q{n_quadpts}"
-
-                if verbose:
-                    print(f"Fitting {key}...")
-
-                try:
-                    result = fit_mirt(
-                        responses,
-                        model=model,
-                        n_factors=n_factors,
-                        n_categories=n_categories,
-                        n_quadpts=n_quadpts,
-                        max_iter=max_iter,
-                        tol=tol,
-                        verbose=False,
-                    )
-                    results[key] = result
-
-                    if verbose:
-                        print(f"  BIC={result.bic:.2f}, converged={result.converged}")
-                except (
-                    ValueError,
-                    RuntimeError,
-                    ArithmeticError,
-                    FloatingPointError,
-                    np.linalg.LinAlgError,
-                ) as e:
-                    if verbose:
-                        print(f"  Failed: {e}")
-                    continue
-
-    return results
+    return GridFitResult(results, failures=failures)
 
 
 __all__ = [
     "fit_models",
     "fit_model_grid",
     "BatchFitResult",
+    "GridFitResult",
 ]

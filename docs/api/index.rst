@@ -33,11 +33,29 @@ Models
    GeneralizedPartialCredit
    PartialCreditModel
    NominalResponseModel
+   TwoPLNestedLogit
+   ThreePLNestedLogit
+   FourPLNestedLogit
    BifactorModel
    MixtureIRT
    TestletModel
    DINA
    DINO
+
+Custom Models
+-------------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   create_item_type
+   CustomItemModel
+   ItemTypeSpec
+   create_group
+   createGroup
+   CustomGroupModel
+   GroupSpec
 
 Network Models
 --------------
@@ -78,6 +96,23 @@ Diagnostics
    compute_drf
    sibtest
 
+Plotting
+--------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   plot_icc
+   plot_category_curves
+   plot_information
+   plot_expected_score
+   plot_se
+   plot_ability_distribution
+   plot_person_item_map
+   plot_itemfit
+   plot_dif
+
 Scoring
 -------
 
@@ -111,6 +146,7 @@ Equating
    equipercentile_equating
    chain_link
    link_mirt
+   transform_mirt_theta
    link_grm
    link_gpcm
 

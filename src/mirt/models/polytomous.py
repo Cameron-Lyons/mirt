@@ -11,6 +11,14 @@ from mirt.constants import PROB_EPSILON
 from mirt.models.base import PolytomousItemModel
 
 
+def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Compute row-wise softmax without overflowing exponentials."""
+    weights = logits - np.max(logits, axis=1, keepdims=True)
+    np.exp(weights, out=weights)
+    weights /= weights.sum(axis=1, keepdims=True)
+    return weights
+
+
 class GradedResponseModel(PolytomousItemModel):
     model_name = "GRM"
     supports_multidimensional = True
@@ -69,14 +77,31 @@ class GradedResponseModel(PolytomousItemModel):
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
-        if category == 0:
-            return 1.0 - self.cumulative_probability(theta, item_idx, 0)
-        elif category == n_cat - 1:
-            return self.cumulative_probability(theta, item_idx, category - 1)
+        return self._category_probabilities(theta, item_idx)[:, category]
+
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all GRM category probabilities in one vectorized pass."""
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+        n_cat = self._n_categories[item_idx]
+        a_item = self._parameters["discrimination"][item_idx]
+        thresholds = self._parameters["thresholds"][item_idx, : n_cat - 1]
+
+        if self.n_factors == 1:
+            logits = a_item * (theta.ravel()[:, None] - thresholds[None, :])
         else:
-            p_upper = self.cumulative_probability(theta, item_idx, category - 1)
-            p_lower = self.cumulative_probability(theta, item_idx, category)
-            return p_upper - p_lower
+            logits = np.dot(theta, a_item)[:, None] - np.sum(a_item) * thresholds
+
+        cumulative = sigmoid(logits)
+        probabilities = np.empty((n_persons, n_cat), dtype=np.float64)
+        probabilities[:, 0] = 1.0 - cumulative[:, 0]
+        probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
+        probabilities[:, -1] = cumulative[:, -1]
+        return probabilities
 
     def _item_information(
         self,
@@ -122,6 +147,8 @@ class GradedResponseModel(PolytomousItemModel):
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         if RUST_AVAILABLE and self.n_factors == 1:
+            responses = self._validate_polytomous_responses(responses)
+            theta = self._ensure_theta_2d(theta)
             quad_points = theta.ravel() if theta.ndim == 2 else theta
             disc = self._parameters["discrimination"]
             thresh = self._parameters["thresholds"]
@@ -166,34 +193,39 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
+        return self._category_probabilities(theta, item_idx)[:, category]
+
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all GPCM category probabilities in one stable pass."""
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+        n_cat = self._n_categories[item_idx]
+
         a = self._parameters["discrimination"]
-        b = self._parameters["steps"][item_idx]
+        steps = self._parameters["steps"][item_idx, : n_cat - 1]
 
         if self.n_factors == 1:
             a_item = a[item_idx]
-            theta_1d = theta.ravel()
+            increments = a_item * (theta.ravel()[:, None] - steps[None, :])
         else:
             a_item = a[item_idx]
-            theta_1d = np.dot(theta, a_item)
-            a_item = np.sqrt(np.sum(a_item**2))
+            scale = np.sqrt(np.sum(a_item**2))
+            projected_theta = np.dot(theta, a_item)
+            increments = scale * (projected_theta[:, None] - steps[None, :])
 
-        numerators = np.zeros((n_persons, n_cat))
-
-        for k in range(n_cat):
-            cumsum = 0.0
-            for v in range(k):
-                cumsum += a_item * (theta_1d - b[v])
-            numerators[:, k] = np.exp(cumsum)
-
-        denominator = numerators.sum(axis=1)
-
-        return numerators[:, category] / denominator
+        logits = np.empty((n_persons, n_cat), dtype=np.float64)
+        logits[:, 0] = 0.0
+        np.cumsum(increments, axis=1, out=logits[:, 1:])
+        return _stable_softmax(logits)
 
     def _item_information(
         self,
@@ -225,6 +257,8 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         if RUST_AVAILABLE and self.n_factors == 1:
+            responses = self._validate_polytomous_responses(responses)
+            theta = self._ensure_theta_2d(theta)
             quad_points = theta.ravel() if theta.ndim == 2 else theta
             disc = self._parameters["discrimination"]
             steps_full = np.zeros((self.n_items, max(self._n_categories)))
@@ -333,8 +367,8 @@ class RatingScaleModel(PolytomousItemModel):
                 )
             n_categories = n_categories[0]
 
-        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
         self._n_cats = n_categories
+        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["difficulty"] = np.zeros(self.n_items)
@@ -375,27 +409,31 @@ class RatingScaleModel(PolytomousItemModel):
             Probability of category response for each theta
         """
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
         n_cat = self._n_cats
 
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
+        return self._category_probabilities(theta, item_idx)[:, category]
+
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all RSM category probabilities in one stable pass."""
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+        n_cat = self._n_cats
+
         b_j = self._parameters["difficulty"][item_idx]
         tau = self._parameters["thresholds"]
-        theta_1d = theta.ravel()
+        increments = theta.ravel()[:, None] - b_j - tau[None, :]
 
-        numerators = np.zeros((n_persons, n_cat))
-
-        for k in range(n_cat):
-            cumsum = 0.0
-            for v in range(k):
-                cumsum += theta_1d - b_j - tau[v]
-            numerators[:, k] = np.exp(cumsum)
-
-        denominator = numerators.sum(axis=1)
-
-        return numerators[:, category] / denominator
+        logits = np.empty((n_persons, n_cat), dtype=np.float64)
+        logits[:, 0] = 0.0
+        np.cumsum(increments, axis=1, out=logits[:, 1:])
+        return _stable_softmax(logits)
 
     def _item_information(
         self,
@@ -555,14 +593,28 @@ class GradedRatingScaleModel(PolytomousItemModel):
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
-        if category == 0:
-            return 1.0 - self.cumulative_probability(theta, item_idx, 0)
-        elif category == n_cat - 1:
-            return self.cumulative_probability(theta, item_idx, category - 1)
-        else:
-            p_upper = self.cumulative_probability(theta, item_idx, category - 1)
-            p_lower = self.cumulative_probability(theta, item_idx, category)
-            return p_upper - p_lower
+        return self._category_probabilities(theta, item_idx)[:, category]
+
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all GRSM category probabilities in one vectorized pass."""
+        theta = self._ensure_theta_2d(theta)
+        n_persons = theta.shape[0]
+        n_cat = self._n_cats
+        a = self._parameters["discrimination"][0]
+        b_j = self._parameters["difficulty"][item_idx]
+        thresholds = self._parameters["thresholds"]
+
+        logits = a * (theta.ravel()[:, None] - b_j - thresholds[None, :])
+        cumulative = sigmoid(logits)
+        probabilities = np.empty((n_persons, n_cat), dtype=np.float64)
+        probabilities[:, 0] = 1.0 - cumulative[:, 0]
+        probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
+        probabilities[:, -1] = cumulative[:, -1]
+        return probabilities
 
     def _item_information(
         self,
@@ -656,27 +708,34 @@ class NominalResponseModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
             raise ValueError(f"Category {category} out of range [0, {n_cat})")
 
+        return self._category_probabilities(theta, item_idx)[:, category]
+
+    def _category_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Compute all NRM category probabilities in one stable pass."""
+        theta = self._ensure_theta_2d(theta)
+        n_cat = self._n_categories[item_idx]
+
         a = self._parameters["slopes"]
         c = self._parameters["intercepts"]
 
-        numerators = np.zeros((n_persons, n_cat))
+        if self.n_factors == 1:
+            logits = (
+                theta.ravel()[:, None] * a[item_idx, None, :n_cat]
+                + c[item_idx, None, :n_cat]
+            )
+        else:
+            logits = np.dot(theta, a[item_idx, :n_cat].T) + c[item_idx, None, :n_cat]
 
-        for k in range(n_cat):
-            if self.n_factors == 1:
-                z = a[item_idx, k] * theta.ravel() + c[item_idx, k]
-            else:
-                z = np.dot(theta, a[item_idx, k]) + c[item_idx, k]
-            numerators[:, k] = np.exp(z)
-
-        denominator = numerators.sum(axis=1)
-
-        return numerators[:, category] / denominator
+        return _stable_softmax(logits)
 
     def _item_information(
         self,

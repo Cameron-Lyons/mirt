@@ -20,6 +20,9 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
+ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+
+
 @runtime_checkable
 class Splitter(Protocol):
     """Protocol for cross-validation splitters."""
@@ -62,6 +65,9 @@ class KFold:
     shuffle: bool = True
     random_state: int | None = None
 
+    def __post_init__(self) -> None:
+        _validate_split_count(self.n_splits)
+
     def split(
         self,
         responses: NDArray[np.int_],
@@ -79,6 +85,10 @@ class KFold:
             Indices for training and testing sets.
         """
         n_persons = responses.shape[0]
+        if self.n_splits > n_persons:
+            raise ValueError(
+                f"n_splits={self.n_splits} cannot exceed n_persons={n_persons}"
+            )
         indices = np.arange(n_persons)
 
         if self.shuffle:
@@ -126,6 +136,15 @@ class StratifiedKFold:
     n_bins: int = 5
     random_state: int | None = None
 
+    def __post_init__(self) -> None:
+        _validate_split_count(self.n_splits)
+        if isinstance(self.n_bins, bool) or not isinstance(
+            self.n_bins, (int, np.integer)
+        ):
+            raise ValueError("n_bins must be an integer")
+        if self.n_bins < 1:
+            raise ValueError("n_bins must be at least 1")
+
     def split(
         self,
         responses: NDArray[np.int_],
@@ -143,6 +162,10 @@ class StratifiedKFold:
             Indices for training and testing sets.
         """
         n_persons = responses.shape[0]
+        if self.n_splits > n_persons:
+            raise ValueError(
+                f"n_splits={self.n_splits} cannot exceed n_persons={n_persons}"
+            )
 
         sum_scores = np.sum(np.maximum(responses, 0), axis=1)
 
@@ -158,11 +181,13 @@ class StratifiedKFold:
 
         fold_assignments = np.zeros(n_persons, dtype=int)
 
+        next_fold = 0
         for stratum in range(strata.max() + 1):
             stratum_indices = np.where(strata == stratum)[0]
             rng.shuffle(stratum_indices)
             for i, idx in enumerate(stratum_indices):
-                fold_assignments[idx] = i % self.n_splits
+                fold_assignments[idx] = (next_fold + i) % self.n_splits
+            next_fold = (next_fold + len(stratum_indices)) % self.n_splits
 
         for fold in range(self.n_splits):
             test_idx = np.where(fold_assignments == fold)[0]
@@ -209,6 +234,10 @@ class LeaveOneOut:
             Indices for training and testing sets.
         """
         n_persons = responses.shape[0]
+        if n_persons < 2:
+            raise ValueError(
+                "leave-one-out cross-validation requires at least 2 persons"
+            )
         self._n_splits = n_persons
         indices = np.arange(n_persons)
 
@@ -377,6 +406,86 @@ class BICScorer(Scorer):
         return -result.bic
 
 
+def _validate_split_count(n_splits: int) -> None:
+    """Validate a requested number of cross-validation folds."""
+    if isinstance(n_splits, bool) or not isinstance(n_splits, (int, np.integer)):
+        raise ValueError("n_splits must be an integer")
+    if n_splits < 2:
+        raise ValueError("n_splits must be at least 2")
+
+
+@dataclass(frozen=True)
+class _CVFoldTask:
+    """Serializable inputs for fitting one cross-validation fold."""
+
+    fold_idx: int
+    train_responses: NDArray[np.int_]
+    model_type: ModelType
+    n_categories: int | None
+    n_factors: int
+    n_quadpts: int
+    max_iter: int
+    tol: float
+
+
+def _fit_cv_fold(task: _CVFoldTask) -> tuple[int, FitResult]:
+    """Fit one fold in a process-safe module-level worker."""
+    from mirt import fit_mirt
+
+    result = fit_mirt(
+        task.train_responses,
+        model=task.model_type,
+        n_categories=task.n_categories,
+        n_factors=task.n_factors,
+        n_quadpts=task.n_quadpts,
+        max_iter=task.max_iter,
+        tol=task.tol,
+        verbose=False,
+    )
+    return task.fold_idx, result
+
+
+def _validated_splits(
+    splitter: Splitter,
+    responses: NDArray[np.int_],
+) -> list[tuple[NDArray[np.intp], NDArray[np.intp]]]:
+    """Materialize and validate indices supplied by a splitter."""
+    n_persons = responses.shape[0]
+    splits: list[tuple[NDArray[np.intp], NDArray[np.intp]]] = []
+
+    for fold_idx, (train_indices, test_indices) in enumerate(splitter.split(responses)):
+        train_values = np.asarray(train_indices)
+        test_values = np.asarray(test_indices)
+        if train_values.ndim != 1 or test_values.ndim != 1:
+            raise ValueError(f"fold {fold_idx} indices must be one-dimensional")
+        if train_values.size == 0 or test_values.size == 0:
+            raise ValueError(f"fold {fold_idx} must have non-empty train and test sets")
+        if not np.issubdtype(train_values.dtype, np.integer) or not np.issubdtype(
+            test_values.dtype, np.integer
+        ):
+            raise ValueError(f"fold {fold_idx} indices must be integers")
+        train_idx = train_values.astype(np.intp, copy=False)
+        test_idx = test_values.astype(np.intp, copy=False)
+        if (
+            np.any(train_idx < 0)
+            or np.any(train_idx >= n_persons)
+            or np.any(test_idx < 0)
+            or np.any(test_idx >= n_persons)
+        ):
+            raise ValueError(f"fold {fold_idx} contains out-of-bounds indices")
+        if np.unique(train_idx).size != train_idx.size:
+            raise ValueError(f"fold {fold_idx} contains duplicate training indices")
+        if np.unique(test_idx).size != test_idx.size:
+            raise ValueError(f"fold {fold_idx} contains duplicate test indices")
+        if np.intersect1d(train_idx, test_idx, assume_unique=True).size:
+            raise ValueError(f"fold {fold_idx} train and test sets overlap")
+        splits.append((train_idx, test_idx))
+
+    if not splits:
+        raise ValueError("splitter produced no folds")
+    return splits
+
+
 @dataclass
 class CVResult:
     """Result of cross-validation.
@@ -439,7 +548,7 @@ class CVResult:
 
 
 def cross_validate(
-    model_type: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"],
+    model_type: ModelType,
     responses: NDArray[np.int_],
     splitter: Splitter | None = None,
     scorers: list[Scorer] | None = None,
@@ -480,7 +589,9 @@ def cross_validate(
     return_models : bool, default=False
         Whether to return fitted models for each fold.
     n_jobs : int, default=1
-        Number of parallel jobs for fold fitting. Use -1 for all CPUs.
+        Number of process workers for fold fitting. Use -1 for all CPUs.
+        Process startup has overhead, so ``n_jobs=1`` is preferable for
+        very small or fast fits.
 
     Returns
     -------
@@ -503,53 +614,64 @@ def cross_validate(
     import os
     from concurrent.futures import ProcessPoolExecutor
 
-    from mirt import fit_mirt
-
     responses = np.asarray(responses)
+    if responses.ndim != 2 or responses.shape[0] < 2 or responses.shape[1] == 0:
+        raise ValueError(
+            "responses must be a two-dimensional matrix with at least "
+            "2 persons and 1 item"
+        )
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, (int, np.integer)):
+        raise ValueError("n_jobs must be an integer")
+    if n_jobs == 0 or n_jobs < -1:
+        raise ValueError("n_jobs must be -1 or a positive integer")
+    n_jobs = int(n_jobs)
 
     if splitter is None:
         splitter = KFold(n_splits=5)
 
     if scorers is None:
         scorers = [LogLikelihoodScorer()]
+    if not scorers:
+        raise ValueError("scorers must contain at least one scorer")
+    scorer_names = [scorer.name for scorer in scorers]
+    if any(not isinstance(name, str) or not name for name in scorer_names):
+        raise ValueError("each scorer must have a non-empty string name")
+    if len(set(scorer_names)) != len(scorer_names):
+        raise ValueError("scorer names must be unique")
 
-    scores: dict[str, list[float]] = {s.name: [] for s in scorers}
+    scores: dict[str, list[float]] = {name: [] for name in scorer_names}
     fold_results: list[FitResult] = []
 
     if n_jobs == -1:
         n_jobs = os.cpu_count() or 1
 
-    splits = list(splitter.split(responses))
-
-    def fit_fold(
-        fold_data: tuple[int, tuple[NDArray[np.intp], NDArray[np.intp]]],
-    ) -> tuple[int, FitResult, NDArray[np.intp]]:
-        fold_idx, (train_idx, test_idx) = fold_data
-        train_data = responses[train_idx]
-        result = fit_mirt(
-            train_data,
-            model=model_type,
+    splits = _validated_splits(splitter, responses)
+    n_folds = len(splits)
+    tasks = [
+        _CVFoldTask(
+            fold_idx=fold_idx,
+            train_responses=responses[train_idx],
+            model_type=model_type,
             n_categories=n_categories,
             n_factors=n_factors,
             n_quadpts=n_quadpts,
             max_iter=max_iter,
             tol=tol,
-            verbose=False,
         )
-        return fold_idx, result, test_idx
+        for fold_idx, (train_idx, _) in enumerate(splits)
+    ]
 
-    if n_jobs > 1 and len(splits) > 1:
-        with ProcessPoolExecutor(max_workers=min(n_jobs, len(splits))) as executor:
-            fold_data_list = list(enumerate(splits))
-            results_list = list(executor.map(fit_fold, fold_data_list))
+    if n_jobs > 1 and n_folds > 1:
+        with ProcessPoolExecutor(max_workers=min(n_jobs, n_folds)) as executor:
+            results_list = list(executor.map(_fit_cv_fold, tasks))
 
         results_list.sort(key=lambda x: x[0])
 
-        for fold_idx, result, test_idx in results_list:
+        for fold_idx, result in results_list:
             if verbose:
-                print(f"Fold {fold_idx + 1}/{splitter.n_splits} completed")
+                print(f"Fold {fold_idx + 1}/{n_folds} completed")
 
-            train_idx = splits[fold_idx][0]
+            train_idx, test_idx = splits[fold_idx]
             train_data = responses[train_idx]
             test_data = responses[test_idx]
 
@@ -560,23 +682,14 @@ def cross_validate(
                 score = scorer(result, train_data, test_data, test_idx)
                 scores[scorer.name].append(score)
     else:
-        for fold_idx, (train_idx, test_idx) in enumerate(splits):
+        for task, (train_idx, test_idx) in zip(tasks, splits):
             if verbose:
-                print(f"Fold {fold_idx + 1}/{splitter.n_splits}")
+                print(f"Fold {task.fold_idx + 1}/{n_folds}")
 
             train_data = responses[train_idx]
             test_data = responses[test_idx]
 
-            result = fit_mirt(
-                train_data,
-                model=model_type,
-                n_categories=n_categories,
-                n_factors=n_factors,
-                n_quadpts=n_quadpts,
-                max_iter=max_iter,
-                tol=tol,
-                verbose=False,
-            )
+            _, result = _fit_cv_fold(task)
 
             if return_models:
                 fold_results.append(result)
@@ -594,7 +707,7 @@ def cross_validate(
         scores=scores,
         mean_scores=mean_scores,
         std_scores=std_scores,
-        n_folds=splitter.n_splits,
+        n_folds=n_folds,
         fold_results=fold_results if return_models else None,
     )
 
