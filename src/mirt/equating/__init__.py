@@ -76,6 +76,7 @@ from mirt.equating.multidimensional import (
     orthogonal_procrustes_rotation,
     target_rotation,
     transform_mirt_parameters,
+    transform_mirt_theta,
 )
 from mirt.equating.polytomous import (
     PolytomousLinkingResult,
@@ -131,6 +132,7 @@ __all__ = [
     "orthogonal_procrustes_rotation",
     "oblique_procrustes_rotation",
     "transform_mirt_parameters",
+    "transform_mirt_theta",
     "factor_congruence_coefficient",
     "match_factors",
     "compute_mirt_linking_fit",

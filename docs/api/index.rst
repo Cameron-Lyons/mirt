@@ -101,6 +101,7 @@ Equating
    equipercentile_equating
    chain_link
    link_mirt
+   transform_mirt_theta
    link_grm
    link_gpcm
 
