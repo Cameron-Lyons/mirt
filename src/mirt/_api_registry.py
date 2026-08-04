@@ -100,6 +100,9 @@ BASE_EXPORTS = [
     "KFold",
     "StratifiedKFold",
     "LeaveOneOut",
+    "cv_select_lambda",
+    "information_criteria_path",
+    "RegularizationCVResult",
     "fit_models",
     "fit_model_grid",
     "BatchFitResult",
@@ -502,6 +505,11 @@ TOP_LEVEL_IMPORT_GROUPS = {
         "shrinkage_estimates",
     ),
     "mirt.utils.reliability": ("empirical_rxx", "marginal_rxx", "sem"),
+    "mirt.utils.regularization_cv": (
+        "RegularizationCVResult",
+        "cv_select_lambda",
+        "information_criteria_path",
+    ),
     "mirt.utils.residuals": ("Q3", "residuals"),
     "mirt.utils.sampling": (
         "ParameterSamples",
