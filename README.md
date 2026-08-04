@@ -238,7 +238,9 @@ q_matrix = np.array([[1, 0], [1, 1], [0, 1], [1, 1]])
 cdm_result = fit_cdm(responses, q_matrix, model="DINA")
 
 from mirt import fit_mixture_irt
-mix_result = fit_mixture_irt(responses, n_classes=2, model="2PL")
+mix_model, class_posteriors = fit_mixture_irt(
+    responses, n_classes=2, base_model="2PL"
+)
 
 from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
