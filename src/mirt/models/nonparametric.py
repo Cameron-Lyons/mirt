@@ -1,54 +1,187 @@
-"""Non-parametric and semi-parametric IRT models.
+"""Nonparametric and semiparametric item response models.
 
-These models relax the parametric assumptions of standard IRT models,
-allowing more flexible item response functions. This includes:
-- Monotonic spline models
-- Monotonic polynomial models
-- Kernel-smoothed IRFs
-
-References:
-    Ramsay, J. O. (1991). Kernel smoothing approaches to nonparametric
-        item characteristic curve estimation. Psychometrika, 56(4), 611-630.
-
-    Woods, C. M. (2006). Ramsay-curve item response theory (RC-IRT) to detect
-        and correct for nonnormal latent variables. Psychological Methods.
+The implementations in this module provide monotone spline and Bernstein
+response curves plus kernel-smoothed empirical item response functions.
 """
 
 from __future__ import annotations
 
+from typing import Self
+
 import numpy as np
 from numpy.typing import NDArray
-from scipy.integrate import trapezoid
+from scipy.interpolate import BSpline
+from scipy.special import comb, expit
 
-from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
+_POWER_BASIS_MAX_DEGREE = 12
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _positive_finite(value: float, name: str) -> float:
+    result = float(value)
+    if not np.isfinite(result) or result <= 0:
+        raise ValueError(f"{name} must be finite and positive")
+    return result
+
+
+def _item_index(item_idx: int, n_items: int) -> int:
+    if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+        item_idx, (int, np.integer)
+    ):
+        raise TypeError("item_idx must be an integer")
+    result = int(item_idx)
+    if result < 0 or result >= n_items:
+        raise IndexError(f"item_idx {result} out of range [0, {n_items})")
+    return result
+
+
+def _theta_vector(
+    model: DichotomousItemModel,
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    result = model._ensure_theta_2d(theta).ravel()
+    if not np.all(np.isfinite(result)):
+        raise ValueError("theta must contain only finite values")
+    return result
+
+
+def _parameter_update(
+    parameters: dict[str, NDArray[np.float64]],
+    updates: dict[str, NDArray[np.float64]],
+) -> dict[str, NDArray[np.float64]]:
+    """Validate and copy a parameter update without partial mutation."""
+    result = {name: values.copy() for name, values in parameters.items()}
+    for name, values in updates.items():
+        if name not in parameters:
+            valid = ", ".join(parameters)
+            raise ValueError(f"Unknown parameter: {name}. Valid parameters: {valid}")
+        values_array = np.asarray(values, dtype=np.float64)
+        if values_array.shape != parameters[name].shape:
+            raise ValueError(
+                f"Shape mismatch for {name}: expected {parameters[name].shape}, "
+                f"got {values_array.shape}"
+            )
+        if not np.all(np.isfinite(values_array)):
+            raise ValueError(f"{name} must contain only finite values")
+        result[name] = values_array.copy()
+    return result
+
+
+def _item_parameter_update(
+    parameters: dict[str, NDArray[np.float64]],
+    n_items: int,
+    item_idx: int,
+    param_name: str,
+    value: float | NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Build a validated-shape single-item parameter update."""
+    item_idx = _item_index(item_idx, n_items)
+    if param_name not in parameters:
+        valid = ", ".join(parameters)
+        raise ValueError(f"Unknown parameter: {param_name}. Valid parameters: {valid}")
+    values = parameters[param_name].copy()
+    value_array = np.asarray(value, dtype=np.float64)
+    if values.ndim == 1 and values.shape == (n_items,):
+        if value_array.ndim != 0:
+            raise ValueError(f"{param_name} requires a scalar item value")
+        values[item_idx] = float(value_array)
+    elif values.ndim == 2 and values.shape[0] == n_items:
+        if value_array.shape != values.shape[1:]:
+            raise ValueError(
+                f"{param_name} item value shape {value_array.shape} != "
+                f"{values.shape[1:]}"
+            )
+        values[item_idx] = value_array
+    else:
+        raise ValueError(f"{param_name} does not contain per-item values")
+    return values
+
+
+def _validate_curve_bounds(parameters: dict[str, NDArray[np.float64]]) -> None:
+    lower = parameters["lower"]
+    upper = parameters["upper"]
+    if np.any(lower < 0) or np.any(lower >= 1):
+        raise ValueError("lower must be in [0, 1)")
+    if np.any(upper <= 0) or np.any(upper > 1):
+        raise ValueError("upper must be in (0, 1]")
+    if np.any(lower >= upper):
+        raise ValueError("lower must be strictly less than upper for every item")
+
+
+def _relative_positive(log_values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Exponentiate log values after removing an unidentified row scale."""
+    centered = log_values - np.max(log_values, axis=1, keepdims=True)
+    centered = np.maximum(centered, np.log(np.nextafter(0.0, 1.0)))
+    return np.exp(centered)
+
+
+def _stable_gaussian_weights(
+    samples: NDArray[np.float64],
+    grid: NDArray[np.float64],
+    bandwidth: float,
+) -> NDArray[np.float64]:
+    """Return Gaussian weights relative to the nearest sample per grid point."""
+    sample_matrix = samples[:, None]
+    grid_matrix = grid[None, :]
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        scaled_distance = (sample_matrix - grid_matrix) / bandwidth
+        log_weights = -0.5 * scaled_distance**2
+    column_maximum = np.max(log_weights, axis=0)
+    if np.all(np.isfinite(column_maximum)):
+        return np.exp(log_weights - column_maximum)
+
+    scale = np.maximum(np.abs(sample_matrix), np.abs(grid_matrix))
+    nonzero_scale = scale > 0
+    scaled_samples = np.divide(
+        sample_matrix, scale, out=np.zeros_like(scale), where=nonzero_scale
+    )
+    scaled_grid = np.divide(
+        grid_matrix, scale, out=np.zeros_like(scale), where=nonzero_scale
+    )
+    normalized_distance = np.abs(scaled_samples - scaled_grid)
+    with np.errstate(divide="ignore"):
+        log_distance = np.log(scale) + np.log(normalized_distance)
+
+    nearest_log_distance = np.min(log_distance, axis=0)
+    non_nearest = log_distance > nearest_log_distance[None, :]
+    log_squared_gap = np.full_like(log_distance, -np.inf)
+    relative_log_square = np.zeros_like(log_distance)
+    np.subtract(
+        nearest_log_distance[None, :],
+        log_distance,
+        out=relative_log_square,
+        where=non_nearest,
+    )
+    relative_log_square *= 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_squared_gap[non_nearest] = 2.0 * log_distance[non_nearest] + np.log1p(
+            -np.exp(relative_log_square[non_nearest])
+        )
+
+    log_penalty = log_squared_gap - np.log(2.0) - 2.0 * np.log(bandwidth)
+    max_log_penalty = np.log(-np.log(np.nextafter(0.0, 1.0)))
+    penalty = np.exp(np.minimum(log_penalty, max_log_penalty))
+    return np.exp(-penalty)
+
 
 class MonotonicSplineModel(DichotomousItemModel):
-    """Monotonic Spline Item Response Model.
+    """Monotone item response curves represented by I-spline bases.
 
-    Uses I-splines (integrated B-splines) to create monotonically
-    increasing item response functions without assuming a specific
-    parametric form.
-
-    Parameters
-    ----------
-    n_items : int
-        Number of items
-    n_knots : int
-        Number of interior knots for spline
-    degree : int
-        Degree of spline (default 3 for cubic)
-    item_names : list of str, optional
-        Names for items
-
-    Notes
-    -----
-    The IRF is defined as:
-        P(X=1|θ) = c + (d - c) * sum_k w_k * I_k(θ)
-
-    where I_k are I-spline basis functions and w_k >= 0 ensures monotonicity.
+    The basis functions are exact normalized integrals of B-splines over
+    ``[-4, 4]``. Positive item weights therefore produce nondecreasing curves.
+    Values outside that interval use the corresponding saturated endpoint.
     """
 
     model_name = "MonotonicSpline"
@@ -64,152 +197,146 @@ class MonotonicSplineModel(DichotomousItemModel):
     ) -> None:
         if n_factors != 1:
             raise ValueError("Spline model only supports unidimensional analysis")
-        self.n_knots = n_knots
-        self.degree = degree
-        self._n_basis = n_knots + degree + 1
+        self.n_knots = _positive_integer(n_knots, "n_knots")
+        self.degree = _positive_integer(degree, "degree")
+        self._n_basis = self.n_knots + self.degree + 1
+        self._knots = np.empty(0, dtype=np.float64)
+        self._ispline_antiderivative: BSpline
+        self._ispline_origin = np.empty(0, dtype=np.float64)
+        self._ispline_scale = np.empty(0, dtype=np.float64)
         super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["log_weights"] = np.zeros((self.n_items, self._n_basis))
-
         self._parameters["lower"] = np.zeros(self.n_items)
         self._parameters["upper"] = np.ones(self.n_items)
 
-        knots = np.linspace(-3, 3, self.n_knots)
-        self._knots = knots
+        self._knots = np.linspace(-3.0, 3.0, self.n_knots + 2)[1:-1]
+        knot_vector = np.concatenate(
+            [
+                np.full(self.degree + 1, -4.0),
+                self._knots,
+                np.full(self.degree + 1, 4.0),
+            ]
+        )
+        basis_spline = BSpline(
+            knot_vector,
+            np.eye(self._n_basis),
+            self.degree,
+            extrapolate=False,
+        )
+        self._ispline_antiderivative = basis_spline.antiderivative()
+        self._ispline_origin = np.asarray(
+            self._ispline_antiderivative(-4.0), dtype=np.float64
+        )
+        self._ispline_scale = np.asarray(
+            self._ispline_antiderivative(4.0) - self._ispline_origin,
+            dtype=np.float64,
+        )
+
+    @property
+    def knots(self) -> NDArray[np.float64]:
+        """Interior knots used by the spline basis."""
+        return self._knots.copy()
 
     @property
     def weights(self) -> NDArray[np.float64]:
-        """Non-negative spline weights."""
-        return np.exp(self._parameters["log_weights"])
+        """Finite positive relative spline weights."""
+        return _relative_positive(self._parameters["log_weights"])
 
     @property
     def lower(self) -> NDArray[np.float64]:
-        return self._parameters["lower"]
+        return self._parameters["lower"].copy()
 
     @property
     def upper(self) -> NDArray[np.float64]:
-        return self._parameters["upper"]
+        return self._parameters["upper"].copy()
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        updated = _parameter_update(self._parameters, params)
+        _validate_curve_bounds(updated)
+        self._parameters = updated
+        return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        values = _item_parameter_update(
+            self._parameters, self.n_items, item_idx, param_name, value
+        )
+        self.set_parameters(**{param_name: values})
+
+    def _basis_matrix(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        clipped_theta = np.clip(np.asarray(theta, dtype=np.float64).ravel(), -4.0, 4.0)
+        integrated = self._ispline_antiderivative(clipped_theta) - self._ispline_origin
+        basis = integrated / self._ispline_scale
+        return np.clip(basis, 0.0, 1.0)
 
     def _ispline_basis(
         self,
         theta: NDArray[np.float64],
         knot_idx: int,
     ) -> NDArray[np.float64]:
-        """Compute I-spline basis function at given theta values.
-
-        I-splines are integrated B-splines and are monotonically increasing.
-        """
-        theta = np.asarray(theta).ravel()
-
-        all_knots = np.concatenate(
-            [
-                np.full(self.degree + 1, -4),
-                self._knots,
-                np.full(self.degree + 1, 4),
-            ]
-        )
-
-        from scipy.interpolate import BSpline
-
-        c = np.zeros(len(all_knots) - self.degree - 1)
-        if knot_idx < len(c):
-            c[knot_idx] = 1
-
-        bspline = BSpline(all_knots, c, self.degree, extrapolate=True)
-
-        ispline_vals = np.zeros_like(theta)
-
-        for i, t in enumerate(theta):
-            grid = np.linspace(-4, t, 50)
-            b_vals = bspline(grid)
-            ispline_vals[i] = trapezoid(b_vals, grid)
-
-        max_val = trapezoid(bspline(np.linspace(-4, 4, 100)), np.linspace(-4, 4, 100))
-        if max_val > 0:
-            ispline_vals = ispline_vals / max_val
-
-        return np.clip(ispline_vals, 0, 1)
+        """Compute one normalized I-spline basis function."""
+        knot_idx = _item_index(knot_idx, self._n_basis)
+        return self._basis_matrix(theta)[:, knot_idx]
 
     def probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        n_persons = len(theta_1d)
-
-        c = self._parameters["lower"]
-        d = self._parameters["upper"]
-        w = self.weights
+        theta_vector = _theta_vector(self, theta)
+        basis = self._basis_matrix(theta_vector)
+        weights = self.weights
+        normalized_weights = weights / np.sum(weights, axis=1, keepdims=True)
+        lower = self._parameters["lower"]
+        upper = self._parameters["upper"]
 
         if item_idx is not None:
-            p_star = np.zeros(n_persons)
-            for k in range(self._n_basis):
-                basis = self._ispline_basis(theta_1d, k)
-                p_star += w[item_idx, k] * basis
+            item_idx = _item_index(item_idx, self.n_items)
+            curve = basis @ normalized_weights[item_idx]
+            return lower[item_idx] + (upper[item_idx] - lower[item_idx]) * curve
 
-            p_star = p_star / (np.sum(w[item_idx]) + PROB_EPSILON)
-            return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
-
-        probs = np.zeros((n_persons, self.n_items))
-        for j in range(self.n_items):
-            p_star = np.zeros(n_persons)
-            for k in range(self._n_basis):
-                basis = self._ispline_basis(theta_1d, k)
-                p_star += w[j, k] * basis
-
-            p_star = p_star / (np.sum(w[j]) + PROB_EPSILON)
-            probs[:, j] = c[j] + (d[j] - c[j]) * p_star
-
-        return probs
+        curves = basis @ normalized_weights.T
+        return lower + (upper - lower) * curves
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-
+        theta_array = self._ensure_theta_2d(theta)
+        p = self.probability(theta_array, item_idx)
         h = 1e-5
-        p_plus = self.probability(theta + h, item_idx)
-        p_minus = self.probability(theta - h, item_idx)
+        derivative = (
+            self.probability(theta_array + h, item_idx)
+            - self.probability(theta_array - h, item_idx)
+        ) / (2 * h)
+        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
 
-        dp = (p_plus - p_minus) / (2 * h)
-
-        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
+    def copy(self) -> Self:
+        new_model = MonotonicSplineModel(
+            n_items=self.n_items,
+            n_knots=self.n_knots,
+            degree=self.degree,
+            item_names=self.item_names.copy(),
+        )
+        new_model._parameters = {
+            name: values.copy() for name, values in self._parameters.items()
+        }
+        new_model._is_fitted = self._is_fitted
+        return new_model
 
 
 class MonotonicPolynomialModel(DichotomousItemModel):
-    """Monotonic Polynomial Item Response Model.
+    """Monotone item response curves represented in a Bernstein basis.
 
-    Uses Bernstein polynomials to create monotonically increasing IRFs.
-    Bernstein polynomials with non-negative coefficients guarantee monotonicity.
-
-    Parameters
-    ----------
-    n_items : int
-        Number of items
-    degree : int
-        Polynomial degree (higher = more flexible)
-    item_names : list of str, optional
-        Names for items
-
-    Notes
-    -----
-    The IRF uses Bernstein polynomial basis:
-        P(X=1|θ) = c + (d - c) * sum_k w_k * B_k,n(g(θ))
-
-    where B_k,n are Bernstein basis polynomials, w_k >= 0 for monotonicity,
-    and g(θ) maps theta to [0, 1].
-
-    References
-    ----------
-    Liang, L., & Browne, M. W. (2015). A quasi-parametric method for
-        fitting flexible item response functions. Journal of Educational
-        and Behavioral Statistics.
+    Positive increments are accumulated into ordered Bernstein coefficients.
+    Ordered coefficients and a positive scale guarantee nondecreasing curves.
     """
 
     model_name = "MonotonicPolynomial"
@@ -223,23 +350,69 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         item_names: list[str] | None = None,
     ) -> None:
         if n_factors != 1:
-            raise ValueError("Polynomial model only supports unidimensional")
-        self.degree = degree
+            raise ValueError("Polynomial model only supports unidimensional analysis")
+        self.degree = _positive_integer(degree, "degree")
+        self._bernstein_to_power = np.empty((0, 0), dtype=np.float64)
         super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["log_coefficients"] = np.zeros((self.n_items, self.degree + 1))
-
         self._parameters["location"] = np.zeros(self.n_items)
         self._parameters["scale"] = np.ones(self.n_items)
-
         self._parameters["lower"] = np.zeros(self.n_items)
         self._parameters["upper"] = np.ones(self.n_items)
+        if self.degree <= _POWER_BASIS_MAX_DEGREE:
+            self._bernstein_to_power = np.zeros(
+                (self.degree + 1, self.degree + 1), dtype=np.float64
+            )
+            for power in range(self.degree + 1):
+                for basis_idx in range(power + 1):
+                    self._bernstein_to_power[power, basis_idx] = (
+                        comb(self.degree, power)
+                        * comb(power, basis_idx)
+                        * (-1.0) ** (power - basis_idx)
+                    )
 
     @property
     def coefficients(self) -> NDArray[np.float64]:
-        """Non-negative polynomial coefficients."""
-        return np.exp(self._parameters["log_coefficients"])
+        """Ordered Bernstein coefficients in ``(0, 1]``."""
+        increments = _relative_positive(self._parameters["log_coefficients"])
+        return np.cumsum(increments, axis=1) / np.sum(increments, axis=1, keepdims=True)
+
+    @property
+    def location(self) -> NDArray[np.float64]:
+        return self._parameters["location"].copy()
+
+    @property
+    def scale(self) -> NDArray[np.float64]:
+        return self._parameters["scale"].copy()
+
+    @property
+    def lower(self) -> NDArray[np.float64]:
+        return self._parameters["lower"].copy()
+
+    @property
+    def upper(self) -> NDArray[np.float64]:
+        return self._parameters["upper"].copy()
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        updated = _parameter_update(self._parameters, params)
+        _validate_curve_bounds(updated)
+        if np.any(updated["scale"] <= 0):
+            raise ValueError("scale must be positive for every item")
+        self._parameters = updated
+        return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        values = _item_parameter_update(
+            self._parameters, self.n_items, item_idx, param_name, value
+        )
+        self.set_parameters(**{param_name: values})
 
     def _bernstein_basis(
         self,
@@ -247,93 +420,114 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         k: int,
         n: int,
     ) -> NDArray[np.float64]:
-        """Compute Bernstein basis polynomial B_{k,n}(t)."""
-        from scipy.special import comb
+        """Compute one Bernstein basis polynomial."""
+        if n < 1:
+            raise ValueError("n must be positive")
+        k = _item_index(k, n + 1)
+        clipped = np.clip(np.asarray(t, dtype=np.float64), 0.0, 1.0)
+        return comb(n, k) * (clipped**k) * ((1.0 - clipped) ** (n - k))
 
-        t = np.clip(t, 0, 1)
-        return comb(n, k) * (t**k) * ((1 - t) ** (n - k))
+    def _basis_matrix(
+        self, transformed_theta: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        t = np.clip(np.asarray(transformed_theta, dtype=np.float64), 0.0, 1.0)
+        orders = np.arange(self.degree + 1)
+        binomial = comb(self.degree, orders)
+        return (
+            binomial
+            * (t[..., None] ** orders)
+            * ((1.0 - t[..., None]) ** (self.degree - orders))
+        )
+
+    def _evaluate_bernstein(
+        self,
+        transformed_theta: NDArray[np.float64],
+        coefficients: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate Bernstein curves with a degree-appropriate stable form."""
+        t = np.asarray(transformed_theta, dtype=np.float64)
+        if self.degree > _POWER_BASIS_MAX_DEGREE:
+            if coefficients.ndim == 1:
+                result = self._basis_matrix(t) @ coefficients
+                return np.clip(result, coefficients[0], coefficients[-1])
+            result = np.empty_like(t)
+            for item_idx in range(self.n_items):
+                result[:, item_idx] = (
+                    self._basis_matrix(t[:, item_idx]) @ coefficients[item_idx]
+                )
+            return np.clip(result, coefficients[:, 0], coefficients[:, -1])
+
+        if coefficients.ndim == 1:
+            power_coefficients = self._bernstein_to_power @ coefficients
+            result = np.full_like(t, power_coefficients[-1])
+            for power in range(self.degree - 1, -1, -1):
+                result = result * t + power_coefficients[power]
+            return np.clip(result, coefficients[0], coefficients[-1])
+
+        power_coefficients = coefficients @ self._bernstein_to_power.T
+        result = np.broadcast_to(power_coefficients[:, -1], t.shape).copy()
+        for power in range(self.degree - 1, -1, -1):
+            result *= t
+            result += power_coefficients[:, power]
+        return np.clip(result, coefficients[:, 0], coefficients[:, -1])
 
     def probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        n_persons = len(theta_1d)
-
-        loc = self._parameters["location"]
+        theta_vector = _theta_vector(self, theta)
+        location = self._parameters["location"]
         scale = self._parameters["scale"]
-        c = self._parameters["lower"]
-        d = self._parameters["upper"]
-        w = self.coefficients
+        lower = self._parameters["lower"]
+        upper = self._parameters["upper"]
+        coefficients = self.coefficients
 
         if item_idx is not None:
-            z = scale[item_idx] * (theta_1d - loc[item_idx])
-            t = sigmoid(z)
+            item_idx = _item_index(item_idx, self.n_items)
+            transformed = expit(scale[item_idx] * (theta_vector - location[item_idx]))
+            curve = self._evaluate_bernstein(transformed, coefficients[item_idx])
+            return lower[item_idx] + (upper[item_idx] - lower[item_idx]) * curve
 
-            p_star = np.zeros(n_persons)
-            for k in range(self.degree + 1):
-                basis = self._bernstein_basis(t, k, self.degree)
-                p_star += w[item_idx, k] * basis
-
-            p_star = p_star / (np.sum(w[item_idx]) + PROB_EPSILON)
-
-            return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
-
-        probs = np.zeros((n_persons, self.n_items))
-        for j in range(self.n_items):
-            z = scale[j] * (theta_1d - loc[j])
-            t = sigmoid(z)
-
-            p_star = np.zeros(n_persons)
-            for k in range(self.degree + 1):
-                basis = self._bernstein_basis(t, k, self.degree)
-                p_star += w[j, k] * basis
-
-            p_star = p_star / (np.sum(w[j]) + PROB_EPSILON)
-            probs[:, j] = c[j] + (d[j] - c[j]) * p_star
-
-        return probs
+        transformed = expit(
+            scale[None, :] * (theta_vector[:, None] - location[None, :])
+        )
+        curves = self._evaluate_bernstein(transformed, coefficients)
+        return lower + (upper - lower) * curves
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-
+        theta_array = self._ensure_theta_2d(theta)
+        p = self.probability(theta_array, item_idx)
         h = 1e-5
-        p_plus = self.probability(theta + h, item_idx)
-        p_minus = self.probability(theta - h, item_idx)
+        derivative = (
+            self.probability(theta_array + h, item_idx)
+            - self.probability(theta_array - h, item_idx)
+        ) / (2 * h)
+        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
 
-        dp = (p_plus - p_minus) / (2 * h)
-
-        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
+    def copy(self) -> Self:
+        new_model = MonotonicPolynomialModel(
+            n_items=self.n_items,
+            degree=self.degree,
+            item_names=self.item_names.copy(),
+        )
+        new_model._parameters = {
+            name: values.copy() for name, values in self._parameters.items()
+        }
+        new_model._is_fitted = self._is_fitted
+        return new_model
 
 
 class KernelSmoothingModel(DichotomousItemModel):
-    """Kernel-Smoothed Item Response Model.
+    """Gaussian-kernel empirical item response model.
 
-    Non-parametric IRF estimation using kernel smoothing.
-    The IRF is estimated by smoothing observed proportions correct
-    across the theta continuum.
-
-    Parameters
-    ----------
-    n_items : int
-        Number of items
-    bandwidth : float
-        Kernel bandwidth (larger = smoother)
-    item_names : list of str, optional
-        Names for items
-
-    Notes
-    -----
-    This model requires theta estimates from another model and observed
-    responses for calibration. The fitted IRF is then used for new
-    examinees.
+    Calibration uses a numerically stable Nadaraya-Watson estimator on a
+    configurable ability grid. Missing responses may be represented by any
+    negative integer code.
     """
 
     model_name = "KernelSmoothing"
@@ -345,83 +539,176 @@ class KernelSmoothingModel(DichotomousItemModel):
         bandwidth: float = 0.5,
         n_factors: int = 1,
         item_names: list[str] | None = None,
+        theta_grid: NDArray[np.float64] | None = None,
     ) -> None:
         if n_factors != 1:
-            raise ValueError("Kernel smoothing only supports unidimensional")
-        self.bandwidth = bandwidth
-        self._theta_grid: NDArray[np.float64] | None = None
-        self._irf_values: NDArray[np.float64] | None = None
+            raise ValueError("Kernel smoothing only supports unidimensional analysis")
+        self.bandwidth = _positive_finite(bandwidth, "bandwidth")
+        self._configured_theta_grid = self._validate_theta_grid(theta_grid)
+        self._theta_grid = np.empty(0, dtype=np.float64)
+        self._irf_values = np.empty((0, 0), dtype=np.float64)
+        self._calibration_counts = np.empty(0, dtype=np.intp)
         super().__init__(n_items, n_factors=1, item_names=item_names)
 
+    @staticmethod
+    def _validate_theta_grid(
+        theta_grid: NDArray[np.float64] | None,
+    ) -> NDArray[np.float64]:
+        if theta_grid is None:
+            return np.linspace(-4.0, 4.0, 81)
+        result = np.asarray(theta_grid, dtype=np.float64)
+        if result.ndim != 1 or result.size < 2:
+            raise ValueError("theta_grid must be 1D with at least two points")
+        if not np.all(np.isfinite(result)):
+            raise ValueError("theta_grid must contain only finite values")
+        if np.any(result[1:] <= result[:-1]):
+            raise ValueError("theta_grid must be strictly increasing")
+        return result.copy()
+
     def _initialize_parameters(self) -> None:
-        self._theta_grid = np.linspace(-4, 4, 81)
-        self._irf_values = np.full((self.n_items, len(self._theta_grid)), 0.5)
+        self._theta_grid = self._configured_theta_grid.copy()
+        self._irf_values = np.full((self.n_items, self._theta_grid.size), 0.5)
+        self._calibration_counts = np.zeros(self.n_items, dtype=np.intp)
+
+    @property
+    def theta_grid(self) -> NDArray[np.float64]:
+        return self._theta_grid.copy()
+
+    @property
+    def irf_values(self) -> NDArray[np.float64]:
+        if not self._is_fitted:
+            raise ValueError("Model must be calibrated before accessing IRF values")
+        return self._irf_values.copy()
+
+    @property
+    def calibration_counts(self) -> NDArray[np.intp]:
+        """Number of observed responses used for each item."""
+        return self._calibration_counts.copy()
 
     def calibrate(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
-    ) -> None:
-        """Calibrate IRFs using kernel smoothing.
+    ) -> Self:
+        """Calibrate item response functions with stable Gaussian kernels."""
+        responses_array = np.asarray(responses)
+        if responses_array.ndim != 2:
+            raise ValueError("responses must be a 2D array")
+        if responses_array.shape[1] != self.n_items:
+            raise ValueError(
+                f"responses has {responses_array.shape[1]} items; "
+                f"expected {self.n_items}"
+            )
+        if responses_array.shape[0] == 0:
+            raise ValueError("responses must contain at least one person")
+        if responses_array.dtype.kind not in "biuf":
+            raise ValueError("responses must contain numeric response codes")
+        if responses_array.dtype.kind == "f" and (
+            not np.all(np.isfinite(responses_array))
+            or not np.all(responses_array == np.trunc(responses_array))
+        ):
+            raise ValueError("responses must contain finite integer response codes")
+        valid = responses_array >= 0
+        if np.any(valid & (responses_array != 0) & (responses_array != 1)):
+            raise ValueError(
+                "responses must contain only 0, 1, or negative missing codes"
+            )
 
-        Parameters
-        ----------
-        responses : ndarray
-            Response matrix (n_persons, n_items)
-        theta : ndarray
-            Ability estimates for each person
-        """
-        responses = np.asarray(responses)
-        theta = np.asarray(theta).ravel()
+        theta_array = np.asarray(theta, dtype=np.float64)
+        if theta_array.ndim == 2 and theta_array.shape[1] == 1:
+            theta_array = theta_array[:, 0]
+        elif theta_array.ndim != 1:
+            raise ValueError("theta must be 1D or a single-column 2D array")
+        if theta_array.size != responses_array.shape[0]:
+            raise ValueError(
+                f"theta length ({theta_array.size}) must match response rows "
+                f"({responses_array.shape[0]})"
+            )
+        if not np.all(np.isfinite(theta_array)):
+            raise ValueError("theta must contain only finite values")
 
-        grid = self._theta_grid
+        counts = np.sum(valid, axis=0).astype(np.intp, copy=False)
+        if np.any(counts == 0):
+            missing_items = np.flatnonzero(counts == 0).tolist()
+            raise ValueError(f"items without observed responses: {missing_items}")
 
-        for j in range(self.n_items):
-            valid = responses[:, j] >= 0
-            resp_j = responses[valid, j]
-            theta_j = theta[valid]
+        if np.all(valid):
+            weights = _stable_gaussian_weights(
+                theta_array, self._theta_grid, self.bandwidth
+            )
+            new_irf_values = (
+                responses_array.astype(np.float64, copy=False).T
+                @ weights
+                / np.sum(weights, axis=0)
+            )
+        else:
+            new_irf_values = np.empty_like(self._irf_values)
+            for item_idx in range(self.n_items):
+                item_valid = valid[:, item_idx]
+                item_theta = theta_array[item_valid]
+                item_responses = responses_array[item_valid, item_idx].astype(
+                    np.float64, copy=False
+                )
+                weights = _stable_gaussian_weights(
+                    item_theta, self._theta_grid, self.bandwidth
+                )
+                new_irf_values[item_idx] = (
+                    item_responses @ weights / np.sum(weights, axis=0)
+                )
 
-            for g, t in enumerate(grid):
-                weights = np.exp(-0.5 * ((theta_j - t) / self.bandwidth) ** 2)
-                weights_sum = np.sum(weights) + PROB_EPSILON
-
-                self._irf_values[j, g] = np.sum(weights * resp_j) / weights_sum
-
+        self._irf_values = np.clip(new_irf_values, 0.0, 1.0)
+        self._calibration_counts = counts
         self._is_fitted = True
+        return self
 
     def probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        if self._theta_grid is None or self._irf_values is None:
+        if not self._is_fitted:
             raise ValueError("Model must be calibrated before computing probabilities")
-
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        n_persons = len(theta_1d)
+        theta_vector = _theta_vector(self, theta)
+        clipped_theta = np.clip(theta_vector, self._theta_grid[0], self._theta_grid[-1])
+        left = np.searchsorted(self._theta_grid, clipped_theta, side="right") - 1
+        left = np.clip(left, 0, self._theta_grid.size - 2)
+        right = left + 1
+        fraction = (clipped_theta - self._theta_grid[left]) / (
+            self._theta_grid[right] - self._theta_grid[left]
+        )
 
         if item_idx is not None:
-            return np.interp(theta_1d, self._theta_grid, self._irf_values[item_idx])
+            item_idx = _item_index(item_idx, self.n_items)
+            lower_values = self._irf_values[item_idx, left]
+            upper_values = self._irf_values[item_idx, right]
+            return lower_values + fraction * (upper_values - lower_values)
 
-        probs = np.zeros((n_persons, self.n_items))
-        for j in range(self.n_items):
-            probs[:, j] = np.interp(theta_1d, self._theta_grid, self._irf_values[j])
-
-        return probs
+        lower_values = self._irf_values[:, left].T
+        upper_values = self._irf_values[:, right].T
+        return lower_values + fraction[:, None] * (upper_values - lower_values)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-
+        theta_array = self._ensure_theta_2d(theta)
+        p = self.probability(theta_array, item_idx)
         h = 0.01
-        p_plus = self.probability(theta + h, item_idx)
-        p_minus = self.probability(theta - h, item_idx)
+        derivative = (
+            self.probability(theta_array + h, item_idx)
+            - self.probability(theta_array - h, item_idx)
+        ) / (2 * h)
+        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
 
-        dp = (p_plus - p_minus) / (2 * h)
-
-        return (dp**2) / (p * (1 - p) + PROB_EPSILON)
+    def copy(self) -> Self:
+        new_model = KernelSmoothingModel(
+            n_items=self.n_items,
+            bandwidth=self.bandwidth,
+            item_names=self.item_names.copy(),
+            theta_grid=self._theta_grid,
+        )
+        new_model._irf_values = self._irf_values.copy()
+        new_model._calibration_counts = self._calibration_counts.copy()
+        new_model._is_fitted = self._is_fitted
+        return new_model
