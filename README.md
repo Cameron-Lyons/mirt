@@ -15,6 +15,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 ### Advanced Models
 - **Cognitive Diagnostic**: DINA, DINO, G-DINA
 - **Testlet**: Random effects for item bundles
+- **Nested Logit**: Keyed multiple-choice items with informative distractors
 - **Mixture IRT**: Latent class IRT models
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
@@ -346,6 +347,7 @@ plot_person_item_map(result.model, scores.theta)
 | GPCM | Generalized Partial Credit | Partial credit scoring |
 | PCM | Partial Credit Model | Rasch for polytomous |
 | NRM | Nominal Response Model | Unordered categories |
+| 2PL/3PL/4PL-NRM | Nested Logit | Keyed multiple choice with distractor information |
 
 ### Advanced Models
 
@@ -355,6 +357,7 @@ plot_person_item_map(result.model, scores.theta)
 | Bifactor | General + specific factors |
 | DINA/DINO | Cognitive diagnostic |
 | Testlet | Local dependence modeling |
+| Nested Logit | Keyed response and conditional distractor modeling |
 | Mixture IRT | Latent class IRT |
 | GGUM | Generalized graded unfolding |
 

@@ -33,6 +33,9 @@ Models
    GeneralizedPartialCredit
    PartialCreditModel
    NominalResponseModel
+   TwoPLNestedLogit
+   ThreePLNestedLogit
+   FourPLNestedLogit
    BifactorModel
    MixtureIRT
    TestletModel
