@@ -1,5 +1,7 @@
 """Tests for chain linking."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -146,6 +148,24 @@ class TestChainLink:
 
         assert result.drift_accumulation is None
 
+    def test_single_model_chain_is_an_identity(self, linked_models):
+        models, _ = linked_models
+
+        result = chain_link([models[0]], [], compute_drift=True)
+
+        assert result.cumulative_A == [1.0]
+        assert result.cumulative_B == [0.0]
+        assert result.pairwise_results == []
+        assert result.drift_accumulation is not None
+        assert result.drift_accumulation.shape == (0, 0)
+
+    def test_anchor_indices_are_validated(self, linked_models):
+        models, anchor_pairs = linked_models
+        anchor_pairs[0] = ([0, 1, 2], [0, 1, 20])
+
+        with pytest.raises(ValueError, match="out-of-range right"):
+            chain_link(models, anchor_pairs)
+
 
 class TestAccumulateConstants:
     """Tests for accumulate_constants function."""
@@ -192,6 +212,44 @@ class TestAccumulateConstants:
 
         assert cum_A[1] == pytest.approx(1.0)
         assert cum_B[1] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("reference_index", [0, 1, 2, 3])
+    def test_nonunit_affine_composition(self, reference_index):
+        pairwise_A = [1.2, 0.75, 1.8]
+        pairwise_B = [0.4, -0.3, 0.6]
+        theta_by_time = [np.array([-1.5, 0.0, 2.0])]
+        for slope, intercept in zip(pairwise_A, pairwise_B):
+            theta_by_time.append(slope * theta_by_time[-1] + intercept)
+
+        cumulative_A, cumulative_B = accumulate_constants(
+            pairwise_A,
+            pairwise_B,
+            reference_index=reference_index,
+        )
+
+        for time_index, theta in enumerate(theta_by_time):
+            transformed = cumulative_A[time_index] * theta + cumulative_B[time_index]
+            assert_allclose(transformed, theta_by_time[reference_index], atol=1e-14)
+
+    @pytest.mark.parametrize(
+        ("pairwise_A", "pairwise_B", "reference_index", "message"),
+        [
+            ([1.0], [], 0, "same length"),
+            ([0.0], [0.0], 0, "positive"),
+            ([np.nan], [0.0], 0, "positive"),
+            ([1.0], [np.inf], 0, "finite"),
+            ([1.0], [0.0], 2, "Invalid reference_index"),
+        ],
+    )
+    def test_invalid_constants_are_rejected(
+        self,
+        pairwise_A,
+        pairwise_B,
+        reference_index,
+        message,
+    ):
+        with pytest.raises(ValueError, match=message):
+            accumulate_constants(pairwise_A, pairwise_B, reference_index)
 
 
 class TestTransformToReference:
@@ -250,6 +308,22 @@ class TestTransformThetaToReference:
 
         assert_allclose(transformed, theta)
 
+    def test_invalid_time_index_is_rejected(self, linked_models):
+        models, anchor_pairs = linked_models
+        chain_result = chain_link(models, anchor_pairs)
+
+        with pytest.raises(ValueError, match="Invalid time_index"):
+            transform_theta_to_reference(np.array([0.0]), chain_result, time_index=-1)
+
+    def test_nonfinite_theta_is_rejected(self, linked_models):
+        models, anchor_pairs = linked_models
+        chain_result = chain_link(models, anchor_pairs)
+
+        with pytest.raises(ValueError, match="finite"):
+            transform_theta_to_reference(
+                np.array([0.0, np.nan]), chain_result, time_index=0
+            )
+
 
 class TestConcurrentLink:
     """Tests for concurrent_link function."""
@@ -283,6 +357,182 @@ class TestConcurrentLink:
 
         assert result[0][0] == pytest.approx(1.0)
         assert result[0][1] == pytest.approx(0.0)
+
+    def test_recovers_three_pl_transformation(self):
+        from mirt.models.dichotomous import ThreeParameterLogistic
+
+        forward_A, forward_B = 1.25, 0.35
+        discrimination = np.array([0.7, 0.9, 1.1, 1.3, 1.5, 1.8])
+        difficulty = np.linspace(-1.5, 1.5, 6)
+        guessing = np.linspace(0.05, 0.25, 6)
+
+        reference = ThreeParameterLogistic(6)
+        reference.set_parameters(
+            discrimination=discrimination,
+            difficulty=difficulty,
+            guessing=guessing,
+        )
+        transformed = ThreeParameterLogistic(6)
+        transformed.set_parameters(
+            discrimination=discrimination / forward_A,
+            difficulty=forward_A * difficulty + forward_B,
+            guessing=guessing,
+        )
+        pairs = [[[(index, index) for index in range(6)]]]
+
+        result = concurrent_link(
+            [reference, transformed],
+            pairs,
+            method="stocking_lord",
+            max_iter=100,
+            tol=1e-10,
+        )
+
+        assert result[1][0] == pytest.approx(1.0 / forward_A, rel=2e-5)
+        assert result[1][1] == pytest.approx(-forward_B / forward_A, abs=2e-5)
+
+    def test_supports_variable_category_polytomous_models(self):
+        from mirt.models.polytomous import GradedResponseModel
+
+        forward_A, forward_B = 1.25, 0.35
+        categories = [3, 4, 3, 5]
+        discrimination = np.array([0.8, 1.0, 1.2, 1.4])
+        reference = GradedResponseModel(4, categories)
+        thresholds = reference.thresholds.copy()
+        reference.set_parameters(
+            discrimination=discrimination,
+            thresholds=thresholds,
+        )
+        transformed = GradedResponseModel(4, categories)
+        transformed.set_parameters(
+            discrimination=discrimination / forward_A,
+            thresholds=forward_A * thresholds + forward_B,
+        )
+        pairs = [[[(index, index) for index in range(4)]]]
+
+        result = concurrent_link(
+            [reference, transformed],
+            pairs,
+            method="haebara",
+            max_iter=100,
+            tol=1e-10,
+        )
+
+        assert result[1][0] == pytest.approx(1.0 / forward_A, rel=2e-5)
+        assert result[1][1] == pytest.approx(-forward_B / forward_A, abs=2e-5)
+
+    def test_batches_probability_evaluations(self, linked_models, monkeypatch):
+        from scipy import optimize
+
+        models, _ = linked_models
+        calls = [0, 0, 0]
+        for model_index, model in enumerate(models):
+            probability = model.probability
+
+            def counted_probability(
+                theta, item_idx=None, *, _index=model_index, _fn=probability
+            ):
+                calls[_index] += 1
+                return _fn(theta, item_idx)
+
+            monkeypatch.setattr(model, "probability", counted_probability)
+
+        def evaluate_once(function, x0, **kwargs):
+            return SimpleNamespace(x=x0, fun=function(x0))
+
+        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+        anchor_matrices = [
+            [[(index, index) for index in range(10)]],
+            [[(index, index) for index in range(10)]],
+        ]
+
+        concurrent_link(models, anchor_matrices)
+
+        assert calls == [1, 1, 1]
+
+    def test_uses_itemwise_evaluation_for_sparse_anchor_banks(
+        self, linked_models, monkeypatch
+    ):
+        from scipy import optimize
+
+        models, _ = linked_models
+        selected_calls: list[list[int | None]] = [[], []]
+        for model_index, model in enumerate(models[:2]):
+            probability = model.probability
+
+            def counted_probability(
+                theta, item_idx=None, *, _index=model_index, _fn=probability
+            ):
+                selected_calls[_index].append(item_idx)
+                return _fn(theta, item_idx)
+
+            monkeypatch.setattr(model, "probability", counted_probability)
+
+        def evaluate_once(function, x0, **kwargs):
+            return SimpleNamespace(x=x0, fun=function(x0))
+
+        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+
+        concurrent_link(models[:2], [[[(2, 3), (7, 8)]]])
+
+        assert selected_calls == [[2, 7], [3, 8]]
+
+    def test_stocking_lord_and_haebara_use_distinct_losses(self, monkeypatch):
+        from scipy import optimize
+
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        reference = TwoParameterLogistic(2)
+        reference.set_parameters(
+            discrimination=np.ones(2),
+            difficulty=np.array([-1.0, 1.0]),
+        )
+        reversed_items = TwoParameterLogistic(2)
+        reversed_items.set_parameters(
+            discrimination=np.ones(2),
+            difficulty=np.array([1.0, -1.0]),
+        )
+        losses = []
+
+        def capture_loss(function, x0, **kwargs):
+            loss = function(x0)
+            losses.append(loss)
+            return SimpleNamespace(x=x0, fun=loss)
+
+        monkeypatch.setattr(optimize, "minimize", capture_loss)
+        pairs = [[[(0, 0), (1, 1)]]]
+
+        concurrent_link([reference, reversed_items], pairs, method="stocking_lord")
+        concurrent_link([reference, reversed_items], pairs, method="haebara")
+
+        assert losses[0] == pytest.approx(0.0, abs=1e-15)
+        assert losses[1] > 0.0
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"method": "unknown"}, "Unknown concurrent linking method"),
+            ({"n_theta": 1}, "at least 2"),
+            ({"max_iter": 0}, "positive"),
+            ({"tol": 0.0}, "positive"),
+        ],
+    )
+    def test_invalid_configuration_is_rejected(self, linked_models, kwargs, message):
+        models, _ = linked_models
+        anchor_matrices = [
+            [[(index, index) for index in range(5)]],
+            [[(index, index) for index in range(5)]],
+        ]
+
+        with pytest.raises(ValueError, match=message):
+            concurrent_link(models, anchor_matrices, **kwargs)
+
+    def test_disconnected_anchor_design_is_rejected(self, linked_models):
+        models, _ = linked_models
+        anchor_matrices = [[[(index, index) for index in range(5)]]]
+
+        with pytest.raises(ValueError, match="connect every model"):
+            concurrent_link(models, anchor_matrices)
 
 
 class TestDetectLongitudinalDrift:
