@@ -3,14 +3,19 @@
 import numpy as np
 import pytest
 
+import mirt.equating.vertical as vertical_module
+from mirt.equating.linking import transform_parameters
 from mirt.equating.vertical import (
     GradeData,
     VerticalScaleDiagnostics,
     VerticalScaleResult,
+    _enforce_monotonicity,
+    _GradeModelInfo,
     compute_vertical_diagnostics,
     vertical_scale,
     vertical_scale_summary,
 )
+from mirt.models.dichotomous import TwoParameterLogistic
 
 
 def generate_grade_responses(
@@ -122,6 +127,16 @@ class TestVerticalScale:
             assert result.method == method
             assert len(result.grade_means) == 2
 
+    def test_concurrent_respects_linking_method(self, two_grade_data):
+        """Concurrent scaling must not silently replace the requested linker."""
+        result = vertical_scale(
+            two_grade_data,
+            method="concurrent",
+            linking_method="haebara",
+        )
+
+        assert result.linking_results[0].constants.method == "haebara"
+
     def test_vertical_scale_reference_grade(self, three_grade_data):
         result_ref0 = vertical_scale(three_grade_data, reference_grade=0)
         result_ref1 = vertical_scale(three_grade_data, reference_grade=1)
@@ -161,6 +176,149 @@ class TestVerticalScale:
         for link_result in result.linking_results:
             assert link_result.constants.A != 0
             assert link_result.fit_statistics is not None
+
+    def test_chain_maps_upper_grade_to_reference_scale(self, monkeypatch):
+        """Pairwise constants must transform upper-grade scores downward."""
+        lower_model = TwoParameterLogistic(n_items=6)
+        lower_model.set_parameters(
+            discrimination=np.array([0.7, 0.9, 1.1, 1.3, 1.5, 1.8]),
+            difficulty=np.array([-1.5, -0.8, -0.2, 0.4, 1.0, 1.7]),
+        )
+        scale, shift = 1.4, 0.6
+        upper_model = transform_parameters(lower_model, scale, shift)
+        theta_lower = np.array([[0.0], [1.0], [2.0]])
+        theta_upper = scale * theta_lower + shift
+        grade_data = [
+            GradeData(
+                "lower",
+                np.zeros((3, 6), dtype=int),
+                anchor_items_above=[2, 3, 4, 5],
+            ),
+            GradeData("upper", np.zeros((3, 6), dtype=int)),
+        ]
+        grade_models = [
+            _GradeModelInfo(lower_model, theta_lower, "lower"),
+            _GradeModelInfo(upper_model, theta_upper, "upper"),
+        ]
+        monkeypatch.setattr(
+            vertical_module,
+            "_fit_grade_models",
+            lambda grade_data, models: grade_models,
+        )
+
+        result = vertical_scale(
+            grade_data,
+            models=[lower_model, upper_model],
+            enforce_monotonicity=False,
+        )
+
+        np.testing.assert_allclose(
+            result.grade_transformations["upper"],
+            (1.0 / scale, -shift / scale),
+            atol=1e-6,
+        )
+        assert result.grade_means["upper"] == pytest.approx(1.0, abs=1e-6)
+        assert result.grade_means["upper"] == pytest.approx(
+            result.grade_means["lower"], abs=1e-6
+        )
+        assert result.linking_results[0].anchor_items == [2, 3, 4, 5]
+
+    def test_chain_composes_around_middle_reference(self, monkeypatch):
+        """Multi-grade transforms compose exactly around any reference form."""
+        model_0 = TwoParameterLogistic(n_items=5)
+        model_0.set_parameters(
+            discrimination=np.array([0.7, 0.9, 1.1, 1.4, 1.8]),
+            difficulty=np.array([-1.4, -0.6, 0.0, 0.8, 1.5]),
+        )
+        scale_01, shift_01 = 1.4, 0.6
+        scale_12, shift_12 = 0.8, -0.3
+        model_1 = transform_parameters(model_0, scale_01, shift_01)
+        model_2 = transform_parameters(model_1, scale_12, shift_12)
+        theta_0 = np.array([[0.0], [1.0], [2.0]])
+        theta_1 = scale_01 * theta_0 + shift_01
+        theta_2 = scale_12 * theta_1 + shift_12
+        anchors = list(range(5))
+        grade_data = [
+            GradeData(
+                "g0",
+                np.zeros((3, 5), dtype=int),
+                anchor_items_above=anchors,
+            ),
+            GradeData(
+                "g1",
+                np.zeros((3, 5), dtype=int),
+                anchor_items_below=anchors,
+                anchor_items_above=anchors,
+            ),
+            GradeData(
+                "g2",
+                np.zeros((3, 5), dtype=int),
+                anchor_items_below=anchors,
+            ),
+        ]
+        grade_models = [
+            _GradeModelInfo(model_0, theta_0, "g0"),
+            _GradeModelInfo(model_1, theta_1, "g1"),
+            _GradeModelInfo(model_2, theta_2, "g2"),
+        ]
+        monkeypatch.setattr(
+            vertical_module,
+            "_fit_grade_models",
+            lambda grade_data, models: grade_models,
+        )
+
+        result = vertical_scale(
+            grade_data,
+            models=[model_0, model_1, model_2],
+            reference_grade=1,
+            enforce_monotonicity=False,
+        )
+
+        np.testing.assert_allclose(
+            result.grade_transformations["g0"],
+            (scale_01, shift_01),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            result.grade_transformations["g1"], (1.0, 0.0), atol=1e-6
+        )
+        np.testing.assert_allclose(
+            result.grade_transformations["g2"],
+            (1.0 / scale_12, -shift_12 / scale_12),
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(list(result.grade_means.values()), 2.0, atol=1e-6)
+
+    def test_monotonicity_preserves_reference_and_scale(self):
+        """Growth correction shifts locations without rescaling abilities."""
+        labels = ["g1", "g2", "g3"]
+        grade_data = [GradeData(label, np.zeros((2, 2), dtype=int)) for label in labels]
+        result = VerticalScaleResult(
+            grade_transformations={
+                "g1": (0.8, 0.2),
+                "g2": (1.0, 0.0),
+                "g3": (1.2, -0.1),
+            },
+            grade_means={"g1": 3.0, "g2": 2.0, "g3": 1.0},
+            grade_sds={"g1": 0.8, "g2": 1.0, "g3": 1.2},
+            linking_results=[],
+            monotonicity_violations=[],
+            growth_curve=np.array([3.0, 2.0, 1.0]),
+            method="chain",
+            reference_grade=1,
+        )
+
+        adjusted = _enforce_monotonicity(result, grade_data, reference_grade=1)
+
+        means = np.array([adjusted.grade_means[label] for label in labels])
+        assert np.all(np.diff(means) > 0.0)
+        assert adjusted.grade_transformations["g2"] == (1.0, 0.0)
+        for label in labels:
+            assert adjusted.grade_transformations[label][0] == pytest.approx(
+                result.grade_transformations[label][0]
+            )
+        assert adjusted.grade_sds == result.grade_sds
+        assert adjusted.monotonicity_violations == [("g1", "g2"), ("g2", "g3")]
 
 
 class TestVerticalScaleValidation:
@@ -217,6 +375,46 @@ class TestVerticalScaleValidation:
         with pytest.raises(ValueError, match="Unknown vertical scaling method"):
             vertical_scale(two_grade_data, method="invalid_method")
 
+    @pytest.mark.parametrize("reference_grade", [-1, 2, 1.5])
+    def test_reference_grade_must_be_valid(self, two_grade_data, reference_grade):
+        """Reference indices are validated before fitting begins."""
+        with pytest.raises(ValueError, match="reference_grade"):
+            vertical_scale(two_grade_data, reference_grade=reference_grade)
+
+    def test_grade_labels_must_be_unique(self, two_grade_data):
+        """Duplicate labels would silently overwrite result dictionaries."""
+        two_grade_data[1].grade_label = two_grade_data[0].grade_label
+
+        with pytest.raises(ValueError, match="labels must be unique"):
+            vertical_scale(two_grade_data)
+
+    def test_models_must_match_grades_and_response_width(self, two_grade_data):
+        """A partial or dimensionally incompatible model list is rejected."""
+        model = TwoParameterLogistic(n_items=15)
+        wrong_width = TwoParameterLogistic(n_items=14)
+
+        with pytest.raises(ValueError, match="one model per grade"):
+            vertical_scale(two_grade_data, models=[model])
+        with pytest.raises(ValueError, match="responses have 15"):
+            vertical_scale(two_grade_data, models=[model, wrong_width])
+
+    @pytest.mark.parametrize(
+        ("anchors", "message"),
+        [([0], "At least 2"), ([0, 0], "unique"), ([-1, 1], "out of range")],
+    )
+    def test_anchor_indices_are_validated(self, two_grade_data, anchors, message):
+        """Invalid anchor mappings fail before model calibration."""
+        two_grade_data[0].anchor_items_above = anchors
+        two_grade_data[1].anchor_items_below = anchors
+
+        with pytest.raises(ValueError, match=message):
+            vertical_scale(two_grade_data)
+
+    def test_invalid_linking_method_fails_before_fitting(self, two_grade_data):
+        """Linking configuration is checked at the public boundary."""
+        with pytest.raises(ValueError, match="Unknown linking method"):
+            vertical_scale(two_grade_data, linking_method="invalid")
+
 
 class TestComputeVerticalDiagnostics:
     """Tests for compute_vertical_diagnostics function."""
@@ -243,6 +441,25 @@ class TestComputeVerticalDiagnostics:
 
         assert np.all(diagnostics.grade_separation >= 0)
 
+    def test_cumulative_growth_uses_selected_reference(self):
+        """Cumulative growth is centered on the result's reference grade."""
+        labels = ["g1", "g2", "g3"]
+        grade_data = [GradeData(label, np.zeros((2, 2), dtype=int)) for label in labels]
+        result = VerticalScaleResult(
+            grade_transformations={label: (1.0, 0.0) for label in labels},
+            grade_means={"g1": 1.0, "g2": 3.0, "g3": 5.0},
+            grade_sds={label: 1.0 for label in labels},
+            linking_results=[],
+            monotonicity_violations=[],
+            growth_curve=np.array([1.0, 3.0, 5.0]),
+            method="chain",
+            reference_grade=1,
+        )
+
+        diagnostics = compute_vertical_diagnostics(result, grade_data)
+
+        np.testing.assert_allclose(diagnostics.cumulative_growth, [-2.0, 0.0, 2.0])
+
 
 class TestVerticalScaleSummary:
     """Tests for vertical_scale_summary function."""
@@ -262,6 +479,7 @@ class TestVerticalScaleSummary:
         summary = vertical_scale_summary(result)
 
         assert "chain" in summary
+        assert "Reference grade: Grade 3" in summary
 
 
 class TestVerticalScaleEdgeCases:
