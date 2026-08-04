@@ -68,6 +68,23 @@ Diagnostics
    compute_drf
    sibtest
 
+Plotting
+--------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   plot_icc
+   plot_category_curves
+   plot_information
+   plot_expected_score
+   plot_se
+   plot_ability_distribution
+   plot_person_item_map
+   plot_itemfit
+   plot_dif
+
 Scoring
 -------
 
