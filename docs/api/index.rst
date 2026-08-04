@@ -42,6 +42,21 @@ Models
    DINA
    DINO
 
+Custom Models
+-------------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   create_item_type
+   CustomItemModel
+   ItemTypeSpec
+   create_group
+   createGroup
+   CustomGroupModel
+   GroupSpec
+
 Estimation
 ----------
 
