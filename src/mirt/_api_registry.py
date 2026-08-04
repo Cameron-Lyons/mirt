@@ -100,7 +100,9 @@ BASE_EXPORTS = [
     "StratifiedKFold",
     "LeaveOneOut",
     "fit_models",
+    "fit_model_grid",
     "BatchFitResult",
+    "GridFitResult",
     "testinfo",
     "iteminfo",
     "areainfo",
@@ -418,7 +420,12 @@ TOP_LEVEL_IMPORT_GROUPS = {
     "mirt.results.fit_result": ("FitResult",),
     "mirt.results.score_result": ("ScoreResult",),
     "mirt.scoring": ("fscores",),
-    "mirt.utils.batch": ("BatchFitResult", "fit_models"),
+    "mirt.utils.batch": (
+        "BatchFitResult",
+        "GridFitResult",
+        "fit_model_grid",
+        "fit_models",
+    ),
     "mirt.utils.bootstrap": ("bootstrap_ci", "bootstrap_se", "parametric_bootstrap"),
     "mirt.utils.calibration": ("equate", "fixed_calib"),
     "mirt.utils.classical": (

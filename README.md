@@ -406,6 +406,8 @@ plot_person_item_map(result.model, scores.theta)
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
 | `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
 | `calc_null()` | Independence and pooled-intercept baseline fit statistics |
+| `fit_models()` | Validated sequential or parallel model comparison |
+| `fit_model_grid()` | Hyperparameter grids with retained failure details |
 | `set_dataframe_backend()` | Choose pandas/polars |
 | `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
 | `Q3()` | Yen's Q3 local dependence statistic |

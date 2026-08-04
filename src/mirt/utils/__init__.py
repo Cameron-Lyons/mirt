@@ -1,5 +1,5 @@
 from mirt._core import sigmoid
-from mirt.utils.batch import BatchFitResult, fit_model_grid, fit_models
+from mirt.utils.batch import BatchFitResult, GridFitResult, fit_model_grid, fit_models
 from mirt.utils.calibration import (
     CalibrationResult,
     EquatingResult,
@@ -142,6 +142,7 @@ __all__ = [
     "fit_models",
     "fit_model_grid",
     "BatchFitResult",
+    "GridFitResult",
     "testinfo",
     "iteminfo",
     "areainfo",
