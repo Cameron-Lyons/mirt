@@ -82,6 +82,7 @@ BASE_EXPORTS = [
     "generate_item_parameters",
     "validate_responses",
     "set_dataframe_backend",
+    "get_dataframe_backend",
     "load_dataset",
     "list_datasets",
     "bootstrap_se",
@@ -451,7 +452,7 @@ TOP_LEVEL_IMPORT_GROUPS = {
         "cross_validate",
     ),
     "mirt.utils.data": ("validate_responses",),
-    "mirt.utils.dataframe": ("set_dataframe_backend",),
+    "mirt.utils.dataframe": ("get_dataframe_backend", "set_dataframe_backend"),
     "mirt.utils.datasets": ("list_datasets", "load_dataset"),
     "mirt.utils.empirical": (
         "ItemGAMResult",

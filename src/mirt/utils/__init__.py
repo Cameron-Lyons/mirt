@@ -37,7 +37,7 @@ from mirt.utils.cv import (
     cross_validate,
 )
 from mirt.utils.data import validate_responses
-from mirt.utils.dataframe import set_dataframe_backend
+from mirt.utils.dataframe import get_dataframe_backend, set_dataframe_backend
 from mirt.utils.empirical import (
     RMSD_DIF,
     DIFEffectSize,
@@ -123,6 +123,7 @@ __all__ = [
     "simdata",
     "validate_responses",
     "set_dataframe_backend",
+    "get_dataframe_backend",
     "rotate_loadings",
     "varimax",
     "promax",
