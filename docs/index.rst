@@ -16,6 +16,7 @@ powered by a Rust backend for computational efficiency.
    guides/multigroup
    guides/equating
    guides/custom_models
+   guides/network_models
    api/index
 
 Installation

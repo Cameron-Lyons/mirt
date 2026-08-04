@@ -57,6 +57,19 @@ Custom Models
    CustomGroupModel
    GroupSpec
 
+Network Models
+--------------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   models.IsingModel
+   models.GaussianGraphicalModel
+   models.fit_ising
+   models.fit_ggm
+   models.compare_networks
+
 Estimation
 ----------
 
