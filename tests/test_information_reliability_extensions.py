@@ -69,11 +69,13 @@ def test_marginal_reliability_uses_the_selected_latent_range_variance():
     model = GeneralizedPartialCredit(n_items=20, n_categories=4)
     theta = np.linspace(-1.0, 1.0, 41)
     weights = stats.norm.pdf(theta)
+    weights[[0, -1]] *= 0.5
     weights /= weights.sum()
     latent_mean = np.sum(weights * theta)
     latent_variance = np.sum(weights * (theta - latent_mean) ** 2)
-    expected_error_variance = np.sum(weights / information_utils.testinfo(model, theta))
-    expected = np.clip(1.0 - expected_error_variance / latent_variance, 0.0, 1.0)
+    information = information_utils.testinfo(model, theta)
+    local_reliability = information / (information + 1.0 / latent_variance)
+    expected = np.clip(np.sum(weights * local_reliability), 0.0, 1.0)
 
     assert marginal_rxx(model, (-1.0, 1.0), n_points=41) == pytest.approx(expected)
 
@@ -81,10 +83,10 @@ def test_marginal_reliability_uses_the_selected_latent_range_variance():
 def test_empirical_reliability_supports_polytomous_information():
     model = GeneralizedPartialCredit(n_items=20, n_categories=4)
     theta = np.linspace(-2.0, 2.0, 21)
-    observed_variance = np.var(theta)
+    observed_variance = np.var(theta, ddof=1)
     error_variance = np.mean(1.0 / information_utils.testinfo(model, theta))
     expected = np.clip(
-        max(observed_variance - error_variance, 0.0) / observed_variance,
+        observed_variance / (observed_variance + error_variance),
         0.0,
         1.0,
     )
@@ -96,8 +98,8 @@ def test_empirical_reliability_supports_polytomous_information():
 def test_reliability_rejects_unsupported_options():
     model = TwoParameterLogistic(n_items=3)
 
-    with pytest.raises(ValueError, match="density must be 'norm'"):
-        marginal_rxx(model, density="uniform")
+    with pytest.raises(ValueError, match="density must be"):
+        marginal_rxx(model, density="other")
 
     with pytest.raises(ValueError, match="method must be"):
         empirical_rxx(model, np.zeros(3), method="unknown")
