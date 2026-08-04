@@ -11,7 +11,11 @@ from mirt.equating import (
     link,
     transform_parameters,
 )
-from mirt.models.dichotomous import TwoParameterLogistic
+from mirt.models.dichotomous import (
+    FourParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
+)
 
 
 @pytest.fixture
@@ -85,6 +89,39 @@ class TestLinkingBasic:
             assert isinstance(result.constants.B, float)
             assert result.constants.method == method
 
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "mean_sigma",
+            "mean_mean",
+            "stocking_lord",
+            "haebara",
+            "tcc",
+            "bisector",
+            "orthogonal",
+        ],
+    )
+    def test_all_methods_recover_exact_constants(self, reference_model, method):
+        """Every linker must use the same documented transformation direction."""
+        scale, shift = 1.7, -0.4
+        target_model = transform_parameters(reference_model, scale, shift)
+        anchors = list(range(reference_model.n_items))
+
+        result = link(
+            target_model,
+            reference_model,
+            anchors,
+            anchors,
+            method=method,
+            compute_diagnostics=False,
+        )
+
+        assert result.constants.A == pytest.approx(scale, abs=1e-6)
+        assert result.constants.B == pytest.approx(shift, abs=1e-6)
+        assert result.constants.A > 0.0
+        if method == "tcc":
+            assert result.convergence_info["method"] == "tcc"
+
     def test_link_with_diagnostics(self, reference_model, scaled_model):
         """Test that diagnostics are computed when requested."""
         new_model, _, _ = scaled_model
@@ -136,6 +173,55 @@ class TestLinkingValidation:
         with pytest.raises(ValueError, match="Unknown linking method"):
             link(reference_model, new_model, [0, 1], [0, 1], method="invalid")
 
+    @pytest.mark.parametrize(
+        ("anchors", "message"),
+        [
+            ([-1, 1], "out of range"),
+            ([0, 10], "out of range"),
+            ([1, 1], "unique"),
+            ([0, 1.5], "integers"),
+        ],
+    )
+    def test_anchor_indices_are_validated(self, reference_model, anchors, message):
+        """Invalid indices cannot silently select or duplicate items."""
+        with pytest.raises(ValueError, match=message):
+            link(reference_model, reference_model, anchors, [0, 1])
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"theta_range": (1.0, -1.0)}, "theta_range"),
+            ({"n_theta": 1}, "n_theta"),
+            ({"weights": np.ones(3)}, "weights must have shape"),
+            ({"weights": np.zeros(61)}, "positive sum"),
+            ({"weights": np.r_[np.ones(60), -1.0]}, "non-negative"),
+        ],
+    )
+    def test_curve_grid_is_validated(self, reference_model, kwargs, message):
+        """Malformed integration grids fail with clear errors."""
+        with pytest.raises(ValueError, match=message):
+            link(reference_model, reference_model, [0, 1], [0, 1], **kwargs)
+
+    @pytest.mark.parametrize("n_bootstrap", [0, 1, 1.5])
+    def test_bootstrap_count_is_validated(self, reference_model, n_bootstrap):
+        """At least two integer replicates are required for a standard error."""
+        with pytest.raises(ValueError, match="n_bootstrap"):
+            link(
+                reference_model,
+                reference_model,
+                [0, 1],
+                [0, 1],
+                compute_se=True,
+                n_bootstrap=n_bootstrap,
+            )
+
+    def test_multidimensional_models_are_rejected(self):
+        """Scalar link constants cannot silently discard extra factors."""
+        model = TwoParameterLogistic(n_items=3, n_factors=2)
+
+        with pytest.raises(ValueError, match="unidimensional"):
+            link(model, model, [0, 1], [0, 1])
+
 
 class TestTransformParameters:
     """Tests for parameter transformation."""
@@ -180,6 +266,20 @@ class TestTransformParameters:
             np.asarray(transformed.difficulty), expected_diff, rtol=1e-10
         )
 
+    @pytest.mark.parametrize(
+        ("A", "B", "message"),
+        [
+            (0.0, 0.0, "A must"),
+            (-1.0, 0.0, "A must"),
+            (np.inf, 0.0, "A must"),
+            (1.0, np.nan, "B must"),
+        ],
+    )
+    def test_transform_rejects_invalid_constants(self, reference_model, A, B, message):
+        """Invalid transformations fail before copying or mutating a model."""
+        with pytest.raises(ValueError, match=message):
+            transform_parameters(reference_model, A, B)
+
 
 class TestLinkingRobust:
     """Tests for robust linking options."""
@@ -187,6 +287,9 @@ class TestLinkingRobust:
     def test_link_robust_option(self, reference_model, scaled_model):
         """Test that robust linking uses median instead of mean."""
         new_model, _, _ = scaled_model
+        difficulty = np.asarray(new_model.difficulty).copy()
+        difficulty[0] += 8.0
+        new_model.set_parameters(difficulty=difficulty)
         anchors = list(range(10))
 
         result_robust = link(
@@ -206,11 +309,14 @@ class TestLinkingRobust:
             robust=False,
         )
 
-        assert result_robust.constants.A != result_normal.constants.A
+        assert result_robust.constants.A != pytest.approx(result_normal.constants.A)
 
     def test_link_with_bootstrap_se(self, reference_model, scaled_model):
         """Test bootstrap standard error computation."""
         new_model, _, _ = scaled_model
+        difficulty = np.asarray(new_model.difficulty).copy()
+        difficulty[0] += 0.5
+        new_model.set_parameters(difficulty=difficulty)
         anchors = list(range(10))
 
         result = link(
@@ -220,12 +326,33 @@ class TestLinkingRobust:
             anchors,
             compute_se=True,
             n_bootstrap=50,
+            random_state=42,
         )
 
         assert result.constants.A_se is not None
         assert result.constants.B_se is not None
         assert result.constants.A_se > 0
         assert result.constants.B_se > 0
+
+    def test_bootstrap_is_reproducible(self, reference_model, scaled_model):
+        """Supplying a seed reproduces the same uncertainty estimates."""
+        new_model, _, _ = scaled_model
+        difficulty = np.asarray(new_model.difficulty).copy()
+        difficulty[-1] += 0.4
+        new_model.set_parameters(difficulty=difficulty)
+        anchors = list(range(10))
+        kwargs = {
+            "method": "mean_sigma",
+            "compute_se": True,
+            "n_bootstrap": 100,
+            "random_state": 1234,
+        }
+
+        first = link(reference_model, new_model, anchors, anchors, **kwargs)
+        second = link(reference_model, new_model, anchors, anchors, **kwargs)
+
+        assert first.constants.A_se == second.constants.A_se
+        assert first.constants.B_se == second.constants.B_se
 
 
 class TestLinkingFitStatistics:
@@ -290,3 +417,40 @@ class TestAnchorDiagnostics:
 
         assert result.anchor_diagnostics is not None
         assert np.sum(result.anchor_diagnostics.flagged) == 0
+
+    def test_three_pl_guessing_drift_affects_curves(self):
+        """Lower-asymptote drift must appear in areas and robust flags."""
+        model_old = ThreeParameterLogistic(n_items=5)
+        model_new = ThreeParameterLogistic(n_items=5)
+        common = {
+            "discrimination": np.ones(5),
+            "difficulty": np.linspace(-1.0, 1.0, 5),
+        }
+        model_old.set_parameters(**common, guessing=np.full(5, 0.1))
+        model_new.set_parameters(**common, guessing=np.array([0.4, 0.1, 0.1, 0.1, 0.1]))
+
+        result = link(model_old, model_new, list(range(5)), list(range(5)))
+
+        diagnostics = result.anchor_diagnostics
+        assert diagnostics is not None
+        assert diagnostics.area_diff[0] > diagnostics.area_diff[1:].max()
+        assert diagnostics.flagged.tolist() == [True, False, False, False, False]
+
+    def test_four_pl_upper_drift_affects_curves(self):
+        """Upper-asymptote drift must also contribute to diagnostics."""
+        model_old = FourParameterLogistic(n_items=5)
+        model_new = FourParameterLogistic(n_items=5)
+        common = {
+            "discrimination": np.ones(5),
+            "difficulty": np.linspace(-1.0, 1.0, 5),
+            "guessing": np.full(5, 0.1),
+        }
+        model_old.set_parameters(**common, upper=np.ones(5))
+        model_new.set_parameters(**common, upper=np.array([0.7, 1.0, 1.0, 1.0, 1.0]))
+
+        result = link(model_old, model_new, list(range(5)), list(range(5)))
+
+        diagnostics = result.anchor_diagnostics
+        assert diagnostics is not None
+        assert diagnostics.area_diff[0] > diagnostics.area_diff[1:].max()
+        assert diagnostics.flagged.tolist() == [True, False, False, False, False]
