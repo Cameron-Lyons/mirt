@@ -46,7 +46,12 @@ def key2binary(
      [0. 1. 0.]]
     """
     responses = np.asarray(responses)
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
+
     key = np.asarray(key)
+    if key.ndim != 1:
+        raise ValueError(f"key must be a 1D array, got {key.ndim}D")
 
     if responses.shape[1] != len(key):
         raise ValueError(
@@ -54,13 +59,12 @@ def key2binary(
             f"key length ({len(key)})"
         )
 
-    scored = np.zeros(responses.shape, dtype=np.float64)
+    try:
+        incorrect, correct = (float(value) for value in scored_values)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scored_values must contain two numeric values") from exc
 
-    for j in range(responses.shape[1]):
-        correct = responses[:, j] == key[j]
-        scored[:, j] = np.where(correct, scored_values[1], scored_values[0])
-
-    return scored
+    return np.where(responses == key[None, :], correct, incorrect)
 
 
 def poly2dich(
@@ -240,26 +244,36 @@ def expand_table(
     (10, 3)
     """
     table = np.asarray(table, dtype=np.float64)
+    if table.ndim != 2:
+        raise ValueError(f"table must be a 2D array, got {table.ndim}D")
+    if table.shape[1] < 2:
+        raise ValueError(
+            "table must contain at least one item and one frequency column"
+        )
+    if isinstance(freq_col, (bool, np.bool_)) or not isinstance(
+        freq_col, (int, np.integer)
+    ):
+        raise ValueError("freq_col must be an integer column index")
 
-    freqs = table[:, freq_col].astype(int)
+    normalized_freq_col = int(freq_col)
+    if normalized_freq_col < 0:
+        normalized_freq_col += table.shape[1]
+    if normalized_freq_col < 0 or normalized_freq_col >= table.shape[1]:
+        raise ValueError(
+            f"freq_col {freq_col} is out of range for {table.shape[1]} columns"
+        )
 
-    if freq_col == -1:
-        patterns = table[:, :-1]
-    else:
-        patterns = np.delete(table, freq_col, axis=1)
+    raw_freqs = table[:, normalized_freq_col]
+    if not np.all(np.isfinite(raw_freqs)):
+        raise ValueError("frequencies must contain only finite values")
+    if np.any(raw_freqs < 0) or np.any(raw_freqs != np.trunc(raw_freqs)):
+        raise ValueError("frequencies must be non-negative integers")
+    if np.any(raw_freqs > np.iinfo(np.intp).max):
+        raise ValueError("frequencies exceed the supported integer range")
 
-    n_total = np.sum(freqs)
-    n_items = patterns.shape[1]
-
-    expanded = np.zeros((n_total, n_items), dtype=np.float64)
-
-    row = 0
-    for i, freq in enumerate(freqs):
-        for _ in range(freq):
-            expanded[row] = patterns[i]
-            row += 1
-
-    return expanded
+    freqs = raw_freqs.astype(np.intp, copy=False)
+    patterns = np.delete(table, normalized_freq_col, axis=1)
+    return np.repeat(patterns, freqs, axis=0)
 
 
 def collapse_table(
@@ -293,10 +307,14 @@ def collapse_table(
     [2 3]
     """
     responses = np.asarray(responses, dtype=np.float64)
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
+    if np.any(np.isinf(responses)):
+        raise ValueError("responses must contain finite values or NaN")
 
-    unique_patterns, indices, counts = np.unique(
-        responses, axis=0, return_inverse=True, return_counts=True
-    )
+    canonical = np.where(np.isnan(responses), np.inf, responses)
+    unique_patterns, counts = np.unique(canonical, axis=0, return_counts=True)
+    unique_patterns[unique_patterns == np.inf] = np.nan
 
     return unique_patterns, counts
 
@@ -333,16 +351,36 @@ def recode_responses(
     [[0. 0. 2.]
      [1. 1. 0.]]
     """
-    responses = np.asarray(responses, dtype=np.float64).copy()
+    responses = np.asarray(responses, dtype=np.float64)
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
+
+    responses = responses.copy()
     n_items = responses.shape[1]
 
     if items is None:
-        items = list(range(n_items))
+        item_indices = np.arange(n_items, dtype=np.intp)
+    else:
+        item_indices = np.asarray(items)
+        if item_indices.ndim != 1:
+            raise ValueError("items must be a one-dimensional sequence of integers")
+        if item_indices.size == 0:
+            return responses
+        if item_indices.dtype.kind not in "iu":
+            raise ValueError("items must be a one-dimensional sequence of integers")
+        item_indices = item_indices.astype(np.intp, copy=False)
+        if np.any(item_indices < -n_items) or np.any(item_indices >= n_items):
+            raise IndexError("item index out of range")
+        item_indices = np.unique(item_indices % n_items)
 
-    for j in items:
-        for old_val, new_val in mapping.items():
-            mask = responses[:, j] == old_val
-            responses[mask, j] = new_val
+    if not mapping:
+        return responses
+
+    original = responses[:, item_indices].copy()
+    recoded = original.copy()
+    for old_val, new_val in mapping.items():
+        recoded[original == old_val] = new_val
+    responses[:, item_indices] = recoded
 
     return responses
 
@@ -376,19 +414,19 @@ def likert2int(
      [4. 2.]]
     """
     responses = np.asarray(responses)
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
 
     if labels is None:
-        labels = sorted(list(set(responses.ravel())))
+        try:
+            labels = sorted(set(responses.ravel()))
+        except TypeError as exc:
+            raise ValueError(
+                "responses must contain mutually comparable labels when labels is omitted"
+            ) from exc
 
-    label_to_int = {label: i for i, label in enumerate(labels)}
-
-    coded = np.zeros(responses.shape, dtype=np.float64)
-    for i in range(responses.shape[0]):
-        for j in range(responses.shape[1]):
-            val = responses[i, j]
-            if val in label_to_int:
-                coded[i, j] = label_to_int[val]
-            else:
-                coded[i, j] = np.nan
+    coded = np.full(responses.shape, np.nan, dtype=np.float64)
+    for code, label in enumerate(labels):
+        coded[responses == label] = code
 
     return coded

@@ -35,6 +35,9 @@ class ItemAnalysisReport(ReportBuilder):
         Ability estimates for Wright map. If None, Wright map is omitted.
     title : str, optional
         Report title.
+    include_plots : bool
+        Embed visualizations in the report. Set to False for a lightweight
+        report that does not require matplotlib. Default True.
 
     Examples
     --------
@@ -54,23 +57,16 @@ class ItemAnalysisReport(ReportBuilder):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64] | None = None,
         title: str | None = None,
+        include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
         self.responses = np.asarray(responses)
         self.theta = theta
+        self.include_plots = include_plots
 
     def _build_content(self) -> str:
         from mirt.diagnostics.itemfit import compute_itemfit
-        from mirt.reports._plots import (
-            create_icc_plot_base64,
-            create_information_plot_base64,
-            create_itemfit_plot_base64,
-            create_wright_map_base64,
-        )
-        from mirt.reports._templates import (
-            embedded_plot,
-            section,
-        )
+        from mirt.reports._templates import section
 
         sections = []
 
@@ -83,44 +79,66 @@ class ItemAnalysisReport(ReportBuilder):
             section("Item Fit Statistics", self._build_fit_table(fit_stats))
         )
 
-        plot_base64 = create_itemfit_plot_base64(
-            fit_stats, item_names=self.fit_result.model.item_names
-        )
-        sections.append(
-            section("Item Fit Plot", embedded_plot(plot_base64, "Item Fit Statistics"))
-        )
-
-        icc_base64 = create_icc_plot_base64(self.fit_result.model)
-        sections.append(
-            section("Item Characteristic Curves", embedded_plot(icc_base64, "ICC Plot"))
-        )
-
-        info_base64 = create_information_plot_base64(self.fit_result.model)
-        sections.append(
-            section(
-                "Test Information Function",
-                embedded_plot(info_base64, "Information Function"),
+        if self.include_plots:
+            from mirt.reports._plots import (
+                create_icc_plot_base64,
+                create_information_plot_base64,
+                create_itemfit_plot_base64,
+                create_wright_map_base64,
             )
-        )
+            from mirt.reports._templates import embedded_plot
 
-        if self.theta is not None:
-            wright_base64 = create_wright_map_base64(self.fit_result.model, self.theta)
+            plot_base64 = create_itemfit_plot_base64(
+                fit_stats, item_names=self.fit_result.model.item_names
+            )
             sections.append(
                 section(
-                    "Person-Item Map (Wright Map)",
-                    embedded_plot(wright_base64, "Wright Map"),
+                    "Item Fit Plot",
+                    embedded_plot(plot_base64, "Item Fit Statistics"),
                 )
             )
+
+            icc_base64 = create_icc_plot_base64(self.fit_result.model)
+            sections.append(
+                section(
+                    "Item Characteristic Curves",
+                    embedded_plot(icc_base64, "ICC Plot"),
+                )
+            )
+
+            info_base64 = create_information_plot_base64(self.fit_result.model)
+            sections.append(
+                section(
+                    "Test Information Function",
+                    embedded_plot(info_base64, "Information Function"),
+                )
+            )
+
+            if self.theta is not None:
+                wright_base64 = create_wright_map_base64(
+                    self.fit_result.model, self.theta
+                )
+                sections.append(
+                    section(
+                        "Person-Item Map (Wright Map)",
+                        embedded_plot(wright_base64, "Wright Map"),
+                    )
+                )
 
         return "\n".join(sections)
 
     def _build_model_summary(self) -> str:
-        from mirt.reports._templates import format_value, section, summary_box
+        from mirt.reports._templates import (
+            escape_text,
+            format_value,
+            section,
+            summary_box,
+        )
 
         model = self.fit_result.model
         stats = self.fit_result.fit_statistics()
         summary_html = f"""
-        <p><strong>Model:</strong> {model.model_name}</p>
+        <p><strong>Model:</strong> {escape_text(model.model_name)}</p>
         <p><strong>Items:</strong> {model.n_items} | <strong>Factors:</strong> {model.n_factors}</p>
         <p><strong>Persons:</strong> {stats["n_observations"]} | <strong>Parameters:</strong> {stats["n_parameters"]}</p>
         <p><strong>Log-Likelihood:</strong> {format_value(stats["log_likelihood"], ".2f")}</p>

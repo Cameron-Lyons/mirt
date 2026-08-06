@@ -54,6 +54,12 @@ For polars DataFrame support:
 
    pip install mirt[polars]
 
+For plotting and embedded report visualizations:
+
+.. code-block:: bash
+
+   pip install "mirt[plot]"
+
 For development:
 
 .. code-block:: bash

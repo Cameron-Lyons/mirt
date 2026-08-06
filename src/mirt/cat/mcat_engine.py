@@ -12,6 +12,7 @@ from mirt.cat._engine_common import (
     configure_exposure_control,
     consume_pending_item,
     finalize_administered_item,
+    get_pending_item,
     initialize_common_engine,
     record_item_administration,
     reset_session_state,
@@ -218,8 +219,12 @@ class MCATEngine:
         """
         next_item = None
         if not self._is_complete and self._available_items:
-            next_item = self._select_next_item()
+            next_item = get_pending_item(self)
 
+        return self._build_state(next_item)
+
+    def _build_state(self, next_item: int | None) -> MCATState:
+        """Create a state snapshot with an explicitly resolved next item."""
         return MCATState(
             theta=self._current_theta.copy(),
             covariance=self._current_covariance.copy(),
@@ -249,7 +254,7 @@ class MCATEngine:
         if not self._available_items:
             raise RuntimeError("No items available for selection")
 
-        return self._select_next_item()
+        return get_pending_item(self)
 
     def _select_next_item(self) -> int:
         """Internal item selection with constraint handling."""
@@ -308,8 +313,7 @@ class MCATEngine:
         self._se_history.append(self.current_standard_error.copy())
         self._covariance_history.append(self._current_covariance.copy())
 
-        state = self.get_current_state()
-        finalize_administered_item(self, state)
+        finalize_administered_item(self, self._build_state(next_item=None))
 
         return self.get_current_state()
 

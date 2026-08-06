@@ -135,19 +135,35 @@ class MaxFisherInformation(ItemSelectionStrategy):
         if not available_items:
             raise ValueError("No available items to select from")
 
+        criteria = self.get_item_criteria(model, theta, available_items)
+        return max(criteria, key=criteria.__getitem__)
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Get Fisher information with one model call when supported."""
         theta_arr = np.array([[theta]])
-        best_item = -1
-        best_info = -np.inf
 
-        for item_idx in available_items:
-            info = model.information(theta_arr, item_idx=item_idx)
-            info_val = float(info.sum())
+        # Polytomous models define information(theta) as total test
+        # information rather than an item-wise array.
+        if not model.is_polytomous:
+            information = np.asarray(model.information(theta_arr))
+            if information.size == model.n_items:
+                item_information = information.reshape(model.n_items)
+                return {
+                    item_idx: float(item_information[item_idx])
+                    for item_idx in available_items
+                }
 
-            if info_val > best_info:
-                best_info = info_val
-                best_item = item_idx
-
-        return best_item
+        return {
+            item_idx: self._compute_criterion(model, theta_arr, item_idx)
+            for item_idx in available_items
+        }
 
     def _compute_criterion(
         self,

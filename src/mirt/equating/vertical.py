@@ -34,6 +34,22 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+_VERTICAL_METHODS = frozenset(
+    {"chain", "concurrent", "fixed_anchor", "floating_anchor"}
+)
+_LINKING_METHODS = frozenset(
+    {
+        "mean_sigma",
+        "mean_mean",
+        "stocking_lord",
+        "haebara",
+        "tcc",
+        "bisector",
+        "orthogonal",
+    }
+)
+
+
 @dataclass
 class GradeData:
     """Data for a single grade level in vertical scaling.
@@ -78,6 +94,8 @@ class VerticalScaleResult:
         Mean ability by grade level.
     method : str
         Vertical scaling method used.
+    reference_grade : int
+        Index of the grade that defines the common scale.
     """
 
     grade_transformations: dict[str | int, tuple[float, float]]
@@ -87,6 +105,7 @@ class VerticalScaleResult:
     monotonicity_violations: list[tuple]
     growth_curve: NDArray[np.float64]
     method: str
+    reference_grade: int = 0
 
 
 @dataclass
@@ -181,12 +200,14 @@ def vertical_scale(
     ... ]
     >>> result = vertical_scale(grade_data)
     """
-    if len(grade_data) < 2:
-        raise ValueError(
-            f"Vertical scaling requires at least 2 grades, got {len(grade_data)}"
-        )
-
-    _validate_anchor_structure(grade_data, method)
+    _validate_vertical_inputs(
+        grade_data,
+        models,
+        method,
+        linking_method,
+        reference_grade,
+    )
+    reference_grade = int(reference_grade)
 
     grade_models = _fit_grade_models(grade_data, models)
 
@@ -201,6 +222,7 @@ def vertical_scale(
         result = _concurrent_vertical_scale(
             grade_data,
             grade_models,
+            linking_method,
             reference_grade,
         )
     elif method in ("fixed_anchor", "floating_anchor"):
@@ -218,12 +240,11 @@ def vertical_scale(
             monotonicity_violations=result.monotonicity_violations,
             growth_curve=result.growth_curve,
             method=method,
+            reference_grade=reference_grade,
         )
-    else:
-        raise ValueError(f"Unknown vertical scaling method: {method}")
 
     if enforce_monotonicity:
-        result = _enforce_monotonicity(result, grade_data)
+        result = _enforce_monotonicity(result, grade_data, reference_grade)
 
     return result
 
@@ -246,22 +267,23 @@ def compute_vertical_diagnostics(
     VerticalScaleDiagnostics
         Diagnostic statistics for the vertical scale.
     """
-    n_grades = len(grade_data)
+    if not 0 <= result.reference_grade < len(grade_data):
+        raise ValueError("result.reference_grade is out of range for grade_data")
     labels = [gd.grade_label for gd in grade_data]
 
     means = np.array([result.grade_means[label] for label in labels])
     sds = np.array([result.grade_sds[label] for label in labels])
 
     growth_per_grade = np.diff(means)
-    cumulative_growth = means - means[0]
+    cumulative_growth = means - means[result.reference_grade]
 
-    grade_separation = np.zeros(n_grades - 1)
-    for i in range(n_grades - 1):
-        pooled_sd = np.sqrt((sds[i] ** 2 + sds[i + 1] ** 2) / 2)
-        if pooled_sd > 1e-10:
-            grade_separation[i] = (means[i + 1] - means[i]) / pooled_sd
-        else:
-            grade_separation[i] = 0.0
+    pooled_sds = np.sqrt((sds[:-1] ** 2 + sds[1:] ** 2) / 2)
+    grade_separation = np.divide(
+        growth_per_grade,
+        pooled_sds,
+        out=np.zeros_like(growth_per_grade),
+        where=pooled_sds > 1e-10,
+    )
 
     anchor_stability: dict[tuple, float] = {}
     for i, link_result in enumerate(result.linking_results):
@@ -297,6 +319,7 @@ def vertical_scale_summary(result: VerticalScaleResult) -> str:
         "=" * 40,
         f"Method: {result.method}",
         f"Number of grades: {len(result.grade_means)}",
+        f"Reference grade: {list(result.grade_means)[result.reference_grade]}",
         "",
         "Grade Statistics:",
         "-" * 40,
@@ -388,44 +411,143 @@ def plot_vertical_scale(
     return fig
 
 
-def _validate_anchor_structure(
+def _validate_vertical_inputs(
     grade_data: list[GradeData],
+    models: list[BaseItemModel] | None,
     method: str,
+    linking_method: str,
+    reference_grade: int,
 ) -> None:
-    """Validate that anchor items form a connected structure.
-
-    For chain linking, each adjacent pair of grades must share anchor
-    items (either via anchor_items_above/below).
-    """
-    n_grades = len(grade_data)
-
-    for i in range(n_grades - 1):
-        lower = grade_data[i]
-        upper = grade_data[i + 1]
-
-        has_connection = (
-            lower.anchor_items_above is not None or upper.anchor_items_below is not None
+    """Validate scale configuration before fitting or scoring any models."""
+    if method not in _VERTICAL_METHODS:
+        raise ValueError(f"Unknown vertical scaling method: {method}")
+    if linking_method not in _LINKING_METHODS:
+        raise ValueError(f"Unknown linking method: {linking_method}")
+    if len(grade_data) < 2:
+        raise ValueError(
+            f"Vertical scaling requires at least 2 grades, got {len(grade_data)}"
+        )
+    if isinstance(reference_grade, (bool, np.bool_)) or not isinstance(
+        reference_grade, (int, np.integer)
+    ):
+        raise ValueError("reference_grade must be an integer index")
+    if reference_grade < 0 or reference_grade >= len(grade_data):
+        raise ValueError(
+            f"reference_grade must be in [0, {len(grade_data)}), got {reference_grade}"
         )
 
-        if not has_connection:
+    labels = [gd.grade_label for gd in grade_data]
+    if any(
+        isinstance(label, (bool, np.bool_))
+        or not isinstance(label, (str, int, np.integer))
+        for label in labels
+    ):
+        raise ValueError("Grade labels must be strings or integers")
+    if len(set(labels)) != len(labels):
+        raise ValueError("Grade labels must be unique")
+
+    from mirt.utils.data import validate_responses
+
+    for gd in grade_data:
+        responses = validate_responses(gd.responses)
+        if responses.shape[0] < 2:
             raise ValueError(
-                f"No anchor items connecting grade '{lower.grade_label}' "
-                f"to grade '{upper.grade_label}'. Specify anchor_items_above "
-                f"for the lower grade or anchor_items_below for the upper grade."
+                f"Grade '{gd.grade_label}' must contain at least 2 response rows"
             )
 
-        if (
-            lower.anchor_items_above is not None
-            and upper.anchor_items_below is not None
-        ):
-            n_lower = len(lower.anchor_items_above)
-            n_upper = len(upper.anchor_items_below)
-            if n_lower != n_upper:
+    if models is not None:
+        if len(models) != len(grade_data):
+            raise ValueError(
+                f"models must contain one model per grade: expected "
+                f"{len(grade_data)}, got {len(models)}"
+            )
+        for gd, model in zip(grade_data, models):
+            n_response_items = np.asarray(gd.responses).shape[1]
+            if model.n_items != n_response_items:
                 raise ValueError(
-                    f"Anchor item count mismatch between grades "
-                    f"'{lower.grade_label}' ({n_lower}) and "
-                    f"'{upper.grade_label}' ({n_upper})"
+                    f"Model for grade '{gd.grade_label}' has {model.n_items} items, "
+                    f"but responses have {n_response_items}"
                 )
+            if model.n_factors != 1:
+                raise ValueError("Vertical scaling requires unidimensional models")
+
+    _validate_anchor_structure(grade_data)
+
+
+def _validate_anchor_structure(grade_data: list[GradeData]) -> None:
+    """Validate that adjacent grades have explicit, usable anchor mappings.
+
+    When only one side of an adjacent pair is supplied, matching item indices
+    are inferred for the other form. Supplying both sides supports anchors in
+    different item positions.
+    """
+    for i in range(len(grade_data) - 1):
+        lower = grade_data[i]
+        upper = grade_data[i + 1]
+        anchors_lower, anchors_upper = _resolve_anchor_pair(lower, upper)
+        if len(anchors_lower) != len(anchors_upper):
+            raise ValueError(
+                f"Anchor item count mismatch between grades "
+                f"'{lower.grade_label}' ({len(anchors_lower)}) and "
+                f"'{upper.grade_label}' ({len(anchors_upper)})"
+            )
+        if len(anchors_lower) < 2:
+            raise ValueError(
+                f"At least 2 anchor items are required between grades "
+                f"'{lower.grade_label}' and '{upper.grade_label}'"
+            )
+
+        _validate_anchor_indices(
+            anchors_lower,
+            np.asarray(lower.responses).shape[1],
+            lower.grade_label,
+        )
+        _validate_anchor_indices(
+            anchors_upper,
+            np.asarray(upper.responses).shape[1],
+            upper.grade_label,
+        )
+
+
+def _resolve_anchor_pair(
+    lower: GradeData, upper: GradeData
+) -> tuple[list[int], list[int]]:
+    """Resolve corresponding anchor indices for one adjacent grade pair."""
+    anchors_lower = lower.anchor_items_above
+    anchors_upper = upper.anchor_items_below
+    if anchors_lower is None and anchors_upper is None:
+        raise ValueError(
+            f"No anchor items connecting grade '{lower.grade_label}' "
+            f"to grade '{upper.grade_label}'. Specify anchor_items_above "
+            f"for the lower grade or anchor_items_below for the upper grade."
+        )
+    if anchors_lower is None:
+        anchors_lower = anchors_upper
+    if anchors_upper is None:
+        anchors_upper = anchors_lower
+    assert anchors_lower is not None and anchors_upper is not None
+    return list(anchors_lower), list(anchors_upper)
+
+
+def _validate_anchor_indices(
+    anchors: list[int], n_items: int, label: str | int
+) -> None:
+    """Validate anchor index type, uniqueness, and form bounds."""
+    normalized: list[int] = []
+    for anchor in anchors:
+        if isinstance(anchor, (bool, np.bool_)) or not isinstance(
+            anchor, (int, np.integer)
+        ):
+            raise ValueError(f"Anchor indices for grade '{label}' must be integers")
+        index = int(anchor)
+        if index < 0 or index >= n_items:
+            raise ValueError(
+                f"Anchor index {index} out of range for grade '{label}' "
+                f"with {n_items} items"
+            )
+        normalized.append(index)
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"Anchor indices for grade '{label}' must be unique")
 
 
 def _fit_grade_models(
@@ -439,16 +561,24 @@ def _fit_grade_models(
     grade_models = []
 
     for i, gd in enumerate(grade_data):
-        if models is not None and i < len(models):
+        if models is not None:
             model = models[i]
         else:
             result = fit_mirt(gd.responses, model="2PL", verbose=False)
             model = result.model
 
         score_result = fscores(model, gd.responses, method="EAP")
-        theta = score_result.theta
+        theta = np.asarray(score_result.theta, dtype=np.float64)
         if theta.ndim == 1:
             theta = theta.reshape(-1, 1)
+        expected_shape = (np.asarray(gd.responses).shape[0], 1)
+        if theta.shape != expected_shape:
+            raise ValueError(
+                f"Scores for grade '{gd.grade_label}' have shape {theta.shape}; "
+                f"expected {expected_shape}"
+            )
+        if not np.all(np.isfinite(theta)):
+            raise ValueError(f"Scores for grade '{gd.grade_label}' must be finite")
 
         grade_models.append(
             _GradeModelInfo(
@@ -482,25 +612,13 @@ def _chain_vertical_scale(
         lower_model = grade_models[i].model
         upper_model = grade_models[i + 1].model
 
-        if lower_gd.anchor_items_above is not None:
-            anchor_lower = lower_gd.anchor_items_above
-        else:
-            anchor_lower = list(range(min(5, lower_model.n_items)))
-
-        if upper_gd.anchor_items_below is not None:
-            anchor_upper = upper_gd.anchor_items_below
-        else:
-            anchor_upper = list(range(min(5, upper_model.n_items)))
-
-        min_len = min(len(anchor_lower), len(anchor_upper))
-        anchor_lower = anchor_lower[:min_len]
-        anchor_upper = anchor_upper[:min_len]
+        anchor_lower, anchor_upper = _resolve_anchor_pair(lower_gd, upper_gd)
 
         link_result = link(
-            upper_model,
             lower_model,
-            anchor_upper,
+            upper_model,
             anchor_lower,
+            anchor_upper,
             method=linking_method,
             compute_diagnostics=True,
         )
@@ -540,21 +658,23 @@ def _chain_vertical_scale(
         monotonicity_violations=[],
         growth_curve=growth_curve,
         method="chain",
+        reference_grade=reference_grade,
     )
 
 
 def _concurrent_vertical_scale(
     grade_data: list[GradeData],
     grade_models: list[_GradeModelInfo],
+    linking_method: str,
     reference_grade: int,
 ) -> VerticalScaleResult:
     """Perform concurrent vertical scaling.
 
-    This is a simplified implementation that uses chain linking as a
-    starting point, then refines with joint optimization.
+    This implementation uses the connected adjacent-grade anchor structure
+    to place every form on the selected reference scale.
     """
     chain_result = _chain_vertical_scale(
-        grade_data, grade_models, "stocking_lord", reference_grade
+        grade_data, grade_models, linking_method, reference_grade
     )
 
     return VerticalScaleResult(
@@ -565,28 +685,38 @@ def _concurrent_vertical_scale(
         monotonicity_violations=chain_result.monotonicity_violations,
         growth_curve=chain_result.growth_curve,
         method="concurrent",
+        reference_grade=reference_grade,
     )
 
 
 def _enforce_monotonicity(
     result: VerticalScaleResult,
     grade_data: list[GradeData],
+    reference_grade: int,
 ) -> VerticalScaleResult:
-    """Adjust transformations to ensure strictly increasing grade means."""
+    """Shift grade locations to ensure growth while preserving the reference."""
     labels = [gd.grade_label for gd in grade_data]
     means = np.array([result.grade_means[label] for label in labels])
     sds = np.array([result.grade_sds[label] for label in labels])
 
-    violations = []
+    violation_indices: set[int] = set()
     adjusted_means = means.copy()
 
-    for i in range(len(means) - 1):
-        if adjusted_means[i + 1] <= adjusted_means[i]:
-            violations.append((labels[i], labels[i + 1]))
-            min_growth = 0.1 * sds[i]
-            adjusted_means[i + 1] = adjusted_means[i] + min_growth
+    for i in range(reference_grade - 1, -1, -1):
+        if adjusted_means[i] >= adjusted_means[i + 1]:
+            violation_indices.add(i)
+            adjusted_means[i] = adjusted_means[i + 1] - _minimum_growth(
+                sds[i], sds[i + 1]
+            )
 
-    if not violations:
+    for i in range(reference_grade, len(means) - 1):
+        if adjusted_means[i + 1] <= adjusted_means[i]:
+            violation_indices.add(i)
+            adjusted_means[i + 1] = adjusted_means[i] + _minimum_growth(
+                sds[i], sds[i + 1]
+            )
+
+    if not violation_indices:
         return result
 
     new_transformations = {}
@@ -595,17 +725,11 @@ def _enforce_monotonicity(
     for i, label in enumerate(labels):
         old_A, old_B = result.grade_transformations[label]
         old_mean = result.grade_means[label]
+        mean_shift = float(adjusted_means[i] - old_mean)
+        new_transformations[label] = (old_A, old_B + mean_shift)
+        new_means[label] = float(adjusted_means[i])
 
-        if old_mean != 0:
-            scale_factor = adjusted_means[i] / old_mean
-            new_A = old_A * scale_factor
-            new_B = old_B * scale_factor
-        else:
-            new_A = old_A
-            new_B = adjusted_means[i]
-
-        new_transformations[label] = (new_A, new_B)
-        new_means[label] = adjusted_means[i]
+    violations = [(labels[i], labels[i + 1]) for i in sorted(violation_indices)]
 
     return VerticalScaleResult(
         grade_transformations=new_transformations,
@@ -615,4 +739,11 @@ def _enforce_monotonicity(
         monotonicity_violations=violations,
         growth_curve=adjusted_means,
         method=result.method,
+        reference_grade=reference_grade,
     )
+
+
+def _minimum_growth(sd_lower: float, sd_upper: float) -> float:
+    """Return a stable positive spacing for adjacent grade means."""
+    pooled_sd = float(np.sqrt((sd_lower**2 + sd_upper**2) / 2))
+    return max(0.1 * pooled_sd, 1e-6)
