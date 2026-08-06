@@ -15,6 +15,7 @@ powered by a Rust backend for computational efficiency.
    guides/plotting
    guides/multigroup
    guides/equating
+   guides/results
    guides/reports
    guides/custom_models
    guides/network_models
@@ -54,6 +55,7 @@ Features
 * **Diagnostics**: Item fit, model fit, DIF analysis, SIBTEST
 * **Reports**: Standalone HTML summaries with optional embedded visualizations
 * **Scoring**: EAP, MAP, ML scoring methods
+* **Results**: Validated inference, confidence intervals, and portable exports
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
 * **Custom Models**: Validated dichotomous, polytomous, multidimensional, and group callbacks
 * **High Performance**: Rust-powered backend for fast computation
