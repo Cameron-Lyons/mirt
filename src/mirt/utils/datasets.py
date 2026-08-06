@@ -1,15 +1,20 @@
 """Sample datasets for IRT analysis.
 
 This module provides classic IRT datasets commonly used in psychometric research.
+Dataset prototypes are generated once per process and copied on demand so repeated
+loads remain fast without sharing mutable response matrices between callers.
 """
 
+from collections.abc import Callable
+from difflib import get_close_matches
+from functools import cache
 from typing import Any
 
 import numpy as np
 
 from mirt.constants import PROB_EPSILON
 
-_DATASET_LOADERS: dict[str, Any] = {
+_DATASET_LOADERS: dict[str, Callable[[], dict[str, Any]]] = {
     "LSAT6": lambda: _load_lsat6(),
     "LSAT7": lambda: _load_lsat7(),
     "SAT12": lambda: _load_sat12(),
@@ -22,9 +27,73 @@ _DATASET_LOADERS: dict[str, Any] = {
     "deAyala": lambda: _load_deayala(),
     "SLF": lambda: _load_slf(),
 }
+_DATASET_NAME_INDEX = {name.casefold(): name for name in _DATASET_LOADERS}
 
 
-def load_dataset(name: str) -> dict[str, Any]:
+def _resolve_dataset_name(name: str) -> str:
+    """Resolve a case-insensitive dataset name to its canonical spelling."""
+    if not isinstance(name, str):
+        raise TypeError("name must be a string")
+
+    normalized = name.strip().casefold()
+    try:
+        return _DATASET_NAME_INDEX[normalized]
+    except KeyError:
+        available = ", ".join(_DATASET_LOADERS)
+        matches = get_close_matches(normalized, _DATASET_NAME_INDEX, n=1, cutoff=0.6)
+        suggestion = (
+            f" Did you mean '{_DATASET_NAME_INDEX[matches[0]]}'?" if matches else ""
+        )
+        raise ValueError(
+            f"Unknown dataset: {name}.{suggestion} Available: {available}"
+        ) from None
+
+
+@cache
+def _load_dataset_prototype(name: str) -> dict[str, Any]:
+    """Generate and retain the private prototype for a canonical dataset name."""
+    prototype = _DATASET_LOADERS[name]()
+    _freeze_dataset_arrays(prototype)
+    return prototype
+
+
+def _freeze_dataset_arrays(value: Any) -> None:
+    """Make every array in a cached prototype immutable in place."""
+    if isinstance(value, np.ndarray):
+        value.flags.writeable = False
+    elif isinstance(value, dict):
+        for item in value.values():
+            _freeze_dataset_arrays(item)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _freeze_dataset_arrays(item)
+
+
+def _clone_dataset_value(value: Any, *, copy_arrays: bool) -> Any:
+    """Clone dataset containers while optionally sharing read-only array storage."""
+    if isinstance(value, np.ndarray):
+        if copy_arrays:
+            return value.copy()
+        view = value.view()
+        view.flags.writeable = False
+        return view
+    if isinstance(value, dict):
+        return {
+            key: _clone_dataset_value(item, copy_arrays=copy_arrays)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_clone_dataset_value(item, copy_arrays=copy_arrays) for item in value]
+    if isinstance(value, tuple):
+        return tuple(
+            _clone_dataset_value(item, copy_arrays=copy_arrays) for item in value
+        )
+    if isinstance(value, set):
+        return {_clone_dataset_value(item, copy_arrays=copy_arrays) for item in value}
+    return value
+
+
+def load_dataset(name: str, *, copy: bool = True) -> dict[str, Any]:
     """Load a sample dataset by name.
 
     Parameters
@@ -42,6 +111,10 @@ def load_dataset(name: str) -> dict[str, Any]:
         - 'Bock1997': Bock (1997) nominal response data (1000 x 5)
         - 'deAyala': de Ayala GPCM example data (500 x 10)
         - 'SLF': Science Literacy Foundation data (500 x 15)
+    copy : bool, default=True
+        Return independent, writable copies of array values. Set to False to share
+        cached array storage through read-only views, which minimizes allocations
+        for workloads that treat sample data as immutable.
 
     Returns
     -------
@@ -54,17 +127,44 @@ def load_dataset(name: str) -> dict[str, Any]:
         - 'source': Citation/reference
         - Additional metadata depending on dataset
     """
-    name_lower = name.lower()
-    for key, loader in _DATASET_LOADERS.items():
-        if key.lower() == name_lower:
-            return loader()
+    canonical_name = _resolve_dataset_name(name)
+    prototype = _load_dataset_prototype(canonical_name)
+    return _clone_dataset_value(prototype, copy_arrays=copy)
 
-    available = ", ".join(_DATASET_LOADERS.keys())
-    raise ValueError(f"Unknown dataset: {name}. Available: {available}")
+
+def describe_dataset(name: str) -> dict[str, Any]:
+    """Return lightweight metadata for a sample dataset.
+
+    Array-valued response data and simulation parameters are omitted, making this
+    suitable for discovery interfaces that do not need response-matrix copies.
+    Loading metadata also warms the process-local dataset cache.
+
+    Parameters
+    ----------
+    name : str
+        Dataset name. Matching is case-insensitive and ignores surrounding space.
+
+    Returns
+    -------
+    dict
+        Dataset name and non-array metadata such as description, dimensions,
+        item names, and source.
+    """
+    canonical_name = _resolve_dataset_name(name)
+    prototype = _load_dataset_prototype(canonical_name)
+    metadata = {
+        key: value
+        for key, value in prototype.items()
+        if key != "data" and not isinstance(value, np.ndarray)
+    }
+    return {
+        "name": canonical_name,
+        **_clone_dataset_value(metadata, copy_arrays=True),
+    }
 
 
 def list_datasets() -> list[str]:
-    """List available dataset names."""
+    """List available dataset names in stable display order."""
     return list(_DATASET_LOADERS.keys())
 
 
@@ -734,7 +834,7 @@ def _load_slf() -> dict[str, Any]:
 
 def __getattr__(name: str) -> dict[str, Any]:
     if name in _DATASET_LOADERS:
-        dataset = _DATASET_LOADERS[name]()
+        dataset = load_dataset(name)
         globals()[name] = dataset
         return dataset
     raise AttributeError(f"module 'mirt.utils.datasets' has no attribute '{name}'")

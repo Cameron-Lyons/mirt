@@ -17,6 +17,7 @@ Core Functions
    dif
    load_dataset
    list_datasets
+   describe_dataset
 
 Models
 ------
