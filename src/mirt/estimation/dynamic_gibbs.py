@@ -239,23 +239,24 @@ class BKTGibbsSampler:
         """Forward-filtering backward-sampling for hidden states."""
         n_trials = len(responses)
 
-        alpha, scaling = model.forward(responses, skill_assignments)
+        alpha, _ = model.forward(responses, skill_assignments)
 
         states = np.zeros(n_trials, dtype=np.int32)
 
-        p_learned = alpha[n_trials - 1, 1]
-        states[n_trials - 1] = int(rng.random() < p_learned)
+        for skill_idx, trial_indices in enumerate(
+            model._skill_trials(skill_assignments)
+        ):
+            if len(trial_indices) == 0:
+                continue
 
-        for t in range(n_trials - 2, -1, -1):
-            skill_idx = skill_assignments[t + 1]
-            T = model.transition_matrix(skill_idx)
+            last_trial = int(trial_indices[-1])
+            states[last_trial] = int(rng.random() < alpha[last_trial, 1])
+            transition = model.transition_matrix(skill_idx)
 
-            p_state = np.zeros(2)
-            for s in range(2):
-                p_state[s] = alpha[t, s] * T[s, states[t + 1]]
-
-            p_state = p_state / (p_state.sum() + 1e-300)
-            states[t] = int(rng.random() < p_state[1])
+            for trial, next_trial in zip(trial_indices[-2::-1], trial_indices[:0:-1]):
+                p_state = alpha[trial] * transition[:, states[next_trial]]
+                p_state /= p_state.sum() + 1e-300
+                states[trial] = int(rng.random() < p_state[1])
 
         return states
 

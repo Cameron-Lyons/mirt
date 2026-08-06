@@ -45,8 +45,23 @@ class BKTModel:
     p_guess: NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.n_skills, bool)
+            or not isinstance(self.n_skills, (int, np.integer))
+            or self.n_skills < 1
+        ):
+            raise ValueError("n_skills must be a positive integer")
+
         if self.skill_names is None:
             self.skill_names = [f"Skill_{i}" for i in range(self.n_skills)]
+        else:
+            self.skill_names = list(self.skill_names)
+            if len(self.skill_names) != self.n_skills:
+                raise ValueError("skill_names length must match n_skills")
+            if any(not isinstance(name, str) or not name for name in self.skill_names):
+                raise ValueError("skill_names must contain non-empty strings")
+            if len(set(self.skill_names)) != len(self.skill_names):
+                raise ValueError("skill_names must be unique")
 
         if self.p_init is None:
             self.p_init = np.full(self.n_skills, 0.3)
@@ -62,6 +77,75 @@ class BKTModel:
             self.p_slip = np.full(self.n_skills, 0.1)
         if self.p_guess is None:
             self.p_guess = np.full(self.n_skills, 0.2)
+
+        for parameter_name in (
+            "p_init",
+            "p_learn",
+            "p_forget",
+            "p_slip",
+            "p_guess",
+        ):
+            values = np.asarray(getattr(self, parameter_name), dtype=np.float64)
+            if values.shape != (self.n_skills,):
+                raise ValueError(f"{parameter_name} must have shape ({self.n_skills},)")
+            if not np.all(np.isfinite(values)) or np.any((values < 0) | (values > 1)):
+                raise ValueError(
+                    f"{parameter_name} values must be finite and in [0, 1]"
+                )
+            setattr(self, parameter_name, values.copy())
+
+        if not self.allow_forgetting and np.any(self.p_forget != 0):
+            raise ValueError("p_forget must be zero when allow_forgetting is False")
+
+    def _validate_sequence(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
+        """Validate and normalize a single observed trial sequence."""
+        responses = np.asarray(responses)
+        skill_assignments = np.asarray(skill_assignments)
+
+        if responses.ndim != 1 or skill_assignments.ndim != 1:
+            raise ValueError("responses and skill_assignments must be one-dimensional")
+        if len(responses) == 0:
+            raise ValueError("responses must contain at least one trial")
+        if len(responses) != len(skill_assignments):
+            raise ValueError("responses and skill_assignments must have equal length")
+        if not np.issubdtype(responses.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if not np.all(np.isin(responses, (-1, 0, 1))):
+            raise ValueError("responses must contain only -1, 0, or 1")
+        if not np.issubdtype(skill_assignments.dtype, np.integer):
+            raise ValueError("skill_assignments must contain integer values")
+        if np.any((skill_assignments < 0) | (skill_assignments >= self.n_skills)):
+            raise ValueError(f"skill_assignments must be in [0, {self.n_skills})")
+
+        return (
+            responses.astype(np.int_, copy=False),
+            skill_assignments.astype(np.int_, copy=False),
+        )
+
+    def _emission_pair(
+        self,
+        response: int,
+        skill_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return emission probabilities for unlearned and learned states."""
+        if response < 0:
+            return np.ones(2, dtype=np.float64)
+        if response == 1:
+            return np.array([self.p_guess[skill_idx], 1.0 - self.p_slip[skill_idx]])
+        return np.array([1.0 - self.p_guess[skill_idx], self.p_slip[skill_idx]])
+
+    def _skill_trials(
+        self, skill_assignments: NDArray[np.int_]
+    ) -> list[NDArray[np.int_]]:
+        """Return chronological trial indices for every modeled skill."""
+        return [
+            np.flatnonzero(skill_assignments == skill_idx)
+            for skill_idx in range(self.n_skills)
+        ]
 
     def transition_matrix(self, skill_idx: int) -> NDArray[np.float64]:
         """Get transition matrix for a skill.
@@ -85,13 +169,13 @@ class BKTModel:
         skill_idx: int,
     ) -> float:
         """Compute P(response | learned state)."""
-        p_s = self.p_slip[skill_idx]
-        p_g = self.p_guess[skill_idx]
-
-        if learned == 1:
-            return 1 - p_s if response == 1 else p_s
-        else:
-            return p_g if response == 1 else 1 - p_g
+        if response not in (-1, 0, 1):
+            raise ValueError("response must be -1, 0, or 1")
+        if learned not in (0, 1):
+            raise ValueError("learned must be 0 or 1")
+        if skill_idx < 0 or skill_idx >= self.n_skills:
+            raise IndexError(f"skill_idx must be in [0, {self.n_skills})")
+        return float(self._emission_pair(response, skill_idx)[learned])
 
     def forward(
         self,
@@ -112,38 +196,37 @@ class BKTModel:
         tuple
             (alpha, scaling) where alpha[t, s] = P(L_t = s | X_1:t)
         """
+        responses, skill_assignments = self._validate_sequence(
+            responses, skill_assignments
+        )
         n_trials = len(responses)
 
         alpha = np.zeros((n_trials, 2))
         scaling = np.zeros(n_trials)
 
-        skill_idx = skill_assignments[0]
-        p_0 = self.p_init[skill_idx]
+        for skill_idx, trial_indices in enumerate(
+            self._skill_trials(skill_assignments)
+        ):
+            if len(trial_indices) == 0:
+                continue
 
-        for s in range(2):
-            prior = p_0 if s == 1 else 1 - p_0
-            emission = self.emission_probability(responses[0], s, skill_idx)
-            alpha[0, s] = prior * emission
+            first_trial = int(trial_indices[0])
+            p_0 = self.p_init[skill_idx]
+            alpha[first_trial] = np.array([1.0 - p_0, p_0]) * self._emission_pair(
+                int(responses[first_trial]), skill_idx
+            )
+            scaling[first_trial] = np.sum(alpha[first_trial])
+            if scaling[first_trial] > 0:
+                alpha[first_trial] /= scaling[first_trial]
 
-        scaling[0] = np.sum(alpha[0])
-        if scaling[0] > 0:
-            alpha[0] /= scaling[0]
-
-        for t in range(1, n_trials):
-            skill_idx = skill_assignments[t]
-            T = self.transition_matrix(skill_idx)
-
-            for s in range(2):
-                alpha[t, s] = 0
-                for s_prev in range(2):
-                    alpha[t, s] += alpha[t - 1, s_prev] * T[s_prev, s]
-
-                emission = self.emission_probability(responses[t], s, skill_idx)
-                alpha[t, s] *= emission
-
-            scaling[t] = np.sum(alpha[t])
-            if scaling[t] > 0:
-                alpha[t] /= scaling[t]
+            transition = self.transition_matrix(skill_idx)
+            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+                alpha[trial] = (
+                    alpha[previous_trial] @ transition
+                ) * self._emission_pair(int(responses[trial]), skill_idx)
+                scaling[trial] = np.sum(alpha[trial])
+                if scaling[trial] > 0:
+                    alpha[trial] /= scaling[trial]
 
         return alpha, scaling
 
@@ -169,25 +252,31 @@ class BKTModel:
         NDArray
             beta[t, s] = P(X_{t+1:T} | L_t = s) (scaled)
         """
+        responses, skill_assignments = self._validate_sequence(
+            responses, skill_assignments
+        )
+        scaling = np.asarray(scaling, dtype=np.float64)
         n_trials = len(responses)
+        if scaling.shape != (n_trials,):
+            raise ValueError(f"scaling must have shape ({n_trials},)")
+        if not np.all(np.isfinite(scaling)) or np.any(scaling < 0):
+            raise ValueError("scaling values must be finite and non-negative")
 
         beta = np.zeros((n_trials, 2))
-        beta[n_trials - 1] = 1.0
 
-        for t in range(n_trials - 2, -1, -1):
-            skill_idx = skill_assignments[t + 1]
-            T = self.transition_matrix(skill_idx)
+        for skill_idx, trial_indices in enumerate(
+            self._skill_trials(skill_assignments)
+        ):
+            if len(trial_indices) == 0:
+                continue
+            beta[trial_indices[-1]] = 1.0
+            transition = self.transition_matrix(skill_idx)
 
-            for s in range(2):
-                beta[t, s] = 0
-                for s_next in range(2):
-                    emission = self.emission_probability(
-                        responses[t + 1], s_next, skill_idx
-                    )
-                    beta[t, s] += T[s, s_next] * emission * beta[t + 1, s_next]
-
-            if scaling[t + 1] > 0:
-                beta[t] /= scaling[t + 1]
+            for trial, next_trial in zip(trial_indices[-2::-1], trial_indices[:0:-1]):
+                emission = self._emission_pair(int(responses[next_trial]), skill_idx)
+                beta[trial] = transition @ (emission * beta[next_trial])
+                if scaling[next_trial] > 0:
+                    beta[trial] /= scaling[next_trial]
 
         return beta
 
@@ -241,40 +330,45 @@ class BKTModel:
         NDArray
             Most likely state sequence (n_trials,)
         """
+        responses, skill_assignments = self._validate_sequence(
+            responses, skill_assignments
+        )
         n_trials = len(responses)
 
         delta = np.zeros((n_trials, 2))
         psi = np.zeros((n_trials, 2), dtype=int)
 
-        skill_idx = skill_assignments[0]
-        p_0 = self.p_init[skill_idx]
-
-        for s in range(2):
-            prior = np.log(p_0 + 1e-300) if s == 1 else np.log(1 - p_0 + 1e-300)
-            emission = np.log(
-                self.emission_probability(responses[0], s, skill_idx) + 1e-300
-            )
-            delta[0, s] = prior + emission
-
-        for t in range(1, n_trials):
-            skill_idx = skill_assignments[t]
-            T = self.transition_matrix(skill_idx)
-
-            for s in range(2):
-                candidates = delta[t - 1] + np.log(T[:, s] + 1e-300)
-                psi[t, s] = np.argmax(candidates)
-                delta[t, s] = candidates[psi[t, s]]
-
-                emission = np.log(
-                    self.emission_probability(responses[t], s, skill_idx) + 1e-300
-                )
-                delta[t, s] += emission
-
         path = np.zeros(n_trials, dtype=int)
-        path[n_trials - 1] = np.argmax(delta[n_trials - 1])
 
-        for t in range(n_trials - 2, -1, -1):
-            path[t] = psi[t + 1, path[t + 1]]
+        for skill_idx, trial_indices in enumerate(
+            self._skill_trials(skill_assignments)
+        ):
+            if len(trial_indices) == 0:
+                continue
+            first_trial = int(trial_indices[0])
+            p_0 = self.p_init[skill_idx]
+            prior = np.array([1.0 - p_0, p_0])
+            delta[first_trial] = np.log(prior + 1e-300) + np.log(
+                self._emission_pair(int(responses[first_trial]), skill_idx) + 1e-300
+            )
+
+            transition = self.transition_matrix(skill_idx)
+            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+                for state in range(2):
+                    candidates = delta[previous_trial] + np.log(
+                        transition[:, state] + 1e-300
+                    )
+                    psi[trial, state] = int(np.argmax(candidates))
+                    delta[trial, state] = candidates[psi[trial, state]]
+                delta[trial] += np.log(
+                    self._emission_pair(int(responses[trial]), skill_idx) + 1e-300
+                )
+
+            path[trial_indices[-1]] = int(np.argmax(delta[trial_indices[-1]]))
+            for previous_trial, trial in zip(
+                trial_indices[-2::-1], trial_indices[:0:-1]
+            ):
+                path[previous_trial] = psi[trial, path[trial]]
 
         return path
 
@@ -300,6 +394,65 @@ class BKTModel:
         gamma, _ = self.forward_backward(responses, skill_assignments)
         return float(gamma[-1, 1])
 
+    def predict_mastery_by_skill(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Return the latest mastery probability for every modeled skill.
+
+        Skills without observations retain their initial mastery probability.
+        Missing responses advance no evidence but retain their place in the
+        per-skill opportunity sequence.
+        """
+        responses, skill_assignments = self._validate_sequence(
+            responses, skill_assignments
+        )
+        gamma, _ = self.forward_backward(responses, skill_assignments)
+        mastery = self.p_init.copy()
+        for skill_idx, trial_indices in enumerate(
+            self._skill_trials(skill_assignments)
+        ):
+            if len(trial_indices) > 0:
+                mastery[skill_idx] = gamma[trial_indices[-1], 1]
+        return mastery
+
+    def predict_mastery_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Return per-skill mastery probabilities for multiple persons.
+
+        ``skill_assignments`` may be a shared one-dimensional trial layout or a
+        person-specific matrix with the same shape as ``responses``.
+        """
+        responses = np.asarray(responses)
+        skill_assignments = np.asarray(skill_assignments)
+        if responses.ndim != 2:
+            raise ValueError("responses must have shape (n_persons, n_trials)")
+        if skill_assignments.ndim == 1:
+            if len(skill_assignments) != responses.shape[1]:
+                raise ValueError(
+                    "shared skill_assignments length must match the number of trials"
+                )
+        elif skill_assignments.shape != responses.shape:
+            raise ValueError(
+                "skill_assignments must be one-dimensional or match responses"
+            )
+
+        mastery = np.empty((responses.shape[0], self.n_skills), dtype=np.float64)
+        for person_idx, person_responses in enumerate(responses):
+            person_skills = (
+                skill_assignments
+                if skill_assignments.ndim == 1
+                else skill_assignments[person_idx]
+            )
+            mastery[person_idx] = self.predict_mastery_by_skill(
+                person_responses, person_skills
+            )
+        return mastery
+
     def simulate(
         self,
         n_persons: int,
@@ -322,6 +475,19 @@ class BKTModel:
         tuple
             (responses, skill_assignments, learning_states)
         """
+        if (
+            isinstance(n_persons, bool)
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        if (
+            isinstance(n_trials_per_skill, bool)
+            or not isinstance(n_trials_per_skill, (int, np.integer))
+            or n_trials_per_skill < 1
+        ):
+            raise ValueError("n_trials_per_skill must be a positive integer")
+
         rng = np.random.default_rng(seed)
 
         n_trials = n_trials_per_skill * self.n_skills
@@ -334,25 +500,27 @@ class BKTModel:
             end = (j + 1) * n_trials_per_skill
             skill_assignments[start:end] = j
 
-        for i in range(n_persons):
-            for j in range(self.n_skills):
-                start = j * n_trials_per_skill
-                state = int(rng.random() < self.p_init[j])
+        for skill_idx in range(self.n_skills):
+            start = skill_idx * n_trials_per_skill
+            states = rng.random(n_persons) < self.p_init[skill_idx]
 
-                for t_rel in range(n_trials_per_skill):
-                    t = start + t_rel
-                    learning_states[i, t] = state
+            for relative_trial in range(n_trials_per_skill):
+                trial = start + relative_trial
+                learning_states[:, trial] = states
+                p_correct = np.where(
+                    states,
+                    1.0 - self.p_slip[skill_idx],
+                    self.p_guess[skill_idx],
+                )
+                responses[:, trial] = rng.random(n_persons) < p_correct
 
-                    if state == 1:
-                        p_correct = 1 - self.p_slip[j]
-                    else:
-                        p_correct = self.p_guess[j]
-                    responses[i, t] = int(rng.random() < p_correct)
-
-                    if state == 0:
-                        state = int(rng.random() < self.p_learn[j])
-                    else:
-                        state = int(rng.random() >= self.p_forget[j])
+                if relative_trial < n_trials_per_skill - 1:
+                    transition_draws = rng.random(n_persons)
+                    states = np.where(
+                        states,
+                        transition_draws >= self.p_forget[skill_idx],
+                        transition_draws < self.p_learn[skill_idx],
+                    )
 
         return responses, skill_assignments, learning_states
 

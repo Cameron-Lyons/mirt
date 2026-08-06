@@ -11,6 +11,7 @@ powered by a Rust backend for computational efficiency.
    installation
    quickstart
    guides/cat
+   guides/dynamic
    guides/dif
    guides/plotting
    guides/multigroup

@@ -46,49 +46,20 @@ pub fn bkt_forward<'py>(
     let p_slip = p_slip.as_array();
     let p_guess = p_guess.as_array();
 
-    let n_trials = responses.len();
-    let mut alpha = Array2::zeros((n_trials, 2));
-    let mut scaling = Array1::zeros(n_trials);
+    let (alpha, scaling) = forward_single(
+        responses.as_slice().unwrap(),
+        skills.as_slice().unwrap(),
+        p_init.as_slice().unwrap(),
+        p_learn.as_slice().unwrap(),
+        p_forget.as_slice().unwrap(),
+        p_slip.as_slice().unwrap(),
+        p_guess.as_slice().unwrap(),
+    );
 
-    let skill_idx = skills[0] as usize;
-    let p_0 = p_init[skill_idx];
-
-    for s in 0..2 {
-        let prior = if s == 1 { p_0 } else { 1.0 - p_0 };
-        let emission = compute_emission(responses[0], s, skill_idx, &p_slip, &p_guess);
-        alpha[[0, s]] = prior * emission;
-    }
-
-    scaling[0] = alpha[[0, 0]] + alpha[[0, 1]];
-    if scaling[0] > EPSILON {
-        alpha[[0, 0]] /= scaling[0];
-        alpha[[0, 1]] /= scaling[0];
-    }
-
-    for t in 1..n_trials {
-        let skill_idx = skills[t] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        for s in 0..2 {
-            let mut sum = 0.0;
-            for s_prev in 0..2 {
-                let trans = transition_prob(s_prev, s, p_l, p_f);
-                sum += alpha[[t - 1, s_prev]] * trans;
-            }
-
-            let emission = compute_emission(responses[t], s, skill_idx, &p_slip, &p_guess);
-            alpha[[t, s]] = sum * emission;
-        }
-
-        scaling[t] = alpha[[t, 0]] + alpha[[t, 1]];
-        if scaling[t] > EPSILON {
-            alpha[[t, 0]] /= scaling[t];
-            alpha[[t, 1]] /= scaling[t];
-        }
-    }
-
-    (alpha.to_pyarray(py), scaling.to_pyarray(py))
+    (
+        alpha.to_pyarray(py),
+        Array1::from_vec(scaling).to_pyarray(py),
+    )
 }
 
 /// BKT backward algorithm for a single person.
@@ -112,35 +83,16 @@ pub fn bkt_backward<'py>(
     let p_slip = p_slip.as_array();
     let p_guess = p_guess.as_array();
 
-    let n_trials = responses.len();
-    let mut beta = Array2::zeros((n_trials, 2));
-
-    beta[[n_trials - 1, 0]] = 1.0;
-    beta[[n_trials - 1, 1]] = 1.0;
-
-    for t in (0..n_trials - 1).rev() {
-        let skill_idx = skills[t + 1] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        for s in 0..2 {
-            let mut sum = 0.0;
-            for s_next in 0..2 {
-                let trans = transition_prob(s, s_next, p_l, p_f);
-                let emission =
-                    compute_emission(responses[t + 1], s_next, skill_idx, &p_slip, &p_guess);
-                sum += trans * emission * beta[[t + 1, s_next]];
-            }
-            beta[[t, s]] = sum;
-        }
-
-        if scaling[t + 1] > EPSILON {
-            beta[[t, 0]] /= scaling[t + 1];
-            beta[[t, 1]] /= scaling[t + 1];
-        }
-    }
-
-    beta.to_pyarray(py)
+    backward_single(
+        responses.as_slice().unwrap(),
+        skills.as_slice().unwrap(),
+        scaling.as_slice().unwrap(),
+        p_learn.as_slice().unwrap(),
+        p_forget.as_slice().unwrap(),
+        p_slip.as_slice().unwrap(),
+        p_guess.as_slice().unwrap(),
+    )
+    .to_pyarray(py)
 }
 
 /// BKT forward-backward for multiple persons in parallel.
@@ -234,36 +186,29 @@ fn forward_single(
     let n_trials = responses.len();
     let mut alpha = Array2::zeros((n_trials, 2));
     let mut scaling = vec![0.0; n_trials];
+    let mut previous_trial = vec![None; p_init.len()];
 
-    let skill_idx = skills[0] as usize;
-    let p_0 = p_init[skill_idx];
-
-    for s in 0..2 {
-        let prior = if s == 1 { p_0 } else { 1.0 - p_0 };
-        let emission = compute_emission_slice(responses[0], s, skill_idx, p_slip, p_guess);
-        alpha[[0, s]] = prior * emission;
-    }
-
-    scaling[0] = alpha[[0, 0]] + alpha[[0, 1]];
-    if scaling[0] > EPSILON {
-        alpha[[0, 0]] /= scaling[0];
-        alpha[[0, 1]] /= scaling[0];
-    }
-
-    for t in 1..n_trials {
+    for t in 0..n_trials {
         let skill_idx = skills[t] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        for s in 0..2 {
-            let mut sum = 0.0;
-            for s_prev in 0..2 {
-                let trans = transition_prob(s_prev, s, p_l, p_f);
-                sum += alpha[[t - 1, s_prev]] * trans;
+        if let Some(previous) = previous_trial[skill_idx] {
+            let p_l = p_learn[skill_idx];
+            let p_f = p_forget[skill_idx];
+            for state in 0..2 {
+                let mut predicted = 0.0;
+                for previous_state in 0..2 {
+                    predicted += alpha[[previous, previous_state]]
+                        * transition_prob(previous_state, state, p_l, p_f);
+                }
+                alpha[[t, state]] = predicted
+                    * compute_emission_slice(responses[t], state, skill_idx, p_slip, p_guess);
             }
-
-            let emission = compute_emission_slice(responses[t], s, skill_idx, p_slip, p_guess);
-            alpha[[t, s]] = sum * emission;
+        } else {
+            let p_0 = p_init[skill_idx];
+            for state in 0..2 {
+                let prior = if state == 1 { p_0 } else { 1.0 - p_0 };
+                alpha[[t, state]] =
+                    prior * compute_emission_slice(responses[t], state, skill_idx, p_slip, p_guess);
+            }
         }
 
         scaling[t] = alpha[[t, 0]] + alpha[[t, 1]];
@@ -271,6 +216,7 @@ fn forward_single(
             alpha[[t, 0]] /= scaling[t];
             alpha[[t, 1]] /= scaling[t];
         }
+        previous_trial[skill_idx] = Some(t);
     }
 
     (alpha, scaling)
@@ -287,33 +233,157 @@ fn backward_single(
 ) -> Array2<f64> {
     let n_trials = responses.len();
     let mut beta = Array2::zeros((n_trials, 2));
+    let mut next_trial = vec![None; p_learn.len()];
 
-    beta[[n_trials - 1, 0]] = 1.0;
-    beta[[n_trials - 1, 1]] = 1.0;
-
-    for t in (0..n_trials - 1).rev() {
-        let skill_idx = skills[t + 1] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        for s in 0..2 {
-            let mut sum = 0.0;
-            for s_next in 0..2 {
-                let trans = transition_prob(s, s_next, p_l, p_f);
-                let emission =
-                    compute_emission_slice(responses[t + 1], s_next, skill_idx, p_slip, p_guess);
-                sum += trans * emission * beta[[t + 1, s_next]];
+    for t in (0..n_trials).rev() {
+        let skill_idx = skills[t] as usize;
+        if let Some(next) = next_trial[skill_idx] {
+            let p_l = p_learn[skill_idx];
+            let p_f = p_forget[skill_idx];
+            for state in 0..2 {
+                let mut smoothed = 0.0;
+                for next_state in 0..2 {
+                    smoothed += transition_prob(state, next_state, p_l, p_f)
+                        * compute_emission_slice(
+                            responses[next],
+                            next_state,
+                            skill_idx,
+                            p_slip,
+                            p_guess,
+                        )
+                        * beta[[next, next_state]];
+                }
+                beta[[t, state]] = smoothed;
             }
-            beta[[t, s]] = sum;
+            if scaling[next] > EPSILON {
+                beta[[t, 0]] /= scaling[next];
+                beta[[t, 1]] /= scaling[next];
+            }
+        } else {
+            beta[[t, 0]] = 1.0;
+            beta[[t, 1]] = 1.0;
         }
-
-        if scaling[t + 1] > EPSILON {
-            beta[[t, 0]] /= scaling[t + 1];
-            beta[[t, 1]] /= scaling[t + 1];
-        }
+        next_trial[skill_idx] = Some(t);
     }
 
     beta
+}
+
+fn viterbi_single(
+    responses: &[i32],
+    skills: &[i32],
+    p_init: &[f64],
+    p_learn: &[f64],
+    p_forget: &[f64],
+    p_slip: &[f64],
+    p_guess: &[f64],
+) -> Vec<i32> {
+    let n_trials = responses.len();
+    let mut delta = Array2::zeros((n_trials, 2));
+    let mut psi = Array2::<usize>::zeros((n_trials, 2));
+    let mut previous_trial = vec![None; p_init.len()];
+    let mut previous_for_trial = vec![None; n_trials];
+    let mut last_trial = vec![None; p_init.len()];
+
+    for t in 0..n_trials {
+        let skill_idx = skills[t] as usize;
+        if let Some(previous) = previous_trial[skill_idx] {
+            for state in 0..2 {
+                let mut best_value = f64::NEG_INFINITY;
+                let mut best_previous = 0;
+                for previous_state in 0..2 {
+                    let transition = (transition_prob(
+                        previous_state,
+                        state,
+                        p_learn[skill_idx],
+                        p_forget[skill_idx],
+                    ) + EPSILON)
+                        .ln();
+                    let value = delta[[previous, previous_state]] + transition;
+                    if value > best_value {
+                        best_value = value;
+                        best_previous = previous_state;
+                    }
+                }
+                psi[[t, state]] = best_previous;
+                delta[[t, state]] = best_value;
+            }
+        } else {
+            let p_0 = p_init[skill_idx];
+            delta[[t, 0]] = (1.0 - p_0 + EPSILON).ln();
+            delta[[t, 1]] = (p_0 + EPSILON).ln();
+        }
+
+        for state in 0..2 {
+            delta[[t, state]] +=
+                (compute_emission_slice(responses[t], state, skill_idx, p_slip, p_guess) + EPSILON)
+                    .ln();
+        }
+        previous_for_trial[t] = previous_trial[skill_idx];
+        previous_trial[skill_idx] = Some(t);
+        last_trial[skill_idx] = Some(t);
+    }
+
+    let mut path = vec![0i32; n_trials];
+    for last in last_trial.into_iter().flatten() {
+        path[last] = if delta[[last, 1]] > delta[[last, 0]] {
+            1
+        } else {
+            0
+        };
+        let mut current = last;
+        while let Some(previous) = previous_for_trial[current] {
+            path[previous] = psi[[current, path[current] as usize]] as i32;
+            current = previous;
+        }
+    }
+    path
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ffbs_single<R: Rng + ?Sized>(
+    responses: &[i32],
+    skills: &[i32],
+    p_init: &[f64],
+    p_learn: &[f64],
+    p_forget: &[f64],
+    p_slip: &[f64],
+    p_guess: &[f64],
+    rng: &mut R,
+) -> Vec<i32> {
+    let (alpha, _) = forward_single(
+        responses, skills, p_init, p_learn, p_forget, p_slip, p_guess,
+    );
+    let n_trials = responses.len();
+    let mut states = vec![0i32; n_trials];
+    let mut next_trial = vec![None; p_init.len()];
+
+    for t in (0..n_trials).rev() {
+        let skill_idx = skills[t] as usize;
+        let learned_probability = if let Some(next) = next_trial[skill_idx] {
+            let next_state = states[next] as usize;
+            let mut state_probability = [0.0; 2];
+            for state in 0..2 {
+                state_probability[state] = alpha[[t, state]]
+                    * transition_prob(state, next_state, p_learn[skill_idx], p_forget[skill_idx]);
+            }
+            let total = state_probability[0] + state_probability[1];
+            if total > EPSILON {
+                state_probability[1] / total
+            } else {
+                alpha[[t, 1]]
+            }
+        } else {
+            alpha[[t, 1]]
+        };
+        states[t] = if rng.random::<f64>() < learned_probability {
+            1
+        } else {
+            0
+        };
+        next_trial[skill_idx] = Some(t);
+    }
+    states
 }
 
 #[inline]
@@ -324,31 +394,6 @@ fn transition_prob(from: usize, to: usize, p_learn: f64, p_forget: f64) -> f64 {
         (1, 0) => p_forget,
         (1, 1) => 1.0 - p_forget,
         _ => 0.0,
-    }
-}
-
-#[inline]
-fn compute_emission(
-    response: i32,
-    learned: usize,
-    skill_idx: usize,
-    p_slip: &ndarray::ArrayView1<f64>,
-    p_guess: &ndarray::ArrayView1<f64>,
-) -> f64 {
-    if response < 0 {
-        return 1.0;
-    }
-
-    if learned == 1 {
-        if response == 1 {
-            1.0 - p_slip[skill_idx]
-        } else {
-            p_slip[skill_idx]
-        }
-    } else if response == 1 {
-        p_guess[skill_idx]
-    } else {
-        1.0 - p_guess[skill_idx]
     }
 }
 
@@ -398,61 +443,16 @@ pub fn bkt_viterbi<'py>(
     let p_slip = p_slip.as_array();
     let p_guess = p_guess.as_array();
 
-    let n_trials = responses.len();
-    let mut delta = Array2::zeros((n_trials, 2));
-    let mut psi = Array2::<usize>::zeros((n_trials, 2));
-
-    let skill_idx = skills[0] as usize;
-    let p_0 = p_init[skill_idx];
-
-    for s in 0..2 {
-        let prior = if s == 1 {
-            (p_0 + EPSILON).ln()
-        } else {
-            (1.0 - p_0 + EPSILON).ln()
-        };
-        let emission =
-            (compute_emission(responses[0], s, skill_idx, &p_slip, &p_guess) + EPSILON).ln();
-        delta[[0, s]] = prior + emission;
-    }
-
-    for t in 1..n_trials {
-        let skill_idx = skills[t] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        for s in 0..2 {
-            let mut best_val = f64::NEG_INFINITY;
-            let mut best_prev = 0;
-
-            for s_prev in 0..2 {
-                let trans = (transition_prob(s_prev, s, p_l, p_f) + EPSILON).ln();
-                let val = delta[[t - 1, s_prev]] + trans;
-                if val > best_val {
-                    best_val = val;
-                    best_prev = s_prev;
-                }
-            }
-
-            psi[[t, s]] = best_prev;
-            let emission =
-                (compute_emission(responses[t], s, skill_idx, &p_slip, &p_guess) + EPSILON).ln();
-            delta[[t, s]] = best_val + emission;
-        }
-    }
-
-    let mut path = Array1::<i32>::zeros(n_trials);
-    path[n_trials - 1] = if delta[[n_trials - 1, 1]] > delta[[n_trials - 1, 0]] {
-        1
-    } else {
-        0
-    };
-
-    for t in (0..n_trials - 1).rev() {
-        path[t] = psi[[t + 1, path[t + 1] as usize]] as i32;
-    }
-
-    path.to_pyarray(py)
+    Array1::from_vec(viterbi_single(
+        responses.as_slice().unwrap(),
+        skills.as_slice().unwrap(),
+        p_init.as_slice().unwrap(),
+        p_learn.as_slice().unwrap(),
+        p_forget.as_slice().unwrap(),
+        p_slip.as_slice().unwrap(),
+        p_guess.as_slice().unwrap(),
+    ))
+    .to_pyarray(py)
 }
 
 /// Compute log-likelihood for longitudinal IRT data.
@@ -565,9 +565,8 @@ pub fn bkt_ffbs<'py>(
     let p_slip = p_slip.as_array();
     let p_guess = p_guess.as_array();
 
-    let n_trials = responses.len();
-
-    let (alpha, _scaling) = forward_single(
+    let mut rng = StdRng::seed_from_u64(seed);
+    Array1::from_vec(ffbs_single(
         responses.as_slice().unwrap(),
         skills.as_slice().unwrap(),
         p_init.as_slice().unwrap(),
@@ -575,46 +574,9 @@ pub fn bkt_ffbs<'py>(
         p_forget.as_slice().unwrap(),
         p_slip.as_slice().unwrap(),
         p_guess.as_slice().unwrap(),
-    );
-
-    let mut rng = StdRng::seed_from_u64(seed);
-
-    let mut states = Array1::<i32>::zeros(n_trials);
-
-    let p_learned = alpha[[n_trials - 1, 1]];
-    states[n_trials - 1] = if rng.random::<f64>() < p_learned {
-        1
-    } else {
-        0
-    };
-
-    for t in (0..n_trials - 1).rev() {
-        let skill_idx = skills[t + 1] as usize;
-        let p_l = p_learn[skill_idx];
-        let p_f = p_forget[skill_idx];
-
-        let next_state = states[t + 1] as usize;
-
-        let mut p_state = [0.0; 2];
-        for s in 0..2 {
-            let trans = transition_prob(s, next_state, p_l, p_f);
-            p_state[s] = alpha[[t, s]] * trans;
-        }
-
-        let sum = p_state[0] + p_state[1];
-        if sum > EPSILON {
-            p_state[0] /= sum;
-            p_state[1] /= sum;
-        }
-
-        states[t] = if rng.random::<f64>() < p_state[1] {
-            1
-        } else {
-            0
-        };
-    }
-
-    states.to_pyarray(py)
+        &mut rng,
+    ))
+    .to_pyarray(py)
 }
 
 /// Batch FFBS for multiple persons.
@@ -649,7 +611,7 @@ pub fn bkt_ffbs_batch<'py>(
 
             let person_responses: Vec<i32> = (0..n_trials).map(|t| responses[[i, t]]).collect();
 
-            let (alpha, _scaling) = forward_single(
+            ffbs_single(
                 &person_responses,
                 skills.as_slice().unwrap(),
                 p_init.as_slice().unwrap(),
@@ -657,44 +619,8 @@ pub fn bkt_ffbs_batch<'py>(
                 p_forget.as_slice().unwrap(),
                 p_slip.as_slice().unwrap(),
                 p_guess.as_slice().unwrap(),
-            );
-
-            let mut states = vec![0i32; n_trials];
-
-            let p_learned = alpha[[n_trials - 1, 1]];
-            states[n_trials - 1] = if rng.random::<f64>() < p_learned {
-                1
-            } else {
-                0
-            };
-
-            for t in (0..n_trials - 1).rev() {
-                let skill_idx = skills[t + 1] as usize;
-                let p_l = p_learn[skill_idx];
-                let p_f = p_forget[skill_idx];
-
-                let next_state = states[t + 1] as usize;
-
-                let mut p_state = [0.0; 2];
-                for s in 0..2 {
-                    let trans = transition_prob(s, next_state, p_l, p_f);
-                    p_state[s] = alpha[[t, s]] * trans;
-                }
-
-                let sum = p_state[0] + p_state[1];
-                if sum > EPSILON {
-                    p_state[0] /= sum;
-                    p_state[1] /= sum;
-                }
-
-                states[t] = if rng.random::<f64>() < p_state[1] {
-                    1
-                } else {
-                    0
-                };
-            }
-
-            states
+                &mut rng,
+            )
         })
         .collect();
 
