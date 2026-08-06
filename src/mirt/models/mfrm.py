@@ -7,16 +7,14 @@ This module provides:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Self
+from typing import Literal, Self
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt._core import sigmoid
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass
@@ -77,13 +75,48 @@ class Facet:
     is_anchored: bool = True
     anchor_value: float = 0.0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name.strip():
+            raise ValueError("facet name must not be empty")
+        if (
+            isinstance(self.n_levels, (bool, np.bool_))
+            or not isinstance(self.n_levels, (int, np.integer))
+            or self.n_levels < 1
+        ):
+            raise ValueError("n_levels must be a positive integer")
+        self.n_levels = int(self.n_levels)
+        if isinstance(self.anchor_value, (bool, np.bool_)):
+            raise ValueError("anchor_value must be finite")
+        try:
+            self.anchor_value = float(self.anchor_value)
+        except (TypeError, ValueError) as error:
+            raise ValueError("anchor_value must be finite") from error
+        if not np.isfinite(self.anchor_value):
+            raise ValueError("anchor_value must be finite")
+
         if self.labels is None:
             self.labels = [f"{self.name}_{i}" for i in range(self.n_levels)]
+        else:
+            self.labels = list(self.labels)
         if len(self.labels) != self.n_levels:
             raise ValueError(
                 f"labels length ({len(self.labels)}) must match n_levels ({self.n_levels})"
             )
+        if any(not isinstance(label, str) or not label for label in self.labels):
+            raise ValueError("facet labels must be non-empty strings")
+        if len(set(self.labels)) != self.n_levels:
+            raise ValueError("facet labels must be unique")
+
+
+def _copy_facet(facet: Facet) -> Facet:
+    """Return an independent copy of a validated facet definition."""
+    return Facet(
+        name=facet.name,
+        n_levels=facet.n_levels,
+        labels=facet.labels.copy() if facet.labels is not None else None,
+        is_anchored=facet.is_anchored,
+        anchor_value=facet.anchor_value,
+    )
 
 
 class ManyFacetRaschModel:
@@ -131,19 +164,35 @@ class ManyFacetRaschModel:
         facets: list[Facet],
         item_names: list[str] | None = None,
     ) -> None:
-        if n_items < 1:
-            raise ValueError("n_items must be at least 1")
+        if (
+            isinstance(n_items, (bool, np.bool_))
+            or not isinstance(n_items, (int, np.integer))
+            or n_items < 1
+        ):
+            raise ValueError("n_items must be at least 1 and an integer")
 
-        self._n_items = n_items
-        self._facets = list(facets)
-        self._item_names = item_names or [f"Item_{i}" for i in range(n_items)]
+        self._n_items = int(n_items)
+        facet_definitions = list(facets)
+        if any(not isinstance(facet, Facet) for facet in facet_definitions):
+            raise TypeError("facets must contain Facet instances")
+        self._facets = [_copy_facet(facet) for facet in facet_definitions]
+        facet_names = [facet.name for facet in self._facets]
+        if len(set(facet_names)) != len(facet_names):
+            raise ValueError("facet names must be unique")
 
-        if len(self._item_names) != n_items:
+        self._item_names = (
+            list(item_names)
+            if item_names is not None
+            else [f"Item_{i}" for i in range(self._n_items)]
+        )
+
+        if len(self._item_names) != self._n_items:
             raise ValueError(
-                f"item_names length ({len(self._item_names)}) must match n_items ({n_items})"
+                f"item_names length ({len(self._item_names)}) must match "
+                f"n_items ({self._n_items})"
             )
 
-        self._item_difficulty = np.zeros(n_items)
+        self._item_difficulty = np.zeros(self._n_items)
         self._facet_parameters: dict[str, NDArray[np.float64]] = {}
         for facet in self._facets:
             self._facet_parameters[facet.name] = np.zeros(facet.n_levels)
@@ -164,7 +213,7 @@ class ManyFacetRaschModel:
 
     @property
     def facets(self) -> list[Facet]:
-        return list(self._facets)
+        return [_copy_facet(facet) for facet in self._facets]
 
     @property
     def item_names(self) -> list[str]:
@@ -182,7 +231,7 @@ class ManyFacetRaschModel:
         """Get facet by name."""
         for facet in self._facets:
             if facet.name == name:
-                return facet
+                return _copy_facet(facet)
         raise ValueError(f"Unknown facet: {name}")
 
     def set_item_difficulty(self, difficulty: NDArray[np.float64]) -> Self:
@@ -191,7 +240,9 @@ class ManyFacetRaschModel:
             raise ValueError(
                 f"difficulty shape {difficulty.shape} != ({self._n_items},)"
             )
-        self._item_difficulty = difficulty
+        if not np.all(np.isfinite(difficulty)):
+            raise ValueError("difficulty values must be finite")
+        self._item_difficulty = difficulty.copy()
         return self
 
     def set_facet_parameters(
@@ -206,18 +257,103 @@ class ManyFacetRaschModel:
             raise ValueError(
                 f"parameters shape {parameters.shape} != ({facet.n_levels},)"
             )
+        if not np.all(np.isfinite(parameters)):
+            raise ValueError("facet parameters must be finite")
 
         if facet.is_anchored:
             parameters = parameters - np.mean(parameters) + facet.anchor_value
 
-        self._facet_parameters[facet_name] = parameters
+        self._facet_parameters[facet_name] = parameters.copy()
         return self
+
+    @staticmethod
+    def _prepare_theta(theta: ArrayLike) -> NDArray[np.float64]:
+        values = np.asarray(theta, dtype=np.float64)
+        if values.ndim == 0:
+            values = values.reshape(1)
+        if values.ndim != 1:
+            raise ValueError("theta must be a scalar or one-dimensional array")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("theta values must be finite")
+        return values
+
+    def _validate_item_idx(self, item_idx: int) -> int:
+        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+            item_idx, (int, np.integer)
+        ):
+            raise TypeError("item_idx must be an integer")
+        index = int(item_idx)
+        if index < 0 or index >= self._n_items:
+            raise IndexError(f"item_idx {index} out of range [0, {self._n_items})")
+        return index
+
+    def _facet_effect(
+        self,
+        n_persons: int,
+        item_idx: int | None,
+        facet_indices: Mapping[str, ArrayLike] | None,
+    ) -> NDArray[np.float64]:
+        """Validate facet assignments and return their combined severity."""
+        provided = set(facet_indices or {})
+        expected = set(self.facet_names)
+        unknown = sorted(provided - expected)
+        missing = sorted(expected - provided)
+        if unknown:
+            raise ValueError(f"Unknown facet assignments: {', '.join(unknown)}")
+        if missing:
+            raise ValueError(f"Missing facet assignments: {', '.join(missing)}")
+
+        target_shape = (n_persons, self._n_items) if item_idx is None else (n_persons,)
+        effect = np.zeros(target_shape, dtype=np.float64)
+        if not expected:
+            return effect
+
+        assert facet_indices is not None
+        for facet in self._facets:
+            indices = np.asarray(facet_indices[facet.name])
+            if not np.issubdtype(indices.dtype, np.integer) or np.issubdtype(
+                indices.dtype, np.bool_
+            ):
+                raise TypeError(f"facet '{facet.name}' indices must be integers")
+
+            if indices.ndim == 0:
+                prepared_indices = indices
+            elif item_idx is None and indices.shape == (n_persons,):
+                prepared_indices = indices[:, None]
+            elif item_idx is None and indices.shape == (
+                n_persons,
+                self._n_items,
+            ):
+                prepared_indices = indices
+            elif item_idx is not None and indices.shape == (n_persons,):
+                prepared_indices = indices
+            elif item_idx is not None and indices.shape == (
+                n_persons,
+                self._n_items,
+            ):
+                prepared_indices = indices[:, item_idx]
+            else:
+                expected_shapes = (
+                    f"scalar, ({n_persons},), or ({n_persons}, {self._n_items})"
+                )
+                raise ValueError(
+                    f"facet '{facet.name}' indices must have shape {expected_shapes}; "
+                    f"got {indices.shape}"
+                )
+
+            if np.any((prepared_indices < 0) | (prepared_indices >= facet.n_levels)):
+                raise IndexError(
+                    f"facet '{facet.name}' index out of range [0, {facet.n_levels})"
+                )
+            effect += self._facet_parameters[facet.name][prepared_indices]
+
+        return effect
 
     def log_odds(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
-        facet_indices: dict[str, int],
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute log-odds for a response.
 
@@ -225,30 +361,39 @@ class ManyFacetRaschModel:
         ----------
         theta : ndarray
             Person abilities.
-        item_idx : int
-            Item index.
-        facet_indices : dict
-            Index for each facet (e.g., {'rater': 2, 'task': 0}).
+        item_idx : int, optional
+            Item index. If omitted, return log-odds for every item.
+        facet_indices : mapping
+            Assignment for every facet. Each value may be a scalar, a
+            person-level vector, or a person-by-item matrix.
 
         Returns
         -------
         ndarray
-            Log-odds of correct response.
+            Log-odds of correct response, with shape ``(n_persons,)`` for a
+            single item or ``(n_persons, n_items)`` for all items.
         """
-        theta = np.asarray(theta).ravel()
-        log_odds = theta - self._item_difficulty[item_idx]
+        theta_values = self._prepare_theta(theta)
+        validated_item_idx = (
+            self._validate_item_idx(item_idx) if item_idx is not None else None
+        )
+        facet_effect = self._facet_effect(
+            len(theta_values),
+            validated_item_idx,
+            facet_indices,
+        )
 
-        for facet_name, facet_idx in facet_indices.items():
-            if facet_name in self._facet_parameters:
-                log_odds = log_odds - self._facet_parameters[facet_name][facet_idx]
-
-        return log_odds
+        if validated_item_idx is not None:
+            return (
+                theta_values - self._item_difficulty[validated_item_idx] - facet_effect
+            )
+        return theta_values[:, None] - self._item_difficulty[None, :] - facet_effect
 
     def probability(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
-        facet_indices: dict[str, int],
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute response probability.
 
@@ -256,28 +401,37 @@ class ManyFacetRaschModel:
         ----------
         theta : ndarray
             Person abilities.
-        item_idx : int
-            Item index.
-        facet_indices : dict
-            Index for each facet.
+        item_idx : int, optional
+            Item index. If omitted, return probabilities for every item.
+        facet_indices : mapping
+            Scalar or batched assignment for every facet.
 
         Returns
         -------
         ndarray
-            Probability of correct response.
+            Probability of correct response, with shape ``(n_persons,)`` for
+            one item or ``(n_persons, n_items)`` for all items.
         """
         z = self.log_odds(theta, item_idx, facet_indices)
         return sigmoid(z)
 
     def information(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
-        facet_indices: dict[str, int],
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute Fisher information."""
         p = self.probability(theta, item_idx, facet_indices)
         return p * (1.0 - p)
+
+    def test_information(
+        self,
+        theta: ArrayLike,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return test information summed across all items."""
+        return np.sum(self.information(theta, None, facet_indices), axis=1)
 
     def copy(self) -> Self:
         new_model = ManyFacetRaschModel(
@@ -339,18 +493,26 @@ class PolytomousMFRM(ManyFacetRaschModel):
         category_structure: Literal["rating_scale", "partial_credit"] = "rating_scale",
         item_names: list[str] | None = None,
     ) -> None:
+        if (
+            isinstance(n_categories, (bool, np.bool_))
+            or not isinstance(n_categories, (int, np.integer))
+            or n_categories < 2
+        ):
+            raise ValueError("n_categories must be at least 2")
+        if category_structure not in {"rating_scale", "partial_credit"}:
+            raise ValueError(
+                "category_structure must be 'rating_scale' or 'partial_credit'"
+            )
+
         super().__init__(n_items=n_items, facets=facets, item_names=item_names)
 
-        if n_categories < 2:
-            raise ValueError("n_categories must be at least 2")
-
-        self._n_categories = n_categories
+        self._n_categories = int(n_categories)
         self._category_structure = category_structure
 
         if category_structure == "rating_scale":
-            self._thresholds = np.linspace(-1, 1, n_categories - 1)
+            self._thresholds = np.linspace(-1, 1, self._n_categories - 1)
         else:
-            self._thresholds = np.zeros((n_items, n_categories - 1))
+            self._thresholds = np.zeros((self._n_items, self._n_categories - 1))
 
     @property
     def n_categories(self) -> int:
@@ -374,16 +536,78 @@ class PolytomousMFRM(ManyFacetRaschModel):
 
         if thresholds.shape != expected_shape:
             raise ValueError(f"thresholds shape {thresholds.shape} != {expected_shape}")
+        if not np.all(np.isfinite(thresholds)):
+            raise ValueError("threshold values must be finite")
 
-        self._thresholds = thresholds
+        self._thresholds = thresholds.copy()
         return self
+
+    def _validate_category(self, category: int) -> int:
+        if isinstance(category, (bool, np.bool_)) or not isinstance(
+            category, (int, np.integer)
+        ):
+            raise TypeError("category must be an integer")
+        value = int(category)
+        if value < 0 or value >= self._n_categories:
+            raise IndexError(f"category {value} out of range [0, {self._n_categories})")
+        return value
+
+    def _category_logits(
+        self,
+        theta: ArrayLike,
+        item_idx: int | None,
+        facet_indices: Mapping[str, ArrayLike] | None,
+    ) -> NDArray[np.float64]:
+        base_measure = self.log_odds(theta, item_idx, facet_indices)
+        categories = np.arange(self._n_categories, dtype=np.float64)
+
+        if item_idx is not None:
+            validated_item_idx = self._validate_item_idx(item_idx)
+            thresholds = (
+                self._thresholds
+                if self._category_structure == "rating_scale"
+                else self._thresholds[validated_item_idx]
+            )
+            cumulative_thresholds = np.concatenate(([0.0], np.cumsum(thresholds)))
+            return (
+                base_measure[:, None] * categories[None, :]
+                - cumulative_thresholds[None, :]
+            )
+
+        if self._category_structure == "rating_scale":
+            cumulative_thresholds = np.concatenate(([0.0], np.cumsum(self._thresholds)))
+            return (
+                base_measure[:, :, None] * categories[None, None, :]
+                - cumulative_thresholds[None, None, :]
+            )
+
+        cumulative_thresholds = np.concatenate(
+            (
+                np.zeros((self._n_items, 1), dtype=np.float64),
+                np.cumsum(self._thresholds, axis=1),
+            ),
+            axis=1,
+        )
+        return (
+            base_measure[:, :, None] * categories[None, None, :]
+            - cumulative_thresholds[None, :, :]
+        )
+
+    @staticmethod
+    def _normalized_exponentials(
+        logits: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute a stable softmax along the response-category axis."""
+        shifted = logits - np.max(logits, axis=-1, keepdims=True)
+        numerators = np.exp(shifted)
+        return numerators / np.sum(numerators, axis=-1, keepdims=True)
 
     def category_probability(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
+        theta: ArrayLike,
+        item_idx: int | None,
         category: int,
-        facet_indices: dict[str, int],
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute probability of response in a specific category.
 
@@ -391,8 +615,9 @@ class PolytomousMFRM(ManyFacetRaschModel):
         ----------
         theta : ndarray
             Person abilities.
-        item_idx : int
-            Item index.
+        item_idx : int, optional
+            Item index. If omitted, return the category probability for every
+            item.
         category : int
             Response category (0 to n_categories-1).
         facet_indices : dict
@@ -403,66 +628,56 @@ class PolytomousMFRM(ManyFacetRaschModel):
         ndarray
             Category probability.
         """
-        theta = np.asarray(theta).ravel()
-        n_persons = len(theta)
-
-        base_measure = theta - self._item_difficulty[item_idx]
-        for facet_name, facet_idx in facet_indices.items():
-            if facet_name in self._facet_parameters:
-                base_measure = (
-                    base_measure - self._facet_parameters[facet_name][facet_idx]
-                )
-
-        if self._category_structure == "rating_scale":
-            tau = self._thresholds
-        else:
-            tau = self._thresholds[item_idx]
-
-        exp_terms = np.zeros((n_persons, self._n_categories))
-        for k in range(self._n_categories):
-            if k == 0:
-                exp_terms[:, k] = 1.0
-            else:
-                cumsum_tau = np.sum(tau[:k])
-                exp_terms[:, k] = np.exp(k * base_measure - cumsum_tau)
-
-        denom = exp_terms.sum(axis=1)
-        probs = exp_terms[:, category] / denom
-
-        return probs
+        validated_category = self._validate_category(category)
+        return self.probability(theta, item_idx, facet_indices)[..., validated_category]
 
     def probability(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
-        facet_indices: dict[str, int],
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute all category probabilities.
 
         Returns
         -------
-        ndarray of shape (n_persons, n_categories)
-            Category probabilities.
+        ndarray
+            Category probabilities, with shape ``(n_persons, n_categories)``
+            for one item or ``(n_persons, n_items, n_categories)`` for all
+            items.
         """
-        theta = np.asarray(theta).ravel()
-        n_persons = len(theta)
-
-        probs = np.zeros((n_persons, self._n_categories))
-        for k in range(self._n_categories):
-            probs[:, k] = self.category_probability(theta, item_idx, k, facet_indices)
-
-        return probs
+        logits = self._category_logits(theta, item_idx, facet_indices)
+        return self._normalized_exponentials(logits)
 
     def expected_score(
         self,
-        theta: NDArray[np.float64],
-        item_idx: int,
-        facet_indices: dict[str, int],
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
     ) -> NDArray[np.float64]:
         """Compute expected response score."""
         probs = self.probability(theta, item_idx, facet_indices)
-        categories = np.arange(self._n_categories)
-        return np.sum(probs * categories[None, :], axis=1)
+        categories = np.arange(self._n_categories, dtype=np.float64)
+        return np.sum(probs * categories, axis=-1)
+
+    def information(
+        self,
+        theta: ArrayLike,
+        item_idx: int | None = None,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
+    ) -> NDArray[np.float64]:
+        """Return Fisher information for the latent measure.
+
+        For the rating-scale and partial-credit forms this is the variance of
+        the response-category score under the model.
+        """
+        probabilities = self.probability(theta, item_idx, facet_indices)
+        categories = np.arange(self._n_categories, dtype=np.float64)
+        expected = np.sum(probabilities * categories, axis=-1, keepdims=True)
+        return np.sum(
+            probabilities * (categories - expected) ** 2,
+            axis=-1,
+        )
 
     def copy(self) -> Self:
         new_model = PolytomousMFRM(
