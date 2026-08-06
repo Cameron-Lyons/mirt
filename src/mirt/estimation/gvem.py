@@ -6,10 +6,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._gpu_backend import (
-    GPU_AVAILABLE,
     gvem_compute_elbo_gpu,
     gvem_e_step_gpu,
     gvem_m_step_gpu,
+    is_gpu_available,
 )
 from mirt._rust_backend import (
     gvem_compute_elbo as _rust_gvem_compute_elbo,
@@ -97,9 +97,9 @@ class GVEMEstimator(BaseEstimator):
     @property
     def _should_use_gpu(self) -> bool:
         """Determine if GPU should be used based on settings and availability."""
-        if self.use_gpu == "auto":
-            return GPU_AVAILABLE
-        return bool(self.use_gpu) and GPU_AVAILABLE
+        if self.use_gpu is False:
+            return False
+        return is_gpu_available()
 
     def fit(
         self,

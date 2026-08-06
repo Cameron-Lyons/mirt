@@ -11,9 +11,23 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 from scipy import optimize, stats
+from scipy.special import expit
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+
+_LINKING_METHODS = frozenset(
+    {
+        "mean_sigma",
+        "mean_mean",
+        "stocking_lord",
+        "haebara",
+        "tcc",
+        "bisector",
+        "orthogonal",
+    }
+)
 
 
 @dataclass
@@ -148,13 +162,15 @@ def link(
     purify_anchors: bool = False,
     purify_threshold: float = 2.5,
     compute_diagnostics: bool = True,
+    random_state: int | np.random.Generator | None = None,
 ) -> LinkingResult:
     """Link two IRT models using anchor items.
 
-    Finds transformation constants A and B such that:
-        theta_new_scale = A * theta_old_scale + B
-        a_new_scale = a_old / A
-        b_new_scale = A * b_old + B
+    Finds transformation constants A and B that place the new calibration
+    onto the old/reference scale:
+        theta_old_scale = A * theta_new_scale + B
+        a_new_on_old_scale = a_new / A
+        b_new_on_old_scale = A * b_new + B
 
     Parameters
     ----------
@@ -193,6 +209,8 @@ def link(
         Z-score threshold for anchor purification.
     compute_diagnostics : bool
         Whether to compute anchor diagnostics and fit statistics.
+    random_state : int | numpy.random.Generator | None
+        Seed or generator for reproducible bootstrap standard errors.
 
     Returns
     -------
@@ -205,31 +223,44 @@ def link(
     >>> A, B = result.constants.A, result.constants.B
     >>> theta_equated = A * theta_new + B
     """
-    if len(anchor_items_old) != len(anchor_items_new):
-        raise ValueError(
-            f"Anchor item lists must have same length: "
-            f"{len(anchor_items_old)} vs {len(anchor_items_new)}"
-        )
+    if method not in _LINKING_METHODS:
+        raise ValueError(f"Unknown linking method: {method}")
+    anchors_old, anchors_new = _validate_anchor_pairs(
+        model_old,
+        model_new,
+        anchor_items_old,
+        anchor_items_new,
+    )
+    disc_old, diff_old, lower_old, upper_old = _extract_link_parameters(
+        model_old, anchors_old, "old"
+    )
+    disc_new, diff_new, lower_new, upper_new = _extract_link_parameters(
+        model_new, anchors_new, "new"
+    )
+    theta_grid, weights = _validate_curve_grid(theta_range, n_theta, weights)
 
-    if len(anchor_items_old) < 2:
-        raise ValueError("At least 2 anchor items required for linking")
+    if compute_se:
+        if isinstance(n_bootstrap, (bool, np.bool_)) or not isinstance(
+            n_bootstrap, (int, np.integer)
+        ):
+            raise ValueError("n_bootstrap must be an integer")
+        if n_bootstrap < 2:
+            raise ValueError("n_bootstrap must be at least 2")
+    if purify_anchors and (
+        not np.isfinite(purify_threshold) or purify_threshold <= 0.0
+    ):
+        raise ValueError("purify_threshold must be finite and positive")
 
-    disc_old = np.asarray(model_old.discrimination)[anchor_items_old]
-    diff_old = np.asarray(model_old.difficulty)[anchor_items_old]
-    disc_new = np.asarray(model_new.discrimination)[anchor_items_new]
-    diff_new = np.asarray(model_new.difficulty)[anchor_items_new]
-
-    if disc_old.ndim > 1:
-        disc_old = disc_old[:, 0]
-    if disc_new.ndim > 1:
-        disc_new = disc_new[:, 0]
-
-    working_anchors_old = list(anchor_items_old)
-    working_anchors_new = list(anchor_items_new)
+    working_anchors_old = anchors_old.copy()
+    working_anchors_new = anchors_new.copy()
     working_disc_old = disc_old.copy()
     working_diff_old = diff_old.copy()
     working_disc_new = disc_new.copy()
     working_diff_new = diff_new.copy()
+    working_lower_old = lower_old.copy()
+    working_upper_old = upper_old.copy()
+    working_lower_new = lower_new.copy()
+    working_upper_new = upper_new.copy()
 
     if purify_anchors:
         working_anchors_old, working_anchors_new, _ = _purify_anchors_iterative(
@@ -243,17 +274,20 @@ def link(
             threshold=purify_threshold,
             theta_range=theta_range,
             n_theta=n_theta,
+            lower_old=working_lower_old,
+            upper_old=working_upper_old,
+            lower_new=working_lower_new,
+            upper_new=working_upper_new,
         )
-        mask = [i in working_anchors_old for i in anchor_items_old]
+        mask = np.array([i in working_anchors_old for i in anchors_old])
         working_disc_old = disc_old[mask]
         working_diff_old = diff_old[mask]
         working_disc_new = disc_new[mask]
         working_diff_new = diff_new[mask]
-
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    if weights is None:
-        weights = stats.norm.pdf(theta_grid)
-        weights = weights / np.sum(weights)
+        working_lower_old = lower_old[mask]
+        working_upper_old = upper_old[mask]
+        working_lower_new = lower_new[mask]
+        working_upper_new = upper_new[mask]
 
     if method == "mean_sigma":
         A, B, conv_info = _mean_sigma_link(
@@ -279,6 +313,10 @@ def link(
             working_diff_new,
             theta_grid,
             weights,
+            working_lower_old,
+            working_upper_old,
+            working_lower_new,
+            working_upper_new,
         )
     elif method == "haebara":
         A, B, conv_info = _haebara_link(
@@ -288,6 +326,10 @@ def link(
             working_diff_new,
             theta_grid,
             weights,
+            working_lower_old,
+            working_upper_old,
+            working_lower_new,
+            working_upper_new,
         )
     elif method == "tcc":
         A, B, conv_info = _tcc_link(
@@ -297,6 +339,10 @@ def link(
             working_diff_new,
             theta_grid,
             weights,
+            working_lower_old,
+            working_upper_old,
+            working_lower_new,
+            working_upper_new,
         )
     elif method == "bisector":
         A, B, conv_info = _bisector_link(
@@ -306,8 +352,7 @@ def link(
         A, B, conv_info = _orthogonal_link(
             working_disc_old, working_diff_old, working_disc_new, working_diff_new
         )
-    else:
-        raise ValueError(f"Unknown linking method: {method}")
+    A, B = _validate_linking_constants(A, B, method)
 
     A_se: float | None = None
     B_se: float | None = None
@@ -322,6 +367,11 @@ def link(
             theta_range,
             n_theta,
             robust,
+            working_lower_old,
+            working_upper_old,
+            working_lower_new,
+            working_upper_new,
+            random_state,
         )
 
     anchor_diagnostics: AnchorDiagnostics | None = None
@@ -335,11 +385,26 @@ def link(
             diff_new,
             A,
             B,
-            anchor_items_old,
+            anchors_old,
             theta_grid,
+            lower_old,
+            upper_old,
+            lower_new,
+            upper_new,
         )
         fit_statistics = _compute_fit_statistics(
-            disc_old, diff_old, disc_new, diff_new, A, B, theta_grid, weights
+            disc_old,
+            diff_old,
+            disc_new,
+            diff_new,
+            A,
+            B,
+            theta_grid,
+            weights,
+            lower_old,
+            upper_old,
+            lower_new,
+            upper_new,
         )
 
     constants = LinkingConstants(
@@ -353,6 +418,166 @@ def link(
         fit_statistics=fit_statistics,
         convergence_info=conv_info,
     )
+
+
+def _validate_anchor_pairs(
+    model_old: "BaseItemModel",
+    model_new: "BaseItemModel",
+    anchors_old: list[int],
+    anchors_new: list[int],
+) -> tuple[list[int], list[int]]:
+    """Validate and normalize corresponding anchor indices."""
+    if len(anchors_old) != len(anchors_new):
+        raise ValueError(
+            f"Anchor item lists must have same length: "
+            f"{len(anchors_old)} vs {len(anchors_new)}"
+        )
+    if len(anchors_old) < 2:
+        raise ValueError("At least 2 anchor items required for linking")
+
+    normalized: list[list[int]] = []
+    for label, anchors, n_items in (
+        ("old", anchors_old, model_old.n_items),
+        ("new", anchors_new, model_new.n_items),
+    ):
+        current: list[int] = []
+        for anchor in anchors:
+            if isinstance(anchor, (bool, np.bool_)) or not isinstance(
+                anchor, (int, np.integer)
+            ):
+                raise ValueError(
+                    f"Anchor indices for the {label} model must be integers"
+                )
+            index = int(anchor)
+            if index < 0 or index >= n_items:
+                raise ValueError(
+                    f"Anchor index {index} out of range for the {label} model "
+                    f"with {n_items} items"
+                )
+            current.append(index)
+        if len(set(current)) != len(current):
+            raise ValueError(f"Anchor indices for the {label} model must be unique")
+        normalized.append(current)
+    return normalized[0], normalized[1]
+
+
+def _extract_link_parameters(
+    model: "BaseItemModel", anchors: list[int], label: str
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Extract validated unidimensional dichotomous item parameters."""
+    if model.n_factors != 1:
+        raise ValueError("Core linking requires unidimensional models")
+    try:
+        discrimination = np.asarray(model.discrimination, dtype=np.float64)
+        difficulty = np.asarray(model.difficulty, dtype=np.float64)
+    except AttributeError as exc:
+        raise ValueError(
+            "Core linking requires discrimination and difficulty parameters; "
+            "use the model-specific polytomous linker"
+        ) from exc
+
+    if discrimination.ndim == 2 and discrimination.shape == (model.n_items, 1):
+        discrimination = discrimination[:, 0]
+    if discrimination.shape != (model.n_items,) or difficulty.shape != (model.n_items,):
+        raise ValueError(
+            f"Parameters for the {label} model must contain one value per item"
+        )
+
+    lower = np.asarray(
+        getattr(model, "guessing", np.zeros(model.n_items)), dtype=np.float64
+    )
+    upper = np.asarray(
+        getattr(model, "upper", np.ones(model.n_items)), dtype=np.float64
+    )
+    if lower.shape != (model.n_items,) or upper.shape != (model.n_items,):
+        raise ValueError(
+            f"Asymptotes for the {label} model must contain one value per item"
+        )
+
+    selected_disc = discrimination[anchors]
+    selected_diff = difficulty[anchors]
+    selected_lower = lower[anchors]
+    selected_upper = upper[anchors]
+    arrays = (selected_disc, selected_diff, selected_lower, selected_upper)
+    if not all(np.all(np.isfinite(values)) for values in arrays):
+        raise ValueError(f"Item parameters for the {label} model must be finite")
+    if np.any(selected_disc <= 0.0):
+        raise ValueError(
+            f"Discrimination parameters for the {label} model must be positive"
+        )
+    if np.any(selected_lower < 0.0) or np.any(selected_upper > 1.0):
+        raise ValueError(f"Asymptotes for the {label} model must lie in [0, 1]")
+    if np.any(selected_lower >= selected_upper):
+        raise ValueError(
+            f"Lower asymptotes for the {label} model must be below upper asymptotes"
+        )
+    return arrays
+
+
+def _validate_curve_grid(
+    theta_range: tuple[float, float],
+    n_theta: int,
+    weights: NDArray[np.float64] | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Validate and construct the shared curve-matching grid."""
+    if not isinstance(theta_range, (tuple, list)) or len(theta_range) != 2:
+        raise ValueError("theta_range must contain exactly two values")
+    lower, upper = float(theta_range[0]), float(theta_range[1])
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("theta_range must contain finite, increasing values")
+    if isinstance(n_theta, (bool, np.bool_)) or not isinstance(
+        n_theta, (int, np.integer)
+    ):
+        raise ValueError("n_theta must be an integer")
+    if n_theta < 2:
+        raise ValueError("n_theta must be at least 2")
+
+    theta_grid = np.linspace(lower, upper, int(n_theta))
+    if weights is None:
+        normalized_weights = stats.norm.pdf(theta_grid)
+    else:
+        normalized_weights = np.asarray(weights, dtype=np.float64)
+        if normalized_weights.shape != (n_theta,):
+            raise ValueError(f"weights must have shape ({n_theta},)")
+        if not np.all(np.isfinite(normalized_weights)):
+            raise ValueError("weights must be finite")
+        if np.any(normalized_weights < 0.0):
+            raise ValueError("weights must be non-negative")
+    weight_sum = float(np.sum(normalized_weights))
+    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
+        raise ValueError("weights must have a positive sum")
+    return theta_grid, normalized_weights / weight_sum
+
+
+def _validate_linking_constants(A: float, B: float, method: str) -> tuple[float, float]:
+    """Require a finite, orientation-preserving linear transformation."""
+    scale, shift = float(A), float(B)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise RuntimeError(f"{method} linking did not produce a positive finite slope")
+    if not np.isfinite(shift):
+        raise RuntimeError(f"{method} linking did not produce a finite intercept")
+    return scale, shift
+
+
+def _icc_matrix(
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    lower: NDArray[np.float64] | None = None,
+    upper: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Evaluate every dichotomous item curve in one stable batch."""
+    if lower is None:
+        lower = np.zeros_like(discrimination)
+    if upper is None:
+        upper = np.ones_like(discrimination)
+    logistic = expit(discrimination[None, :] * (theta[:, None] - difficulty[None, :]))
+    return lower[None, :] + (upper - lower)[None, :] * logistic
 
 
 def transform_parameters(
@@ -383,14 +608,20 @@ def transform_parameters(
     BaseItemModel
         Model with transformed parameters.
     """
+    scale, shift = float(A), float(B)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("A must be finite and positive")
+    if not np.isfinite(shift):
+        raise ValueError("B must be finite")
+
     if not in_place:
         model = model.copy()
 
     disc = np.asarray(model.discrimination)
     diff = np.asarray(model.difficulty)
 
-    new_disc = disc / A
-    new_diff = A * diff + B
+    new_disc = disc / scale
+    new_diff = scale * diff + shift
 
     model.set_parameters(discrimination=new_disc, difficulty=new_diff)
 
@@ -406,24 +637,22 @@ def _mean_sigma_link(
 ) -> tuple[float, float, dict]:
     """Mean/sigma linking method."""
     if robust:
-        loc_old_a = np.median(disc_old)
-        loc_new_a = np.median(disc_new)
-        scale_old_a = np.median(np.abs(disc_old - loc_old_a)) * 1.4826
-        scale_new_a = np.median(np.abs(disc_new - loc_new_a)) * 1.4826
         loc_old_b = np.median(diff_old)
         loc_new_b = np.median(diff_new)
+        scale_old_b = np.median(np.abs(diff_old - loc_old_b)) * 1.4826
+        scale_new_b = np.median(np.abs(diff_new - loc_new_b)) * 1.4826
     else:
-        loc_old_a = np.mean(disc_old)
-        loc_new_a = np.mean(disc_new)
-        scale_old_a = np.std(disc_old, ddof=1)
-        scale_new_a = np.std(disc_new, ddof=1)
         loc_old_b = np.mean(diff_old)
         loc_new_b = np.mean(diff_new)
+        scale_old_b = np.std(diff_old, ddof=1)
+        scale_new_b = np.std(diff_new, ddof=1)
 
-    if scale_new_a < 1e-10:
-        A = 1.0
+    if scale_new_b < 1e-10:
+        mean_disc_old = np.median(disc_old) if robust else np.mean(disc_old)
+        mean_disc_new = np.median(disc_new) if robust else np.mean(disc_new)
+        A = mean_disc_new / mean_disc_old
     else:
-        A = scale_old_a / scale_new_a
+        A = scale_old_b / scale_new_b
 
     B = loc_old_b - A * loc_new_b
 
@@ -449,10 +678,7 @@ def _mean_mean_link(
         mean_diff_old = np.mean(diff_old)
         mean_diff_new = np.mean(diff_new)
 
-    if mean_disc_new < 1e-10:
-        A = 1.0
-    else:
-        A = mean_disc_old / mean_disc_new
+    A = mean_disc_new / mean_disc_old
 
     B = mean_diff_old - A * mean_diff_new
 
@@ -466,36 +692,57 @@ def _stocking_lord_link(
     diff_new: NDArray[np.float64],
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> tuple[float, float, dict]:
     """Stocking-Lord test characteristic curve method."""
-    n_items = len(disc_old)
-    n_theta = len(theta_grid)
+    curves_old = _icc_matrix(disc_old, diff_old, theta_grid, lower_old, upper_old)
+    tcc_old = curves_old.sum(axis=1)
+    initial_A, initial_B, _ = _mean_sigma_link(disc_old, diff_old, disc_new, diff_new)
+    initial_A, initial_B = _validate_linking_constants(initial_A, initial_B, "initial")
+    initial = np.array([np.log(initial_A), initial_B])
 
     def criterion(params: NDArray[np.float64]) -> float:
-        A, B = params
-        tcc_old = np.zeros(n_theta)
-        tcc_new = np.zeros(n_theta)
+        log_A, B = float(params[0]), float(params[1])
+        if not np.isfinite(log_A) or not np.isfinite(B) or abs(log_A) > 20.0:
+            return float("inf")
+        A = float(np.exp(log_A))
+        curves_new = _icc_matrix(
+            disc_new / A,
+            A * diff_new + B,
+            theta_grid,
+            lower_new,
+            upper_new,
+        )
+        return float(np.sum(weights * (tcc_old - curves_new.sum(axis=1)) ** 2))
 
-        for j in range(n_items):
-            p_old = 1.0 / (1.0 + np.exp(-disc_old[j] * (theta_grid - diff_old[j])))
-            tcc_old += p_old
-
-            disc_trans = disc_new[j] / A
-            diff_trans = A * diff_new[j] + B
-            p_new = 1.0 / (1.0 + np.exp(-disc_trans * (theta_grid - diff_trans)))
-            tcc_new += p_new
-
-        diff_sq = (tcc_old - tcc_new) ** 2
-        return float(np.sum(weights * diff_sq))
+    initial_value = criterion(initial)
+    if initial_value <= np.finfo(np.float64).eps:
+        return (
+            initial_A,
+            initial_B,
+            {
+                "method": "stocking_lord",
+                "success": True,
+                "fun": initial_value,
+                "nit": 0,
+            },
+        )
 
     result = optimize.minimize(
         criterion,
-        np.array([1.0, 0.0]),
+        initial,
         method="Nelder-Mead",
         options={"maxiter": 1000, "xatol": 1e-8, "fatol": 1e-8},
     )
+    if not result.success or not np.all(np.isfinite(result.x)):
+        raise RuntimeError(
+            f"Stocking-Lord linking failed to converge: {result.message}"
+        )
 
-    A, B = result.x
+    A, B = float(np.exp(result.x[0])), float(result.x[1])
     return (
         float(A),
         float(B),
@@ -515,34 +762,54 @@ def _haebara_link(
     diff_new: NDArray[np.float64],
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> tuple[float, float, dict]:
     """Haebara item-level curve matching method."""
-    n_items = len(disc_old)
+    curves_old = _icc_matrix(disc_old, diff_old, theta_grid, lower_old, upper_old)
+    initial_A, initial_B, _ = _mean_sigma_link(disc_old, diff_old, disc_new, diff_new)
+    initial_A, initial_B = _validate_linking_constants(initial_A, initial_B, "initial")
+    initial = np.array([np.log(initial_A), initial_B])
 
     def criterion(params: NDArray[np.float64]) -> float:
-        A, B = params
-        total = 0.0
+        log_A, B = float(params[0]), float(params[1])
+        if not np.isfinite(log_A) or not np.isfinite(B) or abs(log_A) > 20.0:
+            return float("inf")
+        A = float(np.exp(log_A))
+        curves_new = _icc_matrix(
+            disc_new / A,
+            A * diff_new + B,
+            theta_grid,
+            lower_new,
+            upper_new,
+        )
+        return float(np.sum(weights[:, None] * (curves_old - curves_new) ** 2))
 
-        for j in range(n_items):
-            p_old = 1.0 / (1.0 + np.exp(-disc_old[j] * (theta_grid - diff_old[j])))
-
-            disc_trans = disc_new[j] / A
-            diff_trans = A * diff_new[j] + B
-            p_new = 1.0 / (1.0 + np.exp(-disc_trans * (theta_grid - diff_trans)))
-
-            diff_sq = (p_old - p_new) ** 2
-            total += np.sum(weights * diff_sq)
-
-        return float(total)
+    initial_value = criterion(initial)
+    if initial_value <= np.finfo(np.float64).eps:
+        return (
+            initial_A,
+            initial_B,
+            {
+                "method": "haebara",
+                "success": True,
+                "fun": initial_value,
+                "nit": 0,
+            },
+        )
 
     result = optimize.minimize(
         criterion,
-        np.array([1.0, 0.0]),
+        initial,
         method="Nelder-Mead",
         options={"maxiter": 1000, "xatol": 1e-8, "fatol": 1e-8},
     )
+    if not result.success or not np.all(np.isfinite(result.x)):
+        raise RuntimeError(f"Haebara linking failed to converge: {result.message}")
 
-    A, B = result.x
+    A, B = float(np.exp(result.x[0])), float(result.x[1])
     return (
         float(A),
         float(B),
@@ -562,11 +829,26 @@ def _tcc_link(
     diff_new: NDArray[np.float64],
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> tuple[float, float, dict]:
     """Full TCC matching (equivalent to Stocking-Lord for dichotomous)."""
-    return _stocking_lord_link(
-        disc_old, diff_old, disc_new, diff_new, theta_grid, weights
+    A, B, info = _stocking_lord_link(
+        disc_old,
+        diff_old,
+        disc_new,
+        diff_new,
+        theta_grid,
+        weights,
+        lower_old,
+        upper_old,
+        lower_new,
+        upper_new,
     )
+    info["method"] = "tcc"
+    return A, B, info
 
 
 def _bisector_link(
@@ -673,6 +955,10 @@ def _compute_anchor_diagnostics(
     B: float,
     anchor_indices: list[int],
     theta_grid: NDArray[np.float64],
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> AnchorDiagnostics:
     """Compute diagnostics for anchor item quality."""
     disc_new_trans = disc_new / A
@@ -681,24 +967,17 @@ def _compute_anchor_diagnostics(
     signed_diff_a = disc_old - disc_new_trans
     signed_diff_b = diff_old - diff_new_trans
 
-    n_items = len(disc_old)
-    area_diff = np.zeros(n_items)
-    for j in range(n_items):
-        p_old = 1.0 / (1.0 + np.exp(-disc_old[j] * (theta_grid - diff_old[j])))
-        p_new = 1.0 / (
-            1.0 + np.exp(-disc_new_trans[j] * (theta_grid - diff_new_trans[j]))
-        )
-        area_diff[j] = np.trapezoid(np.abs(p_old - p_new), theta_grid)
+    curves_old = _icc_matrix(disc_old, diff_old, theta_grid, lower_old, upper_old)
+    curves_new = _icc_matrix(
+        disc_new_trans, diff_new_trans, theta_grid, lower_new, upper_new
+    )
+    area_diff = np.asarray(
+        np.trapezoid(np.abs(curves_old - curves_new), theta_grid, axis=0),
+        dtype=np.float64,
+    )
 
-    combined_diff = np.sqrt(signed_diff_a**2 + signed_diff_b**2)
-    median_diff = np.median(combined_diff)
-    mad = np.median(np.abs(combined_diff - median_diff)) * 1.4826
-
-    if mad < 1e-10:
-        robust_z = np.zeros(n_items)
-    else:
-        robust_z = (combined_diff - median_diff) / mad
-
+    combined_diff = np.sqrt(signed_diff_a**2 + signed_diff_b**2 + area_diff**2)
+    robust_z = _robust_z_scores(combined_diff)
     flagged = np.abs(robust_z) > 2.5
 
     return AnchorDiagnostics(
@@ -720,6 +999,10 @@ def _compute_fit_statistics(
     B: float,
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> LinkingFitStatistics:
     """Compute fit statistics for linking quality."""
     disc_new_trans = disc_new / A
@@ -735,18 +1018,16 @@ def _compute_fit_statistics(
 
     weighted_rmse = float(np.sqrt(np.mean(diff_a**2) + np.mean(diff_b**2)))
 
-    n_items = len(disc_old)
-    tcc_old = np.zeros(len(theta_grid))
-    tcc_new = np.zeros(len(theta_grid))
-
-    for j in range(n_items):
-        p_old = 1.0 / (1.0 + np.exp(-disc_old[j] * (theta_grid - diff_old[j])))
-        tcc_old += p_old
-
-        p_new = 1.0 / (
-            1.0 + np.exp(-disc_new_trans[j] * (theta_grid - diff_new_trans[j]))
-        )
-        tcc_new += p_new
+    tcc_old = _icc_matrix(disc_old, diff_old, theta_grid, lower_old, upper_old).sum(
+        axis=1
+    )
+    tcc_new = _icc_matrix(
+        disc_new_trans,
+        diff_new_trans,
+        theta_grid,
+        lower_new,
+        upper_new,
+    ).sum(axis=1)
 
     tcc_diff = (tcc_old - tcc_new) ** 2
     tcc_rmse = float(np.sqrt(np.sum(weights * tcc_diff)))
@@ -761,6 +1042,16 @@ def _compute_fit_statistics(
     )
 
 
+def _robust_z_scores(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Compute MAD-based z-scores without hiding isolated tied outliers."""
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)) * 1.4826)
+    if mad >= 1e-10:
+        return (values - median) / mad
+    matches_median = np.isclose(values, median, rtol=1e-8, atol=1e-10)
+    return np.where(matches_median, 0.0, np.inf)
+
+
 def _bootstrap_linking_se(
     disc_old: NDArray[np.float64],
     diff_old: NDArray[np.float64],
@@ -771,10 +1062,24 @@ def _bootstrap_linking_se(
     theta_range: tuple[float, float],
     n_theta: int,
     robust: bool,
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
+    random_state: int | np.random.Generator | None = None,
 ) -> tuple[float, float]:
     """Compute bootstrap standard errors for linking constants."""
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(random_state)
     n_items = len(disc_old)
+
+    if lower_old is None:
+        lower_old = np.zeros(n_items)
+    if upper_old is None:
+        upper_old = np.ones(n_items)
+    if lower_new is None:
+        lower_new = np.zeros(n_items)
+    if upper_new is None:
+        upper_new = np.ones(n_items)
 
     A_samples = np.zeros(n_bootstrap)
     B_samples = np.zeros(n_bootstrap)
@@ -789,6 +1094,10 @@ def _bootstrap_linking_se(
         b_old_b = diff_old[idx]
         d_new_b = disc_new[idx]
         b_new_b = diff_new[idx]
+        l_old_b = lower_old[idx]
+        u_old_b = upper_old[idx]
+        l_new_b = lower_new[idx]
+        u_new_b = upper_new[idx]
 
         if method == "mean_sigma":
             A, B, _ = _mean_sigma_link(d_old_b, b_old_b, d_new_b, b_new_b, robust)
@@ -796,21 +1105,38 @@ def _bootstrap_linking_se(
             A, B, _ = _mean_mean_link(d_old_b, b_old_b, d_new_b, b_new_b, robust)
         elif method in ("stocking_lord", "tcc"):
             A, B, _ = _stocking_lord_link(
-                d_old_b, b_old_b, d_new_b, b_new_b, theta_grid, weights
+                d_old_b,
+                b_old_b,
+                d_new_b,
+                b_new_b,
+                theta_grid,
+                weights,
+                l_old_b,
+                u_old_b,
+                l_new_b,
+                u_new_b,
             )
         elif method == "haebara":
             A, B, _ = _haebara_link(
-                d_old_b, b_old_b, d_new_b, b_new_b, theta_grid, weights
+                d_old_b,
+                b_old_b,
+                d_new_b,
+                b_new_b,
+                theta_grid,
+                weights,
+                l_old_b,
+                u_old_b,
+                l_new_b,
+                u_new_b,
             )
         elif method == "bisector":
             A, B, _ = _bisector_link(d_old_b, b_old_b, d_new_b, b_new_b)
         elif method == "orthogonal":
             A, B, _ = _orthogonal_link(d_old_b, b_old_b, d_new_b, b_new_b)
         else:
-            A, B = 1.0, 0.0
+            raise ValueError(f"Unknown linking method: {method}")
 
-        A_samples[b] = A
-        B_samples[b] = B
+        A_samples[b], B_samples[b] = _validate_linking_constants(A, B, method)
 
     return float(np.std(A_samples, ddof=1)), float(np.std(B_samples, ddof=1))
 
@@ -828,11 +1154,25 @@ def _purify_anchors_iterative(
     n_theta: int,
     min_anchors: int = 3,
     max_iterations: int = 10,
+    lower_old: NDArray[np.float64] | None = None,
+    upper_old: NDArray[np.float64] | None = None,
+    lower_new: NDArray[np.float64] | None = None,
+    upper_new: NDArray[np.float64] | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     """Iteratively purify anchor set by removing drifting items."""
     theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
     weights = stats.norm.pdf(theta_grid)
     weights = weights / np.sum(weights)
+
+    n_items = len(disc_old)
+    if lower_old is None:
+        lower_old = np.zeros(n_items)
+    if upper_old is None:
+        upper_old = np.ones(n_items)
+    if lower_new is None:
+        lower_new = np.zeros(n_items)
+    if upper_new is None:
+        upper_new = np.ones(n_items)
 
     current_old = list(anchors_old)
     current_new = list(anchors_new)
@@ -847,6 +1187,10 @@ def _purify_anchors_iterative(
         b_old = diff_old[mask]
         d_new = disc_new[mask]
         b_new = diff_new[mask]
+        l_old = lower_old[mask]
+        u_old = upper_old[mask]
+        l_new = lower_new[mask]
+        u_new = upper_new[mask]
 
         if method == "mean_sigma":
             A, B, _ = _mean_sigma_link(d_old, b_old, d_new, b_new, False)
@@ -854,10 +1198,30 @@ def _purify_anchors_iterative(
             A, B, _ = _mean_mean_link(d_old, b_old, d_new, b_new, False)
         elif method in ("stocking_lord", "tcc"):
             A, B, _ = _stocking_lord_link(
-                d_old, b_old, d_new, b_new, theta_grid, weights
+                d_old,
+                b_old,
+                d_new,
+                b_new,
+                theta_grid,
+                weights,
+                l_old,
+                u_old,
+                l_new,
+                u_new,
             )
         elif method == "haebara":
-            A, B, _ = _haebara_link(d_old, b_old, d_new, b_new, theta_grid, weights)
+            A, B, _ = _haebara_link(
+                d_old,
+                b_old,
+                d_new,
+                b_new,
+                theta_grid,
+                weights,
+                l_old,
+                u_old,
+                l_new,
+                u_new,
+            )
         else:
             A, B, _ = _mean_sigma_link(d_old, b_old, d_new, b_new, False)
 
@@ -866,15 +1230,11 @@ def _purify_anchors_iterative(
 
         diff_a = d_old - d_new_trans
         diff_b = b_old - b_new_trans
-        combined = np.sqrt(diff_a**2 + diff_b**2)
-
-        median_diff = np.median(combined)
-        mad = np.median(np.abs(combined - median_diff)) * 1.4826
-
-        if mad < 1e-10:
-            break
-
-        z_scores = (combined - median_diff) / mad
+        curves_old = _icc_matrix(d_old, b_old, theta_grid, l_old, u_old)
+        curves_new = _icc_matrix(d_new_trans, b_new_trans, theta_grid, l_new, u_new)
+        areas = np.trapezoid(np.abs(curves_old - curves_new), theta_grid, axis=0)
+        combined = np.sqrt(diff_a**2 + diff_b**2 + areas**2)
+        z_scores = _robust_z_scores(combined)
         max_z_idx = np.argmax(np.abs(z_scores))
         max_z = np.abs(z_scores[max_z_idx])
 

@@ -111,15 +111,19 @@ pub fn simulate_gpcm<'py>(
 
             (0..n_items)
                 .map(|j| {
-                    let mut numerators = vec![0.0; n_categories];
-                    for (k, num) in numerators.iter_mut().enumerate() {
-                        let cumsum: f64 = thresh_vec[j][..k]
+                    let mut logits = vec![0.0; n_categories];
+                    for (k, logit) in logits.iter_mut().enumerate() {
+                        *logit = thresh_vec[j][..k]
                             .iter()
                             .map(|&t| disc_vec[j] * (theta_i - t))
                             .sum();
-                        *num = cumsum.exp();
                     }
 
+                    let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let numerators: Vec<f64> = logits
+                        .iter()
+                        .map(|&value| (value - max_logit).exp())
+                        .collect();
                     let sum: f64 = numerators.iter().sum();
                     let cat_probs: Vec<f64> = numerators.iter().map(|&n| n / sum).collect();
 

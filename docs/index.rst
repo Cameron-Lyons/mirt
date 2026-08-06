@@ -12,9 +12,12 @@ powered by a Rust backend for computational efficiency.
    quickstart
    guides/cat
    guides/dif
+   guides/plotting
    guides/multigroup
    guides/equating
    guides/reports
+   guides/custom_models
+   guides/network_models
    api/index
 
 Installation
@@ -52,6 +55,7 @@ Features
 * **Reports**: Standalone HTML summaries with optional embedded visualizations
 * **Scoring**: EAP, MAP, ML scoring methods
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
+* **Custom Models**: Validated dichotomous, polytomous, multidimensional, and group callbacks
 * **High Performance**: Rust-powered backend for fast computation
 
 Indices and tables

@@ -16,9 +16,13 @@ from mirt.models.compensatory import (
     PartiallyCompensatoryModel,
 )
 from mirt.models.custom import (
+    CustomGroupModel,
     CustomItemModel,
+    GroupSpec,
     ItemTypeSpec,
+    create_group,
     create_item_type,
+    createGroup,
     get_standard_item_type,
     list_standard_item_types,
 )
@@ -52,6 +56,7 @@ from mirt.models.explanatory import (
     LLTMResult,
     RaschLLTM,
 )
+from mirt.models.irtree import IRTreeModel, IRTreeSpec, TreeNode
 from mirt.models.mfrm import (
     Facet,
     ManyFacetRaschModel,
@@ -123,6 +128,9 @@ __all__ = [
     "LatentRegressionResult",
     "ExplanatoryIRT",
     "ExplanatoryIRTResult",
+    "TreeNode",
+    "IRTreeSpec",
+    "IRTreeModel",
     "Facet",
     "ManyFacetRaschModel",
     "MFRMResult",
@@ -162,8 +170,12 @@ __all__ = [
     "create_testlet_structure",
     "compute_testlet_q3",
     "CustomItemModel",
+    "CustomGroupModel",
     "ItemTypeSpec",
+    "GroupSpec",
     "create_item_type",
+    "create_group",
+    "createGroup",
     "get_standard_item_type",
     "list_standard_item_types",
     "IsingModel",
