@@ -9,9 +9,11 @@ This module provides:
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -21,6 +23,265 @@ from mirt.constants import PROB_EPSILON
 if TYPE_CHECKING:
     from mirt.estimation.mcmc import MCMCResult
     from mirt.models.base import BaseItemModel
+
+
+_CHAIN_METADATA = {"log_likelihood", "theta"}
+
+
+def _copy_state_value(value: Any) -> Any:
+    """Copy mutable model state without assuming it is an ndarray."""
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    return deepcopy(value)
+
+
+@contextmanager
+def _preserve_model_state(
+    model: BaseItemModel,
+    parameter_names: set[str],
+) -> Iterator[None]:
+    """Restore model parameters and mirrored private attributes on exit."""
+    original_parameters = {
+        name: value.copy() for name, value in model._parameters.items()
+    }
+    attribute_names = {
+        f"_{name}" for name in parameter_names if hasattr(model, f"_{name}")
+    }
+    original_attributes = {
+        name: _copy_state_value(getattr(model, name)) for name in attribute_names
+    }
+
+    try:
+        yield
+    finally:
+        model._parameters.clear()
+        model._parameters.update(original_parameters)
+        for name, value in original_attributes.items():
+            setattr(model, name, value)
+
+
+def _sampled_parameter_chains(
+    model: BaseItemModel,
+    chains: dict[str, NDArray[np.float64]],
+    *,
+    n_persons: int,
+) -> tuple[int, dict[str, NDArray[np.float64]]]:
+    """Validate posterior chains and return sample-varying model parameters."""
+    parameter_chains: dict[str, NDArray[np.float64]] = {}
+    sample_counts: list[int] = []
+
+    for name, chain in chains.items():
+        if name in _CHAIN_METADATA:
+            continue
+
+        attribute_name = f"_{name}"
+        if name in model._parameters:
+            expected_shape = model._parameters[name].shape
+        elif hasattr(model, attribute_name):
+            expected_shape = np.asarray(getattr(model, attribute_name)).shape
+        else:
+            continue
+
+        values = np.asarray(chain, dtype=np.float64)
+        if values.ndim != len(expected_shape) + 1 or values.shape[1:] != expected_shape:
+            raise ValueError(
+                f"chain '{name}' must have shape (n_samples, {expected_shape}), "
+                f"got {values.shape}"
+            )
+        if not np.all(np.isfinite(values)):
+            raise ValueError(f"chain '{name}' must contain only finite values")
+        parameter_chains[name] = values
+        sample_counts.append(values.shape[0])
+
+    log_likelihood_chain = chains.get("log_likelihood")
+    if log_likelihood_chain is not None:
+        log_likelihood_values = np.asarray(log_likelihood_chain)
+        if log_likelihood_values.ndim != 1:
+            raise ValueError("chain 'log_likelihood' must be one-dimensional")
+        sample_counts.append(log_likelihood_values.shape[0])
+
+    theta_chain = chains.get("theta")
+    if theta_chain is not None:
+        theta_values = np.asarray(theta_chain, dtype=np.float64)
+        if not np.all(np.isfinite(theta_values)):
+            raise ValueError("chain 'theta' must contain only finite values")
+        if theta_values.ndim == 3:
+            sample_counts.append(theta_values.shape[0])
+        elif (
+            theta_values.ndim == 2
+            and model.n_factors == 1
+            and theta_values.shape[1] == n_persons
+            and theta_values.shape != (n_persons, model.n_factors)
+        ):
+            sample_counts.append(theta_values.shape[0])
+
+    if not sample_counts:
+        return 1, parameter_chains
+
+    n_samples = sample_counts[0]
+    if n_samples == 0:
+        raise ValueError("posterior chains must contain at least one sample")
+    if any(count != n_samples for count in sample_counts[1:]):
+        raise ValueError("posterior chains must contain the same number of samples")
+
+    return n_samples, parameter_chains
+
+
+def _apply_parameter_sample(
+    model: BaseItemModel,
+    parameter_chains: dict[str, NDArray[np.float64]],
+    sample_idx: int,
+) -> None:
+    """Apply one posterior parameter sample to a model."""
+    for name, chain in parameter_chains.items():
+        value = np.asarray(chain[sample_idx], dtype=np.float64)
+        if name in model._parameters:
+            model._parameters[name] = value
+        attribute_name = f"_{name}"
+        if hasattr(model, attribute_name):
+            setattr(model, attribute_name, value)
+
+
+def _theta_for_sample(
+    chains: dict[str, NDArray[np.float64]],
+    *,
+    sample_idx: int,
+    n_samples: int,
+    n_persons: int,
+    n_factors: int,
+) -> NDArray[np.float64]:
+    """Resolve sampled or fixed latent traits to a two-dimensional matrix."""
+    theta_chain = chains.get("theta")
+    if theta_chain is None:
+        return np.zeros((n_persons, n_factors), dtype=np.float64)
+
+    theta = np.asarray(theta_chain, dtype=np.float64)
+    if theta.ndim == 3 and theta.shape == (n_samples, n_persons, n_factors):
+        return theta[sample_idx]
+    if theta.ndim == 2 and theta.shape == (n_persons, n_factors):
+        return theta
+    if theta.ndim == 2 and n_factors == 1 and theta.shape == (n_samples, n_persons):
+        return theta[sample_idx, :, None]
+    if theta.ndim == 1 and n_factors == 1 and theta.shape == (n_persons,):
+        return theta[:, None]
+
+    raise ValueError(
+        "chain 'theta' must be fixed (n_persons, n_factors), sampled "
+        "(n_samples, n_persons, n_factors), or sampled unidimensional "
+        "(n_samples, n_persons)"
+    )
+
+
+def _validate_response_matrix(
+    responses: NDArray[np.int_],
+    model: BaseItemModel,
+) -> NDArray[np.int_]:
+    """Validate response shape and observed category codes."""
+    values = np.asarray(responses)
+    if values.ndim != 2:
+        raise ValueError("responses must be a two-dimensional matrix")
+    if values.shape[1] != model.n_items:
+        raise ValueError(
+            f"responses has {values.shape[1]} items, expected {model.n_items}"
+        )
+
+    is_boolean = np.issubdtype(values.dtype, np.bool_)
+    if not is_boolean and not np.issubdtype(values.dtype, np.number):
+        raise ValueError("responses must contain finite integer category codes")
+    if not is_boolean and (
+        not np.all(np.isfinite(values)) or not np.all(values == np.floor(values))
+    ):
+        raise ValueError("responses must contain finite integer category codes")
+
+    integer_values = values.astype(np.int64, copy=False)
+    observed = integer_values >= 0
+    if model.is_polytomous:
+        category_limits = np.asarray(model.n_categories, dtype=np.int64)[None, :]
+        invalid = observed & (integer_values >= category_limits)
+    else:
+        invalid = observed & (integer_values > 1)
+    if np.any(invalid):
+        raise ValueError("responses contain categories unsupported by the model")
+
+    return integer_values
+
+
+def _pointwise_log_likelihood(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute one posterior sample's person-item log likelihood matrix."""
+    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
+    observed = responses >= 0
+
+    if probabilities.shape[:2] != responses.shape:
+        raise ValueError(
+            "model probability shape does not match the response matrix: "
+            f"{probabilities.shape[:2]} != {responses.shape}"
+        )
+
+    if probabilities.ndim == 2:
+        probabilities = np.clip(probabilities, PROB_EPSILON, 1.0 - PROB_EPSILON)
+        log_likelihood = np.where(
+            responses == 1,
+            np.log(probabilities),
+            np.log1p(-probabilities),
+        )
+    elif probabilities.ndim == 3:
+        safe_responses = np.where(observed, responses, 0)
+        selected = np.take_along_axis(
+            probabilities,
+            safe_responses[..., None],
+            axis=2,
+        )[..., 0]
+        log_likelihood = np.log(np.clip(selected, PROB_EPSILON, 1.0))
+    else:
+        raise ValueError(
+            "model probabilities must have shape (n_persons, n_items) or "
+            "(n_persons, n_items, n_categories)"
+        )
+
+    return np.where(observed, log_likelihood, 0.0)
+
+
+def _simulate_response_matrix(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> NDArray[np.int_]:
+    """Draw a dichotomous or polytomous response matrix from a model."""
+    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
+    expected_shape = (theta.shape[0], model.n_items)
+
+    if probabilities.shape[:2] != expected_shape:
+        raise ValueError(
+            "model probability shape does not match theta and item dimensions: "
+            f"{probabilities.shape[:2]} != {expected_shape}"
+        )
+
+    if probabilities.ndim == 2:
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("model probabilities must be finite")
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+        return (rng.random(probabilities.shape) < probabilities).astype(np.int64)
+
+    if probabilities.ndim != 3:
+        raise ValueError(
+            "model probabilities must have shape (n_persons, n_items) or "
+            "(n_persons, n_items, n_categories)"
+        )
+
+    probabilities = np.clip(probabilities, 0.0, None)
+    totals = probabilities.sum(axis=2, keepdims=True)
+    if not np.all(np.isfinite(probabilities)) or np.any(totals <= 0):
+        raise ValueError("category probabilities must be finite with positive totals")
+    probabilities = probabilities / totals
+    cumulative = np.cumsum(probabilities, axis=2)
+    draws = rng.random(probabilities.shape[:2])
+    replicated = np.sum(draws[..., None] > cumulative, axis=2)
+    category_max = np.asarray(model.n_categories, dtype=np.int64)[None, :] - 1
+    return np.minimum(replicated, category_max).astype(np.int64)
 
 
 @dataclass
@@ -441,10 +702,19 @@ def posterior_predictive_check(
     -------
     PPCResult
         Results including observed/replicated statistics and p-value.
+
+    Notes
+    -----
+    Dichotomous and polytomous response models are supported. Posterior samples
+    are applied temporarily; the supplied model is restored before return, even
+    when a custom statistic raises an exception.
     """
     rng = np.random.default_rng(seed)
-    responses = np.asarray(responses)
+    responses = _validate_response_matrix(responses, model)
     n_persons, n_items = responses.shape
+
+    if not np.any(responses >= 0):
+        raise ValueError("responses must contain at least one observed value")
 
     if isinstance(test_statistic, str):
         test_statistic = _get_builtin_statistic(test_statistic, n_items)
@@ -452,37 +722,41 @@ def posterior_predictive_check(
     t_obs = test_statistic(responses)
 
     chains = mcmc_result.chains
-    n_samples = len(next(iter(chains.values())))
+    n_samples, parameter_chains = _sampled_parameter_chains(
+        model,
+        chains,
+        n_persons=n_persons,
+    )
 
     if n_rep is None:
         n_rep = n_samples
+    elif not isinstance(n_rep, (int, np.integer)) or isinstance(n_rep, bool):
+        raise ValueError("n_rep must be a positive integer")
+    if n_rep <= 0:
+        raise ValueError("n_rep must be a positive integer")
 
     sample_indices = rng.choice(n_samples, size=n_rep, replace=n_rep > n_samples)
 
-    t_rep = np.zeros(n_rep)
+    t_rep = np.zeros(n_rep, dtype=np.float64)
+    observed = responses >= 0
+    parameter_names = set(parameter_chains)
 
-    for rep_idx, sample_idx in enumerate(sample_indices):
-        for param_name, chain in chains.items():
-            if hasattr(model, f"_{param_name}"):
-                setattr(model, f"_{param_name}", chain[sample_idx])
-            elif param_name in model._parameters:
-                model._parameters[param_name] = chain[sample_idx]
-
-        theta_samples = chains.get(
-            "theta", rng.standard_normal((n_persons, model.n_factors))
-        )
-        if theta_samples.ndim == 3:
-            theta = theta_samples[sample_idx]
-        else:
-            theta = theta_samples
-
-        probs = model.probability(theta)
-        y_rep = (rng.random((n_persons, n_items)) < probs).astype(int)
-
-        valid_mask = responses >= 0
-        y_rep = np.where(valid_mask, y_rep, -1)
-
-        t_rep[rep_idx] = test_statistic(y_rep)
+    with _preserve_model_state(model, parameter_names):
+        for rep_idx, sample_idx in enumerate(sample_indices):
+            _apply_parameter_sample(model, parameter_chains, int(sample_idx))
+            if "theta" in chains:
+                theta = _theta_for_sample(
+                    chains,
+                    sample_idx=int(sample_idx),
+                    n_samples=n_samples,
+                    n_persons=n_persons,
+                    n_factors=model.n_factors,
+                )
+            else:
+                theta = rng.standard_normal((n_persons, model.n_factors))
+            replicated = _simulate_response_matrix(model, theta, rng)
+            replicated = np.where(observed, replicated, -1)
+            t_rep[rep_idx] = test_statistic(replicated)
 
     p_value = np.mean(t_rep >= t_obs)
 
@@ -628,7 +902,7 @@ def compute_pointwise_log_lik(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     chains: dict[str, NDArray[np.float64]],
-    by: Literal["person", "observation"] = "person",
+    by: Literal["person", "observation", "observed"] = "person",
 ) -> NDArray[np.float64]:
     """Compute pointwise log-likelihood from MCMC chains.
 
@@ -640,60 +914,60 @@ def compute_pointwise_log_lik(
         Response matrix.
     chains : dict
         MCMC chains for model parameters.
-    by : {'person', 'observation'}, default='person'
-        Whether to compute log-lik per person or per observation.
+    by : {'person', 'observation', 'observed'}, default='person'
+        Aggregation level. ``'observation'`` preserves the flattened response
+        layout and assigns zero to missing cells. ``'observed'`` returns only
+        non-missing person-item cells, which is convenient for WAIC or PSIS-LOO.
 
     Returns
     -------
     log_lik : ndarray
         If by='person': shape (n_samples, n_persons)
         If by='observation': shape (n_samples, n_persons * n_items)
-    """
-    responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+        If by='observed': shape (n_samples, n_observed_responses)
 
-    sample_chain = next(iter(chains.values()))
-    n_samples = len(sample_chain)
+    Notes
+    -----
+    Dichotomous and polytomous response models are supported. Posterior samples
+    are applied temporarily and the supplied model is restored before return.
+    """
+    if by not in {"person", "observation", "observed"}:
+        raise ValueError("by must be 'person', 'observation', or 'observed'")
+
+    responses = _validate_response_matrix(responses, model)
+    n_persons, n_items = responses.shape
+    n_samples, parameter_chains = _sampled_parameter_chains(
+        model,
+        chains,
+        n_persons=n_persons,
+    )
 
     if by == "person":
-        log_lik = np.zeros((n_samples, n_persons))
+        log_lik = np.zeros((n_samples, n_persons), dtype=np.float64)
+    elif by == "observation":
+        log_lik = np.zeros((n_samples, n_persons * n_items), dtype=np.float64)
     else:
-        log_lik = np.zeros((n_samples, n_persons * n_items))
+        log_lik = np.zeros((n_samples, int(np.sum(responses >= 0))), dtype=np.float64)
 
-    for s in range(n_samples):
-        for param_name, chain in chains.items():
-            if param_name in model._parameters:
-                model._parameters[param_name] = chain[s]
+    parameter_names = set(parameter_chains)
+    observed = responses >= 0
+    with _preserve_model_state(model, parameter_names):
+        for sample_idx in range(n_samples):
+            _apply_parameter_sample(model, parameter_chains, sample_idx)
+            theta = _theta_for_sample(
+                chains,
+                sample_idx=sample_idx,
+                n_samples=n_samples,
+                n_persons=n_persons,
+                n_factors=model.n_factors,
+            )
+            pointwise = _pointwise_log_likelihood(model, responses, theta)
 
-        theta_chain = chains.get("theta", None)
-        if theta_chain is not None:
-            if theta_chain.ndim == 3:
-                theta = theta_chain[s]
+            if by == "person":
+                log_lik[sample_idx] = pointwise.sum(axis=1)
+            elif by == "observation":
+                log_lik[sample_idx] = pointwise.ravel()
             else:
-                theta = theta_chain
-        else:
-            theta = np.zeros((n_persons, model.n_factors))
-
-        probs = model.probability(theta)
-        probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-        if by == "person":
-            for i in range(n_persons):
-                ll = 0.0
-                for j in range(n_items):
-                    if responses[i, j] >= 0:
-                        r = responses[i, j]
-                        p = probs[i, j]
-                        ll += r * np.log(p) + (1 - r) * np.log(1 - p)
-                log_lik[s, i] = ll
-        else:
-            obs_idx = 0
-            for i in range(n_persons):
-                for j in range(n_items):
-                    if responses[i, j] >= 0:
-                        r = responses[i, j]
-                        p = probs[i, j]
-                        log_lik[s, obs_idx] = r * np.log(p) + (1 - r) * np.log(1 - p)
-                    obs_idx += 1
+                log_lik[sample_idx] = pointwise[observed]
 
     return log_lik
