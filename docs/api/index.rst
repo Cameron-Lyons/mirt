@@ -160,6 +160,19 @@ Multigroup
    fit_multigroup
    compare_invariance
 
+Reports
+-------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   generate_report
+   ItemAnalysisReport
+   ModelFitReport
+   FullDiagnosticReport
+   DIFAnalysisReport
+
 Utils
 -----
 

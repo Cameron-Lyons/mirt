@@ -15,6 +15,7 @@ powered by a Rust backend for computational efficiency.
    guides/plotting
    guides/multigroup
    guides/equating
+   guides/reports
    guides/custom_models
    guides/network_models
    api/index
@@ -51,6 +52,7 @@ Features
 * **Multiple IRT Models**: 1PL, 2PL, 3PL, Graded Response, Partial Credit, and more
 * **Estimation Methods**: EM, MCMC, MHRM, Mixed estimation
 * **Diagnostics**: Item fit, model fit, DIF analysis, SIBTEST
+* **Reports**: Standalone HTML summaries with optional embedded visualizations
 * **Scoring**: EAP, MAP, ML scoring methods
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
 * **Custom Models**: Validated dichotomous, polytomous, multidimensional, and group callbacks
