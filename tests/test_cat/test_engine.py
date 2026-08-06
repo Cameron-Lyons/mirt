@@ -1,5 +1,7 @@
 """Tests for CATEngine."""
 
+from unittest.mock import patch
+
 import numpy as np
 import pytest
 
@@ -141,6 +143,45 @@ class TestCATEngineItemSelection:
 
         assert isinstance(item, int)
         assert 0 <= item < model.n_items
+
+    def test_disclosed_item_remains_pending_until_response(self, fitted_2pl_model):
+        """The response must be recorded against the item shown to the user."""
+        model = fitted_2pl_model.model
+        cat = CATEngine(
+            model,
+            item_selection=RandomSelection(seed=42),
+            max_items=5,
+        )
+
+        with patch.object(cat, "_select_next_item", wraps=cat._select_next_item) as spy:
+            disclosed_item = cat.get_current_state().next_item
+            assert cat.select_next_item() == disclosed_item
+            assert spy.call_count == 1
+            state = cat.administer_item(1)
+
+        assert state.items_administered == [disclosed_item]
+        assert spy.call_count == 2
+
+    def test_completion_does_not_select_an_unused_item(self, fitted_2pl_model):
+        """Stopping should occur before the engine computes another item."""
+        cat = CATEngine(fitted_2pl_model.model, max_items=1)
+
+        with patch.object(cat, "_select_next_item", wraps=cat._select_next_item) as spy:
+            cat.select_next_item()
+            state = cat.administer_item(1)
+
+        assert state.is_complete
+        assert state.next_item is None
+        assert spy.call_count == 1
+
+    def test_reset_discards_pending_item(self, fitted_2pl_model):
+        """A new session must not inherit an unadministered item."""
+        cat = CATEngine(fitted_2pl_model.model, item_selection="random", seed=42)
+        cat.select_next_item()
+
+        cat.reset()
+
+        assert not hasattr(cat, "_pending_item")
 
     def test_select_item_complete_raises_error(self, fitted_2pl_model):
         """Test that selecting when complete raises error."""

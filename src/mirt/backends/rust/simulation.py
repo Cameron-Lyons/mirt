@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import sample_categorical_rows
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     mirt_rs,
@@ -51,14 +52,19 @@ def simulate_grm(
             z = discrimination[i] * (theta[:, 0] - thresholds[i, k])
             cum_probs[:, k + 1] = sigmoid(z)
 
-        cat_probs = np.diff(
+        cat_probs = -np.diff(
             np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1
         )
         cat_probs = np.maximum(cat_probs, 0)
-        cat_probs = cat_probs / cat_probs.sum(axis=1, keepdims=True)
+        totals = cat_probs.sum(axis=1, keepdims=True)
+        cat_probs = np.divide(
+            cat_probs,
+            totals,
+            out=np.zeros_like(cat_probs),
+            where=totals > 0,
+        )
 
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+        responses[:, i] = sample_categorical_rows(cat_probs, rng)
 
     return responses
 
@@ -92,17 +98,15 @@ def simulate_gpcm(
     responses = np.zeros((n_persons, n_items), dtype=np.int_)
 
     for i in range(n_items):
-        numerators = np.zeros((n_persons, n_categories))
-        for k in range(n_categories):
-            cumsum = 0.0
-            for v in range(k):
-                cumsum += discrimination[i] * (theta[:, 0] - thresholds[i, v])
-            numerators[:, k] = np.exp(cumsum)
+        step_logits = discrimination[i] * (theta[:, :1] - thresholds[i][None, :])
+        logits = np.zeros((n_persons, n_categories))
+        logits[:, 1:] = np.cumsum(step_logits, axis=1)
+        logits -= np.max(logits, axis=1, keepdims=True)
+        numerators = np.exp(logits)
 
         cat_probs = numerators / numerators.sum(axis=1, keepdims=True)
 
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+        responses[:, i] = sample_categorical_rows(cat_probs, rng)
 
     return responses
 

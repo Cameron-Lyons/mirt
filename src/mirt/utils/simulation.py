@@ -5,9 +5,12 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 
+SimulationModel = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+_MAX_STABLE_LOGIT = np.finfo(np.float64).max
+
 
 def simdata(
-    model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM"] = "2PL",
+    model: SimulationModel = "2PL",
     n_persons: int = 500,
     n_items: int = 20,
     n_categories: int = 2,
@@ -19,6 +22,9 @@ def simdata(
     upper: NDArray[np.float64] | None = None,
     thresholds: NDArray[np.float64] | None = None,
     seed: int | None = None,
+    steps: NDArray[np.float64] | None = None,
+    slopes: NDArray[np.float64] | None = None,
+    intercepts: NDArray[np.float64] | None = None,
 ) -> NDArray[np.int_]:
     """Simulate item response data from an IRT model.
 
@@ -27,7 +33,7 @@ def simdata(
 
     Parameters
     ----------
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM"}, default="2PL"
+    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
         IRT model to simulate from:
 
         - "1PL": One-parameter logistic (equal discrimination)
@@ -36,6 +42,8 @@ def simdata(
         - "4PL": Four-parameter logistic (with guessing and slipping)
         - "GRM": Graded Response Model (polytomous)
         - "GPCM": Generalized Partial Credit Model (polytomous)
+        - "PCM": Partial Credit Model (unit discrimination)
+        - "NRM": Nominal Response Model (unordered categories)
 
     n_persons : int, default=500
         Number of persons to simulate.
@@ -61,10 +69,18 @@ def simdata(
         Upper asymptote (slipping) parameters for 4PL model.
         If None, defaults to 1.0.
     thresholds : ndarray of shape (n_items, n_categories-1), optional
-        Category threshold parameters for polytomous models.
+        Category threshold parameters for GRM, or a backward-compatible alias
+        for GPCM step parameters.
         If None, equally spaced around difficulty.
     seed : int, optional
         Random seed for reproducibility.
+    steps : ndarray of shape (n_items, n_categories-1), optional
+        Step parameters for GPCM and PCM models.
+    slopes : ndarray, optional
+        NRM category slopes. Shape (n_items, n_categories) when unidimensional
+        or (n_items, n_categories, n_factors) when multidimensional.
+    intercepts : ndarray of shape (n_items, n_categories), optional
+        NRM category intercepts.
 
     Returns
     -------
@@ -90,6 +106,29 @@ def simdata(
     >>> # Simulate polytomous GRM data
     >>> data = simdata(model="GRM", n_categories=5, n_items=15)
     """
+    model = model.upper()
+    valid_models = {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}
+    if model not in valid_models:
+        raise ValueError(f"Unknown model: {model}")
+    if isinstance(n_items, bool) or not isinstance(n_items, (int, np.integer)):
+        raise ValueError("n_items must be a positive integer")
+    if isinstance(n_persons, bool) or not isinstance(n_persons, (int, np.integer)):
+        raise ValueError("n_persons must be a positive integer")
+    if isinstance(n_factors, bool) or not isinstance(n_factors, (int, np.integer)):
+        raise ValueError("n_factors must be a positive integer")
+    if isinstance(n_categories, bool) or not isinstance(
+        n_categories, (int, np.integer)
+    ):
+        raise ValueError("n_categories must be a positive integer")
+    if n_items < 1:
+        raise ValueError("n_items must be a positive integer")
+    if n_persons < 1:
+        raise ValueError("n_persons must be a positive integer")
+    if n_factors < 1:
+        raise ValueError("n_factors must be a positive integer")
+    if model in {"GRM", "GPCM", "PCM", "NRM"} and n_categories < 2:
+        raise ValueError("n_categories must be at least 2")
+
     rng = np.random.default_rng(seed)
 
     if theta is None:
@@ -98,26 +137,106 @@ def simdata(
         else:
             theta = rng.standard_normal((n_persons, n_factors))
     else:
-        theta = np.asarray(theta)
+        theta = np.asarray(theta, dtype=np.float64)
+        if theta.ndim not in (1, 2):
+            raise ValueError("theta must be one- or two-dimensional")
         n_persons = theta.shape[0]
+        if n_persons < 1:
+            raise ValueError("theta must contain at least one person")
 
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
+    n_factors = theta.shape[1]
 
-    if discrimination is None:
-        if n_factors == 1:
-            discrimination = rng.lognormal(0, 0.25, size=n_items)
-        else:
-            discrimination = rng.lognormal(0, 0.25, size=(n_items, n_factors))
-    else:
-        discrimination = np.asarray(discrimination)
+    if not np.all(np.isfinite(theta)):
+        raise ValueError("theta must contain finite values")
 
-    if difficulty is None:
-        difficulty = rng.normal(0, 1, size=n_items)
+    if model in {"GRM", "GPCM", "PCM", "NRM"} and (
+        guessing is not None or upper is not None
+    ):
+        raise ValueError("guessing and upper are only valid for 3PL and 4PL")
+
+    if model == "NRM":
+        if discrimination is not None:
+            raise ValueError("NRM simulation: use slopes instead of discrimination")
+        if difficulty is not None:
+            raise ValueError("NRM simulation: use intercepts instead of difficulty")
+        if thresholds is not None or steps is not None:
+            raise ValueError("NRM does not use thresholds or steps")
+
+        slope_values = _prepare_nrm_slopes(
+            slopes,
+            n_items=n_items,
+            n_categories=n_categories,
+            n_factors=n_factors,
+            rng=rng,
+        )
+        intercept_values = _prepare_parameter(
+            "intercepts",
+            intercepts
+            if intercepts is not None
+            else _default_nrm_intercepts(n_items, n_categories, rng),
+            (n_items, n_categories),
+        )
+        return _simulate_nrm(theta, slope_values, intercept_values, rng)
+
+    if slopes is not None or intercepts is not None:
+        raise ValueError("slopes and intercepts are only valid for NRM")
+
+    expected_discrimination_shape = (
+        (n_items,) if n_factors == 1 else (n_items, n_factors)
+    )
+
+    if model in {"1PL", "PCM"}:
+        if discrimination is not None:
+            supplied_discrimination = _prepare_discrimination(
+                discrimination,
+                n_items=n_items,
+                n_factors=n_factors,
+            )
+            if not np.allclose(supplied_discrimination, 1.0):
+                raise ValueError(f"{model} discrimination is fixed to 1.0")
+        discrimination = np.ones(expected_discrimination_shape, dtype=np.float64)
+    elif discrimination is None:
+        discrimination = rng.lognormal(
+            0,
+            0.25,
+            size=expected_discrimination_shape,
+        )
     else:
-        difficulty = np.asarray(difficulty)
+        discrimination = _prepare_discrimination(
+            discrimination,
+            n_items=n_items,
+            n_factors=n_factors,
+        )
+
+    if model == "PCM":
+        if n_factors != 1:
+            raise ValueError("PCM simulation only supports unidimensional theta")
+        if difficulty is not None:
+            raise ValueError("PCM simulation: use steps instead of difficulty")
+        step_values = _prepare_steps(
+            steps=steps,
+            thresholds=thresholds,
+            n_items=n_items,
+            n_categories=n_categories,
+        )
+        return _simulate_gpcm(
+            theta=theta,
+            discrimination=discrimination,
+            n_categories=n_categories,
+            thresholds=step_values,
+            rng=rng,
+        )
 
     if model in ("1PL", "2PL", "3PL", "4PL"):
+        if steps is not None:
+            raise ValueError("steps are only valid for GPCM and PCM")
+        difficulty = _prepare_parameter(
+            "difficulty",
+            difficulty if difficulty is not None else rng.normal(0, 1, size=n_items),
+            (n_items,),
+        )
         return _simulate_dichotomous(
             model=model,
             theta=theta,
@@ -127,7 +246,14 @@ def simdata(
             upper=upper,
             rng=rng,
         )
-    elif model == "GRM":
+    if model == "GRM":
+        if steps is not None:
+            raise ValueError("GRM uses thresholds instead of steps")
+        difficulty = _prepare_parameter(
+            "difficulty",
+            difficulty if difficulty is not None else rng.normal(0, 1, size=n_items),
+            (n_items,),
+        )
         return _simulate_grm(
             theta=theta,
             discrimination=discrimination,
@@ -136,16 +262,163 @@ def simdata(
             thresholds=thresholds,
             rng=rng,
         )
-    elif model == "GPCM":
+    if model == "GPCM":
+        if difficulty is not None:
+            raise ValueError("GPCM uses steps instead of difficulty")
+        step_values = _prepare_steps(
+            steps=steps,
+            thresholds=thresholds,
+            n_items=n_items,
+            n_categories=n_categories,
+        )
         return _simulate_gpcm(
             theta=theta,
             discrimination=discrimination,
             n_categories=n_categories,
-            thresholds=thresholds,
+            thresholds=step_values,
             rng=rng,
         )
+
+    raise AssertionError("unreachable simulation model")
+
+
+def _prepare_parameter(
+    name: str,
+    value: NDArray[np.float64],
+    shape: tuple[int, ...],
+) -> NDArray[np.float64]:
+    """Validate and normalize one simulation parameter array."""
+    array = np.asarray(value, dtype=np.float64)
+    if array.shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"{name} must contain finite values")
+    return array
+
+
+def _prepare_discrimination(
+    discrimination: NDArray[np.float64],
+    *,
+    n_items: int,
+    n_factors: int,
+) -> NDArray[np.float64]:
+    """Validate discrimination while accepting a unidimensional column."""
+    array = np.asarray(discrimination, dtype=np.float64)
+    if n_factors == 1 and array.shape == (n_items, 1):
+        array = array[:, 0]
+    expected = (n_items,) if n_factors == 1 else (n_items, n_factors)
+    return _prepare_parameter("discrimination", array, expected)
+
+
+def _prepare_steps(
+    *,
+    steps: NDArray[np.float64] | None,
+    thresholds: NDArray[np.float64] | None,
+    n_items: int,
+    n_categories: int,
+) -> NDArray[np.float64]:
+    """Resolve GPCM/PCM step parameters and their legacy alias."""
+    if steps is not None and thresholds is not None:
+        raise ValueError("provide either steps or thresholds, not both")
+    values = steps if steps is not None else thresholds
+    if values is None:
+        values = np.tile(
+            np.linspace(-1.0, 1.0, n_categories - 1),
+            (n_items, 1),
+        )
+    return _prepare_parameter(
+        "steps",
+        values,
+        (n_items, n_categories - 1),
+    )
+
+
+def _prepare_nrm_slopes(
+    slopes: NDArray[np.float64] | None,
+    *,
+    n_items: int,
+    n_categories: int,
+    n_factors: int,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Generate or validate identified NRM category slopes."""
+    shape = (
+        (n_items, n_categories)
+        if n_factors == 1
+        else (n_items, n_categories, n_factors)
+    )
+    if slopes is None:
+        values = rng.normal(0.0, 0.6, size=shape)
+        values[:, 0, ...] = 0.0
     else:
-        raise ValueError(f"Unknown model: {model}")
+        values = slopes
+    return _prepare_parameter("slopes", values, shape)
+
+
+def _default_nrm_intercepts(
+    n_items: int,
+    n_categories: int,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Generate identified NRM category intercepts."""
+    values = rng.normal(0.0, 0.6, size=(n_items, n_categories))
+    values[:, 0] = 0.0
+    return values
+
+
+def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Normalize category logits without overflow at extreme parameters."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        finite_logits = np.nan_to_num(
+            logits,
+            nan=0.0,
+            posinf=_MAX_STABLE_LOGIT,
+            neginf=-_MAX_STABLE_LOGIT,
+        )
+        finite_logits = np.clip(
+            finite_logits,
+            -_MAX_STABLE_LOGIT,
+            _MAX_STABLE_LOGIT,
+        )
+        shifted = finite_logits - finite_logits.max(axis=1, keepdims=True)
+        weights = np.exp(np.clip(shifted, -745.0, 0.0))
+    return weights / weights.sum(axis=1, keepdims=True)
+
+
+def _sample_categories(
+    probabilities: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> NDArray[np.int_]:
+    """Draw one category per row without a Python loop over respondents."""
+    cumulative = np.cumsum(probabilities[:, :-1], axis=1)
+    uniforms = rng.random(probabilities.shape[0])
+    return np.sum(uniforms[:, None] >= cumulative, axis=1, dtype=np.int_)
+
+
+def _should_use_rust() -> bool:
+    """Resolve the global backend preference without eager backend imports."""
+    from mirt._backend_config import should_use_rust
+
+    return should_use_rust()
+
+
+def _next_backend_seed(rng: np.random.Generator) -> int:
+    """Derive a reproducible seed after any generated parameter draws."""
+    return int(rng.integers(0, np.iinfo(np.int64).max))
+
+
+def _gpcm_rust_safe(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    steps: NDArray[np.float64],
+) -> bool:
+    """Return whether exponentiating Rust GPCM logits cannot overflow."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        largest_increment = np.max(np.abs(discrimination)) * (
+            np.max(np.abs(theta)) + np.max(np.abs(steps))
+        )
+        largest_logit = largest_increment * (steps.shape[1] + 1)
+    return bool(np.isfinite(largest_logit) and largest_logit < 700.0)
 
 
 def _simulate_dichotomous(
@@ -167,12 +440,34 @@ def _simulate_dichotomous(
         else:
             guessing = np.zeros(n_items)
     else:
-        guessing = np.asarray(guessing)
+        guessing = _prepare_parameter("guessing", guessing, (n_items,))
 
     if upper is None:
         upper = np.ones(n_items)
     else:
-        upper = np.asarray(upper)
+        upper = _prepare_parameter("upper", upper, (n_items,))
+
+    if np.any((guessing < 0.0) | (guessing > 1.0)):
+        raise ValueError("guessing values must be between 0 and 1")
+    if np.any((upper < 0.0) | (upper > 1.0)):
+        raise ValueError("upper values must be between 0 and 1")
+    if np.any(guessing > upper):
+        raise ValueError("guessing values cannot exceed upper")
+
+    if n_factors == 1 and model != "4PL" and _should_use_rust():
+        from mirt import _rust_backend
+
+        backend_guessing = guessing if model == "3PL" else None
+        return np.asarray(
+            _rust_backend.simulate_dichotomous(
+                theta.ravel(),
+                discrimination.ravel(),
+                difficulty,
+                backend_guessing,
+                seed=_next_backend_seed(rng),
+            ),
+            dtype=np.int_,
+        )
 
     if n_factors == 1:
         a = discrimination if discrimination.ndim == 1 else discrimination.ravel()
@@ -216,35 +511,52 @@ def _simulate_grm(
         thresholds = np.zeros((n_items, n_categories - 1))
         for i in range(n_items):
             thresholds[i] = difficulty[i] + np.linspace(-1.5, 1.5, n_categories - 1)
-    else:
-        thresholds = np.asarray(thresholds)
+    thresholds = _prepare_parameter(
+        "thresholds",
+        thresholds,
+        (n_items, n_categories - 1),
+    )
+    if np.any(np.diff(thresholds, axis=1) < 0):
+        raise ValueError("GRM thresholds must be ordered within each item")
 
     if n_factors == 1:
         a = discrimination if discrimination.ndim == 1 else discrimination.ravel()
     else:
         a = discrimination
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    if n_factors == 1 and _should_use_rust():
+        from mirt import _rust_backend
+
+        return np.asarray(
+            _rust_backend.simulate_grm(
+                theta,
+                a,
+                thresholds,
+                seed=_next_backend_seed(rng),
+            ),
+            dtype=np.int_,
+        )
+
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
 
     for i in range(n_items):
-        cum_probs = np.ones((n_persons, n_categories))
+        if n_factors == 1:
+            logits = a[i] * (theta[:, :1] - thresholds[i][None, :])
+        else:
+            logits = (
+                np.dot(theta, a[i])[:, None] - np.sum(a[i]) * thresholds[i][None, :]
+            )
 
-        for k in range(n_categories - 1):
-            if n_factors == 1:
-                z = a[i] * (theta.ravel() - thresholds[i, k])
-            else:
-                z = np.dot(theta, a[i]) - np.sum(a[i]) * thresholds[i, k]
-
-            cum_probs[:, k + 1] = sigmoid(z)
-
-        cat_probs = np.diff(
-            np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1
+        cumulative = np.column_stack(
+            [
+                np.ones(n_persons),
+                sigmoid(logits),
+                np.zeros(n_persons),
+            ]
         )
-        cat_probs = np.maximum(cat_probs, 0)
-        cat_probs = cat_probs / cat_probs.sum(axis=1, keepdims=True)
-
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+        probabilities = np.maximum(cumulative[:, :-1] - cumulative[:, 1:], 0.0)
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        responses[:, i] = _sample_categories(probabilities, rng)
 
     return responses
 
@@ -261,43 +573,91 @@ def _simulate_gpcm(
     n_factors = theta.shape[1]
 
     if thresholds is None:
-        thresholds = np.zeros((n_items, n_categories - 1))
-        for i in range(n_items):
-            thresholds[i] = np.linspace(-1, 1, n_categories - 1)
-    else:
-        thresholds = np.asarray(thresholds)
+        thresholds = np.tile(
+            np.linspace(-1.0, 1.0, n_categories - 1),
+            (n_items, 1),
+        )
+    thresholds = _prepare_parameter(
+        "steps",
+        thresholds,
+        (n_items, n_categories - 1),
+    )
 
     if n_factors == 1:
         a = discrimination if discrimination.ndim == 1 else discrimination.ravel()
     else:
         a = discrimination
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    if n_factors == 1 and _gpcm_rust_safe(theta, a, thresholds) and _should_use_rust():
+        from mirt import _rust_backend
+
+        return np.asarray(
+            _rust_backend.simulate_gpcm(
+                theta.ravel(),
+                a,
+                thresholds,
+                seed=_next_backend_seed(rng),
+            ),
+            dtype=np.int_,
+        )
+
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
 
     for i in range(n_items):
-        numerators = np.zeros((n_persons, n_categories))
+        with np.errstate(over="ignore", invalid="ignore"):
+            if n_factors == 1:
+                increments = a[i] * (theta[:, :1] - thresholds[i][None, :])
+            else:
+                increments = (
+                    np.dot(theta, a[i])[:, None] - np.sum(a[i]) * thresholds[i][None, :]
+                )
+        increments = np.nan_to_num(
+            increments,
+            nan=0.0,
+            posinf=_MAX_STABLE_LOGIT,
+            neginf=-_MAX_STABLE_LOGIT,
+        )
+        increment_limit = _MAX_STABLE_LOGIT / n_categories
+        increments = np.clip(
+            increments,
+            -increment_limit,
+            increment_limit,
+        )
+        logits = np.zeros((n_persons, n_categories), dtype=np.float64)
+        logits[:, 1:] = np.cumsum(increments, axis=1)
+        probabilities = _stable_softmax(logits)
+        responses[:, i] = _sample_categories(probabilities, rng)
 
-        for k in range(n_categories):
-            cumsum = 0.0
-            for v in range(k):
-                if n_factors == 1:
-                    cumsum += a[i] * (theta.ravel() - thresholds[i, v])
-                else:
-                    cumsum += np.dot(theta, a[i]) - np.sum(a[i]) * thresholds[i, v]
+    return responses
 
-            numerators[:, k] = np.exp(cumsum)
 
-        cat_probs = numerators / numerators.sum(axis=1, keepdims=True)
+def _simulate_nrm(
+    theta: NDArray[np.float64],
+    slopes: NDArray[np.float64],
+    intercepts: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> NDArray[np.int_]:
+    """Simulate nominal categories from category-specific linear predictors."""
+    n_persons = theta.shape[0]
+    n_items, n_categories = intercepts.shape
+    n_factors = theta.shape[1]
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
 
-        for p in range(n_persons):
-            responses[p, i] = rng.choice(n_categories, p=cat_probs[p])
+    for i in range(n_items):
+        with np.errstate(over="ignore", invalid="ignore"):
+            if n_factors == 1:
+                logits = theta[:, :1] * slopes[i][None, :] + intercepts[i]
+            else:
+                logits = np.dot(theta, slopes[i].T) + intercepts[i]
+        probabilities = _stable_softmax(logits)
+        responses[:, i] = _sample_categories(probabilities, rng)
 
     return responses
 
 
 def generate_item_parameters(
     n_items: int,
-    model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM"] = "2PL",
+    model: SimulationModel = "2PL",
     n_factors: int = 1,
     n_categories: int = 2,
     seed: int | None = None,
@@ -311,7 +671,7 @@ def generate_item_parameters(
     ----------
     n_items : int
         Number of items to generate parameters for.
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM"}, default="2PL"
+    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
         IRT model type determining which parameters to generate.
     n_factors : int, default=1
         Number of latent factors for multidimensional models.
@@ -331,6 +691,9 @@ def generate_item_parameters(
           Shape (n_items,).
         - "thresholds": Category thresholds for polytomous models.
           Shape (n_items, n_categories-1).
+        - "steps": Category steps for PCM. Shape
+          (n_items, n_categories-1).
+        - "slopes" and "intercepts": Category parameters for NRM.
         - "guessing": Lower asymptote (c) for 3PL/4PL. Shape (n_items,).
         - "upper": Upper asymptote (d) for 4PL. Shape (n_items,).
 
@@ -345,9 +708,57 @@ def generate_item_parameters(
     >>> params = generate_item_parameters(n_items=15, model="3PL")
     >>> print(params['guessing'].mean())  # Average guessing parameter
     """
+    model = model.upper()
+    valid_models = {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}
+    if model not in valid_models:
+        raise ValueError(f"Unknown model: {model}")
+    if isinstance(n_items, bool) or not isinstance(n_items, (int, np.integer)):
+        raise ValueError("n_items must be a positive integer")
+    if isinstance(n_factors, bool) or not isinstance(n_factors, (int, np.integer)):
+        raise ValueError("n_factors must be a positive integer")
+    if isinstance(n_categories, bool) or not isinstance(
+        n_categories, (int, np.integer)
+    ):
+        raise ValueError("n_categories must be a positive integer")
+    if n_items < 1:
+        raise ValueError("n_items must be a positive integer")
+    if n_factors < 1:
+        raise ValueError("n_factors must be a positive integer")
+    if model in {"GRM", "GPCM", "PCM", "NRM"} and n_categories < 2:
+        raise ValueError("n_categories must be at least 2")
+    if model == "PCM" and n_factors != 1:
+        raise ValueError("PCM only supports one factor")
+
     rng = np.random.default_rng(seed)
 
     params: dict[str, NDArray[np.float64]] = {}
+
+    if model == "NRM":
+        slope_shape = (
+            (n_items, n_categories)
+            if n_factors == 1
+            else (n_items, n_categories, n_factors)
+        )
+        params["slopes"] = rng.normal(0.0, 0.6, size=slope_shape)
+        params["slopes"][:, 0, ...] = 0.0
+        params["intercepts"] = _default_nrm_intercepts(
+            n_items,
+            n_categories,
+            rng,
+        )
+        return params
+
+    if model == "PCM":
+        params["discrimination"] = np.ones(n_items)
+        params["steps"] = np.zeros((n_items, n_categories - 1))
+        for i in range(n_items):
+            base = rng.normal(0, 1)
+            params["steps"][i] = base + np.linspace(
+                -1.5,
+                1.5,
+                n_categories - 1,
+            )
+        return params
 
     if model != "1PL":
         if n_factors == 1:

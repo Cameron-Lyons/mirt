@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 _HAS_PLOTTING = find_spec("matplotlib") is not None
-_HAS_REPORTS = _HAS_PLOTTING
+_HAS_REPORTS = True
 
 
 def fit_mirt(

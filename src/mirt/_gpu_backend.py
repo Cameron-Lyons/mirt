@@ -7,34 +7,20 @@ automatically detecting GPU availability and falling back gracefully.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from importlib import import_module
+from importlib.util import find_spec
+from types import ModuleType
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
 
-if TYPE_CHECKING:
-    pass
-
-try:
-    import torch
-
-    _TORCH_AVAILABLE = True
-    GPU_AVAILABLE = torch.cuda.is_available()
-    if GPU_AVAILABLE:
-        GPU_DEVICE = torch.device("cuda")
-    else:
-        GPU_DEVICE = torch.device("cpu")
-        GPU_AVAILABLE = False
-except ImportError:
-    _TORCH_AVAILABLE = False
-    GPU_AVAILABLE = False
-    GPU_DEVICE = None
-    torch = None
-
-
-_CURRENT_BACKEND: Literal["auto", "gpu", "rust", "numpy"] = "auto"
+_torch: ModuleType | None = None
+_torch_import_error: ImportError | None = None
+_gpu_available: bool | None = None
+_gpu_device: Any = None
 
 
 def is_gpu_available() -> bool:
@@ -45,7 +31,11 @@ def is_gpu_available() -> bool:
     bool
         True if PyTorch is installed and CUDA is available.
     """
-    return GPU_AVAILABLE
+    try:
+        _load_torch()
+    except ImportError:
+        return False
+    return bool(_gpu_available)
 
 
 def is_torch_available() -> bool:
@@ -56,7 +46,59 @@ def is_torch_available() -> bool:
     bool
         True if PyTorch is installed.
     """
-    return _TORCH_AVAILABLE
+    if _torch is not None:
+        return True
+    if _torch_import_error is not None:
+        return False
+    try:
+        return find_spec("torch") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _load_torch() -> ModuleType:
+    """Import and initialize the optional PyTorch runtime on first use."""
+    global _gpu_available, _gpu_device, _torch, _torch_import_error
+
+    if _torch is not None:
+        return _torch
+    if _torch_import_error is not None:
+        raise ImportError(
+            "PyTorch is not installed. Install with: pip install torch"
+        ) from _torch_import_error
+
+    try:
+        _torch = import_module("torch")
+    except ImportError as exc:
+        _torch_import_error = exc
+        raise ImportError(
+            "PyTorch is not installed. Install with: pip install torch"
+        ) from exc
+
+    _gpu_available = bool(_torch.cuda.is_available())
+    _gpu_device = _torch.device("cuda" if _gpu_available else "cpu")
+    return _torch
+
+
+def _load_torch_runtime() -> tuple[ModuleType, Any]:
+    """Return the initialized PyTorch module and preferred device."""
+    torch = _load_torch()
+    return torch, _gpu_device
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve legacy availability constants without eager optional imports."""
+    if name == "GPU_AVAILABLE":
+        return is_gpu_available()
+    if name == "GPU_DEVICE":
+        try:
+            _, device = _load_torch_runtime()
+        except ImportError:
+            return None
+        return device
+    if name == "_TORCH_AVAILABLE":
+        return is_torch_available()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def get_gpu_device_name() -> str | None:
@@ -67,8 +109,9 @@ def get_gpu_device_name() -> str | None:
     str or None
         GPU device name, or None if no GPU is available.
     """
-    if GPU_AVAILABLE and torch is not None:
-        return torch.cuda.get_device_name(0)
+    if is_gpu_available():
+        torch = _load_torch()
+        return str(torch.cuda.get_device_name(0))
     return None
 
 
@@ -81,7 +124,8 @@ def get_gpu_memory_info() -> dict[str, int] | None:
         Dictionary with 'total', 'allocated', and 'free' memory in bytes,
         or None if no GPU is available.
     """
-    if GPU_AVAILABLE and torch is not None:
+    if is_gpu_available():
+        torch = _load_torch()
         return {
             "total": torch.cuda.get_device_properties(0).total_memory,
             "allocated": torch.cuda.memory_allocated(0),
@@ -112,11 +156,10 @@ def to_torch(
     torch.Tensor
         PyTorch tensor on the specified device.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed. Install with: pip install torch")
+    torch, default_device = _load_torch_runtime()
 
     if device is None:
-        device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+        device = default_device
     if dtype is None:
         dtype = torch.float64
 
@@ -166,10 +209,7 @@ def compute_log_likelihoods_2pl_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods for each person at each quadrature point.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
@@ -223,10 +263,7 @@ def compute_log_likelihoods_3pl_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods for each person at each quadrature point.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
@@ -276,10 +313,7 @@ def compute_log_likelihoods_mirt_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods for each person at each quadrature point.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
@@ -345,10 +379,7 @@ def e_step_complete_gpu(
     marginal_ll : ndarray of shape (n_persons,)
         Marginal likelihood for each person.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
@@ -406,10 +437,7 @@ def compute_expected_counts_gpu(
     n_k : ndarray of shape (n_quad,)
         Expected number of responses at each quadrature point.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     weights = torch.from_numpy(posterior_weights.astype(np.float64)).to(device)
@@ -461,10 +489,10 @@ def gvem_e_step_gpu(
     tuple or None
         Updated (mu, sigma, xi) or None if GPU not available.
     """
-    if torch is None or not GPU_AVAILABLE:
+    if not is_gpu_available():
         return None
 
-    device = GPU_DEVICE
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     a = torch.from_numpy(slopes.astype(np.float64)).to(device)
@@ -557,10 +585,10 @@ def gvem_compute_elbo_gpu(
     float or None
         ELBO value or None if GPU not available.
     """
-    if torch is None or not GPU_AVAILABLE:
+    if not is_gpu_available():
         return None
 
-    device = GPU_DEVICE
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     a = torch.from_numpy(slopes.astype(np.float64)).to(device)
@@ -653,10 +681,10 @@ def gvem_m_step_gpu(
     tuple or None
         Updated (slopes, intercepts) or None if GPU not available.
     """
-    if torch is None or not GPU_AVAILABLE:
+    if not is_gpu_available():
         return None
 
-    device = GPU_DEVICE
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.float64)).to(device)
     mu_t = torch.from_numpy(mu.astype(np.float64)).to(device)
@@ -744,10 +772,7 @@ def compute_log_likelihoods_grm_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.int64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
@@ -812,10 +837,7 @@ def compute_log_likelihoods_gpcm_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    if torch is None:
-        raise ImportError("PyTorch is not installed")
-
-    device = GPU_DEVICE if GPU_AVAILABLE else torch.device("cpu")
+    torch, device = _load_torch_runtime()
 
     resp = torch.from_numpy(responses.astype(np.int64)).to(device)
     theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)

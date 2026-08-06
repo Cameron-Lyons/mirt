@@ -306,12 +306,11 @@ pub fn fixed_calib_em<'py>(
     let mut converged = false;
     let mut log_likelihood = f64::NEG_INFINITY;
     let mut final_iter = 0;
-    let mut posterior_weights = Array2::zeros((n_persons, n_quad));
 
     for iteration in 0..max_iter {
-        final_iter = iteration;
+        final_iter = iteration + 1;
 
-        let (new_posterior, new_ll) = e_step_fixed_calib(
+        let (posterior_weights, new_ll) = e_step_fixed_calib(
             &anchor_ll,
             &new_responses,
             &theta_grid_vec,
@@ -319,10 +318,7 @@ pub fn fixed_calib_em<'py>(
             &new_disc,
             &new_diff,
         );
-        posterior_weights = new_posterior;
-
         if (new_ll - log_likelihood).abs() < tol {
-            log_likelihood = new_ll;
             converged = true;
             break;
         }
@@ -363,6 +359,18 @@ pub fn fixed_calib_em<'py>(
         }
     }
 
+    // The final M-step can change item parameters immediately before the loop
+    // exits. Recompute the posterior so theta and likelihood describe the
+    // parameters returned to Python.
+    let (posterior_weights, log_likelihood) = e_step_fixed_calib(
+        &anchor_ll,
+        &new_responses,
+        &theta_grid_vec,
+        &log_weights,
+        &new_disc,
+        &new_diff,
+    );
+
     let theta_est: Vec<f64> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
@@ -383,7 +391,7 @@ pub fn fixed_calib_em<'py>(
         diff_arr.to_pyarray(py),
         theta_arr.to_pyarray(py),
         log_likelihood,
-        final_iter + 1,
+        final_iter,
         converged,
     )
 }

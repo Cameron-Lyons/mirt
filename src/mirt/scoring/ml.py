@@ -7,7 +7,11 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
 from mirt.results.score_result import ScoreResult
-from mirt.scoring._common import finite_difference_se, score_responses_parallel
+from mirt.scoring._common import (
+    finite_difference_se,
+    observed_test_information,
+    score_responses_parallel,
+)
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -84,7 +88,7 @@ class MLScorer:
         theta_est = result.x
 
         theta_arr = np.array([[theta_est]])
-        info = model.information(theta_arr).sum()
+        info = observed_test_information(model, theta_arr, responses[0] >= 0)[0]
 
         if info > 0:
             se_est = 1.0 / np.sqrt(info)

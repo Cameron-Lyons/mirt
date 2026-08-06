@@ -15,10 +15,12 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 ### Advanced Models
 - **Cognitive Diagnostic**: DINA, DINO, G-DINA
 - **Testlet**: Random effects for item bundles
+- **Nested Logit**: Keyed multiple-choice items with informative distractors
 - **Mixture IRT**: Latent class IRT models
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
 - **Nonparametric**: Monotonic spline IRFs
+- **Network Psychometrics**: Ising and sparse Gaussian graphical models
 
 ### Estimation Methods
 - **EM Algorithm**: Gauss-Hermite quadrature (with Rust acceleration)
@@ -46,6 +48,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Local dependence**: Q3, chi-square residuals
 
 ### Additional Features
+- Custom dichotomous, ordinal, multidimensional, and latent group models
 - Multiple group analysis with invariance testing
 - Bootstrap standard errors and confidence intervals
 - Plausible values for population inference
@@ -59,7 +62,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Profile-likelihood confidence intervals
 - Posterior parameter sampling
 - **Result objects**: Validated uncertainty, confidence intervals, and portable exports
-- **HTML reports**: Automated IRT analysis report generation
+- **HTML reports**: Safe standalone summaries with optional embedded plots
 
 ## Installation
 
@@ -76,7 +79,7 @@ pip install mirt[dev]
 
 For plotting support:
 ```bash
-pip install matplotlib
+pip install "mirt[plot]"
 ```
 
 ## Quick Start
@@ -109,6 +112,21 @@ b = np.random.normal(0, 1, size=20)
 responses = mirt.simdata(model="2PL", discrimination=a, difficulty=b, n_persons=1000)
 
 likert_data = mirt.simdata(model="GRM", n_categories=5, n_persons=500, n_items=15)
+
+pcm_params = mirt.generate_item_parameters(
+    n_items=15, model="PCM", n_categories=5, seed=42
+)
+pcm_data = mirt.simdata(
+    model="PCM", n_persons=500, n_items=15, n_categories=5, **pcm_params
+)
+
+nrm_params = mirt.generate_item_parameters(
+    n_items=10, model="NRM", n_categories=4, n_factors=2, seed=42
+)
+nrm_data = mirt.simdata(
+    model="NRM", n_persons=500, n_items=10, n_categories=4,
+    n_factors=2, **nrm_params
+)
 ```
 
 ### Fitting Models
@@ -224,10 +242,38 @@ q_matrix = np.array([[1, 0], [1, 1], [0, 1], [1, 1]])
 cdm_result = fit_cdm(responses, q_matrix, model="DINA")
 
 from mirt import fit_mixture_irt
-mix_result = fit_mixture_irt(responses, n_classes=2, model="2PL")
+mix_model, class_posteriors = fit_mixture_irt(
+    responses, n_classes=2, base_model="2PL"
+)
 
 from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
+```
+
+### Custom Item Models
+
+```python
+import numpy as np
+
+from mirt import CustomItemModel, create_item_type
+
+def adjacent_categories(theta, shift):
+    weights = np.column_stack((
+        np.ones_like(theta),
+        np.exp(theta - shift),
+        np.exp(2 * (theta - shift)),
+    ))
+    return weights / weights.sum(axis=1, keepdims=True)
+
+spec = create_item_type(
+    "AdjacentCategories",
+    adjacent_categories,
+    par_bounds={"shift": (-4, 4)},
+    par_defaults={"shift": 0},
+    n_categories=3,
+)
+model = CustomItemModel(n_items=10, item_type=spec)
+probabilities = model.probability(np.linspace(-3, 3, 61))
 ```
 
 ### Exploratory Factor Analysis with Automatic Structure Discovery
@@ -302,11 +348,19 @@ print(f"Grade separation (effect sizes): {diagnostics.grade_separation}")
 ### Plotting
 
 ```python
-from mirt import plot_icc, plot_information, plot_person_item_map
+from mirt import (
+    plot_category_curves,
+    plot_icc,
+    plot_information,
+    plot_person_item_map,
+)
 
 plot_icc(result.model, item_idx=[0, 1, 2])
 
 plot_information(result.model)
+
+# Polytomous category response curves
+plot_category_curves(result.model, item_idx=0)
 
 plot_person_item_map(result.model, scores.theta)
 ```
@@ -330,6 +384,7 @@ plot_person_item_map(result.model, scores.theta)
 | GPCM | Generalized Partial Credit | Partial credit scoring |
 | PCM | Partial Credit Model | Rasch for polytomous |
 | NRM | Nominal Response Model | Unordered categories |
+| 2PL/3PL/4PL-NRM | Nested Logit | Keyed multiple choice with distractor information |
 
 ### Advanced Models
 
@@ -339,6 +394,7 @@ plot_person_item_map(result.model, scores.theta)
 | Bifactor | General + specific factors |
 | DINA/DINO | Cognitive diagnostic |
 | Testlet | Local dependence modeling |
+| Nested Logit | Keyed response and conditional distractor modeling |
 | Mixture IRT | Latent class IRT |
 | GGUM | Generalized graded unfolding |
 
@@ -371,7 +427,7 @@ plot_person_item_map(result.model, scores.theta)
 
 | Function | Description |
 |----------|-------------|
-| `compute_fit_indices()` | M2, RMSEA, CFI, TLI |
+| `compute_fit_indices()` | M2/M2* score moments, RMSEA, CFI, TLI, SRMSR |
 | `compare_models()` | AIC/BIC comparison |
 | `anova_irt()` | Likelihood ratio tests |
 | `compute_dtf()` | Differential test functioning |
@@ -387,8 +443,15 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_se()` | Bootstrap standard errors |
 | `bootstrap_ci()` | Bootstrap confidence intervals |
 | `generate_plausible_values()` | Plausible values |
+| `cross_validate()` | Validated K-fold evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
-| `set_dataframe_backend()` | Choose pandas/polars |
+| `gen_random_pars()` | Valid random starting values that preserve model constraints |
+| `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
+| `calc_null()` | Independence and pooled-intercept baseline fit statistics |
+| `fit_models()` | Validated sequential or parallel model comparison |
+| `fit_model_grid()` | Hyperparameter grids with retained failure details |
+| `set_dataframe_backend()` | Choose pandas/polars or restore automatic selection |
+| `get_dataframe_backend()` | Inspect the active DataFrame backend |
 | `residuals()` | Model residuals (raw, standardized, Pearson, deviance) |
 | `Q3()` | Yen's Q3 local dependence statistic |
 | `LD_X2()` | Chen & Thissen LD chi-square |
@@ -397,7 +460,14 @@ plot_person_item_map(result.model, scores.theta)
 | `RCI()` | Reliable Change Index for clinical significance |
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
+| `posterior_summary()` | Summarize sampled parameter uncertainty |
+| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
+| `predict_mixed()` | Response probabilities from abilities or person covariates |
+| `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
+| `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
+| `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
+| `rotate_loadings()` | Varimax, quartimax, equamax, oblimin, promax, and geomin rotations |
 
 ### Data Transformation Functions
 
@@ -408,6 +478,8 @@ plot_person_item_map(result.model, scores.theta)
 | `reverse_score()` | Reverse score items |
 | `expand_table()` | Expand frequency table to response matrix |
 | `collapse_table()` | Collapse responses to frequency table |
+| `collapse_patterns()` | Collapse duplicate response patterns for efficient estimation |
+| `collapse_with_groups()` | Collapse response patterns independently within groups |
 | `recode_responses()` | Recode response values |
 
 ### Information Functions
@@ -504,7 +576,7 @@ print(f"Rust extension: {mirt.is_rust_available()}")
 
 | Package | Purpose | Installation |
 |---------|---------|--------------|
-| **matplotlib** | Plotting (ICC, information curves, Wright maps, DIF) | `pip install matplotlib` |
+| **matplotlib** | Plotting (ICC, category and information curves, Wright maps, DIF) | `pip install "mirt[plot]"` |
 | **pandas** | DataFrame output for results | `pip install mirt[pandas]` |
 | **polars** | DataFrame output (faster, preferred when both installed) | `pip install mirt[polars]` |
 
@@ -515,6 +587,10 @@ To set your preferred DataFrame backend explicitly:
 import mirt
 mirt.set_dataframe_backend("pandas")
 ```
+
+Restore automatic selection at any time with
+`mirt.set_dataframe_backend("auto")` (or `None`). Use
+`mirt.get_dataframe_backend()` to inspect the active backend.
 
 ## Development
 
@@ -555,7 +631,7 @@ The following are guaranteed stable and will not have breaking changes in v1.x r
 - **CAT**: `CATEngine`, `CATResult`, `CATState`
 - **Diagnostics**: `compare_models()`, `anova_irt()`, `compute_fit_indices()`, `sibtest()`
 - **Utilities**: `bootstrap_se()`, `bootstrap_ci()`, `generate_plausible_values()`, `cross_validate()`, `fit_models()`
-- **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`
+- **Data functions**: `load_dataset()`, `list_datasets()`, `set_dataframe_backend()`, `get_dataframe_backend()`
 - **Backend selection**: `set_backend()`, `get_backend()`, `get_backend_info()`, `should_use_rust()`, `is_rust_available()`
 
 ### Experimental (may change in minor releases)

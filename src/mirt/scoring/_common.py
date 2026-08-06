@@ -16,6 +16,41 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+def observed_test_information(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    observed_mask: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    """Return test information contributed by observed response items."""
+    observed_mask = np.asarray(observed_mask, dtype=np.bool_)
+    if observed_mask.shape != (model.n_items,):
+        raise ValueError(
+            f"observed_mask must have shape ({model.n_items},), "
+            f"got {observed_mask.shape}"
+        )
+
+    n_theta = theta.shape[0]
+    observed_items = np.flatnonzero(observed_mask)
+    if observed_items.size == 0:
+        return np.zeros(n_theta, dtype=np.float64)
+
+    # Dichotomous models expose an itemwise information matrix, so use their
+    # vectorized path. Polytomous models expose only total information in bulk.
+    if not model.is_polytomous:
+        item_information = np.asarray(model.information(theta), dtype=np.float64)
+        if item_information.shape == (n_theta, model.n_items):
+            return item_information[:, observed_mask].sum(axis=1)
+
+    information = np.zeros(n_theta, dtype=np.float64)
+    for item_idx in observed_items:
+        item_information = np.asarray(
+            model.information(theta, int(item_idx)), dtype=np.float64
+        )
+        information += item_information.reshape(n_theta, -1).sum(axis=1)
+
+    return information
+
+
 def resolve_prior_distribution(
     *,
     n_factors: int,
