@@ -36,7 +36,6 @@ class EAPScorer:
             raise ValueError("Model must be fitted before scoring")
 
         responses = np.asarray(responses)
-        n_persons = responses.shape[0]
         n_factors = model.n_factors
 
         quad_points, quad_weights = build_quadrature(
@@ -45,12 +44,8 @@ class EAPScorer:
             prior_mean=self.prior_mean,
             prior_cov=self.prior_cov,
         )
-        n_quad = len(quad_weights)
 
-        log_likes = np.zeros((n_persons, n_quad))
-        for q in range(n_quad):
-            theta_q = quad_points[q : q + 1]
-            log_likes[:, q] = model.log_likelihood(responses, theta_q)
+        log_likes = model.log_likelihood_batch(responses, quad_points)
 
         log_posterior = log_likes + np.log(quad_weights + 1e-300)[None, :]
 

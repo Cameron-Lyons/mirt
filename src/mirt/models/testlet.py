@@ -6,6 +6,8 @@ among items within testlets (e.g., items sharing a common passage).
 
 from __future__ import annotations
 
+from functools import lru_cache
+from numbers import Integral
 from typing import Self
 
 import numpy as np
@@ -13,7 +15,122 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
+
+
+def _validate_item_index(n_items: int, item_idx: int) -> int:
+    if (
+        isinstance(item_idx, bool)
+        or not isinstance(item_idx, Integral)
+        or item_idx < 0
+        or item_idx >= n_items
+    ):
+        raise IndexError(f"Item index {item_idx} out of range [0, {n_items})")
+    return int(item_idx)
+
+
+def _validate_membership(
+    n_items: int,
+    membership: NDArray[np.int_] | list[int],
+) -> NDArray[np.intp]:
+    try:
+        values = np.asarray(membership)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "testlet_membership must contain integer labels",
+            parameter="testlet_membership",
+        ) from exc
+    if values.ndim != 1:
+        raise MirtValidationError(
+            "testlet_membership must be one-dimensional",
+            parameter="testlet_membership",
+            value=values.shape,
+        )
+    if len(values) != n_items:
+        raise MirtValidationError(
+            f"testlet_membership length ({len(values)}) must match n_items ({n_items})",
+            parameter="testlet_membership",
+            value=len(values),
+            expected=str(n_items),
+        )
+    if not np.issubdtype(values.dtype, np.integer):
+        raise MirtValidationError(
+            "testlet_membership must contain integer labels",
+            parameter="testlet_membership",
+        )
+    normalized = values.astype(np.intp, copy=True)
+    if np.any(normalized < -1):
+        raise MirtValidationError(
+            "testlet labels must be -1 or non-negative integers",
+            parameter="testlet_membership",
+        )
+    return normalized
+
+
+def _validate_n_quadpts(n_quadpts: int) -> int:
+    if (
+        isinstance(n_quadpts, bool)
+        or not isinstance(n_quadpts, Integral)
+        or n_quadpts < 1
+    ):
+        raise MirtValidationError(
+            "n_quadpts must be a positive integer",
+            parameter="n_quadpts",
+            value=n_quadpts,
+            expected=">= 1",
+        )
+    return int(n_quadpts)
+
+
+@lru_cache(maxsize=16)
+def _normal_quadrature(
+    n_quadpts: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return nodes and weights for a standard-normal expectation."""
+    nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+    nodes = np.asarray(nodes * np.sqrt(2.0), dtype=np.float64)
+    weights = np.asarray(weights / np.sqrt(np.pi), dtype=np.float64)
+    nodes.setflags(write=False)
+    weights.setflags(write=False)
+    return nodes, weights
+
+
+def _logsumexp(values: NDArray[np.float64], axis: int) -> NDArray[np.float64]:
+    maximum = np.max(values, axis=axis, keepdims=True)
+    return np.squeeze(
+        maximum + np.log(np.sum(np.exp(values - maximum), axis=axis, keepdims=True)),
+        axis=axis,
+    )
+
+
+def _validate_binary_responses(
+    responses: NDArray[np.int_], n_items: int
+) -> tuple[NDArray[np.intp], NDArray[np.bool_]]:
+    try:
+        values = np.asarray(responses, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise MirtDataError("responses must contain numeric values") from exc
+    if values.ndim != 2:
+        raise MirtDataError("responses must be two-dimensional", ndim=values.ndim)
+    if values.shape[1] != n_items:
+        raise MirtDataError(
+            "response item count does not match the model",
+            n_items=values.shape[1],
+            expected=n_items,
+        )
+
+    missing = np.isnan(values) | (np.isfinite(values) & (values < 0.0))
+    observed = ~missing
+    observed_values = values[observed]
+    if not np.all(np.isfinite(observed_values)):
+        raise MirtDataError("observed responses must be finite")
+    if np.any((observed_values != 0.0) & (observed_values != 1.0)):
+        raise MirtDataError("observed responses must be coded 0 or 1")
+
+    codes = np.zeros(values.shape, dtype=np.intp)
+    codes[observed] = observed_values.astype(np.intp)
+    return codes, observed
 
 
 class TestletModel(DichotomousItemModel):
@@ -43,6 +160,7 @@ class TestletModel(DichotomousItemModel):
         n_items: int,
         testlet_membership: NDArray[np.int_] | list[int],
         item_names: list[str] | None = None,
+        n_quadpts: int = 11,
     ) -> None:
         """Initialize Testlet model.
 
@@ -56,18 +174,17 @@ class TestletModel(DichotomousItemModel):
             Use -1 for items not in any testlet (standalone items).
         item_names : list of str, optional
             Names for items
+        n_quadpts : int, default=11
+            Number of Gauss-Hermite points used for marginal probabilities.
         """
-        self._testlet_membership = np.asarray(testlet_membership, dtype=np.int_)
-
-        if len(self._testlet_membership) != n_items:
-            raise ValueError(
-                f"testlet_membership length ({len(self._testlet_membership)}) "
-                f"must match n_items ({n_items})"
-            )
-
+        self._testlet_membership = _validate_membership(n_items, testlet_membership)
         unique_testlets = np.unique(self._testlet_membership)
         self._unique_testlets = unique_testlets[unique_testlets >= 0]
         self._n_testlets = len(self._unique_testlets)
+        self._testlet_positions = np.full(n_items, -1, dtype=np.intp)
+        for position, label in enumerate(self._unique_testlets):
+            self._testlet_positions[self._testlet_membership == label] = position
+        self._n_quadpts = _validate_n_quadpts(n_quadpts)
 
         n_factors = 1 + self._n_testlets
 
@@ -81,7 +198,22 @@ class TestletModel(DichotomousItemModel):
     @property
     def testlet_membership(self) -> NDArray[np.int_]:
         """Testlet assignment for each item."""
-        return self._testlet_membership
+        return self._testlet_membership.copy()
+
+    @property
+    def testlet_labels(self) -> NDArray[np.int_]:
+        """Sorted labels identifying the modeled testlets."""
+        return self._unique_testlets.copy()
+
+    @property
+    def testlet_variances(self) -> NDArray[np.float64]:
+        """Random-effect variances in ``testlet_labels`` order."""
+        return self._parameters["testlet_variances"].copy()
+
+    @property
+    def n_quadpts(self) -> int:
+        """Number of standard-normal quadrature points."""
+        return self._n_quadpts
 
     def _initialize_parameters(self) -> None:
         """Initialize model parameters."""
@@ -114,6 +246,117 @@ class TestletModel(DichotomousItemModel):
         """Item difficulties."""
         return self._parameters["difficulty"]
 
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Atomically set finite parameters while preserving testlet constraints."""
+        unknown = set(params) - set(self._parameters)
+        if unknown:
+            name = sorted(unknown)[0]
+            raise MirtValidationError(f"Unknown parameter: {name}", parameter=name)
+
+        updated = {name: values.copy() for name, values in self._parameters.items()}
+        for name, value in params.items():
+            try:
+                array = np.asarray(value, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must contain numeric values", parameter=name
+                ) from exc
+            if array.shape != updated[name].shape:
+                raise MirtValidationError(
+                    f"Shape mismatch for {name}",
+                    parameter=name,
+                    value=array.shape,
+                    expected=str(updated[name].shape),
+                )
+            if not np.all(np.isfinite(array)):
+                raise MirtValidationError(
+                    f"{name} must contain only finite values", parameter=name
+                )
+            if name == "testlet_variances" and np.any(array < 0.0):
+                raise MirtValidationError(
+                    "testlet variances must be non-negative",
+                    parameter=name,
+                    expected=">= 0",
+                )
+            updated[name] = array.copy()
+
+        standalone = self._testlet_positions < 0
+        if np.any(updated["testlet_loadings"][standalone] != 0.0):
+            raise MirtValidationError(
+                "standalone items must have zero testlet loading",
+                parameter="testlet_loadings",
+            )
+        self._parameters = updated
+        return self
+
+    def _prepare_theta(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        try:
+            values = np.asarray(theta, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "theta must contain numeric values", parameter="theta"
+            ) from exc
+        if values.ndim == 1:
+            values = values.reshape(-1, 1)
+        if values.ndim != 2:
+            raise MirtValidationError(
+                "theta must be one- or two-dimensional",
+                parameter="theta",
+                value=values.ndim,
+                expected="1 or 2",
+            )
+        if values.shape[1] not in {1, self.n_factors}:
+            raise MirtValidationError(
+                "theta must contain the general factor alone or every factor",
+                parameter="theta",
+                value=values.shape[1],
+                expected=f"1 or {self.n_factors}",
+            )
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                "theta must contain only finite values", parameter="theta"
+            )
+        return values
+
+    def _marginal_components(
+        self,
+        theta_general: NDArray[np.float64],
+        item_idx: int | None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return marginal probabilities and derivatives by general ability."""
+        nodes, weights = _normal_quadrature(self._n_quadpts)
+        a = self._parameters["discrimination"]
+        d = self._parameters["testlet_loadings"]
+        b = self._parameters["difficulty"]
+        variances = self._parameters["testlet_variances"]
+
+        if item_idx is not None:
+            item = _validate_item_index(self.n_items, item_idx)
+            position = self._testlet_positions[item]
+            variance = variances[position] if position >= 0 else 0.0
+            scale = d[item] * np.sqrt(variance)
+            linear = a[item] * theta_general[:, None] - b[item] + scale * nodes[None, :]
+            conditional = sigmoid(linear)
+            probability = conditional @ weights
+            derivative = a[item] * (conditional * (1.0 - conditional)) @ weights
+            return probability, derivative
+
+        item_variances = np.zeros(self.n_items, dtype=np.float64)
+        in_testlet = self._testlet_positions >= 0
+        item_variances[in_testlet] = variances[self._testlet_positions[in_testlet]]
+        scale = d * np.sqrt(item_variances)
+        linear = (
+            a[None, :, None] * theta_general[:, None, None]
+            - b[None, :, None]
+            + scale[None, :, None] * nodes[None, None, :]
+        )
+        conditional = sigmoid(linear)
+        probability = np.sum(conditional * weights[None, None, :], axis=2)
+        derivative = a[None, :] * np.sum(
+            conditional * (1.0 - conditional) * weights[None, None, :], axis=2
+        )
+        return probability, derivative
+
     def probability(
         self,
         theta: NDArray[np.float64],
@@ -140,122 +383,85 @@ class TestletModel(DichotomousItemModel):
         NDArray
             Response probabilities
         """
-        theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
+        theta_values = self._prepare_theta(theta)
+        if theta_values.shape[1] == 1:
+            return self._marginal_components(theta_values[:, 0], item_idx)[0]
 
+        if item_idx is not None:
+            item = _validate_item_index(self.n_items, item_idx)
         a = self._parameters["discrimination"]
         d = self._parameters["testlet_loadings"]
         b = self._parameters["difficulty"]
-
-        if theta.shape[1] == 1:
-            return self._marginal_probability(theta[:, 0], item_idx)
-
-        theta_general = theta[:, 0]
-
         if item_idx is not None:
-            testlet_idx = self._testlet_membership[item_idx]
+            position = self._testlet_positions[item]
+            linear = a[item] * theta_values[:, 0] - b[item]
+            if position >= 0:
+                linear += d[item] * theta_values[:, position + 1]
+            return sigmoid(linear)
 
-            z = a[item_idx] * theta_general - b[item_idx]
-
-            if testlet_idx >= 0:
-                testlet_pos = np.where(self._unique_testlets == testlet_idx)[0][0] + 1
-                gamma = theta[:, testlet_pos]
-                z = z + d[item_idx] * gamma
-
-            return sigmoid(z)
-
-        probs = np.zeros((n_persons, self.n_items))
-
-        for j in range(self.n_items):
-            testlet_idx = self._testlet_membership[j]
-            z = a[j] * theta_general - b[j]
-
-            if testlet_idx >= 0:
-                testlet_pos = np.where(self._unique_testlets == testlet_idx)[0][0] + 1
-                gamma = theta[:, testlet_pos]
-                z = z + d[j] * gamma
-
-            probs[:, j] = sigmoid(z)
-
-        return probs
+        linear = a[None, :] * theta_values[:, :1] - b[None, :]
+        in_testlet = self._testlet_positions >= 0
+        if np.any(in_testlet):
+            linear[:, in_testlet] += (
+                d[None, in_testlet]
+                * theta_values[:, self._testlet_positions[in_testlet] + 1]
+            )
+        return sigmoid(linear)
 
     def _marginal_probability(
         self,
         theta_general: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute marginal probability integrating out testlet effects.
-
-        Uses Gauss-Hermite quadrature for numerical integration.
-        """
-        from scipy.special import roots_hermite
-
-        n_persons = len(theta_general)
-        n_quadpts = 11
-
-        nodes, weights = roots_hermite(n_quadpts)
-        weights = weights / np.sqrt(np.pi)
-        nodes = nodes * np.sqrt(2)
-
-        a = self._parameters["discrimination"]
-        d = self._parameters["testlet_loadings"]
-        b = self._parameters["difficulty"]
-        testlet_vars = self._parameters["testlet_variances"]
-
-        if item_idx is not None:
-            testlet_idx = self._testlet_membership[item_idx]
-
-            if testlet_idx < 0:
-                z = a[item_idx] * theta_general - b[item_idx]
-                return sigmoid(z)
-
-            var_t = testlet_vars[testlet_idx]
-            probs = np.zeros(n_persons)
-
-            for q in range(n_quadpts):
-                gamma = nodes[q] * np.sqrt(var_t)
-                z = a[item_idx] * theta_general + d[item_idx] * gamma - b[item_idx]
-                probs += weights[q] * (sigmoid(z))
-
-            return probs
-
-        probs = np.zeros((n_persons, self.n_items))
-
-        for j in range(self.n_items):
-            testlet_idx = self._testlet_membership[j]
-
-            if testlet_idx < 0:
-                z = a[j] * theta_general - b[j]
-                probs[:, j] = sigmoid(z)
-            else:
-                var_t = testlet_vars[testlet_idx]
-                for q in range(n_quadpts):
-                    gamma = nodes[q] * np.sqrt(var_t)
-                    z = a[j] * theta_general + d[j] * gamma - b[j]
-                    probs[:, j] += weights[q] * (sigmoid(z))
-
-        return probs
+        """Compute marginal probability integrating out testlet effects."""
+        values = self._prepare_theta(theta_general)
+        if values.shape[1] != 1:
+            raise MirtValidationError(
+                "theta_general must contain one general-factor column",
+                parameter="theta_general",
+                value=values.shape[1],
+                expected="1",
+            )
+        return self._marginal_components(values[:, 0], item_idx)[0]
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute Fisher information.
+        """Compute general-factor marginal or full conditional information.
 
-        For testlet model, uses marginal probability for information.
+        General-only theta values use the derivative of the quadrature-marginal
+        probability. Full theta values use the squared norm of each item's
+        active general and testlet loadings.
         """
-        theta = self._ensure_theta_2d(theta)
+        theta_values = self._prepare_theta(theta)
+        if theta_values.shape[1] == 1:
+            probability, derivative = self._marginal_components(
+                theta_values[:, 0], item_idx
+            )
+            denominator = probability * (1.0 - probability)
+            return np.divide(
+                derivative**2,
+                denominator,
+                out=np.zeros_like(probability),
+                where=denominator > PROB_EPSILON,
+            )
 
-        p = self.probability(theta, item_idx)
-        q = 1.0 - p
-
-        a = self._parameters["discrimination"]
-
+        probability = self.probability(theta_values, item_idx)
         if item_idx is not None:
-            return (a[item_idx] ** 2) * p * q
-        else:
-            return (a[None, :] ** 2) * p * q
+            item = _validate_item_index(self.n_items, item_idx)
+            squared_loading = self._parameters["discrimination"][item] ** 2
+            if self._testlet_positions[item] >= 0:
+                squared_loading += self._parameters["testlet_loadings"][item] ** 2
+            return squared_loading * probability * (1.0 - probability)
+
+        squared_loading = self._parameters["discrimination"] ** 2
+        in_testlet = self._testlet_positions >= 0
+        squared_loading[in_testlet] += (
+            self._parameters["testlet_loadings"][in_testlet] ** 2
+        )
+        return squared_loading[None, :] * probability * (1.0 - probability)
 
     def get_testlet_items(self, testlet_idx: int) -> list[int]:
         """Get indices of items belonging to a testlet.
@@ -270,7 +476,64 @@ class TestletModel(DichotomousItemModel):
         list of int
             Item indices in the testlet
         """
-        return list(np.where(self._testlet_membership == testlet_idx)[0])
+        if isinstance(testlet_idx, bool) or not isinstance(testlet_idx, Integral):
+            raise MirtValidationError(
+                "testlet_idx must be an integer label", parameter="testlet_idx"
+            )
+        return list(np.where(self._testlet_membership == int(testlet_idx))[0])
+
+    def _testlet_position(self, testlet_idx: int) -> int:
+        if isinstance(testlet_idx, bool) or not isinstance(testlet_idx, Integral):
+            raise MirtValidationError(
+                "testlet_idx must be an integer label", parameter="testlet_idx"
+            )
+        matches = np.flatnonzero(self._unique_testlets == int(testlet_idx))
+        if len(matches) == 0:
+            raise MirtValidationError(
+                f"Unknown testlet index: {testlet_idx}",
+                parameter="testlet_idx",
+                value=testlet_idx,
+            )
+        return int(matches[0])
+
+    def set_testlet_variance(self, testlet_idx: int, variance: float) -> Self:
+        """Set one random-effect variance by its external testlet label."""
+        position = self._testlet_position(testlet_idx)
+        try:
+            value = float(variance)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "variance must be numeric", parameter="variance"
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise MirtValidationError(
+                "variance must be finite and non-negative",
+                parameter="variance",
+                value=variance,
+                expected=">= 0",
+            )
+        updated = self._parameters["testlet_variances"].copy()
+        updated[position] = value
+        return self.set_parameters(testlet_variances=updated)
+
+    def set_all_testlet_variances(self, variance: float) -> Self:
+        """Set one finite non-negative variance for every testlet."""
+        try:
+            value = float(variance)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "variance must be numeric", parameter="variance"
+            ) from exc
+        if not np.isfinite(value) or value < 0.0:
+            raise MirtValidationError(
+                "variance must be finite and non-negative",
+                parameter="variance",
+                value=variance,
+                expected=">= 0",
+            )
+        return self.set_parameters(
+            testlet_variances=np.full(self._n_testlets, value, dtype=np.float64)
+        )
 
     def testlet_reliability(self) -> dict[int, float]:
         """Compute reliability for each testlet.
@@ -284,7 +547,7 @@ class TestletModel(DichotomousItemModel):
         """
         reliabilities = {}
 
-        for testlet_idx in self._unique_testlets:
+        for position, testlet_idx in enumerate(self._unique_testlets):
             items = self.get_testlet_items(testlet_idx)
 
             if len(items) < 2:
@@ -298,7 +561,9 @@ class TestletModel(DichotomousItemModel):
             sum_testlet = testlet_loadings.sum()
 
             var_general = sum_general**2
-            var_testlet = sum_testlet**2
+            var_testlet = (
+                sum_testlet**2 * self._parameters["testlet_variances"][position]
+            )
             var_unique = len(items)
 
             total_var = var_general + var_testlet + var_unique
@@ -317,6 +582,7 @@ class TestletModel(DichotomousItemModel):
             n_items=self.n_items,
             testlet_membership=self._testlet_membership.copy(),
             item_names=self.item_names.copy() if self.item_names else None,
+            n_quadpts=self._n_quadpts,
         )
 
         if self._parameters:
@@ -351,8 +617,23 @@ def create_testlet_structure(
     >>> create_testlet_structure(10, [3, 3, 1, 3])
     array([0, 0, 0, 1, 1, 1, -1, 2, 2, 2])
     """
+    if isinstance(n_items, bool) or not isinstance(n_items, Integral) or n_items < 1:
+        raise MirtValidationError(
+            "n_items must be a positive integer",
+            parameter="n_items",
+            value=n_items,
+            expected=">= 1",
+        )
+    if not isinstance(testlet_sizes, list) or any(
+        isinstance(size, bool) or not isinstance(size, Integral) or size < 1
+        for size in testlet_sizes
+    ):
+        raise MirtValidationError(
+            "testlet_sizes must contain positive integers",
+            parameter="testlet_sizes",
+        )
     if sum(testlet_sizes) != n_items:
-        raise ValueError(
+        raise MirtValidationError(
             f"Sum of testlet_sizes ({sum(testlet_sizes)}) must equal n_items ({n_items})"
         )
 
@@ -399,12 +680,14 @@ class BifactorTestletModel(TestletModel):
         testlet_membership: NDArray[np.int_] | list[int],
         constrain_testlet_loadings: bool = False,
         item_names: list[str] | None = None,
+        n_quadpts: int = 11,
     ) -> None:
         self._constrain_loadings = constrain_testlet_loadings
         super().__init__(
             n_items=n_items,
             testlet_membership=testlet_membership,
             item_names=item_names,
+            n_quadpts=n_quadpts,
         )
 
     @property
@@ -418,30 +701,45 @@ class BifactorTestletModel(TestletModel):
 
     def set_general_loadings(self, loadings: NDArray[np.float64]) -> Self:
         """Set general factor loadings."""
-        loadings = np.asarray(loadings, dtype=np.float64)
-        if loadings.shape != (self.n_items,):
-            raise ValueError(f"loadings shape {loadings.shape} != ({self.n_items},)")
-        self._parameters["discrimination"] = loadings
-        return self
+        try:
+            values = np.asarray(loadings, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "loadings must contain numeric values", parameter="loadings"
+            ) from exc
+        if values.shape != (self.n_items,):
+            raise MirtValidationError(
+                f"loadings shape {values.shape} != ({self.n_items},)",
+                parameter="loadings",
+            )
+        return self.set_parameters(discrimination=values)
 
     def set_testlet_loadings(self, loadings: NDArray[np.float64]) -> Self:
         """Set testlet-specific factor loadings."""
-        loadings = np.asarray(loadings, dtype=np.float64)
-        if loadings.shape != (self.n_items,):
-            raise ValueError(f"loadings shape {loadings.shape} != ({self.n_items},)")
+        try:
+            values = np.asarray(loadings, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "loadings must contain numeric values", parameter="loadings"
+            ) from exc
+        if values.shape != (self.n_items,):
+            raise MirtValidationError(
+                f"loadings shape {values.shape} != ({self.n_items},)",
+                parameter="loadings",
+            )
+        values = values.copy()
 
-        loadings[self._testlet_membership < 0] = 0.0
+        values[self._testlet_membership < 0] = 0.0
 
         if self._constrain_loadings:
             for testlet_idx in self._unique_testlets:
                 items = self.get_testlet_items(testlet_idx)
-                mean_loading = loadings[items].mean()
-                loadings[items] = mean_loading
+                mean_loading = values[items].mean()
+                values[items] = mean_loading
 
-        self._parameters["testlet_loadings"] = loadings
-        return self
+        return self.set_parameters(testlet_loadings=values)
 
-    def explained_variance(self) -> dict:
+    def explained_variance(self) -> dict[str, float]:
         """Compute variance explained by general and testlet factors.
 
         Returns
@@ -494,6 +792,7 @@ class BifactorTestletModel(TestletModel):
             testlet_membership=self._testlet_membership.copy(),
             constrain_testlet_loadings=self._constrain_loadings,
             item_names=self.item_names.copy() if self.item_names else None,
+            n_quadpts=self._n_quadpts,
         )
 
         if self._parameters:
@@ -532,11 +831,11 @@ class RandomTestletEffectsModel(TestletModel):
         n_quadpts: int = 11,
         item_names: list[str] | None = None,
     ) -> None:
-        self._n_quadpts = n_quadpts
         super().__init__(
             n_items=n_items,
             testlet_membership=testlet_membership,
             item_names=item_names,
+            n_quadpts=n_quadpts,
         )
 
     @property
@@ -546,25 +845,15 @@ class RandomTestletEffectsModel(TestletModel):
     @property
     def testlet_effect_variance(self) -> NDArray[np.float64]:
         """Variance of testlet random effects."""
-        return self._parameters["testlet_variances"].copy()
+        return self.testlet_variances
 
     def set_testlet_variance(self, testlet_idx: int, variance: float) -> Self:
         """Set variance for a specific testlet."""
-        if variance < 0:
-            raise ValueError("variance must be non-negative")
-        if testlet_idx not in self._unique_testlets:
-            raise ValueError(f"Unknown testlet index: {testlet_idx}")
-
-        pos = np.where(self._unique_testlets == testlet_idx)[0][0]
-        self._parameters["testlet_variances"][pos] = variance
-        return self
+        return super().set_testlet_variance(testlet_idx, variance)
 
     def set_all_testlet_variances(self, variance: float) -> Self:
         """Set same variance for all testlets."""
-        if variance < 0:
-            raise ValueError("variance must be non-negative")
-        self._parameters["testlet_variances"][:] = variance
-        return self
+        return super().set_all_testlet_variances(variance)
 
     def integrate_out_testlet_effects(
         self,
@@ -585,60 +874,160 @@ class RandomTestletEffectsModel(TestletModel):
         NDArray
             Log-likelihood for each person (n_persons,).
         """
-        from scipy.special import roots_hermite
+        response_codes, observed = _validate_binary_responses(responses, self.n_items)
+        theta_values = self._prepare_theta(theta)
+        if theta_values.shape[1] != 1:
+            raise MirtValidationError(
+                "theta must contain general ability values only",
+                parameter="theta",
+                value=theta_values.shape[1],
+                expected="1",
+            )
+        if len(theta_values) != len(response_codes):
+            raise MirtDataError(
+                "theta and responses must contain the same number of persons",
+                theta_persons=len(theta_values),
+                response_persons=len(response_codes),
+            )
+        return self._paired_marginal_log_likelihood(
+            response_codes, observed, theta_values[:, 0]
+        )
 
-        responses = np.asarray(responses)
-        theta = np.asarray(theta).ravel()
-        n_persons = len(theta)
+    def _paired_marginal_log_likelihood(
+        self,
+        response_codes: NDArray[np.intp],
+        observed: NDArray[np.bool_],
+        theta_values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute one marginal likelihood at each person's theta value."""
+        nodes, weights = _normal_quadrature(self._n_quadpts)
+        log_weights = np.log(weights)
+        discrimination = self._parameters["discrimination"]
+        loading = self._parameters["testlet_loadings"]
+        difficulty = self._parameters["difficulty"]
+        variances = self._parameters["testlet_variances"]
+        likelihood = np.zeros(len(theta_values), dtype=np.float64)
 
-        nodes, weights = roots_hermite(self._n_quadpts)
-        weights = weights / np.sqrt(np.pi)
-        nodes = nodes * np.sqrt(2)
+        standalone = self._testlet_positions < 0
+        if np.any(standalone):
+            linear = (
+                theta_values[:, None] * discrimination[None, standalone]
+                - difficulty[None, standalone]
+            )
+            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
+            contributions = response_codes[:, standalone] * np.log(probability) + (
+                1 - response_codes[:, standalone]
+            ) * np.log1p(-probability)
+            likelihood += np.sum(
+                np.where(observed[:, standalone], contributions, 0.0), axis=1
+            )
 
-        a = self._parameters["discrimination"]
-        d = self._parameters["testlet_loadings"]
-        b = self._parameters["difficulty"]
-        testlet_vars = self._parameters["testlet_variances"]
+        for position in range(self._n_testlets):
+            items = self._testlet_positions == position
+            scale = np.sqrt(variances[position]) * loading[items]
+            linear = (
+                theta_values[:, None, None] * discrimination[None, items, None]
+                - difficulty[None, items, None]
+                + scale[None, :, None] * nodes[None, None, :]
+            )
+            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
+            contributions = response_codes[:, items, None] * np.log(probability) + (
+                1 - response_codes[:, items, None]
+            ) * np.log1p(-probability)
+            conditional = np.sum(
+                np.where(observed[:, items, None], contributions, 0.0), axis=1
+            )
+            likelihood += _logsumexp(conditional + log_weights[None, :], axis=1)
+        return likelihood
 
-        standalone_items = np.where(self._testlet_membership < 0)[0]
-        ll_standalone = np.zeros(n_persons)
+    def _marginal_log_likelihood_batch(
+        self,
+        response_codes: NDArray[np.intp],
+        observed: NDArray[np.bool_],
+        theta_values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute every response-pattern by general-ability likelihood."""
+        nodes, weights = _normal_quadrature(self._n_quadpts)
+        log_weights = np.log(weights)
+        discrimination = self._parameters["discrimination"]
+        loading = self._parameters["testlet_loadings"]
+        difficulty = self._parameters["difficulty"]
+        variances = self._parameters["testlet_variances"]
+        successes = (observed & (response_codes == 1)).astype(np.float64)
+        failures = (observed & (response_codes == 0)).astype(np.float64)
+        likelihood = np.zeros(
+            (len(response_codes), len(theta_values)), dtype=np.float64
+        )
 
-        for j in standalone_items:
-            if responses[:, j].min() >= 0:
-                z = a[j] * theta - b[j]
-                p = sigmoid(z)
-                p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-                ll_standalone += responses[:, j] * np.log(p) + (
-                    1 - responses[:, j]
-                ) * np.log(1 - p)
+        standalone = self._testlet_positions < 0
+        if np.any(standalone):
+            linear = (
+                theta_values[:, None] * discrimination[None, standalone]
+                - difficulty[None, standalone]
+            )
+            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
+            likelihood += successes[:, standalone] @ np.log(probability).T
+            likelihood += failures[:, standalone] @ np.log1p(-probability).T
 
-        ll_testlets = np.zeros(n_persons)
+        for position in range(self._n_testlets):
+            items = self._testlet_positions == position
+            scale = np.sqrt(variances[position]) * loading[items]
+            linear = (
+                theta_values[:, None, None] * discrimination[None, items, None]
+                - difficulty[None, items, None]
+                + scale[None, :, None] * nodes[None, None, :]
+            )
+            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
+            conditional = np.einsum(
+                "pi,tiq->ptq",
+                successes[:, items],
+                np.log(probability),
+                optimize=True,
+            )
+            conditional += np.einsum(
+                "pi,tiq->ptq",
+                failures[:, items],
+                np.log1p(-probability),
+                optimize=True,
+            )
+            likelihood += _logsumexp(conditional + log_weights[None, None, :], axis=2)
+        return likelihood
 
-        for t_idx in self._unique_testlets:
-            items = self.get_testlet_items(t_idx)
-            t_pos = np.where(self._unique_testlets == t_idx)[0][0]
-            var_t = testlet_vars[t_pos]
+    def log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute conditional or random-effect-marginal log likelihood."""
+        response_codes, observed = _validate_binary_responses(responses, self.n_items)
+        theta_values = self._prepare_theta(theta)
+        if len(theta_values) != len(response_codes):
+            raise MirtDataError(
+                "theta and responses must contain the same number of persons",
+                theta_persons=len(theta_values),
+                response_persons=len(response_codes),
+            )
+        if theta_values.shape[1] == 1:
+            return self._paired_marginal_log_likelihood(
+                response_codes, observed, theta_values[:, 0]
+            )
+        normalized = np.where(observed, response_codes, -1)
+        return super().log_likelihood(normalized, theta_values)
 
-            marginal_ll = np.zeros(n_persons)
-
-            for q in range(self._n_quadpts):
-                gamma = nodes[q] * np.sqrt(var_t)
-
-                cond_ll = np.zeros(n_persons)
-                for j in items:
-                    if responses[:, j].min() >= 0:
-                        z = a[j] * theta + d[j] * gamma - b[j]
-                        p = sigmoid(z)
-                        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-                        cond_ll += responses[:, j] * np.log(p) + (
-                            1 - responses[:, j]
-                        ) * np.log(1 - p)
-
-                marginal_ll += weights[q] * np.exp(cond_ll)
-
-            ll_testlets += np.log(marginal_ll + 1e-300)
-
-        return ll_standalone + ll_testlets
+    def log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute conditional or marginal likelihood over a theta grid."""
+        response_codes, observed = _validate_binary_responses(responses, self.n_items)
+        theta_values = self._prepare_theta(theta)
+        if theta_values.shape[1] == 1:
+            return self._marginal_log_likelihood_batch(
+                response_codes, observed, theta_values[:, 0]
+            )
+        normalized = np.where(observed, response_codes, -1)
+        return super().log_likelihood_batch(normalized, theta_values)
 
     def estimate_testlet_variances(
         self,
@@ -659,8 +1048,23 @@ class RandomTestletEffectsModel(TestletModel):
         NDArray
             Estimated variance for each testlet.
         """
-        responses = np.asarray(responses)
-        theta = np.asarray(theta).ravel()
+        response_codes, observed = _validate_binary_responses(responses, self.n_items)
+        try:
+            theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "theta must contain numeric values", parameter="theta"
+            ) from exc
+        if len(theta_values) != len(response_codes):
+            raise MirtDataError(
+                "theta and responses must contain the same number of persons",
+                theta_persons=len(theta_values),
+                response_persons=len(response_codes),
+            )
+        if not np.all(np.isfinite(theta_values)):
+            raise MirtValidationError(
+                "theta must contain only finite values", parameter="theta"
+            )
 
         a = self._parameters["discrimination"]
         b = self._parameters["difficulty"]
@@ -676,15 +1080,32 @@ class RandomTestletEffectsModel(TestletModel):
                 estimated_vars[pos] = 0.0
                 continue
 
-            residuals = np.zeros((len(theta), n_items_t))
+            residuals = np.full(
+                (len(theta_values), n_items_t), np.nan, dtype=np.float64
+            )
             for i, j in enumerate(items):
-                z = a[j] * theta - b[j]
+                z = a[j] * theta_values - b[j]
                 expected = sigmoid(z)
-                residuals[:, i] = responses[:, j] - expected
+                residuals[observed[:, j], i] = (
+                    response_codes[observed[:, j], j] - expected[observed[:, j]]
+                )
 
-            corr_matrix = np.corrcoef(residuals.T)
-            off_diag = corr_matrix[np.triu_indices_from(corr_matrix, k=1)]
-            mean_corr = np.mean(off_diag) if len(off_diag) > 0 else 0.0
+            correlations: list[float] = []
+            for first in range(n_items_t):
+                for second in range(first + 1, n_items_t):
+                    pair_observed = np.isfinite(residuals[:, first]) & np.isfinite(
+                        residuals[:, second]
+                    )
+                    if np.count_nonzero(pair_observed) < 2:
+                        continue
+                    first_residual = residuals[pair_observed, first]
+                    second_residual = residuals[pair_observed, second]
+                    if np.std(first_residual) == 0.0 or np.std(second_residual) == 0.0:
+                        continue
+                    correlations.append(
+                        float(np.corrcoef(first_residual, second_residual)[0, 1])
+                    )
+            mean_corr = float(np.mean(correlations)) if correlations else 0.0
 
             pos = np.where(self._unique_testlets == t_idx)[0][0]
             estimated_vars[pos] = max(0.0, mean_corr)
@@ -714,7 +1135,7 @@ def compute_testlet_q3(
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
     testlet_membership: NDArray[np.int_],
-) -> dict:
+) -> dict[str, NDArray[np.float64] | float]:
     """Compute Q3 statistic for testlet local dependence.
 
     The Q3 statistic measures residual correlations between items
@@ -739,34 +1160,73 @@ def compute_testlet_q3(
     dict
         Contains 'q3_matrix', 'within_testlet', 'between_testlet'.
     """
-    responses = np.asarray(responses)
-    theta = np.asarray(theta).ravel()
-    n_items = responses.shape[1]
+    response_values = np.asarray(responses)
+    if response_values.ndim != 2:
+        raise MirtDataError(
+            "responses must be two-dimensional", ndim=response_values.ndim
+        )
+    n_persons, n_items = response_values.shape
+    response_codes, observed = _validate_binary_responses(responses, n_items)
 
-    residuals = np.zeros_like(responses, dtype=np.float64)
-    for j in range(n_items):
-        z = discrimination[j] * theta - difficulty[j]
-        expected = sigmoid(z)
-        residuals[:, j] = responses[:, j] - expected
+    try:
+        theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
+        discrimination_values = np.asarray(discrimination, dtype=np.float64).reshape(-1)
+        difficulty_values = np.asarray(difficulty, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError("Q3 inputs must contain numeric values") from exc
+    if len(theta_values) != n_persons:
+        raise MirtDataError(
+            "theta and responses must contain the same number of persons",
+            theta_persons=len(theta_values),
+            response_persons=n_persons,
+        )
+    if discrimination_values.shape != (n_items,) or difficulty_values.shape != (
+        n_items,
+    ):
+        raise MirtValidationError(
+            "item parameter lengths must match the response columns",
+            parameter="item_parameters",
+            expected=str((n_items,)),
+        )
+    if not (
+        np.all(np.isfinite(theta_values))
+        and np.all(np.isfinite(discrimination_values))
+        and np.all(np.isfinite(difficulty_values))
+    ):
+        raise MirtValidationError("Q3 inputs must contain only finite values")
+    membership = _validate_membership(n_items, testlet_membership)
 
-    q3_matrix = np.corrcoef(residuals.T)
+    expected = sigmoid(
+        theta_values[:, None] * discrimination_values[None, :]
+        - difficulty_values[None, :]
+    )
+    residuals = np.where(observed, response_codes - expected, np.nan)
+    q3_matrix = np.full((n_items, n_items), np.nan, dtype=np.float64)
+    for first in range(n_items):
+        for second in range(first, n_items):
+            pair_observed = observed[:, first] & observed[:, second]
+            if np.count_nonzero(pair_observed) < 2:
+                continue
+            first_residual = residuals[pair_observed, first]
+            second_residual = residuals[pair_observed, second]
+            if np.std(first_residual) == 0.0 or np.std(second_residual) == 0.0:
+                continue
+            correlation = np.corrcoef(first_residual, second_residual)[0, 1]
+            q3_matrix[first, second] = correlation
+            q3_matrix[second, first] = correlation
 
-    unique_testlets = np.unique(testlet_membership)
-    unique_testlets = unique_testlets[unique_testlets >= 0]
-
-    within_q3 = []
-    between_q3 = []
+    within_q3: list[float] = []
+    between_q3: list[float] = []
 
     for i in range(n_items):
         for j in range(i + 1, n_items):
             q3_val = q3_matrix[i, j]
-            if (
-                testlet_membership[i] >= 0
-                and testlet_membership[i] == testlet_membership[j]
-            ):
-                within_q3.append(q3_val)
+            if not np.isfinite(q3_val):
+                continue
+            if membership[i] >= 0 and membership[i] == membership[j]:
+                within_q3.append(float(q3_val))
             else:
-                between_q3.append(q3_val)
+                between_q3.append(float(q3_val))
 
     return {
         "q3_matrix": q3_matrix,

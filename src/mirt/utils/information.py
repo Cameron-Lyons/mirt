@@ -13,6 +13,42 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+def _theta_matrix(
+    theta: NDArray[np.float64] | float | list[float],
+) -> NDArray[np.float64]:
+    """Normalize scalar and one-dimensional ability inputs."""
+    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
+    if theta_arr.ndim == 1:
+        theta_arr = theta_arr.reshape(-1, 1)
+    return theta_arr
+
+
+def _item_information_matrix(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return item-level information regardless of model-family convention."""
+    if getattr(model, "is_polytomous", False):
+        return np.column_stack(
+            [model.information(theta, item_idx=idx) for idx in range(model.n_items)]
+        )
+
+    information = np.asarray(model.information(theta), dtype=np.float64)
+    expected_shape = (theta.shape[0], model.n_items)
+    if information.shape == expected_shape:
+        return information
+
+    if information.shape == (theta.shape[0],):
+        return np.column_stack(
+            [model.information(theta, item_idx=idx) for idx in range(model.n_items)]
+        )
+
+    raise ValueError(
+        f"model information has shape {information.shape}, expected "
+        f"{expected_shape} or {(theta.shape[0],)}"
+    )
+
+
 def testinfo(
     model: "BaseItemModel",
     theta: NDArray[np.float64] | float | list[float],
@@ -42,12 +78,18 @@ def testinfo(
     >>> info = testinfo(result.model, theta)
     >>> print(f"Max information at theta = {theta[np.argmax(info)]:.2f}")
     """
-    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
-    if theta_arr.ndim == 1:
-        theta_arr = theta_arr.reshape(-1, 1)
+    theta_arr = _theta_matrix(theta)
+    information = np.asarray(model.information(theta_arr), dtype=np.float64)
 
-    item_info = model.information(theta_arr)
-    return np.sum(item_info, axis=1)
+    if information.shape == (theta_arr.shape[0],):
+        return information
+    if information.shape == (theta_arr.shape[0], model.n_items):
+        return np.sum(information, axis=1)
+
+    raise ValueError(
+        f"model information has shape {information.shape}, expected "
+        f"{(theta_arr.shape[0], model.n_items)} or {(theta_arr.shape[0],)}"
+    )
 
 
 def iteminfo(
@@ -77,18 +119,17 @@ def iteminfo(
     >>> info = iteminfo(result.model, theta=0.0, item_idx=0)
     >>> print(f"Item 0 information at theta=0: {info[0]:.3f}")
     """
-    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
-    if theta_arr.ndim == 1:
-        theta_arr = theta_arr.reshape(-1, 1)
-
-    all_info = model.information(theta_arr)
+    theta_arr = _theta_matrix(theta)
 
     if item_idx is None:
-        return all_info
+        return _item_information_matrix(model, theta_arr)
 
     if isinstance(item_idx, int):
-        return all_info[:, item_idx]
+        return np.asarray(
+            model.information(theta_arr, item_idx=item_idx), dtype=np.float64
+        )
 
+    all_info = _item_information_matrix(model, theta_arr)
     return all_info[:, item_idx]
 
 
@@ -169,9 +210,7 @@ def probtrace(
     >>> traces = probtrace(result.model, theta, item_idx=0)
     >>> # For 2PL: traces has shape (61,) - probability of correct response
     """
-    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
-    if theta_arr.ndim == 1:
-        theta_arr = theta_arr.reshape(-1, 1)
+    theta_arr = _theta_matrix(theta)
 
     probs = model.probability(theta_arr, item_idx=item_idx)
     return probs
@@ -207,22 +246,34 @@ def expected_score(
     >>> expected = expected_score(result.model, theta)
     >>> print(f"Expected test score at theta=0: {expected[1]:.2f}")
     """
-    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
-    if theta_arr.ndim == 1:
-        theta_arr = theta_arr.reshape(-1, 1)
+    theta_arr = _theta_matrix(theta)
 
-    if hasattr(model, "expected_score"):
-        scores = model.expected_score(theta_arr)
-    else:
-        scores = model.probability(theta_arr)
+    def score_one(index: int | None) -> NDArray[np.float64]:
+        score_method = getattr(model, "expected_score", None)
+        if callable(score_method):
+            return np.asarray(score_method(theta_arr, item_idx=index), dtype=np.float64)
 
-    if item_idx is None:
-        return np.sum(scores, axis=1) if scores.ndim > 1 else scores
+        probabilities = np.asarray(
+            model.probability(theta_arr, item_idx=index), dtype=np.float64
+        )
+        if getattr(model, "is_polytomous", False):
+            category_scores = np.arange(probabilities.shape[-1])
+            scores = (
+                probabilities @ category_scores
+                if index is not None
+                else np.sum(probabilities * category_scores, axis=-1)
+            )
+        else:
+            scores = probabilities
 
-    if isinstance(item_idx, int):
-        return scores[:, item_idx] if scores.ndim > 1 else scores
+        return np.sum(scores, axis=1) if index is None and scores.ndim > 1 else scores
 
-    return scores[:, item_idx] if scores.ndim > 1 else scores
+    if item_idx is None or isinstance(item_idx, int):
+        return score_one(item_idx)
+
+    if not item_idx:
+        return np.empty((theta_arr.shape[0], 0), dtype=np.float64)
+    return np.column_stack([score_one(index) for index in item_idx])
 
 
 def gen_difficulty(

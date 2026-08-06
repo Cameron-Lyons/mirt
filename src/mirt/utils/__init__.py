@@ -1,5 +1,7 @@
+from typing import Any
+
 from mirt._core import sigmoid
-from mirt.utils.batch import BatchFitResult, fit_model_grid, fit_models
+from mirt.utils.batch import BatchFitResult, GridFitResult, fit_model_grid, fit_models
 from mirt.utils.calibration import (
     CalibrationResult,
     EquatingResult,
@@ -7,8 +9,22 @@ from mirt.utils.calibration import (
     fixed_calib,
     transform_theta,
 )
-from mirt.utils.classical import TraditionalStats, item_fit_chisq, traditional
+from mirt.utils.classical import (
+    ItemStats,
+    TraditionalStats,
+    item_fit_chisq,
+    itemstats,
+    itemstats_to_dataframe,
+    traditional,
+)
 from mirt.utils.clinical import RCI, RCIResult, clinical_significance
+from mirt.utils.collapse import (
+    CollapsedData,
+    collapse_patterns,
+    collapse_with_groups,
+    compute_pattern_likelihood,
+    weighted_sum_from_collapsed,
+)
 from mirt.utils.confidence import PLCI, PLCIResult, delta_method, score_CI
 from mirt.utils.cv import (
     AICScorer,
@@ -23,14 +39,16 @@ from mirt.utils.cv import (
     cross_validate,
 )
 from mirt.utils.data import validate_responses
-from mirt.utils.dataframe import set_dataframe_backend
+from mirt.utils.dataframe import get_dataframe_backend, set_dataframe_backend
 from mirt.utils.empirical import (
     RMSD_DIF,
     DIFEffectSize,
     EmpiricalPlotData,
+    ItemGAMResult,
     empirical_ES,
     empirical_plot,
     empirical_rmsea,
+    itemGAM,
     mantel_haenszel,
     weighted_RMSD_DIF,
 )
@@ -38,6 +56,8 @@ from mirt.utils.extraction import (
     ItemParameters,
     ModelValues,
     coef,
+    estfun,
+    estfun_summary,
     extract_item,
     itemplot_data,
     mod2values,
@@ -84,6 +104,7 @@ from mirt.utils.sampling import (
     sample_expected_scores,
 )
 from mirt.utils.simulation import simdata
+from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
 from mirt.utils.statistical_tests import (
     LagrangeTestResult,
     WaldTestResult,
@@ -106,6 +127,7 @@ __all__ = [
     "simdata",
     "validate_responses",
     "set_dataframe_backend",
+    "get_dataframe_backend",
     "rotate_loadings",
     "varimax",
     "promax",
@@ -125,6 +147,7 @@ __all__ = [
     "fit_models",
     "fit_model_grid",
     "BatchFitResult",
+    "GridFitResult",
     "testinfo",
     "iteminfo",
     "areainfo",
@@ -136,9 +159,15 @@ __all__ = [
     "marginal_rxx",
     "empirical_rxx",
     "sem",
+    "cv_select_lambda",
+    "information_criteria_path",
+    "RegularizationCVResult",
     "traditional",
     "TraditionalStats",
     "item_fit_chisq",
+    "itemstats",
+    "ItemStats",
+    "itemstats_to_dataframe",
     "wald",
     "lagrange",
     "likelihood_ratio",
@@ -147,6 +176,8 @@ __all__ = [
     "mod2values",
     "extract_item",
     "coef",
+    "estfun",
+    "estfun_summary",
     "itemplot_data",
     "ModelValues",
     "ItemParameters",
@@ -162,6 +193,8 @@ __all__ = [
     "weighted_RMSD_DIF",
     "DIFEffectSize",
     "EmpiricalPlotData",
+    "itemGAM",
+    "ItemGAMResult",
     "RCI",
     "RCIResult",
     "clinical_significance",
@@ -178,6 +211,11 @@ __all__ = [
     "PLCIResult",
     "score_CI",
     "delta_method",
+    "CollapsedData",
+    "collapse_patterns",
+    "collapse_with_groups",
+    "compute_pattern_likelihood",
+    "weighted_sum_from_collapsed",
     "key2binary",
     "poly2dich",
     "reverse_score",
@@ -196,4 +234,31 @@ __all__ = [
     "shrinkage_estimates",
     "RandomEffects",
     "FixedEffects",
+    "gen_random_pars",
+    "calc_null",
+    "multi_start_fit",
 ]
+
+_LAZY_EXPORTS = {
+    "RegularizationCVResult": "mirt.utils.regularization_cv",
+    "cv_select_lambda": "mirt.utils.regularization_cv",
+    "information_criteria_path": "mirt.utils.regularization_cv",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load estimation-backed utilities without creating import cycles."""
+    module_name = _LAZY_EXPORTS.get(name)
+    if module_name is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    from importlib import import_module
+
+    value = getattr(import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Include lazy utility exports in interactive discovery."""
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))

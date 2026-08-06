@@ -241,6 +241,22 @@ class TestMLVsEAP:
 class TestMLScorerEmptyResponses:
     """Tests for ML with empty/missing responses."""
 
+    def test_standard_error_uses_only_observed_items(self):
+        """Test that missing items do not contribute score information."""
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        model = TwoParameterLogistic(n_items=4)
+        model.set_parameters(
+            discrimination=np.array([1.0, 1.0, 50.0, 50.0]),
+            difficulty=np.zeros(4),
+        )
+        model._is_fitted = True
+
+        result = MLScorer().score(model, np.array([[1, 0, -1, -1]]))
+
+        assert result.theta[0] == pytest.approx(0.0, abs=1e-6)
+        assert result.standard_error[0] == pytest.approx(np.sqrt(2.0))
+
     def test_all_missing_returns_zero(self, fitted_2pl_model):
         """Test that all missing returns zero theta."""
         model = fitted_2pl_model.model

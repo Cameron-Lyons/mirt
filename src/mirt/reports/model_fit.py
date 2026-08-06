@@ -32,6 +32,9 @@ class ModelFitReport(ReportBuilder):
         Response matrix (n_persons x n_items).
     title : str, optional
         Report title.
+    include_plots : bool
+        Embed visualizations in the report. Set to False for a lightweight
+        report that does not require matplotlib. Default True.
 
     Examples
     --------
@@ -49,17 +52,15 @@ class ModelFitReport(ReportBuilder):
         fit_result: FitResult,
         responses: NDArray[np.int_],
         title: str | None = None,
+        include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
         self.responses = np.asarray(responses)
+        self.include_plots = include_plots
 
     def _build_content(self) -> str:
         from mirt.diagnostics.modelfit import compute_fit_indices
-        from mirt.reports._plots import (
-            create_information_plot_base64,
-            create_se_plot_base64,
-        )
-        from mirt.reports._templates import embedded_plot, section
+        from mirt.reports._templates import section
 
         sections = []
 
@@ -74,27 +75,43 @@ class ModelFitReport(ReportBuilder):
             section("Interpretation Guidelines", self._interpretation_guide())
         )
 
-        info_base64 = create_information_plot_base64(self.fit_result.model)
-        sections.append(
-            section(
-                "Test Information Function", embedded_plot(info_base64, "Information")
+        if self.include_plots:
+            from mirt.reports._plots import (
+                create_information_plot_base64,
+                create_se_plot_base64,
             )
-        )
+            from mirt.reports._templates import embedded_plot
 
-        se_base64 = create_se_plot_base64(self.fit_result.model)
-        sections.append(
-            section("Standard Error of Measurement", embedded_plot(se_base64, "SEM"))
-        )
+            info_base64 = create_information_plot_base64(self.fit_result.model)
+            sections.append(
+                section(
+                    "Test Information Function",
+                    embedded_plot(info_base64, "Information"),
+                )
+            )
+
+            se_base64 = create_se_plot_base64(self.fit_result.model)
+            sections.append(
+                section(
+                    "Standard Error of Measurement",
+                    embedded_plot(se_base64, "SEM"),
+                )
+            )
 
         return "\n".join(sections)
 
     def _build_model_summary(self) -> str:
-        from mirt.reports._templates import format_value, section, summary_box
+        from mirt.reports._templates import (
+            escape_text,
+            format_value,
+            section,
+            summary_box,
+        )
 
         model = self.fit_result.model
         stats = self.fit_result.fit_statistics()
         summary_html = f"""
-        <p><strong>Model:</strong> {model.model_name}</p>
+        <p><strong>Model:</strong> {escape_text(model.model_name)}</p>
         <p><strong>Items:</strong> {model.n_items} | <strong>Factors:</strong> {model.n_factors}</p>
         <p><strong>Persons:</strong> {stats["n_observations"]} | <strong>Parameters:</strong> {stats["n_parameters"]}</p>
         <p><strong>Log-Likelihood:</strong> {format_value(stats["log_likelihood"], ".2f")}</p>
