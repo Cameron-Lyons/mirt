@@ -26,6 +26,7 @@ def fscores(
     prior_cov: NDArray[np.float64] | None = None,
     person_ids: list[Any] | None = None,
     bounds: tuple[float, float] = (-6.0, 6.0),
+    n_jobs: int = 1,
 ) -> ScoreResult:
     """Compute ability (theta) estimates for respondents.
 
@@ -57,6 +58,10 @@ def fscores(
         Identifiers for each person in the output.
     bounds : tuple of float, default=(-6.0, 6.0)
         Bounds for theta estimation (used by WLE).
+    n_jobs : int, default=1
+        Number of response patterns to optimize in parallel for MAP, ML, and
+        WLE scoring. ``-1`` uses all available CPU cores. EAP methods already
+        evaluate respondents in a single batched operation.
 
     Returns
     -------
@@ -113,11 +118,12 @@ def fscores(
         scorer = MAPScorer(
             prior_mean=prior_mean,
             prior_cov=prior_cov,
+            n_jobs=n_jobs,
         )
     elif method == "ML":
-        scorer = MLScorer()
+        scorer = MLScorer(n_jobs=n_jobs)
     elif method == "WLE":
-        scorer = WLEScorer(bounds=bounds)
+        scorer = WLEScorer(bounds=bounds, n_jobs=n_jobs)
     else:
         raise ValueError(f"Unknown scoring method: {method}")
 

@@ -11,6 +11,8 @@ from mirt.scoring._common import (
     finite_difference_se,
     observed_test_information,
     score_responses_parallel,
+    unique_response_patterns,
+    validate_scoring_responses,
 )
 from mirt.utils.numeric import compute_hessian_se
 
@@ -35,23 +37,26 @@ class MLScorer:
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
-        responses = np.asarray(responses)
+        responses = validate_scoring_responses(model, responses)
+        patterns, inverse = unique_response_patterns(responses)
         n_factors = model.n_factors
 
         def score_person(
             i: int,
         ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:
-            person_responses = responses[i : i + 1, :]
+            person_responses = patterns[i : i + 1, :]
             if n_factors == 1:
                 return self._score_unidimensional(model, person_responses)
             return self._score_multidimensional(model, person_responses)
 
         theta_ml, theta_se = score_responses_parallel(
             model=model,
-            responses=responses,
+            responses=patterns,
             n_jobs=self.n_jobs,
             score_person=score_person,
         )
+        theta_ml = theta_ml[inverse]
+        theta_se = theta_se[inverse]
 
         return ScoreResult(
             theta=theta_ml,

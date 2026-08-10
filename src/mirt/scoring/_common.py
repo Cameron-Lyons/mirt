@@ -95,9 +95,61 @@ def build_quadrature(
 
 def resolve_n_jobs(n_jobs: int) -> int:
     """Resolve n_jobs configuration, including -1 for all cores."""
+    if (
+        isinstance(n_jobs, (bool, np.bool_))
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs == 0
+        or n_jobs < -1
+    ):
+        raise ValueError("n_jobs must be -1 or a positive integer")
     if n_jobs == -1:
         return os.cpu_count() or 1
-    return n_jobs
+    return int(n_jobs)
+
+
+def validate_scoring_responses(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+) -> NDArray[np.int_]:
+    """Validate a scoring matrix and normalize every missing code to -1."""
+    raw = np.asarray(responses)
+    if raw.ndim != 2:
+        raise ValueError(f"responses must be 2D, got {raw.ndim}D")
+    if raw.shape[1] != model.n_items:
+        raise ValueError(
+            f"responses has {raw.shape[1]} items, expected {model.n_items}"
+        )
+    if raw.dtype.kind not in "biuf":
+        raise ValueError("responses must contain numeric values")
+
+    values = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("responses must contain only finite values")
+    observed = values >= 0.0
+    if np.any(values[observed] != np.floor(values[observed])):
+        raise ValueError("observed responses must be integer-valued")
+
+    if model.is_polytomous:
+        category_counts = np.asarray(model.n_categories, dtype=np.float64)
+        invalid = observed & (values >= category_counts[None, :])
+        if np.any(invalid):
+            raise ValueError("observed responses exceed an item's category range")
+    elif np.any(observed & (values > 1.0)):
+        raise ValueError(
+            "dichotomous responses must contain only 0, 1, or missing values"
+        )
+
+    return np.where(observed, values, -1.0).astype(np.int_, copy=False)
+
+
+def unique_response_patterns(
+    responses: NDArray[np.int_],
+) -> tuple[NDArray[np.int_], NDArray[np.intp]]:
+    """Collapse duplicate response rows for deterministic optimizer reuse."""
+    if responses.shape[0] == 0:
+        return responses.copy(), np.empty(0, dtype=np.intp)
+    patterns, inverse = np.unique(responses, axis=0, return_inverse=True)
+    return patterns, inverse.astype(np.intp, copy=False)
 
 
 def finite_difference_se(
