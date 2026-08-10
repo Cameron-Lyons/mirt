@@ -11,6 +11,8 @@ from mirt.scoring._common import (
     finite_difference_se,
     resolve_prior_distribution,
     score_responses_parallel,
+    unique_response_patterns,
+    validate_scoring_responses,
 )
 from mirt.utils.numeric import compute_hessian_se
 
@@ -39,7 +41,8 @@ class MAPScorer:
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
-        responses = np.asarray(responses)
+        responses = validate_scoring_responses(model, responses)
+        patterns, inverse = unique_response_patterns(responses)
         n_factors = model.n_factors
 
         prior_mean, prior_cov = resolve_prior_distribution(
@@ -53,7 +56,7 @@ class MAPScorer:
         def score_person(
             i: int,
         ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:
-            person_responses = responses[i : i + 1, :]
+            person_responses = patterns[i : i + 1, :]
             if n_factors == 1:
                 return self._score_unidimensional(
                     model, person_responses, prior_mean[0], prior_cov[0, 0]
@@ -64,10 +67,12 @@ class MAPScorer:
 
         theta_map, theta_se = score_responses_parallel(
             model=model,
-            responses=responses,
+            responses=patterns,
             n_jobs=self.n_jobs,
             score_person=score_person,
         )
+        theta_map = theta_map[inverse]
+        theta_se = theta_se[inverse]
 
         return ScoreResult(
             theta=theta_map,
