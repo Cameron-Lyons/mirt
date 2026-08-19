@@ -176,6 +176,7 @@ jobs:
           path: dist
 
       - name: List dist contents
+        shell: bash
         run: ls -la dist/
 
       - name: Install wheel

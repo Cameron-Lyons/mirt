@@ -5,7 +5,7 @@ All notable changes to the mirt package will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] - 2026-08-18
 
 ### Added
 - Documented Rust fallback contract (`numpy` / `optional` / `required` / `mixed`)
@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Coverage gate raised from 55% toward Production/Stable expectations (now 59%)
 - Stricter mypy checking on additional public modules
 
-## [1.1.0] - 2026-07-01
+### Included from the original 1.1 development milestone
 
 ### Added
 - Custom exception hierarchy for better error handling
