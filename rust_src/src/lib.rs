@@ -15,6 +15,8 @@
 
 use pyo3::prelude::*;
 
+mod special;
+
 pub mod utils;
 
 pub mod bayesian_diagnostics;

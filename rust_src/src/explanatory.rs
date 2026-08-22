@@ -5,7 +5,7 @@
 //! - Latent regression with person covariates
 //! - Combined explanatory IRT E-step
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use numpy::ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

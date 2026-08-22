@@ -2,7 +2,7 @@
 //!
 //! Provides parallel implementations of E-step and M-step for variational inference.
 
-use ndarray::{Array2, Array3};
+use numpy::ndarray::{Array2, Array3};
 use numpy::{
     PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray,
 };

@@ -5,7 +5,7 @@
 //! - WAIC computation
 //! - Pointwise log-likelihood computation
 
-use ndarray::{Array1, Array2, Axis};
+use numpy::ndarray::{Array1, Array2, Axis};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

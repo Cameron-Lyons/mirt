@@ -1,6 +1,6 @@
 //! Advanced MIRT model probability computations.
 
-use ndarray::Array2;
+use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

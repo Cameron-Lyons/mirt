@@ -1,7 +1,9 @@
 //! Core utility functions for IRT computations.
 
-use ndarray::ArrayView1;
+use numpy::ndarray::ArrayView1;
 use rand::{Rng, RngExt};
+
+use crate::special::erfc;
 
 pub const LOG_2_PI: f64 = 1.8378770664093453;
 pub const EPSILON: f64 = 1e-10;
@@ -96,7 +98,13 @@ pub fn clip(x: f64, min: f64, max: f64) -> f64 {
 
 #[inline]
 pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + libm::erf(x / std::f64::consts::SQRT_2))
+    0.5 * erfc(-x / std::f64::consts::SQRT_2)
+}
+
+/// Return the standard normal survival probability without tail cancellation.
+#[inline]
+pub fn normal_sf(x: f64) -> f64 {
+    0.5 * erfc(x / std::f64::consts::SQRT_2)
 }
 
 #[inline]
@@ -446,6 +454,41 @@ mod tests {
         assert!((clip(0.5, 0.0, 1.0) - 0.5).abs() < 1e-12);
         assert!((clip(-1.0, 0.0, 1.0) - 0.0).abs() < 1e-12);
         assert!((clip(2.0, 0.0, 1.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normal_distribution_helpers_match_reference_values() {
+        let cases = [
+            (-8.0, 6.220_960_574_271_74e-16, 0.999_999_999_999_999_3),
+            (-3.0, 0.001_349_898_031_630_094_5, 0.998_650_101_968_369_9),
+            (-1.0, 0.158_655_253_931_457_07, 0.841_344_746_068_542_9),
+            (0.0, 0.5, 0.5),
+            (1.0, 0.841_344_746_068_542_9, 0.158_655_253_931_457_07),
+            (3.0, 0.998_650_101_968_369_9, 0.001_349_898_031_630_094_5),
+            (8.0, 0.999_999_999_999_999_3, 6.220_960_574_271_74e-16),
+        ];
+
+        for (value, expected_cdf, expected_sf) in cases {
+            let cdf_error = (normal_cdf(value) - expected_cdf).abs();
+            let sf_error = (normal_sf(value) - expected_sf).abs();
+            assert!(
+                cdf_error <= 64.0 * f64::EPSILON * expected_cdf,
+                "normal_cdf({value}) was {}, expected {expected_cdf}",
+                normal_cdf(value)
+            );
+            assert!(
+                sf_error <= 64.0 * f64::EPSILON * expected_sf,
+                "normal_sf({value}) was {}, expected {expected_sf}",
+                normal_sf(value)
+            );
+        }
+
+        assert!(normal_cdf(f64::NAN).is_nan());
+        assert_eq!(normal_cdf(f64::NEG_INFINITY), 0.0);
+        assert_eq!(normal_cdf(f64::INFINITY), 1.0);
+        assert!(normal_sf(f64::NAN).is_nan());
+        assert_eq!(normal_sf(f64::NEG_INFINITY), 1.0);
+        assert_eq!(normal_sf(f64::INFINITY), 0.0);
     }
 
     #[test]

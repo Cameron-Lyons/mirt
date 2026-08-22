@@ -5,7 +5,7 @@
 //! - ICC area difference calculations
 //! - Lord-Wingersky recursion for observed score distributions
 
-use ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

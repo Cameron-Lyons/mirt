@@ -5,7 +5,7 @@
 //! - Forward-filtering backward-sampling (FFBS)
 //! - Longitudinal IRT likelihood computations
 
-use ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
