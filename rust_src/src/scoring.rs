@@ -1,6 +1,6 @@
 //! Person scoring functions (EAP, WLE).
 
-use ndarray::Array1;
+use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

@@ -1,11 +1,11 @@
 //! SIBTEST (Simultaneous Item Bias Test) functions.
 
-use ndarray::Array1;
+use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, normal_cdf};
+use crate::utils::{EPSILON, normal_sf};
 
 /// Compute SIBTEST beta statistic
 #[pyfunction]
@@ -277,7 +277,7 @@ pub fn sibtest_all_items<'py>(
             let p_value = if z.is_nan() {
                 f64::NAN
             } else {
-                2.0 * (1.0 - normal_cdf(z.abs()))
+                2.0 * normal_sf(z.abs())
             };
 
             (beta, z, p_value)

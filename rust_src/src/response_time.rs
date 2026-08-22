@@ -3,7 +3,7 @@
 //! This module provides functions for joint modeling of response accuracy
 //! and response times using Van der Linden's hierarchical framework.
 
-use ndarray::Array1;
+use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
@@ -283,7 +283,7 @@ fn log_mvn_density_single(
     x2: f64,
     mu1: f64,
     mu2: f64,
-    sigma_inv: &ndarray::ArrayView2<f64>,
+    sigma_inv: &numpy::ndarray::ArrayView2<f64>,
     log_det_sigma: f64,
 ) -> f64 {
     let d1 = x1 - mu1;

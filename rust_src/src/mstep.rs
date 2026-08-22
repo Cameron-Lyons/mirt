@@ -3,7 +3,7 @@
 //! This module provides parallelized M-step computation using Rayon,
 //! enabling efficient parameter estimation for large-scale IRT analysis.
 
-use ndarray::Array1;
+use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -327,8 +327,8 @@ pub fn compute_expected_counts_parallel<'py>(
         })
         .collect();
 
-    let mut r_k_all = ndarray::Array2::zeros((n_items, n_quad));
-    let mut n_k_all = ndarray::Array2::zeros((n_items, n_quad));
+    let mut r_k_all = numpy::ndarray::Array2::zeros((n_items, n_quad));
+    let mut n_k_all = numpy::ndarray::Array2::zeros((n_items, n_quad));
 
     for (j, (r_k, n_k)) in counts.into_iter().enumerate() {
         for q in 0..n_quad {

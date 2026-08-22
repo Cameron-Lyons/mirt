@@ -13,10 +13,8 @@ path = "rust_src/src/lib.rs"
 [dependencies]
 pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py311"] }
 numpy = "0.29.0"
-ndarray = "0.17.2"
 rayon = "1.12.0"
 rand = { version = "0.10.1", default-features = false, features = ["std", "std_rng"] }
-libm = "0.2.16"
 
 [profile.release]
 lto = true

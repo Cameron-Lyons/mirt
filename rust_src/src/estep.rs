@@ -1,6 +1,6 @@
 //! E-step and expected counts computation functions.
 
-use ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

@@ -1,6 +1,6 @@
 //! Computerized Adaptive Testing (CAT) functions.
 
-use ndarray::Array1;
+use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};

@@ -3,7 +3,7 @@
 //! This module provides functions for expanding ordinal responses to pseudo-items
 //! and computing E-step posteriors for multidimensional IRTree models.
 
-use ndarray::{Array1, Array2, Array3};
+use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{
     PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray,
 };

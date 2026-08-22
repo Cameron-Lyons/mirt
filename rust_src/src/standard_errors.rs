@@ -3,7 +3,7 @@
 //! Exploits the block diagonal structure of the Hessian matrix
 //! since item parameters are independent given the data.
 
-use ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -102,7 +102,7 @@ pub fn compute_item_se_parallel<'py>(
 fn compute_item_ll(
     r_k: &[f64],
     n_k: &[f64],
-    quad_points: &ndarray::ArrayView1<f64>,
+    quad_points: &numpy::ndarray::ArrayView1<f64>,
     a: f64,
     b: f64,
 ) -> f64 {

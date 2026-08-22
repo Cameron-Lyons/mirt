@@ -1,6 +1,6 @@
 //! Bootstrap sampling, imputation, and QMC functions.
 
-use ndarray::{Array2, Array3};
+use numpy::ndarray::{Array2, Array3};
 use numpy::{PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};

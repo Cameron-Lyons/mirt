@@ -3,7 +3,7 @@
 //! This module provides parallelized fixed-item calibration using Rayon,
 //! enabling efficient calibration of new items to an existing scale.
 
-use ndarray::{Array1, Array2};
+use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;

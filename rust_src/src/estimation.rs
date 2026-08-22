@@ -1,6 +1,6 @@
 //! Parameter estimation functions (EM, Gibbs, MHRM, Bootstrap).
 
-use ndarray::{Array1, Array2, Array3};
+use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
@@ -121,7 +121,7 @@ pub fn em_fit_2pl<'py>(
 
 #[allow(clippy::too_many_arguments)]
 fn e_step_2pl_internal(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     quad_points: &[f64],
     quad_weights: &[f64],
     discrimination: &[f64],
@@ -175,7 +175,7 @@ fn e_step_2pl_internal(
 
 #[allow(clippy::too_many_arguments)]
 fn m_step_2pl_internal(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     posterior_weights: &[Vec<f64>],
     quad_points: &[f64],
     discrimination: &mut [f64],
@@ -376,7 +376,7 @@ pub fn gibbs_sample_2pl<'py>(
 
 #[allow(clippy::too_many_arguments)]
 fn sample_theta_mh(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     theta: &[f64],
     discrimination: &[f64],
     difficulty: &[f64],
@@ -433,7 +433,7 @@ fn sample_theta_mh(
 }
 
 fn sample_discrimination_mh(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     theta: &[f64],
     discrimination: &[f64],
     difficulty: &[f64],
@@ -482,7 +482,7 @@ fn sample_discrimination_mh(
 }
 
 fn sample_difficulty_mh(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     theta: &[f64],
     discrimination: &[f64],
     difficulty: &[f64],
@@ -531,7 +531,7 @@ fn sample_difficulty_mh(
 }
 
 fn compute_total_ll(
-    responses: &ndarray::ArrayView2<i32>,
+    responses: &numpy::ndarray::ArrayView2<i32>,
     theta: &[f64],
     discrimination: &[f64],
     difficulty: &[f64],
@@ -911,7 +911,7 @@ pub fn em_iteration_2pl<'py>(
         .collect::<Vec<_>>()
         .into();
 
-    let mut posterior_arr = ndarray::Array2::zeros((n_persons, n_quad));
+    let mut posterior_arr = numpy::ndarray::Array2::zeros((n_persons, n_quad));
     for (i, pw) in posterior_weights.iter().enumerate() {
         for (q, &w) in pw.iter().enumerate() {
             posterior_arr[[i, q]] = w;
@@ -1131,7 +1131,7 @@ pub fn em_iteration_3pl<'py>(
         .collect::<Vec<_>>()
         .into();
 
-    let mut posterior_arr = ndarray::Array2::zeros((n_persons, n_quad));
+    let mut posterior_arr = numpy::ndarray::Array2::zeros((n_persons, n_quad));
     for (i, pw) in posterior_weights.iter().enumerate() {
         for (q, &w) in pw.iter().enumerate() {
             posterior_arr[[i, q]] = w;
