@@ -12,6 +12,7 @@ powered by a Rust backend for computational efficiency.
    quickstart
    guides/cat
    guides/dynamic
+   guides/explanatory
    guides/information
    guides/dif
    guides/plotting
