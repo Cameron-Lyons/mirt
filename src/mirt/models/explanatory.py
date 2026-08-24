@@ -1,13 +1,132 @@
+"""Explanatory item and person covariate IRT models."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Self
 
 import numpy as np
+from numpy.polynomial.hermite import hermgauss
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
+from mirt.utils.numeric import logsumexp_axis1
+
+
+def _positive_integer(value: int, name: str) -> int:
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
+
+
+def _boolean(value: bool, name: str) -> bool:
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be boolean")
+    return bool(value)
+
+
+def _numeric_matrix(
+    values: NDArray[np.float64],
+    name: str,
+) -> NDArray[np.float64]:
+    raw = np.asarray(values)
+    if raw.ndim != 2:
+        raise ValueError(f"{name} must be 2D")
+    if raw.dtype.kind not in "biuf":
+        raise ValueError(f"{name} must contain numeric values")
+    matrix = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError(f"{name} must contain only finite values")
+    return matrix.copy()
+
+
+def _parameter_vector(
+    values: NDArray[np.float64],
+    size: int,
+    name: str,
+) -> NDArray[np.float64]:
+    raw = np.asarray(values)
+    if raw.dtype.kind not in "biuf":
+        raise ValueError(f"{name} must contain numeric values")
+    vector = np.asarray(raw, dtype=np.float64)
+    if vector.shape != (size,):
+        raise ValueError(f"{name} shape {vector.shape} doesn't match ({size},)")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} must contain only finite values")
+    return vector.copy()
+
+
+def _names_or_default(
+    names: list[str] | None,
+    size: int,
+    prefix: str,
+    name: str,
+) -> list[str]:
+    if names is None:
+        return [f"{prefix}_{index}" for index in range(size)]
+    if len(names) != size:
+        raise ValueError(
+            f"Length of {name} ({len(names)}) must match expected size ({size})"
+        )
+    if not all(isinstance(value, str) for value in names):
+        raise ValueError(f"{name} must contain strings")
+    return list(names)
+
+
+def _item_index(item_idx: int | None, n_items: int) -> int | None:
+    if item_idx is None:
+        return None
+    if (
+        isinstance(item_idx, (bool, np.bool_))
+        or not isinstance(item_idx, (int, np.integer))
+        or item_idx < 0
+        or item_idx >= n_items
+    ):
+        raise IndexError(f"item_idx must be in [0, {n_items})")
+    return int(item_idx)
+
+
+def _person_vector(
+    values: NDArray[np.float64] | float,
+    n_persons: int,
+    name: str,
+) -> NDArray[np.float64]:
+    raw = np.asarray(values)
+    if raw.dtype.kind not in "biuf":
+        raise ValueError(f"{name} must contain numeric values")
+    vector = np.asarray(raw, dtype=np.float64)
+    if vector.ndim == 0:
+        vector = np.full(n_persons, float(vector), dtype=np.float64)
+    elif vector.ndim == 2 and vector.shape[1:] == (1,):
+        vector = vector[:, 0]
+    elif vector.ndim != 1:
+        raise ValueError(f"{name} must be a scalar or one-dimensional array")
+    if vector.shape not in {(1,), (n_persons,)}:
+        raise ValueError(f"{name} must contain one value or {n_persons} values")
+    if not np.all(np.isfinite(vector)):
+        raise ValueError(f"{name} must contain only finite values")
+    if vector.shape == (1,) and n_persons != 1:
+        return np.full(n_persons, vector[0], dtype=np.float64)
+    return vector.copy()
+
+
+@lru_cache(maxsize=16)
+def _standard_normal_quadrature(
+    n_points: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    nodes, weights = hermgauss(n_points)
+    nodes = np.asarray(nodes * np.sqrt(2.0), dtype=np.float64)
+    weights = np.asarray(weights / np.sqrt(np.pi), dtype=np.float64)
+    nodes.setflags(write=False)
+    weights.setflags(write=False)
+    return nodes, weights
 
 
 @dataclass
@@ -112,28 +231,33 @@ class LLTM(DichotomousItemModel):
         item_names: list[str] | None = None,
         constrain_discrimination: bool = True,
     ) -> None:
-        item_features = np.asarray(item_features, dtype=np.float64)
-        if item_features.ndim != 2:
-            raise ValueError("item_features must be 2D")
+        n_items = _positive_integer(n_items, "n_items")
+        item_features = _numeric_matrix(item_features, "item_features")
         if item_features.shape[0] != n_items:
             raise ValueError(
                 f"item_features has {item_features.shape[0]} rows, expected {n_items}"
             )
+        if item_features.shape[1] == 0:
+            raise ValueError("item_features must contain at least one feature")
 
         self._item_features = item_features
         self._n_features = item_features.shape[1]
-        self._feature_names = feature_names or [
-            f"Feature_{i}" for i in range(self._n_features)
-        ]
-        self._constrain_discrimination = constrain_discrimination
+        self._feature_names = _names_or_default(
+            feature_names,
+            self._n_features,
+            "Feature",
+            "feature_names",
+        )
+        self._constrain_discrimination = _boolean(
+            constrain_discrimination,
+            "constrain_discrimination",
+        )
 
-        if len(self._feature_names) != self._n_features:
-            raise ValueError(
-                f"Length of feature_names ({len(self._feature_names)}) must match "
-                f"number of features ({self._n_features})"
-            )
-
-        super().__init__(n_items, n_factors=1, item_names=item_names)
+        super().__init__(
+            n_items,
+            n_factors=1,
+            item_names=None if item_names is None else list(item_names),
+        )
 
     @property
     def item_features(self) -> NDArray[np.float64]:
@@ -148,12 +272,17 @@ class LLTM(DichotomousItemModel):
         return self._feature_names.copy()
 
     @property
+    def constrain_discrimination(self) -> bool:
+        """Whether item discriminations must share one common value."""
+        return self._constrain_discrimination
+
+    @property
     def feature_weights(self) -> NDArray[np.float64]:
-        return self._parameters["feature_weights"]
+        return self._parameters["feature_weights"].copy()
 
     @property
     def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
+        return self._parameters["discrimination"].copy()
 
     @property
     def difficulty(self) -> NDArray[np.float64]:
@@ -161,19 +290,58 @@ class LLTM(DichotomousItemModel):
 
     def _initialize_parameters(self) -> None:
         self._parameters["feature_weights"] = np.zeros(self._n_features)
-        if self._constrain_discrimination:
-            self._parameters["discrimination"] = np.ones(self.n_items)
-        else:
-            self._parameters["discrimination"] = np.ones(self.n_items)
+        self._parameters["discrimination"] = np.ones(self.n_items)
 
     def set_feature_weights(self, weights: NDArray[np.float64]) -> Self:
-        weights = np.asarray(weights, dtype=np.float64)
-        if weights.shape != (self._n_features,):
-            raise ValueError(
-                f"weights shape {weights.shape} doesn't match ({self._n_features},)"
+        """Set finite item-feature effects without retaining caller storage."""
+        return self.set_parameters(feature_weights=weights)
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set finite, identified item parameters."""
+        normalized = dict(params)
+        if "feature_weights" in normalized:
+            normalized["feature_weights"] = _parameter_vector(
+                normalized["feature_weights"],
+                self._n_features,
+                "feature_weights",
             )
-        self._parameters["feature_weights"] = weights
-        return self
+        if "discrimination" in normalized:
+            discrimination = _parameter_vector(
+                normalized["discrimination"],
+                self.n_items,
+                "discrimination",
+            )
+            if np.any(discrimination <= 0.0):
+                raise ValueError("discrimination must contain positive values")
+            if self._constrain_discrimination and not np.allclose(
+                discrimination,
+                discrimination[0],
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "constrained discrimination must use one common item value"
+                )
+            normalized["discrimination"] = discrimination
+        return super().set_parameters(**normalized)
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        index = _item_index(item_idx, self.n_items)
+        assert index is not None
+        if param_name == "discrimination":
+            if self._constrain_discrimination:
+                raise ValueError(
+                    "Cannot set one discrimination when discrimination is constrained"
+                )
+            scalar = np.asarray(value, dtype=np.float64)
+            if scalar.ndim != 0 or not np.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError("discrimination must be a finite positive scalar")
+        super().set_item_parameter(index, param_name, value)
 
     def probability(
         self,
@@ -181,13 +349,16 @@ class LLTM(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        if not np.all(np.isfinite(theta)):
+            raise ValueError("theta must contain only finite values")
         theta_1d = theta.ravel()
+        index = _item_index(item_idx, self.n_items)
 
         a = self._parameters["discrimination"]
         b = self.difficulty
 
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
+        if index is not None:
+            z = a[index] * (theta_1d - b[index])
             return sigmoid(z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
@@ -198,14 +369,14 @@ class LLTM(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
+        index = _item_index(item_idx, self.n_items)
+        p = self.probability(theta, index)
         q = 1.0 - p
 
         a = self._parameters["discrimination"]
 
-        if item_idx is not None:
-            return (a[item_idx] ** 2) * p * q
+        if index is not None:
+            return (a[index] ** 2) * p * q
 
         return (a[None, :] ** 2) * p * q
 
@@ -261,22 +432,15 @@ class LatentRegressionModel:
         covariate_names: list[str] | None = None,
         include_intercept: bool = True,
     ) -> None:
-        if n_covariates < 1:
-            raise ValueError("n_covariates must be at least 1")
-
-        self._n_covariates = n_covariates
-        self._include_intercept = include_intercept
-        self._n_weights = n_covariates + 1 if include_intercept else n_covariates
-
-        if covariate_names is None:
-            self._covariate_names = [f"X_{i}" for i in range(n_covariates)]
-        else:
-            if len(covariate_names) != n_covariates:
-                raise ValueError(
-                    f"Length of covariate_names ({len(covariate_names)}) must match "
-                    f"n_covariates ({n_covariates})"
-                )
-            self._covariate_names = list(covariate_names)
+        self._n_covariates = _positive_integer(n_covariates, "n_covariates")
+        self._include_intercept = _boolean(include_intercept, "include_intercept")
+        self._n_weights = self._n_covariates + int(self._include_intercept)
+        self._covariate_names = _names_or_default(
+            covariate_names,
+            self._n_covariates,
+            "X",
+            "covariate_names",
+        )
 
         self._regression_weights = np.zeros(self._n_weights)
         self._residual_variance = 1.0
@@ -302,35 +466,53 @@ class LatentRegressionModel:
         return self._residual_variance
 
     def set_regression_weights(self, weights: NDArray[np.float64]) -> Self:
-        weights = np.asarray(weights, dtype=np.float64)
-        if weights.shape != (self._n_weights,):
-            raise ValueError(
-                f"weights shape {weights.shape} doesn't match ({self._n_weights},)"
-            )
-        self._regression_weights = weights
+        """Set finite regression weights without retaining caller storage."""
+        self._regression_weights = _parameter_vector(
+            weights,
+            self._n_weights,
+            "regression_weights",
+        )
         return self
 
     def set_residual_variance(self, variance: float) -> Self:
-        if variance <= 0:
-            raise ValueError("residual_variance must be positive")
-        self._residual_variance = variance
+        raw = np.asarray(variance)
+        if (
+            isinstance(variance, (bool, np.bool_))
+            or raw.ndim != 0
+            or raw.dtype.kind not in "iuf"
+        ):
+            raise ValueError("residual_variance must be finite and positive")
+        numeric_variance = float(raw)
+        if not np.isfinite(numeric_variance) or numeric_variance <= 0.0:
+            raise ValueError("residual_variance must be finite and positive")
+        self._residual_variance = numeric_variance
         return self
 
     def _prepare_design_matrix(
         self, covariates: NDArray[np.float64]
     ) -> NDArray[np.float64]:
-        covariates = np.asarray(covariates, dtype=np.float64)
-        if covariates.ndim == 1:
-            covariates = covariates.reshape(-1, 1)
-        if covariates.shape[1] != self._n_covariates:
+        raw = np.asarray(covariates)
+        if raw.dtype.kind not in "biuf":
+            raise ValueError("covariates must contain numeric values")
+        values = np.asarray(raw, dtype=np.float64)
+        if values.ndim == 1:
+            if self._n_covariates == 1:
+                values = values.reshape(-1, 1)
+            else:
+                values = values.reshape(1, -1)
+        if values.ndim != 2:
+            raise ValueError("covariates must be one- or two-dimensional")
+        if values.shape[1] != self._n_covariates:
             raise ValueError(
-                f"covariates has {covariates.shape[1]} columns, "
+                f"covariates has {values.shape[1]} columns, "
                 f"expected {self._n_covariates}"
             )
+        if not np.all(np.isfinite(values)):
+            raise ValueError("covariates must contain only finite values")
         if self._include_intercept:
-            intercept = np.ones((covariates.shape[0], 1))
-            return np.hstack([intercept, covariates])
-        return covariates
+            intercept = np.ones((values.shape[0], 1))
+            return np.hstack([intercept, values])
+        return values
 
     def predict_mean(self, covariates: NDArray[np.float64]) -> NDArray[np.float64]:
         """Predict expected ability given covariates."""
@@ -346,12 +528,28 @@ class LatentRegressionModel:
         return self._residual_variance
 
     def log_prior_density(
-        self, theta: NDArray[np.float64], covariates: NDArray[np.float64]
+        self,
+        theta: NDArray[np.float64] | float,
+        covariates: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Compute log prior density of theta given covariates."""
         mu = self.predict_mean(covariates)
+        theta_values = _person_vector(theta, mu.size, "theta")
         sigma2 = self._residual_variance
-        return -0.5 * np.log(2 * np.pi * sigma2) - 0.5 * (theta - mu) ** 2 / sigma2
+        return (
+            -0.5 * np.log(2 * np.pi * sigma2) - 0.5 * (theta_values - mu) ** 2 / sigma2
+        )
+
+    def copy(self) -> Self:
+        """Create an independent copy of the latent regression."""
+        new_model = self.__class__(
+            n_covariates=self._n_covariates,
+            covariate_names=self._covariate_names.copy(),
+            include_intercept=self._include_intercept,
+        )
+        new_model._regression_weights = self._regression_weights.copy()
+        new_model._residual_variance = self._residual_variance
+        return new_model
 
 
 class ExplanatoryIRT(DichotomousItemModel):
@@ -408,34 +606,51 @@ class ExplanatoryIRT(DichotomousItemModel):
         constrain_discrimination: bool = True,
         include_intercept: bool = True,
     ) -> None:
-        item_features = np.asarray(item_features, dtype=np.float64)
-        if item_features.ndim != 2:
-            raise ValueError("item_features must be 2D")
+        n_items = _positive_integer(n_items, "n_items")
+        item_features = _numeric_matrix(item_features, "item_features")
         if item_features.shape[0] != n_items:
             raise ValueError(
                 f"item_features has {item_features.shape[0]} rows, expected {n_items}"
             )
+        if item_features.shape[1] == 0:
+            raise ValueError("item_features must contain at least one feature")
 
         self._item_features = item_features
         self._n_item_features = item_features.shape[1]
-        self._n_person_covariates = n_person_covariates
-        self._constrain_discrimination = constrain_discrimination
-        self._include_intercept = include_intercept
+        self._n_person_covariates = _positive_integer(
+            n_person_covariates,
+            "n_person_covariates",
+        )
+        self._constrain_discrimination = _boolean(
+            constrain_discrimination,
+            "constrain_discrimination",
+        )
+        self._include_intercept = _boolean(include_intercept, "include_intercept")
 
-        self._feature_names = feature_names or [
-            f"ItemFeature_{i}" for i in range(self._n_item_features)
-        ]
-        self._covariate_names = covariate_names or [
-            f"PersonCov_{i}" for i in range(n_person_covariates)
-        ]
-
-        self._latent_regression = LatentRegressionModel(
-            n_covariates=n_person_covariates,
-            covariate_names=self._covariate_names,
-            include_intercept=include_intercept,
+        self._feature_names = _names_or_default(
+            feature_names,
+            self._n_item_features,
+            "ItemFeature",
+            "feature_names",
+        )
+        self._covariate_names = _names_or_default(
+            covariate_names,
+            self._n_person_covariates,
+            "PersonCov",
+            "covariate_names",
         )
 
-        super().__init__(n_items, n_factors=1, item_names=item_names)
+        self._latent_regression = LatentRegressionModel(
+            n_covariates=self._n_person_covariates,
+            covariate_names=self._covariate_names,
+            include_intercept=self._include_intercept,
+        )
+
+        super().__init__(
+            n_items,
+            n_factors=1,
+            item_names=None if item_names is None else list(item_names),
+        )
 
     @property
     def item_features(self) -> NDArray[np.float64]:
@@ -458,8 +673,18 @@ class ExplanatoryIRT(DichotomousItemModel):
         return self._covariate_names.copy()
 
     @property
+    def constrain_discrimination(self) -> bool:
+        """Whether item discriminations must share one common value."""
+        return self._constrain_discrimination
+
+    @property
+    def include_intercept(self) -> bool:
+        """Whether latent regression includes an intercept."""
+        return self._include_intercept
+
+    @property
     def feature_weights(self) -> NDArray[np.float64]:
-        return self._parameters["feature_weights"]
+        return self._parameters["feature_weights"].copy()
 
     @property
     def regression_weights(self) -> NDArray[np.float64]:
@@ -471,7 +696,7 @@ class ExplanatoryIRT(DichotomousItemModel):
 
     @property
     def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
+        return self._parameters["discrimination"].copy()
 
     @property
     def difficulty(self) -> NDArray[np.float64]:
@@ -486,14 +711,55 @@ class ExplanatoryIRT(DichotomousItemModel):
         self._parameters["discrimination"] = np.ones(self.n_items)
 
     def set_feature_weights(self, weights: NDArray[np.float64]) -> Self:
-        weights = np.asarray(weights, dtype=np.float64)
-        if weights.shape != (self._n_item_features,):
-            raise ValueError(
-                f"weights shape {weights.shape} doesn't match "
-                f"({self._n_item_features},)"
+        """Set finite item-feature effects without retaining caller storage."""
+        return self.set_parameters(feature_weights=weights)
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set finite, identified item parameters."""
+        normalized = dict(params)
+        if "feature_weights" in normalized:
+            normalized["feature_weights"] = _parameter_vector(
+                normalized["feature_weights"],
+                self._n_item_features,
+                "feature_weights",
             )
-        self._parameters["feature_weights"] = weights
-        return self
+        if "discrimination" in normalized:
+            discrimination = _parameter_vector(
+                normalized["discrimination"],
+                self.n_items,
+                "discrimination",
+            )
+            if np.any(discrimination <= 0.0):
+                raise ValueError("discrimination must contain positive values")
+            if self._constrain_discrimination and not np.allclose(
+                discrimination,
+                discrimination[0],
+                rtol=0.0,
+                atol=1e-12,
+            ):
+                raise ValueError(
+                    "constrained discrimination must use one common item value"
+                )
+            normalized["discrimination"] = discrimination
+        return super().set_parameters(**normalized)
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        index = _item_index(item_idx, self.n_items)
+        assert index is not None
+        if param_name == "discrimination":
+            if self._constrain_discrimination:
+                raise ValueError(
+                    "Cannot set one discrimination when discrimination is constrained"
+                )
+            scalar = np.asarray(value, dtype=np.float64)
+            if scalar.ndim != 0 or not np.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError("discrimination must be a finite positive scalar")
+        super().set_item_parameter(index, param_name, value)
 
     def set_regression_weights(self, weights: NDArray[np.float64]) -> Self:
         self._latent_regression.set_regression_weights(weights)
@@ -509,13 +775,16 @@ class ExplanatoryIRT(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        if not np.all(np.isfinite(theta)):
+            raise ValueError("theta must contain only finite values")
         theta_1d = theta.ravel()
+        index = _item_index(item_idx, self.n_items)
 
         a = self._parameters["discrimination"]
         b = self.difficulty
 
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
+        if index is not None:
+            z = a[index] * (theta_1d - b[index])
             return sigmoid(z)
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
@@ -524,7 +793,7 @@ class ExplanatoryIRT(DichotomousItemModel):
     def probability_given_covariates(
         self,
         covariates: NDArray[np.float64],
-        residual_theta: NDArray[np.float64] | None = None,
+        residual_theta: NDArray[np.float64] | float | None = None,
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         """Compute probability given person covariates.
@@ -533,8 +802,9 @@ class ExplanatoryIRT(DichotomousItemModel):
         ----------
         covariates : ndarray of shape (n_persons, n_covariates)
             Person covariates.
-        residual_theta : ndarray of shape (n_persons,), optional
-            Residual ability not explained by covariates. If None, uses 0.
+        residual_theta : float or ndarray of shape (n_persons,), optional
+            Residual ability not explained by covariates. A scalar is shared
+            across respondents. If None, uses 0.
         item_idx : int, optional
             If given, compute probability for single item.
 
@@ -547,22 +817,128 @@ class ExplanatoryIRT(DichotomousItemModel):
         if residual_theta is None:
             theta = mu
         else:
-            theta = mu + np.asarray(residual_theta).ravel()
+            theta = mu + _person_vector(
+                residual_theta,
+                mu.size,
+                "residual_theta",
+            )
         return self.probability(theta.reshape(-1, 1), item_idx)
+
+    def marginal_probability_given_covariates(
+        self,
+        covariates: NDArray[np.float64],
+        item_idx: int | None = None,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Integrate response probabilities over residual ability.
+
+        Quadrature evaluations are vectorized across respondents and items,
+        while peak working memory remains proportional to the returned array.
+
+        Parameters
+        ----------
+        covariates : ndarray of shape (n_persons, n_person_covariates)
+            Person covariates.
+        item_idx : int, optional
+            If given, return probabilities for one item.
+        n_quadpts : int, default=21
+            Number of Gauss-Hermite quadrature points.
+
+        Returns
+        -------
+        ndarray
+            Marginal probabilities with shape ``(n_persons, n_items)`` or
+            ``(n_persons,)`` when ``item_idx`` is supplied.
+        """
+        n_quadpts = _positive_integer(n_quadpts, "n_quadpts")
+        index = _item_index(item_idx, self.n_items)
+        mean = self._latent_regression.predict_mean(covariates)
+        nodes, weights = _standard_normal_quadrature(n_quadpts)
+        scale = np.sqrt(self._latent_regression.residual_variance)
+        shape = (mean.size,) if index is not None else (mean.size, self.n_items)
+        marginal = np.zeros(shape, dtype=np.float64)
+
+        for node, weight in zip(nodes, weights, strict=True):
+            theta = (mean + scale * node).reshape(-1, 1)
+            marginal += weight * self.probability(theta, index)
+
+        return np.clip(marginal, 0.0, 1.0)
+
+    def marginal_log_likelihood_given_covariates(
+        self,
+        responses: NDArray[np.int_],
+        covariates: NDArray[np.float64],
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Return joint response-pattern log likelihoods given covariates.
+
+        Each respondent's likelihood is integrated over the shared residual
+        ability distribution, preserving dependence among their item responses.
+        Negative response values are treated as missing.
+        """
+        n_quadpts = _positive_integer(n_quadpts, "n_quadpts")
+        raw_responses = np.asarray(responses)
+        if raw_responses.ndim != 2:
+            raise ValueError("responses must be two-dimensional")
+        if raw_responses.shape[1] != self.n_items:
+            raise ValueError(
+                f"responses has {raw_responses.shape[1]} items, expected {self.n_items}"
+            )
+        if raw_responses.dtype.kind not in "biuf":
+            raise ValueError("responses must contain numeric values")
+        response_values = np.asarray(raw_responses, dtype=np.float64)
+        if not np.all(np.isfinite(response_values)):
+            raise ValueError("responses must contain only finite values")
+        observed = response_values >= 0.0
+        if np.any(observed & (response_values != 0.0) & (response_values != 1.0)):
+            raise ValueError("observed responses must contain only 0 and 1")
+
+        mean = self._latent_regression.predict_mean(covariates)
+        if response_values.shape[0] != mean.size:
+            raise ValueError(
+                "responses and covariates must contain the same number of persons"
+            )
+        values = np.where(observed, response_values, 0.0)
+        incorrect = observed.astype(np.float64) - values
+        nodes, weights = _standard_normal_quadrature(n_quadpts)
+        scale = np.sqrt(self._latent_regression.residual_variance)
+        log_integrand = np.empty((mean.size, n_quadpts), dtype=np.float64)
+
+        for point, (node, weight) in enumerate(zip(nodes, weights, strict=True)):
+            theta = (mean + scale * node).reshape(-1, 1)
+            probabilities = np.clip(
+                self.probability(theta),
+                PROB_EPSILON,
+                1.0 - PROB_EPSILON,
+            )
+            conditional_log_likelihood = np.einsum(
+                "ij,ij->i",
+                values,
+                np.log(probabilities),
+                optimize=True,
+            ) + np.einsum(
+                "ij,ij->i",
+                incorrect,
+                np.log1p(-probabilities),
+                optimize=True,
+            )
+            log_integrand[:, point] = np.log(weight) + conditional_log_likelihood
+
+        return logsumexp_axis1(log_integrand)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
+        index = _item_index(item_idx, self.n_items)
+        p = self.probability(theta, index)
         q = 1.0 - p
 
         a = self._parameters["discrimination"]
 
-        if item_idx is not None:
-            return (a[item_idx] ** 2) * p * q
+        if index is not None:
+            return (a[index] ** 2) * p * q
 
         return (a[None, :] ** 2) * p * q
 
@@ -578,17 +954,7 @@ class ExplanatoryIRT(DichotomousItemModel):
             include_intercept=self._include_intercept,
         )
         new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
-        new_model._latent_regression = LatentRegressionModel(
-            n_covariates=self._n_person_covariates,
-            covariate_names=self._covariate_names,
-            include_intercept=self._include_intercept,
-        )
-        new_model._latent_regression.set_regression_weights(
-            self._latent_regression.regression_weights
-        )
-        new_model._latent_regression.set_residual_variance(
-            self._latent_regression.residual_variance
-        )
+        new_model._latent_regression = self._latent_regression.copy()
         new_model._is_fitted = self._is_fitted
         return new_model
 
@@ -624,3 +990,17 @@ class RaschLLTM(LLTM):
         if "discrimination" in params:
             raise ValueError("Cannot set discrimination in RaschLLTM (fixed to 1)")
         return super().set_parameters(**params)
+
+    def copy(self) -> Self:
+        """Create an independent Rasch-constrained copy."""
+        new_model = self.__class__(
+            n_items=self.n_items,
+            item_features=self._item_features.copy(),
+            feature_names=self._feature_names.copy(),
+            item_names=self.item_names.copy(),
+        )
+        new_model._parameters["feature_weights"] = self._parameters[
+            "feature_weights"
+        ].copy()
+        new_model._is_fitted = self._is_fitted
+        return new_model
