@@ -9,7 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
+from mirt.backends.rust.response_time import rt_joint_log_likelihood
 from mirt.exceptions import MirtValidationError
 
 AccuracyModel = Literal["2PL", "3PL"]
@@ -43,6 +43,7 @@ class ResponseTimeModel:
     time_discrimination: NDArray[np.float64] | None = None
     ability_speed_mean: NDArray[np.float64] | None = None
     ability_speed_cov: NDArray[np.float64] | None = None
+    use_rust: bool = True
 
     _PARAMETER_NAMES: ClassVar[frozenset[str]] = frozenset(
         {
@@ -81,6 +82,14 @@ class ResponseTimeModel:
                 value=self.accuracy_model,
                 expected="'2PL' or '3PL'",
             )
+        if not isinstance(self.use_rust, (bool, np.bool_)):
+            raise MirtValidationError(
+                "use_rust must be a boolean",
+                parameter="use_rust",
+                value=self.use_rust,
+                expected="boolean",
+            )
+        self.use_rust = bool(self.use_rust)
 
         if self.item_names is None:
             self.item_names = [f"Item_{i}" for i in range(self.n_items)]
@@ -540,28 +549,46 @@ class ResponseTimeModel:
         theta_values = self._person_vector(theta, "theta", n_persons)
         tau_values = self._person_vector(tau, "tau", n_persons)
 
-        try:
-            response_numeric = response_values.astype(np.float64)
-        except (TypeError, ValueError) as exc:
-            raise MirtValidationError(
-                "responses must be numeric",
-                parameter="responses",
-                value=response_values,
-                expected="0, 1, or a missing value",
-            ) from exc
-        response_finite = np.isfinite(response_numeric)
-        response_missing = np.isnan(response_numeric) | (
-            response_finite & (response_numeric < 0.0)
-        )
-        response_observed = response_finite & (response_numeric >= 0.0)
-        invalid_response = (~response_missing & ~response_observed) | (
-            response_observed & (response_numeric != 0.0) & (response_numeric != 1.0)
-        )
+        if np.issubdtype(response_values.dtype, np.integer) or np.issubdtype(
+            response_values.dtype, np.bool_
+        ):
+            response_observed = response_values >= 0
+            invalid_response = (
+                response_observed & (response_values != 0) & (response_values != 1)
+            )
+            response_integers = response_values
+            invalid_values = response_values[invalid_response]
+        else:
+            try:
+                response_numeric = response_values.astype(np.float64, copy=False)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    "responses must be numeric",
+                    parameter="responses",
+                    value=response_values,
+                    expected="0, 1, or a missing value",
+                ) from exc
+            response_finite = np.isfinite(response_numeric)
+            response_missing = np.isnan(response_numeric) | (
+                response_finite & (response_numeric < 0.0)
+            )
+            response_observed = response_finite & (response_numeric >= 0.0)
+            invalid_response = (~response_missing & ~response_observed) | (
+                response_observed
+                & (response_numeric != 0.0)
+                & (response_numeric != 1.0)
+            )
+            response_integers = np.where(
+                response_observed,
+                response_numeric,
+                -1,
+            ).astype(np.int32)
+            invalid_values = response_numeric[invalid_response]
         if np.any(invalid_response):
             raise MirtValidationError(
                 "observed responses must be 0 or 1",
                 parameter="responses",
-                value=response_numeric[invalid_response],
+                value=invalid_values,
                 expected="0, 1, or a negative/NaN missing value",
             )
 
@@ -573,24 +600,27 @@ class ResponseTimeModel:
                 expected="finite values or NaN",
             )
 
-        probability = np.clip(
-            self.accuracy_probability(theta_values),
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
+        (
+            discrimination,
+            difficulty,
+            guessing,
+            time_intensity,
+            time_discrimination,
+            _,
+            _,
+        ) = self._validated_state()
+        return rt_joint_log_likelihood(
+            response_integers,
+            log_rt_values,
+            theta_values,
+            tau_values,
+            discrimination,
+            difficulty,
+            time_discrimination,
+            time_intensity,
+            guessing,
+            use_rust=self.use_rust,
         )
-        observed_values = np.where(response_observed, response_numeric, 0.0)
-        accuracy_log_likelihood = np.where(
-            response_observed,
-            observed_values * np.log(probability)
-            + (1.0 - observed_values) * np.log1p(-probability),
-            0.0,
-        )
-
-        timing_observed = ~np.isnan(log_rt_values)
-        timing_values = np.where(timing_observed, log_rt_values, 0.0)
-        timing_log_likelihood = self.rt_log_density(timing_values, tau_values)
-        timing_log_likelihood = np.where(timing_observed, timing_log_likelihood, 0.0)
-        return np.sum(accuracy_log_likelihood + timing_log_likelihood, axis=1)
 
     def simulate(
         self,

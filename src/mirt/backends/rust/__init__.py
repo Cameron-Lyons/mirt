@@ -106,6 +106,10 @@ from mirt.backends.rust.polytomous import (
 from mirt.backends.rust.regularized import (
     coordinate_descent_mstep_regularized,
 )
+from mirt.backends.rust.response_time import (
+    rt_accept_person_proposals,
+    rt_joint_log_likelihood,
+)
 from mirt.backends.rust.scoring import (
     compute_eap_scores,
 )
@@ -180,6 +184,8 @@ __all__ = [
     "gvem_m_step",
     "gvem_compute_elbo",
     "coordinate_descent_mstep_regularized",
+    "rt_joint_log_likelihood",
+    "rt_accept_person_proposals",
     "bkt_forward",
     "bkt_backward",
     "bkt_forward_backward_batch",
