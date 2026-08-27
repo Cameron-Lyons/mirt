@@ -43,6 +43,7 @@ Models
    ResponseTimeModel
    DINA
    DINO
+   IRTreeModel
 
 Custom Models
 -------------
@@ -84,6 +85,8 @@ Estimation
    GibbsSampler
    BLEstimator
    ResponseTimeGibbsSampler
+   IRTreeEMEstimator
+   IRTreeResult
 
 Diagnostics
 -----------

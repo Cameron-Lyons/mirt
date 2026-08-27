@@ -14,6 +14,7 @@ powered by a Rust backend for computational efficiency.
    guides/dynamic
    guides/response_time
    guides/explanatory
+   guides/irtree
    guides/information
    guides/dif
    guides/plotting
