@@ -53,6 +53,7 @@ def compute_se(
     method: SEMethod = "numerical",
     step_size: float = 1e-5,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute standard errors using specified method.
 
@@ -73,6 +74,9 @@ def compute_se(
     n_jobs : int
         Number of parallel jobs for item-wise computation.
         Use -1 for all CPUs, 1 for sequential.
+    prior_mass : ndarray, optional
+        Quadrature prior mass used by matrix-based methods. When omitted,
+        it is recovered from the final posterior weights.
 
     Returns
     -------
@@ -93,23 +97,53 @@ def compute_se(
         )
     elif method == "louis":
         return _se_louis(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     elif method == "sandwich":
         return _se_sandwich(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     elif method == "oakes":
         return _se_oakes(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     elif method == "crossprod":
         return _se_crossprod(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     elif method == "sem":
         return _se_sem(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     elif method == "fisher":
         return _se_fisher(
@@ -128,6 +162,28 @@ def _se_numerical_central(
     n_jobs: int = 1,
 ) -> dict[str, NDArray[np.float64]]:
     """Central difference numerical Hessian."""
+    return _se_itemwise_numerical(
+        model,
+        responses,
+        quadrature,
+        posterior_weights,
+        h,
+        n_jobs,
+        scheme="central",
+    )
+
+
+def _se_itemwise_numerical(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    posterior_weights: NDArray[np.float64],
+    h: float,
+    n_jobs: int,
+    *,
+    scheme: Literal["central", "forward"],
+) -> dict[str, NDArray[np.float64]]:
+    """Compute diagonal item-wise curvature without sharing mutable models."""
     import os
     from concurrent.futures import ThreadPoolExecutor
 
@@ -145,42 +201,36 @@ def _se_numerical_central(
 
         se = np.zeros_like(values)
 
+        def item_standard_error(
+            item_model: BaseItemModel,
+            item_idx: int,
+        ) -> float | NDArray[np.float64]:
+            return _compute_item_se_curvature(
+                item_model,
+                item_idx,
+                param_name,
+                responses,
+                quadrature,
+                posterior_weights,
+                h,
+                scheme=scheme,
+            )
+
         if n_jobs == 1:
             for item_idx in range(model.n_items):
-                item_se = _compute_item_se_central(
-                    model,
-                    item_idx,
-                    param_name,
-                    responses,
-                    quadrature,
-                    posterior_weights,
-                    h,
-                )
-                if values.ndim == 1:
-                    se[item_idx] = item_se
-                else:
-                    se[item_idx] = item_se
+                se[item_idx] = item_standard_error(model, item_idx)
         else:
 
-            def compute_item(item_idx):
-                return item_idx, _compute_item_se_central(
-                    model,
-                    item_idx,
-                    param_name,
-                    responses,
-                    quadrature,
-                    posterior_weights,
-                    h,
-                )
+            def compute_item(
+                item_idx: int,
+            ) -> tuple[int, float | NDArray[np.float64]]:
+                return item_idx, item_standard_error(model.copy(), item_idx)
 
             with ThreadPoolExecutor(max_workers=min(n_jobs, model.n_items)) as executor:
                 results = list(executor.map(compute_item, range(model.n_items)))
 
             for item_idx, item_se in results:
-                if values.ndim == 1:
-                    se[item_idx] = item_se
-                else:
-                    se[item_idx] = item_se
+                se[item_idx] = item_se
 
         se[~free_mask] = 0.0
         se_dict[param_name] = se
@@ -188,7 +238,7 @@ def _se_numerical_central(
     return se_dict
 
 
-def _compute_item_se_central(
+def _compute_item_se_curvature(
     model: BaseItemModel,
     item_idx: int,
     param_name: str,
@@ -196,8 +246,10 @@ def _compute_item_se_central(
     quadrature: GaussHermiteQuadrature,
     posterior_weights: NDArray[np.float64],
     h: float,
+    *,
+    scheme: Literal["central", "forward"],
 ) -> float | NDArray[np.float64]:
-    """Compute SE for single item using central differences."""
+    """Compute a single item's diagonal finite-difference curvature."""
     quad_points = quadrature.nodes
     item_responses = responses[:, item_idx]
     valid_mask = item_responses >= 0
@@ -243,25 +295,28 @@ def _compute_item_se_central(
             model.set_item_parameter(item_idx, param_name, current)
             return ll
 
-    ll_center = log_likelihood(current)
+    offsets = (-1.0, 0.0, 1.0) if scheme == "central" else (0.0, 1.0, 2.0)
+    coefficients = (1.0, -2.0, 1.0)
 
     if is_scalar:
-        ll_plus = log_likelihood(current + h)
-        ll_minus = log_likelihood(current - h)
-        hessian = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+        hessian = (
+            sum(
+                coefficient * log_likelihood(current + offset * h)
+                for coefficient, offset in zip(coefficients, offsets, strict=True)
+            )
+            / h**2
+        )
         return np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
     else:
         n_params = len(current)
         se = np.zeros(n_params)
         for i in range(n_params):
-            param_plus = current.copy()
-            param_plus[i] += h
-            param_minus = current.copy()
-            param_minus[i] -= h
-
-            ll_plus = log_likelihood(param_plus)
-            ll_minus = log_likelihood(param_minus)
-            hessian = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+            hessian = 0.0
+            for coefficient, offset in zip(coefficients, offsets, strict=True):
+                candidate = current.copy()
+                candidate[i] += offset * h
+                hessian += coefficient * log_likelihood(candidate)
+            hessian /= h**2
             se[i] = np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
         return se
 
@@ -275,8 +330,14 @@ def _se_numerical_forward(
     n_jobs: int = 1,
 ) -> dict[str, NDArray[np.float64]]:
     """Forward difference numerical Hessian (less accurate but faster)."""
-    return _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    return _se_itemwise_numerical(
+        model,
+        responses,
+        quadrature,
+        posterior_weights,
+        h,
+        n_jobs,
+        scheme="forward",
     )
 
 
@@ -313,86 +374,18 @@ def _se_louis(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Louis information matrix method.
-
-    Uses the identity:
-        I_obs = I_complete - I_missing
-
-    where I_missing is computed from the variance of the complete-data
-    score function with respect to the posterior distribution.
-    """
-    se_complete = _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    """Louis-equivalent observed-information standard errors."""
+    return _se_oakes(
+        model,
+        responses,
+        quadrature,
+        posterior_weights,
+        h,
+        n_jobs,
+        prior_mass,
     )
-
-    quad_points = quadrature.nodes
-    n_quad = len(quadrature.weights)
-    n_persons = responses.shape[0]
-
-    se_dict = {}
-    free_masks = model.free_parameter_masks
-    for param_name, values in model.parameters.items():
-        free_mask = free_masks[param_name]
-        if not np.any(free_mask):
-            se_dict[param_name] = np.zeros_like(values)
-            continue
-
-        se = np.zeros_like(values)
-
-        for item_idx in range(model.n_items):
-            item_responses = responses[:, item_idx]
-            valid_mask = item_responses >= 0
-
-            scores = np.zeros((n_persons, n_quad))
-
-            for q in range(n_quad):
-                theta_q = quad_points[q : q + 1]
-                probs = model.probability(theta_q, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                if model.is_polytomous:
-                    for i in range(n_persons):
-                        if valid_mask[i]:
-                            resp = item_responses[i]
-                            p = probs[0, resp] if probs.ndim > 1 else probs[resp]
-                            scores[i, q] = 1.0 / p
-                else:
-                    p = probs[0] if probs.ndim > 0 else probs
-                    scores[valid_mask, q] = item_responses[valid_mask] / p - (
-                        1 - item_responses[valid_mask]
-                    ) / (1 - p)
-
-            score_mean = np.sum(posterior_weights * scores, axis=1)
-            score_sq_mean = np.sum(posterior_weights * (scores**2), axis=1)
-            missing_info = np.sum(score_sq_mean - score_mean**2)
-
-            complete_se = se_complete[param_name]
-            if complete_se.ndim == 1:
-                complete_var = (
-                    complete_se[item_idx] ** 2
-                    if not np.isnan(complete_se[item_idx])
-                    else np.inf
-                )
-            else:
-                complete_var = (
-                    complete_se[item_idx][0] ** 2
-                    if not np.isnan(complete_se[item_idx][0])
-                    else np.inf
-                )
-
-            adjustment = 1 + missing_info * complete_var
-            adjustment = max(adjustment, 1.0)
-
-            if values.ndim == 1:
-                se[item_idx] = se_complete[param_name][item_idx] * np.sqrt(adjustment)
-            else:
-                se[item_idx] = se_complete[param_name][item_idx] * np.sqrt(adjustment)
-
-        se[~free_mask] = 0.0
-        se_dict[param_name] = se
-
-    return se_dict
 
 
 def _se_sandwich(
@@ -402,6 +395,7 @@ def _se_sandwich(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Sandwich (robust) standard errors.
 
@@ -410,8 +404,16 @@ def _se_sandwich(
 
     This provides consistent SEs even under model misspecification.
     """
-    return _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    del n_jobs
+    from mirt.estimation.standard_errors import compute_sandwich_se
+
+    return compute_sandwich_se(
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h=h,
+        prior_mass=prior_mass,
     )
 
 
@@ -422,14 +424,23 @@ def _se_oakes(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Oakes information method.
 
-    Direct computation of observed information using the Oakes (1999)
-    identity for EM algorithms.
+    Evaluate the observed-information target of the Oakes (1999) identity
+    directly from the marginal likelihood at the converged EM solution.
     """
-    return _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    del n_jobs
+    from mirt.estimation.standard_errors import compute_oakes_se
+
+    return compute_oakes_se(
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h=h,
+        prior_mass=prior_mass,
     )
 
 
@@ -440,14 +451,23 @@ def _se_crossprod(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Cross-product of scores standard errors.
 
     Estimates information from the outer product of score vectors:
         I ≈ sum_i s_i * s_i'
     """
-    return _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    del n_jobs
+    from mirt.estimation.standard_errors import compute_crossprod_se
+
+    return compute_crossprod_se(
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h=h,
+        prior_mass=prior_mass,
     )
 
 
@@ -458,14 +478,23 @@ def _se_sem(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Supplemented EM (SEM) standard errors.
 
-    Uses the rate of convergence of EM to estimate standard errors.
-    Requires additional EM iterations to estimate the rate matrix.
+    Evaluate the observed-information target of supplemented EM directly.
+    This deterministic form avoids a noisy, seed-dependent rate estimate.
     """
-    return _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    del n_jobs
+    from mirt.estimation.standard_errors import compute_sem_se
+
+    return compute_sem_se(
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h=h,
+        prior_mass=prior_mass,
     )
 
 
