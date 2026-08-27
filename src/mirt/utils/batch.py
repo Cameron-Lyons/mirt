@@ -10,6 +10,7 @@ import os
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from multiprocessing import get_context
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
@@ -208,11 +209,17 @@ def _execute_tasks(
             except _FIT_FAILURES as exc:
                 record_failure(task, exc)
     else:
-        executor_type = (
-            ThreadPoolExecutor if parallel_backend == "thread" else ProcessPoolExecutor
-        )
         try:
-            executor = executor_type(max_workers=worker_count)
+            executor: ThreadPoolExecutor | ProcessPoolExecutor
+            if parallel_backend == "thread":
+                executor = ThreadPoolExecutor(max_workers=worker_count)
+            else:
+                # Forking after the native backend initializes its thread pool can
+                # deadlock the child. Spawn workers from a clean interpreter instead.
+                executor = ProcessPoolExecutor(
+                    max_workers=worker_count,
+                    mp_context=get_context("spawn"),
+                )
         except OSError as exc:
             raise RuntimeError(
                 f"{parallel_backend} parallel backend is unavailable; "

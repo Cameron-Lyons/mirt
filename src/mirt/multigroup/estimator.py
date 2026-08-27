@@ -135,9 +135,12 @@ class MultigroupEMEstimator:
         self._convergence_history = []
         prev_ll = -np.inf
         n_iterations = 0
+        converged = False
+        state_is_current = False
 
         for iteration in range(self.max_iter):
             posterior_weights, group_lls = self._e_step(model, responses)
+            state_is_current = True
 
             current_ll = sum(group_lls)
             self._convergence_history.append(current_ll)
@@ -146,6 +149,7 @@ class MultigroupEMEstimator:
                 print(f"Iteration {iteration + 1}: LL = {current_ll:.4f}")
 
             if abs(current_ll - prev_ll) < self.tol:
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration + 1}")
                 n_iterations = iteration + 1
@@ -155,6 +159,7 @@ class MultigroupEMEstimator:
             n_iterations = iteration + 1
 
             self._m_step(model, responses, posterior_weights, inv_spec)
+            state_is_current = False
 
             for g in range(model.n_groups):
                 n_k = posterior_weights[g].sum(axis=0)
@@ -163,8 +168,13 @@ class MultigroupEMEstimator:
         for g in range(model.n_groups):
             model.get_group_model(g)._is_fitted = True
 
-        posterior_weights, group_lls = self._e_step(model, responses)
-        final_ll = sum(group_lls)
+        if state_is_current:
+            final_ll = current_ll
+        else:
+            posterior_weights, group_lls = self._e_step(model, responses)
+            final_ll = sum(group_lls)
+            self._convergence_history.append(final_ll)
+            converged = abs(final_ll - prev_ll) < self.tol
 
         group_n = [r.shape[0] for r in responses]
         total_n = sum(group_n)
@@ -181,7 +191,7 @@ class MultigroupEMEstimator:
             invariance=inv_spec.level,
             log_likelihood=final_ll,
             n_iterations=n_iterations,
-            converged=n_iterations < self.max_iter,
+            converged=converged,
             group_log_likelihoods=group_lls,
             group_n_observations=group_n,
             latent_distributions=[d.copy() for d in self._latent_density.distributions],

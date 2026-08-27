@@ -286,6 +286,7 @@ def fit_mirt(
             max_iter=max_iter,
             tol=tol,
             verbose=verbose,
+            use_rust=use_rust,
         )
         return estimator.fit(irt_model, data)
 

@@ -380,6 +380,7 @@ class SparseBayesianEstimator(BaseEstimator):
         self._convergence_history = []
         self._elbo_history = []
         prev_elbo = -np.inf
+        converged = False
 
         prior_cov_inv = np.linalg.inv(prior_cov)
 
@@ -393,6 +394,7 @@ class SparseBayesianEstimator(BaseEstimator):
             self._log_iteration(iteration, current_elbo, elbo=current_elbo)
 
             if self._check_convergence(prev_elbo, current_elbo):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -403,6 +405,12 @@ class SparseBayesianEstimator(BaseEstimator):
 
             if self._ssl_prior.adaptive:
                 self._ssl_prior.update_theta(self._gamma)
+        else:
+            self._e_step(responses, prior_cov_inv)
+            current_elbo = self._compute_elbo(responses, prior_mean, prior_cov)
+            self._elbo_history.append(current_elbo)
+            self._convergence_history.append(current_elbo)
+            converged = self._check_convergence(prev_elbo, current_elbo)
 
         sparse_loadings = self._apply_sparsity()
 
@@ -435,7 +443,7 @@ class SparseBayesianEstimator(BaseEstimator):
             bic=bic,
             ebic=ebic,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             n_observations=n_persons,
             n_items=n_items,
             elbo_history=self._elbo_history.copy(),

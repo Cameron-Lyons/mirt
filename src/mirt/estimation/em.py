@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt._backend_config import should_use_rust
 from mirt._core import sigmoid
 from mirt._gpu_backend import (
     compute_log_likelihoods_2pl_gpu,
@@ -14,6 +16,8 @@ from mirt._gpu_backend import (
     compute_log_likelihoods_grm_gpu,
     is_gpu_available,
 )
+from mirt._rust_backend import RUST_AVAILABLE, em_iteration_3pl
+from mirt.constants import PROB_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtValidationError
@@ -41,6 +45,7 @@ class EMEstimator(BaseEstimator):
         se_step_size: float = 1e-5,
         n_jobs: int = 1,
         use_gpu: bool | Literal["auto"] = "auto",
+        use_rust: bool = True,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -59,6 +64,7 @@ class EMEstimator(BaseEstimator):
         self.se_step_size = se_step_size
         self.n_jobs = n_jobs
         self.use_gpu = use_gpu
+        self.use_rust = use_rust
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
@@ -111,29 +117,59 @@ class EMEstimator(BaseEstimator):
             model._initialize_parameters()
 
         valid_masks = [responses[:, j] >= 0 for j in range(model.n_items)]
+        use_rust_3pl = self._can_use_rust_3pl(model, responses)
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
-            posterior_weights, marginal_ll = self._e_step(model, responses)
+            rust_result = None
+            if use_rust_3pl:
+                rust_result = self._run_rust_3pl_iteration(model, responses)
+                if rust_result is None:
+                    use_rust_3pl = False
 
-            current_ll = np.sum(np.log(marginal_ll + 1e-300))
+            if rust_result is None:
+                posterior_weights, marginal_ll = self._e_step(model, responses)
+                current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            else:
+                (
+                    new_discrimination,
+                    new_difficulty,
+                    new_guessing,
+                    posterior_weights,
+                    current_ll,
+                ) = rust_result
+
             self._convergence_history.append(current_ll)
 
             self._log_iteration(iteration, current_ll)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
 
             prev_ll = current_ll
 
-            self._m_step(model, responses, posterior_weights, valid_masks)
+            if rust_result is None:
+                self._m_step(model, responses, posterior_weights, valid_masks)
+            else:
+                model.set_parameters(
+                    discrimination=new_discrimination,
+                    difficulty=new_difficulty,
+                    guessing=new_guessing,
+                )
 
             n_k = posterior_weights.sum(axis=0)
             self._latent_density.update(self._quadrature.nodes, n_k)
+        else:
+            posterior_weights, marginal_ll = self._e_step(model, responses)
+            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            self._convergence_history.append(current_ll)
+            converged = self._check_convergence(prev_ll, current_ll)
 
         model._is_fitted = True
 
@@ -149,12 +185,152 @@ class EMEstimator(BaseEstimator):
             model=model,
             log_likelihood=current_ll,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+        )
+
+    def _can_use_rust_3pl(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+    ) -> bool:
+        """Return whether the batched native 3PL iteration preserves semantics."""
+        from mirt.estimation.latent_density import GaussianDensity
+        from mirt.models.dichotomous import ThreeParameterLogistic
+
+        if (
+            not RUST_AVAILABLE
+            or not should_use_rust(self.use_rust)
+            or self._should_use_gpu
+            or type(model) is not ThreeParameterLogistic
+            or model.n_factors != 1
+            or self.n_jobs != 1
+            or self.prob_epsilon != PROB_EPSILON
+        ):
+            return False
+
+        if (
+            isinstance(self.item_optim_maxiter, (bool, np.bool_))
+            or not isinstance(self.item_optim_maxiter, Integral)
+            or self.item_optim_maxiter < 1
+            or isinstance(self.item_optim_ftol, (bool, np.bool_))
+            or not isinstance(self.item_optim_ftol, Real)
+            or not np.isfinite(self.item_optim_ftol)
+            or self.item_optim_ftol <= 0.0
+        ):
+            return False
+
+        density = self._latent_density
+        if (
+            not isinstance(density, GaussianDensity)
+            or density.n_dimensions != 1
+            or density.estimate_mean
+            or density.estimate_cov
+            or not np.array_equal(density.mean, np.zeros(1))
+            or not np.array_equal(density.cov, np.eye(1))
+        ):
+            return False
+
+        params = model.parameters
+        expected_shape = (model.n_items,)
+        if any(
+            name not in params or params[name].shape != expected_shape
+            for name in ("discrimination", "difficulty", "guessing")
+        ):
+            return False
+
+        observed = responses[responses >= 0]
+        return bool(np.all((observed == 0) | (observed == 1)))
+
+    def _run_rust_3pl_iteration(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+    ) -> (
+        tuple[
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            NDArray[np.float64],
+            float,
+        ]
+        | None
+    ):
+        """Run and validate one batched native 3PL E/M iteration."""
+        if self._quadrature is None:
+            return None
+
+        params = model.parameters
+        try:
+            result = em_iteration_3pl(
+                responses,
+                self._quadrature.nodes.ravel(),
+                self._quadrature.weights,
+                params["discrimination"],
+                params["difficulty"],
+                params["guessing"],
+                prior_mean=0.0,
+                prior_var=1.0,
+                max_m_iter=int(self.item_optim_maxiter),
+                m_tol=float(self.item_optim_ftol),
+                disc_bounds=(0.1, 5.0),
+                diff_bounds=(-6.0, 6.0),
+                guess_bounds=(0.0, 0.5),
+                damping_ab=0.5,
+                damping_c=0.3,
+                regularization=0.01,
+                regularization_c=0.1,
+            )
+        except Exception:
+            return None
+
+        try:
+            if result is None or len(result) != 5:
+                return None
+
+            discrimination, difficulty, guessing, posterior, log_likelihood = result
+            discrimination = np.asarray(discrimination, dtype=np.float64)
+            difficulty = np.asarray(difficulty, dtype=np.float64)
+            guessing = np.asarray(guessing, dtype=np.float64)
+            posterior = np.asarray(posterior, dtype=np.float64)
+            log_likelihood = float(log_likelihood)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+        parameter_shape = (model.n_items,)
+        posterior_shape = (responses.shape[0], self.n_quadpts)
+        if (
+            discrimination.shape != parameter_shape
+            or difficulty.shape != parameter_shape
+            or guessing.shape != parameter_shape
+            or posterior.shape != posterior_shape
+            or not np.all(np.isfinite(discrimination))
+            or not np.all(np.isfinite(difficulty))
+            or not np.all(np.isfinite(guessing))
+            or not np.all(np.isfinite(posterior))
+            or not np.isfinite(log_likelihood)
+            or np.any((discrimination < 0.1) | (discrimination > 5.0))
+            or np.any((difficulty < -6.0) | (difficulty > 6.0))
+            or np.any((guessing < 0.0) | (guessing > 0.5))
+            or np.any(posterior < 0.0)
+        ):
+            return None
+
+        row_sums = posterior.sum(axis=1)
+        if not np.allclose(row_sums, 1.0, rtol=1e-10, atol=1e-12):
+            return None
+        posterior = posterior / row_sums[:, None]
+
+        return (
+            discrimination.copy(),
+            difficulty.copy(),
+            guessing.copy(),
+            posterior,
+            log_likelihood,
         )
 
     def _e_step(
