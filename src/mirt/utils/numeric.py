@@ -141,12 +141,16 @@ def compute_hessian_se(
     return np.sqrt(variances)
 
 
-def compute_expected_variance(
+def compute_probability_moments(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     n_items: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute expected values and variances for all items.
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Validate probabilities and compute score moments for all items.
 
     Parameters
     ----------
@@ -159,6 +163,10 @@ def compute_expected_variance(
 
     Returns
     -------
+    probabilities : array
+        Validated probabilities. Dichotomous models return shape
+        ``(n_persons, n_items)`` and polytomous models return shape
+        ``(n_persons, n_items, n_categories)``.
     expected : array of shape (n_persons, n_items)
         Expected scores for each person-item combination.
     variance : array of shape (n_persons, n_items)
@@ -204,7 +212,7 @@ def compute_expected_variance(
         expected = probabilities @ categories
         expected_squared = probabilities @ (categories**2)
         variance = np.maximum(expected_squared - expected**2, 0.0)
-        return expected, variance
+        return probabilities, expected, variance
 
     if probabilities.shape != (n_persons, model.n_items):
         raise ValueError("model returned invalid dichotomous probabilities")
@@ -215,7 +223,34 @@ def compute_expected_variance(
         raise ValueError("model returned probabilities outside [0, 1]")
 
     expected = np.clip(probabilities, 0.0, 1.0, out=probabilities)
-    return expected, expected * (1.0 - expected)
+    return probabilities, expected, expected * (1.0 - expected)
+
+
+def compute_expected_variance(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    n_items: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute expected values and variances for all items.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted IRT model.
+    theta : array of shape (n_persons, n_factors)
+        Person ability estimates.
+    n_items : int
+        Number of items.
+
+    Returns
+    -------
+    expected : array of shape (n_persons, n_items)
+        Expected scores for each person-item combination.
+    variance : array of shape (n_persons, n_items)
+        Variance of scores for each person-item combination.
+    """
+    _, expected, variance = compute_probability_moments(model, theta, n_items)
+    return expected, variance
 
 
 def compute_fit_stats(

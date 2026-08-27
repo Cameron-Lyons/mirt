@@ -1,9 +1,101 @@
 """Tests for person fit statistics."""
 
+from typing import get_args
+
 import numpy as np
+import pytest
 from numpy.testing import assert_allclose
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.personfit import compute_personfit, flag_aberrant_persons
+from mirt.typing import PersonFitStatistic
+
+
+class FixedProbabilityModel:
+    """Minimal model returning fixed all-item probabilities."""
+
+    def __init__(self, probabilities, n_categories=None):
+        self.probabilities = np.asarray(probabilities, dtype=np.float64)
+        self.n_items = self.probabilities.shape[1]
+        self._n_categories = n_categories
+        self.probability_calls = 0
+
+    @property
+    def is_polytomous(self):
+        return self._n_categories is not None
+
+    @property
+    def n_categories(self):
+        if self._n_categories is None:
+            raise AttributeError("dichotomous models do not have categories")
+        return list(self._n_categories)
+
+    def probability(self, theta, item_idx=None):
+        self.probability_calls += 1
+        if len(theta) != len(self.probabilities):
+            raise ValueError("theta length must match fixed probabilities")
+        if item_idx is None:
+            return self.probabilities.copy()
+        if self.is_polytomous:
+            return self.probabilities[
+                :,
+                item_idx,
+                : self._n_categories[item_idx],
+            ].copy()
+        return self.probabilities[:, item_idx].copy()
+
+
+def reference_zh(responses, probabilities, n_categories=None):
+    """Scalar reference matching the person-fit log-likelihood definition."""
+    n_persons, n_items = responses.shape
+    valid = responses >= 0
+    log_likelihood = np.zeros(n_persons)
+    expected_log_likelihood = np.zeros(n_persons)
+    variance_log_likelihood = np.zeros(n_persons)
+
+    for item_idx in range(n_items):
+        item_valid = valid[:, item_idx]
+        item_responses = responses[:, item_idx]
+
+        if probabilities.ndim == 2:
+            probs = np.clip(
+                probabilities[:, item_idx],
+                PROB_EPSILON,
+                1.0 - PROB_EPSILON,
+            )
+            log_p = np.log(probs)
+            log_q = np.log(1.0 - probs)
+            observed = np.where(item_responses == 1, log_p, log_q)
+            expected = probs * log_p + (1.0 - probs) * log_q
+            variance = probs * (1.0 - probs) * (log_p - log_q) ** 2
+        else:
+            category_count = n_categories[item_idx]
+            probs = np.clip(
+                probabilities[:, item_idx, :category_count],
+                PROB_EPSILON,
+                1.0 - PROB_EPSILON,
+            )
+            log_probs = np.log(probs)
+            safe_responses = np.clip(
+                np.where(item_valid, item_responses, 0),
+                0,
+                category_count - 1,
+            )
+            observed = log_probs[np.arange(n_persons), safe_responses]
+            expected = np.sum(probs * log_probs, axis=1)
+            variance = np.sum(probs * log_probs**2, axis=1) - expected**2
+
+        log_likelihood += np.where(item_valid, observed, 0.0)
+        expected_log_likelihood += np.where(item_valid, expected, 0.0)
+        variance_log_likelihood += np.where(item_valid, variance, 0.0)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(
+            (valid.sum(axis=1) >= 2) & (variance_log_likelihood > PROB_EPSILON),
+            (log_likelihood - expected_log_likelihood)
+            / np.sqrt(variance_log_likelihood),
+            np.nan,
+        )
 
 
 class TestComputePersonfit:
@@ -117,6 +209,53 @@ class TestComputePersonfit:
         assert "outfit" in result
         assert "Zh" in result
 
+    def test_reuses_one_probability_matrix_for_all_statistics(self):
+        """Test mean-square and likelihood statistics share probabilities."""
+        responses = np.tile(
+            np.array([[0, 0, 1], [0, 1, 1], [1, 0, 0], [1, 1, 0]]),
+            (3, 1),
+        )
+        responses[1, 1] = -1
+        probabilities = np.column_stack(
+            (
+                np.linspace(0.2, 0.8, len(responses)),
+                np.linspace(0.7, 0.3, len(responses)),
+                np.linspace(0.4, 0.6, len(responses)),
+            )
+        )
+        model = FixedProbabilityModel(probabilities)
+
+        result = compute_personfit(model, responses, np.zeros(len(responses)))
+
+        assert model.probability_calls == 1
+        assert_allclose(
+            result["Zh"],
+            reference_zh(responses, probabilities),
+            rtol=1e-13,
+            atol=1e-13,
+            equal_nan=True,
+        )
+
+    def test_zh_only_uses_one_probability_matrix(self):
+        """Test requesting only Zh avoids repeated item evaluations."""
+        responses = np.tile(np.array([[0, 1], [1, 0]]), (5, 1))
+        probabilities = np.tile(np.array([[0.3, 0.7]]), (len(responses), 1))
+        model = FixedProbabilityModel(probabilities)
+
+        result = compute_personfit(
+            model,
+            responses,
+            np.zeros(len(responses)),
+            statistics=["Zh"],
+        )
+
+        assert set(result) == {"Zh"}
+        assert model.probability_calls == 1
+
+    def test_lz_is_in_public_personfit_statistic_type(self):
+        """Test runtime typing matches the documented lz option."""
+        assert "lz" in get_args(PersonFitStatistic)
+
 
 class TestFlagAberrantPersons:
     """Tests for flag_aberrant_persons function."""
@@ -216,6 +355,17 @@ class TestFlagAberrantPersons:
         flag_rate = np.mean(flags)
         assert flag_rate < 0.5
 
+    def test_default_criteria_support_lz_alias(self):
+        """Test lz-only results use the documented likelihood thresholds."""
+        flags = flag_aberrant_persons({"lz": np.array([-2.5, 0.0, 2.5])})
+
+        np.testing.assert_array_equal(flags, np.array([True, False, True]))
+
+    def test_empty_statistics_are_rejected(self):
+        """Test empty inputs fail with a clear message."""
+        with pytest.raises(ValueError, match="at least one"):
+            flag_aberrant_persons({})
+
 
 class TestPersonfitEdgeCases:
     """Tests for edge cases in person fit computation."""
@@ -312,3 +462,35 @@ class TestPersonfitPolytomous:
 
         assert "infit" in fit_result
         assert len(fit_result["infit"]) == polytomous_responses["n_persons"]
+
+    def test_polytomous_zh_matches_scalar_reference(self):
+        """Test chunked polytomous Zh with different category counts."""
+        responses = np.tile(
+            np.array([[0, 0], [1, 1], [2, 1], [1, 0]]),
+            (3, 1),
+        )
+        item_probabilities = np.array(
+            [
+                [[0.6, 0.3, 0.1], [0.7, 0.3, 0.0]],
+            ]
+        )
+        probabilities = np.tile(item_probabilities, (len(responses), 1, 1))
+        model = FixedProbabilityModel(probabilities, n_categories=[3, 2])
+
+        result = compute_personfit(
+            model,
+            responses,
+            np.zeros(len(responses)),
+            statistics=["Zh", "lz"],
+        )
+        expected = reference_zh(responses, probabilities, [3, 2])
+
+        assert model.probability_calls == 1
+        assert_allclose(
+            result["Zh"],
+            expected,
+            rtol=1e-13,
+            atol=1e-13,
+            equal_nan=True,
+        )
+        assert_allclose(result["lz"], result["Zh"], equal_nan=True)

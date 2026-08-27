@@ -11,6 +11,7 @@ from mirt.utils.numeric import (
     compute_expected_variance,
     compute_fit_stats,
     compute_hessian_se,
+    compute_probability_moments,
     logsumexp,
     logsumexp_axis1,
 )
@@ -142,6 +143,20 @@ class TestHessianStandardErrors:
 
 
 class TestExpectedVariance:
+    def test_probability_moments_expose_validated_probabilities(self) -> None:
+        model = ThreeParameterLogistic(3)
+        theta = np.linspace(-2.0, 2.0, 21)[:, None]
+
+        probabilities, expected, variance = compute_probability_moments(
+            model,
+            theta,
+            model.n_items,
+        )
+
+        np.testing.assert_allclose(probabilities, model.probability(theta))
+        np.testing.assert_allclose(expected, probabilities)
+        np.testing.assert_allclose(variance, probabilities * (1.0 - probabilities))
+
     def test_three_pl_matches_model_probabilities(self) -> None:
         model = ThreeParameterLogistic(3)
         model.set_parameters(
