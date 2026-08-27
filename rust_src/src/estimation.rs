@@ -1044,8 +1044,13 @@ pub fn em_iteration_3pl<'py>(
             for _ in 0..max_m_iter {
                 let mut grad_a = 0.0;
                 let mut grad_b = 0.0;
-                let mut hess_aa = 0.0;
-                let mut hess_bb = 0.0;
+                let mut grad_c = 0.0;
+                let mut info_aa = regularization;
+                let mut info_ab = 0.0;
+                let mut info_ac = 0.0;
+                let mut info_bb = regularization;
+                let mut info_bc = 0.0;
+                let mut info_cc = regularization_c;
 
                 for q in 0..n_quad {
                     if n_k[q] < EPSILON {
@@ -1059,54 +1064,97 @@ pub fn em_iteration_3pl<'py>(
 
                     let dp_da = (1.0 - c) * p_star * (1.0 - p_star) * (theta - b);
                     let dp_db = -(1.0 - c) * p_star * (1.0 - p_star) * a;
-
-                    let residual = r_k[q] - n_k[q] * p_clipped;
-
-                    grad_a += residual * dp_da / (p_clipped * (1.0 - p_clipped) + EPSILON);
-                    grad_b += residual * dp_db / (p_clipped * (1.0 - p_clipped) + EPSILON);
-
-                    let info = n_k[q] * p_clipped * (1.0 - p_clipped);
-                    hess_aa -= info * dp_da * dp_da / (p_clipped * (1.0 - p_clipped) + EPSILON);
-                    hess_bb -= info * dp_db * dp_db / (p_clipped * (1.0 - p_clipped) + EPSILON);
-                }
-
-                hess_aa -= regularization;
-                hess_bb -= regularization;
-
-                if hess_aa.abs() > EPSILON {
-                    a = (a - grad_a / hess_aa * damping_ab).clamp(disc_bounds.0, disc_bounds.1);
-                }
-                if hess_bb.abs() > EPSILON {
-                    b = (b - grad_b / hess_bb * damping_ab).clamp(diff_bounds.0, diff_bounds.1);
-                }
-
-                let mut grad_c = 0.0;
-                let mut hess_cc = 0.0;
-
-                for q in 0..n_quad {
-                    if n_k[q] < EPSILON {
-                        continue;
-                    }
-                    let theta = quad_points[q];
-                    let z = a * (theta - b);
-                    let p_star = sigmoid(z);
-                    let p = c + (1.0 - c) * p_star;
-                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
-
                     let dp_dc = 1.0 - p_star;
+
                     let residual = r_k[q] - n_k[q] * p_clipped;
+                    let variance = (p_clipped * (1.0 - p_clipped)).max(EPSILON);
+                    let score_scale = residual / variance;
+                    let info_scale = n_k[q] / variance;
 
-                    grad_c += residual * dp_dc / (p_clipped * (1.0 - p_clipped) + EPSILON);
-                    hess_cc -= n_k[q] * dp_dc * dp_dc / (p_clipped * (1.0 - p_clipped) + EPSILON);
+                    grad_a += score_scale * dp_da;
+                    grad_b += score_scale * dp_db;
+                    grad_c += score_scale * dp_dc;
+
+                    info_aa += info_scale * dp_da * dp_da;
+                    info_ab += info_scale * dp_da * dp_db;
+                    info_ac += info_scale * dp_da * dp_dc;
+                    info_bb += info_scale * dp_db * dp_db;
+                    info_bc += info_scale * dp_db * dp_dc;
+                    info_cc += info_scale * dp_dc * dp_dc;
                 }
 
-                hess_cc -= regularization_c;
+                let cofactor_aa = info_bb * info_cc - info_bc * info_bc;
+                let cofactor_ab = info_ac * info_bc - info_ab * info_cc;
+                let cofactor_ac = info_ab * info_bc - info_ac * info_bb;
+                let cofactor_bb = info_aa * info_cc - info_ac * info_ac;
+                let cofactor_bc = info_ab * info_ac - info_aa * info_bc;
+                let cofactor_cc = info_aa * info_bb - info_ab * info_ab;
+                let determinant =
+                    info_aa * cofactor_aa + info_ab * cofactor_ab + info_ac * cofactor_ac;
 
-                if hess_cc.abs() > EPSILON {
-                    c = (c - grad_c / hess_cc * damping_c).clamp(guess_bounds.0, guess_bounds.1);
+                if !determinant.is_finite() || determinant.abs() < EPSILON {
+                    break;
                 }
 
-                if grad_a.abs() < m_tol && grad_b.abs() < m_tol && grad_c.abs() < m_tol {
+                let delta_a = (cofactor_aa * grad_a + cofactor_ab * grad_b + cofactor_ac * grad_c)
+                    / determinant;
+                let delta_b = (cofactor_ab * grad_a + cofactor_bb * grad_b + cofactor_bc * grad_c)
+                    / determinant;
+                let delta_c = (cofactor_ac * grad_a + cofactor_bc * grad_b + cofactor_cc * grad_c)
+                    / determinant;
+
+                if !delta_a.is_finite() || !delta_b.is_finite() || !delta_c.is_finite() {
+                    break;
+                }
+
+                let expected_log_likelihood =
+                    |candidate_a: f64, candidate_b: f64, candidate_c: f64| -> f64 {
+                        (0..n_quad)
+                            .filter(|&q| n_k[q] >= EPSILON)
+                            .map(|q| {
+                                let z = candidate_a * (quad_points[q] - candidate_b);
+                                let p_star = sigmoid(z);
+                                let p = (candidate_c + (1.0 - candidate_c) * p_star)
+                                    .clamp(EPSILON, 1.0 - EPSILON);
+                                r_k[q] * p.ln() + (n_k[q] - r_k[q]) * (1.0 - p).ln()
+                            })
+                            .sum()
+                    };
+
+                let current_objective = expected_log_likelihood(a, b, c);
+                let mut step_scale = 1.0;
+                let mut accepted = None;
+                for _ in 0..12 {
+                    let candidate_a =
+                        (a + step_scale * damping_ab * delta_a).clamp(disc_bounds.0, disc_bounds.1);
+                    let candidate_b =
+                        (b + step_scale * damping_ab * delta_b).clamp(diff_bounds.0, diff_bounds.1);
+                    let candidate_c = (c + step_scale * damping_c * delta_c)
+                        .clamp(guess_bounds.0, guess_bounds.1);
+                    let candidate_objective =
+                        expected_log_likelihood(candidate_a, candidate_b, candidate_c);
+
+                    if candidate_objective.is_finite()
+                        && candidate_objective + EPSILON >= current_objective
+                    {
+                        accepted = Some((candidate_a, candidate_b, candidate_c));
+                        break;
+                    }
+                    step_scale *= 0.5;
+                }
+
+                let Some((new_a, new_b, new_c)) = accepted else {
+                    break;
+                };
+                let max_change = (new_a - a)
+                    .abs()
+                    .max((new_b - b).abs())
+                    .max((new_c - c).abs());
+                a = new_a;
+                b = new_b;
+                c = new_c;
+
+                if max_change < m_tol {
                     break;
                 }
             }
