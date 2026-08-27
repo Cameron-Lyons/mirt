@@ -133,6 +133,7 @@ class MCEMEstimator(BaseEstimator):
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         L = np.linalg.cholesky(prior_cov)
 
@@ -149,6 +150,7 @@ class MCEMEstimator(BaseEstimator):
             self._log_iteration(iteration, current_ll)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -156,6 +158,12 @@ class MCEMEstimator(BaseEstimator):
             prev_ll = current_ll
 
             self._m_step_mc(model, responses, theta_samples, weights)
+        else:
+            current_ll, weights = self._refresh_mc_state(
+                model, responses, theta_samples, weights
+            )
+            self._convergence_history.append(current_ll)
+            converged = self._check_convergence(prev_ll, current_ll)
 
         model._is_fitted = True
 
@@ -171,7 +179,7 @@ class MCEMEstimator(BaseEstimator):
             model=model,
             log_likelihood=current_ll,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,
@@ -218,6 +226,19 @@ class MCEMEstimator(BaseEstimator):
         weights: NDArray[np.float64],
     ) -> float:
         """Estimate marginal log-likelihood using importance sampling."""
+        marginal_ll, _ = self._refresh_mc_state(
+            model, responses, theta_samples, weights
+        )
+        return marginal_ll
+
+    def _refresh_mc_state(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        theta_samples: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> tuple[float, NDArray[np.float64]]:
+        """Evaluate current parameters on an existing Monte Carlo draw."""
         n_persons = responses.shape[0]
 
         log_likes = np.zeros((n_persons, self.n_samples))
@@ -225,9 +246,12 @@ class MCEMEstimator(BaseEstimator):
             theta_s = theta_samples[:, s, :]
             log_likes[:, s] = model.log_likelihood(responses, theta_s)
 
-        log_marginal = logsumexp(log_likes, axis=1) - np.log(self.n_samples)
+        log_normalizer = logsumexp(log_likes, axis=1, keepdims=True)
+        log_marginal = log_normalizer.ravel() - np.log(self.n_samples)
+        if self.importance_sampling:
+            weights = np.exp(log_likes - log_normalizer)
 
-        return float(np.sum(log_marginal))
+        return float(np.sum(log_marginal)), weights
 
     def _m_step_mc(
         self,

@@ -114,6 +114,7 @@ class EMEstimator(BaseEstimator):
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
             posterior_weights, marginal_ll = self._e_step(model, responses)
@@ -124,6 +125,7 @@ class EMEstimator(BaseEstimator):
             self._log_iteration(iteration, current_ll)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -134,6 +136,11 @@ class EMEstimator(BaseEstimator):
 
             n_k = posterior_weights.sum(axis=0)
             self._latent_density.update(self._quadrature.nodes, n_k)
+        else:
+            posterior_weights, marginal_ll = self._e_step(model, responses)
+            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            self._convergence_history.append(current_ll)
+            converged = self._check_convergence(prev_ll, current_ll)
 
         model._is_fitted = True
 
@@ -149,7 +156,7 @@ class EMEstimator(BaseEstimator):
             model=model,
             log_likelihood=current_ll,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,

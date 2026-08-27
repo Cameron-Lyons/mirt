@@ -252,6 +252,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
             posterior_weights, marginal_ll = self._e_step(
@@ -266,6 +267,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
             self._log_iteration(iteration, current_ll, penalty=penalty_term)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -278,6 +280,15 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
             n_k = posterior_weights.sum(axis=0)
             latent_density.update(self._quadrature.nodes, n_k)
+        else:
+            posterior_weights, marginal_ll = self._e_step(
+                responses, loadings, intercepts, latent_density
+            )
+            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            penalty_term = self._compute_penalty(loadings)
+            penalized_ll = current_ll - penalty_term
+            self._convergence_history.append(current_ll)
+            converged = self._check_convergence(prev_ll, current_ll)
 
         model.set_parameters(slopes=loadings, intercepts=intercepts)
         model._is_fitted = True
@@ -305,7 +316,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
             aic=aic,
             bic=bic,
             ebic=ebic,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             n_iterations=iteration + 1,
             n_observations=n_persons,
             n_parameters=n_params,

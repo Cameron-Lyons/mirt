@@ -158,6 +158,7 @@ class GVEMEstimator(BaseEstimator):
         self._convergence_history = []
         self._elbo_history = []
         prev_elbo = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
             self._e_step(model, responses, prior_cov)
@@ -169,6 +170,7 @@ class GVEMEstimator(BaseEstimator):
             self._log_iteration(iteration, current_elbo, elbo=current_elbo)
 
             if self._check_convergence(prev_elbo, current_elbo):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -176,6 +178,12 @@ class GVEMEstimator(BaseEstimator):
             prev_elbo = current_elbo
 
             self._m_step(model, responses)
+        else:
+            self._e_step(model, responses, prior_cov)
+            current_elbo = self._compute_elbo(model, responses, prior_mean, prior_cov)
+            self._elbo_history.append(current_elbo)
+            self._convergence_history.append(current_elbo)
+            converged = self._check_convergence(prev_elbo, current_elbo)
 
         self._convert_from_slope_intercept(model)
 
@@ -191,7 +199,7 @@ class GVEMEstimator(BaseEstimator):
             model=model,
             log_likelihood=current_elbo,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,

@@ -183,6 +183,7 @@ class IRTreeEMEstimator(BaseEstimator):
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
             posterior_weights, marginal_ll = self._e_step(
@@ -200,6 +201,7 @@ class IRTreeEMEstimator(BaseEstimator):
             self._log_iteration(iteration, current_ll)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -218,6 +220,18 @@ class IRTreeEMEstimator(BaseEstimator):
                 trait_mean, trait_cov = self._update_trait_distribution(
                     posterior_weights, trait_mean, trait_cov
                 )
+        else:
+            posterior_weights, marginal_ll = self._e_step(
+                model,
+                pseudo_responses,
+                trait_assignments,
+                valid_mask,
+                trait_mean,
+                trait_cov,
+            )
+            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            self._convergence_history.append(current_ll)
+            converged = self._check_convergence(prev_ll, current_ll)
 
         model._is_fitted = True
         model._trait_correlations = self._cov_to_corr(trait_cov)
@@ -250,7 +264,7 @@ class IRTreeEMEstimator(BaseEstimator):
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             n_iterations=iteration + 1,
             n_observations=n_persons,
             n_parameters=n_params,
