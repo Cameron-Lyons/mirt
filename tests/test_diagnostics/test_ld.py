@@ -4,14 +4,83 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.ld import (
     LDResult,
+    _compute_ld_chi2_g2,
+    _compute_q3,
     compute_ld_chi2,
     compute_ld_statistics,
     compute_q3,
     flag_ld_pairs,
     ld_summary_table,
 )
+
+
+class _CountingPolytomousModel:
+    """Small deterministic model that records probability evaluations."""
+
+    is_polytomous = True
+
+    def __init__(self, n_items: int) -> None:
+        self.n_items = n_items
+        self.item_names = [f"Item_{index}" for index in range(n_items)]
+        self.probability_calls = 0
+
+    def positive_probability(self, theta, item_idx):
+        theta_values = np.asarray(theta, dtype=np.float64).reshape(-1)
+        slope = 0.8 + 0.1 * item_idx
+        difficulty = -0.6 + 0.25 * item_idx
+        logits = slope * (theta_values - difficulty)
+        return 1.0 / (1.0 + np.exp(-logits))
+
+    def probability(self, theta, item_idx):
+        self.probability_calls += 1
+        positive = self.positive_probability(theta, item_idx)
+        return np.column_stack((1.0 - positive, positive))
+
+
+def _reference_ld_chi2_g2(model, responses, theta):
+    """Scalar reference implementation for pairwise LD statistics."""
+    n_items = responses.shape[1]
+    chi2_matrix = np.full((n_items, n_items), np.nan)
+    g2_matrix = np.full((n_items, n_items), np.nan)
+
+    for first in range(n_items):
+        for second in range(first + 1, n_items):
+            valid = (responses[:, first] >= 0) & (responses[:, second] >= 0)
+            if valid.sum() < 10:
+                continue
+
+            first_response = responses[valid, first] > 0
+            second_response = responses[valid, second] > 0
+            first_probability = model.positive_probability(theta[valid], first)
+            second_probability = model.positive_probability(theta[valid], second)
+
+            observed = np.array(
+                [
+                    np.sum(~first_response & ~second_response),
+                    np.sum(~first_response & second_response),
+                    np.sum(first_response & ~second_response),
+                    np.sum(first_response & second_response),
+                ]
+            )
+            expected = np.array(
+                [
+                    np.sum((1.0 - first_probability) * (1.0 - second_probability)),
+                    np.sum((1.0 - first_probability) * second_probability),
+                    np.sum(first_probability * (1.0 - second_probability)),
+                    np.sum(first_probability * second_probability),
+                ]
+            )
+            expected = np.maximum(expected, 0.5)
+
+            chi2 = np.sum((observed - expected) ** 2 / expected)
+            g2 = 2.0 * np.sum(observed * np.log(observed / expected + PROB_EPSILON))
+            chi2_matrix[first, second] = chi2_matrix[second, first] = chi2
+            g2_matrix[first, second] = g2_matrix[second, first] = g2
+
+    return chi2_matrix, g2_matrix
 
 
 class TestLDResult:
@@ -111,6 +180,85 @@ class TestComputeLDStatistics:
         for i, j, q3_val in result.q3_flagged:
             assert abs(q3_val) > 0.05
             assert i < j
+
+
+class TestVectorizedLDCalculations:
+    """Regression tests for the shared pairwise matrix calculations."""
+
+    def test_q3_matches_pairwise_reference_with_missing_responses(self):
+        rng = np.random.default_rng(90210)
+        responses = rng.integers(0, 2, size=(40, 7))
+        responses[rng.random(responses.shape) < 0.2] = -1
+        residuals = rng.normal(size=responses.shape)
+        residuals[responses < 0] = np.nan
+
+        expected = np.zeros((responses.shape[1], responses.shape[1]))
+        for first in range(responses.shape[1]):
+            for second in range(first + 1, responses.shape[1]):
+                valid = (responses[:, first] >= 0) & (responses[:, second] >= 0)
+                valid &= ~np.isnan(residuals[:, first])
+                valid &= ~np.isnan(residuals[:, second])
+                if valid.sum() > 2:
+                    correlation = np.corrcoef(
+                        residuals[valid, first], residuals[valid, second]
+                    )[0, 1]
+                    expected[first, second] = expected[second, first] = correlation
+
+        actual = _compute_q3(residuals, responses)
+
+        assert_allclose(actual, expected, rtol=1e-13, atol=1e-14, equal_nan=True)
+
+    def test_chi2_and_g2_match_pairwise_reference(self):
+        rng = np.random.default_rng(314159)
+        n_persons, n_items = 50, 6
+        theta = rng.normal(size=(n_persons, 1))
+        model = _CountingPolytomousModel(n_items)
+        probabilities = np.column_stack(
+            [model.positive_probability(theta, item) for item in range(n_items)]
+        )
+        responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+        responses[rng.random(responses.shape) < 0.15] = -1
+
+        expected_chi2, expected_g2 = _reference_ld_chi2_g2(model, responses, theta)
+        actual_chi2, actual_g2 = _compute_ld_chi2_g2(
+            model, responses, theta, n_quadpts=21
+        )
+
+        assert model.probability_calls == n_items
+        assert_allclose(
+            actual_chi2, expected_chi2, rtol=1e-12, atol=1e-12, equal_nan=True
+        )
+        assert_allclose(actual_g2, expected_g2, rtol=1e-12, atol=1e-12, equal_nan=True)
+
+    def test_full_analysis_reuses_residual_correlations(self):
+        rng = np.random.default_rng(271828)
+        n_persons, n_items = 40, 5
+        theta = rng.normal(size=(n_persons, 1))
+        model = _CountingPolytomousModel(n_items)
+        probabilities = np.column_stack(
+            [model.positive_probability(theta, item) for item in range(n_items)]
+        )
+        responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+        responses[rng.random(responses.shape) < 0.1] = -1
+
+        result = compute_ld_statistics(model, responses, theta=theta)
+
+        assert model.probability_calls == 2 * n_items
+        assert_allclose(
+            result.adj_residual_corr,
+            result.q3_matrix + 1.0 / (n_items - 1),
+            equal_nan=True,
+        )
+
+    def test_single_item_adjustment_remains_finite(self):
+        model = _CountingPolytomousModel(1)
+        theta = np.linspace(-2.0, 2.0, 12).reshape(-1, 1)
+        responses = np.array([[0], [1]] * 6)
+
+        result = compute_ld_statistics(model, responses, theta=theta)
+
+        assert_allclose(result.q3_matrix, np.zeros((1, 1)))
+        assert_allclose(result.adj_residual_corr, np.zeros((1, 1)))
 
 
 class TestComputeQ3:
