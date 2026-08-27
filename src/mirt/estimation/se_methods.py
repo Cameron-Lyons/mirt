@@ -132,12 +132,14 @@ def _se_numerical_central(
     from concurrent.futures import ThreadPoolExecutor
 
     se_dict = {}
+    free_masks = model.free_parameter_masks
 
     if n_jobs == -1:
         n_jobs = os.cpu_count() or 1
 
     for param_name, values in model.parameters.items():
-        if model.model_name == "1PL" and param_name == "discrimination":
+        free_mask = free_masks[param_name]
+        if not np.any(free_mask):
             se_dict[param_name] = np.zeros_like(values)
             continue
 
@@ -180,6 +182,7 @@ def _se_numerical_central(
                 else:
                     se[item_idx] = item_se
 
+        se[~free_mask] = 0.0
         se_dict[param_name] = se
 
     return se_dict
@@ -328,8 +331,10 @@ def _se_louis(
     n_persons = responses.shape[0]
 
     se_dict = {}
+    free_masks = model.free_parameter_masks
     for param_name, values in model.parameters.items():
-        if model.model_name == "1PL" and param_name == "discrimination":
+        free_mask = free_masks[param_name]
+        if not np.any(free_mask):
             se_dict[param_name] = np.zeros_like(values)
             continue
 
@@ -384,6 +389,7 @@ def _se_louis(
             else:
                 se[item_idx] = se_complete[param_name][item_idx] * np.sqrt(adjustment)
 
+        se[~free_mask] = 0.0
         se_dict[param_name] = se
 
     return se_dict
@@ -481,9 +487,11 @@ def _se_fisher(
     n_persons = responses.shape[0]
 
     se_dict = {}
+    free_masks = model.free_parameter_masks
 
     for param_name, values in model.parameters.items():
-        if model.model_name == "1PL" and param_name == "discrimination":
+        free_mask = free_masks[param_name]
+        if not np.any(free_mask):
             se_dict[param_name] = np.zeros_like(values)
             continue
 
@@ -503,6 +511,7 @@ def _se_fisher(
                     1.0 / np.sqrt(expected_info) if expected_info > 0 else np.nan,
                 )
 
+        se[~free_mask] = 0.0
         se_dict[param_name] = se
 
     return se_dict

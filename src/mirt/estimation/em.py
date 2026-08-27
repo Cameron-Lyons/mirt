@@ -637,9 +637,11 @@ class EMEstimator(BaseEstimator):
     ) -> dict[str, NDArray[np.float64]]:
         standard_errors: dict[str, NDArray[np.float64]] = {}
         params = model.parameters
+        free_masks = model.free_parameter_masks
 
         for name, values in params.items():
-            if name == "discrimination" and model.model_name == "1PL":
+            free_mask = free_masks[name]
+            if not np.any(free_mask):
                 standard_errors[name] = np.zeros_like(values)
                 continue
 
@@ -654,6 +656,7 @@ class EMEstimator(BaseEstimator):
                 else:
                     se[item_idx] = item_se
 
+            se[~free_mask] = 0.0
             standard_errors[name] = se
 
         return standard_errors

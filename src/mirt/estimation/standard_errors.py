@@ -19,6 +19,7 @@ References:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -29,6 +30,13 @@ from mirt.constants import PROB_EPSILON
 if TYPE_CHECKING:
     from mirt.estimation.quadrature import GaussHermiteQuadrature
     from mirt.models.base import BaseItemModel
+
+
+@dataclass(frozen=True)
+class _ParameterLayout:
+    shape: tuple[int, ...]
+    free_indices: NDArray[np.int_]
+    template: NDArray[np.float64]
 
 
 def compute_observed_information(
@@ -340,44 +348,63 @@ def compute_sem_se(
 
 def _flatten_parameters(
     model: BaseItemModel,
-) -> tuple[NDArray[np.float64], dict[str, tuple]]:
-    """Flatten model parameters into a single vector."""
+) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
+    """Flatten statistically free model parameters into a single vector."""
     params_list = []
-    shapes = {}
+    layouts = {}
+    free_masks = model.free_parameter_masks
 
     for name, values in model.parameters.items():
-        shapes[name] = values.shape
-        params_list.extend(values.ravel().tolist())
+        canonical = model._canonical_parameter_values(name, values)
+        free_mask = np.asarray(free_masks[name], dtype=np.bool_)
+        if free_mask.shape != values.shape:
+            raise RuntimeError(
+                f"free-parameter mask for {name} has shape {free_mask.shape}, "
+                f"expected {values.shape}"
+            )
+        free_indices = np.flatnonzero(free_mask.ravel())
+        layouts[name] = _ParameterLayout(
+            shape=values.shape,
+            free_indices=free_indices,
+            template=canonical,
+        )
+        params_list.append(canonical.ravel()[free_indices])
 
-    return np.array(params_list), shapes
+    flattened = (
+        np.concatenate(params_list) if params_list else np.empty(0, dtype=np.float64)
+    )
+    return flattened, layouts
 
 
 def _set_flat_parameters(
     model: BaseItemModel,
     params_flat: NDArray[np.float64],
-    shapes: dict[str, tuple],
+    layouts: dict[str, _ParameterLayout],
 ) -> None:
     """Set model parameters from flat vector."""
     idx = 0
-    for name, shape in shapes.items():
-        size = np.prod(shape)
-        values = params_flat[idx : idx + size].reshape(shape)
-        model._parameters[name] = values
+    for name, layout in layouts.items():
+        size = layout.free_indices.size
+        values = layout.template.copy().ravel()
+        values[layout.free_indices] = params_flat[idx : idx + size]
+        model._parameters[name] = values.reshape(layout.shape)
         idx += size
 
 
 def _unflatten_se(
     se_flat: NDArray[np.float64],
-    shapes: dict[str, tuple],
+    layouts: dict[str, _ParameterLayout],
     model: BaseItemModel,
 ) -> dict[str, NDArray[np.float64]]:
     """Convert flat SE vector to parameter dictionary."""
     se_dict = {}
     idx = 0
 
-    for name, shape in shapes.items():
-        size = np.prod(shape)
-        se_dict[name] = se_flat[idx : idx + size].reshape(shape)
+    for name, layout in layouts.items():
+        size = layout.free_indices.size
+        values = np.zeros(layout.shape, dtype=np.float64)
+        values.ravel()[layout.free_indices] = se_flat[idx : idx + size]
+        se_dict[name] = values
         idx += size
 
     return se_dict
@@ -430,7 +457,7 @@ def _compute_person_scores(
     posterior_weights: NDArray[np.float64],
     quadrature: GaussHermiteQuadrature,
     params_flat: NDArray[np.float64],
-    param_shapes: dict[str, tuple],
+    param_shapes: dict[str, _ParameterLayout],
     h: float = 1e-5,
 ) -> NDArray[np.float64]:
     """Compute score contribution for each person."""
@@ -575,7 +602,7 @@ def _compute_missing_information_oakes(
     posterior_weights: NDArray[np.float64],
     quadrature: GaussHermiteQuadrature,
     params_flat: NDArray[np.float64],
-    param_shapes: dict[str, tuple],
+    param_shapes: dict[str, _ParameterLayout],
     h: float = 1e-5,
 ) -> NDArray[np.float64]:
     """Compute missing information using Oakes formula."""
@@ -601,7 +628,7 @@ def _one_m_step_iteration(
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
     quadrature: GaussHermiteQuadrature,
-    param_shapes: dict[str, tuple],
+    param_shapes: dict[str, _ParameterLayout],
 ) -> NDArray[np.float64]:
     """Perform one M-step iteration and return updated parameters."""
     from mirt.estimation.em import EMEstimator
