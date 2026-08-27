@@ -59,30 +59,24 @@ def rust_required(name: str) -> NoReturn:
 
 
 def _ensure_f64(arr: NDArray[np.floating] | None) -> NDArray[np.float64] | None:
-    """Convert array to float64 using no-copy if already correct dtype."""
+    """Return a contiguous float64 array, avoiding copies when possible."""
     if arr is None:
         return None
-    if arr.dtype == np.float64:
-        return arr
-    return arr.astype(np.float64)
+    return np.ascontiguousarray(arr, dtype=np.float64)
 
 
 def _ensure_i32(arr: NDArray[np.integer] | None) -> NDArray[np.int32] | None:
-    """Convert array to int32 using no-copy if already correct dtype."""
+    """Return a contiguous int32 array, avoiding copies when possible."""
     if arr is None:
         return None
-    if arr.dtype == np.int32:
-        return arr
-    return arr.astype(np.int32)
+    return np.ascontiguousarray(arr, dtype=np.int32)
 
 
 def _ensure_i64(arr: NDArray[np.integer] | None) -> NDArray[np.int64] | None:
-    """Convert array to int64 using no-copy if already correct dtype."""
+    """Return a contiguous int64 array, avoiding copies when possible."""
     if arr is None:
         return None
-    if arr.dtype == np.int64:
-        return arr
-    return arr.astype(np.int64)
+    return np.ascontiguousarray(arr, dtype=np.int64)
 
 
 _MAX_VECTOR_CHUNK_ENTRIES = 1_000_000

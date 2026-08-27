@@ -13,6 +13,8 @@ use rayon::prelude::*;
 
 use crate::utils::{EPSILON, sigmoid};
 
+const LOG_FLOOR: f64 = 1e-300;
+
 /// BKT forward algorithm for a single person.
 ///
 /// # Arguments
@@ -155,7 +157,7 @@ pub fn bkt_forward_backward_batch<'py>(
                 }
             }
 
-            let log_likelihood: f64 = scaling.iter().map(|s| (s + EPSILON).ln()).sum();
+            let log_likelihood: f64 = scaling.iter().map(|s| s.max(LOG_FLOOR).ln()).sum();
 
             (gamma, log_likelihood)
         })
@@ -292,13 +294,14 @@ fn viterbi_single(
                 let mut best_value = f64::NEG_INFINITY;
                 let mut best_previous = 0;
                 for previous_state in 0..2 {
-                    let transition = (transition_prob(
+                    let transition = transition_prob(
                         previous_state,
                         state,
                         p_learn[skill_idx],
                         p_forget[skill_idx],
-                    ) + EPSILON)
-                        .ln();
+                    )
+                    .max(LOG_FLOOR)
+                    .ln();
                     let value = delta[[previous, previous_state]] + transition;
                     if value > best_value {
                         best_value = value;
@@ -310,13 +313,14 @@ fn viterbi_single(
             }
         } else {
             let p_0 = p_init[skill_idx];
-            delta[[t, 0]] = (1.0 - p_0 + EPSILON).ln();
-            delta[[t, 1]] = (p_0 + EPSILON).ln();
+            delta[[t, 0]] = (1.0 - p_0).max(LOG_FLOOR).ln();
+            delta[[t, 1]] = p_0.max(LOG_FLOOR).ln();
         }
 
         for state in 0..2 {
             delta[[t, state]] +=
-                (compute_emission_slice(responses[t], state, skill_idx, p_slip, p_guess) + EPSILON)
+                compute_emission_slice(responses[t], state, skill_idx, p_slip, p_guess)
+                    .max(LOG_FLOOR)
                     .ln();
         }
         previous_for_trial[t] = previous_trial[skill_idx];
