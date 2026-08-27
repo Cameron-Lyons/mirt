@@ -19,6 +19,40 @@ from mirt.backends.rust._helpers import (
 FALLBACK_MODE = "mixed"
 
 
+def _validate_positive_integer(value: int, message: str) -> int:
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < 1
+    ):
+        raise ValueError(message)
+    return int(value)
+
+
+def _validate_positive_float(value: float, name: str) -> float:
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError(f"{name} must be positive")
+
+    normalized = float(value)
+    if not np.isfinite(normalized) or normalized <= 0:
+        raise ValueError(f"{name} must be positive")
+    return normalized
+
+
+def _validate_em_controls(
+    n_quadpts: int,
+    max_iter: int,
+    tol: float,
+) -> tuple[int, int, float]:
+    return (
+        _validate_positive_integer(n_quadpts, "n_quadpts must be positive"),
+        _validate_positive_integer(max_iter, "max_iter must be at least 1"),
+        _validate_positive_float(tol, "tol"),
+    )
+
+
 def em_fit_2pl(
     responses: NDArray[np.int_],
     n_quadpts: int = 21,
@@ -32,6 +66,8 @@ def em_fit_2pl(
     tuple
         (discrimination, difficulty, log_likelihood, n_iterations, converged)
     """
+    n_quadpts, max_iter, tol = _validate_em_controls(n_quadpts, max_iter, tol)
+
     if rust_enabled():
         return mirt_rs.em_fit_2pl(
             _ensure_i32(responses),
@@ -118,6 +154,11 @@ def bootstrap_fit_2pl(
     tuple
         (disc_samples, diff_samples) - arrays of shape (n_bootstrap, n_items)
     """
+    n_bootstrap = _validate_positive_integer(
+        n_bootstrap, "n_bootstrap must be at least 1"
+    )
+    n_quadpts, max_iter, tol = _validate_em_controls(n_quadpts, max_iter, tol)
+
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
