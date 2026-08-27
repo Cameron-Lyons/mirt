@@ -10,6 +10,9 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.backends.rust.equating import (
+    observed_score_distribution_2pl as _rust_observed_score_distribution_2pl,
+)
 from mirt.equating.linking import LinkingResult
 
 if TYPE_CHECKING:
@@ -17,6 +20,7 @@ if TYPE_CHECKING:
 
 
 _PROBABILITY_TOLERANCE = 1e-10
+_SMOOTHING_METHODS = ("none", "loglinear", "kernel")
 
 
 @dataclass
@@ -129,6 +133,7 @@ def observed_score_equating(
     n_theta: int = 61,
     items_old: list[int] | None = None,
     items_new: list[int] | None = None,
+    smoothing: Literal["none", "loglinear", "kernel"] = "none",
 ) -> ScoreEquatingResult:
     """Perform IRT observed score equating.
 
@@ -151,6 +156,8 @@ def observed_score_equating(
         Subset of items for old form.
     items_new : list[int] | None
         Subset of items for new form.
+    smoothing : {"none", "loglinear", "kernel"}
+        Score-distribution smoothing applied before equipercentile inversion.
 
     Returns
     -------
@@ -161,6 +168,8 @@ def observed_score_equating(
     _validate_model(model_new, "model_new")
     _resolve_items(model_old, items_old, "items_old")
     _resolve_items(model_new, items_new, "items_new")
+    if smoothing not in _SMOOTHING_METHODS:
+        raise ValueError("smoothing must be one of 'none', 'loglinear', or 'kernel'")
 
     if theta_grid is None:
         n_theta = _validate_count(n_theta, "n_theta", minimum=1)
@@ -181,7 +190,9 @@ def observed_score_equating(
         model_new, theta_grid, theta_distribution, items_new
     )
 
-    new_scores = equipercentile_equating(score_dist_old, score_dist_new)
+    new_scores = equipercentile_equating(
+        score_dist_old, score_dist_new, smoothing=smoothing
+    )
 
     old_scores = np.arange(len(score_dist_old), dtype=np.float64)
 
@@ -225,6 +236,12 @@ def lord_wingersky_recursion(
     theta_grid = _validate_vector(theta_grid, "theta_grid")
     weights = _validate_weights(theta_weights, len(theta_grid), "theta_weights")
     item_indices = _resolve_items(model, items, "items")
+    native_distribution = _native_score_distribution(
+        model, theta_grid, weights, item_indices
+    )
+    if native_distribution is not None:
+        return native_distribution
+
     item_probabilities = _item_score_probabilities(model, theta_grid, item_indices)
 
     conditional = np.ones((len(theta_grid), 1), dtype=np.float64)
@@ -241,12 +258,50 @@ def lord_wingersky_recursion(
             )
         conditional = updated
 
-    marginal = weights @ conditional
+    return _normalize_score_distribution(weights @ conditional)
+
+
+def _normalize_score_distribution(
+    marginal: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Clip numerical noise and normalize a marginal score distribution."""
     marginal = np.clip(marginal, 0.0, None)
     total = float(np.sum(marginal))
     if not np.isfinite(total) or total <= 0.0:
         raise ValueError("score distribution has zero or non-finite probability mass")
     return np.asarray(marginal / total, dtype=np.float64)
+
+
+def _native_score_distribution(
+    model: "BaseItemModel",
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    item_indices: NDArray[np.intp],
+) -> NDArray[np.float64] | None:
+    """Use the compiled 1PL/2PL recursion when the model is compatible."""
+    if model.is_polytomous or model.model_name not in {"1PL", "2PL"}:
+        return None
+
+    parameters = model.parameters
+    discrimination = np.asarray(parameters.get("discrimination"))
+    difficulty = np.asarray(parameters.get("difficulty"))
+    if discrimination.ndim != 1 or difficulty.shape != discrimination.shape:
+        return None
+
+    conditional = _rust_observed_score_distribution_2pl(
+        theta_grid,
+        discrimination[item_indices],
+        difficulty[item_indices],
+    )
+    if conditional is None:
+        return None
+    expected_shape = (len(theta_grid), len(item_indices) + 1)
+    if conditional.shape != expected_shape:
+        raise RuntimeError(
+            f"native score distribution has shape {conditional.shape}, "
+            f"expected {expected_shape}"
+        )
+    return _normalize_score_distribution(weights @ conditional)
 
 
 def equipercentile_equating(
