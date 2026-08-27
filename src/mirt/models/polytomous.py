@@ -46,6 +46,26 @@ class GradedResponseModel(PolytomousItemModel):
     def thresholds(self) -> NDArray[np.float64]:
         return self._parameters["thresholds"]
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        threshold_mask = np.zeros_like(self.thresholds, dtype=np.bool_)
+        for item_idx, n_categories in enumerate(self._n_categories):
+            threshold_mask[item_idx, : n_categories - 1] = True
+        masks["thresholds"] = threshold_mask
+        return masks
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "thresholds":
+            for item_idx, n_categories in enumerate(self._n_categories):
+                canonical[item_idx, n_categories - 1 :] = 0.0
+        return canonical
+
     def cumulative_probability(
         self,
         theta: NDArray[np.float64],
@@ -186,6 +206,26 @@ class GeneralizedPartialCredit(PolytomousItemModel):
     def steps(self) -> NDArray[np.float64]:
         return self._parameters["steps"]
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        step_mask = np.zeros_like(self.steps, dtype=np.bool_)
+        for item_idx, n_categories in enumerate(self._n_categories):
+            step_mask[item_idx, : n_categories - 1] = True
+        masks["steps"] = step_mask
+        return masks
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "steps":
+            for item_idx, n_categories in enumerate(self._n_categories):
+                canonical[item_idx, n_categories - 1 :] = 0.0
+        return canonical
+
     def category_probability(
         self,
         theta: NDArray[np.float64],
@@ -297,6 +337,22 @@ class PartialCreditModel(GeneralizedPartialCredit):
                 steps[i, : n_cat - 1] = np.linspace(-1, 1, n_cat - 1)
 
         self._parameters["steps"] = steps
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
+        return masks
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "discrimination":
+            canonical.fill(1.0)
+        return canonical
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "PartialCreditModel":
         if "discrimination" in params:
@@ -700,6 +756,33 @@ class NominalResponseModel(PolytomousItemModel):
     @property
     def intercepts(self) -> NDArray[np.float64]:
         return self._parameters["intercepts"]
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        slope_mask = np.zeros_like(self.slopes, dtype=np.bool_)
+        intercept_mask = np.zeros_like(self.intercepts, dtype=np.bool_)
+        for item_idx, n_categories in enumerate(self._n_categories):
+            slope_mask[item_idx, 1:n_categories, ...] = True
+            intercept_mask[item_idx, 1:n_categories] = True
+        masks["slopes"] = slope_mask
+        masks["intercepts"] = intercept_mask
+        return masks
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name not in {"slopes", "intercepts"}:
+            return canonical
+
+        for item_idx, n_categories in enumerate(self._n_categories):
+            reference = canonical[item_idx, 0].copy()
+            canonical[item_idx, :n_categories] -= reference
+            canonical[item_idx, n_categories:] = 0.0
+        return canonical
 
     def category_probability(
         self,

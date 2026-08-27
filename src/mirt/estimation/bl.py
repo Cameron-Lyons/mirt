@@ -202,27 +202,44 @@ class BLEstimator(BaseEstimator):
         }
 
         idx = 0
+        free_masks = model.free_parameter_masks
         for name, values in model.parameters.items():
-            if model.model_name == "1PL" and name == "discrimination":
-                continue
-
-            flat = values.ravel()
-            n_params = len(flat)
+            canonical = model._canonical_parameter_values(name, values)
+            free_mask = np.asarray(free_masks[name], dtype=np.bool_)
+            if free_mask.shape != values.shape:
+                raise RuntimeError(
+                    f"free-parameter mask for {name} has shape {free_mask.shape}, "
+                    f"expected {values.shape}"
+                )
+            free_indices = np.flatnonzero(free_mask.ravel())
+            flat = canonical.ravel()[free_indices]
+            n_params = free_indices.size
 
             structure[name] = {
                 "start_idx": idx,
                 "end_idx": idx + n_params,
                 "shape": values.shape,
+                "free_indices": free_indices,
+                "template": canonical,
             }
 
             params_list.append(flat)
 
-            bound = bounds_map.get(name, (-10.0, 10.0))
+            bound = (
+                (-5.0, 5.0)
+                if name == "slopes" and model.model_name == "NRM"
+                else bounds_map.get(name, (-10.0, 10.0))
+            )
             bounds_list.extend([bound] * n_params)
 
             idx += n_params
 
-        return np.concatenate(params_list), bounds_list, structure
+        flattened = (
+            np.concatenate(params_list)
+            if params_list
+            else np.empty(0, dtype=np.float64)
+        )
+        return flattened, bounds_list, structure
 
     def _unflatten_parameters(
         self,
@@ -233,7 +250,9 @@ class BLEstimator(BaseEstimator):
         """Set model parameters from flat optimization vector."""
         for name, info in structure.items():
             flat_params = params[info["start_idx"] : info["end_idx"]]
-            model._parameters[name] = flat_params.reshape(info["shape"])
+            values = info["template"].copy().ravel()
+            values[info["free_indices"]] = flat_params
+            model._parameters[name] = values.reshape(info["shape"])
 
     def _compute_standard_errors(
         self,
@@ -275,9 +294,8 @@ class BLEstimator(BaseEstimator):
         se_dict = {}
         for name, info in structure.items():
             se_values = se_flat[info["start_idx"] : info["end_idx"]]
-            se_dict[name] = se_values.reshape(info["shape"])
-
-        if model.model_name == "1PL":
-            se_dict["discrimination"] = np.zeros(model.n_items)
+            full_se = np.zeros(info["shape"], dtype=np.float64)
+            full_se.ravel()[info["free_indices"]] = se_values
+            se_dict[name] = full_se
 
         return se_dict

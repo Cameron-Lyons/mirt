@@ -20,6 +20,18 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
+def _parameter_count(result: FitResult) -> int:
+    """Read fitted metadata, with compatibility for result-like objects."""
+    count = getattr(result, "n_parameters", None)
+    if count is not None:
+        return int(count)
+
+    model_count = getattr(result.model, "n_parameters", None)
+    if model_count is not None:
+        return int(model_count)
+    return sum(np.asarray(values).size for values in result.model.parameters.values())
+
+
 def anova_irt(
     *results: FitResult,
     method: str = "LRT",
@@ -62,7 +74,7 @@ def anova_irt(
     for i, result in enumerate(results):
         model_names.append(f"Model {i + 1}: {result.model.model_name}")
         log_likelihoods.append(result.log_likelihood)
-        n_params = sum(v.size for v in result.model.parameters.values())
+        n_params = _parameter_count(result)
         n_params_list.append(n_params)
         aics.append(result.aic)
         bics.append(result.bic)
@@ -136,7 +148,7 @@ def compare_models(
     for i, result in enumerate(results):
         model_names.append(f"Model {i + 1}: {result.model.model_name}")
         log_likelihoods.append(result.log_likelihood)
-        n_params = sum(v.size for v in result.model.parameters.values())
+        n_params = _parameter_count(result)
         n_params_list.append(n_params)
         n_obs_list.append(result.n_observations)
 
@@ -272,7 +284,7 @@ def information_criteria(
         Dictionary with AIC, BIC, SABIC, AICc, CAIC
     """
     ll = result.log_likelihood
-    k = sum(v.size for v in result.model.parameters.values())
+    k = _parameter_count(result)
     n = n_obs if n_obs is not None else result.n_observations
 
     if n <= 0:

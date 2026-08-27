@@ -120,6 +120,22 @@ class OneParameterLogistic(TwoParameterLogistic):
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
+        return masks
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "discrimination":
+            canonical.fill(1.0)
+        return canonical
+
     def set_parameters(self, **params: NDArray[np.float64]) -> "OneParameterLogistic":
         if "discrimination" in params:
             raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")

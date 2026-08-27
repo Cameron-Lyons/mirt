@@ -387,7 +387,7 @@ class MHRMEstimator(BaseEstimator):
 
     def _count_parameters(self, model: BaseItemModel) -> int:
         """Count number of parameters."""
-        return sum(v.size for v in model.parameters.values())
+        return model.n_parameters
 
 
 class GibbsSampler(BaseEstimator):

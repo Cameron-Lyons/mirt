@@ -106,50 +106,38 @@ class BaseEstimator(ABC):
         """Get current item parameters and their bounds for optimization."""
         params_list: list[float] = []
         bounds: list[tuple[float, float]] = []
-
-        model_name = model.model_name
         params = model.parameters
+        free_masks = model.free_parameter_masks
+        bounds_map = {
+            "discrimination": (0.1, 5.0),
+            "difficulty": (-6.0, 6.0),
+            "intercepts": (-6.0, 6.0),
+            "thresholds": (-6.0, 6.0),
+            "steps": (-6.0, 6.0),
+            "guessing": (0.0, 0.5),
+            "upper": (0.5, 1.0),
+            "asymmetry": (0.1, 5.0),
+        }
 
-        if model_name in ("1PL", "2PL", "3PL", "4PL"):
-            if model_name != "1PL":
-                a = params["discrimination"]
-                if a.ndim == 1:
-                    params_list.append(float(a[item_idx]))
-                    bounds.append((0.1, 5.0))
-                else:
-                    params_list.extend(a[item_idx].tolist())
-                    bounds.extend([(0.1, 5.0)] * model.n_factors)
+        for name, values in params.items():
+            if values.ndim == 0 or values.shape[0] != model.n_items:
+                continue
 
-            b = params["difficulty"][item_idx]
-            params_list.append(float(b))
-            bounds.append((-6.0, 6.0))
+            canonical = model._canonical_parameter_values(name, values)
+            item_values = np.asarray(canonical[item_idx]).reshape(-1)
+            item_mask = np.asarray(free_masks[name][item_idx], dtype=np.bool_).reshape(
+                -1
+            )
+            params_list.extend(item_values[item_mask].tolist())
+            if name == "slopes" and model.model_name == "NRM":
+                bound = (-5.0, 5.0)
+            elif "discrimination" in name or "slope" in name:
+                bound = (0.1, 5.0)
+            else:
+                bound = bounds_map.get(name, (-6.0, 6.0))
+            bounds.extend([bound] * int(np.count_nonzero(item_mask)))
 
-            if model_name in ("3PL", "4PL"):
-                c = params["guessing"][item_idx]
-                params_list.append(float(c))
-                bounds.append((0.0, 0.5))
-
-            if model_name == "4PL":
-                d = params["upper"][item_idx]
-                params_list.append(float(d))
-                bounds.append((0.5, 1.0))
-
-        else:
-            for name, values in params.items():
-                if values.ndim == 1 and len(values) == model.n_items:
-                    params_list.append(float(values[item_idx]))
-                    if "discrimination" in name or "slope" in name:
-                        bounds.append((0.1, 5.0))
-                    else:
-                        bounds.append((-6.0, 6.0))
-                elif values.ndim == 2 and values.shape[0] == model.n_items:
-                    params_list.extend(values[item_idx].tolist())
-                    if "discrimination" in name or "slope" in name:
-                        bounds.extend([(0.1, 5.0)] * values.shape[1])
-                    else:
-                        bounds.extend([(-6.0, 6.0)] * values.shape[1])
-
-        return np.array(params_list), bounds
+        return np.asarray(params_list, dtype=np.float64), bounds
 
     def _set_item_params(
         self,
@@ -158,38 +146,29 @@ class BaseEstimator(ABC):
         params: NDArray[np.float64],
     ) -> None:
         """Set item parameters from flat array."""
-        model_name = model.model_name
         idx = 0
+        free_masks = model.free_parameter_masks
 
-        if model_name in ("1PL", "2PL", "3PL", "4PL"):
-            if model_name != "1PL":
-                a = model.parameters["discrimination"]
-                if a.ndim == 1:
-                    model.set_item_parameter(item_idx, "discrimination", params[idx])
-                    idx += 1
-                else:
-                    n_factors = a.shape[1]
-                    model.set_item_parameter(
-                        item_idx, "discrimination", params[idx : idx + n_factors]
-                    )
-                    idx += n_factors
+        for name, values in model.parameters.items():
+            if values.ndim == 0 or values.shape[0] != model.n_items:
+                continue
 
-            model.set_item_parameter(item_idx, "difficulty", params[idx])
-            idx += 1
+            canonical = model._canonical_parameter_values(name, values)
+            item_values = np.asarray(canonical[item_idx]).copy()
+            item_flat = item_values.reshape(-1)
+            item_mask = np.asarray(free_masks[name][item_idx], dtype=np.bool_).reshape(
+                -1
+            )
+            n_free = int(np.count_nonzero(item_mask))
+            item_flat[item_mask] = params[idx : idx + n_free]
 
-            if model_name in ("3PL", "4PL"):
-                model.set_item_parameter(item_idx, "guessing", params[idx])
-                idx += 1
+            value: float | NDArray[np.float64]
+            if item_values.ndim == 0:
+                value = float(item_flat[0])
+            else:
+                value = item_flat.reshape(item_values.shape)
+            model.set_item_parameter(item_idx, name, value)
+            idx += n_free
 
-            if model_name == "4PL":
-                model.set_item_parameter(item_idx, "upper", params[idx])
-
-        else:
-            for name, values in model.parameters.items():
-                if values.ndim == 1 and len(values) == model.n_items:
-                    model.set_item_parameter(item_idx, name, params[idx])
-                    idx += 1
-                elif values.ndim == 2 and values.shape[0] == model.n_items:
-                    n_vals = values.shape[1]
-                    model.set_item_parameter(item_idx, name, params[idx : idx + n_vals])
-                    idx += n_vals
+        if idx != params.size:
+            raise ValueError(f"Expected {idx} item parameters, got {params.size}")

@@ -449,7 +449,7 @@ def estfun(
     NDArray[np.float64]
         Estimating functions (scores) for each person-parameter combination.
         Shape: (n_persons, n_parameters). Columns follow ``model.parameters``
-        insertion order, with each array flattened in row-major order.
+        insertion order and include each array's free entries in row-major order.
 
     Examples
     --------
@@ -577,27 +577,34 @@ def _logistic_estfun(
     curve_derivative = (upper - guessing)[None, :] * logistic * (1 - logistic)
 
     chunks: list[NDArray[np.float64]] = []
+    free_masks = model.free_parameter_masks
     for name in parameters:
         if name == "discrimination":
             derivative = curve_derivative[:, :, None] * (
                 theta[:, None, :] - difficulty[None, :, None]
             )
-            chunks.append(
-                (likelihood_scale[:, :, None] * derivative).reshape(
-                    responses.shape[0], -1
-                )
+            chunk = (likelihood_scale[:, :, None] * derivative).reshape(
+                responses.shape[0], -1
             )
         elif name == "difficulty":
             derivative = -curve_derivative * discrimination_2d.sum(axis=1)[None, :]
-            chunks.append(likelihood_scale * derivative)
+            chunk = likelihood_scale * derivative
         elif name == "guessing":
-            chunks.append(likelihood_scale * (1 - logistic))
+            chunk = likelihood_scale * (1 - logistic)
         elif name == "upper":
-            chunks.append(likelihood_scale * logistic)
+            chunk = likelihood_scale * logistic
         else:
             return _numerical_estfun(model, responses, theta, parameters)
 
-    return np.concatenate(chunks, axis=1)
+        free_mask = free_masks[name].ravel()
+        if np.any(free_mask):
+            chunks.append(chunk[:, free_mask])
+
+    return (
+        np.concatenate(chunks, axis=1)
+        if chunks
+        else np.empty((responses.shape[0], 0), dtype=np.float64)
+    )
 
 
 def _numerical_estfun(
@@ -608,15 +615,20 @@ def _numerical_estfun(
 ) -> NDArray[np.float64]:
     """Compute conditional scores for arbitrary models with central differences."""
     n_persons = responses.shape[0]
-    n_parameters = sum(values.size for values in parameters.values())
+    n_parameters = model.n_parameters
     scores = np.empty((n_persons, n_parameters), dtype=np.float64)
     work_model = model.copy()
+    for name, values in parameters.items():
+        work_model._parameters[name] = model._canonical_parameter_values(name, values)
+
+    free_masks = model.free_parameter_masks
     relative_step = np.cbrt(np.finfo(np.float64).eps)
 
     column = 0
     for name, values in parameters.items():
         work_values = work_model._parameters[name]
-        for index in np.ndindex(values.shape):
+        for flat_index in np.flatnonzero(free_masks[name].ravel()):
+            index = np.unravel_index(flat_index, values.shape)
             original = float(work_values[index])
             step = relative_step * max(1.0, abs(original))
 

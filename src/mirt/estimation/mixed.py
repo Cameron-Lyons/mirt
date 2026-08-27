@@ -380,7 +380,9 @@ class MixedEffectsIRT:
                 )
             )
 
-        n_params = sum(v.size for v in base_result.model.parameters.values())
+        n_params = int(
+            getattr(base_result, "n_parameters", base_result.model.n_parameters)
+        )
         if person_effects is not None:
             n_params += len(person_effects) + 2
         if item_effects is not None:

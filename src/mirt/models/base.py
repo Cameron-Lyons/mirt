@@ -94,7 +94,25 @@ class BaseItemModel(ABC):
 
     @property
     def n_parameters(self) -> int:
-        return sum(p.size for p in self._parameters.values())
+        return sum(
+            int(np.count_nonzero(mask)) for mask in self.free_parameter_masks.values()
+        )
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Boolean masks identifying statistically free stored parameters."""
+        return {
+            name: np.ones(values.shape, dtype=np.bool_)
+            for name, values in self._parameters.items()
+        }
+
+    def _canonical_parameter_values(
+        self,
+        name: str,
+        values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return an identified full-storage representation for estimation."""
+        return np.asarray(values, dtype=np.float64).copy()
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         for name, value in params.items():
