@@ -44,8 +44,18 @@ one call:
    mastery = model.predict_mastery_batch(response_matrix, skills)
    print(mastery.shape)  # (2, 3)
 
+   posterior, log_likelihoods = model.forward_backward_batch(
+       response_matrix,
+       skills,
+   )
+   print(posterior.shape)  # (2, 6, 2)
+
 ``skill_assignments`` may also be a matrix matching the response matrix when
-learners receive different trial layouts.
+learners receive different trial layouts. Shared layouts use the compiled
+parallel implementation when it is available. Set ``use_rust=False`` on
+``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy implementation for a
+specific workflow; the global ``mirt.set_backend("numpy")`` preference is also
+honored.
 
 Simulation
 ----------

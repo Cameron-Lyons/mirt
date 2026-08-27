@@ -9,6 +9,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
+    _ensure_f64,
+    _ensure_i32,
     mirt_rs,
     rust_enabled,
 )
@@ -51,13 +53,13 @@ def bkt_forward(
     """
     if rust_enabled():
         return mirt_rs.bkt_forward(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            p_init.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(p_init),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
         )
 
     return None
@@ -98,13 +100,13 @@ def bkt_backward(
     """
     if rust_enabled():
         return mirt_rs.bkt_backward(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            scaling.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(scaling),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
         )
 
     return None
@@ -145,13 +147,13 @@ def bkt_forward_backward_batch(
     """
     if rust_enabled():
         return mirt_rs.bkt_forward_backward_batch(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            p_init.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(p_init),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
         )
 
     return None
@@ -192,13 +194,13 @@ def bkt_viterbi(
     """
     if rust_enabled():
         return mirt_rs.bkt_viterbi(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            p_init.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(p_init),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
         )
 
     return None
@@ -242,13 +244,13 @@ def bkt_ffbs(
     """
     if rust_enabled():
         return mirt_rs.bkt_ffbs(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            p_init.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(p_init),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
             int(seed),
         )
 
@@ -293,13 +295,13 @@ def bkt_ffbs_batch(
     """
     if rust_enabled():
         return mirt_rs.bkt_ffbs_batch(
-            responses.astype(np.int32),
-            skill_assignments.astype(np.int32),
-            p_init.astype(np.float64),
-            p_learn.astype(np.float64),
-            p_forget.astype(np.float64),
-            p_slip.astype(np.float64),
-            p_guess.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_i32(skill_assignments),
+            _ensure_f64(p_init),
+            _ensure_f64(p_learn),
+            _ensure_f64(p_forget),
+            _ensure_f64(p_slip),
+            _ensure_f64(p_guess),
             int(seed),
         )
 
@@ -332,10 +334,10 @@ def longitudinal_log_likelihood(
     """
     if rust_enabled():
         return mirt_rs.longitudinal_log_likelihood(
-            responses.astype(np.int32),
-            theta.astype(np.float64),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            _ensure_i32(responses),
+            _ensure_f64(theta),
+            _ensure_f64(discrimination),
+            _ensure_f64(difficulty),
         )
 
     return None
@@ -364,8 +366,8 @@ def compute_growth_trajectory(
     """
     if rust_enabled():
         return mirt_rs.compute_growth_trajectory(
-            growth_factors.astype(np.float64),
-            time_values.astype(np.float64),
+            _ensure_f64(growth_factors),
+            _ensure_f64(time_values),
             growth_model,
         )
 

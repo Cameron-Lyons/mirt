@@ -78,6 +78,7 @@ class BKTGibbsSampler:
         priors: BKTPriors | None = None,
         verbose: bool = False,
         seed: int | None = None,
+        use_rust: bool = True,
     ) -> None:
         """Initialize BKT Gibbs sampler.
 
@@ -95,6 +96,8 @@ class BKTGibbsSampler:
             Whether to print progress
         seed : int, optional
             Random seed
+        use_rust : bool
+            Use compiled BKT inference kernels when available
         """
         self.n_iter = n_iter
         self.burnin = burnin
@@ -102,6 +105,9 @@ class BKTGibbsSampler:
         self.priors = priors or BKTPriors()
         self.verbose = verbose
         self.seed = seed
+        if not isinstance(use_rust, (bool, np.bool_)):
+            raise TypeError("use_rust must be a boolean")
+        self.use_rust = bool(use_rust)
 
     def fit(
         self,
@@ -135,7 +141,11 @@ class BKTGibbsSampler:
         if n_skills is None:
             n_skills = int(np.max(skill_assignments) + 1)
 
-        model = BKTModel(n_skills=n_skills, allow_forgetting=allow_forgetting)
+        model = BKTModel(
+            n_skills=n_skills,
+            allow_forgetting=allow_forgetting,
+            use_rust=self.use_rust,
+        )
 
         learning_states = np.zeros((n_persons, n_trials), dtype=np.int32)
         for i in range(n_persons):
@@ -193,23 +203,14 @@ class BKTGibbsSampler:
 
         learning_curves = np.zeros((n_persons, n_skills))
         skill_mastery = np.zeros((n_persons, n_skills))
+        gamma, _ = model.forward_backward_batch(responses, skill_assignments)
 
-        for i in range(n_persons):
-            for j in range(n_skills):
-                skill_mask = skill_assignments == j
-                if np.any(skill_mask):
-                    gamma, _ = model.forward_backward(
-                        responses[i, skill_mask],
-                        skill_assignments[skill_mask],
-                    )
-                    skill_mastery[i, j] = gamma[-1, 1]
-
-                    n_skill_trials = np.sum(skill_mask)
-                    learning_curves[i, j] = (
-                        np.sum(gamma[:, 1]) / n_skill_trials
-                        if n_skill_trials > 0
-                        else 0
-                    )
+        for skill_idx in range(n_skills):
+            skill_mask = skill_assignments == skill_idx
+            if np.any(skill_mask):
+                learned = gamma[:, skill_mask, 1]
+                skill_mastery[:, skill_idx] = learned[:, -1]
+                learning_curves[:, skill_idx] = learned.mean(axis=1)
 
         ll_final = self._compute_log_likelihood(responses, skill_assignments, model)
         n_params = 4 * n_skills if not allow_forgetting else 5 * n_skills
@@ -404,14 +405,8 @@ class BKTGibbsSampler:
         model: BKTModel,
     ) -> float:
         """Compute total log-likelihood."""
-        n_persons = responses.shape[0]
-        ll = 0.0
-
-        for i in range(n_persons):
-            _, ll_i = model.forward_backward(responses[i], skill_assignments)
-            ll += ll_i
-
-        return ll
+        _, log_likelihoods = model.forward_backward_batch(responses, skill_assignments)
+        return float(log_likelihoods.sum())
 
 
 class LongitudinalGibbsSampler:

@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._backend_config import should_use_rust
 from mirt._core import sigmoid
+from mirt.backends.rust.dynamic import (
+    bkt_backward,
+    bkt_forward,
+    bkt_forward_backward_batch,
+    bkt_viterbi,
+)
 from mirt.constants import PROB_EPSILON
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass
@@ -32,6 +36,8 @@ class BKTModel:
         Names for each skill
     allow_forgetting : bool
         Whether to model forgetting (default False)
+    use_rust : bool
+        Use compiled inference kernels when available (default True)
     """
 
     n_skills: int
@@ -43,6 +49,7 @@ class BKTModel:
     p_forget: NDArray[np.float64] | None = None
     p_slip: NDArray[np.float64] | None = None
     p_guess: NDArray[np.float64] | None = None
+    use_rust: bool = True
 
     def __post_init__(self) -> None:
         if (
@@ -96,6 +103,9 @@ class BKTModel:
 
         if not self.allow_forgetting and np.any(self.p_forget != 0):
             raise ValueError("p_forget must be zero when allow_forgetting is False")
+        if not isinstance(self.use_rust, (bool, np.bool_)):
+            raise TypeError("use_rust must be a boolean")
+        self.use_rust = bool(self.use_rust)
 
     def _validate_sequence(
         self,
@@ -122,8 +132,58 @@ class BKTModel:
             raise ValueError(f"skill_assignments must be in [0, {self.n_skills})")
 
         return (
-            responses.astype(np.int_, copy=False),
-            skill_assignments.astype(np.int_, copy=False),
+            responses.astype(np.int32, copy=False),
+            skill_assignments.astype(np.int32, copy=False),
+        )
+
+    def _validate_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
+        """Validate and normalize multiple observed trial sequences."""
+        responses = np.asarray(responses)
+        skill_assignments = np.asarray(skill_assignments)
+
+        if responses.ndim != 2:
+            raise ValueError("responses must have shape (n_persons, n_trials)")
+        if responses.shape[1] == 0:
+            raise ValueError("responses must contain at least one trial")
+        if not np.issubdtype(responses.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if not np.all(np.isin(responses, (-1, 0, 1))):
+            raise ValueError("responses must contain only -1, 0, or 1")
+
+        if skill_assignments.ndim == 1:
+            if len(skill_assignments) != responses.shape[1]:
+                raise ValueError(
+                    "shared skill_assignments length must match the number of trials"
+                )
+        elif skill_assignments.shape != responses.shape:
+            raise ValueError(
+                "skill_assignments must be one-dimensional or match responses"
+            )
+        if not np.issubdtype(skill_assignments.dtype, np.integer):
+            raise ValueError("skill_assignments must contain integer values")
+        if np.any((skill_assignments < 0) | (skill_assignments >= self.n_skills)):
+            raise ValueError(f"skill_assignments must be in [0, {self.n_skills})")
+
+        return (
+            responses.astype(np.int32, copy=False),
+            skill_assignments.astype(np.int32, copy=False),
+        )
+
+    def _can_use_native_inference(self) -> bool:
+        """Return whether compiled kernels preserve this model's semantics."""
+        if not should_use_rust(self.use_rust):
+            return False
+        return bool(
+            np.all(
+                (self.p_slip > PROB_EPSILON)
+                & (self.p_slip < 1.0 - PROB_EPSILON)
+                & (self.p_guess > PROB_EPSILON)
+                & (self.p_guess < 1.0 - PROB_EPSILON)
+            )
         )
 
     def _emission_pair(
@@ -199,6 +259,41 @@ class BKTModel:
         responses, skill_assignments = self._validate_sequence(
             responses, skill_assignments
         )
+
+        if self._can_use_native_inference():
+            try:
+                result = bkt_forward(
+                    responses,
+                    skill_assignments,
+                    self.p_init,
+                    self.p_learn,
+                    self.p_forget,
+                    self.p_slip,
+                    self.p_guess,
+                )
+                if result is not None:
+                    alpha = np.asarray(result[0], dtype=np.float64)
+                    scaling = np.asarray(result[1], dtype=np.float64)
+                    if (
+                        alpha.shape == (len(responses), 2)
+                        and scaling.shape == (len(responses),)
+                        and np.all(np.isfinite(alpha))
+                        and np.all(alpha >= 0.0)
+                        and np.all(np.isfinite(scaling))
+                        and np.all(scaling >= 0.0)
+                    ):
+                        return alpha, scaling
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+
+        return self._forward_python(responses, skill_assignments)
+
+    def _forward_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Run the Python forward fallback for validated inputs."""
         n_trials = len(responses)
 
         alpha = np.zeros((n_trials, 2))
@@ -262,6 +357,38 @@ class BKTModel:
         if not np.all(np.isfinite(scaling)) or np.any(scaling < 0):
             raise ValueError("scaling values must be finite and non-negative")
 
+        if self._can_use_native_inference():
+            try:
+                result = bkt_backward(
+                    responses,
+                    skill_assignments,
+                    scaling,
+                    self.p_learn,
+                    self.p_forget,
+                    self.p_slip,
+                    self.p_guess,
+                )
+                if result is not None:
+                    beta = np.asarray(result, dtype=np.float64)
+                    if (
+                        beta.shape == (n_trials, 2)
+                        and np.all(np.isfinite(beta))
+                        and np.all(beta >= 0.0)
+                    ):
+                        return beta
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+
+        return self._backward_python(responses, skill_assignments, scaling)
+
+    def _backward_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        scaling: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Run the Python backward fallback for validated inputs."""
+        n_trials = len(responses)
         beta = np.zeros((n_trials, 2))
 
         for skill_idx, trial_indices in enumerate(
@@ -299,8 +426,26 @@ class BKTModel:
         tuple
             (gamma, log_likelihood) where gamma[t, s] = P(L_t = s | X_1:T)
         """
-        alpha, scaling = self.forward(responses, skill_assignments)
-        beta = self.backward(responses, skill_assignments, scaling)
+        responses, skill_assignments = self._validate_sequence(
+            responses, skill_assignments
+        )
+        native = self._native_forward_backward_batch(
+            responses[None, :], skill_assignments
+        )
+        if native is not None:
+            gamma, log_likelihoods = native
+            return gamma[0], float(log_likelihoods[0])
+
+        return self._forward_backward_python(responses, skill_assignments)
+
+    def _forward_backward_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], float]:
+        """Run the Python forward-backward fallback for validated inputs."""
+        alpha, scaling = self._forward_python(responses, skill_assignments)
+        beta = self._backward_python(responses, skill_assignments, scaling)
 
         gamma = alpha * beta
         gamma_sum = np.sum(gamma, axis=1, keepdims=True)
@@ -310,6 +455,95 @@ class BKTModel:
         log_likelihood = np.sum(np.log(scaling + 1e-300))
 
         return gamma, log_likelihood
+
+    def _native_forward_backward_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+        """Run and validate compiled batch smoothing for a shared skill layout."""
+        if not self._can_use_native_inference():
+            return None
+
+        try:
+            result = bkt_forward_backward_batch(
+                responses,
+                skill_assignments,
+                self.p_init,
+                self.p_learn,
+                self.p_forget,
+                self.p_slip,
+                self.p_guess,
+            )
+            if result is None:
+                return None
+            learned = np.asarray(result[0], dtype=np.float64)
+            log_likelihoods = np.asarray(result[1], dtype=np.float64)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+        if (
+            learned.shape != responses.shape
+            or log_likelihoods.shape != (responses.shape[0],)
+            or not np.all(np.isfinite(learned))
+            or np.any((learned < 0.0) | (learned > 1.0))
+            or not np.all(np.isfinite(log_likelihoods))
+        ):
+            return None
+
+        gamma = np.empty((*responses.shape, 2), dtype=np.float64)
+        gamma[..., 1] = learned
+        gamma[..., 0] = 1.0 - learned
+        return gamma, log_likelihoods
+
+    def forward_backward_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Run forward-backward inference for multiple persons.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Response matrix with shape ``(n_persons, n_trials)``.
+        skill_assignments : NDArray
+            Shared trial-to-skill vector or a matrix matching ``responses``.
+
+        Returns
+        -------
+        tuple
+            ``(gamma, log_likelihoods)`` where ``gamma`` has shape
+            ``(n_persons, n_trials, 2)``.
+        """
+        responses, skill_assignments = self._validate_batch(
+            responses, skill_assignments
+        )
+        return self._forward_backward_batch_validated(responses, skill_assignments)
+
+    def _forward_backward_batch_validated(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Run batch smoothing for validated inputs."""
+        if skill_assignments.ndim == 1:
+            native = self._native_forward_backward_batch(responses, skill_assignments)
+            if native is not None:
+                return native
+
+        gamma = np.empty((*responses.shape, 2), dtype=np.float64)
+        log_likelihoods = np.empty(responses.shape[0], dtype=np.float64)
+        for person_idx, person_responses in enumerate(responses):
+            person_skills = (
+                skill_assignments
+                if skill_assignments.ndim == 1
+                else skill_assignments[person_idx]
+            )
+            gamma[person_idx], log_likelihoods[person_idx] = (
+                self._forward_backward_python(person_responses, person_skills)
+            )
+        return gamma, log_likelihoods
 
     def viterbi(
         self,
@@ -333,6 +567,37 @@ class BKTModel:
         responses, skill_assignments = self._validate_sequence(
             responses, skill_assignments
         )
+
+        if self._can_use_native_inference():
+            try:
+                result = bkt_viterbi(
+                    responses,
+                    skill_assignments,
+                    self.p_init,
+                    self.p_learn,
+                    self.p_forget,
+                    self.p_slip,
+                    self.p_guess,
+                )
+                if result is not None:
+                    path = np.asarray(result)
+                    if (
+                        path.shape == responses.shape
+                        and np.issubdtype(path.dtype, np.integer)
+                        and np.all((path == 0) | (path == 1))
+                    ):
+                        return path.astype(np.int_, copy=False)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+
+        return self._viterbi_python(responses, skill_assignments)
+
+    def _viterbi_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.int_]:
+        """Run the Python Viterbi fallback for validated inputs."""
         n_trials = len(responses)
 
         delta = np.zeros((n_trials, 2))
@@ -427,30 +692,30 @@ class BKTModel:
         ``skill_assignments`` may be a shared one-dimensional trial layout or a
         person-specific matrix with the same shape as ``responses``.
         """
-        responses = np.asarray(responses)
-        skill_assignments = np.asarray(skill_assignments)
-        if responses.ndim != 2:
-            raise ValueError("responses must have shape (n_persons, n_trials)")
-        if skill_assignments.ndim == 1:
-            if len(skill_assignments) != responses.shape[1]:
-                raise ValueError(
-                    "shared skill_assignments length must match the number of trials"
-                )
-        elif skill_assignments.shape != responses.shape:
-            raise ValueError(
-                "skill_assignments must be one-dimensional or match responses"
-            )
+        responses, skill_assignments = self._validate_batch(
+            responses, skill_assignments
+        )
+        gamma, _ = self._forward_backward_batch_validated(responses, skill_assignments)
+        mastery = np.broadcast_to(
+            self.p_init, (responses.shape[0], self.n_skills)
+        ).copy()
 
-        mastery = np.empty((responses.shape[0], self.n_skills), dtype=np.float64)
-        for person_idx, person_responses in enumerate(responses):
-            person_skills = (
-                skill_assignments
-                if skill_assignments.ndim == 1
-                else skill_assignments[person_idx]
-            )
-            mastery[person_idx] = self.predict_mastery_by_skill(
-                person_responses, person_skills
-            )
+        if skill_assignments.ndim == 1:
+            for skill_idx, trial_indices in enumerate(
+                self._skill_trials(skill_assignments)
+            ):
+                if len(trial_indices) > 0:
+                    mastery[:, skill_idx] = gamma[:, trial_indices[-1], 1]
+            return mastery
+
+        for person_idx, person_skills in enumerate(skill_assignments):
+            for skill_idx, trial_indices in enumerate(
+                self._skill_trials(person_skills)
+            ):
+                if len(trial_indices) > 0:
+                    mastery[person_idx, skill_idx] = gamma[
+                        person_idx, trial_indices[-1], 1
+                    ]
         return mastery
 
     def simulate(
