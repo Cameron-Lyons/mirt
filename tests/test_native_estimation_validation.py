@@ -40,3 +40,51 @@ def test_native_bootstrap_requires_positive_integer_replicates(
 
     with pytest.raises(ValueError, match="n_bootstrap must be at least 1"):
         bootstrap_fit_2pl(responses, n_bootstrap=n_bootstrap)
+
+
+def test_native_bootstrap_validates_warm_start_parameters() -> None:
+    responses = np.array([[0, 1], [1, 0]], dtype=np.int32)
+
+    with pytest.raises(ValueError, match="provided together"):
+        bootstrap_fit_2pl(
+            responses,
+            n_bootstrap=2,
+            initial_discrimination=np.ones(2),
+        )
+    with pytest.raises(ValueError, match="one value per item"):
+        bootstrap_fit_2pl(
+            responses,
+            n_bootstrap=2,
+            initial_discrimination=np.ones(1),
+            initial_difficulty=np.zeros(1),
+        )
+    with pytest.raises(ValueError, match="finite"):
+        bootstrap_fit_2pl(
+            responses,
+            n_bootstrap=2,
+            initial_discrimination=np.array([1.0, np.nan]),
+            initial_difficulty=np.zeros(2),
+        )
+
+
+def test_native_bootstrap_accepts_warm_start_parameters() -> None:
+    responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]], dtype=np.int32)
+    kwargs = {
+        "n_bootstrap": 2,
+        "max_iter": 2,
+        "seed": 42,
+        "initial_discrimination": np.array([1.2, 0.8]),
+        "initial_difficulty": np.array([-0.25, 0.25]),
+    }
+
+    discrimination, difficulty = bootstrap_fit_2pl(responses, **kwargs)
+    repeated_discrimination, repeated_difficulty = bootstrap_fit_2pl(
+        responses, **kwargs
+    )
+
+    assert discrimination.shape == (2, 2)
+    assert difficulty.shape == (2, 2)
+    assert np.isfinite(discrimination).all()
+    assert np.isfinite(difficulty).all()
+    np.testing.assert_array_equal(discrimination, repeated_discrimination)
+    np.testing.assert_array_equal(difficulty, repeated_difficulty)

@@ -146,6 +146,8 @@ def bootstrap_fit_2pl(
     max_iter: int = 100,
     tol: float = 1e-4,
     seed: int | None = None,
+    initial_discrimination: NDArray[np.float64] | None = None,
+    initial_difficulty: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Run parallel bootstrap for 2PL model in Rust.
 
@@ -158,6 +160,26 @@ def bootstrap_fit_2pl(
         n_bootstrap, "n_bootstrap must be at least 1"
     )
     n_quadpts, max_iter, tol = _validate_em_controls(n_quadpts, max_iter, tol)
+    if (initial_discrimination is None) != (initial_difficulty is None):
+        raise ValueError(
+            "initial_discrimination and initial_difficulty must be provided together"
+        )
+
+    response_values = np.asarray(responses)
+    if response_values.ndim != 2:
+        raise ValueError("responses must be a two-dimensional array")
+    n_items = response_values.shape[1]
+    if initial_discrimination is not None and initial_difficulty is not None:
+        initial_discrimination = np.asarray(initial_discrimination, dtype=np.float64)
+        initial_difficulty = np.asarray(initial_difficulty, dtype=np.float64)
+        if initial_discrimination.shape != (n_items,) or initial_difficulty.shape != (
+            n_items,
+        ):
+            raise ValueError("initial parameters must contain one value per item")
+        if not np.all(np.isfinite(initial_discrimination)) or not np.all(
+            np.isfinite(initial_difficulty)
+        ):
+            raise ValueError("initial parameters must be finite")
 
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
@@ -170,6 +192,8 @@ def bootstrap_fit_2pl(
             max_iter,
             tol,
             int(seed),
+            _ensure_f64(initial_discrimination),
+            _ensure_f64(initial_difficulty),
         )
 
     rust_required("bootstrap_fit_2pl")

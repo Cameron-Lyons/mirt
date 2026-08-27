@@ -251,6 +251,59 @@ def _simulate_model_responses(
     return (uniforms > cumulative).sum(axis=2).astype(np.int_)
 
 
+def _native_2pl_bootstrap_samples(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    n_bootstrap: int,
+    seed: int | None,
+    warm_start: bool,
+) -> dict[str, NDArray[np.float64]] | None:
+    """Return native parallel parameter samples for eligible 2PL models."""
+    from mirt.backends.rust._helpers import rust_enabled
+    from mirt.backends.rust.estimation import bootstrap_fit_2pl
+    from mirt.models.dichotomous import TwoParameterLogistic
+
+    if (
+        not rust_enabled()
+        or not isinstance(model, TwoParameterLogistic)
+        or model.model_name != "2PL"
+    ):
+        return None
+    if model.n_factors != 1:
+        return None
+
+    parameters = model.parameters
+    initial_discrimination = parameters["discrimination"] if warm_start else None
+    initial_difficulty = parameters["difficulty"] if warm_start else None
+    rng = np.random.default_rng(seed)
+    native_seed = int(rng.integers(0, 2**31))
+    discrimination, difficulty = bootstrap_fit_2pl(
+        responses,
+        n_bootstrap=n_bootstrap,
+        n_quadpts=21,
+        max_iter=100 if warm_start else 200,
+        tol=1e-3,
+        seed=native_seed,
+        initial_discrimination=initial_discrimination,
+        initial_difficulty=initial_difficulty,
+    )
+
+    expected_shape = (n_bootstrap, model.n_items)
+    samples = {
+        "discrimination": np.asarray(discrimination, dtype=np.float64),
+        "difficulty": np.asarray(difficulty, dtype=np.float64),
+    }
+    if any(values.shape != expected_shape for values in samples.values()):
+        raise MirtModelError(
+            "Native bootstrap returned an unexpected parameter shape",
+            model_type=model.model_name,
+            expected=str(expected_shape),
+        )
+    if any(not np.all(np.isfinite(values)) for values in samples.values()):
+        raise MirtModelError("Native bootstrap returned non-finite parameters")
+    return samples
+
+
 def bootstrap_se(
     model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
@@ -287,6 +340,12 @@ def bootstrap_se(
     -------
     dict
         Dictionary with parameter names as keys and SE arrays as values
+
+    Notes
+    -----
+    Parameter bootstraps for unidimensional 2PL models use the native parallel
+    implementation when that backend is enabled. Other models and statistics
+    retain the general Python implementation.
     """
     from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
@@ -297,9 +356,19 @@ def bootstrap_se(
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
 
-    rng = np.random.default_rng(seed)
     responses = validate_responses(responses, n_items=model.n_items)
     n_persons = responses.shape[0]
+    if statistic == "parameters":
+        native_samples = _native_2pl_bootstrap_samples(
+            model, responses, n_bootstrap, seed, warm_start
+        )
+        if native_samples is not None:
+            return {
+                name: np.std(values, axis=0, ddof=1)
+                for name, values in native_samples.items()
+            }
+
+    rng = np.random.default_rng(seed)
 
     boot_estimates: dict[str, list[NDArray]] = {}
 
@@ -405,6 +474,12 @@ def bootstrap_ci(
     -------
     dict
         Dictionary with parameter names as keys and (lower, upper) CI tuples
+
+    Notes
+    -----
+    Parameter bootstraps for unidimensional 2PL models use the native parallel
+    implementation when that backend is enabled. Other models and statistics
+    retain the general Python implementation.
     """
     from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
@@ -445,56 +520,69 @@ def bootstrap_ci(
     max_iter = 100 if warm_start else 200
     estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
 
-    for b in range(n_bootstrap):
-        if verbose and (b + 1) % 50 == 0:
-            print(f"Bootstrap sample {b + 1}/{n_bootstrap}")
-
-        indices = rng.integers(0, n_persons, size=n_persons)
-        boot_responses = responses[indices]
-        boot_model = _prepare_bootstrap_model(
-            original_model, original_params, warm_start
+    native_samples = None
+    if statistic == "parameters":
+        native_samples = _native_2pl_bootstrap_samples(
+            original_model, responses, n_bootstrap, seed, warm_start
         )
+    if native_samples is not None:
+        for name, samples in native_samples.items():
+            if (
+                name in boot_estimates
+                and samples.shape[1:] == original_estimates[name].shape
+            ):
+                boot_estimates[name].extend(samples)
+    else:
+        for b in range(n_bootstrap):
+            if verbose and (b + 1) % 50 == 0:
+                print(f"Bootstrap sample {b + 1}/{n_bootstrap}")
 
-        try:
-            result = estimator.fit(boot_model, boot_responses)
+            indices = rng.integers(0, n_persons, size=n_persons)
+            boot_responses = responses[indices]
+            boot_model = _prepare_bootstrap_model(
+                original_model, original_params, warm_start
+            )
 
-            if statistic == "parameters":
-                for name, values in result.model.parameters.items():
-                    if (
-                        name in boot_estimates
-                        and values.shape == original_estimates[name].shape
-                    ):
-                        boot_estimates[name].append(
-                            np.asarray(values, dtype=np.float64)
-                        )
+            try:
+                result = estimator.fit(boot_model, boot_responses)
 
-            elif statistic == "theta":
-                from mirt.scoring import fscores
+                if statistic == "parameters":
+                    for name, values in result.model.parameters.items():
+                        if (
+                            name in boot_estimates
+                            and values.shape == original_estimates[name].shape
+                        ):
+                            boot_estimates[name].append(
+                                np.asarray(values, dtype=np.float64)
+                            )
 
-                scores = fscores(result.model, responses, method="EAP")
-                values = np.asarray(scores.theta, dtype=np.float64)
-                if values.shape == original_estimates["theta"].shape:
-                    boot_estimates["theta"].append(values)
+                elif statistic == "theta":
+                    from mirt.scoring import fscores
 
-            elif callable(statistic):
-                custom_result = _as_statistic_mapping(
-                    statistic(result.model, boot_responses)
-                )
-                for name, values in custom_result.items():
-                    if (
-                        name in boot_estimates
-                        and values.shape == original_estimates[name].shape
-                    ):
-                        boot_estimates[name].append(values)
+                    scores = fscores(result.model, responses, method="EAP")
+                    values = np.asarray(scores.theta, dtype=np.float64)
+                    if values.shape == original_estimates["theta"].shape:
+                        boot_estimates["theta"].append(values)
 
-        except _BOOTSTRAP_EXCEPTIONS as exc:
-            if verbose:
-                warnings.warn(
-                    f"Bootstrap CI replicate failed and was skipped: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-            continue
+                elif callable(statistic):
+                    custom_result = _as_statistic_mapping(
+                        statistic(result.model, boot_responses)
+                    )
+                    for name, values in custom_result.items():
+                        if (
+                            name in boot_estimates
+                            and values.shape == original_estimates[name].shape
+                        ):
+                            boot_estimates[name].append(values)
+
+            except _BOOTSTRAP_EXCEPTIONS as exc:
+                if verbose:
+                    warnings.warn(
+                        f"Bootstrap CI replicate failed and was skipped: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                continue
 
     jackknife_estimates: dict[str, list[NDArray[np.float64]]] = {
         name: [] for name in original_estimates
