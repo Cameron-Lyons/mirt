@@ -3,7 +3,7 @@
 //! This module provides functions for joint modeling of response accuracy
 //! and response times using Van der Linden's hierarchical framework.
 
-use numpy::ndarray::Array1;
+use numpy::ndarray::{Array1, ArrayView1};
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
@@ -16,6 +16,47 @@ use crate::utils::{EPSILON, NormalSampler, sigmoid};
 fn log_lognormal_density(log_x: f64, mean: f64, precision: f64) -> f64 {
     let var = 1.0 / precision;
     -0.5 * (2.0 * std::f64::consts::PI * var).ln() - 0.5 * precision * (log_x - mean).powi(2)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn joint_log_likelihood_single(
+    responses: &ArrayView1<'_, i32>,
+    log_rt: &ArrayView1<'_, f64>,
+    theta: f64,
+    tau: f64,
+    discrimination: &ArrayView1<'_, f64>,
+    difficulty: &ArrayView1<'_, f64>,
+    time_discrimination: &ArrayView1<'_, f64>,
+    time_intensity: &ArrayView1<'_, f64>,
+    guessing: Option<&[f64]>,
+) -> f64 {
+    let mut log_likelihood = 0.0;
+
+    for item in 0..responses.len() {
+        let response = responses[item];
+        if response >= 0 {
+            let logistic = sigmoid(discrimination[item] * (theta - difficulty[item]));
+            let probability = guessing
+                .map(|values| values[item] + (1.0 - values[item]) * logistic)
+                .unwrap_or(logistic)
+                .clamp(EPSILON, 1.0 - EPSILON);
+
+            if response == 1 {
+                log_likelihood += probability.ln();
+            } else {
+                log_likelihood += (1.0 - probability).ln();
+            }
+        }
+
+        let timing = log_rt[item];
+        if !timing.is_nan() {
+            let mean = time_intensity[item] - tau;
+            let precision = time_discrimination[item].powi(2);
+            log_likelihood += log_lognormal_density(timing, mean, precision);
+        }
+    }
+
+    log_likelihood
 }
 
 /// Compute joint log-likelihood for response time model.
@@ -55,37 +96,20 @@ pub fn rt_joint_log_likelihood<'py>(
     let time_int = time_intensity.as_array();
 
     let n_persons = responses.nrows();
-    let n_items = responses.ncols();
-
     let log_likes: Vec<f64> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut ll = 0.0;
-            let theta_i = theta[i];
-            let tau_i = tau[i];
-
-            for j in 0..n_items {
-                let resp = responses[[i, j]];
-                if resp >= 0 {
-                    let z = disc[j] * (theta_i - diff[j]);
-                    let p = sigmoid(z).clamp(EPSILON, 1.0 - EPSILON);
-
-                    if resp == 1 {
-                        ll += p.ln();
-                    } else {
-                        ll += (1.0 - p).ln();
-                    }
-                }
-
-                let rt = log_rt[[i, j]];
-                if !rt.is_nan() {
-                    let mean = time_int[j] - tau_i;
-                    let precision = time_disc[j].powi(2);
-                    ll += log_lognormal_density(rt, mean, precision);
-                }
-            }
-
-            ll
+            joint_log_likelihood_single(
+                &responses.row(i),
+                &log_rt.row(i),
+                theta[i],
+                tau[i],
+                &disc,
+                &diff,
+                &time_disc,
+                &time_int,
+                None,
+            )
         })
         .collect();
 
@@ -113,47 +137,138 @@ pub fn rt_joint_log_likelihood_3pl<'py>(
     let tau = tau.as_array();
     let disc = discrimination.as_array();
     let diff = difficulty.as_array();
-    let guess = guessing.as_array();
     let time_disc = time_discrimination.as_array();
     let time_int = time_intensity.as_array();
 
     let n_persons = responses.nrows();
-    let n_items = responses.ncols();
+    let guess = guessing.as_array().to_vec();
 
     let log_likes: Vec<f64> = (0..n_persons)
         .into_par_iter()
         .map(|i| {
-            let mut ll = 0.0;
-            let theta_i = theta[i];
-            let tau_i = tau[i];
-
-            for j in 0..n_items {
-                let resp = responses[[i, j]];
-                if resp >= 0 {
-                    let z = disc[j] * (theta_i - diff[j]);
-                    let p_star = sigmoid(z);
-                    let p = (guess[j] + (1.0 - guess[j]) * p_star).clamp(EPSILON, 1.0 - EPSILON);
-
-                    if resp == 1 {
-                        ll += p.ln();
-                    } else {
-                        ll += (1.0 - p).ln();
-                    }
-                }
-
-                let rt = log_rt[[i, j]];
-                if !rt.is_nan() {
-                    let mean = time_int[j] - tau_i;
-                    let precision = time_disc[j].powi(2);
-                    ll += log_lognormal_density(rt, mean, precision);
-                }
-            }
-
-            ll
+            joint_log_likelihood_single(
+                &responses.row(i),
+                &log_rt.row(i),
+                theta[i],
+                tau[i],
+                &disc,
+                &diff,
+                &time_disc,
+                &time_int,
+                Some(&guess),
+            )
         })
         .collect();
 
     Array1::from(log_likes).to_pyarray(py)
+}
+
+/// Accept or reject pre-generated joint ability and speed proposals.
+///
+/// Proposal generation remains in Python so the accelerated and NumPy paths
+/// consume exactly the same random values. Likelihood evaluation and the
+/// Metropolis-Hastings decision run in parallel here.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+pub fn rt_accept_person_proposals<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    log_rt: PyReadonlyArray2<f64>,
+    theta: PyReadonlyArray1<f64>,
+    tau: PyReadonlyArray1<f64>,
+    theta_proposed: PyReadonlyArray1<f64>,
+    tau_proposed: PyReadonlyArray1<f64>,
+    log_uniform: PyReadonlyArray1<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+    time_discrimination: PyReadonlyArray1<f64>,
+    time_intensity: PyReadonlyArray1<f64>,
+    mean: PyReadonlyArray1<f64>,
+    covariance_inverse: PyReadonlyArray2<f64>,
+    log_determinant: f64,
+    guessing: Option<PyReadonlyArray1<f64>>,
+) -> (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<i32>>,
+) {
+    let responses = responses.as_array();
+    let log_rt = log_rt.as_array();
+    let theta = theta.as_array();
+    let tau = tau.as_array();
+    let theta_proposed = theta_proposed.as_array();
+    let tau_proposed = tau_proposed.as_array();
+    let log_uniform = log_uniform.as_array();
+    let discrimination = discrimination.as_array();
+    let difficulty = difficulty.as_array();
+    let time_discrimination = time_discrimination.as_array();
+    let time_intensity = time_intensity.as_array();
+    let mean = mean.as_array();
+    let covariance_inverse = covariance_inverse.as_array();
+    let guessing = guessing.map(|values| values.as_array().to_vec());
+
+    let results: Vec<(f64, f64, i32)> = (0..responses.nrows())
+        .into_par_iter()
+        .map(|person| {
+            let current_likelihood = joint_log_likelihood_single(
+                &responses.row(person),
+                &log_rt.row(person),
+                theta[person],
+                tau[person],
+                &discrimination,
+                &difficulty,
+                &time_discrimination,
+                &time_intensity,
+                guessing.as_deref(),
+            );
+            let proposed_likelihood = joint_log_likelihood_single(
+                &responses.row(person),
+                &log_rt.row(person),
+                theta_proposed[person],
+                tau_proposed[person],
+                &discrimination,
+                &difficulty,
+                &time_discrimination,
+                &time_intensity,
+                guessing.as_deref(),
+            );
+            let current_prior = log_mvn_density_single(
+                theta[person],
+                tau[person],
+                mean[0],
+                mean[1],
+                &covariance_inverse,
+                log_determinant,
+            );
+            let proposed_prior = log_mvn_density_single(
+                theta_proposed[person],
+                tau_proposed[person],
+                mean[0],
+                mean[1],
+                &covariance_inverse,
+                log_determinant,
+            );
+            let log_acceptance =
+                (proposed_likelihood + proposed_prior) - (current_likelihood + current_prior);
+
+            if log_uniform[person] < log_acceptance {
+                (theta_proposed[person], tau_proposed[person], 1)
+            } else {
+                (theta[person], tau[person], 0)
+            }
+        })
+        .collect();
+
+    let new_theta = Array1::from_iter(results.iter().map(|result| result.0));
+    let new_tau = Array1::from_iter(results.iter().map(|result| result.1));
+    let accepted = Array1::from_iter(results.iter().map(|result| result.2));
+
+    (
+        new_theta.to_pyarray(py),
+        new_tau.to_pyarray(py),
+        accepted.to_pyarray(py),
+    )
 }
 
 /// Sample (theta, tau) for all persons via Metropolis-Hastings.
@@ -381,6 +496,7 @@ pub fn rt_time_sufficient_stats<'py>(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rt_joint_log_likelihood, m)?)?;
     m.add_function(wrap_pyfunction!(rt_joint_log_likelihood_3pl, m)?)?;
+    m.add_function(wrap_pyfunction!(rt_accept_person_proposals, m)?)?;
     m.add_function(wrap_pyfunction!(rt_sample_person_params, m)?)?;
     m.add_function(wrap_pyfunction!(rt_log_mvn_density, m)?)?;
     m.add_function(wrap_pyfunction!(rt_time_sufficient_stats, m)?)?;

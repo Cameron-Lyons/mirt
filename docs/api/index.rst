@@ -40,6 +40,7 @@ Models
    BifactorModel
    MixtureIRT
    TestletModel
+   ResponseTimeModel
    DINA
    DINO
 
@@ -82,6 +83,7 @@ Estimation
    MHRMEstimator
    GibbsSampler
    BLEstimator
+   ResponseTimeGibbsSampler
 
 Diagnostics
 -----------
@@ -207,3 +209,4 @@ Results
 
    FitResult
    ScoreResult
+   ResponseTimeResult

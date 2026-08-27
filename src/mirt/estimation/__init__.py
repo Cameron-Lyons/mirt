@@ -46,6 +46,7 @@ from mirt.estimation.priors import (
     weakly_informative_priors,
 )
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.rt_gibbs import ResponseTimeGibbsSampler, RTModelPriors
 from mirt.estimation.sparse_bayesian import (
     SparseBayesianEstimator,
     SparseBayesianResult,
@@ -102,6 +103,8 @@ __all__ = [
     "MixtureDensity",
     "CustomDensity",
     "create_density",
+    "RTModelPriors",
+    "ResponseTimeGibbsSampler",
     "ParameterConstraint",
     "FixedConstraint",
     "EqualityConstraint",

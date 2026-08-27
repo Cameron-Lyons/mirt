@@ -8,7 +8,9 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt._core import sigmoid
+from mirt.backends.rust.response_time import rt_accept_person_proposals
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
@@ -94,6 +96,8 @@ class ResponseTimeGibbsSampler:
         Print progress
     seed : int, optional
         Random seed
+    use_rust : bool, default=True
+        Use compiled likelihood and person-proposal evaluation when available.
     """
 
     def __init__(
@@ -107,6 +111,7 @@ class ResponseTimeGibbsSampler:
         adapt_interval: int = 100,
         verbose: bool = False,
         seed: int | None = None,
+        use_rust: bool = True,
     ) -> None:
         self.n_iter = n_iter
         self.burnin = burnin
@@ -117,6 +122,14 @@ class ResponseTimeGibbsSampler:
         self.adapt_interval = adapt_interval
         self.verbose = verbose
         self.seed = seed
+        if not isinstance(use_rust, (bool, np.bool_)):
+            raise MirtValidationError(
+                "use_rust must be a boolean",
+                parameter="use_rust",
+                value=use_rust,
+                expected="boolean",
+            )
+        self.use_rust = bool(use_rust)
 
     def fit(
         self,
@@ -271,6 +284,7 @@ class ResponseTimeGibbsSampler:
                     [np.mean(chains["sigma_12"]), np.mean(chains["sigma_22"])],
                 ]
             ),
+            use_rust=self.use_rust,
         )
 
         log_likelihood = np.mean(
@@ -327,72 +341,32 @@ class ResponseTimeGibbsSampler:
     ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
         """Sample (θ, τ) jointly via Metropolis-Hastings."""
         n_persons = len(theta)
-        n_items = len(disc)
 
         sigma_inv = np.linalg.inv(sigma)
         log_det_sigma = np.linalg.slogdet(sigma)[1]
+        proposal_offsets = rng.normal(0.0, proposal_sd, size=(n_persons, 2))
+        theta_proposed = theta + proposal_offsets[:, 0]
+        tau_proposed = tau + proposal_offsets[:, 1]
+        log_uniform = np.log(rng.random(n_persons))
 
-        new_theta = theta.copy()
-        new_tau = tau.copy()
-        accepted = np.zeros(n_persons, dtype=bool)
-
-        for i in range(n_persons):
-            theta_prop = theta[i] + rng.normal(0, proposal_sd)
-            tau_prop = tau[i] + rng.normal(0, proposal_sd)
-
-            log_prior_curr = self._log_mvn_density_single(
-                np.array([theta[i], tau[i]]), mu, sigma_inv, log_det_sigma
-            )
-            log_prior_prop = self._log_mvn_density_single(
-                np.array([theta_prop, tau_prop]), mu, sigma_inv, log_det_sigma
-            )
-
-            log_like_curr = 0.0
-            log_like_prop = 0.0
-
-            for j in range(n_items):
-                if responses[i, j] >= 0:
-                    z_curr = disc[j] * (theta[i] - diff[j])
-                    z_prop = disc[j] * (theta_prop - diff[j])
-
-                    p_curr = sigmoid(z_curr)
-                    p_prop = sigmoid(z_prop)
-
-                    if guess is not None:
-                        p_curr = guess[j] + (1 - guess[j]) * p_curr
-                        p_prop = guess[j] + (1 - guess[j]) * p_prop
-
-                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
-                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                    if responses[i, j] == 1:
-                        log_like_curr += np.log(p_curr)
-                        log_like_prop += np.log(p_prop)
-                    else:
-                        log_like_curr += np.log(1 - p_curr)
-                        log_like_prop += np.log(1 - p_prop)
-
-                if not np.isnan(log_rt[i, j]):
-                    beta = time_int[j]
-                    alpha = time_disc[j]
-                    var = 1.0 / (alpha**2)
-
-                    mean_curr = beta - tau[i]
-                    mean_prop = beta - tau_prop
-
-                    log_like_curr += -0.5 * (log_rt[i, j] - mean_curr) ** 2 / var
-                    log_like_prop += -0.5 * (log_rt[i, j] - mean_prop) ** 2 / var
-
-            log_accept = (log_like_prop + log_prior_prop) - (
-                log_like_curr + log_prior_curr
-            )
-
-            if np.log(rng.random()) < log_accept:
-                new_theta[i] = theta_prop
-                new_tau[i] = tau_prop
-                accepted[i] = True
-
-        return new_theta, new_tau, accepted
+        return rt_accept_person_proposals(
+            responses,
+            log_rt,
+            theta,
+            tau,
+            theta_proposed,
+            tau_proposed,
+            log_uniform,
+            disc,
+            diff,
+            time_disc,
+            time_int,
+            mu,
+            sigma_inv,
+            log_det_sigma,
+            guess,
+            use_rust=self.use_rust,
+        )
 
     def _sample_accuracy_params(
         self,
@@ -590,20 +564,6 @@ class ResponseTimeGibbsSampler:
         new_sigma = stats.invwishart.rvs(df=df, scale=scale, random_state=rng)
 
         return new_mu, new_sigma
-
-    @staticmethod
-    def _log_mvn_density_single(
-        x: NDArray[np.float64],
-        mean: NDArray[np.float64],
-        sigma_inv: NDArray[np.float64],
-        log_det_sigma: float,
-    ) -> float:
-        """Log MVN density for single observation."""
-        d = len(x)
-        diff = x - mean
-        maha = diff @ sigma_inv @ diff
-        log_norm = -0.5 * (d * np.log(2 * np.pi) + log_det_sigma)
-        return log_norm - 0.5 * maha
 
     def _compute_dic(
         self,

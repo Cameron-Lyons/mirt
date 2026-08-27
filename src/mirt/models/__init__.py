@@ -96,6 +96,7 @@ from mirt.models.polytomous import (
     PartialCreditModel,
     RatingScaleModel,
 )
+from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
 from mirt.models.sequential import (
     AdjacentCategoryModel,
     ContinuationRatioModel,
@@ -192,4 +193,6 @@ __all__ = [
     "NonlinearGrowthModel",
     "GrowthMixtureModel",
     "GrowthMixtureResult",
+    "ResponseTimeModel",
+    "ResponseTimeResult",
 ]
