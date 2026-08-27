@@ -30,6 +30,56 @@ class TestImputeResponses:
 
         assert imputed.shape == responses.shape
 
+    def test_impute_mean_uses_rounded_item_values(self):
+        responses = np.array([[0, -1], [1, 1], [2, 2], [3, 2]])
+
+        imputed = impute_responses(responses, method="mean")
+
+        np.testing.assert_array_equal(
+            imputed,
+            np.array([[0, 2], [1, 1], [2, 2], [3, 2]]),
+        )
+
+    def test_impute_median_supports_ordered_categories(self):
+        responses = np.array(
+            [
+                [0, -1, 2],
+                [1, 1, -1],
+                [4, 2, 4],
+                [4, 3, 4],
+            ]
+        )
+
+        imputed = impute_responses(responses, method="median")
+
+        np.testing.assert_array_equal(
+            imputed,
+            np.array(
+                [
+                    [0, 2, 2],
+                    [1, 1, 4],
+                    [4, 2, 4],
+                    [4, 3, 4],
+                ]
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [
+            ("median", np.array([[0, 3], [1000, 5], [1000, 5], [1000, 7]])),
+            ("mode", np.array([[0, 3], [1000, 3], [1000, 5], [1000, 7]])),
+        ],
+    )
+    def test_simple_imputation_supports_sparse_large_category_codes(
+        self, method, expected
+    ):
+        responses = np.array([[0, 3], [1000, -1], [-1, 5], [1000, 7]])
+
+        imputed = impute_responses(responses, method=method)
+
+        np.testing.assert_array_equal(imputed, expected)
+
     def test_impute_mode(self, responses_with_missing):
         """Test mode imputation."""
         responses = responses_with_missing["responses"]
@@ -133,7 +183,9 @@ class TestImputeResponses:
         with pytest.raises(MirtDataError):
             impute_responses(responses, method="mean")
 
-    @pytest.mark.parametrize("method", ["mean", "mode", "random", "EM", "multiple"])
+    @pytest.mark.parametrize(
+        "method", ["mean", "median", "mode", "random", "EM", "multiple"]
+    )
     def test_fully_missing_item_is_rejected(self, method):
         responses = np.array([[-1, 0], [-1, 1]])
 
