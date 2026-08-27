@@ -1,20 +1,9 @@
-"""Standard error estimation methods for IRT models.
+"""Matrix-based standard errors for marginal item-response models.
 
-This module provides various methods for computing standard errors of
-item parameter estimates:
-- Observed information (Hessian-based)
-- Expected information
-- Oakes method (1999)
-- Sandwich (robust) estimator
-- SEM (Supplemented EM) method
-
-References:
-    Oakes, D. (1999). Direct calculation of the information matrix via the
-        EM algorithm. Journal of the Royal Statistical Society: Series B,
-        61(2), 479-482.
-
-    Cai, L. (2008). SEM of item response data with the Metropolis-Hastings
-        Robbins-Monro algorithm.
+The routines in this module differentiate the person-level marginal
+log-likelihood. Keeping that objective in one place makes the observed,
+cross-product, and sandwich estimators consistent and ensures that a fitted
+latent density is not silently replaced by the quadrature's default mass.
 """
 
 from __future__ import annotations
@@ -25,7 +14,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.constants import PROB_EPSILON
+from mirt.utils.numeric import logsumexp, logsumexp_axis1
 
 if TYPE_CHECKING:
     from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -34,324 +23,159 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class _ParameterLayout:
+    """Mapping between stored parameters and the free parameter vector."""
+
     shape: tuple[int, ...]
     free_indices: NDArray[np.int_]
     template: NDArray[np.float64]
 
 
-def compute_observed_information(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+def _validate_step_size(h: float) -> float:
+    step = float(h)
+    if not np.isfinite(step) or step <= 0.0:
+        raise ValueError("h must be finite and positive")
+    return step
+
+
+def _validate_posterior(
     posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    h: float = 1e-5,
+    n_persons: int,
+    n_quadpts: int,
 ) -> NDArray[np.float64]:
-    """Compute observed information matrix via numerical differentiation.
+    posterior = np.asarray(posterior_weights, dtype=np.float64)
+    if posterior.shape != (n_persons, n_quadpts):
+        raise ValueError(
+            "posterior_weights must have shape "
+            f"({n_persons}, {n_quadpts}), got {posterior.shape}"
+        )
+    if not np.all(np.isfinite(posterior)) or np.any(posterior < 0.0):
+        raise ValueError("posterior_weights must contain finite non-negative values")
+    row_sums = posterior.sum(axis=1)
+    if np.any(~np.isfinite(row_sums)) or np.any(row_sums <= 0.0):
+        raise ValueError("each posterior_weights row must have positive mass")
+    return posterior
 
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
-    posterior_weights : ndarray
-        E-step posterior weights
-    quadrature : GaussHermiteQuadrature
-        Quadrature object used in estimation
-    h : float
-        Step size for numerical differentiation
 
-    Returns
-    -------
-    ndarray
-        Observed information matrix
-    """
+def _validate_prior_mass(
+    prior_mass: NDArray[np.float64],
+    n_quadpts: int,
+) -> NDArray[np.float64]:
+    mass = np.asarray(prior_mass, dtype=np.float64)
+    if mass.shape != (n_quadpts,):
+        raise ValueError(f"prior_mass must have shape ({n_quadpts},), got {mass.shape}")
+    if not np.all(np.isfinite(mass)) or np.any(mass < 0.0):
+        raise ValueError("prior_mass must contain finite non-negative values")
+    total = float(mass.sum())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("prior_mass must contain positive total mass")
+    return mass / total
 
-    params_flat, param_shapes = _flatten_parameters(model)
-    n_params = len(params_flat)
 
-    hessian = np.zeros((n_params, n_params))
+def _infer_prior_mass(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+) -> NDArray[np.float64]:
+    """Recover normalized prior mass from a final E-step posterior."""
+    nodes = quadrature.nodes
+    posterior = _validate_posterior(
+        posterior_weights,
+        responses.shape[0],
+        nodes.shape[0],
+    )
+    usable_rows = np.flatnonzero(np.all(posterior > 0.0, axis=1))
+    if usable_rows.size == 0:
+        raise ValueError(
+            "cannot infer quadrature prior mass from zero posterior cells; "
+            "pass prior_mass explicitly"
+        )
 
-    ll_cache: dict[tuple, float] = {}
+    log_likelihood = np.asarray(
+        model.log_likelihood_batch(responses, nodes),
+        dtype=np.float64,
+    )
+    if log_likelihood.shape != posterior.shape or not np.all(
+        np.isfinite(log_likelihood)
+    ):
+        raise ValueError("model returned invalid log likelihoods at quadrature nodes")
 
-    def cached_ll(params: NDArray[np.float64]) -> float:
-        key = tuple(params)
-        if key not in ll_cache:
-            _set_flat_parameters(model, params, param_shapes)
-            ll_cache[key] = _complete_data_log_likelihood(
-                model, responses, posterior_weights, quadrature
+    row = int(usable_rows[0])
+    log_mass = np.log(posterior[row]) - log_likelihood[row]
+    log_mass -= float(logsumexp(log_mass))
+    mass = np.exp(log_mass)
+
+    # Posterior rows may be scaled, but they must imply the same normalized
+    # prior. Checking a small sample catches stale or unrelated posteriors.
+    for other_row in usable_rows[1:9]:
+        candidate = np.log(posterior[other_row]) - log_likelihood[other_row]
+        candidate -= float(logsumexp(candidate))
+        if not np.allclose(candidate, log_mass, rtol=0.0, atol=5e-8):
+            # Some advanced callers provide working weights rather than a
+            # final E-step posterior. Preserve their historical default.
+            return _validate_prior_mass(quadrature.weights, nodes.shape[0])
+    return mass
+
+
+def _resolve_prior_mass(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    prior_mass: NDArray[np.float64] | None,
+) -> NDArray[np.float64]:
+    n_quadpts = quadrature.nodes.shape[0]
+    _validate_posterior(posterior_weights, responses.shape[0], n_quadpts)
+    if prior_mass is not None:
+        return _validate_prior_mass(prior_mass, n_quadpts)
+    return _infer_prior_mass(model, responses, posterior_weights, quadrature)
+
+
+def _posterior_from_model(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    log_prior_mass: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Compute posterior quadrature weights for testing and advanced use."""
+    response_array = np.asarray(responses)
+    nodes = quadrature.nodes
+    if response_array.ndim != 2 or response_array.shape[0] == 0:
+        raise ValueError("responses must be a non-empty two-dimensional array")
+
+    if log_prior_mass is None:
+        mass = _validate_prior_mass(quadrature.weights, nodes.shape[0])
+        log_mass = np.log(mass)
+    else:
+        log_mass = np.asarray(log_prior_mass, dtype=np.float64)
+        if log_mass.shape != (nodes.shape[0],):
+            raise ValueError(
+                f"log_prior_mass must have shape ({nodes.shape[0]},), "
+                f"got {log_mass.shape}"
             )
-        return ll_cache[key]
+        if np.any(np.isnan(log_mass)) or np.any(np.isposinf(log_mass)):
+            raise ValueError("log_prior_mass must contain finite values or -inf")
+        if not np.any(np.isfinite(log_mass)):
+            raise ValueError("log_prior_mass must contain positive total mass")
+        log_mass = log_mass - float(logsumexp(log_mass))
 
-    ll_center = cached_ll(params_flat)
-
-    ll_single_plus = {}
-    ll_single_minus = {}
-    for i in range(n_params):
-        params_plus = params_flat.copy()
-        params_plus[i] += h
-        ll_single_plus[i] = cached_ll(params_plus)
-
-        params_minus = params_flat.copy()
-        params_minus[i] -= h
-        ll_single_minus[i] = cached_ll(params_minus)
-
-    for i in range(n_params):
-        hessian[i, i] = (ll_single_plus[i] - 2 * ll_center + ll_single_minus[i]) / (
-            h**2
+    log_joint = (
+        np.asarray(
+            model.log_likelihood_batch(response_array, nodes),
+            dtype=np.float64,
         )
-
-    for i in range(n_params):
-        for j in range(i + 1, n_params):
-            params_pp = params_flat.copy()
-            params_pp[i] += h
-            params_pp[j] += h
-
-            params_pm = params_flat.copy()
-            params_pm[i] += h
-            params_pm[j] -= h
-
-            params_mp = params_flat.copy()
-            params_mp[i] -= h
-            params_mp[j] += h
-
-            params_mm = params_flat.copy()
-            params_mm[i] -= h
-            params_mm[j] -= h
-
-            ll_pp = cached_ll(params_pp)
-            ll_pm = cached_ll(params_pm)
-            ll_mp = cached_ll(params_mp)
-            ll_mm = cached_ll(params_mm)
-
-            hessian[i, j] = (ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
-            hessian[j, i] = hessian[i, j]
-
-    _set_flat_parameters(model, params_flat, param_shapes)
-
-    return -hessian
-
-
-def compute_sandwich_se(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    survey_weights: NDArray[np.float64] | None = None,
-) -> dict[str, NDArray[np.float64]]:
-    """Compute sandwich (robust) standard errors.
-
-    The sandwich estimator is robust to model misspecification and
-    is particularly useful when using survey weights.
-
-    Sandwich covariance: (J^-1) @ V @ (J^-1)
-
-    where J is the expected information and V is the variance of
-    the score function.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
-    posterior_weights : ndarray
-        E-step posterior weights
-    quadrature : GaussHermiteQuadrature
-        Quadrature object used in estimation
-    survey_weights : ndarray, optional
-        Person-level survey weights
-
-    Returns
-    -------
-    dict
-        Dictionary mapping parameter names to standard error arrays
-    """
-    n_persons = responses.shape[0]
-
-    if survey_weights is None:
-        survey_weights = np.ones(n_persons)
-
-    params_flat, param_shapes = _flatten_parameters(model)
-    n_params = len(params_flat)
-
-    scores = _compute_person_scores(
-        model, responses, posterior_weights, quadrature, params_flat, param_shapes
+        + log_mass[None, :]
     )
-
-    weighted_scores = scores * survey_weights[:, None]
-
-    J = compute_observed_information(model, responses, posterior_weights, quadrature)
-
-    try:
-        J_inv = np.linalg.inv(J)
-    except np.linalg.LinAlgError:
-        J_inv = np.linalg.pinv(J)
-
-    V = np.zeros((n_params, n_params))
-    for i in range(n_persons):
-        V += np.outer(weighted_scores[i], weighted_scores[i])
-
-    sandwich_cov = J_inv @ V @ J_inv
-
-    variances = np.diag(sandwich_cov)
-    se_flat = np.sqrt(np.maximum(variances, 0))
-
-    return _unflatten_se(se_flat, param_shapes, model)
-
-
-def compute_oakes_se(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    h: float = 1e-5,
-) -> dict[str, NDArray[np.float64]]:
-    """Compute standard errors using Oakes (1999) method.
-
-    The Oakes method provides a direct way to compute the observed
-    information matrix without computing second derivatives of the
-    complete-data log-likelihood.
-
-    I_obs = I_comp - I_miss
-
-    where I_comp is the complete-data information and I_miss is the
-    missing information.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
-    posterior_weights : ndarray
-        E-step posterior weights
-    quadrature : GaussHermiteQuadrature
-        Quadrature object
-    h : float
-        Step size for numerical derivatives
-
-    Returns
-    -------
-    dict
-        Dictionary mapping parameter names to standard error arrays
-
-    References
-    ----------
-    Oakes, D. (1999). Direct calculation of the information matrix via
-        the EM algorithm. Journal of the Royal Statistical Society B.
-    """
-    params_flat, param_shapes = _flatten_parameters(model)
-
-    I_comp = _compute_complete_data_information(
-        model, responses, posterior_weights, quadrature, h
-    )
-
-    I_miss = _compute_missing_information_oakes(
-        model, responses, posterior_weights, quadrature, params_flat, param_shapes, h
-    )
-
-    I_obs = I_comp - I_miss
-
-    try:
-        I_obs_inv = np.linalg.inv(I_obs)
-    except np.linalg.LinAlgError:
-        I_obs_inv = np.linalg.pinv(I_obs)
-
-    variances = np.diag(I_obs_inv)
-    se_flat = np.sqrt(np.maximum(variances, 0))
-
-    return _unflatten_se(se_flat, param_shapes, model)
-
-
-def compute_sem_se(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    n_bootstrap: int = 50,
-    seed: int | None = None,
-) -> dict[str, NDArray[np.float64]]:
-    """Compute standard errors using Supplemented EM (SEM) method.
-
-    SEM augments the observed information with the rate of convergence
-    of the EM algorithm to account for missing information.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
-    posterior_weights : ndarray
-        E-step posterior weights
-    quadrature : GaussHermiteQuadrature
-        Quadrature object
-    n_bootstrap : int
-        Number of perturbations for rate matrix estimation
-    seed : int, optional
-        Random seed
-
-    Returns
-    -------
-    dict
-        Dictionary mapping parameter names to standard error arrays
-    """
-    rng = np.random.default_rng(seed)
-
-    params_flat, param_shapes = _flatten_parameters(model)
-    n_params = len(params_flat)
-
-    I_comp = _compute_complete_data_information(
-        model, responses, posterior_weights, quadrature
-    )
-
-    DM = np.zeros((n_params, n_params))
-    perturbation_scale = 0.01
-
-    for _ in range(n_bootstrap):
-        perturbation = rng.normal(0, perturbation_scale, n_params)
-        perturbed_params = params_flat + perturbation
-
-        _set_flat_parameters(model, perturbed_params, param_shapes)
-
-        new_params = _one_m_step_iteration(
-            model, responses, posterior_weights, quadrature, param_shapes
-        )
-
-        direction = (new_params - perturbed_params) / perturbation_scale
-        DM += np.outer(direction, perturbation / perturbation_scale)
-
-    DM /= n_bootstrap
-
-    _set_flat_parameters(model, params_flat, param_shapes)
-
-    I_minus_DM = np.eye(n_params) - DM
-
-    try:
-        I_minus_DM_inv = np.linalg.inv(I_minus_DM)
-    except np.linalg.LinAlgError:
-        I_minus_DM_inv = np.linalg.pinv(I_minus_DM)
-
-    I_obs = I_comp @ I_minus_DM_inv
-
-    try:
-        I_obs_inv = np.linalg.inv(I_obs)
-    except np.linalg.LinAlgError:
-        I_obs_inv = np.linalg.pinv(I_obs)
-
-    variances = np.diag(I_obs_inv)
-    se_flat = np.sqrt(np.maximum(variances, 0))
-
-    return _unflatten_se(se_flat, param_shapes, model)
+    log_norm = logsumexp_axis1(log_joint)
+    return np.exp(log_joint - log_norm[:, None])
 
 
 def _flatten_parameters(
     model: BaseItemModel,
 ) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
     """Flatten statistically free model parameters into a single vector."""
-    params_list = []
-    layouts = {}
+    chunks: list[NDArray[np.float64]] = []
+    layouts: dict[str, _ParameterLayout] = {}
     free_masks = model.free_parameter_masks
 
     for name, values in model.parameters.items():
@@ -368,11 +192,9 @@ def _flatten_parameters(
             free_indices=free_indices,
             template=canonical,
         )
-        params_list.append(canonical.ravel()[free_indices])
+        chunks.append(canonical.ravel()[free_indices])
 
-    flattened = (
-        np.concatenate(params_list) if params_list else np.empty(0, dtype=np.float64)
-    )
+    flattened = np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float64)
     return flattened, layouts
 
 
@@ -381,263 +203,363 @@ def _set_flat_parameters(
     params_flat: NDArray[np.float64],
     layouts: dict[str, _ParameterLayout],
 ) -> None:
-    """Set model parameters from flat vector."""
-    idx = 0
+    """Set the model from a vector while keeping fixed storage canonical."""
+    offset = 0
     for name, layout in layouts.items():
         size = layout.free_indices.size
         values = layout.template.copy().ravel()
-        values[layout.free_indices] = params_flat[idx : idx + size]
+        values[layout.free_indices] = params_flat[offset : offset + size]
         model._parameters[name] = values.reshape(layout.shape)
-        idx += size
+        offset += size
+
+
+def _restore_parameters(
+    model: BaseItemModel,
+    parameters: dict[str, NDArray[np.float64]],
+) -> None:
+    model._parameters = {name: values.copy() for name, values in parameters.items()}
 
 
 def _unflatten_se(
     se_flat: NDArray[np.float64],
     layouts: dict[str, _ParameterLayout],
-    model: BaseItemModel,
+    _model: BaseItemModel | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Convert flat SE vector to parameter dictionary."""
-    se_dict = {}
-    idx = 0
-
+    """Restore standard errors to the model's stored parameter shapes."""
+    result: dict[str, NDArray[np.float64]] = {}
+    offset = 0
     for name, layout in layouts.items():
         size = layout.free_indices.size
         values = np.zeros(layout.shape, dtype=np.float64)
-        values.ravel()[layout.free_indices] = se_flat[idx : idx + size]
-        se_dict[name] = values
-        idx += size
+        values.ravel()[layout.free_indices] = se_flat[offset : offset + size]
+        result[name] = values
+        offset += size
+    return result
 
-    return se_dict
 
-
-def _complete_data_log_likelihood(
+def _marginal_log_likelihoods(
     model: BaseItemModel,
     responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
     quadrature: GaussHermiteQuadrature,
-) -> float:
-    """Compute expected complete-data log-likelihood."""
-    quad_points = quadrature.nodes
-    n_items = model.n_items
-
-    ll = 0.0
-    for item_idx in range(n_items):
-        item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
-
-        weighted_posterior = posterior_weights[valid_mask]
-
-        if hasattr(model, "_n_categories"):
-            n_categories = model._n_categories[item_idx]
-            for c in range(n_categories):
-                cat_mask = item_responses[valid_mask] == c
-                r_kc = np.sum(weighted_posterior[cat_mask, :], axis=0)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs[:, c], PROB_EPSILON, 1 - PROB_EPSILON)
-                ll += np.sum(r_kc * np.log(probs))
-        else:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * weighted_posterior,
-                axis=0,
-            )
-            n_k = np.sum(weighted_posterior, axis=0)
-
-            probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-            ll += np.sum(r_k * np.log(probs) + (n_k - r_k) * np.log(1 - probs))
-
-    return ll
-
-
-def _compute_person_scores(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    params_flat: NDArray[np.float64],
-    param_shapes: dict[str, _ParameterLayout],
-    h: float = 1e-5,
+    prior_mass: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Compute score contribution for each person."""
-    n_persons = responses.shape[0]
-    n_params = len(params_flat)
-
-    scores = np.zeros((n_persons, n_params))
-
-    for p in range(n_params):
-        params_plus = params_flat.copy()
-        params_plus[p] += h
-        params_minus = params_flat.copy()
-        params_minus[p] -= h
-
-        _set_flat_parameters(model, params_plus, param_shapes)
-        ll_plus = _person_log_likelihoods(
-            model, responses, posterior_weights, quadrature
+    log_mass = np.full(prior_mass.shape, -np.inf, dtype=np.float64)
+    positive = prior_mass > 0.0
+    log_mass[positive] = np.log(prior_mass[positive])
+    log_joint = (
+        np.asarray(
+            model.log_likelihood_batch(responses, quadrature.nodes),
+            dtype=np.float64,
         )
-
-        _set_flat_parameters(model, params_minus, param_shapes)
-        ll_minus = _person_log_likelihoods(
-            model, responses, posterior_weights, quadrature
-        )
-
-        scores[:, p] = (ll_plus - ll_minus) / (2 * h)
-
-    _set_flat_parameters(model, params_flat, param_shapes)
-
-    return scores
-
-
-def _person_log_likelihoods(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-) -> NDArray[np.float64]:
-    """Compute expected log-likelihood for each person."""
-    quad_points = quadrature.nodes
-    n_persons = responses.shape[0]
-    n_items = model.n_items
-
-    person_ll = np.zeros(n_persons)
-
-    for item_idx in range(n_items):
-        item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
-
-        probs_all = model.probability(quad_points, item_idx)
-
-        for i in np.where(valid_mask)[0]:
-            resp = item_responses[i]
-            weights = posterior_weights[i]
-
-            if hasattr(model, "_n_categories"):
-                probs = np.clip(probs_all[:, resp], PROB_EPSILON, 1 - PROB_EPSILON)
-            else:
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-                if resp == 0:
-                    probs = 1 - probs
-
-            person_ll[i] += np.sum(weights * np.log(probs))
-
-    return person_ll
-
-
-def _compute_complete_data_information(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    h: float = 1e-5,
-) -> NDArray[np.float64]:
-    """Compute complete-data Fisher information matrix."""
-    params_flat, param_shapes = _flatten_parameters(model)
-    n_params = len(params_flat)
-
-    info = np.zeros((n_params, n_params))
-
-    ll_cache: dict[tuple, float] = {}
-
-    def cached_ll(params: NDArray[np.float64]) -> float:
-        key = tuple(params)
-        if key not in ll_cache:
-            _set_flat_parameters(model, params, param_shapes)
-            ll_cache[key] = _complete_data_log_likelihood(
-                model, responses, posterior_weights, quadrature
-            )
-        return ll_cache[key]
-
-    ll_center = cached_ll(params_flat)
-
-    ll_single_plus = {}
-    ll_single_minus = {}
-    for i in range(n_params):
-        params_plus = params_flat.copy()
-        params_plus[i] += h
-        ll_single_plus[i] = cached_ll(params_plus)
-
-        params_minus = params_flat.copy()
-        params_minus[i] -= h
-        ll_single_minus[i] = cached_ll(params_minus)
-
-    for i in range(n_params):
-        info[i, i] = -(ll_single_plus[i] - 2 * ll_center + ll_single_minus[i]) / (h**2)
-
-    for i in range(n_params):
-        for j in range(i + 1, n_params):
-            params_pp = params_flat.copy()
-            params_pp[i] += h
-            params_pp[j] += h
-
-            params_mm = params_flat.copy()
-            params_mm[i] -= h
-            params_mm[j] -= h
-
-            params_pm = params_flat.copy()
-            params_pm[i] += h
-            params_pm[j] -= h
-
-            params_mp = params_flat.copy()
-            params_mp[i] -= h
-            params_mp[j] += h
-
-            ll_pp = cached_ll(params_pp)
-            ll_mm = cached_ll(params_mm)
-            ll_pm = cached_ll(params_pm)
-            ll_mp = cached_ll(params_mp)
-
-            info[i, j] = -(ll_pp - ll_pm - ll_mp + ll_mm) / (4 * h**2)
-            info[j, i] = info[i, j]
-
-    _set_flat_parameters(model, params_flat, param_shapes)
-
-    return info
-
-
-def _compute_missing_information_oakes(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-    quadrature: GaussHermiteQuadrature,
-    params_flat: NDArray[np.float64],
-    param_shapes: dict[str, _ParameterLayout],
-    h: float = 1e-5,
-) -> NDArray[np.float64]:
-    """Compute missing information using Oakes formula."""
-    n_params = len(params_flat)
-    I_miss = np.zeros((n_params, n_params))
-
-    scores = _compute_person_scores(
-        model, responses, posterior_weights, quadrature, params_flat, param_shapes, h
+        + log_mass[None, :]
     )
-
-    score_means = scores.mean(axis=0)
-    for i in range(scores.shape[0]):
-        centered = scores[i] - score_means
-        I_miss += np.outer(centered, centered)
-
-    I_miss /= scores.shape[0]
-
-    return I_miss
+    result = logsumexp_axis1(log_joint)
+    if not np.all(np.isfinite(result)):
+        raise ValueError("marginal log likelihood must be finite")
+    return result
 
 
-def _one_m_step_iteration(
+def _finite_difference_values(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    prior_mass: NDArray[np.float64],
+    h: float,
+    *,
+    include_cross_terms: bool,
+) -> tuple[
+    NDArray[np.float64],
+    dict[str, _ParameterLayout],
+    dict[tuple[float, ...], NDArray[np.float64]],
+]:
+    params_flat, layouts = _flatten_parameters(model)
+    original = model.parameters
+    cache: dict[tuple[float, ...], NDArray[np.float64]] = {}
+
+    def evaluate(candidate: NDArray[np.float64]) -> NDArray[np.float64]:
+        key = tuple(float(value) for value in candidate)
+        if key not in cache:
+            _set_flat_parameters(model, candidate, layouts)
+            cache[key] = _marginal_log_likelihoods(
+                model, responses, quadrature, prior_mass
+            )
+        return cache[key]
+
+    try:
+        evaluate(params_flat)
+        for index in range(params_flat.size):
+            plus = params_flat.copy()
+            minus = params_flat.copy()
+            plus[index] += h
+            minus[index] -= h
+            evaluate(plus)
+            evaluate(minus)
+        if include_cross_terms:
+            for row in range(params_flat.size):
+                for column in range(row + 1, params_flat.size):
+                    for row_sign, column_sign in (
+                        (1.0, 1.0),
+                        (1.0, -1.0),
+                        (-1.0, 1.0),
+                        (-1.0, -1.0),
+                    ):
+                        candidate = params_flat.copy()
+                        candidate[row] += row_sign * h
+                        candidate[column] += column_sign * h
+                        evaluate(candidate)
+    finally:
+        _restore_parameters(model, original)
+
+    return params_flat, layouts, cache
+
+
+def _cached_value(
+    cache: dict[tuple[float, ...], NDArray[np.float64]],
+    candidate: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    return cache[tuple(float(value) for value in candidate)]
+
+
+def _finite_difference_information(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    prior_mass: NDArray[np.float64],
+    h: float,
+    person_weights: NDArray[np.float64] | None = None,
+) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
+    params, layouts, cache = _finite_difference_values(
+        model,
+        responses,
+        quadrature,
+        prior_mass,
+        h,
+        include_cross_terms=True,
+    )
+    n_persons = responses.shape[0]
+    weights = (
+        np.ones(n_persons, dtype=np.float64)
+        if person_weights is None
+        else np.asarray(person_weights, dtype=np.float64)
+    )
+    center = _cached_value(cache, params)
+    information = np.zeros((params.size, params.size), dtype=np.float64)
+
+    for row in range(params.size):
+        plus = params.copy()
+        minus = params.copy()
+        plus[row] += h
+        minus[row] -= h
+        second = _cached_value(cache, plus) - 2.0 * center + _cached_value(cache, minus)
+        information[row, row] = -float(weights @ second) / h**2
+
+        for column in range(row + 1, params.size):
+            plus_plus = params.copy()
+            plus_minus = params.copy()
+            minus_plus = params.copy()
+            minus_minus = params.copy()
+            plus_plus[row] += h
+            plus_plus[column] += h
+            plus_minus[row] += h
+            plus_minus[column] -= h
+            minus_plus[row] -= h
+            minus_plus[column] += h
+            minus_minus[row] -= h
+            minus_minus[column] -= h
+            cross = (
+                _cached_value(cache, plus_plus)
+                - _cached_value(cache, plus_minus)
+                - _cached_value(cache, minus_plus)
+                + _cached_value(cache, minus_minus)
+            )
+            value = -float(weights @ cross) / (4.0 * h**2)
+            information[row, column] = value
+            information[column, row] = value
+    return information, layouts
+
+
+def _finite_difference_scores(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    prior_mass: NDArray[np.float64],
+    h: float,
+) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
+    params, layouts, cache = _finite_difference_values(
+        model,
+        responses,
+        quadrature,
+        prior_mass,
+        h,
+        include_cross_terms=False,
+    )
+    scores = np.empty((responses.shape[0], params.size), dtype=np.float64)
+    for column in range(params.size):
+        plus = params.copy()
+        minus = params.copy()
+        plus[column] += h
+        minus[column] -= h
+        scores[:, column] = (
+            _cached_value(cache, plus) - _cached_value(cache, minus)
+        ) / (2.0 * h)
+    return scores, layouts
+
+
+def _se_from_information(
+    information: NDArray[np.float64],
+    layouts: dict[str, _ParameterLayout],
+) -> dict[str, NDArray[np.float64]]:
+    if information.size == 0:
+        return _unflatten_se(np.empty(0, dtype=np.float64), layouts)
+    information = (information + information.T) / 2.0
+    try:
+        covariance = np.linalg.inv(information)
+    except np.linalg.LinAlgError:
+        covariance = np.linalg.pinv(information)
+    variances = np.diag(covariance)
+    se = np.full(variances.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(variances) & (variances >= 0.0)
+    se[valid] = np.sqrt(variances[valid])
+    return _unflatten_se(se, layouts)
+
+
+def compute_observed_information(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     posterior_weights: NDArray[np.float64],
     quadrature: GaussHermiteQuadrature,
-    param_shapes: dict[str, _ParameterLayout],
+    h: float = 1e-5,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Perform one M-step iteration and return updated parameters."""
-    from mirt.estimation.em import EMEstimator
+    """Return the negative Hessian of the marginal log-likelihood."""
+    step = _validate_step_size(h)
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    information, _ = _finite_difference_information(
+        model, response_array, quadrature, mass, step
+    )
+    return information
 
-    estimator = EMEstimator(n_quadpts=len(quadrature.weights))
-    estimator._quadrature = quadrature
 
-    estimator._m_step(model, responses, posterior_weights)
+def compute_crossprod_se(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    h: float = 1e-5,
+    prior_mass: NDArray[np.float64] | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Compute standard errors from the outer product of person scores."""
+    step = _validate_step_size(h)
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    scores, layouts = _finite_difference_scores(
+        model, response_array, quadrature, mass, step
+    )
+    return _se_from_information(scores.T @ scores, layouts)
 
-    new_params, _ = _flatten_parameters(model)
 
-    return new_params
+def compute_sandwich_se(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    survey_weights: NDArray[np.float64] | None = None,
+    h: float = 1e-5,
+    prior_mass: NDArray[np.float64] | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Compute robust bread-meat-bread standard errors."""
+    step = _validate_step_size(h)
+    response_array = np.asarray(responses)
+    n_persons = response_array.shape[0]
+    if survey_weights is None:
+        weights = np.ones(n_persons, dtype=np.float64)
+    else:
+        weights = np.asarray(survey_weights, dtype=np.float64)
+        if weights.shape != (n_persons,):
+            raise ValueError(
+                f"survey_weights must have shape ({n_persons},), got {weights.shape}"
+            )
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError("survey_weights must contain finite non-negative values")
+        if not np.any(weights > 0.0):
+            raise ValueError("survey_weights must contain positive total weight")
+
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    bread, layouts = _finite_difference_information(
+        model,
+        response_array,
+        quadrature,
+        mass,
+        step,
+        person_weights=weights,
+    )
+    scores, _ = _finite_difference_scores(model, response_array, quadrature, mass, step)
+    weighted_scores = weights[:, None] * scores
+    meat = weighted_scores.T @ weighted_scores
+    try:
+        bread_inv = np.linalg.inv(bread)
+    except np.linalg.LinAlgError:
+        bread_inv = np.linalg.pinv(bread)
+    covariance = bread_inv @ meat @ bread_inv.T
+    variances = np.diag(covariance)
+    se = np.full(variances.shape, np.nan, dtype=np.float64)
+    valid = np.isfinite(variances) & (variances >= 0.0)
+    se[valid] = np.sqrt(variances[valid])
+    return _unflatten_se(se, layouts)
+
+
+def compute_oakes_se(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    h: float = 1e-5,
+    prior_mass: NDArray[np.float64] | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Compute observed-information standard errors at an EM solution."""
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    information, layouts = _finite_difference_information(
+        model,
+        response_array,
+        quadrature,
+        mass,
+        _validate_step_size(h),
+    )
+    return _se_from_information(information, layouts)
+
+
+def compute_sem_se(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    n_bootstrap: int = 50,
+    seed: int | None = None,
+    *,
+    h: float = 1e-5,
+    prior_mass: NDArray[np.float64] | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Compute deterministic observed-information SEs for an EM solution.
+
+    ``n_bootstrap`` and ``seed`` remain accepted for API compatibility with
+    the former stochastic approximation.
+    """
+    del n_bootstrap, seed
+    return compute_oakes_se(
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h=h,
+        prior_mass=prior_mass,
+    )
