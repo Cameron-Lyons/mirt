@@ -30,6 +30,45 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
+def _validate_weights(
+    weights: NDArray[np.float64],
+    *,
+    expected_size: int | None = None,
+) -> NDArray[np.float64]:
+    """Return a validated one-dimensional survey-weight vector."""
+    raw_weights = np.asarray(weights)
+    if raw_weights.ndim != 1:
+        raise ValueError("weights must be one-dimensional")
+    if raw_weights.dtype.kind not in "iuf":
+        raise ValueError("weights must be numeric")
+
+    validated = np.asarray(raw_weights, dtype=np.float64)
+    if expected_size is not None and validated.size != expected_size:
+        raise ValueError(
+            f"weights length ({validated.size}) must match "
+            f"number of persons ({expected_size})"
+        )
+    if not np.all(np.isfinite(validated)):
+        raise ValueError("weights must be finite")
+    if np.any(validated < 0.0):
+        raise ValueError("weights must be non-negative")
+    if not np.any(validated > 0.0):
+        raise ValueError("weights must contain at least one positive value")
+    return validated
+
+
+def _normalize_weights_to_total(
+    weights: NDArray[np.float64], total: float
+) -> NDArray[np.float64]:
+    scaled = weights / np.max(weights)
+    return scaled * (total / np.sum(scaled))
+
+
+def _effective_sample_size(weights: NDArray[np.float64]) -> float:
+    scaled = weights / np.max(weights)
+    return float(np.sum(scaled) ** 2 / np.sum(scaled**2))
+
+
 class WeightedEMEstimator(EMEstimator):
     """EM estimator with support for survey weights.
 
@@ -70,7 +109,9 @@ class WeightedEMEstimator(EMEstimator):
         normalize_weights: bool = True,
     ) -> None:
         super().__init__(n_quadpts, max_iter, tol, verbose)
-        self.normalize_weights = normalize_weights
+        if not isinstance(normalize_weights, (bool, np.bool_)):
+            raise ValueError("normalize_weights must be a boolean")
+        self.normalize_weights = bool(normalize_weights)
 
     def fit(
         self,
@@ -106,19 +147,12 @@ class WeightedEMEstimator(EMEstimator):
         n_persons = responses.shape[0]
 
         if weights is None:
-            weights = np.ones(n_persons)
+            weights = np.ones(n_persons, dtype=np.float64)
         else:
-            weights = np.asarray(weights).ravel()
-            if len(weights) != n_persons:
-                raise ValueError(
-                    f"weights length ({len(weights)}) must match "
-                    f"number of persons ({n_persons})"
-                )
-            if np.any(weights < 0):
-                raise ValueError("weights must be non-negative")
+            weights = _validate_weights(weights, expected_size=n_persons)
 
         if self.normalize_weights:
-            weights = weights * n_persons / weights.sum()
+            weights = _normalize_weights_to_total(weights, float(n_persons))
 
         self._weights = weights
 
@@ -137,6 +171,7 @@ class WeightedEMEstimator(EMEstimator):
 
         self._convergence_history = []
         prev_ll = -np.inf
+        converged = False
 
         for iteration in range(self.max_iter):
             posterior_weights, marginal_ll = self._e_step_weighted(
@@ -149,6 +184,7 @@ class WeightedEMEstimator(EMEstimator):
             self._log_iteration(iteration, current_ll)
 
             if self._check_convergence(prev_ll, current_ll):
+                converged = True
                 if self.verbose:
                     print(f"Converged at iteration {iteration}")
                 break
@@ -157,6 +193,13 @@ class WeightedEMEstimator(EMEstimator):
 
             self._m_step_weighted(model, responses, posterior_weights, weights)
 
+        if not converged:
+            posterior_weights, marginal_ll = self._e_step_weighted(
+                model, responses, prior_mean, prior_cov, weights
+            )
+            current_ll = float(np.sum(weights * np.log(marginal_ll + 1e-300)))
+            self._convergence_history[-1] = current_ll
+
         model._is_fitted = True
 
         standard_errors = self._compute_weighted_standard_errors(
@@ -164,7 +207,7 @@ class WeightedEMEstimator(EMEstimator):
         )
 
         n_params = model.n_parameters
-        effective_n = weights.sum() ** 2 / np.sum(weights**2)
+        effective_n = _effective_sample_size(weights)
         aic = self._compute_aic(current_ll, n_params)
         bic = self._compute_bic(current_ll, n_params, effective_n)
 
@@ -172,7 +215,7 @@ class WeightedEMEstimator(EMEstimator):
             model=model,
             log_likelihood=current_ll,
             n_iterations=iteration + 1,
-            converged=iteration < self.max_iter - 1,
+            converged=converged,
             standard_errors=standard_errors,
             aic=aic,
             bic=bic,
@@ -345,8 +388,8 @@ def compute_effective_sample_size(weights: NDArray[np.float64]) -> float:
         Effective sample size, which is smaller than actual N when
         weights vary substantially
     """
-    weights = np.asarray(weights)
-    return weights.sum() ** 2 / np.sum(weights**2)
+    weights = _validate_weights(weights)
+    return _effective_sample_size(weights)
 
 
 def compute_design_effect(weights: NDArray[np.float64]) -> float:
@@ -363,6 +406,7 @@ def compute_design_effect(weights: NDArray[np.float64]) -> float:
         Design effect, ratio of actual variance to SRS variance.
         DEFF = n / effective_n
     """
+    weights = _validate_weights(weights)
     n = len(weights)
-    effective_n = compute_effective_sample_size(weights)
+    effective_n = _effective_sample_size(weights)
     return n / effective_n
