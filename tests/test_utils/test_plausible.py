@@ -21,9 +21,13 @@ class TestGeneratePlausibleValues:
             ({"n_plausible": 1.5}, "n_plausible"),
             ({"n_quadpts": 0}, "n_quadpts"),
             ({"method": "mcmc", "n_iter": 0}, "n_iter"),
+            ({"method": "mcmc", "burn_in": -1}, "burn_in"),
+            ({"method": "mcmc", "proposal_scale": 0}, "proposal_scale"),
+            ({"method": "mcmc", "proposal_scale": np.inf}, "proposal_scale"),
+            ({"method": "mcmc", "chunk_size": 0}, "chunk_size"),
         ],
     )
-    def test_generation_parameters_must_be_positive_integers(
+    def test_generation_parameters_are_validated(
         self,
         fitted_2pl_model,
         dichotomous_responses,
@@ -127,20 +131,19 @@ class TestGeneratePlausibleValues:
         assert pvs.shape == (n_persons, 1, 3)
         assert not np.array_equal(pvs[:, :, 0], pvs[:, :, -1])
 
-    def test_mcmc_reuses_current_log_density(
+    def test_mcmc_batches_people_and_reuses_current_log_density(
         self,
         fitted_2pl_model_small,
         monkeypatch,
     ):
-        """MCMC recomputes only proposed states after initialization."""
+        """MCMC uses one paired likelihood call per iteration and batch."""
         model = fitted_2pl_model_small["result"].model
-        responses = fitted_2pl_model_small["responses"][:2]
+        responses = fitted_2pl_model_small["responses"][:5]
         original = model.log_likelihood
-        call_count = 0
+        batch_sizes = []
 
         def counted_likelihood(responses, theta):
-            nonlocal call_count
-            call_count += 1
+            batch_sizes.append(len(responses))
             return original(responses, theta)
 
         monkeypatch.setattr(model, "log_likelihood", counted_likelihood)
@@ -151,10 +154,91 @@ class TestGeneratePlausibleValues:
             n_plausible=3,
             method="mcmc",
             n_iter=4,
+            burn_in=2,
+            chunk_size=2,
             seed=42,
         )
 
-        assert call_count == responses.shape[0] * (1 + 3 * 4)
+        n_batches = 3
+        assert len(batch_sizes) == n_batches * (1 + 2 + 3 * 4)
+        assert batch_sizes == [2, 2, 1] * (1 + 2 + 3 * 4)
+
+    def test_mcmc_controls_are_reproducible(
+        self,
+        fitted_2pl_model_small,
+    ):
+        """Burn-in and proposal tuning retain seeded reproducibility."""
+        model = fitted_2pl_model_small["result"].model
+        responses = fitted_2pl_model_small["responses"][:8]
+        kwargs = {
+            "n_plausible": 3,
+            "method": "mcmc",
+            "n_iter": 5,
+            "burn_in": 4,
+            "proposal_scale": 0.35,
+            "chunk_size": 3,
+            "seed": 42,
+        }
+
+        first = generate_plausible_values(model, responses, **kwargs)
+        second = generate_plausible_values(model, responses, **kwargs)
+        unchunked = generate_plausible_values(
+            model,
+            responses,
+            **{**kwargs, "chunk_size": len(responses)},
+        )
+
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(first, unchunked)
+        assert np.isfinite(first).all()
+        assert not np.array_equal(first[:, :, 0], first[:, :, -1])
+
+    def test_mcmc_supports_paired_polytomous_likelihoods(self):
+        """Batched sampling supports fitted ordinal item models."""
+        from mirt.models.polytomous import GradedResponseModel
+
+        model = GradedResponseModel(n_items=3, n_categories=[3, 4, 3])
+        model._is_fitted = True
+        responses = np.array(
+            [[0, 1, 2], [2, 3, 1], [1, -1, 0], [2, 0, 2]],
+            dtype=int,
+        )
+
+        pvs = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=2,
+            method="mcmc",
+            n_iter=3,
+            burn_in=2,
+            seed=7,
+        )
+
+        assert pvs.shape == (4, 1, 2)
+        assert np.isfinite(pvs).all()
+
+    def test_mcmc_supports_multidimensional_likelihoods(self):
+        """Batched sampling advances every latent dimension."""
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        model = TwoParameterLogistic(n_items=3, n_factors=2)
+        model._is_fitted = True
+        responses = np.array([[0, 1, 0], [1, 1, 0], [1, -1, 1], [0, 0, 1]])
+
+        pvs = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=3,
+            method="mcmc",
+            n_iter=4,
+            burn_in=3,
+            seed=11,
+        )
+
+        assert pvs.shape == (4, 2, 3)
+        assert np.isfinite(pvs).all()
+        assert np.any(pvs[:, 0, :] != 0.0)
+        assert np.any(pvs[:, 1, :] != 0.0)
 
     def test_pv_variability(self, fitted_2pl_model, dichotomous_responses):
         """Test that PVs show appropriate variability."""

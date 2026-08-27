@@ -29,6 +29,9 @@ def generate_plausible_values(
     n_quadpts: int = 21,
     n_iter: int = 50,
     seed: int | None = None,
+    burn_in: int = 0,
+    proposal_scale: float = 0.5,
+    chunk_size: int = 4096,
 ) -> NDArray[np.float64]:
     """Generate plausible values for latent abilities.
 
@@ -54,6 +57,15 @@ def generate_plausible_values(
         Positive number of MCMC iterations between draws (for mcmc method)
     seed : int, optional
         Random seed
+    burn_in : int
+        Non-negative number of MCMC iterations to discard before the first
+        retained draw. Default 0.
+    proposal_scale : float
+        Positive standard deviation of the MCMC random-walk proposal.
+        Default 0.5.
+    chunk_size : int
+        Positive number of people evaluated in each MCMC likelihood batch.
+        Smaller values reduce peak memory use. Default 4096.
 
     Returns
     -------
@@ -93,6 +105,25 @@ def generate_plausible_values(
         or n_iter < 1
     ):
         raise ValueError("n_iter must be a positive integer")
+    if method == "mcmc" and (
+        isinstance(burn_in, bool)
+        or not isinstance(burn_in, (int, np.integer))
+        or burn_in < 0
+    ):
+        raise ValueError("burn_in must be a non-negative integer")
+    if method == "mcmc" and (
+        isinstance(proposal_scale, bool)
+        or not isinstance(proposal_scale, (int, float, np.integer, np.floating))
+        or not np.isfinite(proposal_scale)
+        or proposal_scale <= 0
+    ):
+        raise ValueError("proposal_scale must be a positive finite number")
+    if method == "mcmc" and (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, (int, np.integer))
+        or chunk_size < 1
+    ):
+        raise ValueError("chunk_size must be a positive integer")
 
     responses = validate_responses(responses, n_items=model.n_items)
     observed = responses >= 0
@@ -112,7 +143,16 @@ def generate_plausible_values(
     if method == "posterior":
         pvs = _generate_pv_posterior(model, responses, n_plausible, n_quadpts, rng)
     else:
-        pvs = _generate_pv_mcmc(model, responses, n_plausible, rng, n_iter)
+        pvs = _generate_pv_mcmc(
+            model,
+            responses,
+            n_plausible,
+            rng,
+            n_iter,
+            burn_in,
+            float(proposal_scale),
+            int(chunk_size),
+        )
 
     return pvs
 
@@ -153,45 +193,66 @@ def _generate_pv_posterior(
     return pvs
 
 
+def _paired_log_density(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    chunk_size: int,
+) -> NDArray[np.float64]:
+    """Evaluate paired person/ability log densities in bounded batches."""
+    n_persons = responses.shape[0]
+    density = np.empty(n_persons, dtype=np.float64)
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        theta_chunk = theta[start:stop]
+        log_likelihood = np.asarray(
+            model.log_likelihood(responses[start:stop], theta_chunk),
+            dtype=np.float64,
+        )
+        if log_likelihood.shape != (stop - start,):
+            raise ValueError(
+                "model.log_likelihood must return one value per response row"
+            )
+        density[start:stop] = log_likelihood - 0.5 * np.einsum(
+            "ij,ij->i", theta_chunk, theta_chunk, optimize=True
+        )
+    return density
+
+
 def _generate_pv_mcmc(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     n_plausible: int,
     rng: np.random.Generator,
     n_iter: int = 50,
+    burn_in: int = 0,
+    proposal_scale: float = 0.5,
+    chunk_size: int = 4096,
 ) -> NDArray[np.float64]:
-    """Generate PVs using MCMC sampling."""
+    """Generate PVs using batched random-walk Metropolis sampling."""
     n_persons = responses.shape[0]
     n_factors = model.n_factors
 
-    proposal_sd = 0.5
+    theta = np.zeros((n_persons, n_factors), dtype=np.float64)
+    current_log_density = _paired_log_density(model, responses, theta, chunk_size)
+    pvs = np.empty((n_persons, n_factors, n_plausible), dtype=np.float64)
 
-    pvs = np.zeros((n_persons, n_factors, n_plausible))
-
-    for i in range(n_persons):
-        resp_i = responses[i : i + 1]
-
-        theta = np.zeros(n_factors)
-        current_log_density = float(
-            model.log_likelihood(resp_i, theta.reshape(1, -1))[0]
-            - 0.5 * np.dot(theta, theta)
+    draw = 0
+    total_iterations = burn_in + n_plausible * n_iter
+    for completed in range(1, total_iterations + 1):
+        proposal = theta + rng.normal(0.0, proposal_scale, size=theta.shape)
+        proposal_log_density = _paired_log_density(
+            model, responses, proposal, chunk_size
         )
+        accepted = (
+            np.log(rng.random(n_persons)) < proposal_log_density - current_log_density
+        )
+        theta[accepted] = proposal[accepted]
+        current_log_density[accepted] = proposal_log_density[accepted]
 
-        for p in range(n_plausible):
-            for _ in range(n_iter):
-                proposal = theta + rng.normal(0, proposal_sd, n_factors)
-
-                ll_proposal = model.log_likelihood(resp_i, proposal.reshape(1, -1))[0]
-                proposal_log_density = float(
-                    ll_proposal - 0.5 * np.dot(proposal, proposal)
-                )
-                log_alpha = proposal_log_density - current_log_density
-
-                if np.log(rng.random()) < log_alpha:
-                    theta = proposal
-                    current_log_density = proposal_log_density
-
-            pvs[i, :, p] = theta
+        if completed > burn_in and (completed - burn_in) % n_iter == 0:
+            pvs[:, :, draw] = theta
+            draw += 1
 
     return pvs
 
