@@ -223,9 +223,13 @@ def test_sparse_bayesian_refreshes_final_variational_state(monkeypatch):
 
     result = estimator.fit(model, responses)
     expected = estimator._compute_elbo(responses, np.zeros(1), np.eye(1))
+    expected_log_likelihood = estimator._compute_log_likelihood(
+        responses,
+        result.sparse_loadings,
+    )
 
     assert result.elbo == pytest.approx(expected)
-    assert result.log_likelihood == pytest.approx(expected)
+    assert result.log_likelihood == pytest.approx(expected_log_likelihood)
     assert result.elbo_history[-1] == pytest.approx(expected)
     assert result.converged
     assert len(estimator.convergence_history) == 2
