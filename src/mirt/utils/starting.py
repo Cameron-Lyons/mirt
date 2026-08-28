@@ -131,6 +131,35 @@ def _random_category_parameter(
     return np.sort(draws, axis=-1) if ordered else draws
 
 
+def _random_ggum_thresholds(
+    model: BaseItemModel,
+    current: NDArray[np.float64],
+    rng: np.random.Generator,
+    bounds: tuple[float, float],
+) -> NDArray[np.float64]:
+    """Randomize free GGUM thresholds and construct the symmetric scale."""
+    values = current.copy()
+    if len(set(model.n_categories)) == 1:
+        n_independent = model.n_categories[0] - 1
+        n_active = 2 * n_independent + 1
+        independent = np.sort(
+            rng.uniform(*bounds, size=(model.n_items, n_independent)), axis=1
+        )
+        values[:, :n_independent] = independent
+        values[:, n_independent] = 0.0
+        values[:, n_independent + 1 : n_active] = -independent[:, ::-1]
+        return values
+
+    for item_index, n_categories in enumerate(model.n_categories):
+        n_independent = n_categories - 1
+        n_active = 2 * n_independent + 1
+        independent = np.sort(rng.uniform(*bounds, size=n_independent))
+        values[item_index, :n_independent] = independent
+        values[item_index, n_independent] = 0.0
+        values[item_index, n_independent + 1 : n_active] = -independent[::-1]
+    return values
+
+
 def _random_nominal_parameter(
     model: BaseItemModel,
     current: NDArray[np.float64],
@@ -175,7 +204,8 @@ def gen_random_pars(
     guessing_range : tuple of float
         Range for guessing parameters (min, max).
     upper_range : tuple of float
-        Range for upper asymptote parameters (min, max).
+        Range for upper asymptote and ideal-point peak-height parameters
+        (min, max).
 
     Returns
     -------
@@ -253,6 +283,14 @@ def gen_random_pars(
             elif name in ("difficulty", "intercepts", "location"):
                 params[name] = rng.uniform(*difficulty_range, size=current.shape)
 
+            elif name == "thresholds" and getattr(model, "model_name", "") == "GGUM":
+                params[name] = _random_ggum_thresholds(
+                    model,
+                    current,
+                    rng,
+                    difficulty_range,
+                )
+
             elif name in ("thresholds", "steps"):
                 params[name] = _random_category_parameter(
                     model,
@@ -267,6 +305,10 @@ def gen_random_pars(
 
             elif name == "upper":
                 params[name] = rng.uniform(*upper_range, size=current.shape)
+
+            elif name == "peak_height":
+                values = rng.uniform(*upper_range, size=current.shape)
+                params[name] = np.maximum(values, np.nextafter(0.0, 1.0))
 
             elif name == "asymmetry":
                 params[name] = rng.uniform(0.5, 2.0, size=current.shape)
