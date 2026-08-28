@@ -12,9 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
-
-from mirt.constants import PROB_EPSILON
+from scipy import special, stats
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
@@ -64,6 +62,8 @@ def anova_irt(
 
     if len(results) < 2:
         raise ValueError("At least two models required for comparison")
+    if not isinstance(method, str) or method.upper() != "LRT":
+        raise ValueError("method must be 'LRT'")
 
     model_names = []
     log_likelihoods = []
@@ -94,7 +94,7 @@ def anova_irt(
         else:
             chi_sq.append(ll_diff)
             df_diff.append(param_diff)
-            p_values.append(1 - stats.chi2.cdf(ll_diff, param_diff))
+            p_values.append(stats.chi2.sf(ll_diff, param_diff))
 
     data = {
         "Model": model_names,
@@ -191,7 +191,10 @@ def vuong_test(
     result1: FitResult,
     result2: FitResult,
     responses: NDArray[np.int_],
-) -> dict[str, float]:
+    *,
+    alpha: float = 0.05,
+    n_quadpts: int = 49,
+) -> dict[str, float | str]:
     """Vuong test for non-nested model comparison.
 
     Tests whether two models are equally close to the true data generating
@@ -203,6 +206,10 @@ def vuong_test(
         Two fitted model results
     responses : NDArray
         Response matrix used to fit the models
+    alpha : float, default=0.05
+        Two-sided significance level used to select a preferred model
+    n_quadpts : int, default=49
+        Number of Gauss-Hermite points per latent dimension
 
     Returns
     -------
@@ -211,33 +218,89 @@ def vuong_test(
         - 'z': Vuong test statistic
         - 'p_value': Two-sided p-value
         - 'preferred': Name of preferred model (or 'neither')
-    """
-    responses = np.asarray(responses)
-    n_persons = responses.shape[0]
+        - 'mean_log_likelihood_difference': Mean personwise difference
+        - 'standard_error': Standard error of the mean difference
 
-    ll1 = _compute_person_loglik(result1.model, responses)
-    ll2 = _compute_person_loglik(result2.model, responses)
+    Notes
+    -----
+    Personwise likelihoods are marginalized over a standard-normal latent
+    distribution. This matches the default latent distribution used during
+    model estimation.
+    """
+    from mirt.results._common import validate_alpha
+    from mirt.scoring._common import validate_scoring_responses
+
+    validated_alpha = validate_alpha(alpha)
+    if (
+        isinstance(n_quadpts, (bool, np.bool_))
+        or not isinstance(n_quadpts, (int, np.integer))
+        or n_quadpts < 5
+    ):
+        raise ValueError("n_quadpts must be an integer of at least 5")
+
+    model1 = result1.model
+    model2 = result2.model
+    if model1.n_items != model2.n_items:
+        raise ValueError("models must contain the same number of items")
+    categories1 = (
+        np.asarray(model1.n_categories, dtype=np.int_)
+        if model1.is_polytomous
+        else np.full(model1.n_items, 2, dtype=np.int_)
+    )
+    categories2 = (
+        np.asarray(model2.n_categories, dtype=np.int_)
+        if model2.is_polytomous
+        else np.full(model2.n_items, 2, dtype=np.int_)
+    )
+    if not np.array_equal(categories1, categories2):
+        raise ValueError("models must use the same response categories")
+
+    validated_responses = validate_scoring_responses(model1, responses)
+    # Validate category ranges against both candidate models. This matters for
+    # comparisons between different polytomous model families.
+    second_responses = validate_scoring_responses(model2, responses)
+    if not np.array_equal(validated_responses, second_responses):
+        raise ValueError("models must use the same response coding")
+
+    n_persons = validated_responses.shape[0]
+    if n_persons < 2:
+        raise ValueError("responses must contain at least two persons")
+    for result in (result1, result2):
+        fitted_n = getattr(result, "n_observations", 0)
+        if fitted_n > 0 and fitted_n != n_persons:
+            raise ValueError(
+                "responses must contain the observations used to fit both models"
+            )
+
+    ll1 = _compute_person_loglik(model1, validated_responses, n_quadpts)
+    ll2 = _compute_person_loglik(model2, validated_responses, n_quadpts)
 
     diff = ll1 - ll2
 
-    mean_diff = np.mean(diff)
-    var_diff = np.var(diff, ddof=1)
+    mean_diff = float(np.mean(diff))
+    var_diff = float(np.var(diff, ddof=1))
+    standard_error = float(np.sqrt(var_diff / n_persons))
 
-    if var_diff < PROB_EPSILON:
+    variance_tolerance = np.finfo(np.float64).eps * max(
+        1.0, float(np.mean(np.square(diff)))
+    )
+    if var_diff <= variance_tolerance:
         return {
             "z": 0.0,
             "p_value": 1.0,
             "preferred": "neither",
+            "mean_log_likelihood_difference": mean_diff,
+            "standard_error": standard_error,
         }
 
-    z = np.sqrt(n_persons) * mean_diff / np.sqrt(var_diff)
-    p_value = 2 * (1 - stats.norm.cdf(abs(z)))
+    z = mean_diff / standard_error
+    p_value = 2.0 * special.ndtr(-abs(z))
 
-    if p_value < 0.05:
+    if p_value < validated_alpha:
         if z > 0:
-            preferred = result1.model.model_name
+            preferred = model1.model_name
         else:
-            preferred = result2.model.model_name
+            preferred = model2.model_name
     else:
         preferred = "neither"
 
@@ -245,24 +308,92 @@ def vuong_test(
         "z": float(z),
         "p_value": float(p_value),
         "preferred": preferred,
+        "mean_log_likelihood_difference": mean_diff,
+        "standard_error": standard_error,
     }
 
 
 def _compute_person_loglik(
     model: Any,
     responses: NDArray[np.int_],
+    n_quadpts: int,
 ) -> NDArray[np.float64]:
-    """Compute log-likelihood for each person."""
-    from mirt.scoring import fscores
+    """Compute each person's marginal response-pattern log-likelihood."""
+    from mirt.scoring._common import build_quadrature
+    from mirt.utils.numeric import logsumexp_axis1
 
-    n_persons, n_items = responses.shape
+    quad_points, quad_weights = build_quadrature(
+        n_quadpts=n_quadpts,
+        n_factors=model.n_factors,
+        prior_mean=None,
+        prior_cov=None,
+    )
+    weights = np.asarray(quad_weights, dtype=np.float64)
+    if (
+        weights.ndim != 1
+        or weights.shape[0] != quad_points.shape[0]
+        or not np.all(np.isfinite(weights))
+        or np.any(weights <= 0.0)
+    ):
+        raise ValueError("quadrature weights must be finite and positive")
+    weights = weights / weights.sum()
+    log_weights = np.log(weights)
 
-    scores = fscores(model, responses, method="EAP")
-    theta = scores.theta
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
+    n_persons = responses.shape[0]
+    n_nodes = quad_points.shape[0]
+    # Bound the largest temporary likelihood matrix to roughly eight MiB.
+    batch_size = max(1, 1_000_000 // n_nodes)
+    marginal = np.empty(n_persons, dtype=np.float64)
 
-    return model.log_likelihood(responses, theta)
+    batch_method = getattr(model, "log_likelihood_batch", None)
+    for start in range(0, n_persons, batch_size):
+        stop = min(start + batch_size, n_persons)
+        response_batch = responses[start:stop]
+
+        if callable(batch_method):
+            try:
+                raw_log_likelihood = batch_method(response_batch, quad_points)
+            except NotImplementedError:
+                batch_method = None
+                raw_log_likelihood = _conditional_loglik_grid(
+                    model, response_batch, quad_points
+                )
+        else:
+            raw_log_likelihood = _conditional_loglik_grid(
+                model, response_batch, quad_points
+            )
+
+        log_likelihood = np.asarray(raw_log_likelihood, dtype=np.float64)
+        expected_shape = (stop - start, n_nodes)
+        if log_likelihood.shape != expected_shape:
+            raise ValueError(
+                "model.log_likelihood_batch returned shape "
+                f"{log_likelihood.shape}, expected {expected_shape}"
+            )
+        if not np.all(np.isfinite(log_likelihood)):
+            raise ValueError("model produced non-finite person log-likelihoods")
+
+        marginal[start:stop] = logsumexp_axis1(
+            log_likelihood + log_weights[None, :]
+        )
+
+    if not np.all(np.isfinite(marginal)):
+        raise ValueError("model produced non-finite marginal log-likelihoods")
+    return marginal
+
+
+def _conditional_loglik_grid(
+    model: Any,
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate a model without a vectorized quadrature-grid method."""
+    n_persons = responses.shape[0]
+    columns = []
+    for point in quad_points:
+        theta = np.broadcast_to(point, (n_persons, point.size))
+        columns.append(np.asarray(model.log_likelihood(responses, theta)))
+    return np.column_stack(columns)
 
 
 def information_criteria(

@@ -95,6 +95,7 @@ Diagnostics
    compute_fit_indices
    compare_models
    anova_irt
+   vuong_test
    compute_dtf
    compute_drf
    sibtest
