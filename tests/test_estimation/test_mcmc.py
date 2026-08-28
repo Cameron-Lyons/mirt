@@ -4,7 +4,28 @@ import numpy as np
 import pytest
 
 from mirt import GibbsSampler, MCMCResult, MHRMEstimator, TwoParameterLogistic
+from mirt.exceptions import MirtEstimationError
 from mirt.results.fit_result import FitResult
+
+
+def _manual_posterior_waic(
+    model, responses: np.ndarray, chains: dict[str, np.ndarray]
+) -> float:
+    """Evaluate the pointwise WAIC definition with paired posterior draws."""
+    evaluation_model = model.copy()
+    pointwise = []
+    for sample_index, theta in enumerate(chains["theta"]):
+        for name in model.parameters:
+            evaluation_model._parameters[name] = chains[name][sample_index]
+        pointwise.append(evaluation_model.log_likelihood(responses, theta))
+
+    log_likelihood = np.stack(pointwise)
+    maximum = np.max(log_likelihood, axis=0)
+    lppd = np.sum(
+        maximum + np.log(np.mean(np.exp(log_likelihood - maximum[None, :]), axis=0))
+    )
+    effective_parameters = np.sum(np.var(log_likelihood, axis=0))
+    return float(-2.0 * (lppd - effective_parameters))
 
 
 class TestMHRMEstimator:
@@ -452,6 +473,109 @@ class TestMCMCResult:
         assert result.n_iterations == n_iter
         assert result.burnin == burnin
         assert result.thin == thin
+
+
+class TestWAICComputation:
+    """Tests for stable posterior-draw WAIC evaluation."""
+
+    def test_fit_reports_waic_from_paired_posterior_draws(self, dichotomous_responses):
+        responses = dichotomous_responses["responses"]
+        model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
+        sampler = GibbsSampler(
+            n_iter=30,
+            burnin=10,
+            thin=2,
+            use_rust=False,
+            seed=824,
+        )
+
+        result = sampler.fit(model, responses)
+        expected = _manual_posterior_waic(result.model, responses, result.chains)
+
+        assert result.waic == pytest.approx(expected, rel=1e-13, abs=1e-13)
+
+    def test_matches_paired_definition_with_one_likelihood_call_per_draw(
+        self, monkeypatch
+    ):
+        rng = np.random.default_rng(20260827)
+        n_samples, n_persons, n_items = 7, 11, 5
+        responses = rng.integers(0, 2, size=(n_persons, n_items))
+        model = TwoParameterLogistic(n_items=n_items)
+        model._initialize_parameters()
+        model._parameters["discrimination"] = np.linspace(0.8, 1.4, n_items)
+        model._parameters["difficulty"] = np.linspace(-0.7, 0.6, n_items)
+        original_parameters = {
+            name: values.copy() for name, values in model.parameters.items()
+        }
+        chains = {
+            "theta": rng.normal(size=(n_samples, n_persons, 1)),
+            "discrimination": rng.uniform(0.6, 1.8, size=(n_samples, n_items)),
+            "difficulty": rng.normal(0.0, 0.9, size=(n_samples, n_items)),
+            "log_likelihood": np.zeros(n_samples),
+        }
+        expected = _manual_posterior_waic(model, responses, chains)
+
+        original_log_likelihood = TwoParameterLogistic.log_likelihood
+        call_count = 0
+
+        def counted_log_likelihood(self, response_values, theta_values):
+            nonlocal call_count
+            call_count += 1
+            return original_log_likelihood(self, response_values, theta_values)
+
+        monkeypatch.setattr(
+            TwoParameterLogistic,
+            "log_likelihood",
+            counted_log_likelihood,
+        )
+        sampler = GibbsSampler(n_iter=10, burnin=2, use_rust=False)
+        actual = sampler._compute_waic(chains, model, responses)
+
+        assert actual == pytest.approx(expected, rel=1e-13, abs=1e-13)
+        assert call_count == n_samples
+        for name, values in original_parameters.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
+
+    def test_remains_finite_when_direct_exponentiation_underflows(self):
+        n_samples, n_persons, n_items = 3, 2, 1200
+        responses = np.ones((n_persons, n_items), dtype=int)
+        model = TwoParameterLogistic(n_items=n_items)
+        model._initialize_parameters()
+        model._parameters["discrimination"] = np.ones(n_items)
+        model._parameters["difficulty"] = np.zeros(n_items)
+        theta = np.zeros((n_samples, n_persons, 1))
+        chains = {
+            "theta": theta,
+            "discrimination": np.ones((n_samples, n_items)),
+            "difficulty": np.zeros((n_samples, n_items)),
+            "log_likelihood": np.zeros(n_samples),
+        }
+        pointwise = model.log_likelihood(responses, theta[0])
+        assert np.all(np.exp(pointwise) == 0.0)
+
+        sampler = GibbsSampler(n_iter=10, burnin=2, use_rust=False)
+        actual = sampler._compute_waic(chains, model, responses)
+
+        assert np.isfinite(actual)
+        assert actual == pytest.approx(float(-2.0 * np.sum(pointwise)))
+
+    def test_rejects_misaligned_parameter_chains(self):
+        model = TwoParameterLogistic(n_items=2)
+        model._initialize_parameters()
+        responses = np.zeros((3, 2), dtype=int)
+        chains = {
+            "theta": np.zeros((4, 3, 1)),
+            "discrimination": np.ones((4, 2)),
+            "difficulty": np.zeros((3, 2)),
+            "log_likelihood": np.zeros(4),
+        }
+
+        sampler = GibbsSampler(n_iter=10, burnin=2, use_rust=False)
+        with pytest.raises(
+            MirtEstimationError,
+            match="parameter chain has an unexpected shape",
+        ):
+            sampler._compute_waic(chains, model, responses)
 
 
 class TestMCMCEdgeCases:
