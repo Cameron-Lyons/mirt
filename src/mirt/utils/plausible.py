@@ -64,8 +64,9 @@ def generate_plausible_values(
         Positive standard deviation of the MCMC random-walk proposal.
         Default 0.5.
     chunk_size : int
-        Positive number of people evaluated in each MCMC likelihood batch.
-        Smaller values reduce peak memory use. Default 4096.
+        Positive number of people evaluated in each likelihood batch. Smaller
+        values reduce peak memory use for posterior and MCMC generation.
+        Default 4096.
 
     Returns
     -------
@@ -118,7 +119,7 @@ def generate_plausible_values(
         or proposal_scale <= 0
     ):
         raise ValueError("proposal_scale must be a positive finite number")
-    if method == "mcmc" and (
+    if (
         isinstance(chunk_size, bool)
         or not isinstance(chunk_size, (int, np.integer))
         or chunk_size < 1
@@ -141,7 +142,14 @@ def generate_plausible_values(
     rng = np.random.default_rng(seed)
 
     if method == "posterior":
-        pvs = _generate_pv_posterior(model, responses, n_plausible, n_quadpts, rng)
+        pvs = _generate_pv_posterior(
+            model,
+            responses,
+            n_plausible,
+            n_quadpts,
+            rng,
+            int(chunk_size),
+        )
     else:
         pvs = _generate_pv_mcmc(
             model,
@@ -163,8 +171,9 @@ def _generate_pv_posterior(
     n_plausible: int,
     n_quadpts: int,
     rng: np.random.Generator,
+    chunk_size: int,
 ) -> NDArray[np.float64]:
-    """Generate PVs by sampling from posterior using quadrature."""
+    """Generate PVs from a quadrature posterior in bounded row batches."""
     from mirt.estimation.quadrature import GaussHermiteQuadrature
 
     n_persons = responses.shape[0]
@@ -174,23 +183,65 @@ def _generate_pv_posterior(
     nodes = quad.nodes
     weights = quad.weights
 
-    log_likes = model.log_likelihood_batch(responses, nodes)
-    log_posterior = log_likes + np.log(weights + 1e-300)[None, :]
-    log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
-    posterior = np.exp(log_posterior)
-    posterior /= posterior.sum(axis=1, keepdims=True)
-
-    cumulative = np.cumsum(posterior, axis=1)
-    cumulative[:, -1] = 1.0
-
-    pvs = np.empty((n_persons, n_factors, n_plausible))
+    # Draw in the historical order before batching the deterministic likelihood
+    # work. This keeps seeded results independent of chunk_size.
+    uniforms = np.empty((n_persons, n_plausible), dtype=np.float64)
+    pvs = np.empty((n_persons, n_factors, n_plausible), dtype=np.float64)
     for p in range(n_plausible):
-        uniforms = rng.random(n_persons)
-        indices = np.sum(uniforms[:, None] > cumulative, axis=1)
-        jitter = rng.normal(0, 0.3, size=(n_persons, n_factors))
-        pvs[:, :, p] = nodes[indices] + jitter
+        uniforms[:, p] = rng.random(n_persons)
+        pvs[:, :, p] = rng.normal(0, 0.3, size=(n_persons, n_factors))
+
+    log_weights = np.log(weights + 1e-300)
+    n_nodes = nodes.shape[0]
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        log_likes = np.asarray(
+            model.log_likelihood_batch(responses[start:stop], nodes),
+            dtype=np.float64,
+        )
+        expected_shape = (stop - start, n_nodes)
+        if log_likes.shape != expected_shape:
+            raise ValueError(
+                "model.log_likelihood_batch must return one value per "
+                "response row and quadrature node"
+            )
+
+        log_posterior = log_likes + log_weights[None, :]
+        row_maximum = np.max(log_posterior, axis=1, keepdims=True)
+        if not np.all(np.isfinite(row_maximum)):
+            raise ValueError("posterior likelihood must have positive finite mass")
+        posterior = np.exp(log_posterior - row_maximum)
+        posterior_mass = posterior.sum(axis=1, keepdims=True)
+        if not np.all(np.isfinite(posterior_mass)) or np.any(posterior_mass <= 0.0):
+            raise ValueError("posterior likelihood must have positive finite mass")
+        posterior /= posterior_mass
+
+        cumulative = np.cumsum(posterior, axis=1)
+        cumulative[:, -1] = 1.0
+        indices = _inverse_cdf_rows(cumulative, uniforms[start:stop])
+        pvs[start:stop] += np.moveaxis(nodes[indices], 1, 2)
 
     return pvs
+
+
+def _inverse_cdf_rows(
+    cumulative: NDArray[np.float64],
+    uniforms: NDArray[np.float64],
+) -> NDArray[np.intp]:
+    """Search independent row CDFs without a rows-by-draws-by-nodes array."""
+    n_rows, n_nodes = cumulative.shape
+    if uniforms.shape[0] != n_rows:
+        raise ValueError("uniform draws must align with cumulative rows")
+
+    # Separate adjacent row CDFs with a unit gap before flattening them into a
+    # single monotonic sequence. The gap also handles an exact uniform draw of
+    # zero without matching the preceding row's terminal probability.
+    row_offsets = (2.0 * np.arange(n_rows, dtype=np.float64))[:, None]
+    shifted_cdf = (cumulative + row_offsets).ravel()
+    shifted_uniforms = (uniforms + row_offsets).ravel()
+    flat_indices = np.searchsorted(shifted_cdf, shifted_uniforms, side="left")
+    row_starts = (np.arange(n_rows, dtype=np.intp) * n_nodes)[:, None]
+    return flat_indices.reshape(uniforms.shape) - row_starts
 
 
 def _paired_log_density(

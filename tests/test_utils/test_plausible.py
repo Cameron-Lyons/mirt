@@ -9,6 +9,7 @@ from mirt import (
     plausible_value_regression,
     plausible_value_statistics,
 )
+from mirt.utils.plausible import _inverse_cdf_rows
 
 
 class TestGeneratePlausibleValues:
@@ -24,6 +25,7 @@ class TestGeneratePlausibleValues:
             ({"method": "mcmc", "burn_in": -1}, "burn_in"),
             ({"method": "mcmc", "proposal_scale": 0}, "proposal_scale"),
             ({"method": "mcmc", "proposal_scale": np.inf}, "proposal_scale"),
+            ({"method": "posterior", "chunk_size": 0}, "chunk_size"),
             ({"method": "mcmc", "chunk_size": 0}, "chunk_size"),
         ],
     )
@@ -113,6 +115,94 @@ class TestGeneratePlausibleValues:
         )
 
         assert call_count == 1
+
+    def test_posterior_batches_people_without_changing_seeded_draws(
+        self,
+        fitted_2pl_model,
+        dichotomous_responses,
+        monkeypatch,
+    ):
+        """Posterior row batching is reproducible across chunk sizes."""
+        model = fitted_2pl_model.model
+        responses = dichotomous_responses["responses"][:17]
+        expected = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=4,
+            method="posterior",
+            n_quadpts=15,
+            chunk_size=len(responses),
+            seed=42,
+        )
+
+        original = model.log_likelihood_batch
+        batch_sizes = []
+
+        def counted_batch(responses, theta):
+            batch_sizes.append(len(responses))
+            return original(responses, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", counted_batch)
+        actual = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=4,
+            method="posterior",
+            n_quadpts=15,
+            chunk_size=6,
+            seed=42,
+        )
+
+        np.testing.assert_array_equal(actual, expected)
+        assert batch_sizes == [6, 6, 5]
+
+    def test_posterior_rejects_malformed_batch_likelihood(
+        self,
+        fitted_2pl_model,
+        dichotomous_responses,
+        monkeypatch,
+    ):
+        """Posterior generation checks the model's batch likelihood contract."""
+        model = fitted_2pl_model.model
+        monkeypatch.setattr(
+            model,
+            "log_likelihood_batch",
+            lambda responses, theta: np.zeros(len(responses)),
+        )
+
+        with pytest.raises(ValueError, match="quadrature node"):
+            generate_plausible_values(
+                model,
+                dichotomous_responses["responses"][:3],
+                n_plausible=2,
+                method="posterior",
+                seed=42,
+            )
+
+    def test_inverse_cdf_search_matches_reference_scan(self):
+        """Flattened row search agrees with direct categorical scanning."""
+        cumulative = np.array(
+            [
+                [0.1, 0.4, 1.0],
+                [0.0, 0.25, 1.0],
+                [0.7, 0.9, 1.0],
+            ]
+        )
+        uniforms = np.array(
+            [
+                [0.0, 0.1, 0.4, 0.999],
+                [0.0, 0.2, 0.25, 0.8],
+                [0.0, 0.7, 0.95, 0.999],
+            ]
+        )
+        expected = np.sum(
+            uniforms[:, :, None] > cumulative[:, None, :],
+            axis=2,
+        )
+
+        actual = _inverse_cdf_rows(cumulative, uniforms)
+
+        np.testing.assert_array_equal(actual, expected)
 
     def test_generate_pv_mcmc(self, fitted_2pl_model_small):
         """Test MCMC sampling method."""
