@@ -8,14 +8,16 @@ This module provides:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._core import sigmoid
 from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN, PROB_EPSILON
 from mirt.models.cdm import BaseCDM
+from mirt.utils.numeric import logsumexp
 
 ReducedModelType = Literal["DINA", "DINO", "ACDM", "LLM", "RRUM", "saturated"]
 
@@ -47,13 +49,28 @@ class AttributeHierarchy:
 
     adjacency: NDArray[np.int_]
     attribute_names: list[str] | None = None
+    _topological_order: list[int] = field(init=False, repr=False)
 
-    def __post_init__(self):
-        self.adjacency = np.asarray(self.adjacency, dtype=np.int_)
-        n_attrs = self.adjacency.shape[0]
-
-        if self.adjacency.shape != (n_attrs, n_attrs):
+    def __post_init__(self) -> None:
+        raw_adjacency = np.asarray(self.adjacency)
+        if raw_adjacency.ndim != 2 or raw_adjacency.shape[0] != raw_adjacency.shape[1]:
             raise ValueError("Adjacency matrix must be square")
+        n_attrs = raw_adjacency.shape[0]
+        if n_attrs == 0:
+            raise ValueError("Adjacency matrix must contain at least one attribute")
+        if raw_adjacency.dtype.kind not in "biuf":
+            raise ValueError("Adjacency matrix must contain numeric binary values")
+        adjacency = np.asarray(raw_adjacency, dtype=np.float64)
+        if not np.all(np.isfinite(adjacency)) or np.any(
+            (adjacency != 0.0) & (adjacency != 1.0)
+        ):
+            raise ValueError("Adjacency matrix must contain only 0 and 1")
+        if np.any(np.diag(adjacency) != 0.0):
+            raise ValueError("An attribute cannot be its own prerequisite")
+
+        self.adjacency = adjacency.astype(np.int_, copy=True)
+        self._topological_order = self._compute_topological_order()
+        self.adjacency.setflags(write=False)
 
         if self.attribute_names is None:
             self.attribute_names = [f"A{i}" for i in range(n_attrs)]
@@ -62,6 +79,34 @@ class AttributeHierarchy:
                 f"attribute_names length ({len(self.attribute_names)}) "
                 f"must match n_attributes ({n_attrs})"
             )
+        else:
+            self.attribute_names = list(self.attribute_names)
+
+    def _validate_attribute_index(self, attribute: int) -> int:
+        if (
+            isinstance(attribute, (bool, np.bool_))
+            or not isinstance(attribute, (int, np.integer))
+            or attribute < 0
+            or attribute >= self.n_attributes
+        ):
+            raise IndexError(f"attribute must be in [0, {self.n_attributes})")
+        return int(attribute)
+
+    def _compute_topological_order(self) -> list[int]:
+        in_degree = np.sum(self.adjacency, axis=0).astype(np.int_, copy=False)
+        available = [int(attribute) for attribute in np.flatnonzero(in_degree == 0)]
+        order: list[int] = []
+
+        while available:
+            attribute = available.pop(0)
+            order.append(attribute)
+            children = np.flatnonzero(self.adjacency[attribute] == 1)
+            in_degree[children] -= 1
+            available.extend(int(child) for child in children if in_degree[child] == 0)
+
+        if len(order) != self.n_attributes:
+            raise ValueError("Adjacency matrix must describe a directed acyclic graph")
+        return order
 
     @property
     def n_attributes(self) -> int:
@@ -69,12 +114,13 @@ class AttributeHierarchy:
 
     def prerequisites(self, attribute: int) -> list[int]:
         """Get direct prerequisites for an attribute."""
-        return list(np.where(self.adjacency[:, attribute] == 1)[0])
+        index = self._validate_attribute_index(attribute)
+        return list(np.where(self.adjacency[:, index] == 1)[0])
 
     def all_prerequisites(self, attribute: int) -> set[int]:
         """Get all prerequisites (direct and indirect) for an attribute."""
-        visited = set()
-        stack = self.prerequisites(attribute)
+        visited: set[int] = set()
+        stack = self.prerequisites(self._validate_attribute_index(attribute))
 
         while stack:
             prereq = stack.pop()
@@ -90,47 +136,34 @@ class AttributeHierarchy:
         A pattern is valid if all prerequisites of mastered attributes
         are also mastered.
         """
-        pattern = np.asarray(pattern).ravel()
-        for k in range(self.n_attributes):
-            if pattern[k] == 1:
-                for prereq in self.prerequisites(k):
-                    if pattern[prereq] == 0:
-                        return False
-        return True
+        raw_pattern = np.asarray(pattern)
+        if raw_pattern.shape != (self.n_attributes,):
+            raise ValueError(f"pattern must have shape ({self.n_attributes},)")
+        if raw_pattern.dtype.kind not in "biuf":
+            raise ValueError("pattern must contain numeric binary values")
+        values = np.asarray(raw_pattern, dtype=np.float64)
+        if not np.all(np.isfinite(values)) or np.any((values != 0.0) & (values != 1.0)):
+            raise ValueError("pattern must contain only 0 and 1")
+
+        prerequisites, attributes = np.where(self.adjacency == 1)
+        return bool(np.all(values[attributes] <= values[prerequisites]))
 
     def valid_patterns(self) -> NDArray[np.int_]:
         """Generate all valid attribute patterns under the hierarchy."""
         n_attrs = self.n_attributes
-        n_all = 2**n_attrs
-
-        valid = []
-        for i in range(n_all):
-            pattern = np.array([(i >> k) & 1 for k in range(n_attrs)])
-            if self.is_valid_pattern(pattern):
-                valid.append(pattern)
-
-        return np.array(valid, dtype=np.int_)
+        pattern_indices = np.arange(2**n_attrs, dtype=np.uint64)[:, None]
+        bit_indices = np.arange(n_attrs, dtype=np.uint64)[None, :]
+        patterns = ((pattern_indices >> bit_indices) & 1).astype(np.int_)
+        prerequisites, attributes = np.where(self.adjacency == 1)
+        valid = np.all(
+            patterns[:, attributes] <= patterns[:, prerequisites],
+            axis=1,
+        )
+        return patterns[valid]
 
     def topological_order(self) -> list[int]:
         """Return attributes in topological order (prerequisites first)."""
-        n_attrs = self.n_attributes
-        in_degree = np.sum(self.adjacency, axis=0)
-        order = []
-        remaining = set(range(n_attrs))
-
-        while remaining:
-            for attr in remaining:
-                if in_degree[attr] == 0:
-                    order.append(attr)
-                    remaining.remove(attr)
-                    for j in range(n_attrs):
-                        if self.adjacency[attr, j] == 1:
-                            in_degree[j] -= 1
-                    break
-            else:
-                raise ValueError("Adjacency matrix contains a cycle")
-
-        return order
+        return list(self._topological_order)
 
 
 class GDINA(BaseCDM):
@@ -757,9 +790,13 @@ class HigherOrderCDM(BaseCDM):
             raise ValueError(
                 f"thresholds shape {thresholds.shape} != ({self._n_attributes},)"
             )
+        if not np.all(np.isfinite(loadings)):
+            raise ValueError("loadings must contain only finite values")
+        if not np.all(np.isfinite(thresholds)):
+            raise ValueError("thresholds must contain only finite values")
 
-        self._loadings = loadings
-        self._thresholds = thresholds
+        self._loadings = loadings.copy()
+        self._thresholds = thresholds.copy()
         self._sync_parameter_cache()
         return self
 
@@ -774,26 +811,72 @@ class HigherOrderCDM(BaseCDM):
                 f"Unknown parameter(s): {unknown_s}. Valid parameters: {valid}"
             )
 
-        if "loadings" in params:
-            loadings = np.asarray(params["loadings"], dtype=np.float64)
-            if loadings.shape != (self._n_attributes,):
-                raise ValueError(
-                    f"Shape mismatch for loadings: expected ({self._n_attributes},), "
-                    f"got {loadings.shape}"
-                )
-            self._loadings = loadings
+        loadings = np.asarray(params.get("loadings", self._loadings), dtype=np.float64)
+        thresholds = np.asarray(
+            params.get("thresholds", self._thresholds), dtype=np.float64
+        )
+        if loadings.shape != (self._n_attributes,):
+            raise ValueError(
+                f"Shape mismatch for loadings: expected ({self._n_attributes},), "
+                f"got {loadings.shape}"
+            )
+        if thresholds.shape != (self._n_attributes,):
+            raise ValueError(
+                f"Shape mismatch for thresholds: expected ({self._n_attributes},), "
+                f"got {thresholds.shape}"
+            )
+        if not np.all(np.isfinite(loadings)):
+            raise ValueError("loadings must contain only finite values")
+        if not np.all(np.isfinite(thresholds)):
+            raise ValueError("thresholds must contain only finite values")
 
-        if "thresholds" in params:
-            thresholds = np.asarray(params["thresholds"], dtype=np.float64)
-            if thresholds.shape != (self._n_attributes,):
-                raise ValueError(
-                    f"Shape mismatch for thresholds: expected ({self._n_attributes},), "
-                    f"got {thresholds.shape}"
-                )
-            self._thresholds = thresholds
+        return self.set_higher_order_params(loadings, thresholds)
 
-        self._sync_parameter_cache()
-        return self
+    def _validate_theta(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        raw_theta = np.asarray(theta)
+        if raw_theta.ndim > 2 or (raw_theta.ndim == 2 and 1 not in raw_theta.shape):
+            raise ValueError("theta must be a scalar, vector, or single-column matrix")
+        if raw_theta.dtype.kind not in "biuf":
+            raise ValueError("theta must contain numeric values")
+        values = np.asarray(raw_theta, dtype=np.float64).reshape(-1)
+        if values.size == 0:
+            raise ValueError("theta must contain at least one value")
+        if not np.all(np.isfinite(values)):
+            raise ValueError("theta must contain only finite values")
+        return values
+
+    def _validate_responses(self, responses: NDArray[np.int_]) -> NDArray[np.int_]:
+        raw_responses = np.asarray(responses)
+        if raw_responses.ndim != 2:
+            raise ValueError("responses must be a two-dimensional matrix")
+        if raw_responses.shape[1] != self.n_items:
+            raise ValueError(
+                f"responses has {raw_responses.shape[1]} items, expected {self.n_items}"
+            )
+        if raw_responses.dtype.kind not in "biuf":
+            raise ValueError("responses must contain numeric values")
+        values = np.asarray(raw_responses, dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("responses must contain only finite values")
+        observed = values >= 0.0
+        if np.any(observed & (values != 0.0) & (values != 1.0)):
+            raise ValueError(
+                "responses must contain only 0, 1, or negative missing values"
+            )
+        return np.where(observed, values, -1.0).astype(np.int_, copy=False)
+
+    def _linear_predictor(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        with np.errstate(over="ignore", invalid="ignore"):
+            differences = theta[:, np.newaxis] - self._thresholds
+            predictor = self._loadings * differences
+        predictor[:, self._loadings == 0.0] = 0.0
+        finite_limit = np.finfo(np.float64).max / (self._n_attributes + 1)
+        return np.clip(predictor, -finite_limit, finite_limit)
+
+    def _conditional_response_probability(
+        self, item_idx: int | None = None
+    ) -> NDArray[np.float64]:
+        return self._base_cdm.probability(self._valid_patterns, item_idx)
 
     def attribute_probability(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute attribute mastery probabilities given theta.
@@ -810,12 +893,8 @@ class HigherOrderCDM(BaseCDM):
         NDArray
             Probabilities (n_persons, n_attributes).
         """
-        theta = np.asarray(theta).ravel()
-
-        z = self._loadings * (theta[:, np.newaxis] - self._thresholds)
-        prob = 1 / (1 + np.exp(-z))
-
-        return prob
+        theta_values = self._validate_theta(theta)
+        return np.asarray(sigmoid(self._linear_predictor(theta_values)))
 
     def pattern_probability(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute probability of each valid attribute pattern given theta.
@@ -830,29 +909,19 @@ class HigherOrderCDM(BaseCDM):
         NDArray
             Pattern probabilities (n_persons, n_valid_patterns).
         """
-        theta = np.asarray(theta).ravel()
-        n_persons = len(theta)
-
-        attr_prob = self.attribute_probability(theta)
+        theta_values = self._validate_theta(theta)
+        predictor = self._linear_predictor(theta_values)
+        log_mastery = -np.logaddexp(0.0, -predictor)
+        log_nonmastery = -np.logaddexp(0.0, predictor)
         patterns = self._valid_patterns
-        n_patterns = len(patterns)
-
-        pattern_prob = np.zeros((n_persons, n_patterns))
-
-        for p_idx, pattern in enumerate(patterns):
-            prob = np.ones(n_persons)
-            for k in range(self._n_attributes):
-                if pattern[k] == 1:
-                    prob *= attr_prob[:, k]
-                else:
-                    prob *= 1 - attr_prob[:, k]
-            pattern_prob[:, p_idx] = prob
-
-        pattern_prob = pattern_prob / (
-            pattern_prob.sum(axis=1, keepdims=True) + PROB_EPSILON
+        log_pattern_probability = (
+            log_mastery @ patterns.T + log_nonmastery @ (1 - patterns).T
         )
-
-        return pattern_prob
+        log_pattern_probability -= np.max(
+            log_pattern_probability, axis=1, keepdims=True
+        )
+        pattern_probability = np.exp(log_pattern_probability)
+        return pattern_probability / np.sum(pattern_probability, axis=1, keepdims=True)
 
     def probability(
         self,
@@ -873,28 +942,10 @@ class HigherOrderCDM(BaseCDM):
         NDArray
             Response probabilities.
         """
-        theta = np.asarray(theta).ravel()
-        n_persons = len(theta)
-
-        pattern_prob = self.pattern_probability(theta)
-        patterns = self._valid_patterns
-
-        if item_idx is not None:
-            probs = np.zeros(n_persons)
-            for p_idx, pattern in enumerate(patterns):
-                alpha = pattern.reshape(1, -1)
-                cond_prob = self._base_cdm.probability(alpha, item_idx)[0]
-                probs += pattern_prob[:, p_idx] * cond_prob
-            return probs
-
-        probs = np.zeros((n_persons, self.n_items))
-        for j in range(self.n_items):
-            for p_idx, pattern in enumerate(patterns):
-                alpha = pattern.reshape(1, -1)
-                cond_prob = self._base_cdm.probability(alpha, j)[0]
-                probs[:, j] += pattern_prob[:, p_idx] * cond_prob
-
-        return probs
+        index = None if item_idx is None else self._validate_item_index(item_idx)
+        pattern_probability = self.pattern_probability(theta)
+        conditional_probability = self._conditional_response_probability(index)
+        return pattern_probability @ conditional_probability
 
     def eta(
         self,
@@ -910,16 +961,19 @@ class HigherOrderCDM(BaseCDM):
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Compute log-likelihood for each person."""
-        responses = np.asarray(responses)
-        theta = np.asarray(theta).ravel()
+        response_values = self._validate_responses(responses)
+        theta_values = self._validate_theta(theta)
+        if theta_values.size not in (1, response_values.shape[0]):
+            raise ValueError("responses and theta must have compatible row counts")
 
-        probs = self.probability(theta)
+        probs = self.probability(theta_values)
         probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
 
-        valid = responses >= 0
+        valid = response_values >= 0
+        values = np.where(valid, response_values, 0)
         ll = np.where(
             valid,
-            responses * np.log(probs) + (1 - responses) * np.log(1 - probs),
+            values * np.log(probs) + (1 - values) * np.log1p(-probs),
             0.0,
         )
 
@@ -956,15 +1010,29 @@ class HigherOrderCDM(BaseCDM):
         NDArray
             Estimated theta values (n_persons,).
         """
-        responses = np.asarray(responses)
-        n_persons = responses.shape[0]
+        response_values = self._validate_responses(responses)
+        if method not in ("EAP", "MLE"):
+            raise ValueError("method must be 'EAP' or 'MLE'")
+        if (
+            isinstance(n_quad, (bool, np.bool_))
+            or not isinstance(n_quad, (int, np.integer))
+            or n_quad <= 0
+        ):
+            raise ValueError("n_quad must be a positive integer")
 
         quad_points = np.linspace(-4, 4, n_quad)
-
-        log_likes = np.zeros((n_persons, n_quad))
-        for q, theta_q in enumerate(quad_points):
-            theta_arr = np.full(n_persons, theta_q)
-            log_likes[:, q] = self.log_likelihood(responses, theta_arr)
+        probabilities = np.clip(
+            self.probability(quad_points),
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        observed = response_values >= 0
+        values = np.where(observed, response_values, 0).astype(np.float64, copy=False)
+        observed_values = observed.astype(np.float64)
+        log_likes = (
+            values @ np.log(probabilities).T
+            + (observed_values - values) @ np.log1p(-probabilities).T
+        )
 
         if method == "MLE":
             best_idx = np.argmax(log_likes, axis=1)
@@ -973,8 +1041,9 @@ class HigherOrderCDM(BaseCDM):
         log_prior = -0.5 * quad_points**2
         log_posterior = log_likes + log_prior
 
-        log_sum = np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
-        posterior = np.exp(log_posterior - log_sum)
+        posterior = np.exp(
+            log_posterior - logsumexp(log_posterior, axis=1, keepdims=True)
+        )
 
         theta_eap = np.sum(posterior * quad_points, axis=1)
 
