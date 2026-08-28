@@ -591,16 +591,15 @@ MODULE_EXPORTS = {
 }
 
 
-def build_all_exports(*, has_plotting: bool, has_reports: bool) -> list[str]:
-    """Build ``mirt.__all__`` from static export groups."""
-    exports = list(BASE_EXPORTS)
-    if has_plotting:
-        exports.extend(PLOTTING_EXPORTS)
-    exports.extend(BACKEND_EXPORTS)
-    exports.extend(MODULE_NAMESPACE_EXPORTS)
-    if has_reports:
-        exports.extend(REPORT_EXPORTS)
-    return exports
+def build_all_exports() -> list[str]:
+    """Build the stable public export list from static groups."""
+    return [
+        *BASE_EXPORTS,
+        *PLOTTING_EXPORTS,
+        *BACKEND_EXPORTS,
+        *MODULE_NAMESPACE_EXPORTS,
+        *REPORT_EXPORTS,
+    ]
 
 
 def build_lazy_imports() -> dict[str, tuple[str, str]]:

@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, Literal
+from copy import deepcopy
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -32,6 +34,29 @@ _BOOTSTRAP_EXCEPTIONS = (
 )
 _CI_METHODS = ("percentile", "BCa", "basic")
 _STATISTICS = ("parameters", "theta")
+_TaskInput = TypeVar("_TaskInput")
+_TaskResult = TypeVar("_TaskResult")
+
+
+@dataclass(slots=True)
+class _StatisticFitTask:
+    model: BaseItemModel
+    original_params: dict[str, NDArray[np.float64]]
+    warm_start: bool
+    max_iter: int
+    responses: NDArray[np.int_]
+    sample_indices: list[NDArray[np.int64]]
+    statistic: Literal["parameters", "theta"] | Callable[..., Any]
+
+
+@dataclass(slots=True)
+class _ParametricFitTask:
+    model: BaseItemModel
+    original_params: dict[str, NDArray[np.float64]]
+    warm_start: bool
+    max_iter: int
+    n_persons: int
+    rng_states: list[dict[str, Any]]
 
 
 def _validate_resample_count(n_bootstrap: int) -> None:
@@ -45,6 +70,71 @@ def _validate_resample_count(n_bootstrap: int) -> None:
             parameter="n_bootstrap",
             value=n_bootstrap,
         )
+
+
+def _validate_n_jobs(n_jobs: int) -> int:
+    """Validate and resolve bootstrap worker counts."""
+    if (
+        isinstance(n_jobs, (bool, np.bool_))
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs == 0
+        or n_jobs < -1
+    ):
+        raise MirtValidationError(
+            "n_jobs must be -1 or a positive integer",
+            parameter="n_jobs",
+            value=n_jobs,
+        )
+    if n_jobs == -1:
+        import os
+
+        return max(1, os.cpu_count() or 1)
+    return int(n_jobs)
+
+
+def _run_bootstrap_tasks(
+    function: Callable[[_TaskInput], _TaskResult],
+    inputs: list[_TaskInput],
+    n_jobs: int,
+) -> list[_TaskResult]:
+    """Run independent bootstrap tasks in deterministic input order."""
+    if n_jobs == 1 or len(inputs) < 2:
+        return [function(value) for value in inputs]
+
+    import pickle
+    from concurrent.futures import ProcessPoolExecutor
+    from multiprocessing import get_context
+
+    try:
+        pickle.dumps((function, inputs[0]))
+    except (AttributeError, pickle.PickleError, TypeError) as exc:
+        raise MirtValidationError(
+            "parallel bootstrap inputs must be picklable; use n_jobs=1 for "
+            "locally defined models or statistics",
+            parameter="n_jobs",
+            value=n_jobs,
+        ) from exc
+
+    with ProcessPoolExecutor(
+        max_workers=min(n_jobs, len(inputs)),
+        mp_context=get_context("spawn"),
+    ) as executor:
+        return list(executor.map(function, inputs))
+
+
+def _chunk_values(values: list[_TaskInput], n_chunks: int) -> list[list[_TaskInput]]:
+    """Split ordered inputs into balanced contiguous worker chunks."""
+    if not values:
+        return []
+    chunk_count = min(n_chunks, len(values))
+    quotient, remainder = divmod(len(values), chunk_count)
+    chunks: list[list[_TaskInput]] = []
+    start = 0
+    for chunk_index in range(chunk_count):
+        stop = start + quotient + (chunk_index < remainder)
+        chunks.append(values[start:stop])
+        start = stop
+    return chunks
 
 
 def _validate_statistic(statistic: str | Callable[..., Any]) -> None:
@@ -121,19 +211,68 @@ def _as_statistic_mapping(result: Any) -> dict[str, NDArray[np.float64]]:
     return converted
 
 
+def _fit_statistic_task(
+    task: _StatisticFitTask,
+) -> list[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
+    """Fit one worker chunk and extract each requested statistic."""
+    from mirt.estimation.em import EMEstimator
+
+    task_results: list[tuple[dict[str, NDArray[np.float64]] | None, str | None]] = []
+    for indices in task.sample_indices:
+        fit_responses = task.responses[indices]
+        boot_model = _prepare_bootstrap_model(
+            task.model,
+            task.original_params,
+            task.warm_start,
+        )
+        try:
+            estimator = EMEstimator(max_iter=task.max_iter, tol=1e-3, verbose=False)
+            result = estimator.fit(boot_model, fit_responses)
+
+            if task.statistic == "parameters":
+                values_by_name = {
+                    name: np.asarray(values, dtype=np.float64).copy()
+                    for name, values in result.model.parameters.items()
+                }
+            elif task.statistic == "theta":
+                from mirt.scoring import fscores
+
+                scores = fscores(result.model, task.responses, method="EAP")
+                values_by_name = {
+                    "theta": np.asarray(scores.theta, dtype=np.float64).copy()
+                }
+            else:
+                values_by_name = _as_statistic_mapping(
+                    task.statistic(result.model, fit_responses)
+                )
+            task_results.append((values_by_name, None))
+        except _BOOTSTRAP_EXCEPTIONS as exc:
+            task_results.append((None, f"{type(exc).__name__}: {exc}"))
+    return task_results
+
+
 def _elementwise_percentile(
     samples: NDArray[np.float64], quantiles: NDArray[np.float64]
 ) -> NDArray[np.float64]:
+    if samples.shape[0] == 0:
+        raise ValueError("samples must contain at least one bootstrap replicate")
     flat_samples = samples.reshape(samples.shape[0], -1)
     flat_quantiles = np.asarray(quantiles, dtype=np.float64).reshape(-1)
-    values = np.fromiter(
-        (
-            np.percentile(flat_samples[:, index], 100 * quantile)
-            for index, quantile in enumerate(flat_quantiles)
-        ),
-        dtype=np.float64,
-        count=flat_quantiles.size,
-    )
+    if flat_quantiles.size != flat_samples.shape[1]:
+        raise ValueError("quantiles must contain one value per sample element")
+    if not np.all(np.isfinite(flat_quantiles)) or np.any(
+        (flat_quantiles < 0.0) | (flat_quantiles > 1.0)
+    ):
+        raise ValueError("quantiles must be finite values in [0, 1]")
+
+    ordered = np.sort(flat_samples, axis=0)
+    positions = (flat_samples.shape[0] - 1) * flat_quantiles
+    lower_indices = np.floor(positions).astype(np.intp)
+    upper_indices = np.ceil(positions).astype(np.intp)
+    columns = np.arange(flat_quantiles.size)
+    lower = ordered[lower_indices, columns]
+    upper = ordered[upper_indices, columns]
+    values = lower + (upper - lower) * (positions - lower_indices)
     return values.reshape(samples.shape[1:])
 
 
@@ -251,6 +390,46 @@ def _simulate_model_responses(
     return (uniforms > cumulative).sum(axis=2).astype(np.int_)
 
 
+def _fit_parametric_replicate(
+    task: _ParametricFitTask,
+    replicate_rng: np.random.Generator,
+) -> tuple[dict[str, NDArray[np.float64]] | None, str | None]:
+    """Simulate and fit one parametric-bootstrap replicate."""
+    from mirt.estimation.em import EMEstimator
+
+    theta = replicate_rng.standard_normal((task.n_persons, task.model.n_factors))
+    sim_data = _simulate_model_responses(task.model, theta, replicate_rng)
+    boot_model = _prepare_bootstrap_model(
+        task.model,
+        task.original_params,
+        task.warm_start,
+    )
+    try:
+        estimator = EMEstimator(max_iter=task.max_iter, tol=1e-3, verbose=False)
+        result = estimator.fit(boot_model, sim_data)
+        return (
+            {
+                name: np.asarray(values, dtype=np.float64).copy()
+                for name, values in result.model.parameters.items()
+            },
+            None,
+        )
+    except _BOOTSTRAP_EXCEPTIONS as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _fit_parametric_task(
+    task: _ParametricFitTask,
+) -> list[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
+    """Simulate and fit one deterministic worker chunk."""
+    task_results = []
+    for rng_state in task.rng_states:
+        replicate_rng = np.random.default_rng()
+        replicate_rng.bit_generator.state = rng_state
+        task_results.append(_fit_parametric_replicate(task, replicate_rng))
+    return task_results
+
+
 def _native_2pl_bootstrap_samples(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -312,6 +491,7 @@ def bootstrap_se(
     seed: int | None = None,
     verbose: bool = False,
     warm_start: bool = True,
+    n_jobs: int = 1,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute bootstrap standard errors.
 
@@ -335,6 +515,11 @@ def bootstrap_se(
     warm_start : bool
         Whether to use original parameter estimates as starting values
         for bootstrap samples. This significantly speeds up convergence.
+    n_jobs : int
+        Number of process workers for the general Python implementation.
+        Use ``-1`` for all available CPU cores. The default ``1`` preserves
+        serial execution and is preferable for small fits. The native 2PL path
+        manages its own parallelism.
 
     Returns
     -------
@@ -345,9 +530,10 @@ def bootstrap_se(
     -----
     Parameter bootstraps for unidimensional 2PL models use the native parallel
     implementation when that backend is enabled. Other models and statistics
-    retain the general Python implementation.
+    retain the general Python implementation. Parallel custom models and
+    statistic callables must be picklable; define them at module scope. Seeded
+    results are deterministic and retain input order across worker counts.
     """
-    from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
 
     if isinstance(model, FitResult):
@@ -355,6 +541,7 @@ def bootstrap_se(
 
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
+    n_jobs = _validate_n_jobs(n_jobs)
 
     responses = validate_responses(responses, n_items=model.n_items)
     n_persons = responses.shape[0]
@@ -373,53 +560,43 @@ def bootstrap_se(
     boot_estimates: dict[str, list[NDArray]] = {}
 
     max_iter = 100 if warm_start else 200
-    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
-
     original_params = {k: v.copy() for k, v in model.parameters.items()}
 
-    for b in range(n_bootstrap):
-        if verbose and (b + 1) % 50 == 0:
-            print(f"Bootstrap sample {b + 1}/{n_bootstrap}")
-
-        indices = rng.integers(0, n_persons, size=n_persons)
-        boot_responses = responses[indices]
-
-        boot_model = _prepare_bootstrap_model(model, original_params, warm_start)
-
-        try:
-            result = estimator.fit(boot_model, boot_responses)
-
-            if statistic == "parameters":
-                for name, values in result.model.parameters.items():
-                    if name not in boot_estimates:
-                        boot_estimates[name] = []
-                    boot_estimates[name].append(values.copy())
-
-            elif statistic == "theta":
-                from mirt.scoring import fscores
-
-                scores = fscores(result.model, responses, method="EAP")
-                if "theta" not in boot_estimates:
-                    boot_estimates["theta"] = []
-                boot_estimates["theta"].append(scores.theta.copy())
-
-            elif callable(statistic):
-                custom_result = _as_statistic_mapping(
-                    statistic(result.model, boot_responses)
-                )
-                for name, values in custom_result.items():
-                    if name not in boot_estimates:
-                        boot_estimates[name] = []
-                    boot_estimates[name].append(values)
-
-        except _BOOTSTRAP_EXCEPTIONS as exc:
+    sample_indices = [
+        rng.integers(0, n_persons, size=n_persons) for _ in range(n_bootstrap)
+    ]
+    replicate_tasks = [
+        _StatisticFitTask(
+            model=model,
+            original_params=original_params,
+            warm_start=warm_start,
+            max_iter=max_iter,
+            responses=responses,
+            sample_indices=index_chunk,
+            statistic=statistic,
+        )
+        for index_chunk in _chunk_values(sample_indices, n_jobs)
+    ]
+    chunk_results = _run_bootstrap_tasks(
+        _fit_statistic_task,
+        replicate_tasks,
+        n_jobs,
+    )
+    replicate_results = [result for chunk in chunk_results for result in chunk]
+    for b, (values_by_name, error) in enumerate(replicate_results, start=1):
+        if verbose and b % 50 == 0:
+            print(f"Bootstrap sample {b}/{n_bootstrap}")
+        if error is not None:
             if verbose:
                 warnings.warn(
-                    f"Bootstrap replicate failed and was skipped: {exc}",
+                    f"Bootstrap replicate failed and was skipped: {error}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
             continue
+        assert values_by_name is not None
+        for name, values in values_by_name.items():
+            boot_estimates.setdefault(name, []).append(values)
 
     se_results: dict[str, NDArray[np.float64]] = {}
     for name, estimates in boot_estimates.items():
@@ -442,6 +619,7 @@ def bootstrap_ci(
     seed: int | None = None,
     verbose: bool = False,
     warm_start: bool = True,
+    n_jobs: int = 1,
 ) -> dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]]:
     """Compute bootstrap confidence intervals.
 
@@ -469,6 +647,11 @@ def bootstrap_ci(
     warm_start : bool
         Whether to use original parameter estimates as starting values
         for bootstrap samples. This significantly speeds up convergence.
+    n_jobs : int
+        Number of process workers for bootstrap and jackknife fits. Use ``-1``
+        for all available CPU cores. The default is serial execution and is
+        preferable for small fits. The native 2PL path manages its own
+        parallelism.
 
     Returns
     -------
@@ -479,9 +662,10 @@ def bootstrap_ci(
     -----
     Parameter bootstraps for unidimensional 2PL models use the native parallel
     implementation when that backend is enabled. Other models and statistics
-    retain the general Python implementation.
+    retain the general Python implementation. Parallel custom models and
+    statistic callables must be picklable; define them at module scope. Seeded
+    results are deterministic and retain input order across worker counts.
     """
-    from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
 
     if isinstance(model, FitResult):
@@ -492,6 +676,7 @@ def bootstrap_ci(
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
     _validate_ci_configuration(alpha, method)
+    n_jobs = _validate_n_jobs(n_jobs)
 
     rng = np.random.default_rng(seed)
     responses = validate_responses(responses, n_items=original_model.n_items)
@@ -518,7 +703,6 @@ def bootstrap_ci(
     original_params = {k: v.copy() for k, v in original_model.parameters.items()}
 
     max_iter = 100 if warm_start else 200
-    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
 
     native_samples = None
     if statistic == "parameters":
@@ -533,56 +717,45 @@ def bootstrap_ci(
             ):
                 boot_estimates[name].extend(samples)
     else:
-        for b in range(n_bootstrap):
-            if verbose and (b + 1) % 50 == 0:
-                print(f"Bootstrap sample {b + 1}/{n_bootstrap}")
-
-            indices = rng.integers(0, n_persons, size=n_persons)
-            boot_responses = responses[indices]
-            boot_model = _prepare_bootstrap_model(
-                original_model, original_params, warm_start
+        sample_indices = [
+            rng.integers(0, n_persons, size=n_persons) for _ in range(n_bootstrap)
+        ]
+        replicate_tasks = [
+            _StatisticFitTask(
+                model=original_model,
+                original_params=original_params,
+                warm_start=warm_start,
+                max_iter=max_iter,
+                responses=responses,
+                sample_indices=index_chunk,
+                statistic=statistic,
             )
-
-            try:
-                result = estimator.fit(boot_model, boot_responses)
-
-                if statistic == "parameters":
-                    for name, values in result.model.parameters.items():
-                        if (
-                            name in boot_estimates
-                            and values.shape == original_estimates[name].shape
-                        ):
-                            boot_estimates[name].append(
-                                np.asarray(values, dtype=np.float64)
-                            )
-
-                elif statistic == "theta":
-                    from mirt.scoring import fscores
-
-                    scores = fscores(result.model, responses, method="EAP")
-                    values = np.asarray(scores.theta, dtype=np.float64)
-                    if values.shape == original_estimates["theta"].shape:
-                        boot_estimates["theta"].append(values)
-
-                elif callable(statistic):
-                    custom_result = _as_statistic_mapping(
-                        statistic(result.model, boot_responses)
-                    )
-                    for name, values in custom_result.items():
-                        if (
-                            name in boot_estimates
-                            and values.shape == original_estimates[name].shape
-                        ):
-                            boot_estimates[name].append(values)
-
-            except _BOOTSTRAP_EXCEPTIONS as exc:
+            for index_chunk in _chunk_values(sample_indices, n_jobs)
+        ]
+        chunk_results = _run_bootstrap_tasks(
+            _fit_statistic_task,
+            replicate_tasks,
+            n_jobs,
+        )
+        replicate_results = [result for chunk in chunk_results for result in chunk]
+        for b, (values_by_name, error) in enumerate(replicate_results, start=1):
+            if verbose and b % 50 == 0:
+                print(f"Bootstrap sample {b}/{n_bootstrap}")
+            if error is not None:
                 if verbose:
                     warnings.warn(
-                        f"Bootstrap CI replicate failed and was skipped: {exc}",
+                        f"Bootstrap CI replicate failed and was skipped: {error}",
                         RuntimeWarning,
                         stacklevel=2,
                     )
                 continue
+            assert values_by_name is not None
+            for name, values in values_by_name.items():
+                if (
+                    name in boot_estimates
+                    and values.shape == original_estimates[name].shape
+                ):
+                    boot_estimates[name].append(values)
 
     jackknife_estimates: dict[str, list[NDArray[np.float64]]] = {
         name: [] for name in original_estimates
@@ -591,39 +764,41 @@ def bootstrap_ci(
         len(estimates) >= 10 for estimates in boot_estimates.values()
     ):
         max_jack = min(20, n_persons)
-        jack_indices = rng.choice(n_persons, size=max_jack, replace=False)
-        for index in jack_indices:
-            jack_responses = np.delete(responses, index, axis=0)
-            jack_model = _prepare_bootstrap_model(
-                original_model, original_params, warm_start
+        jack_indices = rng.choice(n_persons, size=max_jack, replace=False).tolist()
+        all_indices = np.arange(n_persons, dtype=np.int64)
+        jackknife_sample_indices = [
+            np.delete(all_indices, index) for index in jack_indices
+        ]
+        jackknife_tasks = [
+            _StatisticFitTask(
+                model=original_model,
+                original_params=original_params,
+                warm_start=warm_start,
+                max_iter=max_iter,
+                responses=responses,
+                sample_indices=index_chunk,
+                statistic=statistic,
             )
-            try:
-                jack_result = estimator.fit(jack_model, jack_responses)
-                if statistic == "parameters":
-                    values_by_name = {
-                        name: np.asarray(values, dtype=np.float64)
-                        for name, values in jack_result.model.parameters.items()
-                    }
-                elif statistic == "theta":
-                    from mirt.scoring import fscores
-
-                    scores = fscores(jack_result.model, responses, method="EAP")
-                    values_by_name = {
-                        "theta": np.asarray(scores.theta, dtype=np.float64)
-                    }
-                else:
-                    values_by_name = _as_statistic_mapping(
-                        statistic(jack_result.model, jack_responses)
-                    )
-
-                for name, values in values_by_name.items():
-                    if (
-                        name in jackknife_estimates
-                        and values.shape == original_estimates[name].shape
-                    ):
-                        jackknife_estimates[name].append(values)
-            except _BOOTSTRAP_EXCEPTIONS:
+            for index_chunk in _chunk_values(jackknife_sample_indices, n_jobs)
+        ]
+        jackknife_chunk_results = _run_bootstrap_tasks(
+            _fit_statistic_task,
+            jackknife_tasks,
+            n_jobs,
+        )
+        jackknife_results = [
+            result for chunk in jackknife_chunk_results for result in chunk
+        ]
+        for values_by_name, error in jackknife_results:
+            if error is not None:
                 continue
+            assert values_by_name is not None
+            for name, values in values_by_name.items():
+                if (
+                    name in jackknife_estimates
+                    and values.shape == original_estimates[name].shape
+                ):
+                    jackknife_estimates[name].append(values)
 
     ci_results: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
 
@@ -669,6 +844,7 @@ def parametric_bootstrap(
     seed: int | None = None,
     verbose: bool = False,
     warm_start: bool = True,
+    n_jobs: int = 1,
 ) -> dict[str, NDArray[np.float64]]:
     """Parametric bootstrap using model to generate data.
 
@@ -689,19 +865,28 @@ def parametric_bootstrap(
     warm_start : bool
         Whether to use original parameter estimates as starting values
         for bootstrap samples. This significantly speeds up convergence.
+    n_jobs : int
+        Number of process workers. Use ``-1`` for all available CPU cores. The
+        default ``1`` preserves serial execution and is preferable for small
+        fits. Custom models must be picklable when using multiple workers.
 
     Returns
     -------
     dict
         Standard errors for each parameter
+
+    Notes
+    -----
+    Seeded simulations are deterministic and retain replicate order across
+    worker counts.
     """
-    from mirt.estimation.em import EMEstimator
     from mirt.results.fit_result import FitResult
 
     if isinstance(model, FitResult):
         model = model.model
 
     _validate_resample_count(n_bootstrap)
+    n_jobs = _validate_n_jobs(n_jobs)
     if n_persons is None:
         n_persons = 500
     if (
@@ -719,33 +904,57 @@ def parametric_bootstrap(
     boot_estimates: dict[str, list[NDArray]] = {}
 
     max_iter = 100 if warm_start else 200
-    estimator = EMEstimator(max_iter=max_iter, tol=1e-3, verbose=False)
-
     original_params = {k: v.copy() for k, v in model.parameters.items()}
 
-    for b in range(n_bootstrap):
-        if verbose and (b + 1) % 50 == 0:
-            print(f"Parametric bootstrap {b + 1}/{n_bootstrap}")
-
-        theta = rng.standard_normal((n_persons, model.n_factors))
-        sim_data = _simulate_model_responses(model, theta, rng)
-        boot_model = _prepare_bootstrap_model(model, original_params, warm_start)
-
-        try:
-            result = estimator.fit(boot_model, sim_data)
-
-            for name, values in result.model.parameters.items():
-                if name not in boot_estimates:
-                    boot_estimates[name] = []
-                boot_estimates[name].append(values.copy())
-        except _BOOTSTRAP_EXCEPTIONS as exc:
+    task_context = _ParametricFitTask(
+        model=model,
+        original_params=original_params,
+        warm_start=warm_start,
+        max_iter=max_iter,
+        n_persons=int(n_persons),
+        rng_states=[],
+    )
+    if n_jobs == 1:
+        replicate_results = [
+            _fit_parametric_replicate(task_context, rng) for _ in range(n_bootstrap)
+        ]
+    else:
+        replicate_rng_states: list[dict[str, Any]] = []
+        for _ in range(n_bootstrap):
+            replicate_rng_states.append(deepcopy(rng.bit_generator.state))
+            rng.standard_normal((n_persons, model.n_factors))
+            rng.random((n_persons, model.n_items))
+        replicate_tasks = [
+            _ParametricFitTask(
+                model=model,
+                original_params=original_params,
+                warm_start=warm_start,
+                max_iter=max_iter,
+                n_persons=int(n_persons),
+                rng_states=state_chunk,
+            )
+            for state_chunk in _chunk_values(replicate_rng_states, n_jobs)
+        ]
+        chunk_results = _run_bootstrap_tasks(
+            _fit_parametric_task,
+            replicate_tasks,
+            n_jobs,
+        )
+        replicate_results = [result for chunk in chunk_results for result in chunk]
+    for b, (values_by_name, error) in enumerate(replicate_results, start=1):
+        if verbose and b % 50 == 0:
+            print(f"Parametric bootstrap {b}/{n_bootstrap}")
+        if error is not None:
             if verbose:
                 warnings.warn(
-                    f"Parametric bootstrap replicate failed and was skipped: {exc}",
+                    f"Parametric bootstrap replicate failed and was skipped: {error}",
                     RuntimeWarning,
                     stacklevel=2,
                 )
             continue
+        assert values_by_name is not None
+        for name, values in values_by_name.items():
+            boot_estimates.setdefault(name, []).append(values)
 
     se_results: dict[str, NDArray[np.float64]] = {}
     for name, estimates in boot_estimates.items():

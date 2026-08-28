@@ -156,12 +156,7 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
         if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
             item_idx, (int, np.integer)
         ):
-            raise MirtValidationError(
-                "item_idx must be an integer",
-                parameter="item_idx",
-                value=item_idx,
-                expected="integer",
-            )
+            raise IndexError("item_idx must be an integer")
         item_idx = int(item_idx)
         if item_idx < 0 or item_idx >= self.n_items:
             raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")

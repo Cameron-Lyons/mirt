@@ -111,6 +111,28 @@ class TestBootstrapLinkingSE:
         assert se_a1 == pytest.approx(se_a2)
         assert se_b1 == pytest.approx(se_b2)
 
+    def test_parallel_curve_bootstrap_matches_sequential(self, linked_models_pair):
+        """Worker count does not change seeded nonlinear replicates."""
+        model_old, model_new, anchors = linked_models_pair
+        common = {
+            "model_old": model_old,
+            "model_new": model_new,
+            "responses_old": None,
+            "responses_new": None,
+            "anchors_old": anchors,
+            "anchors_new": anchors,
+            "method": "stocking_lord",
+            "n_bootstrap": 24,
+            "n_theta": 101,
+            "seed": 42,
+        }
+
+        sequential = bootstrap_linking_se(**common, n_jobs=1)
+        parallel = bootstrap_linking_se(**common, n_jobs=3)
+
+        for actual, expected in zip(parallel, sequential, strict=True):
+            np.testing.assert_array_equal(actual, expected)
+
     @pytest.mark.parametrize(
         "method",
         [
@@ -214,6 +236,22 @@ class TestBootstrapLinkingSE:
                 anchors,
                 anchors,
                 n_bootstrap=n_bootstrap,
+            )
+
+    @pytest.mark.parametrize("n_jobs", [0, -1, 1.5, True])
+    def test_rejects_invalid_worker_count(self, linked_models_pair, n_jobs):
+        """Reject invalid parallel worker counts before sampling."""
+        model_old, model_new, anchors = linked_models_pair
+
+        with pytest.raises(ValueError, match="n_jobs"):
+            bootstrap_linking_se(
+                model_old,
+                model_new,
+                None,
+                None,
+                anchors,
+                anchors,
+                n_jobs=n_jobs,
             )
 
     def test_rejects_unknown_method(self, linked_models_pair):
@@ -321,6 +359,37 @@ class TestBootstrapLinkingSE:
         assert len(sampled_responses) == 32
         assert se_b > 0
         assert np.unique(b_samples).size > 1
+
+    def test_parallel_response_refits_match_sequential(self, linked_models_pair):
+        """Pre-sampled response replicates stay deterministic across workers."""
+        model_old, model_new, anchors = linked_models_pair
+        rng = np.random.default_rng(91)
+        responses_old = rng.integers(0, 2, size=(40, model_old.n_items))
+        responses_new = rng.integers(0, 2, size=(35, model_new.n_items))
+
+        def refit(model, responses):
+            means = np.clip(np.mean(responses, axis=0), 0.05, 0.95)
+            difficulty = np.log((1.0 - means) / means) / model.discrimination
+            return model.set_parameters(difficulty=difficulty)
+
+        common = {
+            "model_old": model_old,
+            "model_new": model_new,
+            "responses_old": responses_old,
+            "responses_new": responses_new,
+            "anchors_old": anchors,
+            "anchors_new": anchors,
+            "method": "mean_mean",
+            "n_bootstrap": 16,
+            "seed": 42,
+            "refit": refit,
+        }
+
+        sequential = bootstrap_linking_se(**common, n_jobs=1)
+        parallel = bootstrap_linking_se(**common, n_jobs=4)
+
+        for actual, expected in zip(parallel, sequential, strict=True):
+            np.testing.assert_array_equal(actual, expected)
 
     def test_response_bootstrap_preserves_missing_values(self, linked_models_pair):
         """Allow recalibration callbacks to handle missing responses."""

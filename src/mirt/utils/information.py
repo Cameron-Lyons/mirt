@@ -16,6 +16,10 @@ if TYPE_CHECKING:
 _SCORE_INVERSION_TARGET_ELEMENTS = 2_000_000
 _SCORE_INVERSION_THETA_TOLERANCE = 1e-6
 _SCORE_MONOTONICITY_POINTS = 65
+_GENERALIZED_DIFFICULTY_MODELS = frozenset({"1PL", "2PL", "3PL", "4PL", "5PL"})
+_GENERALIZED_DIFFICULTY_GRID_POINTS = 65
+_GENERALIZED_DIFFICULTY_GRID_ELEMENTS = 2_000_000
+_GENERALIZED_DIFFICULTY_THETA_TOLERANCE = 1e-6
 
 
 def _theta_matrix(
@@ -281,10 +285,262 @@ def expected_score(
     return np.column_stack([score_one(index) for index in item_idx])
 
 
+def _difficulty_item_indices(
+    model: "BaseItemModel",
+    item_idx: int | ArrayLike | None,
+) -> tuple[NDArray[np.intp], bool, tuple[int, ...]]:
+    """Validate requested generalized-difficulty item indices."""
+    if item_idx is None:
+        return np.arange(model.n_items, dtype=np.intp), False, (model.n_items,)
+    if isinstance(item_idx, (bool, np.bool_)):
+        raise ValueError("item_idx must contain integer item indices")
+    if isinstance(item_idx, (int, np.integer)):
+        index = int(item_idx)
+        if index < 0 or index >= model.n_items:
+            raise IndexError(f"item_idx {index} out of range [0, {model.n_items})")
+        return np.array([index], dtype=np.intp), True, ()
+
+    raw_indices = np.asarray(item_idx)
+    if raw_indices.ndim == 0:
+        raise ValueError("item_idx must contain integer item indices")
+    if raw_indices.ndim != 1:
+        raise ValueError("item_idx must be an integer or one-dimensional array")
+    if raw_indices.size == 0:
+        return np.empty(0, dtype=np.intp), False, raw_indices.shape
+    if raw_indices.dtype.kind not in "iu":
+        raise ValueError("item_idx must contain integer item indices")
+    indices = raw_indices.astype(np.intp, copy=False)
+    invalid = indices[(indices < 0) | (indices >= model.n_items)]
+    if invalid.size:
+        index = int(invalid[0])
+        raise IndexError(f"item_idx {index} out of range [0, {model.n_items})")
+    return indices, False, raw_indices.shape
+
+
+def _difficulty_targets(
+    target_prob: ArrayLike,
+    output_shape: tuple[int, ...],
+) -> NDArray[np.float64]:
+    """Broadcast and validate generalized-difficulty target probabilities."""
+    try:
+        targets = np.asarray(target_prob, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_prob must contain numeric values") from exc
+    try:
+        broadcast = np.broadcast_to(targets, output_shape).astype(np.float64, copy=True)
+    except ValueError as exc:
+        raise ValueError(
+            f"target_prob must be scalar or broadcast to shape {output_shape}"
+        ) from exc
+    if not np.all(np.isfinite(broadcast)) or np.any(
+        (broadcast <= 0.0) | (broadcast >= 1.0)
+    ):
+        raise ValueError(
+            "target_prob must contain finite values strictly between 0 and 1"
+        )
+    return broadcast.reshape(-1)
+
+
+def _difficulty_theta_bounds(theta_range: tuple[float, float]) -> tuple[float, float]:
+    """Validate generalized-difficulty theta bounds."""
+    try:
+        bounds = np.asarray(theta_range, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("theta_range must contain exactly two numeric bounds") from exc
+    if bounds.shape != (2,):
+        raise ValueError("theta_range must contain exactly two numeric bounds")
+    lower, upper = float(bounds[0]), float(bounds[1])
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("theta_range must contain finite bounds with lower < upper")
+    return lower, upper
+
+
+def _logistic_difficulties(
+    model: "BaseItemModel",
+    indices: NDArray[np.intp],
+    targets: NDArray[np.float64],
+    lower_bound: float,
+    upper_bound: float,
+) -> NDArray[np.float64] | None:
+    """Invert standard logistic-family item curves analytically."""
+    if getattr(model, "model_name", None) not in _GENERALIZED_DIFFICULTY_MODELS:
+        return None
+
+    parameters = model.parameters
+    discrimination = np.asarray(parameters.get("discrimination"), dtype=np.float64)
+    difficulty = np.asarray(parameters.get("difficulty"), dtype=np.float64)
+    expected_shape = (model.n_items,)
+    if discrimination.shape != expected_shape or difficulty.shape != expected_shape:
+        raise ValueError(
+            "generalized difficulty requires one discrimination and difficulty per item"
+        )
+
+    lower = np.asarray(
+        parameters.get("guessing", np.zeros(model.n_items)), dtype=np.float64
+    )
+    upper = np.asarray(
+        parameters.get("upper", np.ones(model.n_items)), dtype=np.float64
+    )
+    asymmetry = np.asarray(
+        parameters.get("asymmetry", np.ones(model.n_items)), dtype=np.float64
+    )
+    if lower.shape != expected_shape or upper.shape != expected_shape:
+        raise ValueError("item asymptotes must contain one value per item")
+    if asymmetry.shape != expected_shape:
+        raise ValueError("item asymmetry must contain one value per item")
+    if (
+        not np.all(np.isfinite(discrimination))
+        or not np.all(np.isfinite(difficulty))
+        or not np.all(np.isfinite(lower))
+        or not np.all(np.isfinite(upper))
+        or not np.all(np.isfinite(asymmetry))
+        or np.any(discrimination <= 0.0)
+        or np.any(asymmetry <= 0.0)
+        or np.any(lower < 0.0)
+        or np.any(upper > 1.0)
+        or np.any(lower >= upper)
+    ):
+        raise ValueError("model parameters do not define valid monotonic item curves")
+
+    selected_discrimination = discrimination[indices]
+    selected_difficulty = difficulty[indices]
+    selected_lower = lower[indices]
+    selected_upper = upper[indices]
+    selected_asymmetry = asymmetry[indices]
+    result = np.empty(indices.size, dtype=np.float64)
+
+    below = targets <= selected_lower
+    above = targets >= selected_upper
+    result[below] = lower_bound
+    result[above] = upper_bound
+    interior = ~(below | above)
+    if np.any(interior):
+        scaled = (targets[interior] - selected_lower[interior]) / (
+            selected_upper[interior] - selected_lower[interior]
+        )
+        logistic = scaled ** (1.0 / selected_asymmetry[interior])
+        logit = np.log(logistic) - np.log1p(-logistic)
+        result[interior] = selected_difficulty[interior] + (
+            logit / selected_discrimination[interior]
+        )
+    return np.clip(result, lower_bound, upper_bound)
+
+
+def _difficulty_probability_curve(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    item_index: int,
+) -> NDArray[np.float64]:
+    """Evaluate and validate one dichotomous probability curve."""
+    probabilities = np.asarray(
+        model.probability(theta[:, None], item_idx=item_index), dtype=np.float64
+    )
+    if probabilities.size != theta.size:
+        raise ValueError(
+            "model must return one dichotomous probability per theta and item"
+        )
+    curve = probabilities.reshape(-1)
+    tolerance = 1e-10
+    if not np.all(np.isfinite(curve)) or np.any(
+        (curve < -tolerance) | (curve > 1.0 + tolerance)
+    ):
+        raise ValueError("model probabilities must be finite and lie in [0, 1]")
+    return np.clip(curve, 0.0, 1.0)
+
+
+def _difficulty_probability_curves(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    indices: NDArray[np.intp],
+) -> NDArray[np.float64]:
+    """Evaluate selected custom-model curves with bounded temporary memory."""
+    if theta.size * model.n_items <= _GENERALIZED_DIFFICULTY_GRID_ELEMENTS:
+        probabilities = np.asarray(model.probability(theta[:, None]), dtype=np.float64)
+        expected_shape = (theta.size, model.n_items)
+        if probabilities.shape == expected_shape:
+            curves = probabilities[:, indices]
+            tolerance = 1e-10
+            if not np.all(np.isfinite(curves)) or np.any(
+                (curves < -tolerance) | (curves > 1.0 + tolerance)
+            ):
+                raise ValueError("model probabilities must be finite and lie in [0, 1]")
+            return np.clip(curves, 0.0, 1.0)
+
+    return np.column_stack(
+        [
+            _difficulty_probability_curve(model, theta, int(item_index))
+            for item_index in indices
+        ]
+    )
+
+
+def _numerical_difficulties(
+    model: "BaseItemModel",
+    indices: NDArray[np.intp],
+    targets: NDArray[np.float64],
+    lower_bound: float,
+    upper_bound: float,
+) -> NDArray[np.float64]:
+    """Invert custom monotonic dichotomous curves numerically."""
+    from scipy.optimize import brentq
+
+    theta_grid = np.linspace(
+        lower_bound, upper_bound, _GENERALIZED_DIFFICULTY_GRID_POINTS
+    )
+    curves = _difficulty_probability_curves(model, theta_grid, indices)
+    differences = np.diff(curves, axis=0)
+    scale = np.maximum(1.0, np.max(np.abs(curves), axis=0))
+    tolerance = np.sqrt(np.finfo(np.float64).eps) * scale
+    increasing = curves[-1] >= curves[0]
+    monotonic = np.where(
+        increasing,
+        np.all(differences >= -tolerance[None, :], axis=0),
+        np.all(differences <= tolerance[None, :], axis=0),
+    )
+    monotonic &= np.abs(curves[-1] - curves[0]) > tolerance
+    if not np.all(monotonic):
+        invalid = indices[~monotonic].tolist()
+        raise ValueError(
+            f"item probability curves must be monotonic and vary over theta_range; "
+            f"invalid item indices: {invalid}"
+        )
+
+    first = curves[0]
+    last = curves[-1]
+    minimum = np.minimum(first, last)
+    maximum = np.maximum(first, last)
+    minimum_theta = np.where(increasing, lower_bound, upper_bound)
+    maximum_theta = np.where(increasing, upper_bound, lower_bound)
+    result = np.empty(indices.size, dtype=np.float64)
+    below = targets <= minimum
+    above = targets >= maximum
+    result[below] = minimum_theta[below]
+    result[above] = maximum_theta[above]
+
+    for position in np.flatnonzero(~(below | above)):
+        item_index = int(indices[position])
+        target = float(targets[position])
+
+        def objective(theta_value: float) -> float:
+            probability = _difficulty_probability_curve(
+                model, np.array([theta_value]), item_index
+            )[0]
+            return float(probability - target)
+
+        result[position] = brentq(
+            objective,
+            lower_bound,
+            upper_bound,
+            xtol=_GENERALIZED_DIFFICULTY_THETA_TOLERANCE,
+        )
+    return result
+
+
 def gen_difficulty(
     model: "BaseItemModel",
-    item_idx: int | None = None,
-    target_prob: float = 0.5,
+    item_idx: int | ArrayLike | None = None,
+    target_prob: ArrayLike = 0.5,
+    theta_range: tuple[float, float] = (-10.0, 10.0),
 ) -> NDArray[np.float64] | float:
     """Compute generalized difficulty (theta where P(X=1) = target_prob).
 
@@ -295,15 +551,19 @@ def gen_difficulty(
     ----------
     model : BaseItemModel
         A fitted IRT model.
-    item_idx : int or None
-        Item index. If None, returns for all items.
-    target_prob : float
-        Target probability. Default 0.5 (traditional difficulty).
+    item_idx : int, array-like, or None
+        Item index or one-dimensional item selection. If None, returns all items.
+    target_prob : array-like
+        Target probability in ``(0, 1)``. A scalar applies to every selected
+        item; an array may provide one target per selected item.
+    theta_range : tuple of float
+        Finite search bounds for custom models and asymptote clamping.
 
     Returns
     -------
     NDArray[np.float64] or float
-        Generalized difficulty value(s).
+        Generalized difficulty value(s). A scalar item selection returns a
+        float; other selections retain their one-dimensional shape.
 
     Examples
     --------
@@ -313,38 +573,47 @@ def gen_difficulty(
     >>> # Find theta where P(correct) = 0.8
     >>> b80 = gen_difficulty(result.model, item_idx=0, target_prob=0.8)
     >>> print(f"Theta for 80% correct: {b80:.3f}")
+
+    Notes
+    -----
+    Standard 1PL through 5PL curves are inverted analytically. Other
+    unidimensional dichotomous models use a validated numerical inversion and
+    must be monotonic and vary over ``theta_range``. Polytomous category
+    probabilities are not a single monotonic item-response curve; use
+    ``expected_score`` or ``theta_for_score`` for those models.
     """
-    from scipy.optimize import brentq
+    if getattr(model, "is_polytomous", False):
+        raise ValueError(
+            "gen_difficulty supports dichotomous models only; use "
+            "theta_for_score for polytomous expected scores"
+        )
+    if model.n_factors != 1:
+        raise ValueError("gen_difficulty supports unidimensional models only")
 
-    def find_theta_for_item(j: int) -> float:
-        def objective(theta):
-            theta_2d = np.array([[theta]])
-            prob = model.probability(theta_2d, item_idx=j)
-            if prob.ndim > 1:
-                prob = prob[0, 0] if prob.shape[1] > 0 else prob[0]
-            else:
-                prob = prob[0]
-            return prob - target_prob
+    indices, scalar_item, output_shape = _difficulty_item_indices(model, item_idx)
+    targets = _difficulty_targets(target_prob, output_shape)
+    lower_bound, upper_bound = _difficulty_theta_bounds(theta_range)
+    if indices.size == 0:
+        return np.empty(output_shape, dtype=np.float64)
 
-        try:
-            return brentq(objective, -10, 10, xtol=1e-6)
-        except ValueError:
-            if objective(-10) > 0:
-                return -10.0
-            elif objective(10) < 0:
-                return 10.0
-            else:
-                return 0.0
+    difficulties = _logistic_difficulties(
+        model,
+        indices,
+        targets,
+        lower_bound,
+        upper_bound,
+    )
+    if difficulties is None:
+        difficulties = _numerical_difficulties(
+            model,
+            indices,
+            targets,
+            lower_bound,
+            upper_bound,
+        )
 
-    if item_idx is not None:
-        return find_theta_for_item(item_idx)
-
-    n_items = model.n_items
-    difficulties = np.zeros(n_items)
-    for j in range(n_items):
-        difficulties[j] = find_theta_for_item(j)
-
-    return difficulties
+    shaped = difficulties.reshape(output_shape)
+    return float(shaped) if scalar_item else shaped
 
 
 def expected_test_score(
