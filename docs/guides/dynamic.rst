@@ -87,6 +87,33 @@ contribute zero log score, and produce ``numpy.nan`` residuals. Both result
 types retain final per-skill posteriors and next-opportunity priors, so a
 forecast can continue without replaying the history.
 
+Adaptive skill ranking
+----------------------
+
+Rank the next skill opportunity directly from retained mastery priors:
+
+.. code-block:: python
+
+   ranking = model.rank_skills(
+       diagnostics.next_mastery_priors,
+       criterion="information_gain",
+       top_k=2,
+   )
+   next_skill = ranking.best_skill_index
+   next_skill_name = model.skill_names[next_skill]
+
+``information_gain`` measures the exact mutual information, in nats, between
+the latent mastery state and the next binary response. It favors opportunities
+whose outcome is expected to be most diagnostic. Other objectives prioritize
+expected net ``mastery_gain``, ``lowest_mastery`` for remediation, or the
+highest ``success_probability``. Pass ``available_skills`` to restrict the
+candidate set. Equal scores are ordered by the lower skill index.
+
+``rank_skills_batch`` evaluates an ``(n_persons, n_skills)`` matrix together
+and returns one ranked row per learner. The retained priors from
+``predictive_diagnostics`` or ``predictive_diagnostics_batch`` can be passed
+directly to the ranking methods, without replaying response histories.
+
 Mastery forecasts
 -----------------
 

@@ -22,6 +22,12 @@ from mirt.utils.numeric import logsumexp
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 _GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
+BKTSkillCriterion = Literal[
+    "information_gain",
+    "mastery_gain",
+    "lowest_mastery",
+    "success_probability",
+]
 
 
 @dataclass(frozen=True)
@@ -271,6 +277,58 @@ class BKTBatchForecastResult:
     def n_skills(self) -> int:
         """Number of modeled skills."""
         return int(self.mastery_probabilities.shape[2])
+
+
+@dataclass(frozen=True, slots=True)
+class BKTSkillRankingResult:
+    """Ranked skill opportunities for one learner."""
+
+    skill_indices: NDArray[np.int_]
+    scores: NDArray[np.float64]
+    mastery_probabilities: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    criterion: BKTSkillCriterion
+
+    @property
+    def n_recommendations(self) -> int:
+        """Number of ranked skills in the result."""
+        return int(self.skill_indices.size)
+
+    @property
+    def best_skill_index(self) -> int:
+        """Highest-ranked skill index."""
+        return int(self.skill_indices[0])
+
+    @property
+    def best_score(self) -> float:
+        """Criterion value for the highest-ranked skill."""
+        return float(self.scores[0])
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchSkillRankingResult:
+    """Vectorized ranked skill opportunities for multiple learners."""
+
+    skill_indices: NDArray[np.int_]
+    scores: NDArray[np.float64]
+    mastery_probabilities: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    criterion: BKTSkillCriterion
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.skill_indices.shape[0])
+
+    @property
+    def n_recommendations(self) -> int:
+        """Number of ranked skills per learner."""
+        return int(self.skill_indices.shape[1])
+
+    @property
+    def best_skill_indices(self) -> NDArray[np.int_]:
+        """Highest-ranked skill index for every learner."""
+        return self.skill_indices[:, 0]
 
 
 @dataclass
@@ -889,6 +947,199 @@ class BKTModel:
             batch=True,
         )
         return self._forecast_from_priors_batch(mastery_values, n_steps)
+
+    def _validated_skill_ranking_options(
+        self,
+        criterion: BKTSkillCriterion,
+        available_skills: NDArray[np.int_] | None,
+        top_k: int | None,
+    ) -> tuple[NDArray[np.int_], int]:
+        """Return validated shared ranking options."""
+        valid_criteria = (
+            "information_gain",
+            "mastery_gain",
+            "lowest_mastery",
+            "success_probability",
+        )
+        if criterion not in valid_criteria:
+            choices = ", ".join(valid_criteria)
+            raise ValueError(f"criterion must be one of: {choices}")
+
+        if available_skills is None:
+            skill_values = np.arange(self.n_skills, dtype=np.int_)
+        else:
+            raw_skills = np.asarray(available_skills)
+            if (
+                raw_skills.ndim != 1
+                or raw_skills.size < 1
+                or not np.issubdtype(raw_skills.dtype, np.integer)
+            ):
+                raise ValueError("available_skills must be a non-empty integer vector")
+            if np.any((raw_skills < 0) | (raw_skills >= self.n_skills)):
+                raise ValueError(f"available_skills must be in [0, {self.n_skills})")
+            if np.unique(raw_skills).size != raw_skills.size:
+                raise ValueError("available_skills must not contain duplicates")
+            skill_values = np.sort(raw_skills.astype(np.int_, copy=True))
+
+        if top_k is None:
+            n_ranked = int(skill_values.size)
+        elif (
+            isinstance(top_k, (bool, np.bool_))
+            or not isinstance(top_k, (int, np.integer))
+            or top_k < 1
+            or top_k > skill_values.size
+        ):
+            raise ValueError(
+                "top_k must be a positive integer no greater than available skills"
+            )
+        else:
+            n_ranked = int(top_k)
+        return skill_values, n_ranked
+
+    @staticmethod
+    def _binary_entropy(probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return Bernoulli entropy in nats without boundary warnings."""
+        complements = 1.0 - probabilities
+        return -(
+            probabilities * np.log(np.maximum(probabilities, 1e-300))
+            + complements * np.log(np.maximum(complements, 1e-300))
+        )
+
+    def _skill_ranking_scores_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        criterion: BKTSkillCriterion,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return criterion and success values for validated mastery rows."""
+        response_probabilities = (
+            prior_mastery * (1.0 - self.p_slip) + (1.0 - prior_mastery) * self.p_guess
+        )
+        if criterion == "information_gain":
+            conditional_entropy = prior_mastery * self._binary_entropy(
+                1.0 - self.p_slip
+            ) + (1.0 - prior_mastery) * self._binary_entropy(self.p_guess)
+            scores = self._binary_entropy(response_probabilities) - conditional_entropy
+            scores = np.maximum(scores, 0.0)
+        elif criterion == "mastery_gain":
+            scores = (1.0 - prior_mastery) * self.p_learn - (
+                prior_mastery * self.p_forget
+            )
+        elif criterion == "lowest_mastery":
+            scores = 1.0 - prior_mastery
+        else:
+            scores = response_probabilities.copy()
+        return scores, response_probabilities
+
+    def _rank_skills_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        criterion: BKTSkillCriterion,
+        available_skills: NDArray[np.int_],
+        top_k: int,
+    ) -> BKTBatchSkillRankingResult:
+        """Rank validated learner rows and shared skill candidates."""
+        all_scores, all_response_probabilities = self._skill_ranking_scores_batch(
+            prior_mastery,
+            criterion,
+        )
+        candidate_scores = all_scores[:, available_skills]
+        order = np.argsort(-candidate_scores, axis=1, kind="stable")[:, :top_k]
+        skill_indices = available_skills[order]
+        return BKTBatchSkillRankingResult(
+            skill_indices=skill_indices,
+            scores=np.take_along_axis(all_scores, skill_indices, axis=1),
+            mastery_probabilities=np.take_along_axis(
+                prior_mastery,
+                skill_indices,
+                axis=1,
+            ),
+            response_probabilities=np.take_along_axis(
+                all_response_probabilities,
+                skill_indices,
+                axis=1,
+            ),
+            criterion=criterion,
+        )
+
+    def rank_skills(
+        self,
+        prior_mastery: NDArray[np.float64],
+        *,
+        criterion: BKTSkillCriterion = "information_gain",
+        available_skills: NDArray[np.int_] | None = None,
+        top_k: int | None = None,
+    ) -> BKTSkillRankingResult:
+        """Rank the next skill opportunities for one learner.
+
+        Parameters
+        ----------
+        prior_mastery : NDArray
+            Next-opportunity mastery probabilities with shape ``(n_skills,)``.
+        criterion : str, default="information_gain"
+            Ranking objective: binary mutual information, expected mastery
+            gain, lowest current mastery, or predicted success probability.
+        available_skills : NDArray, optional
+            Shared candidate skill indices. Omitted values rank every skill.
+        top_k : int, optional
+            Number of highest-ranked candidates to return.
+
+        Returns
+        -------
+        BKTSkillRankingResult
+            Ranked skill indices and their criterion, mastery, and success
+            values.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=False,
+        )
+        skill_values, n_ranked = self._validated_skill_ranking_options(
+            criterion,
+            available_skills,
+            top_k,
+        )
+        result = self._rank_skills_batch(
+            mastery_values[None, :],
+            criterion,
+            skill_values,
+            n_ranked,
+        )
+        return BKTSkillRankingResult(
+            skill_indices=result.skill_indices[0].copy(),
+            scores=result.scores[0].copy(),
+            mastery_probabilities=result.mastery_probabilities[0].copy(),
+            response_probabilities=result.response_probabilities[0].copy(),
+            criterion=criterion,
+        )
+
+    def rank_skills_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        *,
+        criterion: BKTSkillCriterion = "information_gain",
+        available_skills: NDArray[np.int_] | None = None,
+        top_k: int | None = None,
+    ) -> BKTBatchSkillRankingResult:
+        """Rank shared candidate skills for multiple learners.
+
+        All learner rows are evaluated together. Ties are resolved by the
+        lower skill index.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=True,
+        )
+        skill_values, n_ranked = self._validated_skill_ranking_options(
+            criterion,
+            available_skills,
+            top_k,
+        )
+        return self._rank_skills_batch(
+            mastery_values,
+            criterion,
+            skill_values,
+            n_ranked,
+        )
 
     def _can_use_native_inference(self) -> bool:
         """Return whether compiled kernels preserve this model's semantics."""
