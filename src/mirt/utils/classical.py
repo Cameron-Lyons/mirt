@@ -13,6 +13,8 @@ from numpy.typing import ArrayLike, NDArray
 from mirt._rust_backend import RUST_AVAILABLE
 from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
 
+_ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
+
 
 def _clean_response_matrix(
     responses: ArrayLike,
@@ -252,6 +254,65 @@ def traditional(
     )
 
 
+def _aggregate_item_fit_groups(
+    responses: NDArray[np.float64],
+    expected: NDArray[np.float64],
+    missing: NDArray[np.bool_],
+    group_idx: NDArray[np.intp],
+    n_groups: int,
+) -> tuple[
+    NDArray[np.intp],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Aggregate every item-group table in bounded response-matrix chunks."""
+    n_persons, n_items = responses.shape
+    chunk_size = min(
+        n_items,
+        max(1, _ITEM_FIT_CHUNK_ELEMENTS // n_persons),
+    )
+    group_counts = np.empty((n_items, n_groups), dtype=np.intp)
+    observed_counts = np.empty((n_items, n_groups), dtype=np.float64)
+    expected_counts = np.empty((n_items, n_groups), dtype=np.float64)
+    expected_variances = np.empty((n_items, n_groups), dtype=np.float64)
+    grouped = group_idx >= 0
+
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        width = stop - start
+        response_chunk = responses[:, start:stop]
+        expected_chunk = expected[:, start:stop]
+        valid = grouped[:, None] & ~missing[:, start:stop]
+        item_offsets = n_groups * np.arange(width, dtype=np.intp)
+        combined_groups = group_idx[:, None] + item_offsets[None, :]
+        codes = combined_groups[valid]
+        output_size = width * n_groups
+
+        group_counts[start:stop] = np.bincount(
+            codes,
+            minlength=output_size,
+        ).reshape(width, n_groups)
+        observed_counts[start:stop] = np.bincount(
+            codes,
+            weights=response_chunk[valid],
+            minlength=output_size,
+        ).reshape(width, n_groups)
+        probabilities = expected_chunk[valid]
+        expected_counts[start:stop] = np.bincount(
+            codes,
+            weights=probabilities,
+            minlength=output_size,
+        ).reshape(width, n_groups)
+        expected_variances[start:stop] = np.bincount(
+            codes,
+            weights=probabilities * (1.0 - probabilities),
+            minlength=output_size,
+        ).reshape(width, n_groups)
+
+    return group_counts, observed_counts, expected_counts, expected_variances
+
+
 def item_fit_chisq(
     responses: ArrayLike,
     expected: ArrayLike,
@@ -341,42 +402,32 @@ def item_fit_chisq(
         int(n_groups) - 1,
     )
 
-    chisq = np.zeros(n_items)
-    degrees_of_freedom = np.ones(n_items, dtype=np.intp)
-
-    for j in range(n_items):
-        valid = (group_idx >= 0) & ~missing[:, j]
-        item_groups = group_idx[valid]
-        probabilities = expected[valid, j]
-        group_counts = np.bincount(item_groups, minlength=n_groups)
-        observed_counts = np.bincount(
-            item_groups,
-            weights=responses[valid, j],
-            minlength=n_groups,
+    group_counts, observed_counts, expected_counts, expected_variances = (
+        _aggregate_item_fit_groups(
+            responses,
+            expected,
+            missing,
+            group_idx,
+            int(n_groups),
         )
-        expected_counts = np.bincount(
-            item_groups,
-            weights=probabilities,
-            minlength=n_groups,
-        )
-        expected_variances = np.bincount(
-            item_groups,
-            weights=probabilities * (1.0 - probabilities),
-            minlength=n_groups,
-        )
-        contributing = (group_counts >= min_group_size) & (
-            expected_variances > np.finfo(np.float64).eps
-        )
-        residuals = observed_counts - expected_counts
-        chisq[j] = np.sum(
-            np.divide(
-                residuals**2,
-                expected_variances,
-                out=np.zeros(n_groups),
-                where=contributing,
-            )
-        )
-        degrees_of_freedom[j] = max(int(np.count_nonzero(contributing)) - 1, 1)
+    )
+    contributing = (group_counts >= min_group_size) & (
+        expected_variances > np.finfo(np.float64).eps
+    )
+    residuals = observed_counts - expected_counts
+    chisq = np.sum(
+        np.divide(
+            residuals**2,
+            expected_variances,
+            out=np.zeros_like(expected_variances),
+            where=contributing,
+        ),
+        axis=1,
+    )
+    degrees_of_freedom = np.maximum(
+        np.count_nonzero(contributing, axis=1) - 1,
+        1,
+    )
 
     from scipy import stats
 
