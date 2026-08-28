@@ -440,8 +440,9 @@ plot_person_item_map(result.model, scores.theta)
 
 | Function | Description |
 |----------|-------------|
-| `bootstrap_se()` | Bootstrap standard errors |
-| `bootstrap_ci()` | Bootstrap confidence intervals |
+| `bootstrap_se()` | Bootstrap standard errors with optional process workers |
+| `bootstrap_ci()` | Percentile, basic, and BCa intervals with parallel replicate and jackknife fits |
+| `parametric_bootstrap()` | Deterministic model-based bootstrap with optional process workers |
 | `generate_plausible_values()` | Plausible values |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
