@@ -1,266 +1,147 @@
+"""Public utility API with on-demand imports.
+
+Utility implementations and numerical dependencies remain deferred until a
+public symbol is accessed.
+"""
+
+from __future__ import annotations
+
+import importlib
 from typing import Any
 
-from mirt._core import sigmoid
-from mirt.utils.batch import BatchFitResult, GridFitResult, fit_model_grid, fit_models
-from mirt.utils.calibration import (
-    CalibrationResult,
-    EquatingResult,
-    equate,
-    fixed_calib,
-    transform_theta,
-)
-from mirt.utils.classical import (
-    ItemStats,
-    TraditionalStats,
-    item_fit_chisq,
-    itemstats,
-    itemstats_to_dataframe,
-    traditional,
-)
-from mirt.utils.clinical import RCI, RCIResult, clinical_significance
-from mirt.utils.collapse import (
-    CollapsedData,
-    collapse_patterns,
-    collapse_with_groups,
-    compute_pattern_likelihood,
-    weighted_sum_from_collapsed,
-)
-from mirt.utils.confidence import PLCI, PLCIResult, delta_method, score_CI
-from mirt.utils.cv import (
-    AICScorer,
-    BICScorer,
-    CVResult,
-    GroupKFold,
-    KFold,
-    LeaveOneOut,
-    LogLikelihoodScorer,
-    Scorer,
-    Splitter,
-    StratifiedKFold,
-    cross_validate,
-)
-from mirt.utils.data import validate_responses
-from mirt.utils.dataframe import get_dataframe_backend, set_dataframe_backend
-from mirt.utils.empirical import (
-    RMSD_DIF,
-    DIFEffectSize,
-    EmpiricalPlotData,
-    ItemGAMResult,
-    empirical_ES,
-    empirical_plot,
-    empirical_rmsea,
-    itemGAM,
-    mantel_haenszel,
-    weighted_RMSD_DIF,
-)
-from mirt.utils.extraction import (
-    ItemParameters,
-    ModelValues,
-    coef,
-    estfun,
-    estfun_summary,
-    extract_item,
-    itemplot_data,
-    mod2values,
-)
-from mirt.utils.information import (
-    areainfo,
-    expected_score,
-    expected_test_score,
-    gen_difficulty,
-    iteminfo,
-    probtrace,
-    testinfo,
-    theta_for_score,
-)
-from mirt.utils.multidimensional import (
-    MDIFF,
-    MDISC,
-    composite_score_weights,
-    direction_cosines,
-)
-from mirt.utils.predictions import (
-    FixedEffects,
-    RandomEffects,
-    conditional_effects,
-    fixef,
-    predict_mixed,
-    randef,
-    shrinkage_estimates,
-)
-from mirt.utils.reliability import empirical_rxx, marginal_rxx, sem
-from mirt.utils.residuals import LD_X2, Q3, ResidualResult, residuals
-from mirt.utils.rotation import (
-    apply_rotation_to_model,
-    get_rotated_loadings,
-    oblimin,
-    promax,
-    rotate_loadings,
-    varimax,
-)
-from mirt.utils.sampling import (
-    ParameterSamples,
-    draw_parameters,
-    posterior_summary,
-    sample_expected_scores,
-)
-from mirt.utils.simulation import simdata
-from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
-from mirt.utils.statistical_tests import (
-    LagrangeTestResult,
-    WaldTestResult,
-    lagrange,
-    likelihood_ratio,
-    wald,
-)
-from mirt.utils.transform import (
-    collapse_table,
-    expand_table,
-    key2binary,
-    likert2int,
-    poly2dich,
-    recode_responses,
-    reverse_score,
-)
-
-__all__ = [
-    "sigmoid",
-    "simdata",
-    "validate_responses",
-    "set_dataframe_backend",
-    "get_dataframe_backend",
-    "rotate_loadings",
-    "varimax",
-    "promax",
-    "oblimin",
-    "apply_rotation_to_model",
-    "get_rotated_loadings",
-    "cross_validate",
-    "CVResult",
-    "Splitter",
-    "GroupKFold",
-    "KFold",
-    "StratifiedKFold",
-    "LeaveOneOut",
-    "Scorer",
-    "LogLikelihoodScorer",
-    "AICScorer",
-    "BICScorer",
-    "fit_models",
-    "fit_model_grid",
-    "BatchFitResult",
-    "GridFitResult",
-    "testinfo",
-    "iteminfo",
-    "areainfo",
-    "probtrace",
-    "expected_score",
-    "expected_test_score",
-    "gen_difficulty",
-    "theta_for_score",
-    "marginal_rxx",
-    "empirical_rxx",
-    "sem",
-    "cv_select_lambda",
-    "information_criteria_path",
-    "RegularizationCVResult",
-    "traditional",
-    "TraditionalStats",
-    "item_fit_chisq",
-    "itemstats",
-    "ItemStats",
-    "itemstats_to_dataframe",
-    "wald",
-    "lagrange",
-    "likelihood_ratio",
-    "WaldTestResult",
-    "LagrangeTestResult",
-    "mod2values",
-    "extract_item",
-    "coef",
-    "estfun",
-    "estfun_summary",
-    "itemplot_data",
-    "ModelValues",
-    "ItemParameters",
-    "MDIFF",
-    "MDISC",
-    "direction_cosines",
-    "composite_score_weights",
-    "empirical_ES",
-    "empirical_plot",
-    "empirical_rmsea",
-    "mantel_haenszel",
-    "RMSD_DIF",
-    "weighted_RMSD_DIF",
-    "DIFEffectSize",
-    "EmpiricalPlotData",
-    "itemGAM",
-    "ItemGAMResult",
-    "RCI",
-    "RCIResult",
-    "clinical_significance",
-    "residuals",
-    "ResidualResult",
-    "Q3",
-    "LD_X2",
-    "fixed_calib",
-    "equate",
-    "transform_theta",
-    "CalibrationResult",
-    "EquatingResult",
-    "PLCI",
-    "PLCIResult",
-    "score_CI",
-    "delta_method",
-    "CollapsedData",
-    "collapse_patterns",
-    "collapse_with_groups",
-    "compute_pattern_likelihood",
-    "weighted_sum_from_collapsed",
-    "key2binary",
-    "poly2dich",
-    "reverse_score",
-    "expand_table",
-    "collapse_table",
-    "recode_responses",
-    "likert2int",
-    "draw_parameters",
-    "ParameterSamples",
-    "posterior_summary",
-    "sample_expected_scores",
-    "randef",
-    "fixef",
-    "predict_mixed",
-    "conditional_effects",
-    "shrinkage_estimates",
-    "RandomEffects",
-    "FixedEffects",
-    "gen_random_pars",
-    "calc_null",
-    "multi_start_fit",
-]
-
-_LAZY_EXPORTS = {
-    "RegularizationCVResult": "mirt.utils.regularization_cv",
+_LAZY_IMPORTS = {
+    "sigmoid": "mirt._core",
+    "simdata": "mirt.utils.simulation",
+    "validate_responses": "mirt.utils.data",
+    "set_dataframe_backend": "mirt.utils.dataframe",
+    "get_dataframe_backend": "mirt.utils.dataframe",
+    "rotate_loadings": "mirt.utils.rotation",
+    "varimax": "mirt.utils.rotation",
+    "promax": "mirt.utils.rotation",
+    "oblimin": "mirt.utils.rotation",
+    "apply_rotation_to_model": "mirt.utils.rotation",
+    "get_rotated_loadings": "mirt.utils.rotation",
+    "cross_validate": "mirt.utils.cv",
+    "CVResult": "mirt.utils.cv",
+    "Splitter": "mirt.utils.cv",
+    "GroupKFold": "mirt.utils.cv",
+    "KFold": "mirt.utils.cv",
+    "StratifiedKFold": "mirt.utils.cv",
+    "LeaveOneOut": "mirt.utils.cv",
+    "Scorer": "mirt.utils.cv",
+    "LogLikelihoodScorer": "mirt.utils.cv",
+    "AICScorer": "mirt.utils.cv",
+    "BICScorer": "mirt.utils.cv",
+    "fit_models": "mirt.utils.batch",
+    "fit_model_grid": "mirt.utils.batch",
+    "BatchFitResult": "mirt.utils.batch",
+    "GridFitResult": "mirt.utils.batch",
+    "testinfo": "mirt.utils.information",
+    "iteminfo": "mirt.utils.information",
+    "areainfo": "mirt.utils.information",
+    "probtrace": "mirt.utils.information",
+    "expected_score": "mirt.utils.information",
+    "expected_test_score": "mirt.utils.information",
+    "gen_difficulty": "mirt.utils.information",
+    "theta_for_score": "mirt.utils.information",
+    "marginal_rxx": "mirt.utils.reliability",
+    "empirical_rxx": "mirt.utils.reliability",
+    "sem": "mirt.utils.reliability",
     "cv_select_lambda": "mirt.utils.regularization_cv",
     "information_criteria_path": "mirt.utils.regularization_cv",
+    "RegularizationCVResult": "mirt.utils.regularization_cv",
+    "traditional": "mirt.utils.classical",
+    "TraditionalStats": "mirt.utils.classical",
+    "item_fit_chisq": "mirt.utils.classical",
+    "itemstats": "mirt.utils.classical",
+    "ItemStats": "mirt.utils.classical",
+    "itemstats_to_dataframe": "mirt.utils.classical",
+    "wald": "mirt.utils.statistical_tests",
+    "lagrange": "mirt.utils.statistical_tests",
+    "likelihood_ratio": "mirt.utils.statistical_tests",
+    "WaldTestResult": "mirt.utils.statistical_tests",
+    "LagrangeTestResult": "mirt.utils.statistical_tests",
+    "mod2values": "mirt.utils.extraction",
+    "extract_item": "mirt.utils.extraction",
+    "coef": "mirt.utils.extraction",
+    "estfun": "mirt.utils.extraction",
+    "estfun_summary": "mirt.utils.extraction",
+    "itemplot_data": "mirt.utils.extraction",
+    "ModelValues": "mirt.utils.extraction",
+    "ItemParameters": "mirt.utils.extraction",
+    "MDIFF": "mirt.utils.multidimensional",
+    "MDISC": "mirt.utils.multidimensional",
+    "direction_cosines": "mirt.utils.multidimensional",
+    "composite_score_weights": "mirt.utils.multidimensional",
+    "empirical_ES": "mirt.utils.empirical",
+    "empirical_plot": "mirt.utils.empirical",
+    "empirical_rmsea": "mirt.utils.empirical",
+    "mantel_haenszel": "mirt.utils.empirical",
+    "RMSD_DIF": "mirt.utils.empirical",
+    "weighted_RMSD_DIF": "mirt.utils.empirical",
+    "DIFEffectSize": "mirt.utils.empirical",
+    "EmpiricalPlotData": "mirt.utils.empirical",
+    "itemGAM": "mirt.utils.empirical",
+    "ItemGAMResult": "mirt.utils.empirical",
+    "RCI": "mirt.utils.clinical",
+    "RCIResult": "mirt.utils.clinical",
+    "clinical_significance": "mirt.utils.clinical",
+    "residuals": "mirt.utils.residuals",
+    "ResidualResult": "mirt.utils.residuals",
+    "Q3": "mirt.utils.residuals",
+    "LD_X2": "mirt.utils.residuals",
+    "fixed_calib": "mirt.utils.calibration",
+    "equate": "mirt.utils.calibration",
+    "transform_theta": "mirt.utils.calibration",
+    "CalibrationResult": "mirt.utils.calibration",
+    "EquatingResult": "mirt.utils.calibration",
+    "PLCI": "mirt.utils.confidence",
+    "PLCIResult": "mirt.utils.confidence",
+    "score_CI": "mirt.utils.confidence",
+    "delta_method": "mirt.utils.confidence",
+    "CollapsedData": "mirt.utils.collapse",
+    "collapse_patterns": "mirt.utils.collapse",
+    "collapse_with_groups": "mirt.utils.collapse",
+    "compute_pattern_likelihood": "mirt.utils.collapse",
+    "weighted_sum_from_collapsed": "mirt.utils.collapse",
+    "key2binary": "mirt.utils.transform",
+    "poly2dich": "mirt.utils.transform",
+    "reverse_score": "mirt.utils.transform",
+    "expand_table": "mirt.utils.transform",
+    "collapse_table": "mirt.utils.transform",
+    "recode_responses": "mirt.utils.transform",
+    "likert2int": "mirt.utils.transform",
+    "draw_parameters": "mirt.utils.sampling",
+    "ParameterSamples": "mirt.utils.sampling",
+    "posterior_summary": "mirt.utils.sampling",
+    "sample_expected_scores": "mirt.utils.sampling",
+    "randef": "mirt.utils.predictions",
+    "fixef": "mirt.utils.predictions",
+    "predict_mixed": "mirt.utils.predictions",
+    "conditional_effects": "mirt.utils.predictions",
+    "shrinkage_estimates": "mirt.utils.predictions",
+    "RandomEffects": "mirt.utils.predictions",
+    "FixedEffects": "mirt.utils.predictions",
+    "gen_random_pars": "mirt.utils.starting",
+    "calc_null": "mirt.utils.starting",
+    "multi_start_fit": "mirt.utils.starting",
 }
+
+__all__ = list(_LAZY_IMPORTS)
 
 
 def __getattr__(name: str) -> Any:
-    """Load estimation-backed utilities without creating import cycles."""
-    module_name = _LAZY_EXPORTS.get(name)
-    if module_name is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    """Resolve and cache a public utility symbol on first access."""
+    try:
+        module_name = _LAZY_IMPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
 
-    from importlib import import_module
-
-    value = getattr(import_module(module_name), name)
+    value = getattr(importlib.import_module(module_name), name)
     globals()[name] = value
     return value
 
 
 def __dir__() -> list[str]:
-    """Include lazy utility exports in interactive discovery."""
-    return sorted(set(globals()) | set(_LAZY_EXPORTS))
+    """Return loaded attributes together with deferred public symbols."""
+    return sorted(set(globals()) | set(__all__))

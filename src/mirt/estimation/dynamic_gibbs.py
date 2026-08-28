@@ -184,6 +184,8 @@ class BKTGibbsSampler:
         n_persons, n_trials = responses.shape
         n_skills = model.n_skills
 
+        # Preserve the established seeded chain while replacing later draws
+        # with an equivalent vectorized path.
         learning_states = rng.integers(0, 2, size=(n_persons, n_trials), dtype=np.int32)
         skill_trials = model._skill_trials(skill_assignments)
 
@@ -197,14 +199,13 @@ class BKTGibbsSampler:
         }
 
         for iteration in range(self.n_iter):
-            for i in range(n_persons):
-                learning_states[i] = self._sample_states_ffbs(
-                    responses[i],
-                    skill_assignments,
-                    model,
-                    rng,
-                    skill_trials,
-                )
+            learning_states = self._sample_states_ffbs_batch(
+                responses,
+                skill_assignments,
+                model,
+                rng,
+                skill_trials,
+            )
 
             self._sample_p_init(
                 model, learning_states, skill_assignments, rng, skill_trials
@@ -353,6 +354,55 @@ class BKTGibbsSampler:
                 p_state = alpha[trial] * transition[:, states[next_trial]]
                 p_state /= p_state.sum() + 1e-300
                 states[trial] = int(rng.random() < p_state[1])
+
+        return states
+
+    def _sample_states_ffbs_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        model: BKTModel,
+        rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
+    ) -> NDArray[np.int_]:
+        """Vectorize FFBS state sampling across a shared skill layout."""
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
+        alpha, _ = model._forward_batch_shared_python(
+            responses,
+            skill_assignments,
+            skill_trials,
+        )
+        states = np.zeros(responses.shape, dtype=np.int32)
+
+        sampling_order = np.concatenate(
+            [
+                trial_indices[::-1]
+                for trial_indices in skill_trials
+                if len(trial_indices)
+            ]
+        )
+        draws = np.empty(responses.shape, dtype=np.float64)
+        draws[:, sampling_order] = rng.random(responses.shape)
+
+        for skill_idx, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+
+            last_trial = int(trial_indices[-1])
+            states[:, last_trial] = draws[:, last_trial] < alpha[:, last_trial, 1]
+            transition = model.transition_matrix(skill_idx)
+
+            for trial, next_trial in zip(
+                trial_indices[-2::-1],
+                trial_indices[:0:-1],
+                strict=True,
+            ):
+                next_states = states[:, next_trial]
+                p_unlearned = alpha[:, trial, 0] * transition[0, next_states]
+                p_learned = alpha[:, trial, 1] * transition[1, next_states]
+                learned_probability = p_learned / (p_unlearned + p_learned + 1e-300)
+                states[:, trial] = draws[:, trial] < learned_probability
 
         return states
 
