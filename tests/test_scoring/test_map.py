@@ -39,6 +39,18 @@ class TestMAPScorerInitialization:
 
         assert_allclose(scorer.prior_cov, prior_cov)
 
+    def test_prior_inputs_are_detached(self):
+        """Later caller mutations cannot reconfigure a scorer."""
+        prior_mean = np.array([0.5])
+        prior_cov = np.array([[2.0]])
+        scorer = MAPScorer(prior_mean=prior_mean, prior_cov=prior_cov)
+
+        prior_mean[0] = 9.0
+        prior_cov[0, 0] = 9.0
+
+        assert_allclose(scorer.prior_mean, [0.5])
+        assert_allclose(scorer.prior_cov, [[2.0]])
+
     def test_parallel_n_jobs(self):
         """Test initialization with parallel processing."""
         scorer = MAPScorer(n_jobs=2)
@@ -98,6 +110,39 @@ class TestMAPScorerScoring:
 
         with pytest.raises(ValueError, match="fitted"):
             scorer.score(model, dichotomous_responses["responses"])
+
+    def test_standard_error_reuses_optimizer_objective(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The known optimum is not evaluated again for finite differences."""
+        from types import SimpleNamespace
+
+        from mirt.models import TwoParameterLogistic
+        from mirt.scoring import map as map_module
+
+        model = TwoParameterLogistic(n_items=2)
+        calls = 0
+
+        def log_likelihood(responses, theta):
+            nonlocal calls
+            calls += 1
+            return -np.sum(theta**2, axis=1)
+
+        def minimize_once(objective, **kwargs):
+            value = objective(0.0)
+            return SimpleNamespace(x=0.0, fun=value)
+
+        monkeypatch.setattr(model, "log_likelihood", log_likelihood)
+        monkeypatch.setattr(map_module, "minimize_scalar", minimize_once)
+
+        MAPScorer()._score_unidimensional(
+            model,
+            np.array([[1, 0]]),
+            prior_mean=0.0,
+            prior_var=1.0,
+        )
+
+        assert calls == 3
 
 
 class TestMAPScorerCustomPrior:

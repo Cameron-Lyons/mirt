@@ -139,6 +139,27 @@ def test_wle_validates_configuration(kwargs: dict[str, object], message: str) ->
         WLEScorer(**kwargs)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("factory", [MLScorer, MAPScorer])
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"theta_bounds": (1.0, -1.0)}, "lower < upper"),
+        ({"theta_bounds": (0.0,)}, "exactly two"),
+        ({"theta_bounds": (0.0, np.inf)}, "finite"),
+        ({"n_jobs": 0}, "positive integer"),
+        ({"n_jobs": -2}, "positive integer"),
+        ({"n_jobs": True}, "positive integer"),
+    ],
+)
+def test_ml_and_map_validate_configuration(
+    factory: Callable[..., OptimizerScorer],
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        factory(**kwargs)
+
+
 def test_wle_reports_factor_specific_multidimensional_uncertainty() -> None:
     model = TwoParameterLogistic(n_items=8, n_factors=2)
     model.set_parameters(
@@ -201,3 +222,13 @@ def test_fscores_exposes_parallel_optimizer_scoring(
 
     np.testing.assert_allclose(parallel.theta, serial.theta)
     np.testing.assert_allclose(parallel.standard_error, serial.standard_error)
+
+
+@pytest.mark.parametrize("method", ["MAP", "ML"])
+def test_fscores_forwards_optimizer_bounds(fitted_2pl_model, method: str) -> None:
+    model = fitted_2pl_model.model
+    responses = np.ones((1, model.n_items), dtype=np.int_)
+
+    result = fscores(model, responses, method=method, bounds=(-0.25, 0.25))
+
+    assert result.theta[0] == pytest.approx(0.25, abs=1e-5)

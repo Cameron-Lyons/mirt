@@ -193,6 +193,19 @@ class TestMLScorerPolytomous:
 
         assert scores.theta.shape == (polytomous_responses["n_persons"],)
 
+    def test_middle_categories_are_optimized_instead_of_treated_as_perfect(self):
+        """Category one is not a perfect score for a three-category item."""
+        from mirt.models import GradedResponseModel
+
+        model = GradedResponseModel(n_items=5, n_categories=3)
+        model._is_fitted = True
+        responses = np.ones((1, model.n_items), dtype=np.int_)
+
+        result = MLScorer().score(model, responses)
+
+        assert result.theta[0] == pytest.approx(0.0, abs=1e-6)
+        assert np.isfinite(result.standard_error[0])
+
 
 class TestMLVsEAP:
     """Tests comparing ML and EAP estimates."""
