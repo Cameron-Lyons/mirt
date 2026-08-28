@@ -103,6 +103,72 @@ def _slow_log_likelihoods_mirt(
     return log_likes
 
 
+def _slow_log_likelihoods_grm(
+    responses: np.ndarray,
+    quad_points: np.ndarray,
+    discrimination: np.ndarray,
+    thresholds: np.ndarray,
+    n_categories: np.ndarray,
+) -> np.ndarray:
+    n_persons, n_items = responses.shape
+    log_likes = np.zeros((n_persons, len(quad_points)))
+
+    for q, theta in enumerate(quad_points):
+        for i in range(n_persons):
+            for j in range(n_items):
+                response = responses[i, j]
+                if response < 0:
+                    continue
+                n_cat = n_categories[j]
+                if response == 0:
+                    probability = 1.0 - sigmoid(
+                        discrimination[j] * (theta - thresholds[j, 0])
+                    )
+                elif response == n_cat - 1:
+                    probability = sigmoid(
+                        discrimination[j] * (theta - thresholds[j, response - 1])
+                    )
+                else:
+                    probability = sigmoid(
+                        discrimination[j] * (theta - thresholds[j, response - 1])
+                    ) - sigmoid(discrimination[j] * (theta - thresholds[j, response]))
+                log_likes[i, q] += np.log(max(probability, PROB_EPSILON))
+
+    return log_likes
+
+
+def _slow_log_likelihoods_gpcm(
+    responses: np.ndarray,
+    quad_points: np.ndarray,
+    discrimination: np.ndarray,
+    steps: np.ndarray,
+    n_categories: np.ndarray,
+) -> np.ndarray:
+    n_persons, n_items = responses.shape
+    log_likes = np.zeros((n_persons, len(quad_points)))
+
+    for q, theta in enumerate(quad_points):
+        for i in range(n_persons):
+            for j in range(n_items):
+                response = responses[i, j]
+                if response < 0:
+                    continue
+                n_cat = n_categories[j]
+                numerators = np.zeros(n_cat)
+                for category in range(1, n_cat):
+                    numerators[category] = numerators[category - 1] + (
+                        discrimination[j] * (theta - steps[j, category])
+                    )
+                max_numerator = np.max(numerators)
+                log_denominator = max_numerator + np.log(
+                    np.sum(np.exp(numerators - max_numerator))
+                )
+                probability = np.exp(numerators[response] - log_denominator)
+                log_likes[i, q] += np.log(max(probability, PROB_EPSILON))
+
+    return log_likes
+
+
 def _with_numpy_backend_and_chunk(chunk: int):
     previous = mirt.get_backend()
     old_chunk = helpers._MAX_VECTOR_CHUNK_ENTRIES
@@ -176,6 +242,123 @@ def test_mirt_vectorized_fallback_matches_reference() -> None:
         )
         actual = rb.compute_log_likelihoods_mirt(
             responses, quad_points, discrimination, difficulty
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_eap_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(45)
+    try:
+        rng = np.random.default_rng(616)
+        responses = rng.integers(0, 2, size=(24, 7), dtype=np.int32)
+        responses[rng.random(size=responses.shape) < 0.2] = -1
+        responses[0] = -1
+        quad_points = np.linspace(-3.5, 3.5, 17)
+        quad_weights = np.exp(-0.5 * quad_points**2)
+        quad_weights[[0, -1]] = 0.0
+        quad_weights /= quad_weights.sum()
+        discrimination = rng.uniform(0.4, 2.2, size=7)
+        difficulty = rng.normal(0, 1, size=7)
+
+        log_likes = _slow_log_likelihoods_2pl(
+            responses,
+            quad_points,
+            discrimination,
+            difficulty,
+        )
+        log_posterior = log_likes + np.log(quad_weights + 1e-300)
+        log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
+        posterior = np.exp(log_posterior)
+        posterior /= posterior.sum(axis=1, keepdims=True)
+        expected_theta = posterior @ quad_points
+        expected_se = np.sqrt(
+            np.sum(
+                posterior * (quad_points[None, :] - expected_theta[:, None]) ** 2,
+                axis=1,
+            )
+        )
+
+        actual_theta, actual_se = rb.compute_eap_scores(
+            responses,
+            quad_points,
+            quad_weights,
+            discrimination,
+            difficulty,
+        )
+
+        np.testing.assert_allclose(actual_theta, expected_theta, rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(actual_se, expected_se, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_grm_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(30)
+    try:
+        rng = np.random.default_rng(717)
+        n_categories = np.array([2, 3, 5, 4, 3, 5], dtype=np.int32)
+        responses = np.column_stack(
+            [rng.integers(0, n_cat, size=22, dtype=np.int32) for n_cat in n_categories]
+        )
+        responses[rng.random(size=responses.shape) < 0.18] = -1
+        responses[:, 2] = -1
+        quad_points = np.linspace(-4.0, 4.0, 19)
+        discrimination = rng.uniform(0.5, 2.0, size=len(n_categories))
+        thresholds = np.sort(
+            rng.normal(size=(len(n_categories), max(n_categories) - 1)),
+            axis=1,
+        )
+
+        expected = _slow_log_likelihoods_grm(
+            responses,
+            quad_points,
+            discrimination,
+            thresholds,
+            n_categories,
+        )
+        actual = rb.compute_log_likelihoods_grm(
+            responses,
+            quad_points,
+            discrimination,
+            thresholds,
+            n_categories,
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_gpcm_vectorized_fallback_matches_reference() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(30)
+    try:
+        rng = np.random.default_rng(818)
+        n_categories = np.array([2, 3, 5, 4, 3, 5], dtype=np.int32)
+        responses = np.column_stack(
+            [rng.integers(0, n_cat, size=22, dtype=np.int32) for n_cat in n_categories]
+        )
+        responses[rng.random(size=responses.shape) < 0.18] = -1
+        responses[:, 4] = -1
+        quad_points = np.linspace(-4.0, 4.0, 19)
+        discrimination = rng.uniform(0.5, 2.0, size=len(n_categories))
+        steps = rng.normal(size=(len(n_categories), max(n_categories)))
+
+        expected = _slow_log_likelihoods_gpcm(
+            responses,
+            quad_points,
+            discrimination,
+            steps,
+            n_categories,
+        )
+        actual = rb.compute_log_likelihoods_gpcm(
+            responses,
+            quad_points,
+            discrimination,
+            steps,
+            n_categories,
         )
 
         np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)

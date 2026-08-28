@@ -92,9 +92,17 @@ def _prepare_binary_response_components(
     return correct, valid
 
 
+def _entry_chunk_size(n_rows: int, entries_per_row: int) -> int:
+    """Select a row chunk size with bounded temporary memory."""
+    return max(
+        1,
+        min(n_rows, _MAX_VECTOR_CHUNK_ENTRIES // max(1, entries_per_row)),
+    )
+
+
 def _quad_chunk_size(n_quad: int, n_items: int) -> int:
     """Select a quadrature chunk size with bounded temporary memory."""
-    return max(1, min(n_quad, _MAX_VECTOR_CHUNK_ENTRIES // max(1, n_items)))
+    return _entry_chunk_size(n_quad, n_items)
 
 
 class PreparedArrays:

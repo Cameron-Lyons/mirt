@@ -12,6 +12,8 @@ from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
+    _entry_chunk_size,
+    _prepare_binary_response_components,
     mirt_rs,
     rust_enabled,
 )
@@ -37,35 +39,51 @@ def compute_eap_scores(
             _ensure_f64(difficulty),
         )
 
-    n_persons = responses.shape[0]
-    n_quad = len(quad_points)
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    quad_weights = np.asarray(quad_weights, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
 
+    n_persons, n_items = responses.shape
+    n_quad = quad_points.shape[0]
+
+    z = discrimination[None, :] * (quad_points[:, None] - difficulty[None, :])
+    probabilities = sigmoid(z)
+    probabilities = np.clip(
+        probabilities,
+        PROB_EPSILON,
+        1 - PROB_EPSILON,
+    )
+    log_correct = np.log(probabilities)
+    log_incorrect = np.log1p(-probabilities)
     log_weights = np.log(quad_weights + 1e-300)
-    theta = np.zeros(n_persons)
-    se = np.zeros(n_persons)
 
-    for i in range(n_persons):
-        log_likes = np.zeros(n_quad)
-        for q in range(n_quad):
-            ll = 0.0
-            t = quad_points[q]
-            for j in range(responses.shape[1]):
-                if responses[i, j] >= 0:
-                    z = discrimination[j] * (t - difficulty[j])
-                    p = sigmoid(z)
-                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-                    if responses[i, j] == 1:
-                        ll += np.log(p)
-                    else:
-                        ll += np.log(1 - p)
-            log_likes[q] = ll
+    correct, valid = _prepare_binary_response_components(responses)
+    chunk_size = _entry_chunk_size(n_persons, n_items + 2 * n_quad)
+    theta = np.empty(n_persons, dtype=np.float64)
+    se = np.empty(n_persons, dtype=np.float64)
 
-        log_posterior = log_likes + log_weights
-        log_posterior = log_posterior - np.max(log_posterior)
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        correct_chunk = correct[start:stop]
+        valid_chunk = valid[start:stop]
+        log_posterior = (
+            correct_chunk @ log_correct.T
+            + (valid_chunk - correct_chunk) @ log_incorrect.T
+            + log_weights[None, :]
+        )
+        log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
         posterior = np.exp(log_posterior)
-        posterior = posterior / posterior.sum()
+        posterior /= posterior.sum(axis=1, keepdims=True)
 
-        theta[i] = np.sum(posterior * quad_points)
-        se[i] = np.sqrt(np.sum(posterior * (quad_points - theta[i]) ** 2))
+        theta_chunk = posterior @ quad_points
+        theta[start:stop] = theta_chunk
+        se[start:stop] = np.sqrt(
+            np.sum(
+                posterior * (quad_points[None, :] - theta_chunk[:, None]) ** 2,
+                axis=1,
+            )
+        )
 
     return theta, se
