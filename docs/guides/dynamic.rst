@@ -27,6 +27,152 @@ Responses use ``1`` for correct, ``0`` for incorrect, and ``-1`` for missing.
 A missing response contributes no response evidence while preserving the trial's
 place in its skill sequence.
 
+Online updates
+--------------
+
+For a live trial stream, retain one next-opportunity prior per skill instead of
+replaying the complete history:
+
+.. code-block:: python
+
+   mastery_priors = model.p_init.copy()
+   latest_mastery = model.p_init.copy()
+
+   for response, skill_idx in zip(responses, skills):
+       step = model.online_step(
+           int(response),
+           int(skill_idx),
+           prior_mastery=mastery_priors[skill_idx],
+       )
+       predicted_success = step.response_probability
+       response_log_score = step.response_log_likelihood
+       predictive_residual = step.standardized_residual
+       latest_mastery[skill_idx] = step.updated_mastery
+       mastery_priors[skill_idx] = step.next_mastery
+
+``online_step`` applies response evidence and prepares the assigned skill for
+its next opportunity in constant history space. ``online_step_batch`` performs
+the same update for many learners; skill assignments and prior mastery may be
+shared scalars or one value per learner. Missing responses have zero log score
+and ``numpy.nan`` residuals while still applying the configured learning and
+forgetting transition.
+
+History diagnostics
+-------------------
+
+Compute the complete causal record in one pass when a trial history is already
+available:
+
+.. code-block:: python
+
+   diagnostics = model.predictive_diagnostics(responses, skills)
+   causal_mastery = diagnostics.predicted_mastery
+   filtered_mastery = diagnostics.updated_mastery
+   predictive_success = diagnostics.response_probabilities
+   predictive_log_scores = diagnostics.response_log_likelihoods
+   predictive_residuals = diagnostics.standardized_residuals
+   total_log_score = diagnostics.total_log_likelihood
+   latest_mastery = diagnostics.latest_mastery_by_skill
+   next_priors = diagnostics.next_mastery_priors
+
+   future = model.forecast_from_priors(next_priors, n_steps=6)
+
+Predicted mastery and success at a trial use only earlier opportunities for
+the assigned skill. Updated mastery additionally conditions on the current
+response, and ``next_mastery`` includes the learning and forgetting transition
+for that skill's next opportunity. ``predictive_diagnostics_batch`` performs
+the same sequential calculation across many learners at once and supports
+shared or person-specific skill layouts. Missing trials retain causal mastery,
+contribute zero log score, and produce ``numpy.nan`` residuals. Both result
+types retain final per-skill posteriors and next-opportunity priors, so a
+forecast can continue without replaying the history.
+
+Adaptive skill ranking
+----------------------
+
+Rank the next skill opportunity directly from retained mastery priors:
+
+.. code-block:: python
+
+   ranking = model.rank_skills(
+       diagnostics.next_mastery_priors,
+       criterion="information_gain",
+       top_k=2,
+   )
+   next_skill = ranking.best_skill_index
+   next_skill_name = model.skill_names[next_skill]
+
+``information_gain`` measures the exact mutual information, in nats, between
+the latent mastery state and the next binary response. It favors opportunities
+whose outcome is expected to be most diagnostic. Other objectives prioritize
+expected net ``mastery_gain``, ``lowest_mastery`` for remediation, or the
+highest ``success_probability``. Pass ``available_skills`` to restrict the
+candidate set. Equal scores are ordered by the lower skill index.
+
+``rank_skills_batch`` evaluates an ``(n_persons, n_skills)`` matrix together
+and returns one ranked row per learner. The retained priors from
+``predictive_diagnostics`` or ``predictive_diagnostics_batch`` can be passed
+directly to the ranking methods, without replaying response histories.
+
+Mastery forecasts
+-----------------
+
+Project mastery and success probabilities directly from the retained
+next-opportunity priors:
+
+.. code-block:: python
+
+   future = model.forecast_from_priors(mastery_priors, n_steps=6)
+   future_mastery = future.mastery_probabilities
+   future_success = future.response_probabilities
+   print(future_mastery.shape)  # (6, 3)
+
+When retained priors are unavailable, forecast from a response history in one
+call:
+
+.. code-block:: python
+
+   future = model.forecast(responses, skills, n_steps=6)
+   next_priors = model.next_mastery_priors(responses, skills)
+
+``forecast_from_priors_batch`` accepts an
+``(n_persons, n_skills)`` prior matrix, while ``forecast_batch`` accepts shared
+or person-specific skill layouts. Each forecast step represents one future
+opportunity for every modeled skill. Forecasts are unconditional on unknown
+future responses and use a closed-form transition, so their runtime does not
+include a Python loop over the horizon. Skills absent from a response history
+begin at their configured initial mastery probability.
+
+Mastery targets
+---------------
+
+Calculate the minimum additional opportunities needed for each skill's
+expected mastery probability to reach a target:
+
+.. code-block:: python
+
+   progress = model.opportunities_to_mastery(
+       diagnostics.next_mastery_priors,
+       target_mastery=0.9,
+   )
+   practice_counts = progress.opportunities
+   reachable = progress.reachable
+
+A count of zero means the retained prior already meets the target.
+``numpy.inf`` explicitly marks a target that cannot be reached under the
+model's unconditional transition path, including a target equal to a limiting
+probability that is approached only asymptotically. This avoids choosing an
+arbitrary forecast horizon or mistaking horizon exhaustion for
+unreachability.
+
+``opportunities_to_mastery_batch`` evaluates every learner and skill together.
+It accepts a shared scalar target, a shared ``(n_skills,)`` vector, or a
+person-specific ``(n_persons, n_skills)`` matrix. Both methods solve the
+transition recurrence directly, so memory and runtime do not grow with the
+number of opportunities returned. The calculation describes expected mastery
+before future responses are known; new evidence can be incorporated with an
+online update and the target recomputed.
+
 Batch inference
 ---------------
 
@@ -52,10 +198,17 @@ one call:
 
 ``skill_assignments`` may also be a matrix matching the response matrix when
 learners receive different trial layouts. Shared layouts use the compiled
-parallel implementation when it is available. Set ``use_rust=False`` on
-``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy implementation for a
-specific workflow; the global ``mirt.set_backend("numpy")`` preference is also
-honored.
+parallel implementation when it is available. The NumPy fallback also filters
+and smooths shared layouts across all learners at once, and BKT Gibbs sampling
+uses the same vectorized filtering path for hidden-state draws. Set
+``use_rust=False`` on ``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy
+implementation for a specific workflow; the global
+``mirt.set_backend("numpy")`` preference is also honored.
+
+Terminal helpers such as ``predict_mastery_batch`` and
+``next_mastery_priors_batch`` avoid backward smoothing when a compiled shared
+layout is unavailable. They update all learners together in one causal pass
+and retain only the current per-skill states.
 
 Simulation
 ----------
@@ -102,14 +255,14 @@ model. The batch filter updates every learner in one vectorized call:
        state_model.extended_kalman_smoother_batch(responses)
    )
 
-   future_means, future_variances = state_model.forecast_batch(
+   future = state_model.forecast_summary_batch(
        responses,
        n_steps=4,
    )
-   future_success = state_model.forecast_response_probabilities_batch(
-       responses,
-       n_steps=4,
-   )
+   future_means = future.state_means
+   future_variances = future.state_variances
+   future_success = future.response_probabilities
+   future_lower, future_upper = future.state_interval(confidence=0.95)
    print(future_success.shape)  # (500, 4, 20)
 
    causal_state_means = diagnostics.predicted_means
@@ -147,6 +300,13 @@ refiltering the complete history:
        prior_mean = step.next_mean
        prior_variance = step.next_variance
 
+   future = state_model.forecast_summary_from_state(
+       step.updated_mean,
+       step.updated_variance,
+       n_steps=4,
+   )
+   future_success = future.response_probabilities
+
 ``online_step`` predicts marginal item success, scores the joint observed
 pattern, updates the state, and prepares the next prior in one quadrature pass.
 ``online_step_batch`` returns the same fields as arrays for many learners and
@@ -169,7 +329,14 @@ state means and process uncertainty. Item-success forecasts integrate the 2PL
 or 3PL response curve over each Gaussian forecast distribution rather than
 evaluating it only at the mean. The default 21-point quadrature can be adjusted
 with ``n_quadpts``. Use ``forecast`` and
-``forecast_response_probabilities`` for one response history.
+``forecast_response_probabilities`` for one response history. When the current
+posterior state is already available, ``forecast_from_state`` and
+``forecast_response_probabilities_from_state`` produce the same multi-step
+forecasts without replaying earlier responses. Their ``_batch`` variants
+accept one current state per learner. ``forecast_summary`` and
+``forecast_summary_from_state`` combine latent moments and response
+probabilities in one result, and provide dependency-free Gaussian state
+intervals. Use their ``_batch`` variants for multiple learners.
 
 Predictive log likelihoods score each observed item pattern against the state
 distribution implied by earlier occasions. Items at the same occasion are

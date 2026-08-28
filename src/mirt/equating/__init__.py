@@ -32,136 +32,86 @@ Drift detection:
 >>> print(f"Flagged items: {drift.flagged_items}")
 """
 
-from mirt.equating.chain import (
-    ChainLinkingResult,
-    TimePointModel,
-    accumulate_constants,
-    chain_link,
-    chain_linking_summary,
-    concurrent_link,
-    detect_longitudinal_drift,
-    transform_theta_to_reference,
-    transform_to_reference,
-)
-from mirt.equating.diagnostics import (
-    bootstrap_linking_se,
-    compare_linking_methods,
-    compute_linking_fit,
-    delta_method_se,
-    linking_summary,
-    parameter_recovery_summary,
-)
-from mirt.equating.drift import (
-    DriftResult,
-    detect_drift,
-    purify_anchors,
-    signed_area_difference,
-)
-from mirt.equating.linking import (
-    AnchorDiagnostics,
-    LinkingConstants,
-    LinkingFitStatistics,
-    LinkingResult,
-    link,
-    transform_parameters,
-)
-from mirt.equating.multidimensional import (
-    ProcrustesResult,
-    compute_mirt_linking_fit,
-    factor_congruence_coefficient,
-    link_mirt,
-    match_factors,
-    mirt_linking_summary,
-    oblique_procrustes_rotation,
-    orthogonal_procrustes_rotation,
-    target_rotation,
-    transform_mirt_parameters,
-    transform_mirt_theta,
-)
-from mirt.equating.polytomous import (
-    PolytomousLinkingResult,
-    link_gpcm,
-    link_grm,
-    link_nrm,
-    transform_polytomous_parameters,
-)
-from mirt.equating.score_equating import (
-    ScoreEquatingResult,
-    compute_see,
-    equipercentile_equating,
-    lord_wingersky_recursion,
-    observed_score_equating,
-    score_equating_summary,
-    score_to_theta,
-    theta_to_score,
-    true_score_equating,
-)
-from mirt.equating.vertical import (
-    GradeData,
-    VerticalScaleDiagnostics,
-    VerticalScaleResult,
-    compute_vertical_diagnostics,
-    plot_vertical_scale,
-    vertical_scale,
-    vertical_scale_summary,
-)
+from __future__ import annotations
 
-__all__ = [
-    "link",
-    "transform_parameters",
-    "LinkingConstants",
-    "LinkingResult",
-    "LinkingFitStatistics",
-    "AnchorDiagnostics",
-    "detect_drift",
-    "purify_anchors",
-    "signed_area_difference",
-    "DriftResult",
-    "bootstrap_linking_se",
-    "delta_method_se",
-    "compute_linking_fit",
-    "linking_summary",
-    "compare_linking_methods",
-    "parameter_recovery_summary",
-    "link_grm",
-    "link_gpcm",
-    "link_nrm",
-    "transform_polytomous_parameters",
-    "PolytomousLinkingResult",
-    "link_mirt",
-    "orthogonal_procrustes_rotation",
-    "oblique_procrustes_rotation",
-    "transform_mirt_parameters",
-    "transform_mirt_theta",
-    "factor_congruence_coefficient",
-    "match_factors",
-    "compute_mirt_linking_fit",
-    "target_rotation",
-    "mirt_linking_summary",
-    "ProcrustesResult",
-    "true_score_equating",
-    "observed_score_equating",
-    "lord_wingersky_recursion",
-    "equipercentile_equating",
-    "score_to_theta",
-    "theta_to_score",
-    "score_equating_summary",
-    "compute_see",
-    "ScoreEquatingResult",
-    "chain_link",
-    "accumulate_constants",
-    "transform_to_reference",
-    "transform_theta_to_reference",
-    "concurrent_link",
-    "chain_linking_summary",
-    "detect_longitudinal_drift",
-    "ChainLinkingResult",
-    "TimePointModel",
-    "vertical_scale",
-    "compute_vertical_diagnostics",
-    "vertical_scale_summary",
-    "plot_vertical_scale",
-    "GradeData",
-    "VerticalScaleResult",
-    "VerticalScaleDiagnostics",
-]
+import importlib
+from typing import Any
+
+_LAZY_IMPORTS = {
+    "link": "mirt.equating.linking",
+    "transform_parameters": "mirt.equating.linking",
+    "LinkingConstants": "mirt.equating.linking",
+    "LinkingResult": "mirt.equating.linking",
+    "LinkingFitStatistics": "mirt.equating.linking",
+    "AnchorDiagnostics": "mirt.equating.linking",
+    "detect_drift": "mirt.equating.drift",
+    "purify_anchors": "mirt.equating.drift",
+    "signed_area_difference": "mirt.equating.drift",
+    "DriftResult": "mirt.equating.drift",
+    "bootstrap_linking_se": "mirt.equating.diagnostics",
+    "delta_method_se": "mirt.equating.diagnostics",
+    "compute_linking_fit": "mirt.equating.diagnostics",
+    "linking_summary": "mirt.equating.diagnostics",
+    "compare_linking_methods": "mirt.equating.diagnostics",
+    "parameter_recovery_summary": "mirt.equating.diagnostics",
+    "link_grm": "mirt.equating.polytomous",
+    "link_gpcm": "mirt.equating.polytomous",
+    "link_nrm": "mirt.equating.polytomous",
+    "transform_polytomous_parameters": "mirt.equating.polytomous",
+    "PolytomousLinkingResult": "mirt.equating.polytomous",
+    "link_mirt": "mirt.equating.multidimensional",
+    "orthogonal_procrustes_rotation": "mirt.equating.multidimensional",
+    "oblique_procrustes_rotation": "mirt.equating.multidimensional",
+    "transform_mirt_parameters": "mirt.equating.multidimensional",
+    "transform_mirt_theta": "mirt.equating.multidimensional",
+    "factor_congruence_coefficient": "mirt.equating.multidimensional",
+    "match_factors": "mirt.equating.multidimensional",
+    "compute_mirt_linking_fit": "mirt.equating.multidimensional",
+    "target_rotation": "mirt.equating.multidimensional",
+    "mirt_linking_summary": "mirt.equating.multidimensional",
+    "ProcrustesResult": "mirt.equating.multidimensional",
+    "true_score_equating": "mirt.equating.score_equating",
+    "observed_score_equating": "mirt.equating.score_equating",
+    "lord_wingersky_recursion": "mirt.equating.score_equating",
+    "equipercentile_equating": "mirt.equating.score_equating",
+    "score_to_theta": "mirt.equating.score_equating",
+    "theta_to_score": "mirt.equating.score_equating",
+    "score_equating_summary": "mirt.equating.score_equating",
+    "compute_see": "mirt.equating.score_equating",
+    "ScoreEquatingResult": "mirt.equating.score_equating",
+    "chain_link": "mirt.equating.chain",
+    "accumulate_constants": "mirt.equating.chain",
+    "transform_to_reference": "mirt.equating.chain",
+    "transform_theta_to_reference": "mirt.equating.chain",
+    "concurrent_link": "mirt.equating.chain",
+    "chain_linking_summary": "mirt.equating.chain",
+    "detect_longitudinal_drift": "mirt.equating.chain",
+    "ChainLinkingResult": "mirt.equating.chain",
+    "TimePointModel": "mirt.equating.chain",
+    "vertical_scale": "mirt.equating.vertical",
+    "compute_vertical_diagnostics": "mirt.equating.vertical",
+    "vertical_scale_summary": "mirt.equating.vertical",
+    "plot_vertical_scale": "mirt.equating.vertical",
+    "GradeData": "mirt.equating.vertical",
+    "VerticalScaleResult": "mirt.equating.vertical",
+    "VerticalScaleDiagnostics": "mirt.equating.vertical",
+}
+
+__all__ = list(_LAZY_IMPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve and cache a public equating symbol on first access."""
+    try:
+        module_name = _LAZY_IMPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return loaded attributes together with deferred public symbols."""
+    return sorted(set(globals()) | set(__all__))
