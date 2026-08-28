@@ -52,5 +52,7 @@ Content balancing and exposure
 
 Use :class:`~mirt.cat.content.ContentConstraint` / blueprints and exposure
 controllers (Sympson–Hetter, randomesque, progressive) for operational CAT.
+Progressive control randomizes early selections within an information window
+and increasingly favors item information as the configured test limit nears.
 
 See ``examples/fit_score_itemfit_cat.py`` for a complete script.
