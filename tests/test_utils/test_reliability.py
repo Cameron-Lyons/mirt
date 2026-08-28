@@ -55,6 +55,27 @@ def test_sem_accepts_one_multidimensional_point() -> None:
     assert np.isfinite(result[0])
 
 
+def test_zero_information_has_unbounded_error_and_zero_reliability(
+    logistic_model: TwoParameterLogistic,
+) -> None:
+    theta = np.array([1e6, 2e6])
+    np.testing.assert_array_equal(logistic_model.information(theta), 0.0)
+
+    with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
+        standard_errors = sem(logistic_model, theta)
+        empirical = empirical_rxx(logistic_model, theta)
+        marginal = marginal_rxx(
+            logistic_model,
+            theta_range=(1e6, 2e6),
+            n_points=3,
+            density="uniform",
+        )
+
+    assert np.all(np.isposinf(standard_errors))
+    assert empirical == 0.0
+    assert marginal == 0.0
+
+
 def test_marginal_reliability_supports_polytomous_models(
     graded_model: GradedResponseModel,
 ) -> None:

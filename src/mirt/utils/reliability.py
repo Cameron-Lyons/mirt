@@ -51,7 +51,7 @@ def _test_information(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return total information for models with item or test-level output."""
+    """Return total information while preserving genuinely uninformative points."""
     information = np.asarray(model.information(theta), dtype=np.float64)
     if information.ndim == 1:
         test_information = information
@@ -70,7 +70,7 @@ def _test_information(
         raise ValueError("model information must contain only finite values")
     if np.any(test_information < 0.0):
         raise ValueError("model information must be non-negative")
-    return np.maximum(test_information, PROB_EPSILON)
+    return test_information
 
 
 def _quadrature_weights(
@@ -232,7 +232,13 @@ def empirical_rxx(
                 "use posterior_variance with factor-specific standard_errors"
             )
         test_information = _test_information(model, theta)
-        average_error_variance = np.array([np.mean(1.0 / test_information)])
+        error_variance = np.divide(
+            1.0,
+            test_information,
+            out=np.full_like(test_information, np.inf),
+            where=test_information > 0.0,
+        )
+        average_error_variance = np.array([np.mean(error_variance)])
 
     denominator = observed_variance + average_error_variance
     reliability = np.divide(
@@ -255,7 +261,8 @@ def sem(
 
     The standard error is ``1 / sqrt(I(theta))``. Models may return either
     total test information or an item-information matrix; both conventions
-    are supported.
+    are supported. A point with zero test information has infinite standard
+    error rather than an arbitrary finite cap.
 
     Parameters
     ----------
@@ -267,7 +274,14 @@ def sem(
     Returns
     -------
     ndarray
-        One standard error for each theta point.
+        One standard error for each theta point. Uninformative points are
+        represented by positive infinity.
     """
     theta_array = _theta_array(model, theta)
-    return 1.0 / np.sqrt(_test_information(model, theta_array))
+    test_information = _test_information(model, theta_array)
+    return np.divide(
+        1.0,
+        np.sqrt(test_information),
+        out=np.full_like(test_information, np.inf),
+        where=test_information > 0.0,
+    )
