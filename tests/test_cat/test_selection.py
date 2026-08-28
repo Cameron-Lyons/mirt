@@ -161,6 +161,97 @@ class TestKullbackLeibler:
 
         assert all(v >= 0 for v in criteria.values())
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"delta": 0.0}, "finite positive"),
+            ({"delta": -0.1}, "finite positive"),
+            ({"delta": np.nan}, "finite positive"),
+            ({"delta": np.inf}, "finite positive"),
+            ({"delta": True}, "finite positive"),
+            ({"n_points": 1}, "at least 2"),
+            ({"n_points": 2.5}, "integer"),
+            ({"n_points": True}, "integer"),
+        ],
+    )
+    def test_rejects_invalid_configuration(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            KullbackLeibler(**kwargs)
+
+    @pytest.mark.parametrize("theta", [np.nan, np.inf, -np.inf, True])
+    def test_rejects_invalid_theta(self, fitted_2pl_model, theta):
+        model = fitted_2pl_model.model
+
+        with pytest.raises(ValueError, match="theta must be finite"):
+            KullbackLeibler().get_item_criteria(model, theta, {0})
+
+    def test_even_grid_averages_every_neighbor(self, fitted_2pl_model):
+        model = fitted_2pl_model.model
+        rule = KullbackLeibler(delta=0.5, n_points=4)
+        theta = 0.2
+        current = model.probability(np.array([[theta]]), item_idx=0)
+        neighbors = np.linspace(theta - rule.delta, theta + rule.delta, 4)
+        expected = np.mean(
+            [
+                rule._kl_divergence(
+                    current,
+                    model.probability(np.array([[neighbor]]), item_idx=0),
+                )
+                for neighbor in neighbors
+            ]
+        )
+
+        assert rule._compute_kl_info(model, theta, 0) == pytest.approx(expected)
+
+    def test_batches_dichotomous_bank_in_one_probability_call(
+        self,
+        fitted_2pl_model,
+    ):
+        model = fitted_2pl_model.model
+        rule = KullbackLeibler(delta=0.2, n_points=9)
+        available = {0, 2, 4}
+
+        with patch.object(model, "probability", wraps=model.probability) as spy:
+            criteria = rule.get_item_criteria(model, 0.25, available)
+
+        assert spy.call_count == 1
+        assert set(criteria) == available
+
+    def test_batches_each_polytomous_item_across_grid(self):
+        model = GradedResponseModel(n_items=3, n_categories=[3, 4, 3])
+        rule = KullbackLeibler(delta=0.2, n_points=4)
+        available = {0, 2}
+
+        with patch.object(model, "probability", wraps=model.probability) as spy:
+            criteria = rule.get_item_criteria(model, 0.25, available)
+
+        neighbors = np.linspace(0.25 - rule.delta, 0.25 + rule.delta, 4)
+        expected = {}
+        for item_idx in available:
+            current = model.probability(np.array([[0.25]]), item_idx=item_idx)
+            expected[item_idx] = np.mean(
+                [
+                    rule._kl_divergence(
+                        current,
+                        model.probability(
+                            np.array([[neighbor]]),
+                            item_idx=item_idx,
+                        ),
+                    )
+                    for neighbor in neighbors
+                ]
+            )
+
+        assert spy.call_count == len(available)
+        assert set(criteria) == available
+        assert criteria == pytest.approx(expected)
+
+    def test_ties_select_lowest_item_index(self):
+        model = GradedResponseModel(n_items=4, n_categories=3)
+        rule = KullbackLeibler()
+
+        assert rule.select_item(model, 0.0, {3, 1, 2}) == 1
+
 
 class TestUrryRule:
     """Tests for Urry's rule item selection."""
