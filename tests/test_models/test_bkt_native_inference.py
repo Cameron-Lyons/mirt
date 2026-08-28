@@ -70,6 +70,97 @@ def test_batch_api_matches_individual_python_inference() -> None:
         assert log_likelihoods[person_idx] == pytest.approx(expected_ll)
 
 
+def test_shared_numpy_filter_and_smoother_match_individual_fallbacks() -> None:
+    responses, skills = _batch()
+    model = _model(use_rust=False)
+    skill_trials = model._skill_trials(skills)
+
+    alpha, scaling = model._forward_batch_shared_python(
+        responses,
+        skills,
+        skill_trials,
+    )
+    beta = model._backward_batch_shared_python(
+        responses,
+        skills,
+        scaling,
+        skill_trials,
+    )
+    gamma, log_likelihoods = model._forward_backward_batch_shared_python(
+        responses,
+        skills,
+    )
+
+    for person_idx, person_responses in enumerate(responses):
+        expected_alpha, expected_scaling = model._forward_python(
+            person_responses,
+            skills,
+        )
+        expected_beta = model._backward_python(
+            person_responses,
+            skills,
+            expected_scaling,
+        )
+        expected_gamma, expected_log_likelihood = model._forward_backward_python(
+            person_responses,
+            skills,
+        )
+        assert_allclose(alpha[person_idx], expected_alpha)
+        assert_allclose(scaling[person_idx], expected_scaling)
+        assert_allclose(beta[person_idx], expected_beta)
+        assert_allclose(gamma[person_idx], expected_gamma)
+        assert log_likelihoods[person_idx] == pytest.approx(expected_log_likelihood)
+
+
+def test_shared_numpy_fallback_avoids_per_person_smoothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses, skills = _batch()
+    model = _model(use_rust=False)
+    monkeypatch.setattr(
+        model,
+        "_forward_backward_python",
+        lambda *args, **kwargs: pytest.fail(
+            "shared fallback must not loop over learners"
+        ),
+    )
+
+    gamma, log_likelihoods = model.forward_backward_batch(responses, skills)
+
+    assert gamma.shape == (*responses.shape, 2)
+    assert log_likelihoods.shape == (len(responses),)
+
+
+def test_shared_numpy_fallback_preserves_zero_scaling_rows() -> None:
+    model = BKTModel(
+        n_skills=1,
+        p_init=np.array([0.0]),
+        p_learn=np.array([0.0]),
+        p_slip=np.array([0.0]),
+        p_guess=np.array([0.0]),
+        use_rust=False,
+    )
+    responses = np.array(
+        [
+            [1, 1, 0],
+            [0, 1, 0],
+            [-1, 0, 1],
+        ],
+        dtype=np.int32,
+    )
+    skills = np.zeros(responses.shape[1], dtype=np.int32)
+
+    gamma, log_likelihoods = model.forward_backward_batch(responses, skills)
+
+    for person_idx, person_responses in enumerate(responses):
+        expected_gamma, expected_log_likelihood = model._forward_backward_python(
+            person_responses,
+            skills,
+        )
+        assert_allclose(gamma[person_idx], expected_gamma)
+        assert log_likelihoods[person_idx] == pytest.approx(expected_log_likelihood)
+
+
 def test_batch_api_supports_person_specific_skill_layouts() -> None:
     responses, shared_skills = _batch()
     skill_assignments = np.vstack(
