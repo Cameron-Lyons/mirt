@@ -213,6 +213,67 @@ class StateSpaceIRT:
             raise ValueError("responses must contain only -1, 0, or 1")
         return response_values.astype(np.int32, copy=False)
 
+    def _validated_update_responses(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        batch: bool,
+    ) -> NDArray[np.int_]:
+        """Validate responses from one modeled occasion."""
+        response_values = np.asarray(responses)
+        valid_shape = (
+            response_values.ndim == 2
+            and response_values.shape[0] > 0
+            and response_values.shape[1] == self.n_items
+            if batch
+            else response_values.shape == (self.n_items,)
+        )
+        if not valid_shape:
+            expected_shape = (
+                f"(n_persons, {self.n_items})" if batch else f"({self.n_items},)"
+            )
+            raise ValueError(f"responses must have shape {expected_shape}")
+        if not np.issubdtype(response_values.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if not np.all(np.isin(response_values, (-1, 0, 1))):
+            raise ValueError("responses must contain only -1, 0, or 1")
+        return response_values.astype(np.int32, copy=False)
+
+    @staticmethod
+    def _validated_state_vector(
+        values: float | NDArray[np.float64] | None,
+        n_persons: int,
+        name: str,
+        *,
+        default: float,
+        positive: bool = False,
+    ) -> NDArray[np.float64]:
+        """Return finite state values broadcast across a batch."""
+        raw_values = np.asarray(default if values is None else values)
+        if (
+            np.issubdtype(raw_values.dtype, np.bool_)
+            or np.issubdtype(raw_values.dtype, np.complexfloating)
+            or not np.issubdtype(raw_values.dtype, np.number)
+        ):
+            qualifier = "finite positive" if positive else "finite"
+            raise ValueError(f"{name} must contain {qualifier} values")
+        if raw_values.ndim == 0:
+            state_values = np.full(
+                n_persons,
+                raw_values.item(),
+                dtype=np.float64,
+            )
+        elif raw_values.shape == (n_persons,):
+            state_values = raw_values.astype(np.float64, copy=True)
+        else:
+            raise ValueError(f"{name} must be scalar or have shape ({n_persons},)")
+        if not np.all(np.isfinite(state_values)) or (
+            positive and np.any(state_values <= 0.0)
+        ):
+            qualifier = "finite positive" if positive else "finite"
+            raise ValueError(f"{name} must contain {qualifier} values")
+        return state_values
+
     @staticmethod
     def _validated_positive_integer(value: int, name: str) -> int:
         """Return a validated positive integer parameter."""
@@ -273,6 +334,275 @@ class StateSpaceIRT:
             )
         return np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON), derivative
 
+    def _extended_kalman_update_batch(
+        self,
+        responses: NDArray[np.int_],
+        prior_means: NDArray[np.float64],
+        prior_variances: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Update validated state priors from one response occasion."""
+        observed = responses >= 0
+        has_observations = np.any(observed, axis=1)
+        updated_means = prior_means.copy()
+        updated_variances = prior_variances.copy()
+
+        if not np.any(has_observations):
+            return updated_means, updated_variances
+
+        candidate_means = prior_means.copy()
+        for _ in range(5):
+            probability, derivative = self._observation_probability_and_derivative(
+                candidate_means
+            )
+            response_variance = (
+                probability * (1.0 - probability) + self.observation_noise
+            )
+            score = (
+                np.sum(
+                    np.where(
+                        observed,
+                        derivative * (responses - probability) / response_variance,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+                - (candidate_means - prior_means) / prior_variances
+            )
+            information = 1.0 / prior_variances + np.sum(
+                np.where(
+                    observed,
+                    derivative**2 / response_variance,
+                    0.0,
+                ),
+                axis=1,
+            )
+            candidate_means[has_observations] += (
+                score[has_observations] / information[has_observations]
+            )
+
+        probability, derivative = self._observation_probability_and_derivative(
+            candidate_means
+        )
+        response_variance = probability * (1.0 - probability) + self.observation_noise
+        final_information = 1.0 / prior_variances + np.sum(
+            np.where(
+                observed,
+                derivative**2 / response_variance,
+                0.0,
+            ),
+            axis=1,
+        )
+        updated_means[has_observations] = candidate_means[has_observations]
+        updated_variances[has_observations] = 1.0 / final_information[has_observations]
+        return updated_means, updated_variances
+
+    def extended_kalman_update(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        prior_mean: float | None = None,
+        prior_variance: float | None = None,
+    ) -> tuple[float, float]:
+        """Update one state prior from one response occasion.
+
+        Omitted prior moments use the model's initial state distribution.
+        Use :meth:`propagate_state` to obtain the next occasion's prior.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response vector with shape ``(n_items,)``. Use ``-1`` for
+            missing item responses.
+        prior_mean : float, optional
+            Finite predicted state mean for this occasion.
+        prior_variance : float, optional
+            Finite positive predicted state variance for this occasion.
+
+        Returns
+        -------
+        tuple
+            Updated state mean and variance.
+        """
+        response_values = self._validated_update_responses(responses, batch=False)
+        prior_means = self._validated_state_vector(
+            prior_mean,
+            1,
+            "prior_mean",
+            default=self.initial_mean,
+        )
+        prior_variances = self._validated_state_vector(
+            prior_variance,
+            1,
+            "prior_variance",
+            default=self.initial_var,
+            positive=True,
+        )
+        updated_means, updated_variances = self._extended_kalman_update_batch(
+            response_values[None, :],
+            prior_means,
+            prior_variances,
+        )
+        return float(updated_means[0]), float(updated_variances[0])
+
+    def extended_kalman_update_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        prior_means: float | NDArray[np.float64] | None = None,
+        prior_variances: float | NDArray[np.float64] | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Update multiple state priors from one response occasion.
+
+        Scalar prior moments are broadcast across people. Omitted moments use
+        the model's initial state distribution.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_items)``. Use
+            ``-1`` for missing item responses.
+        prior_means : float or NDArray, optional
+            Finite predicted state means, either scalar or shape
+            ``(n_persons,)``.
+        prior_variances : float or NDArray, optional
+            Finite positive predicted state variances, either scalar or shape
+            ``(n_persons,)``.
+
+        Returns
+        -------
+        tuple
+            Updated means and variances, each with shape ``(n_persons,)``.
+        """
+        response_values = self._validated_update_responses(responses, batch=True)
+        n_persons = response_values.shape[0]
+        mean_values = self._validated_state_vector(
+            prior_means,
+            n_persons,
+            "prior_means",
+            default=self.initial_mean,
+        )
+        variance_values = self._validated_state_vector(
+            prior_variances,
+            n_persons,
+            "prior_variances",
+            default=self.initial_var,
+            positive=True,
+        )
+        return self._extended_kalman_update_batch(
+            response_values,
+            mean_values,
+            variance_values,
+        )
+
+    def _propagate_state_moments(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_steps: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Propagate validated state moments without observation updates."""
+        propagated_means = state_means.copy()
+        propagated_variances = state_variances.copy()
+        transition = float(self.transition_matrix[0, 0])
+        transition_squared = transition**2
+        process_variance = float(self.process_noise[0, 0])
+        for _ in range(n_steps):
+            propagated_means *= transition
+            propagated_variances = (
+                transition_squared * propagated_variances + process_variance
+            )
+        return propagated_means, propagated_variances
+
+    def propagate_state(
+        self,
+        state_mean: float,
+        state_variance: float,
+        n_steps: int = 1,
+    ) -> tuple[float, float]:
+        """Propagate one state distribution forward without observations.
+
+        Parameters
+        ----------
+        state_mean : float
+            Finite mean of the current state distribution.
+        state_variance : float
+            Finite positive variance of the current state distribution.
+        n_steps : int, default=1
+            Number of state transitions to apply.
+
+        Returns
+        -------
+        tuple
+            Propagated state mean and variance.
+        """
+        n_steps = self._validated_positive_integer(n_steps, "n_steps")
+        state_means = self._validated_state_vector(
+            state_mean,
+            1,
+            "state_mean",
+            default=self.initial_mean,
+        )
+        state_variances = self._validated_state_vector(
+            state_variance,
+            1,
+            "state_variance",
+            default=self.initial_var,
+            positive=True,
+        )
+        propagated_means, propagated_variances = self._propagate_state_moments(
+            state_means,
+            state_variances,
+            n_steps,
+        )
+        return float(propagated_means[0]), float(propagated_variances[0])
+
+    def propagate_state_batch(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: float | NDArray[np.float64],
+        n_steps: int = 1,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Propagate multiple state distributions without observations.
+
+        Parameters
+        ----------
+        state_means : NDArray
+            Finite current state means with shape ``(n_persons,)``.
+        state_variances : float or NDArray
+            Finite positive current state variances, either scalar or shape
+            ``(n_persons,)``.
+        n_steps : int, default=1
+            Number of state transitions to apply.
+
+        Returns
+        -------
+        tuple
+            Propagated means and variances, each with shape ``(n_persons,)``.
+        """
+        n_steps = self._validated_positive_integer(n_steps, "n_steps")
+        raw_means = np.asarray(state_means)
+        if raw_means.ndim != 1 or raw_means.size < 1:
+            raise ValueError("state_means must have shape (n_persons,)")
+        n_persons = raw_means.size
+        mean_values = self._validated_state_vector(
+            raw_means,
+            n_persons,
+            "state_means",
+            default=self.initial_mean,
+        )
+        variance_values = self._validated_state_vector(
+            state_variances,
+            n_persons,
+            "state_variances",
+            default=self.initial_var,
+            positive=True,
+        )
+        return self._propagate_state_moments(
+            mean_values,
+            variance_values,
+            n_steps,
+        )
+
     def extended_kalman_filter(
         self,
         responses: NDArray[np.int_],
@@ -322,76 +652,25 @@ class StateSpaceIRT:
             dtype=np.float64,
         )
         filtered_variances = np.empty_like(filtered_means)
-        transition = float(self.transition_matrix[0, 0])
-        process_variance = float(self.process_noise[0, 0])
         predicted_mean = np.full(n_persons, self.initial_mean, dtype=np.float64)
         predicted_variance = np.full(n_persons, self.initial_var, dtype=np.float64)
 
         for time_index in range(self.n_timepoints):
             time_responses = response_values[:, time_index]
-            observed = time_responses >= 0
-            has_observations = np.any(observed, axis=1)
-            updated_mean = predicted_mean.copy()
-            updated_variance = predicted_variance.copy()
-
-            if np.any(has_observations):
-                candidate_mean = predicted_mean.copy()
-                for _ in range(5):
-                    probability, derivative = (
-                        self._observation_probability_and_derivative(candidate_mean)
-                    )
-                    response_variance = (
-                        probability * (1.0 - probability) + self.observation_noise
-                    )
-                    score = (
-                        np.sum(
-                            np.where(
-                                observed,
-                                derivative
-                                * (time_responses - probability)
-                                / response_variance,
-                                0.0,
-                            ),
-                            axis=1,
-                        )
-                        - (candidate_mean - predicted_mean) / predicted_variance
-                    )
-                    information = 1.0 / predicted_variance + np.sum(
-                        np.where(
-                            observed,
-                            derivative**2 / response_variance,
-                            0.0,
-                        ),
-                        axis=1,
-                    )
-                    candidate_mean[has_observations] += (
-                        score[has_observations] / information[has_observations]
-                    )
-
-                probability, derivative = self._observation_probability_and_derivative(
-                    candidate_mean
-                )
-                response_variance = (
-                    probability * (1.0 - probability) + self.observation_noise
-                )
-                final_information = 1.0 / predicted_variance + np.sum(
-                    np.where(
-                        observed,
-                        derivative**2 / response_variance,
-                        0.0,
-                    ),
-                    axis=1,
-                )
-                updated_mean[has_observations] = candidate_mean[has_observations]
-                updated_variance[has_observations] = (
-                    1.0 / final_information[has_observations]
-                )
+            updated_mean, updated_variance = self._extended_kalman_update_batch(
+                time_responses,
+                predicted_mean,
+                predicted_variance,
+            )
 
             filtered_means[:, time_index] = updated_mean
             filtered_variances[:, time_index] = updated_variance
             if time_index < self.n_timepoints - 1:
-                predicted_mean = transition * updated_mean
-                predicted_variance = transition**2 * updated_variance + process_variance
+                predicted_mean, predicted_variance = self._propagate_state_moments(
+                    updated_mean,
+                    updated_variance,
+                    1,
+                )
 
         return filtered_means, filtered_variances
 
@@ -455,14 +734,12 @@ class StateSpaceIRT:
         smoothed_means = filtered_means.copy()
         smoothed_variances = filtered_variances.copy()
         transition = float(self.transition_matrix[0, 0])
-        transition_squared = transition**2
-        process_variance = float(self.process_noise[0, 0])
 
         for time_index in range(self.n_timepoints - 2, -1, -1):
-            predicted_mean = transition * filtered_means[:, time_index]
-            predicted_variance = (
-                transition_squared * filtered_variances[:, time_index]
-                + process_variance
+            predicted_mean, predicted_variance = self._propagate_state_moments(
+                filtered_means[:, time_index],
+                filtered_variances[:, time_index],
+                1,
             )
             smoothing_gain = (
                 filtered_variances[:, time_index] * transition / predicted_variance
@@ -537,15 +814,15 @@ class StateSpaceIRT:
         n_persons = filtered_means.shape[0]
         forecast_means = np.empty((n_persons, n_steps), dtype=np.float64)
         forecast_variances = np.empty_like(forecast_means)
-        transition = float(self.transition_matrix[0, 0])
-        transition_squared = transition**2
-        process_variance = float(self.process_noise[0, 0])
         current_mean = filtered_means[:, -1]
         current_variance = filtered_variances[:, -1]
 
         for step_index in range(n_steps):
-            current_mean = transition * current_mean
-            current_variance = transition_squared * current_variance + process_variance
+            current_mean, current_variance = self._propagate_state_moments(
+                current_mean,
+                current_variance,
+                1,
+            )
             forecast_means[:, step_index] = current_mean
             forecast_variances[:, step_index] = current_variance
 
@@ -642,12 +919,12 @@ class StateSpaceIRT:
         predicted_variances = np.empty_like(filtered_variances)
         predicted_means[:, 0] = self.initial_mean
         predicted_variances[:, 0] = self.initial_var
-        transition = float(self.transition_matrix[0, 0])
-        transition_squared = transition**2
-        process_variance = float(self.process_noise[0, 0])
-        predicted_means[:, 1:] = transition * filtered_means[:, :-1]
-        predicted_variances[:, 1:] = (
-            transition_squared * filtered_variances[:, :-1] + process_variance
+        predicted_means[:, 1:], predicted_variances[:, 1:] = (
+            self._propagate_state_moments(
+                filtered_means[:, :-1],
+                filtered_variances[:, :-1],
+                1,
+            )
         )
         return predicted_means, predicted_variances
 

@@ -385,6 +385,242 @@ class TestStateSpaceIRT:
 
     @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
     @pytest.mark.parametrize("transition", [0.85, -0.65])
+    def test_online_updates_match_full_history_filter(self, base_model, transition):
+        model = StateSpaceIRT(
+            n_items=7,
+            n_timepoints=6,
+            base_model=base_model,
+            transition_matrix=np.array([[transition]]),
+            process_noise=np.array([[0.09]]),
+            observation_noise=0.12,
+            discrimination=np.linspace(0.6, 1.8, 7),
+            difficulty=np.linspace(-1.2, 1.3, 7),
+            guessing=np.linspace(0.08, 0.24, 7) if base_model == "3PL" else None,
+            initial_mean=-0.15,
+            initial_var=0.75,
+        )
+        responses = np.random.default_rng(83).integers(0, 2, size=(11, 6, 7))
+        responses[np.random.default_rng(84).random(responses.shape) < 0.25] = -1
+        responses[0, 3] = -1
+        expected_means, expected_variances = model.extended_kalman_filter_batch(
+            responses
+        )
+        online_means = np.empty_like(expected_means)
+        online_variances = np.empty_like(expected_variances)
+        prior_means = np.full(len(responses), model.initial_mean)
+        prior_variances = np.full(len(responses), model.initial_var)
+
+        for time_index in range(model.n_timepoints):
+            updated_means, updated_variances = model.extended_kalman_update_batch(
+                responses[:, time_index],
+                prior_means=prior_means,
+                prior_variances=prior_variances,
+            )
+            online_means[:, time_index] = updated_means
+            online_variances[:, time_index] = updated_variances
+            if time_index < model.n_timepoints - 1:
+                prior_means, prior_variances = model.propagate_state_batch(
+                    updated_means,
+                    updated_variances,
+                )
+
+        assert_allclose(online_means, expected_means)
+        assert_allclose(online_variances, expected_variances)
+
+        scalar_means = np.empty(model.n_timepoints)
+        scalar_variances = np.empty(model.n_timepoints)
+        prior_mean = model.initial_mean
+        prior_variance = model.initial_var
+        for time_index in range(model.n_timepoints):
+            prior_mean, prior_variance = model.extended_kalman_update(
+                responses[0, time_index],
+                prior_mean=prior_mean,
+                prior_variance=prior_variance,
+            )
+            scalar_means[time_index] = prior_mean
+            scalar_variances[time_index] = prior_variance
+            if time_index < model.n_timepoints - 1:
+                prior_mean, prior_variance = model.propagate_state(
+                    prior_mean,
+                    prior_variance,
+                )
+
+        assert_allclose(scalar_means, expected_means[0])
+        assert_allclose(scalar_variances, expected_variances[0])
+
+    def test_online_batch_update_matches_scalar_updates_and_preserves_missing(self):
+        model = StateSpaceIRT(
+            n_items=5,
+            n_timepoints=3,
+            base_model="3PL",
+            discrimination=np.linspace(0.7, 1.5, 5),
+            difficulty=np.linspace(-0.8, 0.9, 5),
+            guessing=np.linspace(0.1, 0.25, 5),
+        )
+        responses = np.array(
+            [
+                [1, 0, 1, -1, 0],
+                [-1, -1, -1, -1, -1],
+                [0, 1, 1, 0, 1],
+            ],
+            dtype=np.int32,
+        )
+        prior_means = np.array([-0.4, 0.2, 1.1])
+        prior_variances = np.array([0.5, 0.8, 1.4])
+
+        batch_means, batch_variances = model.extended_kalman_update_batch(
+            responses,
+            prior_means=prior_means,
+            prior_variances=prior_variances,
+        )
+        scalar = [
+            model.extended_kalman_update(
+                person_responses,
+                prior_mean=person_mean,
+                prior_variance=person_variance,
+            )
+            for person_responses, person_mean, person_variance in zip(
+                responses,
+                prior_means,
+                prior_variances,
+                strict=True,
+            )
+        ]
+
+        assert_allclose(batch_means, [result[0] for result in scalar])
+        assert_allclose(batch_variances, [result[1] for result in scalar])
+        assert batch_means[1] == prior_means[1]
+        assert batch_variances[1] == prior_variances[1]
+
+        default_mean, default_variance = model.extended_kalman_update(responses[0])
+        expected_default = model.extended_kalman_update_batch(responses[:1])
+        assert default_mean == expected_default[0][0]
+        assert default_variance == expected_default[1][0]
+
+    def test_state_propagation_matches_iterative_reference(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=3,
+            transition_matrix=np.array([[-0.7]]),
+            process_noise=np.array([[0.08]]),
+        )
+        state_means = np.array([-1.0, 0.2, 2.0])
+        state_variances = np.array([0.3, 1.0, 1.5])
+        expected_means = state_means.copy()
+        expected_variances = state_variances.copy()
+        for _ in range(5):
+            expected_means *= -0.7
+            expected_variances = 0.49 * expected_variances + 0.08
+
+        propagated_means, propagated_variances = model.propagate_state_batch(
+            state_means,
+            state_variances,
+            n_steps=5,
+        )
+
+        assert_allclose(propagated_means, expected_means)
+        assert_allclose(propagated_variances, expected_variances)
+        shared_variance = model.propagate_state_batch(
+            state_means,
+            0.5,
+        )[1]
+        assert_allclose(shared_variance, np.full(3, 0.49 * 0.5 + 0.08))
+        for person_index in range(len(state_means)):
+            scalar_mean, scalar_variance = model.propagate_state(
+                state_means[person_index],
+                state_variances[person_index],
+                n_steps=5,
+            )
+            assert_allclose(scalar_mean, propagated_means[person_index])
+            assert_allclose(scalar_variance, propagated_variances[person_index])
+
+    @pytest.mark.parametrize(
+        ("method_name", "responses", "message"),
+        [
+            ("extended_kalman_update", np.zeros((1, 3), dtype=int), "shape"),
+            ("extended_kalman_update", np.zeros(3), "integer"),
+            ("extended_kalman_update", np.array([0, 1, 2]), "only"),
+            ("extended_kalman_update_batch", np.zeros((0, 3), dtype=int), "shape"),
+            ("extended_kalman_update_batch", np.zeros((2, 2), dtype=int), "shape"),
+            ("extended_kalman_update_batch", np.zeros((2, 3)), "integer"),
+            (
+                "extended_kalman_update_batch",
+                np.array([[0, 1, -2], [1, 0, 1]]),
+                "only",
+            ),
+        ],
+    )
+    def test_online_updates_validate_responses(self, method_name, responses, message):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+
+        with pytest.raises(ValueError, match=message):
+            getattr(model, method_name)(responses)
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"prior_means": np.zeros(2)}, "prior_means"),
+            ({"prior_means": np.array([0.0, np.nan, 0.0])}, "finite"),
+            ({"prior_means": True}, "finite"),
+            ({"prior_means": 1.0 + 0.5j}, "finite"),
+            ({"prior_variances": np.ones(2)}, "prior_variances"),
+            ({"prior_variances": 0.0}, "positive"),
+            ({"prior_variances": np.array([1.0, np.inf, 1.0])}, "positive"),
+        ],
+    )
+    def test_online_batch_update_validates_priors(self, kwargs, message):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((3, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match=message):
+            model.extended_kalman_update_batch(responses, **kwargs)
+
+    @pytest.mark.parametrize(
+        ("method_name", "args", "kwargs", "message"),
+        [
+            ("propagate_state", (np.nan, 1.0), {}, "state_mean"),
+            ("propagate_state", (0.0, 0.0), {}, "state_variance"),
+            ("propagate_state", (0.0, 1.0), {"n_steps": 0}, "n_steps"),
+            (
+                "propagate_state_batch",
+                (np.empty(0), np.empty(0)),
+                {},
+                "state_means",
+            ),
+            (
+                "propagate_state_batch",
+                (np.zeros((2, 1)), np.ones(2)),
+                {},
+                "state_means",
+            ),
+            (
+                "propagate_state_batch",
+                (np.zeros(3), np.ones(2)),
+                {},
+                "state_variances",
+            ),
+            (
+                "propagate_state_batch",
+                (np.zeros(3), np.array([1.0, -0.1, 1.0])),
+                {},
+                "positive",
+            ),
+        ],
+    )
+    def test_state_propagation_validates_inputs(
+        self,
+        method_name,
+        args,
+        kwargs,
+        message,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+
+        with pytest.raises(ValueError, match=message):
+            getattr(model, method_name)(*args, **kwargs)
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    @pytest.mark.parametrize("transition", [0.85, -0.65])
     def test_batch_smoother_matches_independent_scalar_reference(
         self,
         base_model,

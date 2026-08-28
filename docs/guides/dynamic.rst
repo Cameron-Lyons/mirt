@@ -130,6 +130,32 @@ Rauch--Tung--Striebel backward pass so every state uses the complete response
 history. Use ``extended_kalman_filter`` or ``extended_kalman_smoother`` for one
 response history.
 
+For a live response stream, update only the newest occasion instead of
+refiltering the complete history:
+
+.. code-block:: python
+
+   prior_mean = state_model.initial_mean
+   prior_variance = state_model.initial_var
+   online_means = []
+
+   for response_vector in responses[0]:
+       updated_mean, updated_variance = state_model.extended_kalman_update(
+           response_vector,
+           prior_mean=prior_mean,
+           prior_variance=prior_variance,
+       )
+       online_means.append(updated_mean)
+       prior_mean, prior_variance = state_model.propagate_state(
+           updated_mean,
+           updated_variance,
+       )
+
+``extended_kalman_update_batch`` performs the same one-occasion update for
+many learners, accepting either shared scalar priors or one prior per learner.
+``propagate_state_batch`` advances their state distributions by one or more
+occasions. Fully missing response rows leave the supplied priors unchanged.
+
 Forecasts start one step after the final response occasion and propagate both
 state means and process uncertainty. Item-success forecasts integrate the 2PL
 or 3PL response curve over each Gaussian forecast distribution rather than
