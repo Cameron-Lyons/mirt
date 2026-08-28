@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-from importlib.util import find_spec
 from typing import TYPE_CHECKING, Any, Literal
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
@@ -13,9 +12,6 @@ if TYPE_CHECKING:
 
     from mirt.estimation.mcmc import MCMCResult
     from mirt.results.fit_result import FitResult
-
-_HAS_PLOTTING = find_spec("matplotlib") is not None
-_HAS_REPORTS = True
 
 
 def fit_mirt(
@@ -542,7 +538,7 @@ def dif(
     return create_dataframe(dif_results, index_name="item")
 
 
-__all__ = build_all_exports(has_plotting=_HAS_PLOTTING, has_reports=_HAS_REPORTS)
+__all__ = build_all_exports()
 _MODULE_EXPORTS = MODULE_EXPORTS
 _LAZY_IMPORTS = build_lazy_imports()
 

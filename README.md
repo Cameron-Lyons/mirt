@@ -444,6 +444,9 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_ci()` | Percentile, basic, and BCa intervals with parallel replicate and jackknife fits |
 | `parametric_bootstrap()` | Deterministic model-based bootstrap with optional process workers |
 | `generate_plausible_values()` | Plausible values |
+| `combine_plausible_values()` | Validated scalar or vector combining with Rubin uncertainty |
+| `plausible_value_statistics()` | Mean, variance, SD, or percentiles for one or all latent factors |
+| `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
