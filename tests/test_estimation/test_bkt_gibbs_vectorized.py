@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose
+from numpy.testing import assert_allclose, assert_array_equal
 
 from mirt.estimation.dynamic_gibbs import BKTGibbsSampler, BKTPriors
 from mirt.models.dynamic import BKTModel
@@ -189,6 +189,83 @@ def test_vectorized_updates_match_scalar_sufficient_statistics() -> None:
         model.n_skills,
     )
     assert_allclose(recorder.beta_shapes, expected)
+
+
+def test_batch_ffbs_matches_seeded_scalar_sampling() -> None:
+    model = BKTModel(
+        n_skills=3,
+        allow_forgetting=True,
+        p_init=np.array([0.2, 0.55, 0.8]),
+        p_learn=np.array([0.25, 0.12, 0.05]),
+        p_forget=np.array([0.02, 0.08, 0.15]),
+        p_slip=np.array([0.08, 0.15, 0.22]),
+        p_guess=np.array([0.12, 0.25, 0.35]),
+        use_rust=False,
+    )
+    responses, skills, _ = model.simulate(64, 8, seed=7)
+    order = np.arange(skills.size).reshape(model.n_skills, -1).T.ravel()
+    responses = responses[:, order]
+    skills = skills[order]
+    responses[::7, ::5] = -1
+    sampler = BKTGibbsSampler(n_iter=2, burnin=1, use_rust=False)
+    skill_trials = model._skill_trials(skills)
+    scalar_rng = np.random.default_rng(42)
+    batch_rng = np.random.default_rng(42)
+
+    expected = np.stack(
+        [
+            sampler._sample_states_ffbs(
+                person_responses,
+                skills,
+                model,
+                scalar_rng,
+                skill_trials,
+            )
+            for person_responses in responses
+        ]
+    )
+    result = sampler._sample_states_ffbs_batch(
+        responses,
+        skills,
+        model,
+        batch_rng,
+        skill_trials,
+    )
+
+    assert_array_equal(result, expected)
+    assert batch_rng.random() == scalar_rng.random()
+
+
+def test_fit_uses_batch_ffbs_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = BKTModel(n_skills=2, use_rust=False)
+    responses, skills, _ = model.simulate(20, 5, seed=9)
+    sampler = BKTGibbsSampler(
+        n_iter=3,
+        burnin=1,
+        seed=11,
+        use_rust=False,
+    )
+    calls = 0
+    original = sampler._sample_states_ffbs_batch
+
+    def record_batch(*args: Any, **kwargs: Any) -> np.ndarray:
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sampler, "_sample_states_ffbs_batch", record_batch)
+    monkeypatch.setattr(
+        sampler,
+        "_sample_states_ffbs",
+        lambda *args, **kwargs: pytest.fail(
+            "fit must not sample one learner at a time"
+        ),
+    )
+
+    result = sampler.fit(responses, skills, n_skills=model.n_skills)
+
+    assert calls == sampler.n_iter
+    assert np.isfinite(result.log_likelihood)
 
 
 @pytest.mark.parametrize(

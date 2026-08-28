@@ -53,117 +53,80 @@ Multidimensional CAT:
 >>> print(mcat.get_result().summary())
 """
 
-from mirt.cat.content import (
-    ContentArea,
-    ContentBlueprint,
-    ContentConstraint,
-    NoContentConstraint,
-    WeightedContent,
-    create_content_constraint,
-)
-from mirt.cat.engine import CATEngine
-from mirt.cat.exposure import (
-    ExposureControl,
-    NoExposureControl,
-    ProgressiveRestricted,
-    Randomesque,
-    SympsonHetter,
-    create_exposure_control,
-)
-from mirt.cat.mcat_engine import MCATEngine
-from mirt.cat.mcat_selection import (
-    AOptimality,
-    BayesianMCAT,
-    COptimality,
-    DOptimality,
-    KullbackLeiblerMCAT,
-    MCATSelectionStrategy,
-    RandomMCATSelection,
-    create_mcat_selection_strategy,
-)
-from mirt.cat.mcat_stopping import (
-    AvgSEStop,
-    CombinedMCATStop,
-    CovarianceDeterminantStop,
-    CovarianceTraceStop,
-    MaxItemsMCATStop,
-    MaxSEStop,
-    MCATStoppingRule,
-    ThetaChangeMCATStop,
-    create_mcat_stopping_rule,
-)
-from mirt.cat.results import CATResult, CATState, MCATResult, MCATState
-from mirt.cat.selection import (
-    AStratified,
-    ItemSelectionStrategy,
-    KullbackLeibler,
-    MaxExpectedInformation,
-    MaxFisherInformation,
-    RandomSelection,
-    UrryRule,
-    create_selection_strategy,
-)
-from mirt.cat.stopping import (
-    ClassificationStop,
-    CombinedStop,
-    MaxItemsStop,
-    MinItemsStop,
-    StandardErrorStop,
-    StoppingRule,
-    ThetaChangeStop,
-    create_stopping_rule,
-)
+from __future__ import annotations
 
-__all__ = [
-    "CATEngine",
-    "CATResult",
-    "CATState",
-    "ItemSelectionStrategy",
-    "MaxFisherInformation",
-    "MaxExpectedInformation",
-    "KullbackLeibler",
-    "UrryRule",
-    "RandomSelection",
-    "AStratified",
-    "create_selection_strategy",
-    "StoppingRule",
-    "StandardErrorStop",
-    "MaxItemsStop",
-    "MinItemsStop",
-    "ThetaChangeStop",
-    "ClassificationStop",
-    "CombinedStop",
-    "create_stopping_rule",
-    "MCATEngine",
-    "MCATResult",
-    "MCATState",
-    "MCATSelectionStrategy",
-    "DOptimality",
-    "AOptimality",
-    "COptimality",
-    "KullbackLeiblerMCAT",
-    "BayesianMCAT",
-    "RandomMCATSelection",
-    "create_mcat_selection_strategy",
-    "MCATStoppingRule",
-    "CovarianceTraceStop",
-    "CovarianceDeterminantStop",
-    "MaxSEStop",
-    "AvgSEStop",
-    "MaxItemsMCATStop",
-    "ThetaChangeMCATStop",
-    "CombinedMCATStop",
-    "create_mcat_stopping_rule",
-    "ExposureControl",
-    "NoExposureControl",
-    "SympsonHetter",
-    "Randomesque",
-    "ProgressiveRestricted",
-    "create_exposure_control",
-    "ContentConstraint",
-    "NoContentConstraint",
-    "ContentBlueprint",
-    "ContentArea",
-    "WeightedContent",
-    "create_content_constraint",
-]
+import importlib
+from typing import Any
+
+_LAZY_IMPORTS = {
+    "CATEngine": "mirt.cat.engine",
+    "CATResult": "mirt.cat.results",
+    "CATState": "mirt.cat.results",
+    "ItemSelectionStrategy": "mirt.cat.selection",
+    "MaxFisherInformation": "mirt.cat.selection",
+    "MaxExpectedInformation": "mirt.cat.selection",
+    "KullbackLeibler": "mirt.cat.selection",
+    "UrryRule": "mirt.cat.selection",
+    "RandomSelection": "mirt.cat.selection",
+    "AStratified": "mirt.cat.selection",
+    "create_selection_strategy": "mirt.cat.selection",
+    "StoppingRule": "mirt.cat.stopping",
+    "StandardErrorStop": "mirt.cat.stopping",
+    "MaxItemsStop": "mirt.cat.stopping",
+    "MinItemsStop": "mirt.cat.stopping",
+    "ThetaChangeStop": "mirt.cat.stopping",
+    "ClassificationStop": "mirt.cat.stopping",
+    "CombinedStop": "mirt.cat.stopping",
+    "create_stopping_rule": "mirt.cat.stopping",
+    "MCATEngine": "mirt.cat.mcat_engine",
+    "MCATResult": "mirt.cat.results",
+    "MCATState": "mirt.cat.results",
+    "MCATSelectionStrategy": "mirt.cat.mcat_selection",
+    "DOptimality": "mirt.cat.mcat_selection",
+    "AOptimality": "mirt.cat.mcat_selection",
+    "COptimality": "mirt.cat.mcat_selection",
+    "KullbackLeiblerMCAT": "mirt.cat.mcat_selection",
+    "BayesianMCAT": "mirt.cat.mcat_selection",
+    "RandomMCATSelection": "mirt.cat.mcat_selection",
+    "create_mcat_selection_strategy": "mirt.cat.mcat_selection",
+    "MCATStoppingRule": "mirt.cat.mcat_stopping",
+    "CovarianceTraceStop": "mirt.cat.mcat_stopping",
+    "CovarianceDeterminantStop": "mirt.cat.mcat_stopping",
+    "MaxSEStop": "mirt.cat.mcat_stopping",
+    "AvgSEStop": "mirt.cat.mcat_stopping",
+    "MaxItemsMCATStop": "mirt.cat.mcat_stopping",
+    "ThetaChangeMCATStop": "mirt.cat.mcat_stopping",
+    "CombinedMCATStop": "mirt.cat.mcat_stopping",
+    "create_mcat_stopping_rule": "mirt.cat.mcat_stopping",
+    "ExposureControl": "mirt.cat.exposure",
+    "NoExposureControl": "mirt.cat.exposure",
+    "SympsonHetter": "mirt.cat.exposure",
+    "Randomesque": "mirt.cat.exposure",
+    "ProgressiveRestricted": "mirt.cat.exposure",
+    "create_exposure_control": "mirt.cat.exposure",
+    "ContentConstraint": "mirt.cat.content",
+    "NoContentConstraint": "mirt.cat.content",
+    "ContentBlueprint": "mirt.cat.content",
+    "ContentArea": "mirt.cat.content",
+    "WeightedContent": "mirt.cat.content",
+    "create_content_constraint": "mirt.cat.content",
+}
+
+__all__ = list(_LAZY_IMPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve and cache a public CAT symbol on first access."""
+    try:
+        module_name = _LAZY_IMPORTS[name]
+    except KeyError:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from None
+
+    value = getattr(importlib.import_module(module_name), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Return loaded attributes together with deferred public symbols."""
+    return sorted(set(globals()) | set(__all__))
