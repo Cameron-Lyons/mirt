@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Callable
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -135,6 +136,45 @@ def test_exact_ising_probabilities_normalize() -> None:
         model.log_partition_function(max_nodes=2)
 
 
+def test_ising_partition_cache_reuses_and_invalidates_exact_sum() -> None:
+    model = IsingModel(4)
+    model.set_thresholds(np.array([0.2, -0.4, 0.6, 0.1]))
+    model.set_interactions(
+        np.array(
+            [
+                [0.0, 0.5, 0.0, 0.1],
+                [0.5, 0.0, -0.2, 0.0],
+                [0.0, -0.2, 0.0, 0.3],
+                [0.1, 0.0, 0.3, 0.0],
+            ]
+        )
+    )
+
+    with patch.object(np, "einsum", wraps=np.einsum) as einsum:
+        original = model.log_partition_function()
+        assert model.log_partition_function() == original
+        assert einsum.call_count == 1
+
+        model.set_thresholds(model.thresholds + 0.25)
+        updated = model.log_partition_function()
+        assert einsum.call_count == 2
+
+    assert updated != original
+    with pytest.raises(MirtValidationError, match="Exact enumeration"):
+        model.log_partition_function(max_nodes=3)
+
+
+def test_ising_copy_preserves_valid_partition_cache() -> None:
+    model = IsingModel(3)
+    expected = model.log_partition_function()
+    copied = model.copy()
+
+    with patch.object(np, "einsum", wraps=np.einsum) as einsum:
+        assert copied.log_partition_function() == expected
+
+    assert einsum.call_count == 0
+
+
 def test_ising_sampling_supports_thinning_and_empty_output() -> None:
     model = IsingModel(2).set_interactions(np.array([[0.0, 0.8], [0.8, 0.0]]))
     first = model.sample(30, n_burnin=10, thin=3, seed=42)
@@ -191,6 +231,50 @@ def test_gaussian_likelihood_matches_direct_formula() -> None:
         model.log_likelihood(np.ones((2, 3)))
     with pytest.raises(MirtDataError):
         model.log_likelihood(np.array([[0.0, np.inf]]))
+
+
+def test_gaussian_covariance_cache_returns_copies_and_invalidates() -> None:
+    model = GaussianGraphicalModel(3)
+    first_precision = np.array([[2.0, -0.4, 0.2], [-0.4, 1.5, -0.3], [0.2, -0.3, 1.2]])
+    model.set_precision_matrix(first_precision)
+
+    with patch.object(np.linalg, "solve", wraps=np.linalg.solve) as solve:
+        first = model.covariance_matrix
+        first[0, 0] = -1.0
+        second = model.covariance_matrix
+        assert solve.call_count == 1
+        assert second[0, 0] >= 0.0
+
+        model.set_precision_matrix(first_precision + np.eye(3))
+        updated = model.covariance_matrix
+        assert solve.call_count == 2
+
+    assert not np.array_equal(second, updated)
+
+
+def test_gaussian_precision_factorization_is_reused_by_likelihood() -> None:
+    model = GaussianGraphicalModel(3)
+    precision = np.array([[2.0, -0.4, 0.2], [-0.4, 1.5, -0.3], [0.2, -0.3, 1.2]])
+    data = np.array([[0.0, 1.0, -1.0], [0.5, -0.2, 0.8]])
+
+    with patch.object(np.linalg, "cholesky", wraps=np.linalg.cholesky) as cholesky:
+        model.set_precision_matrix(precision)
+        first = model.log_likelihood(data)
+        second = model.log_likelihood(data)
+
+    assert first == second
+    assert cholesky.call_count == 1
+
+
+def test_gaussian_copy_preserves_valid_derived_caches() -> None:
+    model = GaussianGraphicalModel(3)
+    expected_covariance = model.covariance_matrix
+    copied = model.copy()
+
+    with patch.object(np.linalg, "solve", wraps=np.linalg.solve) as solve:
+        np.testing.assert_array_equal(copied.covariance_matrix, expected_covariance)
+
+    assert solve.call_count == 0
 
 
 def test_fit_ising_improves_objective_and_reports_convergence() -> None:
