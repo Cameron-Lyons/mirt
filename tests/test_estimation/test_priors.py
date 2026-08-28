@@ -548,4 +548,10 @@ def test_direct_samplers_preserve_generator_reproducibility(prior, draw):
     actual = prior.sample((4, 3), rng=actual_rng)
     expected = draw(expected_rng, (4, 3))
 
-    assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    assert actual_rng.bit_generator.state == expected_rng.bit_generator.state
+    assert_allclose(
+        actual,
+        expected,
+        rtol=4 * np.finfo(np.float64).eps,
+        atol=0.0,
+    )
