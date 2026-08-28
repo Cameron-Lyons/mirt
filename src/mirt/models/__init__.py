@@ -38,10 +38,12 @@ from mirt.models.dichotomous import (
 )
 from mirt.models.dynamic import (
     BKTBatchForecastResult,
+    BKTBatchMasteryTargetResult,
     BKTBatchPredictiveResult,
     BKTBatchSkillRankingResult,
     BKTBatchStepResult,
     BKTForecastResult,
+    BKTMasteryTargetResult,
     BKTModel,
     BKTPredictiveResult,
     BKTResult,
@@ -206,6 +208,8 @@ __all__ = [
     "BKTBatchStepResult",
     "BKTForecastResult",
     "BKTBatchForecastResult",
+    "BKTMasteryTargetResult",
+    "BKTBatchMasteryTargetResult",
     "BKTPredictiveResult",
     "BKTBatchPredictiveResult",
     "BKTSkillRankingResult",

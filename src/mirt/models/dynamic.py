@@ -280,6 +280,71 @@ class BKTBatchForecastResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BKTMasteryTargetResult:
+    """Minimum opportunities for one learner to reach mastery targets.
+
+    Arrays have shape ``(n_skills,)``. Finite opportunity counts are
+    integer-valued; ``numpy.inf`` denotes a target that the model's
+    unconditional mastery path cannot reach.
+    """
+
+    opportunities: NDArray[np.float64]
+    target_mastery: NDArray[np.float64]
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.opportunities.size)
+
+    @property
+    def reachable(self) -> NDArray[np.bool_]:
+        """Whether each skill's target is reached in finite time."""
+        return np.isfinite(self.opportunities)
+
+    @property
+    def all_reachable(self) -> bool:
+        """Whether all requested mastery targets are reachable."""
+        return bool(np.all(self.reachable))
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchMasteryTargetResult:
+    """Vectorized opportunities to mastery targets for multiple learners.
+
+    Arrays have shape ``(n_persons, n_skills)``. Finite opportunity counts
+    are integer-valued; ``numpy.inf`` denotes an unreachable target.
+    """
+
+    opportunities: NDArray[np.float64]
+    target_mastery: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.opportunities.shape[0])
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.opportunities.shape[1])
+
+    @property
+    def reachable(self) -> NDArray[np.bool_]:
+        """Whether each learner-skill target is reached in finite time."""
+        return np.isfinite(self.opportunities)
+
+    @property
+    def all_reachable(self) -> bool:
+        """Whether all requested mastery targets are reachable."""
+        return bool(np.all(self.reachable))
+
+    @property
+    def reachable_counts(self) -> NDArray[np.int_]:
+        """Number of reachable skill targets for each learner."""
+        return np.sum(self.reachable, axis=1, dtype=np.int_)
+
+
+@dataclass(frozen=True, slots=True)
 class BKTSkillRankingResult:
     """Ranked skill opportunities for one learner."""
 
@@ -947,6 +1012,179 @@ class BKTModel:
             batch=True,
         )
         return self._forecast_from_priors_batch(mastery_values, n_steps)
+
+    def _validated_mastery_targets(
+        self,
+        target_mastery: float | NDArray[np.float64],
+        *,
+        n_persons: int | None,
+    ) -> NDArray[np.float64]:
+        """Return scalar, shared, or person-specific mastery targets."""
+        raw_targets = np.asarray(target_mastery)
+        if (
+            np.issubdtype(raw_targets.dtype, np.bool_)
+            or np.issubdtype(raw_targets.dtype, np.complexfloating)
+            or not np.issubdtype(raw_targets.dtype, np.number)
+        ):
+            raise ValueError("target_mastery must contain values in [0, 1]")
+
+        output_shape = (
+            (self.n_skills,) if n_persons is None else (n_persons, self.n_skills)
+        )
+        if raw_targets.ndim == 0:
+            target_values = np.full(
+                output_shape,
+                raw_targets.item(),
+                dtype=np.float64,
+            )
+        elif raw_targets.shape == (self.n_skills,):
+            target_values = np.broadcast_to(raw_targets, output_shape).astype(
+                np.float64,
+                copy=True,
+            )
+        elif n_persons is not None and raw_targets.shape == output_shape:
+            target_values = raw_targets.astype(np.float64, copy=True)
+        else:
+            expected_shapes = (
+                "a scalar or shape (n_skills,)"
+                if n_persons is None
+                else "a scalar, shape (n_skills,), or shape (n_persons, n_skills)"
+            )
+            raise ValueError(f"target_mastery must be {expected_shapes}")
+
+        if not np.all(np.isfinite(target_values)) or np.any(
+            (target_values < 0.0) | (target_values > 1.0)
+        ):
+            raise ValueError("target_mastery must contain values in [0, 1]")
+        return target_values
+
+    def _opportunities_to_mastery_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: NDArray[np.float64],
+    ) -> BKTBatchMasteryTargetResult:
+        """Solve validated mastery target crossings without scanning a horizon."""
+        opportunities = np.full(prior_mastery.shape, np.inf, dtype=np.float64)
+        reached = prior_mastery >= target_mastery
+        opportunities[reached] = 0.0
+
+        transition_rate = self.p_learn + self.p_forget
+        persistence = 1.0 - transition_rate
+        next_mastery = prior_mastery * persistence + self.p_learn
+        pending = ~reached
+
+        immediate = (
+            pending & (persistence[None, :] <= 0.0) & (next_mastery >= target_mastery)
+        )
+        opportunities[immediate] = 1.0
+
+        equilibrium = np.divide(
+            self.p_learn,
+            transition_rate,
+            out=np.zeros_like(self.p_learn),
+            where=transition_rate > 0.0,
+        )
+        monotone = (
+            pending
+            & (persistence[None, :] > 0.0)
+            & (persistence[None, :] < 1.0)
+            & (prior_mastery < equilibrium[None, :])
+            & (target_mastery < equilibrium[None, :])
+        )
+        rows, columns = np.nonzero(monotone)
+        if rows.size:
+            initial_gaps = equilibrium[columns] - prior_mastery[rows, columns]
+            target_gaps = equilibrium[columns] - target_mastery[rows, columns]
+            raw_opportunities = np.log(target_gaps / initial_gaps) / np.log(
+                persistence[columns]
+            )
+            counts = np.maximum(
+                np.ceil(np.nextafter(raw_opportunities, -np.inf)),
+                1.0,
+            )
+
+            projected = equilibrium[columns] + (
+                prior_mastery[rows, columns] - equilibrium[columns]
+            ) * np.power(persistence[columns], counts)
+            counts += projected < target_mastery[rows, columns]
+
+            previous_counts = counts - 1.0
+            previous = equilibrium[columns] + (
+                prior_mastery[rows, columns] - equilibrium[columns]
+            ) * np.power(persistence[columns], previous_counts)
+            counts -= (counts > 1.0) & (previous >= target_mastery[rows, columns])
+            opportunities[rows, columns] = counts
+
+        return BKTBatchMasteryTargetResult(
+            opportunities=opportunities,
+            target_mastery=target_mastery,
+        )
+
+    def opportunities_to_mastery(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: float | NDArray[np.float64] = 0.95,
+    ) -> BKTMasteryTargetResult:
+        """Return minimum opportunities for expected mastery to reach targets.
+
+        The calculation follows the unconditional transition used by
+        :meth:`forecast_from_priors`. It solves the closed-form recurrence
+        directly, so runtime and memory do not depend on a forecast horizon.
+
+        Parameters
+        ----------
+        prior_mastery : NDArray
+            Next-opportunity mastery probabilities with shape ``(n_skills,)``.
+        target_mastery : float or NDArray, default=0.95
+            Shared scalar target or one target per skill.
+
+        Returns
+        -------
+        BKTMasteryTargetResult
+            Minimum opportunity counts. Unreachable targets are
+            ``numpy.inf``.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=False,
+        )
+        target_values = self._validated_mastery_targets(
+            target_mastery,
+            n_persons=None,
+        )
+        result = self._opportunities_to_mastery_batch(
+            mastery_values[None, :],
+            target_values[None, :],
+        )
+        return BKTMasteryTargetResult(
+            opportunities=result.opportunities[0].copy(),
+            target_mastery=result.target_mastery[0].copy(),
+        )
+
+    def opportunities_to_mastery_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: float | NDArray[np.float64] = 0.95,
+    ) -> BKTBatchMasteryTargetResult:
+        """Vectorize minimum opportunities to expected mastery targets.
+
+        Targets may be a shared scalar, a shared ``(n_skills,)`` vector, or a
+        person-specific ``(n_persons, n_skills)`` matrix. Counts are measured
+        from each supplied next-opportunity prior; zero means the target is
+        already met.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=True,
+        )
+        target_values = self._validated_mastery_targets(
+            target_mastery,
+            n_persons=mastery_values.shape[0],
+        )
+        return self._opportunities_to_mastery_batch(
+            mastery_values,
+            target_values,
+        )
 
     def _validated_skill_ranking_options(
         self,

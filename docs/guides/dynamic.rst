@@ -143,6 +143,36 @@ future responses and use a closed-form transition, so their runtime does not
 include a Python loop over the horizon. Skills absent from a response history
 begin at their configured initial mastery probability.
 
+Mastery targets
+---------------
+
+Calculate the minimum additional opportunities needed for each skill's
+expected mastery probability to reach a target:
+
+.. code-block:: python
+
+   progress = model.opportunities_to_mastery(
+       diagnostics.next_mastery_priors,
+       target_mastery=0.9,
+   )
+   practice_counts = progress.opportunities
+   reachable = progress.reachable
+
+A count of zero means the retained prior already meets the target.
+``numpy.inf`` explicitly marks a target that cannot be reached under the
+model's unconditional transition path, including a target equal to a limiting
+probability that is approached only asymptotically. This avoids choosing an
+arbitrary forecast horizon or mistaking horizon exhaustion for
+unreachability.
+
+``opportunities_to_mastery_batch`` evaluates every learner and skill together.
+It accepts a shared scalar target, a shared ``(n_skills,)`` vector, or a
+person-specific ``(n_persons, n_skills)`` matrix. Both methods solve the
+transition recurrence directly, so memory and runtime do not grow with the
+number of opportunities returned. The calculation describes expected mastery
+before future responses are known; new evidence can be incorporated with an
+online update and the target recomputed.
+
 Batch inference
 ---------------
 
