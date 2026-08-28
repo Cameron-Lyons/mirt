@@ -7,10 +7,15 @@ area under information curves, and probability traces.
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+
+_SCORE_INVERSION_TARGET_ELEMENTS = 2_000_000
+_SCORE_INVERSION_THETA_TOLERANCE = 1e-6
+_SCORE_MONOTONICITY_POINTS = 65
 
 
 def _theta_matrix(
@@ -374,45 +379,162 @@ def expected_test_score(
     return expected_score(model, theta, item_idx=None)
 
 
+def _validated_expected_scores(
+    model: "BaseItemModel", theta: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Evaluate a test curve and enforce one finite score per theta value."""
+    scores = np.asarray(expected_score(model, theta), dtype=np.float64)
+    if scores.shape != theta.shape or not np.all(np.isfinite(scores)):
+        raise ValueError(
+            "model expected scores must be finite with one value per theta"
+        )
+    return scores
+
+
+def _score_curve_direction(
+    model: "BaseItemModel", lower: float, upper: float
+) -> tuple[bool, float, float]:
+    """Validate the inversion interval and return its score direction."""
+    theta_grid = np.linspace(lower, upper, _SCORE_MONOTONICITY_POINTS)
+    score_grid = _validated_expected_scores(model, theta_grid)
+    differences = np.diff(score_grid)
+    tolerance = np.sqrt(np.finfo(np.float64).eps) * max(
+        1.0, float(np.max(np.abs(score_grid)))
+    )
+    increasing = bool(score_grid[-1] >= score_grid[0])
+    monotonic = (
+        np.all(differences >= -tolerance)
+        if increasing
+        else np.all(differences <= tolerance)
+    )
+    if not monotonic:
+        raise ValueError("test characteristic curve must be monotonic over theta_range")
+    if abs(float(score_grid[-1] - score_grid[0])) <= tolerance:
+        raise ValueError("test characteristic curve must vary over theta_range")
+    return increasing, float(score_grid[0]), float(score_grid[-1])
+
+
+def _score_inversion_chunk_size(model: "BaseItemModel") -> int:
+    """Choose a chunk that bounds the largest temporary probability tensor."""
+    elements_per_target = max(1, int(model.n_items))
+    if getattr(model, "is_polytomous", False):
+        category_counts = np.asarray(model.n_categories)
+        if category_counts.size:
+            elements_per_target *= max(1, int(np.max(category_counts)))
+    return max(1, _SCORE_INVERSION_TARGET_ELEMENTS // elements_per_target)
+
+
+def _invert_score_chunk(
+    model: "BaseItemModel",
+    targets: NDArray[np.float64],
+    lower: float,
+    upper: float,
+    *,
+    increasing: bool,
+    n_iterations: int,
+) -> NDArray[np.float64]:
+    """Invert one target chunk with simultaneous bisection."""
+    low = np.full(targets.size, lower)
+    high = np.full(targets.size, upper)
+    for _ in range(n_iterations):
+        midpoint = (low + high) * 0.5
+        midpoint_scores = _validated_expected_scores(model, midpoint)
+        move_lower = (
+            midpoint_scores < targets if increasing else midpoint_scores > targets
+        )
+        low[move_lower] = midpoint[move_lower]
+        high[~move_lower] = midpoint[~move_lower]
+    return (low + high) * 0.5
+
+
 def theta_for_score(
     model: "BaseItemModel",
-    target_score: float,
+    target_score: ArrayLike,
     theta_range: tuple[float, float] = (-6.0, 6.0),
-) -> float:
-    """Find theta value corresponding to a target expected score.
+) -> NDArray[np.float64] | float:
+    """Find theta values corresponding to target expected scores.
 
-    Inverts the test characteristic curve.
+    Inverts a monotonic test characteristic curve using bounded, vectorized
+    bisection. Scalar inputs preserve the historical scalar return type, while
+    arrays are inverted in memory-aware chunks.
 
     Parameters
     ----------
     model : BaseItemModel
         A fitted IRT model.
-    target_score : float
-        Target expected score.
+    target_score : array-like
+        Target expected score or scores. Array inputs retain their shape.
     theta_range : tuple
         Range to search. Default (-6, 6).
 
     Returns
     -------
-    float
-        Theta value where expected score equals target.
+    float or NDArray[np.float64]
+        Theta value or values where the expected score equals each target.
+        Targets outside the score range are clamped to the corresponding
+        theta bound.
 
     Examples
     --------
     >>> # Find theta where expected score is 10
     >>> theta = theta_for_score(result.model, target_score=10)
     >>> print(f"Theta for score=10: {theta:.3f}")
+    >>> targets = np.array([5.0, 10.0, 15.0])
+    >>> theta = theta_for_score(result.model, targets)
     """
-    from scipy.optimize import brentq
-
-    def objective(theta):
-        scores = expected_score(model, np.array([theta]))
-        return scores[0] - target_score
+    if model.n_factors != 1:
+        raise ValueError("theta_for_score supports unidimensional models only")
 
     try:
-        return brentq(objective, theta_range[0], theta_range[1], xtol=1e-6)
-    except ValueError:
-        theta_grid = np.linspace(theta_range[0], theta_range[1], 100)
-        scores = expected_score(model, theta_grid)
-        idx = np.argmin(np.abs(scores - target_score))
-        return float(theta_grid[idx])
+        lower, upper = (float(value) for value in theta_range)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("theta_range must contain exactly two numeric bounds") from exc
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("theta_range must contain finite bounds with lower < upper")
+
+    try:
+        targets = np.asarray(target_score, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("target_score must contain numeric values") from exc
+    if not np.all(np.isfinite(targets)):
+        raise ValueError("target_score must contain only finite values")
+
+    scalar_input = targets.ndim == 0
+    target_shape = targets.shape
+    flat_targets = targets.reshape(-1)
+    if flat_targets.size == 0:
+        return np.empty(target_shape, dtype=np.float64)
+
+    increasing, lower_score, upper_score = _score_curve_direction(model, lower, upper)
+    minimum_score = min(lower_score, upper_score)
+    maximum_score = max(lower_score, upper_score)
+    minimum_theta = lower if increasing else upper
+    maximum_theta = upper if increasing else lower
+
+    result = np.empty_like(flat_targets)
+    below_range = flat_targets <= minimum_score
+    above_range = flat_targets >= maximum_score
+    result[below_range] = minimum_theta
+    result[above_range] = maximum_theta
+
+    interior_indices = np.flatnonzero(~(below_range | above_range))
+    if interior_indices.size:
+        chunk_size = _score_inversion_chunk_size(model)
+        n_iterations = max(
+            1,
+            int(np.ceil(np.log2((upper - lower) / _SCORE_INVERSION_THETA_TOLERANCE))),
+        )
+
+        for start in range(0, interior_indices.size, chunk_size):
+            indices = interior_indices[start : start + chunk_size]
+            result[indices] = _invert_score_chunk(
+                model,
+                flat_targets[indices],
+                lower,
+                upper,
+                increasing=increasing,
+                n_iterations=n_iterations,
+            )
+
+    shaped_result = result.reshape(target_shape)
+    return float(shaped_result) if scalar_input else shaped_result
