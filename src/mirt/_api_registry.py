@@ -110,6 +110,7 @@ BASE_EXPORTS = [
     "plausible_value_statistics",
     "cross_validate",
     "CVResult",
+    "GroupKFold",
     "KFold",
     "StratifiedKFold",
     "LeaveOneOut",
@@ -476,6 +477,7 @@ TOP_LEVEL_IMPORT_GROUPS = {
     "mirt.utils.confidence": ("PLCI", "score_CI"),
     "mirt.utils.cv": (
         "CVResult",
+        "GroupKFold",
         "KFold",
         "LeaveOneOut",
         "StratifiedKFold",

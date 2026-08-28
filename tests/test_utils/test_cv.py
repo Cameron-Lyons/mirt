@@ -10,6 +10,7 @@ from mirt.utils.cv import (
     AICScorer,
     BICScorer,
     CVResult,
+    GroupKFold,
     KFold,
     LeaveOneOut,
     LogLikelihoodScorer,
@@ -89,6 +90,12 @@ class TestKFold:
         with pytest.raises(ValueError, match="cannot exceed"):
             list(KFold(n_splits=4).split(responses))
 
+    def test_rejects_invalid_shuffle_and_response_shape(self):
+        with pytest.raises(ValueError, match="shuffle"):
+            KFold(shuffle=1)
+        with pytest.raises(ValueError, match="two-dimensional"):
+            list(KFold(n_splits=2).split(np.zeros(4, dtype=int)))
+
 
 class TestStratifiedKFold:
     def test_default_splits(self):
@@ -119,6 +126,146 @@ class TestStratifiedKFold:
     def test_invalid_bin_count(self, n_bins):
         with pytest.raises(ValueError, match="n_bins"):
             StratifiedKFold(n_bins=n_bins)
+
+    def test_vectorized_assignments_match_scalar_reference(self):
+        rng = np.random.default_rng(20260827)
+        responses = rng.integers(0, 2, size=(1_000, 12), dtype=np.int8)
+        splitter = StratifiedKFold(n_splits=7, n_bins=9, random_state=123)
+
+        sum_scores = np.sum(np.maximum(responses, 0), axis=1)
+        bins = np.unique(
+            np.percentile(sum_scores, np.linspace(0, 100, splitter.n_bins + 1))
+        )
+        strata = np.clip(np.digitize(sum_scores, bins[:-1]) - 1, 0, len(bins) - 2)
+        expected_assignments = np.zeros(len(responses), dtype=np.intp)
+        reference_rng = np.random.default_rng(splitter.random_state)
+        next_fold = 0
+        for stratum in range(strata.max() + 1):
+            indices = np.flatnonzero(strata == stratum)
+            reference_rng.shuffle(indices)
+            for offset, index in enumerate(indices):
+                expected_assignments[index] = (next_fold + offset) % splitter.n_splits
+            next_fold = (next_fold + indices.size) % splitter.n_splits
+
+        folds = list(splitter.split(responses))
+
+        for fold, (_, test_indices) in enumerate(folds):
+            np.testing.assert_array_equal(
+                test_indices, np.flatnonzero(expected_assignments == fold)
+            )
+
+    def test_missing_scores_do_not_change_strata(self):
+        responses = np.array(
+            [
+                [1.0, np.nan, 0.0],
+                [1.0, -1.0, 1.0],
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 1.0, 1.0],
+            ]
+        )
+        negative = responses.copy()
+        negative[0, 1] = -1.0
+        splitter = StratifiedKFold(n_splits=3, n_bins=3, shuffle=False)
+
+        with_nan = list(splitter.split(responses))
+        with_negative = list(splitter.split(negative))
+
+        for (_, nan_test), (_, negative_test) in zip(with_nan, with_negative):
+            np.testing.assert_array_equal(nan_test, negative_test)
+
+    def test_shuffle_can_be_disabled(self, response_matrix):
+        splitter = StratifiedKFold(n_splits=5, n_bins=5, shuffle=False)
+
+        first = list(splitter.split(response_matrix))
+        second = list(splitter.split(response_matrix))
+
+        for (first_train, first_test), (second_train, second_test) in zip(
+            first, second
+        ):
+            np.testing.assert_array_equal(first_train, second_train)
+            np.testing.assert_array_equal(first_test, second_test)
+
+    def test_rejects_invalid_shuffle_and_non_numeric_scores(self):
+        with pytest.raises(ValueError, match="shuffle"):
+            StratifiedKFold(shuffle="yes")
+        with pytest.raises(ValueError, match="numeric"):
+            list(
+                StratifiedKFold(n_splits=2).split(
+                    np.array([["yes"], ["no"]], dtype=object)
+                )
+            )
+
+
+class TestGroupKFold:
+    def test_keeps_groups_together_and_balances_rows(self):
+        group_sizes = np.array([50, 40, 30, 20, 10, 5])
+        groups = np.repeat(np.arange(group_sizes.size), group_sizes)
+        responses = np.zeros((groups.size, 3), dtype=int)
+        splitter = GroupKFold(groups, n_splits=3)
+
+        folds = list(splitter.split(responses))
+
+        _assert_valid_splits(splitter, responses, expected_n_splits=3)
+        assert sorted(test.size for _, test in folds) == [50, 50, 55]
+        for train_indices, test_indices in folds:
+            assert not set(groups[train_indices]) & set(groups[test_indices])
+
+    def test_equal_sized_groups_use_fast_balanced_assignment(self):
+        groups = np.repeat(np.arange(20), 3)
+        responses = np.zeros((groups.size, 2), dtype=int)
+
+        sizes = [
+            test.size for _, test in GroupKFold(groups, n_splits=5).split(responses)
+        ]
+
+        assert sizes == [12, 12, 12, 12, 12]
+
+    def test_shuffling_is_reproducible(self):
+        groups = np.repeat(np.arange(30), 2)
+        responses = np.zeros((groups.size, 2), dtype=int)
+        first = list(
+            GroupKFold(groups, n_splits=5, shuffle=True, random_state=42).split(
+                responses
+            )
+        )
+        second = list(
+            GroupKFold(groups, n_splits=5, shuffle=True, random_state=42).split(
+                responses
+            )
+        )
+
+        for (_, first_test), (_, second_test) in zip(first, second):
+            np.testing.assert_array_equal(first_test, second_test)
+
+    @pytest.mark.parametrize(
+        ("groups", "responses", "message"),
+        [
+            (np.array([[0], [1]]), np.zeros((2, 1)), "one-dimensional"),
+            (np.array([0, 1]), np.zeros((3, 1)), "same number of rows"),
+            (np.array([0.0, np.nan]), np.zeros((2, 1)), "non-finite"),
+            (np.array([None, "a"], dtype=object), np.zeros((2, 1)), "missing"),
+            (
+                np.array([float("nan"), "a"], dtype=object),
+                np.zeros((2, 1)),
+                "missing",
+            ),
+        ],
+    )
+    def test_validates_groups(self, groups, responses, message):
+        with pytest.raises(ValueError, match=message):
+            list(GroupKFold(groups, n_splits=2).split(responses))
+
+    def test_requires_at_least_one_group_per_fold(self):
+        responses = np.zeros((4, 1), dtype=int)
+        with pytest.raises(ValueError, match="cannot exceed n_groups"):
+            list(GroupKFold(np.array([0, 0, 1, 1]), n_splits=3).split(responses))
+
+    def test_is_exported_at_top_level(self):
+        import mirt
+
+        assert mirt.GroupKFold is GroupKFold
 
 
 class TestLeaveOneOut:
