@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
 
 from mirt.constants import PROB_EPSILON
 
@@ -496,11 +495,14 @@ def plot_ability_distribution(
     ax.hist(values, bins=bins, **histogram_kwargs)
     has_legend = False
     if show_density and values.size >= 2 and float(np.ptp(values)) > 0.0:
-        kde = stats.gaussian_kde(values)
+        from scipy.stats import gaussian_kde
+
+        kde = gaussian_kde(values)
         ax.plot(x_values, kde(x_values), "r-", linewidth=2, label="KDE")
         has_legend = True
     if show_normal:
-        ax.plot(x_values, stats.norm.pdf(x_values), "k--", alpha=0.5, label="N(0,1)")
+        normal_density = np.exp(-0.5 * np.square(x_values)) / np.sqrt(2.0 * np.pi)
+        ax.plot(x_values, normal_density, "k--", alpha=0.5, label="N(0,1)")
         has_legend = True
     ax.set_xlabel(r"$\theta$ (Ability)")
     ax.set_ylabel("Density" if density_scale else "Count")
