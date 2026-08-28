@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -294,9 +295,9 @@ class LinearConstraint(ParameterConstraint):
     Examples
     --------
     >>> # Mean difficulty = 0 (for identification)
-    >>> LinearConstraint("difficulty", target=0.0, type="mean")
+    >>> LinearConstraint("difficulty", target=0.0, constraint_type="mean")
     >>> # Sum of loadings for factor 1 = n_items
-    >>> LinearConstraint("loadings", target=10, type="sum", factor=0)
+    >>> LinearConstraint("loadings", target=10, constraint_type="sum", factor=0)
     """
 
     target: float = 0.0
@@ -304,85 +305,170 @@ class LinearConstraint(ParameterConstraint):
     coefficients: NDArray[np.float64] | None = None
     factor: int | None = None
 
-    def apply(self, model: BaseItemModel) -> None:
-        params = model.parameters
-        if self.param_name not in params:
-            return
+    def __post_init__(self) -> None:
+        if self.constraint_type not in ("sum", "mean"):
+            raise ValueError("constraint_type must be 'sum' or 'mean'")
 
-        values = params[self.param_name].copy()
-        indices = self.item_indices if self.item_indices else list(range(len(values)))
+        self.target = float(self.target)
+        if not np.isfinite(self.target):
+            raise ValueError("target must be finite")
 
-        if values.ndim == 1:
-            current_vals = values[indices]
-        else:
-            f = self.factor if self.factor is not None else 0
-            current_vals = values[indices, f]
+        if self.factor is not None:
+            if (
+                isinstance(self.factor, bool)
+                or not isinstance(self.factor, Integral)
+                or self.factor < 0
+            ):
+                raise ValueError("factor must be a non-negative integer")
+            self.factor = int(self.factor)
+
+        if self.item_indices is not None:
+            if len(self.item_indices) == 0:
+                raise ValueError("item_indices must not be empty")
+            normalized_indices: list[int] = []
+            for item_idx in self.item_indices:
+                if (
+                    isinstance(item_idx, bool)
+                    or not isinstance(item_idx, Integral)
+                    or item_idx < 0
+                ):
+                    raise ValueError("item_indices must contain non-negative integers")
+                normalized_indices.append(int(item_idx))
+            if len(set(normalized_indices)) != len(normalized_indices):
+                raise ValueError("item_indices must not contain duplicates")
+            self.item_indices = normalized_indices
 
         if self.coefficients is not None:
-            current = np.dot(self.coefficients, current_vals)
-            n = np.sum(self.coefficients)
-        elif self.constraint_type == "mean":
-            current = np.mean(current_vals)
-            n = 1
-        else:
-            current = np.sum(current_vals)
-            n = len(current_vals)
+            coefficients = np.asarray(self.coefficients, dtype=np.float64)
+            if coefficients.ndim != 1 or coefficients.size == 0:
+                raise ValueError("coefficients must be a non-empty 1D array")
+            if not np.all(np.isfinite(coefficients)):
+                raise ValueError("coefficients must be finite")
+            if not np.any(coefficients != 0.0):
+                raise ValueError("coefficients must contain a nonzero value")
+            self.coefficients = coefficients.copy()
 
-        adjustment = (self.target - current * n) / len(current_vals)
+    def _selected_values(
+        self,
+        model: BaseItemModel,
+    ) -> (
+        tuple[
+            NDArray[np.float64],
+            NDArray[np.intp],
+            int | None,
+            NDArray[np.float64],
+        ]
+        | None
+    ):
+        params = model.parameters
+        if self.param_name not in params:
+            return None
+
+        values = np.asarray(params[self.param_name], dtype=np.float64)
+        if values.ndim not in (1, 2):
+            raise ValueError(
+                f"parameter {self.param_name!r} must be one- or two-dimensional"
+            )
+
+        if self.item_indices is None:
+            indices = np.arange(values.shape[0], dtype=np.intp)
+        else:
+            indices = np.asarray(self.item_indices, dtype=np.intp)
+            if np.any(indices >= values.shape[0]):
+                raise IndexError(
+                    f"item index out of range for parameter {self.param_name!r} "
+                    f"with {values.shape[0]} entries"
+                )
+
+        if indices.size == 0:
+            raise ValueError(
+                f"parameter {self.param_name!r} has no values to constrain"
+            )
 
         if values.ndim == 1:
-            values[indices] += adjustment
+            if self.factor not in (None, 0):
+                raise ValueError(
+                    f"factor is out of range for one-dimensional parameter "
+                    f"{self.param_name!r}"
+                )
+            factor = None
+            current_values = values[indices]
         else:
-            f = self.factor if self.factor is not None else 0
-            values[indices, f] += adjustment
+            factor = 0 if self.factor is None else self.factor
+            if factor >= values.shape[1]:
+                raise ValueError(
+                    f"factor {factor} out of range for parameter {self.param_name!r} "
+                    f"with {values.shape[1]} factors"
+                )
+            current_values = values[indices, factor]
+
+        if self.coefficients is not None and self.coefficients.size != indices.size:
+            raise ValueError(
+                f"coefficients length ({self.coefficients.size}) must match the "
+                f"number of constrained values ({indices.size})"
+            )
+
+        return values, indices, factor, current_values
+
+    def _constraint_value(self, current_values: NDArray[np.float64]) -> float:
+        if self.coefficients is not None:
+            return float(np.dot(self.coefficients, current_values))
+        if self.constraint_type == "mean":
+            return float(np.mean(current_values))
+        return float(np.sum(current_values))
+
+    def apply(self, model: BaseItemModel) -> None:
+        selected = self._selected_values(model)
+        if selected is None:
+            return
+
+        values, indices, factor, current_values = selected
+
+        if self.coefficients is not None:
+            residual = self.target - float(np.dot(self.coefficients, current_values))
+            adjustment = (
+                residual
+                * self.coefficients
+                / float(np.dot(self.coefficients, self.coefficients))
+            )
+        elif self.constraint_type == "mean":
+            adjustment = np.full(
+                current_values.shape,
+                self.target - float(np.mean(current_values)),
+            )
+        else:
+            adjustment = np.full(
+                current_values.shape,
+                (self.target - float(np.sum(current_values))) / current_values.size,
+            )
+
+        if factor is None:
+            values[indices] = current_values + adjustment
+        else:
+            values[indices, factor] = current_values + adjustment
 
         model.set_parameters(**{self.param_name: values})
 
     def is_satisfied(self, model: BaseItemModel, tol: float = 1e-6) -> bool:
-        params = model.parameters
-        if self.param_name not in params:
+        if not np.isfinite(tol) or tol < 0:
+            raise ValueError("tol must be finite and non-negative")
+
+        selected = self._selected_values(model)
+        if selected is None:
             return True
 
-        values = params[self.param_name]
-        indices = self.item_indices if self.item_indices else list(range(len(values)))
+        current = self._constraint_value(selected[3])
 
-        if values.ndim == 1:
-            current_vals = values[indices]
-        else:
-            f = self.factor if self.factor is not None else 0
-            current_vals = values[indices, f]
-
-        if self.coefficients is not None:
-            current = np.dot(self.coefficients, current_vals)
-        elif self.constraint_type == "mean":
-            current = np.mean(current_vals)
-        else:
-            current = np.sum(current_vals)
-
-        return np.isclose(current, self.target, atol=tol)
+        return bool(np.isclose(current, self.target, atol=tol, rtol=0.0))
 
     def penalty(self, model: BaseItemModel) -> float:
-        params = model.parameters
-        if self.param_name not in params:
+        selected = self._selected_values(model)
+        if selected is None:
             return 0.0
 
-        values = params[self.param_name]
-        indices = self.item_indices if self.item_indices else list(range(len(values)))
+        current = self._constraint_value(selected[3])
 
-        if values.ndim == 1:
-            current_vals = values[indices]
-        else:
-            f = self.factor if self.factor is not None else 0
-            current_vals = values[indices, f]
-
-        if self.coefficients is not None:
-            current = np.dot(self.coefficients, current_vals)
-        elif self.constraint_type == "mean":
-            current = np.mean(current_vals)
-        else:
-            current = np.sum(current_vals)
-
-        return (current - self.target) ** 2
+        return float((current - self.target) ** 2)
 
 
 @dataclass
