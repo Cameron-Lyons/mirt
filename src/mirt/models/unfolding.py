@@ -17,6 +17,65 @@ from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
 
+_SATURATED_LOGIT = 750.0
+_LOG_MAX_FLOAT = float(np.log(np.finfo(np.float64).max))
+
+
+def _saturate_logit(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Clamp overflowed affine terms once their probabilities have saturated."""
+    return np.clip(
+        np.nan_to_num(
+            values,
+            nan=0.0,
+            posinf=_SATURATED_LOGIT,
+            neginf=-_SATURATED_LOGIT,
+        ),
+        -_SATURATED_LOGIT,
+        _SATURATED_LOGIT,
+    )
+
+
+def _stable_affine_predictor(
+    values: NDArray[np.float64],
+    scale: NDArray[np.float64] | float,
+    location: NDArray[np.float64] | float,
+    offset: NDArray[np.float64] | float = 0.0,
+    *,
+    saturate: bool = True,
+) -> NDArray[np.float64]:
+    """Evaluate ``scale * (values - location) - offset`` without warnings."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        distance = values - location
+        predictor = scale * distance - offset
+    if np.all(np.isfinite(predictor)):
+        return _saturate_logit(predictor) if saturate else predictor
+
+    # Distribute the product only for rows where the subtraction itself
+    # overflowed. This recovers finite results when a very small scale offsets
+    # two abilities near the floating-point limits.
+    with np.errstate(over="ignore", invalid="ignore"):
+        distributed = scale * values - scale * location - offset
+    predictor = np.where(np.isfinite(distance), predictor, distributed)
+    if saturate:
+        return _saturate_logit(predictor)
+    return np.nan_to_num(predictor, nan=0.0, posinf=np.inf, neginf=-np.inf)
+
+
+def _scale_information(
+    base_information: NDArray[np.float64],
+    scale: NDArray[np.float64] | float,
+) -> NDArray[np.float64]:
+    """Apply a squared scale without overflowing finite information values."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        information = np.square(scale) * base_information
+    if np.all(np.isfinite(information)):
+        return information
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_information = 2.0 * np.log(np.abs(scale)) + np.log(base_information)
+    saturated = np.exp(np.minimum(log_information, _LOG_MAX_FLOAT))
+    return np.where(base_information > 0.0, saturated, 0.0)
+
 
 def _validate_item_index(n_items: int, item_idx: int) -> int:
     if (
@@ -244,8 +303,10 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         self,
         theta_values: NDArray[np.float64],
         item_idx: int,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Return category probabilities and log-weight derivatives."""
+        *,
+        include_derivatives: bool = True,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+        """Return category probabilities and unscaled log-weight slopes."""
         n_categories = self._n_categories[item_idx]
         c = n_categories - 1
         m = 2 * c + 1
@@ -253,27 +314,60 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         complements = m - categories
 
         thresholds = self._parameters["thresholds"][item_idx, :m]
-        cumulative = np.concatenate(
-            (np.zeros(1, dtype=np.float64), np.cumsum(thresholds))
-        )
         alpha = self._parameters["discrimination"][item_idx]
-        distance = theta_values - self._parameters["location"][item_idx]
+        location = self._parameters["location"][item_idx]
 
-        first = alpha * (
-            distance[:, None] * categories[None, :]
-            - cumulative[categories.astype(np.intp)][None, :]
-        )
-        second = alpha * (
-            distance[:, None] * complements[None, :]
-            - cumulative[complements.astype(np.intp)][None, :]
-        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            cumulative = np.concatenate(
+                (np.zeros(1, dtype=np.float64), np.cumsum(thresholds))
+            )
+            distance = theta_values - location
+            first = alpha * (
+                distance[:, None] * categories[None, :]
+                - cumulative[categories.astype(np.intp)][None, :]
+            )
+            second = alpha * (
+                distance[:, None] * complements[None, :]
+                - cumulative[complements.astype(np.intp)][None, :]
+            )
+
+        if not np.all(np.isfinite(first)) or not np.all(np.isfinite(second)):
+            scaled_distance = _stable_affine_predictor(
+                theta_values,
+                alpha,
+                location,
+            )
+            with np.errstate(over="ignore", invalid="ignore"):
+                scaled_thresholds = alpha * thresholds
+            scaled_thresholds = _saturate_logit(scaled_thresholds)
+            scaled_cumulative = np.concatenate(
+                (np.zeros(1, dtype=np.float64), np.cumsum(scaled_thresholds))
+            )
+            reference = np.where(theta_values >= location, float(m), 0.0)
+            reference_cumulative = scaled_cumulative[reference.astype(np.intp)]
+            first = scaled_distance[:, None] * (
+                categories[None, :] - reference[:, None]
+            ) - (
+                scaled_cumulative[categories.astype(np.intp)][None, :]
+                - reference_cumulative[:, None]
+            )
+            second = scaled_distance[:, None] * (
+                complements[None, :] - reference[:, None]
+            ) - (
+                scaled_cumulative[complements.astype(np.intp)][None, :]
+                - reference_cumulative[:, None]
+            )
+
         log_weights = np.logaddexp(first, second)
         centered = log_weights - np.max(log_weights, axis=1, keepdims=True)
         weights = np.exp(centered)
         probabilities = weights / np.sum(weights, axis=1, keepdims=True)
 
+        if not include_derivatives:
+            return probabilities, None
+
         first_fraction = np.exp(first - log_weights)
-        derivative = alpha * (
+        derivative = (
             first_fraction * categories[None, :]
             + (1.0 - first_fraction) * complements[None, :]
         )
@@ -288,13 +382,21 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         values = _theta_values(self, theta)
         if item_idx is not None:
             item = _validate_item_index(self.n_items, item_idx)
-            return self._item_components(values, item)[0]
+            return self._item_components(
+                values,
+                item,
+                include_derivatives=False,
+            )[0]
 
         probabilities = np.zeros(
             (len(values), self.n_items, max(self._n_categories)), dtype=np.float64
         )
         for item in range(self.n_items):
-            item_probabilities, _ = self._item_components(values, item)
+            item_probabilities, _ = self._item_components(
+                values,
+                item,
+                include_derivatives=False,
+            )
             probabilities[:, item, : self._n_categories[item]] = item_probabilities
         return probabilities
 
@@ -318,7 +420,11 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
                 value=category,
             )
         values = _theta_values(self, theta)
-        return self._item_components(values, item)[0][:, int(category)]
+        return self._item_components(
+            values,
+            item,
+            include_derivatives=False,
+        )[0][:, int(category)]
 
     def information(
         self,
@@ -341,10 +447,15 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         self, theta_values: NDArray[np.float64], item_idx: int
     ) -> NDArray[np.float64]:
         probabilities, derivatives = self._item_components(theta_values, item_idx)
+        assert derivatives is not None
         expected_derivative = np.sum(probabilities * derivatives, axis=1)
-        return np.sum(
+        base_information = np.sum(
             probabilities * (derivatives - expected_derivative[:, None]) ** 2,
             axis=1,
+        )
+        return _scale_information(
+            base_information,
+            self._parameters["discrimination"][item_idx],
         )
 
     def _item_information(
@@ -855,6 +966,28 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         tail = np.exp(-np.abs(linear_predictor))
         return 2.0 * tail / (1.0 + tail) ** 2
 
+    def _linear_predictor_from_values(
+        self,
+        values: NDArray[np.float64],
+        item_idx: int | None,
+    ) -> NDArray[np.float64]:
+        """Return the finite or probability-saturated linear predictor."""
+        if item_idx is not None:
+            return _stable_affine_predictor(
+                values,
+                self._parameters["discrimination"][item_idx],
+                self._parameters["location"][item_idx],
+                self._parameters["asymmetry"][item_idx],
+                saturate=False,
+            )
+        return _stable_affine_predictor(
+            values[:, None],
+            self._parameters["discrimination"][None, :],
+            self._parameters["location"][None, :],
+            self._parameters["asymmetry"][None, :],
+            saturate=False,
+        )
+
     def probability(
         self,
         theta: NDArray[np.float64],
@@ -864,19 +997,12 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         values = _theta_values(self, theta)
         if item_idx is not None:
             item = _validate_item_index(self.n_items, item_idx)
-            predictor = (
-                self._parameters["discrimination"][item]
-                * (values - self._parameters["location"][item])
-                - self._parameters["asymmetry"][item]
+            return self._stable_probability(
+                self._linear_predictor_from_values(values, item)
             )
-            return self._stable_probability(predictor)
-
-        predictor = (
-            self._parameters["discrimination"][None, :]
-            * (values[:, None] - self._parameters["location"][None, :])
-            - self._parameters["asymmetry"][None, :]
+        return self._stable_probability(
+            self._linear_predictor_from_values(values, None)
         )
-        return self._stable_probability(predictor)
 
     def information(
         self,
@@ -885,27 +1011,27 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
     ) -> NDArray[np.float64]:
         """Compute stable Fisher information."""
         values = _theta_values(self, theta)
-        probability = self.probability(values, item_idx)
         if item_idx is not None:
             item = _validate_item_index(self.n_items, item_idx)
-            predictor = (
-                self._parameters["discrimination"][item]
-                * (values - self._parameters["location"][item])
-                - self._parameters["asymmetry"][item]
+            predictor = self._linear_predictor_from_values(values, item)
+            probability = self._stable_probability(predictor)
+            base_information = (
+                np.tanh(predictor / 2.0) ** 2 * probability / (1.0 - probability)
             )
-            log_slope = -self._parameters["discrimination"][item] * np.tanh(
-                predictor / 2.0
+            return _scale_information(
+                base_information,
+                self._parameters["discrimination"][item],
             )
         else:
-            predictor = (
-                self._parameters["discrimination"][None, :]
-                * (values[:, None] - self._parameters["location"][None, :])
-                - self._parameters["asymmetry"][None, :]
+            predictor = self._linear_predictor_from_values(values, None)
+            probability = self._stable_probability(predictor)
+            base_information = (
+                np.tanh(predictor / 2.0) ** 2 * probability / (1.0 - probability)
             )
-            log_slope = -self._parameters["discrimination"][None, :] * np.tanh(
-                predictor / 2.0
+            return _scale_information(
+                base_information,
+                self._parameters["discrimination"][None, :],
             )
-        return log_slope**2 * probability / (1.0 - probability)
 
     def copy(self) -> Self:
         new_model = self.__class__(

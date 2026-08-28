@@ -90,11 +90,12 @@ class TestGeneralizedGradedUnfolding:
 
     def test_extreme_theta_is_finite_without_runtime_warnings(self) -> None:
         model = GeneralizedGradedUnfolding(n_items=2, n_categories=[3, 5])
+        model.set_parameters(discrimination=np.array([2.0, 3.0]))
 
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
-            probabilities = model.probability(np.array([-1e6, 0.0, 1e6]))
-            information = model.information(np.array([-1e6, 0.0, 1e6]))
+            probabilities = model.probability(np.array([-1e308, 0.0, 1e308]))
+            information = model.information(np.array([-1e308, 0.0, 1e308]))
 
         assert np.all(np.isfinite(probabilities))
         assert np.all(np.isfinite(information))
@@ -148,6 +149,19 @@ class TestGeneralizedGradedUnfolding:
         expected = np.sum(derivative**2 / probabilities, axis=1)
 
         np.testing.assert_allclose(model.information(theta, 0), expected, rtol=1e-7)
+
+    def test_extreme_discrimination_saturates_information_without_warnings(
+        self,
+    ) -> None:
+        model = GeneralizedGradedUnfolding(n_items=1, n_categories=3)
+        model.set_parameters(discrimination=np.array([1e308]))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            information = model.information(np.array([0.0, 1e-308, 1.0]), 0)
+
+        assert np.all(np.isfinite(information))
+        assert np.all(information >= 0.0)
 
     def test_information_and_expected_score_sum_over_items(self) -> None:
         model = GeneralizedGradedUnfolding(n_items=2, n_categories=[3, 4])
@@ -411,16 +425,41 @@ class TestHyperbolicCosineModel:
 
     def test_extreme_theta_probability_and_information_are_finite(self) -> None:
         model = HyperbolicCosineModel(n_items=2)
+        model.set_parameters(discrimination=np.array([2.0, 3.0]))
 
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
-            probability = model.probability(np.array([-1e6, 1e6]))
-            information = model.information(np.array([-1e6, 1e6]))
+            probability = model.probability(np.array([-1e308, 1e308]))
+            information = model.information(np.array([-1e308, 1e308]))
 
         assert np.all(np.isfinite(probability))
         assert np.all(np.isfinite(information))
         np.testing.assert_array_equal(probability, 0.0)
         np.testing.assert_array_equal(information, 0.0)
+
+    def test_tiny_discrimination_recovers_overflowed_distance(self) -> None:
+        model = HyperbolicCosineModel(n_items=1)
+        model.set_parameters(
+            discrimination=np.array([1e-308]),
+            location=np.array([-1e308]),
+        )
+
+        probability = model.probability(np.array([1e308]), 0)
+
+        np.testing.assert_allclose(probability, 1.0 / (1.0 + np.cosh(2.0)))
+
+    def test_extreme_discrimination_saturates_information_without_warnings(
+        self,
+    ) -> None:
+        model = HyperbolicCosineModel(n_items=1)
+        model.set_parameters(discrimination=np.array([1e308]))
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            information = model.information(np.array([0.0, 1e-308, 1.0]), 0)
+
+        assert np.all(np.isfinite(information))
+        assert np.all(information >= 0.0)
 
     def test_parameter_validation_and_copy(self) -> None:
         model = HyperbolicCosineModel(n_items=2)
