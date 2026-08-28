@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
 from scipy import stats
 
 if TYPE_CHECKING:
@@ -18,6 +19,53 @@ DISCRIMINATION_PARAMS = {
     "specific_loadings",
 }
 INTERCEPT_PARAMS = {"difficulty", "intercepts", "thresholds", "steps", "location"}
+INVARIANCE_LEVELS = ("configural", "metric", "scalar", "strict")
+
+
+def _validate_item_indices(
+    item_indices: list[int] | None,
+    parameter: str,
+) -> list[int] | None:
+    """Validate a partial-invariance item list without changing its order."""
+    if item_indices is None:
+        return None
+    if not isinstance(item_indices, list):
+        raise ValueError(f"{parameter} must be a list of item indices or None")
+    if any(
+        isinstance(item, (bool, np.bool_)) or not isinstance(item, (int, np.integer))
+        for item in item_indices
+    ):
+        raise ValueError(f"{parameter} must contain only integer item indices")
+
+    normalized = [int(item) for item in item_indices]
+    if any(item < 0 for item in normalized):
+        raise ValueError(f"{parameter} must contain only non-negative item indices")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError(f"{parameter} must not contain duplicate item indices")
+    return normalized
+
+
+def _merge_item_indices(current: list[int], additional: list[int]) -> None:
+    """Append new indices while retaining first-appearance order."""
+    seen = set(current)
+    for item in additional:
+        if item not in seen:
+            current.append(item)
+            seen.add(item)
+
+
+def _parameter_count(result: MultigroupFitResult, label: str) -> int:
+    """Return a validated non-negative model parameter count."""
+    value = result.n_parameters
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < 0
+    ):
+        raise ValueError(
+            f"{label} model parameter count must be a non-negative integer"
+        )
+    return int(value)
 
 
 @dataclass
@@ -44,6 +92,32 @@ class InvarianceSpec:
         default_factory=lambda: INTERCEPT_PARAMS.copy(), repr=False
     )
 
+    def __post_init__(self) -> None:
+        """Reject invalid or ineffectual partial-invariance specifications."""
+        if self.level not in INVARIANCE_LEVELS:
+            valid = ", ".join(INVARIANCE_LEVELS)
+            raise ValueError(
+                f"Unknown invariance level: {self.level}. Choose from: {valid}"
+            )
+
+        self.free_discrimination = _validate_item_indices(
+            self.free_discrimination,
+            "free_discrimination",
+        )
+        self.free_intercepts = _validate_item_indices(
+            self.free_intercepts,
+            "free_intercepts",
+        )
+
+        if self.level == "configural" and (
+            self.free_discrimination is not None or self.free_intercepts is not None
+        ):
+            raise ValueError(
+                "partial-invariance items are not applicable to configural invariance"
+            )
+        if self.level == "metric" and self.free_intercepts is not None:
+            raise ValueError("free_intercepts requires scalar or strict invariance")
+
     def get_shared_parameters(self, model: MultigroupModel) -> list[str]:
         """Get list of parameters that should be shared based on invariance level.
 
@@ -60,25 +134,14 @@ class InvarianceSpec:
         if self.level == "configural":
             return []
 
-        shared = []
-        param_names = set(model.parameter_names)
-
-        if self.level in ("metric", "scalar", "strict"):
-            for p in self._discrimination_params:
-                if p in param_names:
-                    shared.append(p)
-
-        if self.level in ("scalar", "strict"):
-            for p in self._intercept_params:
-                if p in param_names:
-                    shared.append(p)
-
+        parameter_names = model.parameter_names
         if self.level == "strict":
-            for p in param_names:
-                if p not in shared:
-                    shared.append(p)
+            return list(parameter_names)
 
-        return shared
+        shared_families = self._discrimination_params
+        if self.level == "scalar":
+            shared_families = shared_families | self._intercept_params
+        return [name for name in parameter_names if name in shared_families]
 
     def get_free_items(self, param_name: str) -> list[int] | None:
         """Get items that should be freed for partial invariance.
@@ -108,6 +171,14 @@ class InvarianceSpec:
             The model to configure.
         """
         shared_params = self.get_shared_parameters(model)
+        for parameter, indices in (
+            ("free_discrimination", self.free_discrimination),
+            ("free_intercepts", self.free_intercepts),
+        ):
+            if indices is not None and any(index >= model.n_items for index in indices):
+                raise ValueError(
+                    f"{parameter} must contain indices below {model.n_items}"
+                )
 
         for param_name in model.parameter_names:
             model.set_group_specific_parameter(param_name)
@@ -149,28 +220,42 @@ def parse_invariance(
         Parsed invariance specification.
     """
     if isinstance(invariance, InvarianceSpec):
+        if free_items is not None:
+            raise ValueError(
+                "free_items cannot be combined with an InvarianceSpec; "
+                "set partial-invariance items on the specification"
+            )
         return invariance
 
-    if invariance not in ("configural", "metric", "scalar", "strict"):
+    if invariance not in INVARIANCE_LEVELS:
         raise ValueError(
             f"Unknown invariance level: {invariance}. "
-            "Choose from: configural, metric, scalar, strict"
+            f"Choose from: {', '.join(INVARIANCE_LEVELS)}"
         )
 
-    free_disc = None
-    free_int = None
+    free_disc: list[int] = []
+    free_int: list[int] = []
 
     if free_items is not None:
         for param, items in free_items.items():
-            if param in DISCRIMINATION_PARAMS or param == "discrimination":
-                free_disc = items
-            elif param in INTERCEPT_PARAMS or param in ("difficulty", "intercepts"):
-                free_int = items
+            validated = _validate_item_indices(items, f"free_items[{param!r}]")
+            if validated is None:
+                raise ValueError(f"free_items[{param!r}] must be a list")
+            if param in DISCRIMINATION_PARAMS:
+                _merge_item_indices(free_disc, validated)
+            elif param in INTERCEPT_PARAMS:
+                _merge_item_indices(free_int, validated)
+            else:
+                supported = sorted(DISCRIMINATION_PARAMS | INTERCEPT_PARAMS)
+                raise ValueError(
+                    f"Unknown free_items parameter: {param}. "
+                    f"Choose from: {', '.join(supported)}"
+                )
 
     return InvarianceSpec(
         level=invariance,
-        free_discrimination=free_disc,
-        free_intercepts=free_int,
+        free_discrimination=free_disc or None,
+        free_intercepts=free_int or None,
     )
 
 
@@ -197,31 +282,36 @@ def invariance_lrt(
     ValueError
         If the models are not nested (constrained should have higher -2LL).
     """
-    ll_free = free.log_likelihood
-    ll_constrained = constrained.log_likelihood
+    ll_free = float(free.log_likelihood)
+    ll_constrained = float(constrained.log_likelihood)
+    if not np.isfinite(ll_free) or not np.isfinite(ll_constrained):
+        raise ValueError("log-likelihoods must be finite")
 
-    chi2 = -2 * (ll_constrained - ll_free)
+    scale = max(1.0, abs(ll_free), abs(ll_constrained))
+    tolerance = max(1e-3, 64 * np.finfo(np.float64).eps * scale)
 
-    if chi2 < -0.001:
+    if ll_constrained > ll_free + tolerance:
         raise ValueError(
             f"Models may not be nested: constrained LL ({ll_constrained:.4f}) > "
             f"free LL ({ll_free:.4f})"
         )
-    chi2 = max(chi2, 0.0)
+    chi2 = max(2.0 * (ll_free - ll_constrained), 0.0)
 
-    df = free.n_parameters - constrained.n_parameters
+    free_parameters = _parameter_count(free, "free")
+    constrained_parameters = _parameter_count(constrained, "constrained")
+    df = free_parameters - constrained_parameters
     if df <= 0:
         raise ValueError(
             f"Constrained model must have fewer parameters: "
-            f"constrained={constrained.n_parameters}, free={free.n_parameters}"
+            f"constrained={constrained_parameters}, free={free_parameters}"
         )
 
-    p_value = 1 - stats.chi2.cdf(chi2, df)
+    p_value = stats.chi2.sf(chi2, int(df))
 
     return {
-        "chi2": chi2,
-        "df": df,
-        "p_value": p_value,
+        "chi2": float(chi2),
+        "df": int(df),
+        "p_value": float(p_value),
     }
 
 
@@ -243,9 +333,23 @@ def compute_delta_fit(
     dict
         Dictionary with delta values for various fit indices.
     """
-    delta_aic = constrained.aic - free.aic
-    delta_bic = constrained.bic - free.bic
-    delta_ll = constrained.log_likelihood - free.log_likelihood
+    fit_values = np.asarray(
+        [
+            constrained.aic,
+            free.aic,
+            constrained.bic,
+            free.bic,
+            constrained.log_likelihood,
+            free.log_likelihood,
+        ],
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(fit_values)):
+        raise ValueError("fit statistics must be finite")
+
+    delta_aic = float(constrained.aic - free.aic)
+    delta_bic = float(constrained.bic - free.bic)
+    delta_ll = float(constrained.log_likelihood - free.log_likelihood)
 
     return {
         "delta_LL": delta_ll,
@@ -291,6 +395,16 @@ def test_invariance_step(
     InvarianceTestResult
         Test results.
     """
+    if not isinstance(comparison_name, str) or not comparison_name.strip():
+        raise ValueError("comparison_name must be a non-empty string")
+    if (
+        isinstance(alpha, (bool, np.bool_))
+        or not isinstance(alpha, (int, float, np.integer, np.floating))
+        or not np.isfinite(alpha)
+        or not 0.0 < alpha < 1.0
+    ):
+        raise ValueError("alpha must be a finite value between 0 and 1")
+
     lrt = invariance_lrt(constrained, free)
     delta = compute_delta_fit(constrained, free)
 
@@ -305,7 +419,7 @@ def test_invariance_step(
     )
 
 
-INVARIANCE_HIERARCHY = ["configural", "metric", "scalar", "strict"]
+INVARIANCE_HIERARCHY = list(INVARIANCE_LEVELS)
 
 
 def get_invariance_hierarchy_pairs() -> list[tuple[str, str]]:
@@ -316,7 +430,4 @@ def get_invariance_hierarchy_pairs() -> list[tuple[str, str]]:
     list of tuple
         Pairs of (free_level, constrained_level).
     """
-    pairs = []
-    for i in range(len(INVARIANCE_HIERARCHY) - 1):
-        pairs.append((INVARIANCE_HIERARCHY[i], INVARIANCE_HIERARCHY[i + 1]))
-    return pairs
+    return list(zip(INVARIANCE_HIERARCHY, INVARIANCE_HIERARCHY[1:]))
