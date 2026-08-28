@@ -198,10 +198,12 @@ one call:
 
 ``skill_assignments`` may also be a matrix matching the response matrix when
 learners receive different trial layouts. Shared layouts use the compiled
-parallel implementation when it is available. Set ``use_rust=False`` on
-``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy implementation for a
-specific workflow; the global ``mirt.set_backend("numpy")`` preference is also
-honored.
+parallel implementation when it is available. The NumPy fallback also filters
+and smooths shared layouts across all learners at once, and BKT Gibbs sampling
+uses the same vectorized filtering path for hidden-state draws. Set
+``use_rust=False`` on ``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy
+implementation for a specific workflow; the global
+``mirt.set_backend("numpy")`` preference is also honored.
 
 Terminal helpers such as ``predict_mastery_batch`` and
 ``next_mastery_priors_batch`` avoid backward smoothing when a compiled shared
