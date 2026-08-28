@@ -160,10 +160,11 @@ class BKTBatchStepResult:
 class BKTPredictiveResult:
     """Causal predictions and mastery states for one response history.
 
-    Every array has shape ``(n_trials,)``. Predicted mastery conditions only
-    on earlier opportunities for the assigned skill, while updated mastery
-    additionally conditions on the current response. Missing responses have
-    zero log likelihood and ``numpy.nan`` residuals.
+    Trial arrays have shape ``(n_trials,)``. Final skill arrays have shape
+    ``(n_skills,)``. Predicted mastery conditions only on earlier
+    opportunities for the assigned skill, while updated mastery additionally
+    conditions on the current response. Missing responses have zero log
+    likelihood and ``numpy.nan`` residuals.
     """
 
     predicted_mastery: NDArray[np.float64]
@@ -173,6 +174,8 @@ class BKTPredictiveResult:
     standardized_residuals: NDArray[np.float64]
     updated_mastery: NDArray[np.float64]
     next_mastery: NDArray[np.float64]
+    latest_mastery_by_skill: NDArray[np.float64]
+    next_mastery_priors: NDArray[np.float64]
 
     @property
     def n_trials(self) -> int:
@@ -189,8 +192,9 @@ class BKTPredictiveResult:
 class BKTBatchPredictiveResult:
     """Vectorized causal diagnostics for multiple response histories.
 
-    Every array has shape ``(n_persons, n_trials)``. Missing responses have
-    zero log likelihood and ``numpy.nan`` residuals.
+    Trial arrays have shape ``(n_persons, n_trials)``. Final skill arrays have
+    shape ``(n_persons, n_skills)``. Missing responses have zero log
+    likelihood and ``numpy.nan`` residuals.
     """
 
     predicted_mastery: NDArray[np.float64]
@@ -200,6 +204,8 @@ class BKTBatchPredictiveResult:
     standardized_residuals: NDArray[np.float64]
     updated_mastery: NDArray[np.float64]
     next_mastery: NDArray[np.float64]
+    latest_mastery_by_skill: NDArray[np.float64]
+    next_mastery_priors: NDArray[np.float64]
 
     @property
     def n_persons(self) -> int:
@@ -485,13 +491,18 @@ class BKTModel:
             mastery_values,
         )
 
-    def _online_step_batch(
+    def _mastery_update_batch(
         self,
         responses: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         prior_mastery: NDArray[np.float64],
-    ) -> BKTBatchStepResult:
-        """Process validated one-opportunity inputs in one vectorized pass."""
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return response and state updates for validated opportunities."""
         slip = self.p_slip[skill_assignments]
         guess = self.p_guess[skill_assignments]
         response_probabilities = (
@@ -503,11 +514,6 @@ class BKTModel:
             correct,
             response_probabilities,
             np.where(observed, 1.0 - response_probabilities, 1.0),
-        )
-        response_log_likelihoods = np.where(
-            observed,
-            np.log(np.maximum(response_likelihoods, 1e-300)),
-            0.0,
         )
         learned_likelihoods = np.where(
             correct,
@@ -521,6 +527,41 @@ class BKTModel:
             where=response_likelihoods > 0.0,
         )
         updated_mastery = np.where(observed, updated_mastery, prior_mastery)
+        learn = self.p_learn[skill_assignments]
+        forget = self.p_forget[skill_assignments]
+        next_mastery = (
+            updated_mastery * (1.0 - forget) + (1.0 - updated_mastery) * learn
+        )
+        return (
+            response_probabilities,
+            response_likelihoods,
+            updated_mastery,
+            next_mastery,
+        )
+
+    def _online_step_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        prior_mastery: NDArray[np.float64],
+    ) -> BKTBatchStepResult:
+        """Process validated one-opportunity inputs in one vectorized pass."""
+        (
+            response_probabilities,
+            response_likelihoods,
+            updated_mastery,
+            next_mastery,
+        ) = self._mastery_update_batch(
+            responses,
+            skill_assignments,
+            prior_mastery,
+        )
+        observed = responses >= 0
+        response_log_likelihoods = np.where(
+            observed,
+            np.log(np.maximum(response_likelihoods, 1e-300)),
+            0.0,
+        )
         residuals = np.where(
             observed,
             responses - response_probabilities,
@@ -531,11 +572,6 @@ class BKTModel:
             PROB_EPSILON,
         )
         standardized_residuals = residuals / np.sqrt(response_variances)
-        learn = self.p_learn[skill_assignments]
-        forget = self.p_forget[skill_assignments]
-        next_mastery = (
-            updated_mastery * (1.0 - forget) + (1.0 - updated_mastery) * learn
-        )
         return BKTBatchStepResult(
             response_probabilities=response_probabilities,
             response_log_likelihoods=response_log_likelihoods,
@@ -611,6 +647,7 @@ class BKTModel:
             self.p_init,
             (n_persons, self.n_skills),
         ).copy()
+        latest_mastery_by_skill = retained_priors.copy()
         predicted_mastery = np.empty(responses.shape, dtype=np.float64)
         response_probabilities = np.empty_like(predicted_mastery)
         response_log_likelihoods = np.empty_like(predicted_mastery)
@@ -635,6 +672,7 @@ class BKTModel:
             standardized_residuals[:, trial] = step.standardized_residuals
             updated_mastery[:, trial] = step.updated_mastery
             next_mastery[:, trial] = step.next_mastery
+            latest_mastery_by_skill[rows, trial_skills] = step.updated_mastery
             retained_priors[rows, trial_skills] = step.next_mastery
 
         return BKTBatchPredictiveResult(
@@ -645,6 +683,8 @@ class BKTModel:
             standardized_residuals=standardized_residuals,
             updated_mastery=updated_mastery,
             next_mastery=next_mastery,
+            latest_mastery_by_skill=latest_mastery_by_skill,
+            next_mastery_priors=retained_priors,
         )
 
     def predictive_diagnostics(
@@ -683,6 +723,8 @@ class BKTModel:
             standardized_residuals=result.standardized_residuals[0].copy(),
             updated_mastery=result.updated_mastery[0].copy(),
             next_mastery=result.next_mastery[0].copy(),
+            latest_mastery_by_skill=result.latest_mastery_by_skill[0].copy(),
+            next_mastery_priors=result.next_mastery_priors[0].copy(),
         )
 
     def predictive_diagnostics_batch(
@@ -1383,6 +1425,52 @@ class BKTModel:
             observed[rows, skill_assignments] = True
         return np.where(observed, transitioned, latest_mastery)
 
+    def _terminal_mastery_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return latest posteriors and next priors for validated histories."""
+        if responses.shape[0] > 0 and skill_assignments.ndim == 1:
+            native = self._native_forward_backward_batch(
+                responses,
+                skill_assignments,
+            )
+            if native is not None:
+                latest_mastery = self._latest_mastery_batch(
+                    native[0][..., 1],
+                    skill_assignments,
+                )
+                return latest_mastery, self._next_mastery_priors_from_latest(
+                    latest_mastery,
+                    skill_assignments,
+                )
+
+        n_persons, n_trials = responses.shape
+        skill_matrix = (
+            np.broadcast_to(skill_assignments, responses.shape)
+            if skill_assignments.ndim == 1
+            else skill_assignments
+        )
+        next_priors = np.broadcast_to(
+            self.p_init,
+            (n_persons, self.n_skills),
+        ).copy()
+        latest_mastery = next_priors.copy()
+        rows = np.arange(n_persons)
+
+        for trial in range(n_trials):
+            trial_skills = skill_matrix[:, trial]
+            _, _, updated_mastery, next_mastery = self._mastery_update_batch(
+                responses[:, trial],
+                trial_skills,
+                next_priors[rows, trial_skills],
+            )
+            latest_mastery[rows, trial_skills] = updated_mastery
+            next_priors[rows, trial_skills] = next_mastery
+
+        return latest_mastery, next_priors
+
     def predict_mastery_by_skill(
         self,
         responses: NDArray[np.int_],
@@ -1397,11 +1485,11 @@ class BKTModel:
         responses, skill_assignments = self._validate_sequence(
             responses, skill_assignments
         )
-        gamma, _ = self._forward_backward_batch_validated(
+        latest_mastery, _ = self._terminal_mastery_batch(
             responses[None, :],
             skill_assignments,
         )
-        return self._latest_mastery_batch(gamma[..., 1], skill_assignments)[0]
+        return latest_mastery[0]
 
     def predict_mastery_batch(
         self,
@@ -1416,8 +1504,11 @@ class BKTModel:
         responses, skill_assignments = self._validate_batch(
             responses, skill_assignments
         )
-        gamma, _ = self._forward_backward_batch_validated(responses, skill_assignments)
-        return self._latest_mastery_batch(gamma[..., 1], skill_assignments)
+        latest_mastery, _ = self._terminal_mastery_batch(
+            responses,
+            skill_assignments,
+        )
+        return latest_mastery
 
     def next_mastery_priors(
         self,
@@ -1447,18 +1538,11 @@ class BKTModel:
             responses,
             skill_assignments,
         )
-        gamma, _ = self._forward_backward_batch_validated(
+        _, next_priors = self._terminal_mastery_batch(
             responses[None, :],
             skill_assignments,
         )
-        latest_mastery = self._latest_mastery_batch(
-            gamma[..., 1],
-            skill_assignments,
-        )[0]
-        return self._next_mastery_priors_from_latest(
-            latest_mastery,
-            skill_assignments,
-        )
+        return next_priors[0]
 
     def next_mastery_priors_batch(
         self,
@@ -1484,18 +1568,11 @@ class BKTModel:
             responses,
             skill_assignments,
         )
-        gamma, _ = self._forward_backward_batch_validated(
+        _, next_priors = self._terminal_mastery_batch(
             responses,
             skill_assignments,
         )
-        latest_mastery = self._latest_mastery_batch(
-            gamma[..., 1],
-            skill_assignments,
-        )
-        return self._next_mastery_priors_from_latest(
-            latest_mastery,
-            skill_assignments,
-        )
+        return next_priors
 
     def forecast(
         self,
