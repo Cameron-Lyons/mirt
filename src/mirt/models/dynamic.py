@@ -5,6 +5,7 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.spatial.distance import cdist
 
 from mirt._backend_config import should_use_rust
 from mirt._categorical import sample_categorical_rows
@@ -16,8 +17,10 @@ from mirt.backends.rust.dynamic import (
     bkt_viterbi,
 )
 from mirt.constants import PROB_EPSILON
+from mirt.utils.numeric import logsumexp
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
+_GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
 
 
 @dataclass
@@ -2081,23 +2084,170 @@ class GrowthMixtureModel:
         -------
         NDArray
             Class likelihoods (n_persons, n_classes).
+
+        Notes
+        -----
+        For long trajectories, use :meth:`class_log_likelihood` or
+        :meth:`posterior_probabilities` to avoid probability underflow.
         """
-        observations = np.atleast_2d(observations)
-        n_persons = observations.shape[0]
+        return np.exp(self.class_log_likelihood(observations, time_values))
 
-        likelihoods = np.zeros((n_persons, self.n_classes))
+    @staticmethod
+    def _validated_time_values(
+        time_values: NDArray[np.float64],
+        *,
+        expected_length: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return a finite, non-empty one-dimensional time grid."""
+        try:
+            times = np.asarray(time_values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("time_values must contain numeric values") from exc
+        if times.ndim != 1 or times.size < 1:
+            raise ValueError("time_values must be a non-empty one-dimensional array")
+        if expected_length is not None and times.size != expected_length:
+            raise ValueError(
+                "time_values must contain one value per observation column"
+            )
+        if not np.all(np.isfinite(times)):
+            raise ValueError("time_values must contain only finite values")
+        return times
 
-        for k in range(self.n_classes):
-            mean_trajectory = self.compute_class_trajectory(k, time_values)
+    def _validated_class_trajectories(
+        self,
+        times: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Build finite class trajectories from validated time values."""
+        try:
+            intercepts = np.asarray(self.class_intercepts, dtype=np.float64)
+            slopes = np.asarray(self.class_slopes, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("class trajectory parameters must be numeric") from exc
+        if intercepts.shape != (self.n_classes,) or slopes.shape != (self.n_classes,):
+            raise ValueError("class intercepts and slopes must match n_classes")
+        if not np.all(np.isfinite(intercepts)) or not np.all(np.isfinite(slopes)):
+            raise ValueError("class trajectory parameters must be finite")
 
-            for i in range(n_persons):
-                residual = observations[i] - mean_trajectory
-                total_var = self.intercept_var + self.residual_variance
-                ll = -0.5 * np.sum(residual**2) / total_var
-                ll -= 0.5 * len(time_values) * np.log(2 * np.pi * total_var)
-                likelihoods[i, k] = np.exp(ll)
+        trajectories = intercepts[:, None] + slopes[:, None] * times[None, :]
+        if self.growth_type == "quadratic":
+            try:
+                quadratics = np.asarray(self.class_quadratics, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("class quadratics must be numeric") from exc
+            if quadratics.shape != (self.n_classes,) or not np.all(
+                np.isfinite(quadratics)
+            ):
+                raise ValueError("class quadratics must be finite and match n_classes")
+            trajectories += quadratics[:, None] * times[None, :] ** 2
+        return trajectories
 
-        return likelihoods
+    def _validated_class_proportions(self) -> NDArray[np.float64]:
+        """Return normalized, finite class weights."""
+        try:
+            proportions = np.asarray(self.class_proportions, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("class_proportions must be numeric") from exc
+        if proportions.shape != (self.n_classes,):
+            raise ValueError("class_proportions must match n_classes")
+        if not np.all(np.isfinite(proportions)) or np.any(proportions < 0.0):
+            raise ValueError("class_proportions must be finite and nonnegative")
+        total_proportion = float(np.sum(proportions))
+        if total_proportion <= 0.0:
+            raise ValueError("class_proportions must contain a positive value")
+        return proportions / total_proportion
+
+    def _validated_variance_components(self) -> tuple[float, float, float]:
+        """Return finite, nonnegative growth-mixture variances."""
+        try:
+            variances = np.asarray(
+                [self.intercept_var, self.slope_var, self.residual_variance],
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("variance components must be numeric") from exc
+        if not np.all(np.isfinite(variances)) or np.any(variances < 0.0):
+            raise ValueError("variance components must be finite and nonnegative")
+        return float(variances[0]), float(variances[1]), float(variances[2])
+
+    def _validated_trajectory_data(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        float,
+    ]:
+        """Validate growth-mixture inputs and build class trajectories."""
+        try:
+            observation_values = np.asarray(observations, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("observations must contain numeric values") from exc
+        if observation_values.ndim == 1:
+            observation_values = observation_values.reshape(1, -1)
+        if (
+            observation_values.ndim != 2
+            or observation_values.shape[0] < 1
+            or observation_values.shape[1] < 1
+        ):
+            raise ValueError("observations must be a non-empty two-dimensional array")
+        if not np.all(np.isfinite(observation_values)):
+            raise ValueError("observations must contain only finite values")
+
+        times = self._validated_time_values(
+            time_values,
+            expected_length=observation_values.shape[1],
+        )
+        trajectories = self._validated_class_trajectories(times)
+        intercept_variance, _, residual_variance = self._validated_variance_components()
+        total_variance = intercept_variance + residual_variance
+        if total_variance <= 0.0:
+            raise ValueError("intercept_var plus residual_variance must be positive")
+        return observation_values, times, trajectories, total_variance
+
+    def class_log_likelihood(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute stable log likelihoods for every person and class.
+
+        Parameters
+        ----------
+        observations : NDArray
+            Observed trajectories with shape ``(n_persons, n_timepoints)``.
+            A one-dimensional trajectory is accepted as one person.
+        time_values : NDArray
+            One finite value per trajectory column.
+
+        Returns
+        -------
+        NDArray
+            Log likelihoods with shape ``(n_persons, n_classes)``.
+        """
+        values, _, trajectories, total_variance = self._validated_trajectory_data(
+            observations,
+            time_values,
+        )
+        squared_distance = cdist(values, trajectories, metric="sqeuclidean")
+        normalization = 0.5 * values.shape[1] * np.log(2.0 * np.pi * total_variance)
+        return -0.5 * squared_distance / total_variance - normalization
+
+    def _posterior_from_log_likelihoods(
+        self,
+        log_likelihoods: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Normalize class probabilities in log space."""
+        proportions = self._validated_class_proportions()
+
+        log_proportions = np.full(self.n_classes, -np.inf, dtype=np.float64)
+        positive = proportions > 0.0
+        log_proportions[positive] = np.log(proportions[positive])
+        log_joint = log_likelihoods + log_proportions
+        log_normalizer = logsumexp(log_joint, axis=1)
+        posteriors = np.exp(log_joint - log_normalizer[:, None])
+        return posteriors, log_normalizer
 
     def classify(
         self,
@@ -2118,13 +2268,9 @@ class GrowthMixtureModel:
         NDArray
             Class assignments (n_persons,).
         """
-        likelihoods = self.class_likelihood(observations, time_values)
-
-        posteriors = likelihoods * self.class_proportions
-        row_sums = posteriors.sum(axis=1, keepdims=True)
-        posteriors /= np.maximum(row_sums, PROB_EPSILON)
-
-        return np.argmax(posteriors, axis=1)
+        return np.argmax(
+            self.posterior_probabilities(observations, time_values), axis=1
+        )
 
     def posterior_probabilities(
         self,
@@ -2145,12 +2291,8 @@ class GrowthMixtureModel:
         NDArray
             Posterior probabilities (n_persons, n_classes).
         """
-        likelihoods = self.class_likelihood(observations, time_values)
-
-        posteriors = likelihoods * self.class_proportions
-        row_sums = posteriors.sum(axis=1, keepdims=True)
-        posteriors /= np.maximum(row_sums, PROB_EPSILON)
-
+        log_likelihoods = self.class_log_likelihood(observations, time_values)
+        posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
         return posteriors
 
     def simulate(
@@ -2175,33 +2317,59 @@ class GrowthMixtureModel:
         tuple
             (observations, true_classes)
         """
-        rng = np.random.default_rng(seed)
+        if (
+            isinstance(n_persons, bool)
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        n_persons = int(n_persons)
 
         if time_values is None:
-            time_values = np.arange(self.n_timepoints, dtype=np.float64)
+            if (
+                isinstance(self.n_timepoints, bool)
+                or not isinstance(self.n_timepoints, (int, np.integer))
+                or self.n_timepoints < 1
+            ):
+                raise ValueError("n_timepoints must be a positive integer")
+            times = np.arange(int(self.n_timepoints), dtype=np.float64)
+        else:
+            times = self._validated_time_values(time_values)
 
-        n_times = len(time_values)
+        trajectories = self._validated_class_trajectories(times)
+        proportions = self._validated_class_proportions()
+        intercept_variance, slope_variance, residual_variance = (
+            self._validated_variance_components()
+        )
 
+        rng = np.random.default_rng(seed)
         true_classes = rng.choice(
             self.n_classes,
             size=n_persons,
-            p=self.class_proportions,
+            p=proportions,
         )
 
-        observations = np.zeros((n_persons, n_times))
+        n_times = times.size
+        observations = np.empty((n_persons, n_times), dtype=np.float64)
+        random_values_per_person = n_times + 2
+        persons_per_chunk = max(
+            1,
+            _GROWTH_MIXTURE_MAX_RANDOM_VALUES // random_values_per_person,
+        )
+        intercept_scale = np.sqrt(intercept_variance)
+        slope_scale = np.sqrt(slope_variance)
+        residual_scale = np.sqrt(residual_variance)
 
-        for i in range(n_persons):
-            k = true_classes[i]
-            mean_trajectory = self.compute_class_trajectory(k, time_values)
-
-            intercept_deviation = rng.normal(0, np.sqrt(self.intercept_var))
-            slope_deviation = rng.normal(0, np.sqrt(self.slope_var))
-
-            observations[i] = (
-                mean_trajectory
-                + intercept_deviation
-                + slope_deviation * time_values
-                + rng.normal(0, np.sqrt(self.residual_variance), n_times)
+        for start in range(0, n_persons, persons_per_chunk):
+            stop = min(start + persons_per_chunk, n_persons)
+            random_values = rng.standard_normal(
+                (stop - start, random_values_per_person)
+            )
+            observations[start:stop] = (
+                trajectories[true_classes[start:stop]]
+                + random_values[:, :1] * intercept_scale
+                + random_values[:, 1:2] * slope_scale * times[None, :]
+                + random_values[:, 2:] * residual_scale
             )
 
         return observations, true_classes
@@ -2231,64 +2399,155 @@ class GrowthMixtureModel:
         dict
             Estimation results.
         """
-        observations = np.atleast_2d(observations)
-        n_persons = observations.shape[0]
+        observations, times, _, _ = self._validated_trajectory_data(
+            observations,
+            time_values,
+        )
+        if (
+            isinstance(max_iter, bool)
+            or not isinstance(max_iter, (int, np.integer))
+            or max_iter < 1
+        ):
+            raise ValueError("max_iter must be a positive integer")
+        try:
+            tolerance = float(tol)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("tol must be numeric") from exc
+        if isinstance(tol, bool) or not np.isfinite(tolerance) or tolerance <= 0.0:
+            raise ValueError("tol must be positive and finite")
+        max_iter = int(max_iter)
 
+        design = np.column_stack([np.ones(len(times)), times])
+        if self.growth_type == "quadratic":
+            design = np.column_stack([design, times**2])
+        if np.linalg.matrix_rank(design) < design.shape[1]:
+            raise ValueError("time_values must provide a full-rank growth design")
+
+        converged = False
         for iteration in range(max_iter):
-            posteriors = self.posterior_probabilities(observations, time_values)
+            posteriors = self.posterior_probabilities(observations, times)
 
             prev_proportions = self.class_proportions.copy()
             prev_intercepts = self.class_intercepts.copy()
             prev_slopes = self.class_slopes.copy()
+            if self.growth_type == "quadratic":
+                prev_quadratics = self.class_quadratics.copy()
 
             self.class_proportions = np.mean(posteriors, axis=0)
 
-            for k in range(self.n_classes):
-                weights = posteriors[:, k]
-                if np.sum(weights) < PROB_EPSILON:
-                    continue
-
-                X = np.column_stack([np.ones(len(time_values)), time_values])
-                if self.growth_type == "quadratic":
-                    X = np.column_stack([X, time_values**2])
-
-                weighted_y = np.zeros(X.shape[1])
-                weighted_X = np.zeros((X.shape[1], X.shape[1]))
-
-                for i in range(n_persons):
-                    weighted_y += weights[i] * X.T @ observations[i]
-                    weighted_X += weights[i] * X.T @ X
-
-                try:
-                    beta = np.linalg.solve(weighted_X, weighted_y)
-                    self.class_intercepts[k] = beta[0]
-                    self.class_slopes[k] = beta[1]
-                    if self.growth_type == "quadratic" and len(beta) > 2:
-                        self.class_quadratics[k] = beta[2]
-                except np.linalg.LinAlgError:
-                    pass
+            class_mass = np.sum(posteriors, axis=0)
+            active = class_mass >= PROB_EPSILON
+            safe_mass = np.where(active, class_mass, 1.0)
+            weighted_means = (posteriors.T @ observations) / safe_mass[:, None]
+            coefficients = np.linalg.lstsq(
+                design,
+                weighted_means.T,
+                rcond=None,
+            )[0].T
+            self.class_intercepts[active] = coefficients[active, 0]
+            self.class_slopes[active] = coefficients[active, 1]
+            if self.growth_type == "quadratic":
+                self.class_quadratics[active] = coefficients[active, 2]
 
             prop_change = np.max(np.abs(self.class_proportions - prev_proportions))
             int_change = np.max(np.abs(self.class_intercepts - prev_intercepts))
             slope_change = np.max(np.abs(self.class_slopes - prev_slopes))
+            parameter_change = max(prop_change, int_change, slope_change)
+            if self.growth_type == "quadratic":
+                quadratic_change = np.max(
+                    np.abs(self.class_quadratics - prev_quadratics)
+                )
+                parameter_change = max(parameter_change, quadratic_change)
 
-            if max(prop_change, int_change, slope_change) < tol:
+            if parameter_change < tolerance:
+                converged = True
                 break
 
-        final_posteriors = self.posterior_probabilities(observations, time_values)
+        final_log_likelihoods = self.class_log_likelihood(observations, times)
+        final_posteriors, log_normalizer = self._posterior_from_log_likelihoods(
+            final_log_likelihoods
+        )
         classifications = np.argmax(final_posteriors, axis=1)
-
-        likelihoods = self.class_likelihood(observations, time_values)
-        total_likelihood = np.sum(likelihoods * self.class_proportions, axis=1)
-        log_likelihood = np.sum(np.log(total_likelihood + PROB_EPSILON))
+        log_likelihood = float(np.sum(log_normalizer))
 
         return {
             "classifications": classifications,
             "posteriors": final_posteriors,
             "log_likelihood": log_likelihood,
             "n_iterations": iteration + 1,
-            "converged": iteration < max_iter - 1,
+            "converged": converged,
         }
+
+    @property
+    def n_fitted_parameters(self) -> int:
+        """Number of parameters updated by :meth:`fit_em`.
+
+        The count includes one intercept and slope per class, one quadratic
+        coefficient per class for quadratic growth, and ``n_classes - 1``
+        independent mixture weights. Variance components are fixed during the
+        current EM fit and are therefore excluded.
+        """
+        coefficients_per_class = 3 if self.growth_type == "quadratic" else 2
+        return self.n_classes * coefficients_per_class + self.n_classes - 1
+
+    @staticmethod
+    def _entropy_from_posteriors(posteriors: NDArray[np.float64]) -> float:
+        """Calculate mean classification entropy from posterior weights."""
+        clipped = np.clip(posteriors, PROB_EPSILON, 1 - PROB_EPSILON)
+        return float(-np.mean(np.sum(clipped * np.log(clipped), axis=1)))
+
+    def fit(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+        max_iter: int = 100,
+        tol: float = 1e-4,
+    ) -> GrowthMixtureResult:
+        """Fit the model and return structured diagnostics.
+
+        This is the result-oriented counterpart to :meth:`fit_em`, which
+        continues to return its compatibility mapping.
+
+        Parameters
+        ----------
+        observations : NDArray
+            Observed trajectories with shape ``(n_persons, n_timepoints)``.
+        time_values : NDArray
+            One time value per observation column.
+        max_iter : int
+            Maximum EM iterations.
+        tol : float
+            Positive convergence tolerance.
+
+        Returns
+        -------
+        GrowthMixtureResult
+            Fitted classifications, posteriors, information criteria, entropy,
+            and convergence diagnostics.
+        """
+        fit_state = self.fit_em(
+            observations,
+            time_values,
+            max_iter=max_iter,
+            tol=tol,
+        )
+        classifications = np.asarray(fit_state["classifications"], dtype=np.int_)
+        posteriors = np.asarray(fit_state["posteriors"], dtype=np.float64)
+        log_likelihood = float(fit_state["log_likelihood"])
+        parameter_count = self.n_fitted_parameters
+        n_observations = classifications.size
+
+        return GrowthMixtureResult(
+            model=self,
+            classifications=classifications,
+            posteriors=posteriors,
+            log_likelihood=log_likelihood,
+            aic=2.0 * parameter_count - 2.0 * log_likelihood,
+            bic=np.log(n_observations) * parameter_count - 2.0 * log_likelihood,
+            entropy=self._entropy_from_posteriors(posteriors),
+            converged=bool(fit_state["converged"]),
+            n_iterations=int(fit_state["n_iterations"]),
+        )
 
     def entropy(
         self,
@@ -2312,8 +2571,7 @@ class GrowthMixtureModel:
             Entropy value.
         """
         posteriors = self.posterior_probabilities(observations, time_values)
-        posteriors = np.clip(posteriors, PROB_EPSILON, 1 - PROB_EPSILON)
-        return -np.mean(np.sum(posteriors * np.log(posteriors), axis=1))
+        return self._entropy_from_posteriors(posteriors)
 
 
 @dataclass
@@ -2330,7 +2588,31 @@ class GrowthMixtureResult:
     converged: bool
     n_iterations: int
 
+    @property
+    def n_observations(self) -> int:
+        """Number of fitted trajectories."""
+        return int(self.classifications.size)
+
+    @property
+    def n_parameters(self) -> int:
+        """Number of parameters updated during fitting."""
+        return self.model.n_fitted_parameters
+
+    @property
+    def class_counts(self) -> NDArray[np.int_]:
+        """Hard-classification counts in class order."""
+        return np.bincount(
+            self.classifications,
+            minlength=self.model.n_classes,
+        )[: self.model.n_classes]
+
+    @property
+    def class_shares(self) -> NDArray[np.float64]:
+        """Hard-classification shares in class order."""
+        return self.class_counts / self.n_observations
+
     def summary(self) -> str:
+        """Generate a human-readable estimation summary."""
         lines = []
         width = 60
 
@@ -2339,23 +2621,29 @@ class GrowthMixtureResult:
         lines.append("=" * width)
 
         lines.append(f"Number of Classes:  {self.model.n_classes}")
+        lines.append(f"Observations:       {self.n_observations}")
+        lines.append(f"Fitted Parameters:  {self.n_parameters}")
         lines.append(f"Growth Type:        {self.model.growth_type}")
         lines.append(f"Log-Likelihood:     {self.log_likelihood:.4f}")
         lines.append(f"AIC:                {self.aic:.4f}")
         lines.append(f"BIC:                {self.bic:.4f}")
         lines.append(f"Entropy:            {self.entropy:.4f}")
         lines.append(f"Converged:          {self.converged}")
+        lines.append(f"Iterations:         {self.n_iterations}")
         lines.append("-" * width)
 
         lines.append("\nClass Parameters:")
+        counts = self.class_counts
+        shares = self.class_shares
         for k in range(self.model.n_classes):
-            n_in_class = np.sum(self.classifications == k)
-            pct = 100 * n_in_class / len(self.classifications)
-            lines.append(
-                f"  Class {k}: N={n_in_class} ({pct:.1f}%), "
+            parameters = (
+                f"  Class {k}: N={counts[k]} ({100 * shares[k]:.1f}%), "
                 f"Intercept={self.model.class_intercepts[k]:.3f}, "
                 f"Slope={self.model.class_slopes[k]:.3f}"
             )
+            if self.model.growth_type == "quadratic":
+                parameters += f", Quadratic={self.model.class_quadratics[k]:.3f}"
+            lines.append(parameters)
 
         lines.append("=" * width)
         return "\n".join(lines)
