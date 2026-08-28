@@ -95,6 +95,42 @@ class MultidimensionalModel(DichotomousItemModel):
         a_sq_sum = np.sum(a**2, axis=1)
         return a_sq_sum[None, :] * p * q
 
+    def item_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return item Fisher matrices across multidimensional theta points."""
+        if item_idx < 0 or item_idx >= self.n_items:
+            raise IndexError(f"item_idx {item_idx} out of range [0, {self.n_items})")
+
+        theta = self._ensure_theta_2d(theta)
+        probability = self.probability(theta, item_idx)
+        slope = self._parameters["slopes"][item_idx]
+        slope_outer = np.outer(slope, slope)
+        return (
+            probability[:, None, None]
+            * (1.0 - probability[:, None, None])
+            * (slope_outer[None, :, :])
+        )
+
+    def test_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return summed Fisher matrices across all items and theta points."""
+        theta = self._ensure_theta_2d(theta)
+        probability = self.probability(theta)
+        variance = probability * (1.0 - probability)
+        slopes = self._parameters["slopes"]
+        return np.einsum(
+            "ni,ij,ik->njk",
+            variance,
+            slopes,
+            slopes,
+            optimize=True,
+        )
+
     def to_irt_parameterization(self) -> dict[str, NDArray[np.float64]]:
         a = self._parameters["slopes"]
         d = self._parameters["intercepts"]
