@@ -20,6 +20,147 @@ from mirt.constants import PROB_EPSILON
 FALLBACK_MODE = "numpy"
 
 
+def _prepare_item_information_inputs(
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    h: float,
+) -> tuple[
+    NDArray[np.int32],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Validate and normalize inputs for 2PL item information blocks."""
+    responses_array = np.asarray(responses)
+    if responses_array.dtype.kind not in "biuf":
+        raise ValueError("responses must contain numeric values")
+    responses_float = np.asarray(responses_array, dtype=np.float64)
+    posterior_array = np.asarray(posterior_weights, dtype=np.float64)
+    quad_array = np.asarray(quad_points, dtype=np.float64)
+    discrimination_array = np.asarray(discrimination, dtype=np.float64)
+    difficulty_array = np.asarray(difficulty, dtype=np.float64)
+
+    if responses_array.ndim != 2 or not all(responses_array.shape):
+        raise ValueError("responses must be a non-empty 2D matrix")
+    n_persons, n_items = responses_array.shape
+    if (
+        posterior_array.ndim != 2
+        or posterior_array.shape[0] != n_persons
+        or posterior_array.shape[1] == 0
+    ):
+        raise ValueError(
+            "posterior_weights must be a 2D matrix with one row per respondent"
+        )
+    if quad_array.ndim != 1 or quad_array.shape[0] != posterior_array.shape[1]:
+        raise ValueError(
+            "quad_points must be one-dimensional with one value per posterior column"
+        )
+    if discrimination_array.shape != (n_items,):
+        raise ValueError(f"discrimination must have shape ({n_items},)")
+    if difficulty_array.shape != (n_items,):
+        raise ValueError(f"difficulty must have shape ({n_items},)")
+
+    if np.any(np.isinf(responses_float)):
+        raise ValueError("responses must contain finite values or NaN for missing")
+    observed = np.isfinite(responses_float) & (responses_float >= 0)
+    if np.any(observed & (responses_float != 0) & (responses_float != 1)):
+        raise ValueError("observed responses must contain only 0 or 1")
+    if not np.all(np.isfinite(posterior_array)) or np.any(posterior_array < 0):
+        raise ValueError("posterior_weights must contain finite non-negative values")
+    if not np.all(np.isfinite(quad_array)):
+        raise ValueError("quad_points must contain only finite values")
+    if not np.all(np.isfinite(discrimination_array)):
+        raise ValueError("discrimination must contain only finite values")
+    if not np.all(np.isfinite(difficulty_array)):
+        raise ValueError("difficulty must contain only finite values")
+    if (
+        isinstance(h, (bool, np.bool_))
+        or not isinstance(h, (int, float, np.integer, np.floating))
+        or not np.isfinite(h)
+        or h <= 0
+    ):
+        raise ValueError("h must be a finite positive number")
+
+    responses_i32 = _ensure_i32(
+        np.where(np.isnan(responses_float), -1, responses_float)
+    )
+    posterior_f64 = _ensure_f64(posterior_array)
+    quad_f64 = _ensure_f64(quad_array)
+    discrimination_f64 = _ensure_f64(discrimination_array)
+    difficulty_f64 = _ensure_f64(difficulty_array)
+    assert responses_i32 is not None
+    assert posterior_f64 is not None
+    assert quad_f64 is not None
+    assert discrimination_f64 is not None
+    assert difficulty_f64 is not None
+    return (
+        responses_i32,
+        posterior_f64,
+        quad_f64,
+        discrimination_f64,
+        difficulty_f64,
+    )
+
+
+def _item_hessian_blocks(
+    responses: NDArray[np.int32],
+    posterior_weights: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute exact 2PL complete-data Hessian blocks for every item."""
+    valid = responses >= 0
+    correct = responses == 1
+    expected_totals = valid.T @ posterior_weights
+    expected_correct = correct.T @ posterior_weights
+
+    centered_theta = quad_points[None, :] - difficulty[:, None]
+    slopes = discrimination[:, None]
+    probabilities = sigmoid(slopes * centered_theta)
+    curvature = expected_totals * probabilities * (1.0 - probabilities)
+    score_residual = expected_correct - expected_totals * probabilities
+
+    hessian_aa = -np.sum(curvature * centered_theta**2, axis=1)
+    hessian_bb = -np.sum(curvature * slopes**2, axis=1)
+    hessian_ab = np.sum(
+        curvature * slopes * centered_theta - score_residual,
+        axis=1,
+    )
+
+    blocks = np.empty((responses.shape[1], 2, 2), dtype=np.float64)
+    blocks[:, 0, 0] = hessian_aa
+    blocks[:, 0, 1] = hessian_ab
+    blocks[:, 1, 0] = hessian_ab
+    blocks[:, 1, 1] = hessian_bb
+    return blocks
+
+
+def _standard_errors_from_blocks(
+    blocks: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Invert negative 2x2 Hessian blocks and return marginal errors."""
+    information_aa = -blocks[:, 0, 0]
+    information_ab = -blocks[:, 0, 1]
+    information_bb = -blocks[:, 1, 1]
+    determinant = information_aa * information_bb - information_ab**2
+    valid = (
+        (information_aa > PROB_EPSILON)
+        & (information_bb > PROB_EPSILON)
+        & (determinant > PROB_EPSILON)
+    )
+
+    se_discrimination = np.full(blocks.shape[0], np.nan)
+    se_difficulty = np.full(blocks.shape[0], np.nan)
+    se_discrimination[valid] = np.sqrt(information_bb[valid] / determinant[valid])
+    se_difficulty[valid] = np.sqrt(information_aa[valid] / determinant[valid])
+    return se_discrimination, se_difficulty
+
+
 def sibtest_compute_beta(
     ref_data: NDArray[np.int_],
     focal_data: NDArray[np.int_],
@@ -343,62 +484,42 @@ def compute_item_se_parallel(
     difficulty : NDArray
         Difficulty parameters (n_items,)
     h : float
-        Step size for finite difference
+        Retained for API compatibility. Exact analytic derivatives are used.
 
     Returns
     -------
     tuple
         (se_discrimination, se_difficulty)
     """
+    responses, posterior_weights, quad_points, discrimination, difficulty = (
+        _prepare_item_information_inputs(
+            responses,
+            posterior_weights,
+            quad_points,
+            discrimination,
+            difficulty,
+            h,
+        )
+    )
+
     if rust_enabled():
-        qp = _ensure_f64(quad_points)
-        disc = _ensure_f64(discrimination)
-        diff = _ensure_f64(difficulty)
         return mirt_rs.compute_item_se_parallel(
-            _ensure_i32(responses),
-            _ensure_f64(posterior_weights),
-            qp.ravel() if qp is not None else quad_points.astype(np.float64).ravel(),
-            disc.ravel()
-            if disc is not None
-            else discrimination.astype(np.float64).ravel(),
-            diff.ravel() if diff is not None else difficulty.astype(np.float64).ravel(),
+            responses,
+            posterior_weights,
+            quad_points,
+            discrimination,
+            difficulty,
             h,
         )
 
-    n_items = responses.shape[1]
-    se_disc = np.zeros(n_items)
-    se_diff = np.zeros(n_items)
-
-    for j in range(n_items):
-        item_responses = responses[:, j]
-        valid_mask = item_responses >= 0
-
-        r_k = np.sum(
-            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-            axis=0,
-        )
-        n_k = np.sum(posterior_weights[valid_mask], axis=0)
-
-        def item_ll(a, b):
-            z = a * (quad_points - b)
-            p = sigmoid(z)
-            p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-            return np.sum(r_k * np.log(p) + (n_k - r_k) * np.log(1 - p))
-
-        a, b = discrimination[j], difficulty[j]
-        ll_center = item_ll(a, b)
-
-        ll_a_plus = item_ll(a + h, b)
-        ll_a_minus = item_ll(a - h, b)
-        hess_aa = (ll_a_plus - 2 * ll_center + ll_a_minus) / (h**2)
-        se_disc[j] = np.sqrt(-1.0 / hess_aa) if hess_aa < -PROB_EPSILON else np.nan
-
-        ll_b_plus = item_ll(a, b + h)
-        ll_b_minus = item_ll(a, b - h)
-        hess_bb = (ll_b_plus - 2 * ll_center + ll_b_minus) / (h**2)
-        se_diff[j] = np.sqrt(-1.0 / hess_bb) if hess_bb < -PROB_EPSILON else np.nan
-
-    return se_disc, se_diff
+    blocks = _item_hessian_blocks(
+        responses,
+        posterior_weights,
+        quad_points,
+        discrimination,
+        difficulty,
+    )
+    return _standard_errors_from_blocks(blocks)
 
 
 def compute_hessian_block_diagonal(
@@ -424,44 +545,49 @@ def compute_hessian_block_diagonal(
     difficulty : NDArray
         Difficulty parameters (n_items,)
     h : float
-        Step size for finite difference
+        Retained for API compatibility. Exact analytic derivatives are used.
 
     Returns
     -------
     NDArray
         Hessian matrix (n_params, n_params) where n_params = n_items * 2
     """
+    responses, posterior_weights, quad_points, discrimination, difficulty = (
+        _prepare_item_information_inputs(
+            responses,
+            posterior_weights,
+            quad_points,
+            discrimination,
+            difficulty,
+            h,
+        )
+    )
+
     if rust_enabled():
-        qp = _ensure_f64(quad_points)
-        disc = _ensure_f64(discrimination)
-        diff = _ensure_f64(difficulty)
         return mirt_rs.compute_hessian_block_diagonal(
-            _ensure_i32(responses),
-            _ensure_f64(posterior_weights),
-            qp.ravel() if qp is not None else quad_points.astype(np.float64).ravel(),
-            disc.ravel()
-            if disc is not None
-            else discrimination.astype(np.float64).ravel(),
-            diff.ravel() if diff is not None else difficulty.astype(np.float64).ravel(),
+            responses,
+            posterior_weights,
+            quad_points,
+            discrimination,
+            difficulty,
             h,
         )
 
-    n_items = len(discrimination)
+    blocks = _item_hessian_blocks(
+        responses,
+        posterior_weights,
+        quad_points,
+        discrimination,
+        difficulty,
+    )
+    n_items = discrimination.shape[0]
     n_params = n_items * 2
     hessian = np.zeros((n_params, n_params))
-
-    se_disc, se_diff = compute_item_se_parallel(
-        responses, posterior_weights, quad_points, discrimination, difficulty, h
-    )
-
-    for j in range(n_items):
-        idx_a = j * 2
-        idx_b = j * 2 + 1
-
-        if not np.isnan(se_disc[j]):
-            hessian[idx_a, idx_a] = -1.0 / (se_disc[j] ** 2)
-        if not np.isnan(se_diff[j]):
-            hessian[idx_b, idx_b] = -1.0 / (se_diff[j] ** 2)
+    indices = np.arange(n_items) * 2
+    hessian[indices, indices] = blocks[:, 0, 0]
+    hessian[indices, indices + 1] = blocks[:, 0, 1]
+    hessian[indices + 1, indices] = blocks[:, 1, 0]
+    hessian[indices + 1, indices + 1] = blocks[:, 1, 1]
 
     return hessian
 
