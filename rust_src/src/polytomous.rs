@@ -203,10 +203,23 @@ pub fn compute_alpha_if_deleted<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
 
+    if n_items < 3 {
+        return numpy::PyArray1::zeros(py, n_items, false);
+    }
+
     let responses_owned = responses.to_owned();
 
     let total_scores: Vec<f64> = (0..n_persons)
         .map(|i| responses_owned.row(i).iter().filter(|x| !x.is_nan()).sum())
+        .collect();
+    let observed_counts: Vec<usize> = (0..n_persons)
+        .map(|i| {
+            responses_owned
+                .row(i)
+                .iter()
+                .filter(|x| !x.is_nan())
+                .count()
+        })
         .collect();
 
     let item_variances: Vec<f64> = (0..n_items)
@@ -224,37 +237,54 @@ pub fn compute_alpha_if_deleted<'py>(
             col.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (col.len() - 1).max(1) as f64
         })
         .collect();
+    let item_variance_sum: f64 = item_variances.iter().sum();
 
     let alpha_if_deleted = py.detach(|| {
         (0..n_items)
             .into_par_iter()
             .map(|j| {
-                let remaining_scores: Vec<f64> = (0..n_persons)
-                    .map(|i| {
-                        total_scores[i]
-                            - if responses_owned[[i, j]].is_nan() {
-                                0.0
-                            } else {
-                                responses_owned[[i, j]]
-                            }
-                    })
-                    .collect();
-
-                let remaining_var_sum: f64 = (0..n_items)
-                    .filter(|&k| k != j)
-                    .map(|k| item_variances[k])
-                    .sum();
-
-                let remaining_mean = remaining_scores.iter().sum::<f64>() / n_persons as f64;
-                let remaining_total_var = remaining_scores
-                    .iter()
-                    .map(|x| (x - remaining_mean).powi(2))
+                let observed_after_deletion = |i: usize| {
+                    observed_counts[i]
+                        - if responses_owned[[i, j]].is_nan() {
+                            0
+                        } else {
+                            1
+                        }
+                };
+                let remaining_score = |i: usize| {
+                    total_scores[i]
+                        - if responses_owned[[i, j]].is_nan() {
+                            0.0
+                        } else {
+                            responses_owned[[i, j]]
+                        }
+                };
+                let valid_count = (0..n_persons)
+                    .filter(|&i| observed_after_deletion(i) > 0)
+                    .count();
+                if valid_count < 2 {
+                    return 0.0;
+                }
+                let remaining_mean = (0..n_persons)
+                    .filter(|&i| observed_after_deletion(i) > 0)
+                    .map(remaining_score)
                     .sum::<f64>()
-                    / (n_persons - 1).max(1) as f64;
+                    / valid_count as f64;
+                let remaining_total_var = (0..n_persons)
+                    .filter(|&i| observed_after_deletion(i) > 0)
+                    .map(|i| (remaining_score(i) - remaining_mean).powi(2))
+                    .sum::<f64>()
+                    / (valid_count - 1) as f64;
+                let remaining_var_sum = item_variance_sum - item_variances[j];
 
                 let k = (n_items - 1) as f64;
                 if remaining_total_var > 0.0 && k > 1.0 {
-                    (k / (k - 1.0)) * (1.0 - remaining_var_sum / remaining_total_var)
+                    let alpha = (k / (k - 1.0)) * (1.0 - remaining_var_sum / remaining_total_var);
+                    if alpha.abs() <= 4.0 * f64::EPSILON {
+                        0.0
+                    } else {
+                        alpha
+                    }
                 } else {
                     0.0
                 }

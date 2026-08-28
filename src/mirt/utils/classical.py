@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt._classical import _alpha_if_deleted_numpy, _sample_variance
 from mirt._rust_backend import RUST_AVAILABLE
 from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
 
@@ -43,38 +44,6 @@ def _clean_response_matrix(
         raise ValueError("responses must contain only 0, 1, or missing values")
 
     return np.where(missing, np.nan, values), missing
-
-
-def _sample_variance(
-    values: NDArray[np.float64],
-    *,
-    axis: int | None = None,
-) -> NDArray[np.float64] | float:
-    """Compute sample variance without warnings for sparse columns."""
-    valid = np.isfinite(values)
-    counts = np.sum(valid, axis=axis)
-    sums = np.nansum(values, axis=axis)
-    means = np.divide(
-        sums,
-        counts,
-        out=np.zeros_like(sums, dtype=np.float64),
-        where=counts > 0,
-    )
-    if axis is None:
-        squared_deviations = np.where(valid, (values - means) ** 2, 0.0)
-    else:
-        squared_deviations = np.where(
-            valid,
-            (values - np.expand_dims(means, axis=axis)) ** 2,
-            0.0,
-        )
-    squared_sum = np.sum(squared_deviations, axis=axis)
-    return np.divide(
-        squared_sum,
-        counts - 1,
-        out=np.zeros_like(squared_sum, dtype=np.float64),
-        where=counts > 1,
-    )
 
 
 def _cronbach_alpha(responses: NDArray[np.float64]) -> float:
@@ -232,12 +201,7 @@ def traditional(
     if RUST_AVAILABLE:
         alpha_if_deleted = _rust_alpha_if_deleted(scored_responses)
     else:
-        alpha_if_deleted = np.array(
-            [
-                _cronbach_alpha(np.delete(scored_responses, j, axis=1))
-                for j in range(n_items)
-            ]
-        )
+        alpha_if_deleted = _alpha_if_deleted_numpy(scored_responses)
 
     valid_scores = total_scores[np.isfinite(total_scores)]
     score_variance = float(_sample_variance(valid_scores))
