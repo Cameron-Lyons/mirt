@@ -19,6 +19,36 @@ def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
     return weights
 
 
+def _graded_information(
+    probabilities: NDArray[np.float64],
+    discrimination: float,
+) -> NDArray[np.float64]:
+    """Compute graded-response information from existing category curves."""
+    n_persons, n_categories = probabilities.shape
+    cumulative = np.empty((n_persons, n_categories + 1), dtype=np.float64)
+    cumulative[:, 0] = 1.0
+    cumulative[:, -1] = 0.0
+    np.cumsum(
+        probabilities[:, :0:-1],
+        axis=1,
+        out=cumulative[:, -2:0:-1],
+    )
+
+    np.multiply(cumulative, 1.0 - cumulative, out=cumulative)
+    derivatives = cumulative[:, :-1] - cumulative[:, 1:]
+    derivatives *= discrimination
+    np.square(derivatives, out=derivatives)
+    valid = probabilities > PROB_EPSILON
+    np.divide(
+        derivatives,
+        probabilities,
+        out=derivatives,
+        where=valid,
+    )
+    derivatives[~valid] = 0.0
+    return derivatives.sum(axis=1)
+
+
 class GradedResponseModel(PolytomousItemModel):
     model_name = "GRM"
     supports_multidimensional = True
@@ -128,38 +158,14 @@ class GradedResponseModel(PolytomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]:
-        n_persons = theta.shape[0]
-        n_cat = self._n_categories[item_idx]
-
         a = self._parameters["discrimination"]
         if self.n_factors == 1:
-            a_val = a[item_idx]
+            a_val = float(a[item_idx])
         else:
-            a_val = np.sqrt(np.sum(a[item_idx] ** 2))
+            a_val = float(np.linalg.norm(a[item_idx]))
 
-        probs = self.probability(theta, item_idx)
-
-        cum_probs = np.zeros((n_persons, n_cat + 1))
-        cum_probs[:, 0] = 1.0
-        for k in range(n_cat - 1):
-            cum_probs[:, k + 1] = self.cumulative_probability(theta, item_idx, k)
-        cum_probs[:, n_cat] = 0.0
-
-        info = np.zeros(n_persons)
-        for k in range(n_cat):
-            p_k = probs[:, k]
-            p_star_k = cum_probs[:, k]
-            p_star_k1 = cum_probs[:, k + 1]
-
-            dp_k = a_val * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
-            info += np.divide(
-                dp_k**2,
-                p_k,
-                out=np.zeros_like(dp_k),
-                where=p_k > PROB_EPSILON,
-            )
-
-        return info
+        probabilities = self._category_probabilities(theta, item_idx)
+        return _graded_information(probabilities, a_val)
 
     def log_likelihood_batch(
         self,
@@ -677,29 +683,9 @@ class GradedRatingScaleModel(PolytomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]:
-        n_persons = theta.shape[0]
-        n_cat = self._n_cats
-
-        a = self._parameters["discrimination"][0]
-        probs = self.probability(theta, item_idx)
-
-        cum_probs = np.zeros((n_persons, n_cat + 1))
-        cum_probs[:, 0] = 1.0
-        for k in range(n_cat - 1):
-            cum_probs[:, k + 1] = self.cumulative_probability(theta, item_idx, k)
-        cum_probs[:, n_cat] = 0.0
-
-        info = np.zeros(n_persons)
-        for k in range(n_cat):
-            p_k = probs[:, k]
-            p_star_k = cum_probs[:, k]
-            p_star_k1 = cum_probs[:, k + 1]
-
-            dp_k = a * (p_star_k * (1 - p_star_k) - p_star_k1 * (1 - p_star_k1))
-
-            info += np.where(p_k > PROB_EPSILON, (dp_k**2) / p_k, 0.0)
-
-        return info
+        discrimination = float(self._parameters["discrimination"][0])
+        probabilities = self._category_probabilities(theta, item_idx)
+        return _graded_information(probabilities, discrimination)
 
     def set_parameters(
         self,
