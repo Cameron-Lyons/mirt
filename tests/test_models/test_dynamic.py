@@ -400,6 +400,60 @@ class TestStateSpaceIRT:
 
         return forecast_means, forecast_variances
 
+    @staticmethod
+    def _reference_predictive_log_scores(model, responses, n_quadpts=101):
+        filtered_means, filtered_variances = TestStateSpaceIRT._reference_filter(
+            model, responses
+        )
+        predicted_means = np.empty(model.n_timepoints)
+        predicted_variances = np.empty(model.n_timepoints)
+        predicted_means[0] = model.initial_mean
+        predicted_variances[0] = model.initial_var
+        transition = model.transition_matrix[0, 0]
+        process_variance = model.process_noise[0, 0]
+        predicted_means[1:] = transition * filtered_means[:-1]
+        predicted_variances[1:] = (
+            transition**2 * filtered_variances[:-1] + process_variance
+        )
+        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+        nodes = nodes * np.sqrt(2.0)
+        weights = weights / np.sqrt(np.pi)
+        scores = np.zeros(model.n_timepoints)
+
+        for time_index in range(model.n_timepoints):
+            observed = responses[time_index] >= 0
+            if not np.any(observed):
+                continue
+            log_integrand = np.empty(n_quadpts)
+            for point_index, (node, weight) in enumerate(
+                zip(nodes, weights, strict=True)
+            ):
+                theta = (
+                    predicted_means[time_index]
+                    + np.sqrt(predicted_variances[time_index]) * node
+                )
+                logits = model.discrimination * (theta - model.difficulty)
+                base_probability = 1.0 / (1.0 + np.exp(-logits))
+                probability = (
+                    model.guessing + (1.0 - model.guessing) * base_probability
+                    if model.base_model == "3PL"
+                    else base_probability
+                )
+                probability = np.clip(probability, 1e-10, 1.0 - 1e-10)
+                log_integrand[point_index] = np.log(weight) + np.sum(
+                    np.where(
+                        responses[time_index, observed] == 1,
+                        np.log(probability[observed]),
+                        np.log1p(-probability[observed]),
+                    )
+                )
+            maximum = np.max(log_integrand)
+            scores[time_index] = maximum + np.log(
+                np.sum(np.exp(log_integrand - maximum))
+            )
+
+        return scores
+
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         assert model.n_items == 5
@@ -738,6 +792,135 @@ class TestStateSpaceIRT:
                 responses,
                 2,
                 n_quadpts=n_quadpts,
+            )
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    @pytest.mark.parametrize("transition", [0.85, -0.6])
+    def test_predictive_scores_match_high_resolution_scalar_reference(
+        self,
+        base_model,
+        transition,
+    ):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model=base_model,
+            transition_matrix=np.array([[transition]]),
+            process_noise=np.array([[0.08]]),
+            observation_noise=0.1,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+            initial_mean=-0.2,
+            initial_var=0.8,
+        )
+        responses = np.random.default_rng(71).integers(0, 2, size=(7, 5, 6))
+        responses[np.random.default_rng(72).random(responses.shape) < 0.2] = -1
+        expected = np.vstack(
+            [
+                self._reference_predictive_log_scores(model, person_responses)
+                for person_responses in responses
+            ]
+        )
+
+        pointwise = model.predictive_log_likelihood_batch(
+            responses,
+            n_quadpts=31,
+            pointwise=True,
+        )
+        totals = model.predictive_log_likelihood_batch(responses, n_quadpts=31)
+
+        assert_allclose(pointwise, expected, rtol=5e-9, atol=2e-8)
+        assert_allclose(totals, np.sum(pointwise, axis=1))
+        single_pointwise = model.predictive_log_likelihood(
+            responses[0],
+            n_quadpts=31,
+            pointwise=True,
+        )
+        single_total = model.predictive_log_likelihood(responses[0], n_quadpts=31)
+        assert_allclose(single_pointwise, pointwise[0])
+        assert single_total == pytest.approx(totals[0])
+
+    def test_predictive_scores_treat_fully_missing_occasions_as_zero(self):
+        model = StateSpaceIRT(n_items=4, n_timepoints=3)
+        responses = np.full((5, 3, 4), -1, dtype=np.int32)
+
+        pointwise = model.predictive_log_likelihood_batch(
+            responses,
+            pointwise=True,
+        )
+        totals = model.predictive_log_likelihood_batch(responses)
+
+        assert_allclose(pointwise, 0.0)
+        assert_allclose(totals, 0.0)
+
+    def test_predictive_scores_remain_finite_for_extreme_items(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=3,
+            discrimination=np.array([50.0, 100.0, 150.0, 200.0]),
+            difficulty=np.array([-100.0, -50.0, 50.0, 100.0]),
+        )
+        responses = np.array(
+            [
+                [[0, 1, 0, 1], [1, 0, 1, 0], [0, 0, 1, 1]],
+                [[1, 0, 1, 0], [0, 1, 0, 1], [1, 1, 0, 0]],
+            ],
+            dtype=np.int32,
+        )
+
+        scores = model.predictive_log_likelihood_batch(
+            responses,
+            pointwise=True,
+        )
+
+        assert np.all(np.isfinite(scores))
+        assert np.all(scores <= 0.0)
+
+    def test_predictive_scores_favor_generating_configuration(self):
+        true_model = StateSpaceIRT(
+            n_items=12,
+            n_timepoints=8,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.1]]),
+            discrimination=np.linspace(0.7, 1.8, 12),
+            difficulty=np.linspace(-1.5, 1.5, 12),
+        )
+        wrong_model = StateSpaceIRT(
+            n_items=12,
+            n_timepoints=8,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.1]]),
+            discrimination=np.linspace(0.7, 1.8, 12),
+            difficulty=np.linspace(-1.5, 1.5, 12) + 3.0,
+        )
+        responses, _ = true_model.simulate(500, seed=81)
+
+        true_scores = true_model.predictive_log_likelihood_batch(responses)
+        wrong_scores = wrong_model.predictive_log_likelihood_batch(responses)
+
+        assert np.mean(true_scores) > np.mean(wrong_scores) + 5.0
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    def test_predictive_scores_require_positive_quadrature_count(self, n_quadpts):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            model.predictive_log_likelihood_batch(
+                responses,
+                n_quadpts=n_quadpts,
+            )
+
+    @pytest.mark.parametrize("pointwise", [0, 1, "yes", None])
+    def test_predictive_scores_require_boolean_pointwise(self, pointwise):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="pointwise"):
+            model.predictive_log_likelihood_batch(
+                responses,
+                pointwise=pointwise,
             )
 
     def test_3pl_observation_derivative_matches_finite_difference(self):

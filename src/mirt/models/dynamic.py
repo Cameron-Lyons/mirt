@@ -1967,6 +1967,125 @@ class StateSpaceIRT:
         )
         return np.clip(probabilities, 0.0, 1.0)
 
+    def predictive_log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+        pointwise: bool = False,
+    ) -> float | NDArray[np.float64]:
+        """Return the prequential log score for one response history.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_timepoints, n_items)``.
+            Use ``-1`` for missing item responses.
+        n_quadpts : int, default=21
+            Number of quadrature points used at each occasion.
+        pointwise : bool, default=False
+            Return one score per occasion instead of their sum.
+
+        Returns
+        -------
+        float or NDArray
+            Total predictive log likelihood, or an array with shape
+            ``(n_timepoints,)`` when ``pointwise=True``.
+        """
+        if not isinstance(pointwise, (bool, np.bool_)):
+            raise ValueError("pointwise must be boolean")
+        response_values = self._validated_filter_responses(responses, batch=False)
+        scores = self.predictive_log_likelihood_batch(
+            response_values[None, :, :],
+            n_quadpts=n_quadpts,
+            pointwise=True,
+        )[0]
+        if pointwise:
+            return scores.copy()
+        return float(np.sum(scores))
+
+    def predictive_log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+        pointwise: bool = False,
+    ) -> NDArray[np.float64]:
+        """Return prequential log scores for multiple response histories.
+
+        At each occasion, the joint observed item pattern is integrated over
+        the Gaussian state prediction from earlier occasions. Fully missing
+        occasions contribute zero. The filtering distribution is an extended
+        Kalman approximation.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+        n_quadpts : int, default=21
+            Number of quadrature points used at each occasion.
+        pointwise : bool, default=False
+            Return one score per person and occasion instead of per-person
+            totals.
+
+        Returns
+        -------
+        NDArray
+            Per-person totals with shape ``(n_persons,)``, or pointwise scores
+            with shape ``(n_persons, n_timepoints)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        if not isinstance(pointwise, (bool, np.bool_)):
+            raise ValueError("pointwise must be boolean")
+        response_values = self._validated_filter_responses(responses, batch=True)
+        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+            response_values
+        )
+        predicted_means = np.empty_like(filtered_means)
+        predicted_variances = np.empty_like(filtered_variances)
+        predicted_means[:, 0] = self.initial_mean
+        predicted_variances[:, 0] = self.initial_var
+        transition = float(self.transition_matrix[0, 0])
+        transition_squared = transition**2
+        process_variance = float(self.process_noise[0, 0])
+        predicted_means[:, 1:] = transition * filtered_means[:, :-1]
+        predicted_variances[:, 1:] = (
+            transition_squared * filtered_variances[:, :-1] + process_variance
+        )
+
+        observed = response_values >= 0
+        correct = response_values == 1
+        incorrect = response_values == 0
+        nodes, weights = standard_normal_quadrature(n_quadpts)
+        flat_means = predicted_means.ravel()
+        flat_scales = np.sqrt(predicted_variances).ravel()
+        pointwise_scores = np.full(predicted_means.shape, -np.inf, dtype=np.float64)
+
+        for node, weight in zip(nodes, weights, strict=True):
+            states = flat_means + flat_scales * node
+            probabilities = self._observation_probability(states).reshape(
+                response_values.shape
+            )
+            conditional_score = np.sum(
+                np.where(
+                    correct,
+                    np.log(probabilities),
+                    np.where(incorrect, np.log1p(-probabilities), 0.0),
+                ),
+                axis=2,
+            )
+            pointwise_scores = np.logaddexp(
+                pointwise_scores,
+                np.log(weight) + conditional_score,
+            )
+
+        pointwise_scores[~np.any(observed, axis=2)] = 0.0
+        if pointwise:
+            return pointwise_scores
+        return np.sum(pointwise_scores, axis=1)
+
     def simulate(
         self,
         n_persons: int,

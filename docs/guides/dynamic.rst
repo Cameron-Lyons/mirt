@@ -110,6 +110,12 @@ model. The batch filter updates every learner in one vectorized call:
    )
    print(future_success.shape)  # (500, 4, 20)
 
+   predictive_by_time = state_model.predictive_log_likelihood_batch(
+       responses,
+       pointwise=True,
+   )
+   predictive_total = predictive_by_time.sum(axis=1)
+
 Filtering conditions each state on responses available through that occasion,
 which supports online tracking. Smoothing adds a vectorized
 Rauch--Tung--Striebel backward pass so every state uses the complete response
@@ -122,6 +128,13 @@ or 3PL response curve over each Gaussian forecast distribution rather than
 evaluating it only at the mean. The default 21-point quadrature can be adjusted
 with ``n_quadpts``. Use ``forecast`` and
 ``forecast_response_probabilities`` for one response history.
+
+Predictive log likelihoods score each observed item pattern against the state
+distribution implied by earlier occasions. Items at the same occasion are
+integrated jointly over their shared state, and the pointwise form supports
+occasion-level diagnostics. Fully missing occasions contribute zero. These
+scores use the extended Kalman approximation and are useful for comparing
+state-space configurations on the same histories.
 
 State estimation and forecasting accept only ``1`` (correct), ``0``
 (incorrect), and ``-1`` (missing); a fully missing occasion propagates the
