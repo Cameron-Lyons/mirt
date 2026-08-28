@@ -45,6 +45,7 @@ def test_predictive_diagnostics_match_forward_and_online_recursions(
     alpha, scaling = model.forward(responses, skills)
     _, expected_log_likelihood = model.forward_backward(responses, skills)
     retained_priors = model.p_init.copy()
+    latest_mastery = model.p_init.copy()
 
     result = model.predictive_diagnostics(responses, skills)
 
@@ -79,7 +80,11 @@ def test_predictive_diagnostics_match_forward_and_online_recursions(
             )
         assert result.updated_mastery[trial] == pytest.approx(expected.updated_mastery)
         assert result.next_mastery[trial] == pytest.approx(expected.next_mastery)
+        latest_mastery[skill_idx] = expected.updated_mastery
         retained_priors[skill_idx] = expected.next_mastery
+
+    assert_allclose(result.latest_mastery_by_skill, latest_mastery)
+    assert_allclose(result.next_mastery_priors, retained_priors)
 
     with pytest.raises(FrozenInstanceError):
         result.predicted_mastery = np.empty(0)
@@ -144,6 +149,14 @@ def test_batch_diagnostics_match_individual_histories(
                 getattr(expected, field_name),
                 equal_nan=True,
             )
+        assert_allclose(
+            result.latest_mastery_by_skill[person_idx],
+            expected.latest_mastery_by_skill,
+        )
+        assert_allclose(
+            result.next_mastery_priors[person_idx],
+            expected.next_mastery_priors,
+        )
 
 
 def test_predictive_diagnostics_treat_missing_trials_consistently(

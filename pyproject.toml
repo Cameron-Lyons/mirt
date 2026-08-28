@@ -81,6 +81,9 @@ markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "performance: marks performance regression smoke tests",
 ]
+filterwarnings = [
+    "error::pytest.PytestDeprecationWarning",
+]
 
 [tool.coverage.report]
 fail_under = 59
