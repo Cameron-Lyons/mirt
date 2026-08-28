@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from mirt.constants import PROB_EPSILON
 from mirt.models.nonparametric import (
     KernelSmoothingModel,
     MonotonicPolynomialModel,
@@ -12,6 +13,14 @@ from mirt.models.nonparametric import (
 
 def _assert_nondecreasing(values, tolerance=1e-12):
     assert np.all(np.diff(values, axis=0) >= -tolerance)
+
+
+def _finite_difference_information(model, theta, h=1e-6):
+    probability = model.probability(theta)
+    derivative = (model.probability(theta + h) - model.probability(theta - h)) / (
+        2.0 * h
+    )
+    return derivative**2 / (probability * (1.0 - probability) + PROB_EPSILON)
 
 
 class TestMonotonicSplineModel:
@@ -92,6 +101,39 @@ class TestMonotonicSplineModel:
         assert np.all(np.isfinite(information))
         assert np.all(information >= 0)
         np.testing.assert_allclose(information[:, 1], model.information(theta, 1))
+
+    def test_information_matches_exact_spline_derivative(self, monkeypatch):
+        model = MonotonicSplineModel(n_items=3, n_knots=3, degree=3)
+        model.set_parameters(
+            log_weights=np.array(
+                [
+                    [2.0, -1.0, 0.0, 1.0, -2.0, 3.0, -1.0],
+                    [-2.0, 1.0, 3.0, -1.0, 0.0, 2.0, -3.0],
+                    [0.0, 1.0, -1.0, 2.0, -2.0, 3.0, -3.0],
+                ]
+            ),
+            lower=np.array([0.05, 0.1, 0.2]),
+            upper=np.array([0.9, 0.95, 0.8]),
+        )
+        theta = np.array([-3.6, -2.2, -0.3, 0.8, 2.2, 3.6])
+
+        expected = _finite_difference_information(model, theta)
+        monkeypatch.setattr(
+            model,
+            "probability",
+            lambda *args, **kwargs: pytest.fail("information recomputed probability"),
+        )
+
+        np.testing.assert_allclose(
+            model.information(theta),
+            expected,
+            rtol=2e-7,
+            atol=5e-10,
+        )
+        np.testing.assert_array_equal(
+            model.information(np.array([-5.0, 5.0])),
+            np.zeros((2, model.n_items)),
+        )
 
     def test_log_likelihood_supports_missing_responses(self):
         model = MonotonicSplineModel(n_items=2, n_knots=2, degree=2)
@@ -285,6 +327,33 @@ class TestMonotonicPolynomialModel:
         assert np.all(np.isfinite(information))
         assert np.all(information >= 0)
         np.testing.assert_allclose(information[:, 0], model.information(theta, 0))
+
+    @pytest.mark.parametrize("degree", [5, 40])
+    def test_information_matches_exact_bernstein_derivative(self, degree, monkeypatch):
+        rng = np.random.default_rng(17)
+        model = MonotonicPolynomialModel(n_items=3, degree=degree)
+        model.set_parameters(
+            log_coefficients=rng.normal(size=(3, degree + 1)),
+            location=np.array([-0.5, 0.2, 1.0]),
+            scale=np.array([0.7, 1.5, 3.0]),
+            lower=np.array([0.05, 0.1, 0.2]),
+            upper=np.array([0.9, 0.95, 0.8]),
+        )
+        theta = np.array([-3.6, -2.2, -0.3, 0.8, 2.2, 3.6])
+
+        expected = _finite_difference_information(model, theta)
+        monkeypatch.setattr(
+            model,
+            "probability",
+            lambda *args, **kwargs: pytest.fail("information recomputed probability"),
+        )
+
+        np.testing.assert_allclose(
+            model.information(theta),
+            expected,
+            rtol=3e-6,
+            atol=1e-9,
+        )
 
     def test_log_likelihood_matches_manual_calculation(self):
         model = MonotonicPolynomialModel(n_items=2, degree=3)
@@ -527,6 +596,28 @@ class TestKernelSmoothingModel:
         assert np.all(np.isfinite(information))
         assert np.all(information >= 0)
         np.testing.assert_allclose(information[:, 1], model.information(theta, 1))
+
+    def test_information_matches_piecewise_linear_slope(self, monkeypatch):
+        model = self._fitted_model()
+        theta = np.array([-1.75, -0.75, 0.25, 1.25])
+
+        expected = _finite_difference_information(model, theta)
+        monkeypatch.setattr(
+            model,
+            "probability",
+            lambda *args, **kwargs: pytest.fail("information recomputed probability"),
+        )
+
+        np.testing.assert_allclose(
+            model.information(theta),
+            expected,
+            rtol=2e-7,
+            atol=5e-10,
+        )
+        np.testing.assert_array_equal(
+            model.information(np.array([-3.0, 3.0])),
+            np.zeros((2, model.n_items)),
+        )
 
     def test_log_likelihood_uses_calibrated_irfs(self):
         model = self._fitted_model()

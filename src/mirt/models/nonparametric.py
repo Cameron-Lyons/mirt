@@ -176,6 +176,14 @@ def _stable_gaussian_weights(
     return np.exp(-penalty)
 
 
+def _fisher_information(
+    probability: NDArray[np.float64],
+    derivative: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return dichotomous Fisher information from an exact curve derivative."""
+    return np.square(derivative) / (probability * (1.0 - probability) + PROB_EPSILON)
+
+
 class MonotonicSplineModel(DichotomousItemModel):
     """Monotone item response curves represented by I-spline bases.
 
@@ -201,6 +209,7 @@ class MonotonicSplineModel(DichotomousItemModel):
         self.degree = _positive_integer(degree, "degree")
         self._n_basis = self.n_knots + self.degree + 1
         self._knots = np.empty(0, dtype=np.float64)
+        self._mspline_basis: BSpline
         self._ispline_antiderivative: BSpline
         self._ispline_origin = np.empty(0, dtype=np.float64)
         self._ispline_scale = np.empty(0, dtype=np.float64)
@@ -219,13 +228,13 @@ class MonotonicSplineModel(DichotomousItemModel):
                 np.full(self.degree + 1, 4.0),
             ]
         )
-        basis_spline = BSpline(
+        self._mspline_basis = BSpline(
             knot_vector,
             np.eye(self._n_basis),
             self.degree,
             extrapolate=False,
         )
-        self._ispline_antiderivative = basis_spline.antiderivative()
+        self._ispline_antiderivative = self._mspline_basis.antiderivative()
         self._ispline_origin = np.asarray(
             self._ispline_antiderivative(-4.0), dtype=np.float64
         )
@@ -275,6 +284,20 @@ class MonotonicSplineModel(DichotomousItemModel):
         basis = integrated / self._ispline_scale
         return np.clip(basis, 0.0, 1.0)
 
+    def _basis_derivative_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate exact derivatives of the normalized I-spline bases."""
+        theta_vector = np.asarray(theta, dtype=np.float64).ravel()
+        clipped_theta = np.clip(theta_vector, -4.0, 4.0)
+        derivative = (
+            np.asarray(self._mspline_basis(clipped_theta)) / self._ispline_scale
+        )
+        outside = (theta_vector < -4.0) | (theta_vector > 4.0)
+        derivative[outside] = 0.0
+        return derivative
+
     def _ispline_basis(
         self,
         theta: NDArray[np.float64],
@@ -309,14 +332,27 @@ class MonotonicSplineModel(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta_array = self._ensure_theta_2d(theta)
-        p = self.probability(theta_array, item_idx)
-        h = 1e-5
-        derivative = (
-            self.probability(theta_array + h, item_idx)
-            - self.probability(theta_array - h, item_idx)
-        ) / (2 * h)
-        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
+        theta_vector = _theta_vector(self, theta)
+        basis = self._basis_matrix(theta_vector)
+        basis_derivative = self._basis_derivative_matrix(theta_vector)
+        weights = self.weights
+        normalized_weights = weights / np.sum(weights, axis=1, keepdims=True)
+        lower = self._parameters["lower"]
+        upper = self._parameters["upper"]
+
+        if item_idx is not None:
+            item_idx = _item_index(item_idx, self.n_items)
+            scale = upper[item_idx] - lower[item_idx]
+            probability = lower[item_idx] + scale * (
+                basis @ normalized_weights[item_idx]
+            )
+            derivative = scale * (basis_derivative @ normalized_weights[item_idx])
+            return _fisher_information(probability, derivative)
+
+        scales = upper - lower
+        probability = lower + scales * (basis @ normalized_weights.T)
+        derivative = scales * (basis_derivative @ normalized_weights.T)
+        return _fisher_information(probability, derivative)
 
     def copy(self) -> Self:
         new_model = MonotonicSplineModel(
@@ -430,13 +466,21 @@ class MonotonicPolynomialModel(DichotomousItemModel):
     def _basis_matrix(
         self, transformed_theta: NDArray[np.float64]
     ) -> NDArray[np.float64]:
+        return self._basis_matrix_for_degree(transformed_theta, self.degree)
+
+    @staticmethod
+    def _basis_matrix_for_degree(
+        transformed_theta: NDArray[np.float64],
+        degree: int,
+    ) -> NDArray[np.float64]:
+        """Evaluate a complete Bernstein basis of the requested degree."""
         t = np.clip(np.asarray(transformed_theta, dtype=np.float64), 0.0, 1.0)
-        orders = np.arange(self.degree + 1)
-        binomial = comb(self.degree, orders)
+        orders = np.arange(degree + 1)
+        binomial = comb(degree, orders)
         return (
             binomial
             * (t[..., None] ** orders)
-            * ((1.0 - t[..., None]) ** (self.degree - orders))
+            * ((1.0 - t[..., None]) ** (degree - orders))
         )
 
     def _evaluate_bernstein(
@@ -471,6 +515,45 @@ class MonotonicPolynomialModel(DichotomousItemModel):
             result += power_coefficients[:, power]
         return np.clip(result, coefficients[:, 0], coefficients[:, -1])
 
+    def _evaluate_bernstein_derivative(
+        self,
+        transformed_theta: NDArray[np.float64],
+        coefficients: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate the exact derivative of Bernstein curves with respect to t."""
+        t = np.asarray(transformed_theta, dtype=np.float64)
+        if self.degree > _POWER_BASIS_MAX_DEGREE:
+            derivative_coefficients = self.degree * np.diff(coefficients, axis=-1)
+            if coefficients.ndim == 1:
+                return (
+                    self._basis_matrix_for_degree(t, self.degree - 1)
+                    @ derivative_coefficients
+                )
+            result = np.empty_like(t)
+            for item_idx in range(self.n_items):
+                result[:, item_idx] = (
+                    self._basis_matrix_for_degree(t[:, item_idx], self.degree - 1)
+                    @ derivative_coefficients[item_idx]
+                )
+            return result
+
+        orders = np.arange(1, self.degree + 1, dtype=np.float64)
+        if coefficients.ndim == 1:
+            power_coefficients = self._bernstein_to_power @ coefficients
+            derivative_coefficients = orders * power_coefficients[1:]
+            result = np.full_like(t, derivative_coefficients[-1])
+            for power in range(self.degree - 2, -1, -1):
+                result = result * t + derivative_coefficients[power]
+            return np.maximum(result, 0.0)
+
+        power_coefficients = coefficients @ self._bernstein_to_power.T
+        derivative_coefficients = power_coefficients[:, 1:] * orders
+        result = np.broadcast_to(derivative_coefficients[:, -1], t.shape).copy()
+        for power in range(self.degree - 2, -1, -1):
+            result *= t
+            result += derivative_coefficients[:, power]
+        return np.maximum(result, 0.0)
+
     def probability(
         self,
         theta: NDArray[np.float64],
@@ -500,14 +583,48 @@ class MonotonicPolynomialModel(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta_array = self._ensure_theta_2d(theta)
-        p = self.probability(theta_array, item_idx)
-        h = 1e-5
+        theta_vector = _theta_vector(self, theta)
+        location = self._parameters["location"]
+        scale = self._parameters["scale"]
+        lower = self._parameters["lower"]
+        upper = self._parameters["upper"]
+        coefficients = self.coefficients
+
+        if item_idx is not None:
+            item_idx = _item_index(item_idx, self.n_items)
+            transformed = expit(scale[item_idx] * (theta_vector - location[item_idx]))
+            curve = self._evaluate_bernstein(transformed, coefficients[item_idx])
+            curve_derivative = self._evaluate_bernstein_derivative(
+                transformed, coefficients[item_idx]
+            )
+            response_scale = upper[item_idx] - lower[item_idx]
+            probability = lower[item_idx] + response_scale * curve
+            derivative = (
+                response_scale
+                * curve_derivative
+                * scale[item_idx]
+                * transformed
+                * (1.0 - transformed)
+            )
+            return _fisher_information(probability, derivative)
+
+        transformed = expit(
+            scale[None, :] * (theta_vector[:, None] - location[None, :])
+        )
+        curves = self._evaluate_bernstein(transformed, coefficients)
+        curve_derivatives = self._evaluate_bernstein_derivative(
+            transformed, coefficients
+        )
+        response_scales = upper - lower
+        probability = lower + response_scales * curves
         derivative = (
-            self.probability(theta_array + h, item_idx)
-            - self.probability(theta_array - h, item_idx)
-        ) / (2 * h)
-        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
+            response_scales
+            * curve_derivatives
+            * scale
+            * transformed
+            * (1.0 - transformed)
+        )
+        return _fisher_information(probability, derivative)
 
     def copy(self) -> Self:
         new_model = MonotonicPolynomialModel(
@@ -669,13 +786,7 @@ class KernelSmoothingModel(DichotomousItemModel):
         if not self._is_fitted:
             raise ValueError("Model must be calibrated before computing probabilities")
         theta_vector = _theta_vector(self, theta)
-        clipped_theta = np.clip(theta_vector, self._theta_grid[0], self._theta_grid[-1])
-        left = np.searchsorted(self._theta_grid, clipped_theta, side="right") - 1
-        left = np.clip(left, 0, self._theta_grid.size - 2)
-        right = left + 1
-        fraction = (clipped_theta - self._theta_grid[left]) / (
-            self._theta_grid[right] - self._theta_grid[left]
-        )
+        left, right, fraction, _ = self._interpolation_components(theta_vector)
 
         if item_idx is not None:
             item_idx = _item_index(item_idx, self.n_items)
@@ -687,19 +798,54 @@ class KernelSmoothingModel(DichotomousItemModel):
         upper_values = self._irf_values[:, right].T
         return lower_values + fraction[:, None] * (upper_values - lower_values)
 
+    def _interpolation_components(
+        self,
+        theta_vector: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.intp],
+        NDArray[np.intp],
+        NDArray[np.float64],
+        NDArray[np.bool_],
+    ]:
+        """Resolve piecewise-linear interpolation positions and active slopes."""
+        clipped_theta = np.clip(theta_vector, self._theta_grid[0], self._theta_grid[-1])
+        left = np.searchsorted(self._theta_grid, clipped_theta, side="right") - 1
+        left = np.clip(left, 0, self._theta_grid.size - 2)
+        right = left + 1
+        fraction = (clipped_theta - self._theta_grid[left]) / (
+            self._theta_grid[right] - self._theta_grid[left]
+        )
+        active = (theta_vector >= self._theta_grid[0]) & (
+            theta_vector <= self._theta_grid[-1]
+        )
+        return left, right, fraction, active
+
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta_array = self._ensure_theta_2d(theta)
-        p = self.probability(theta_array, item_idx)
-        h = 0.01
-        derivative = (
-            self.probability(theta_array + h, item_idx)
-            - self.probability(theta_array - h, item_idx)
-        ) / (2 * h)
-        return (derivative**2) / (p * (1.0 - p) + PROB_EPSILON)
+        if not self._is_fitted:
+            raise ValueError("Model must be calibrated before computing information")
+        theta_vector = _theta_vector(self, theta)
+        left, right, fraction, active = self._interpolation_components(theta_vector)
+        interval_width = self._theta_grid[right] - self._theta_grid[left]
+
+        if item_idx is not None:
+            item_idx = _item_index(item_idx, self.n_items)
+            lower_values = self._irf_values[item_idx, left]
+            value_difference = self._irf_values[item_idx, right] - lower_values
+            probability = lower_values + fraction * value_difference
+            derivative = np.divide(value_difference, interval_width)
+            derivative[~active] = 0.0
+            return _fisher_information(probability, derivative)
+
+        lower_values = self._irf_values[:, left].T
+        value_difference = self._irf_values[:, right].T - lower_values
+        probability = lower_values + fraction[:, None] * value_difference
+        derivative = value_difference / interval_width[:, None]
+        derivative[~active] = 0.0
+        return _fisher_information(probability, derivative)
 
     def copy(self) -> Self:
         new_model = KernelSmoothingModel(
