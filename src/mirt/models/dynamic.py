@@ -127,6 +127,35 @@ class _GrowthObservationPattern:
     covariance: _GrowthCovariance
 
 
+@dataclass(frozen=True, slots=True)
+class BKTStepResult:
+    """Prediction and mastery update from one skill opportunity."""
+
+    response_probability: float
+    response_log_likelihood: float
+    residual: float
+    standardized_residual: float
+    updated_mastery: float
+    next_mastery: float
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchStepResult:
+    """Vectorized predictions and mastery updates for one opportunity."""
+
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
+    updated_mastery: NDArray[np.float64]
+    next_mastery: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.updated_mastery.size)
+
+
 @dataclass
 class BKTModel:
     """Bayesian Knowledge Tracing model.
@@ -281,6 +310,178 @@ class BKTModel:
         return (
             responses.astype(np.int32, copy=False),
             skill_assignments.astype(np.int32, copy=False),
+        )
+
+    def _validate_online_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: int | NDArray[np.int_],
+        prior_mastery: float | NDArray[np.float64] | None,
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_], NDArray[np.float64]]:
+        """Validate one opportunity for multiple learners."""
+        response_values = np.asarray(responses)
+        if response_values.ndim != 1 or response_values.size < 1:
+            raise ValueError("responses must have shape (n_persons,)")
+        if not np.issubdtype(response_values.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if not np.all(np.isin(response_values, (-1, 0, 1))):
+            raise ValueError("responses must contain only -1, 0, or 1")
+
+        raw_skills = np.asarray(skill_assignments)
+        if not np.issubdtype(raw_skills.dtype, np.integer):
+            raise ValueError("skill_assignments must contain integer values")
+        if raw_skills.ndim == 0:
+            skill_values = np.full(
+                response_values.size,
+                raw_skills.item(),
+                dtype=np.int32,
+            )
+        elif raw_skills.shape == response_values.shape:
+            skill_values = raw_skills.astype(np.int32, copy=False)
+        else:
+            raise ValueError("skill_assignments must be scalar or match responses")
+        if np.any((skill_values < 0) | (skill_values >= self.n_skills)):
+            raise ValueError(f"skill_assignments must be in [0, {self.n_skills})")
+
+        if prior_mastery is None:
+            mastery_values = self.p_init[skill_values].copy()
+        else:
+            raw_mastery = np.asarray(prior_mastery)
+            if (
+                np.issubdtype(raw_mastery.dtype, np.bool_)
+                or np.issubdtype(raw_mastery.dtype, np.complexfloating)
+                or not np.issubdtype(raw_mastery.dtype, np.number)
+            ):
+                raise ValueError("prior_mastery must contain values in [0, 1]")
+            if raw_mastery.ndim == 0:
+                mastery_values = np.full(
+                    response_values.size,
+                    raw_mastery.item(),
+                    dtype=np.float64,
+                )
+            elif raw_mastery.shape == response_values.shape:
+                mastery_values = raw_mastery.astype(np.float64, copy=True)
+            else:
+                raise ValueError("prior_mastery must be scalar or match responses")
+            if not np.all(np.isfinite(mastery_values)) or np.any(
+                (mastery_values < 0.0) | (mastery_values > 1.0)
+            ):
+                raise ValueError("prior_mastery must contain values in [0, 1]")
+
+        return (
+            response_values.astype(np.int32, copy=False),
+            skill_values,
+            mastery_values,
+        )
+
+    def _online_step_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        prior_mastery: NDArray[np.float64],
+    ) -> BKTBatchStepResult:
+        """Process validated one-opportunity inputs in one vectorized pass."""
+        slip = self.p_slip[skill_assignments]
+        guess = self.p_guess[skill_assignments]
+        response_probabilities = (
+            prior_mastery * (1.0 - slip) + (1.0 - prior_mastery) * guess
+        )
+        observed = responses >= 0
+        correct = responses == 1
+        response_likelihoods = np.where(
+            correct,
+            response_probabilities,
+            np.where(observed, 1.0 - response_probabilities, 1.0),
+        )
+        response_log_likelihoods = np.where(
+            observed,
+            np.log(np.maximum(response_likelihoods, 1e-300)),
+            0.0,
+        )
+        learned_likelihoods = np.where(
+            correct,
+            1.0 - slip,
+            np.where(observed, slip, 1.0),
+        )
+        updated_mastery = np.divide(
+            prior_mastery * learned_likelihoods,
+            response_likelihoods,
+            out=np.zeros_like(prior_mastery),
+            where=response_likelihoods > 0.0,
+        )
+        updated_mastery = np.where(observed, updated_mastery, prior_mastery)
+        residuals = np.where(
+            observed,
+            responses - response_probabilities,
+            np.nan,
+        )
+        response_variances = np.maximum(
+            response_probabilities * (1.0 - response_probabilities),
+            PROB_EPSILON,
+        )
+        standardized_residuals = residuals / np.sqrt(response_variances)
+        learn = self.p_learn[skill_assignments]
+        forget = self.p_forget[skill_assignments]
+        next_mastery = (
+            updated_mastery * (1.0 - forget) + (1.0 - updated_mastery) * learn
+        )
+        return BKTBatchStepResult(
+            response_probabilities=response_probabilities,
+            response_log_likelihoods=response_log_likelihoods,
+            residuals=residuals,
+            standardized_residuals=standardized_residuals,
+            updated_mastery=updated_mastery,
+            next_mastery=next_mastery,
+        )
+
+    def online_step(
+        self,
+        response: int,
+        skill_idx: int,
+        *,
+        prior_mastery: float | None = None,
+    ) -> BKTStepResult:
+        """Predict and update mastery for one learner and skill opportunity.
+
+        Omitted prior mastery uses the modeled skill's initial probability.
+        The returned next mastery is ready for that skill's next opportunity.
+        """
+        result = self.online_step_batch(
+            np.asarray([response]),
+            skill_idx,
+            prior_mastery=prior_mastery,
+        )
+        return BKTStepResult(
+            response_probability=float(result.response_probabilities[0]),
+            response_log_likelihood=float(result.response_log_likelihoods[0]),
+            residual=float(result.residuals[0]),
+            standardized_residual=float(result.standardized_residuals[0]),
+            updated_mastery=float(result.updated_mastery[0]),
+            next_mastery=float(result.next_mastery[0]),
+        )
+
+    def online_step_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: int | NDArray[np.int_],
+        *,
+        prior_mastery: float | NDArray[np.float64] | None = None,
+    ) -> BKTBatchStepResult:
+        """Predict and update one skill opportunity for multiple learners.
+
+        Skill assignments and prior mastery may be shared scalars or one value
+        per learner. Omitted mastery uses each assigned skill's initial
+        probability.
+        """
+        response_values, skill_values, mastery_values = self._validate_online_batch(
+            responses,
+            skill_assignments,
+            prior_mastery,
+        )
+        return self._online_step_batch(
+            response_values,
+            skill_values,
+            mastery_values,
         )
 
     def _can_use_native_inference(self) -> bool:

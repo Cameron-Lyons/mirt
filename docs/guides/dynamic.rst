@@ -27,6 +27,36 @@ Responses use ``1`` for correct, ``0`` for incorrect, and ``-1`` for missing.
 A missing response contributes no response evidence while preserving the trial's
 place in its skill sequence.
 
+Online updates
+--------------
+
+For a live trial stream, retain one next-opportunity prior per skill instead of
+replaying the complete history:
+
+.. code-block:: python
+
+   mastery_priors = model.p_init.copy()
+   latest_mastery = model.p_init.copy()
+
+   for response, skill_idx in zip(responses, skills):
+       step = model.online_step(
+           int(response),
+           int(skill_idx),
+           prior_mastery=mastery_priors[skill_idx],
+       )
+       predicted_success = step.response_probability
+       response_log_score = step.response_log_likelihood
+       predictive_residual = step.standardized_residual
+       latest_mastery[skill_idx] = step.updated_mastery
+       mastery_priors[skill_idx] = step.next_mastery
+
+``online_step`` applies response evidence and prepares the assigned skill for
+its next opportunity in constant history space. ``online_step_batch`` performs
+the same update for many learners; skill assignments and prior mastery may be
+shared scalars or one value per learner. Missing responses have zero log score
+and ``numpy.nan`` residuals while still applying the configured learning and
+forgetting transition.
+
 Batch inference
 ---------------
 
