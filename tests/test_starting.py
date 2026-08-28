@@ -24,6 +24,7 @@ from mirt.models.polytomous import (
     NominalResponseModel,
     PartialCreditModel,
 )
+from mirt.models.unfolding import GeneralizedGradedUnfolding, IdealPointModel
 from mirt.utils.starting import calc_null, gen_random_pars, multi_start_fit
 
 
@@ -93,6 +94,44 @@ def test_gen_random_pars_orders_thresholds_and_retains_padding():
         assert np.all(np.diff(values[0, :2]) > 0)
         assert np.all(np.diff(values[1, :4]) > 0)
         np.testing.assert_array_equal(values[0, 2:], [0.0, 0.0])
+        model.copy().set_parameters(**params)
+
+
+@pytest.mark.parametrize("n_categories", [4, [3, 5]])
+def test_gen_random_pars_constructs_symmetric_ggum_thresholds(n_categories):
+    model = GeneralizedGradedUnfolding(2, n_categories=n_categories)
+
+    starts = gen_random_pars(model, n_sets=25, seed=29)
+
+    for params in starts:
+        thresholds = params["thresholds"]
+        for item, n_categories in enumerate(model.n_categories):
+            n_independent = n_categories - 1
+            n_active = 2 * n_independent + 1
+            independent = thresholds[item, :n_independent]
+            assert np.all(np.diff(independent) > 0.0)
+            assert thresholds[item, n_independent] == 0.0
+            np.testing.assert_array_equal(
+                thresholds[item, n_independent + 1 : n_active],
+                -independent[::-1],
+            )
+            np.testing.assert_array_equal(thresholds[item, n_active:], 0.0)
+        model.copy().set_parameters(**params)
+
+
+def test_gen_random_pars_bounds_ideal_point_peak_heights():
+    model = IdealPointModel(20)
+
+    starts = gen_random_pars(
+        model,
+        n_sets=25,
+        seed=31,
+        upper_range=(0.0, 0.8),
+    )
+
+    for params in starts:
+        assert np.all(params["peak_height"] > 0.0)
+        assert np.all(params["peak_height"] < 0.8)
         model.copy().set_parameters(**params)
 
 
