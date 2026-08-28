@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 import mirt
+import mirt.utils.sampling as sampling_utils
 from mirt.models.dichotomous import (
     FiveParameterLogistic,
     FourParameterLogistic,
@@ -18,7 +19,7 @@ from mirt.utils.sampling import (
 )
 
 
-def _direct_expected_scores(model, theta, samples):
+def _direct_expected_scores(model, theta, samples, item_idx=None):
     expected = np.empty((samples.discrimination.shape[0], len(theta)))
     for sample_idx in range(samples.discrimination.shape[0]):
         sampled_model = model.copy()
@@ -31,7 +32,10 @@ def _direct_expected_scores(model, theta, samples):
             if values is not None:
                 parameters[name] = values[sample_idx]
         sampled_model.set_parameters(**parameters)
-        expected[sample_idx] = sampled_model.probability(theta).sum(axis=1)
+        probabilities = sampled_model.probability(theta, item_idx=item_idx)
+        expected[sample_idx] = (
+            probabilities.sum(axis=1) if item_idx is None else probabilities
+        )
     return expected
 
 
@@ -53,6 +57,10 @@ def test_sample_expected_scores_matches_multidimensional_2pl_models():
     np.testing.assert_allclose(actual, _direct_expected_scores(model, theta, samples))
     np.testing.assert_allclose(
         sample_expected_scores(model, theta, samples, chunk_size=1), actual
+    )
+    np.testing.assert_allclose(
+        sample_expected_scores(model, theta, samples, item_idx=1),
+        _direct_expected_scores(model, theta, samples, item_idx=1),
     )
 
 
@@ -86,6 +94,46 @@ def test_sample_expected_scores_matches_bounded_logistic_models(model, samples):
     actual = sample_expected_scores(model, theta, samples)
 
     np.testing.assert_allclose(actual, _direct_expected_scores(model, theta, samples))
+
+
+def test_sample_expected_scores_can_target_one_item_without_full_bank_logits(
+    monkeypatch,
+):
+    model = FiveParameterLogistic(n_items=3)
+    samples = ParameterSamples(
+        discrimination=np.array([[1.0, 1.5, 0.5], [0.75, 1.25, 2.0]]),
+        difficulty=np.array([[0.0, 0.5, -0.5], [-0.5, 0.25, 1.0]]),
+        guessing=np.array([[0.1, 0.2, 0.05], [0.15, 0.05, 0.1]]),
+        upper=np.array([[0.9, 0.95, 0.8], [0.85, 0.8, 0.9]]),
+        asymmetry=np.array([[0.8, 1.2, 1.0], [1.5, 0.6, 0.9]]),
+    )
+    theta = np.array([[-2.0], [0.0], [2.0]])
+    logit_shapes = []
+    sigmoid = sampling_utils._sigmoid_inplace
+
+    def tracked_sigmoid(values):
+        logit_shapes.append(values.shape)
+        return sigmoid(values)
+
+    monkeypatch.setattr(sampling_utils, "_sigmoid_inplace", tracked_sigmoid)
+
+    actual = sample_expected_scores(model, theta, samples, item_idx=1)
+
+    np.testing.assert_allclose(
+        actual,
+        _direct_expected_scores(model, theta, samples, item_idx=1),
+    )
+    assert logit_shapes
+    assert all(shape[2] == 1 for shape in logit_shapes)
+
+
+@pytest.mark.parametrize("item_idx", [-1, 3, True, 1.5])
+def test_sample_expected_scores_rejects_invalid_item_indices(item_idx):
+    model = TwoParameterLogistic(n_items=3)
+    samples = ParameterSamples(np.ones((2, 3)), np.zeros((2, 3)))
+
+    with pytest.raises(IndexError, match="item_idx"):
+        sample_expected_scores(model, np.array([0.0]), samples, item_idx=item_idx)
 
 
 def test_sample_expected_scores_is_stable_at_extreme_abilities():
@@ -177,6 +225,44 @@ def test_posterior_summary_includes_new_optional_parameters():
 
     with pytest.raises(ValueError, match="credible_level"):
         posterior_summary(samples, credible_level=1.0)
+
+
+@pytest.mark.parametrize(
+    ("samples", "message"),
+    [
+        (
+            ParameterSamples(np.empty((0, 2)), np.empty((0, 2))),
+            "at least one draw",
+        ),
+        (
+            ParameterSamples(np.array([[1.0, np.nan]]), np.zeros((1, 2))),
+            "discrimination must contain only finite",
+        ),
+        (
+            ParameterSamples(np.ones((3, 2)), np.zeros((3, 1))),
+            "difficulty must have shape",
+        ),
+        (
+            ParameterSamples(
+                np.ones((3, 2)),
+                np.zeros((3, 2)),
+                guessing=np.ones((1, 7)),
+            ),
+            "guessing must have shape",
+        ),
+        (
+            ParameterSamples(
+                np.ones((3, 2)),
+                np.zeros((3, 2)),
+                upper=np.array([[1.0, np.inf], [1.0, 1.0], [1.0, 1.0]]),
+            ),
+            "upper must contain only finite",
+        ),
+    ],
+)
+def test_posterior_summary_rejects_malformed_sample_containers(samples, message):
+    with pytest.raises(ValueError, match=message):
+        posterior_summary(samples)
 
 
 def test_sampling_rejects_invalid_inputs():
