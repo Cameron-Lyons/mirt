@@ -23,6 +23,27 @@ if TYPE_CHECKING:
 ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 
 
+def _validate_split_responses(
+    responses: NDArray[np.int_],
+    *,
+    minimum_persons: int = 1,
+) -> NDArray[Any]:
+    """Return a response matrix suitable for standalone splitter use."""
+    values = np.asarray(responses)
+    if values.ndim != 2 or values.shape[0] < minimum_persons or values.shape[1] == 0:
+        raise ValueError(
+            "responses must be a two-dimensional matrix with at least "
+            f"{minimum_persons} persons and 1 item"
+        )
+    return values
+
+
+def _validate_shuffle(value: bool) -> None:
+    """Validate a splitter shuffle flag."""
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError("shuffle must be a boolean")
+
+
 @runtime_checkable
 class Splitter(Protocol):
     """Protocol for cross-validation splitters."""
@@ -67,6 +88,7 @@ class KFold:
 
     def __post_init__(self) -> None:
         _validate_split_count(self.n_splits)
+        _validate_shuffle(self.shuffle)
 
     def split(
         self,
@@ -84,7 +106,8 @@ class KFold:
         train_idx, test_idx : tuple[NDArray, NDArray]
             Indices for training and testing sets.
         """
-        n_persons = responses.shape[0]
+        response_values = _validate_split_responses(responses)
+        n_persons = response_values.shape[0]
         if self.n_splits > n_persons:
             raise ValueError(
                 f"n_splits={self.n_splits} cannot exceed n_persons={n_persons}"
@@ -123,6 +146,8 @@ class StratifiedKFold:
         Number of bins for stratification.
     random_state : int | None, default=None
         Random seed.
+    shuffle : bool, default=True
+        Whether to shuffle persons within each score stratum.
 
     Examples
     --------
@@ -135,6 +160,7 @@ class StratifiedKFold:
     n_splits: int = 5
     n_bins: int = 5
     random_state: int | None = None
+    shuffle: bool = True
 
     def __post_init__(self) -> None:
         _validate_split_count(self.n_splits)
@@ -144,6 +170,7 @@ class StratifiedKFold:
             raise ValueError("n_bins must be an integer")
         if self.n_bins < 1:
             raise ValueError("n_bins must be at least 1")
+        _validate_shuffle(self.shuffle)
 
     def split(
         self,
@@ -161,13 +188,24 @@ class StratifiedKFold:
         train_idx, test_idx : tuple[NDArray, NDArray]
             Indices for training and testing sets.
         """
-        n_persons = responses.shape[0]
+        response_values = _validate_split_responses(responses)
+        n_persons = response_values.shape[0]
         if self.n_splits > n_persons:
             raise ValueError(
                 f"n_splits={self.n_splits} cannot exceed n_persons={n_persons}"
             )
 
-        sum_scores = np.sum(np.maximum(responses, 0), axis=1)
+        numeric_scores = np.issubdtype(
+            response_values.dtype, np.number
+        ) or np.issubdtype(response_values.dtype, np.bool_)
+        if not numeric_scores or np.issubdtype(
+            response_values.dtype, np.complexfloating
+        ):
+            raise ValueError("stratified responses must contain numeric scores")
+        if np.any(np.isinf(response_values)):
+            raise ValueError("stratified responses must not contain infinite values")
+        observed = np.isfinite(response_values) & (response_values >= 0)
+        sum_scores = np.sum(np.where(observed, response_values, 0.0), axis=1)
 
         bins = np.percentile(sum_scores, np.linspace(0, 100, self.n_bins + 1))
         bins = np.unique(bins)
@@ -177,21 +215,131 @@ class StratifiedKFold:
         strata = np.digitize(sum_scores, bins[:-1]) - 1
         strata = np.clip(strata, 0, len(bins) - 2)
 
-        rng = np.random.default_rng(self.random_state)
+        rng = np.random.default_rng(self.random_state) if self.shuffle else None
 
-        fold_assignments = np.zeros(n_persons, dtype=int)
+        fold_assignments = np.zeros(n_persons, dtype=np.intp)
 
         next_fold = 0
         for stratum in range(strata.max() + 1):
-            stratum_indices = np.where(strata == stratum)[0]
-            rng.shuffle(stratum_indices)
-            for i, idx in enumerate(stratum_indices):
-                fold_assignments[idx] = (next_fold + i) % self.n_splits
+            stratum_indices = np.flatnonzero(strata == stratum)
+            if rng is not None:
+                rng.shuffle(stratum_indices)
+            fold_assignments[stratum_indices] = (
+                next_fold + np.arange(stratum_indices.size, dtype=np.intp)
+            ) % self.n_splits
             next_fold = (next_fold + len(stratum_indices)) % self.n_splits
 
         for fold in range(self.n_splits):
-            test_idx = np.where(fold_assignments == fold)[0]
-            train_idx = np.where(fold_assignments != fold)[0]
+            test_idx = np.flatnonzero(fold_assignments == fold)
+            train_idx = np.flatnonzero(fold_assignments != fold)
+            yield train_idx, test_idx
+
+
+@dataclass
+class GroupKFold:
+    """Cross-validation splitter that keeps each group in one fold.
+
+    This splitter prevents leakage when rows are clustered, repeated, or
+    otherwise share a subject, site, classroom, test form, or similar group.
+    Groups are assigned largest-first to the currently lightest fold so fold
+    sizes remain as balanced as the group sizes permit.
+
+    Parameters
+    ----------
+    groups : NDArray
+        One-dimensional group label for every response-matrix row.
+    n_splits : int, default=5
+        Number of folds. Cannot exceed the number of unique groups.
+    shuffle : bool, default=False
+        Randomize equal-sized group ordering and fold labels while retaining
+        largest-first load balancing.
+    random_state : int | None, default=None
+        Random seed used when ``shuffle=True``.
+
+    Examples
+    --------
+    >>> groups = np.repeat(np.arange(20), 5)
+    >>> splitter = GroupKFold(groups, n_splits=5)
+    >>> for train_idx, test_idx in splitter.split(responses):
+    ...     assert not set(groups[train_idx]) & set(groups[test_idx])
+    """
+
+    groups: NDArray[Any]
+    n_splits: int = 5
+    shuffle: bool = False
+    random_state: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_split_count(self.n_splits)
+        _validate_shuffle(self.shuffle)
+
+    def split(
+        self,
+        responses: NDArray[np.int_],
+    ) -> Iterator[tuple[NDArray[np.intp], NDArray[np.intp]]]:
+        """Yield complementary train and test indices without group leakage."""
+        response_values = _validate_split_responses(responses)
+        labels = np.asarray(self.groups)
+        if labels.ndim != 1:
+            raise ValueError("groups must be one-dimensional")
+        if labels.shape[0] != response_values.shape[0]:
+            raise ValueError(
+                "groups and responses must contain the same number of rows"
+            )
+        if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
+            raise ValueError("groups must not contain missing or non-finite labels")
+        if labels.dtype.kind == "O":
+            missing_object_label = any(
+                label is None
+                or (
+                    isinstance(
+                        label,
+                        (float, complex, np.floating, np.complexfloating),
+                    )
+                    and not np.isfinite(label)
+                )
+                for label in labels
+            )
+            if missing_object_label:
+                raise ValueError("groups must not contain missing labels")
+
+        try:
+            unique_groups, group_indices, group_sizes = np.unique(
+                labels, return_inverse=True, return_counts=True
+            )
+        except TypeError as exc:
+            raise ValueError("group labels must be mutually comparable") from exc
+        n_groups = unique_groups.size
+        if self.n_splits > n_groups:
+            raise ValueError(
+                f"n_splits={self.n_splits} cannot exceed n_groups={n_groups}"
+            )
+
+        if self.shuffle:
+            rng = np.random.default_rng(self.random_state)
+            tie_breakers = rng.random(n_groups)
+            fold_order = rng.permutation(self.n_splits)
+            group_order = np.lexsort((tie_breakers, -group_sizes))
+        else:
+            fold_order = np.arange(self.n_splits, dtype=np.intp)
+            group_order = np.argsort(-group_sizes, kind="stable")
+
+        group_folds = np.empty(n_groups, dtype=np.intp)
+        if np.all(group_sizes == group_sizes[0]):
+            group_folds[group_order] = fold_order[
+                np.arange(n_groups, dtype=np.intp) % self.n_splits
+            ]
+        else:
+            fold_sizes = np.zeros(self.n_splits, dtype=np.intp)
+            for group_idx in group_order:
+                fold = fold_order[np.argmin(fold_sizes[fold_order])]
+                group_folds[group_idx] = fold
+                fold_sizes[fold] += group_sizes[group_idx]
+
+        fold_assignments = group_folds[group_indices]
+        for fold in range(self.n_splits):
+            test_idx = np.flatnonzero(fold_assignments == fold)
+            train_idx = np.flatnonzero(fold_assignments != fold)
             yield train_idx, test_idx
 
 
@@ -233,11 +381,8 @@ class LeaveOneOut:
         train_idx, test_idx : tuple[NDArray, NDArray]
             Indices for training and testing sets.
         """
-        n_persons = responses.shape[0]
-        if n_persons < 2:
-            raise ValueError(
-                "leave-one-out cross-validation requires at least 2 persons"
-            )
+        response_values = _validate_split_responses(responses, minimum_persons=2)
+        n_persons = response_values.shape[0]
         self._n_splits = n_persons
         indices = np.arange(n_persons)
 

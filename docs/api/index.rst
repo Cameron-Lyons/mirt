@@ -125,6 +125,19 @@ Scoring
 
    fscores
 
+Cross-validation
+----------------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   cross_validate
+   KFold
+   StratifiedKFold
+   GroupKFold
+   LeaveOneOut
+
 CAT
 ---
 
