@@ -29,6 +29,7 @@ from mirt.cat._engine_common import (
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
+    ProgressiveRestricted,
     Randomesque,
 )
 from mirt.cat.results import CATResult, CATState
@@ -158,6 +159,8 @@ class CATEngine:
         else:
             self._stopping = base_rule
 
+        self._selection_horizon = max_items if max_items is not None else model.n_items
+
         self._exposure = configure_exposure_control(exposure_control, seed=seed)
         self._content = configure_content_constraint(content_constraint)
 
@@ -237,6 +240,13 @@ class CATEngine:
         exposure_eligible = self._exposure.filter_items(
             content_eligible, self.model, self._current_theta
         )
+
+        if isinstance(self._exposure, ProgressiveRestricted):
+            return self._exposure.select_from_eligible(
+                exposure_eligible,
+                n_administered=len(self._items_administered),
+                max_items=self._selection_horizon,
+            )
 
         if isinstance(self._exposure, Randomesque):
             criteria = self._selection.get_item_criteria(

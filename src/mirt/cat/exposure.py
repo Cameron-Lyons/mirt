@@ -348,10 +348,12 @@ class Randomesque(ExposureControl):
 
 
 class ProgressiveRestricted(ExposureControl):
-    """Information-window exposure control.
+    """Progressive information-window exposure control.
 
     Restricts the item pool to candidates within a fixed information window
-    of the most informative available item.
+    of the most informative available item. Selection within that window
+    blends a random component with item information. Randomness dominates at
+    the start of a test, while information dominates near the test horizon.
 
     Parameters
     ----------
@@ -378,6 +380,8 @@ class ProgressiveRestricted(ExposureControl):
         self.window_size: float = window_size
         self.rng: np.random.Generator = np.random.default_rng(seed)
         self._max_info_seen: dict[int, float] = {}
+        self._latest_item_indices: NDArray[np.int_] = np.empty(0, dtype=np.int_)
+        self._latest_information: NDArray[np.float64] = np.empty(0, dtype=np.float64)
 
     @property
     def max_information_seen(self) -> dict[int, float]:
@@ -390,6 +394,8 @@ class ProgressiveRestricted(ExposureControl):
         model: BaseItemModel,
         theta: float | NDArray[np.float64],
     ) -> set[int]:
+        self._latest_item_indices = np.empty(0, dtype=np.int_)
+        self._latest_information = np.empty(0, dtype=np.float64)
         if not available_items:
             return set()
 
@@ -423,6 +429,8 @@ class ProgressiveRestricted(ExposureControl):
 
         finite = np.isfinite(candidate_information)
         if not np.any(finite):
+            self._latest_item_indices = item_indices.copy()
+            self._latest_information = candidate_information.copy()
             return {int(item_idx) for item_idx in item_indices}
 
         for item_idx, information in zip(
@@ -438,12 +446,75 @@ class ProgressiveRestricted(ExposureControl):
 
         threshold = float(np.max(candidate_information[finite])) - self.window_size
         eligible_mask = finite & (candidate_information >= threshold)
-        eligible = {int(item_idx) for item_idx in item_indices[eligible_mask]}
+        eligible_indices = item_indices[eligible_mask]
+        eligible_information = candidate_information[eligible_mask]
 
-        return eligible if eligible else {int(item_idx) for item_idx in item_indices}
+        self._latest_item_indices = eligible_indices.copy()
+        self._latest_information = eligible_information.copy()
+        return {int(item_idx) for item_idx in eligible_indices}
+
+    def select_from_eligible(
+        self,
+        eligible_items: set[int],
+        *,
+        n_administered: int,
+        max_items: int,
+    ) -> int:
+        """Select progressively from the most recent eligibility window.
+
+        Parameters
+        ----------
+        eligible_items : set[int]
+            Items returned by the most recent :meth:`filter_items` call.
+        n_administered : int
+            Number of items already administered in the current test.
+        max_items : int
+            Maximum possible test length used to scale progress.
+
+        Returns
+        -------
+        int
+            Selected item index.
+        """
+        item_indices = _prepare_available_items(eligible_items)
+        if len(item_indices) == 0:
+            raise ValueError("No items to select from")
+        if (
+            isinstance(n_administered, (bool, np.bool_))
+            or not isinstance(n_administered, Integral)
+            or n_administered < 0
+        ):
+            raise ValueError("n_administered must be a non-negative integer")
+        if (
+            isinstance(max_items, (bool, np.bool_))
+            or not isinstance(max_items, Integral)
+            or max_items < 1
+        ):
+            raise ValueError("max_items must be a positive integer")
+
+        if not np.array_equal(item_indices, self._latest_item_indices):
+            raise RuntimeError("filter_items must be called before item selection")
+
+        information = self._latest_information
+        if not np.all(np.isfinite(information)):
+            return int(self.rng.choice(item_indices))
+
+        max_information = float(np.max(information))
+        if max_information <= 0.0:
+            return int(self.rng.choice(item_indices))
+
+        progress = min(float(n_administered) / float(max_items), 1.0)
+        if progress >= 1.0:
+            return int(item_indices[int(np.argmax(information))])
+
+        random_component = self.rng.uniform(0.0, max_information, len(item_indices))
+        weights = (1.0 - progress) * random_component + progress * information
+        return int(item_indices[int(np.argmax(weights))])
 
     def reset(self) -> None:
         self._max_info_seen.clear()
+        self._latest_item_indices = np.empty(0, dtype=np.int_)
+        self._latest_information = np.empty(0, dtype=np.float64)
 
 
 def create_exposure_control(

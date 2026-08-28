@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
-from mirt.cat import MCATEngine
+from mirt.cat import CATEngine, MCATEngine
 from mirt.cat.exposure import (
     NoExposureControl,
     ProgressiveRestricted,
@@ -20,6 +20,9 @@ from mirt.models.multidimensional import MultidimensionalModel
 
 
 class _InformationModel:
+    is_fitted = True
+    is_polytomous = False
+
     def __init__(self, information: list[float], n_factors: int = 1) -> None:
         self.values = np.asarray(information, dtype=np.float64)
         self.n_items = len(information)
@@ -185,6 +188,93 @@ def test_progressive_restricted_batches_information_once() -> None:
         3: 0.6,
         5: 0.95,
     }
+
+
+def test_progressive_restricted_selection_is_seeded_and_progressive() -> None:
+    model = _InformationModel([0.1, 0.8, 1.0, 0.95])
+    early_choices = set()
+
+    for seed in range(32):
+        control = ProgressiveRestricted(window_size=0.25, seed=seed)
+        eligible = control.filter_items(set(range(model.n_items)), model, 0.0)
+        early_choices.add(
+            control.select_from_eligible(
+                eligible,
+                n_administered=0,
+                max_items=10,
+            )
+        )
+
+    assert early_choices == {1, 2, 3}
+
+    first = ProgressiveRestricted(window_size=0.25, seed=7)
+    second = ProgressiveRestricted(window_size=0.25, seed=7)
+    first_eligible = first.filter_items(set(range(model.n_items)), model, 0.0)
+    second_eligible = second.filter_items(set(range(model.n_items)), model, 0.0)
+    assert first.select_from_eligible(
+        first_eligible,
+        n_administered=0,
+        max_items=10,
+    ) == second.select_from_eligible(
+        second_eligible,
+        n_administered=0,
+        max_items=10,
+    )
+
+    final = ProgressiveRestricted(window_size=0.25, seed=3)
+    final_eligible = final.filter_items(set(range(model.n_items)), model, 0.0)
+    assert (
+        final.select_from_eligible(
+            final_eligible,
+            n_administered=10,
+            max_items=10,
+        )
+        == 2
+    )
+
+
+def test_progressive_restricted_selection_validates_context() -> None:
+    control = ProgressiveRestricted()
+
+    with pytest.raises(ValueError, match="No items"):
+        control.select_from_eligible(set(), n_administered=0, max_items=10)
+    with pytest.raises(RuntimeError, match="filter_items"):
+        control.select_from_eligible({0}, n_administered=0, max_items=10)
+    with pytest.raises(ValueError, match="non-negative integer"):
+        control.select_from_eligible({0}, n_administered=-1, max_items=10)
+    with pytest.raises(ValueError, match="positive integer"):
+        control.select_from_eligible({0}, n_administered=0, max_items=0)
+
+
+def test_progressive_restricted_engine_reuses_batched_information() -> None:
+    selections = set()
+
+    for seed in range(16):
+        model = _InformationModel([0.1, 0.8, 1.0, 0.95])
+        control = ProgressiveRestricted(window_size=0.25, seed=seed)
+        engine = CATEngine(
+            model,
+            max_items=10,
+            exposure_control=control,
+        )
+
+        selections.add(engine.select_next_item())
+        assert model.calls == 1
+
+    assert selections == {1, 2, 3}
+
+    multidimensional_model = _InformationModel(
+        [0.1, 0.8, 1.0, 0.95],
+        n_factors=2,
+    )
+    multidimensional_engine = MCATEngine(
+        multidimensional_model,
+        max_items=10,
+        exposure_control=ProgressiveRestricted(window_size=0.25, seed=4),
+    )
+
+    assert multidimensional_engine.select_next_item() in {1, 2, 3}
+    assert multidimensional_model.calls == 1
 
 
 def test_progressive_restricted_accepts_multidimensional_theta() -> None:
