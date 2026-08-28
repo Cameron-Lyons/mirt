@@ -8,12 +8,134 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, sigmoid};
+use crate::utils::{EPSILON, log_sigmoid, sigmoid};
 
-/// Parallel M-step optimization for dichotomous items (2PL/3PL).
+const MAX_LINE_SEARCH_STEPS: usize = 24;
+
+#[derive(Clone, Copy)]
+struct DichotomousMstepConfig {
+    max_iter: usize,
+    tol: f64,
+    disc_bounds: (f64, f64),
+    diff_bounds: (f64, f64),
+    damping: f64,
+    regularization: f64,
+}
+
+fn expected_log_likelihood_2pl(
+    correct_counts: &[f64],
+    total_counts: &[f64],
+    quad_points: &[f64],
+    discrimination: f64,
+    difficulty: f64,
+) -> f64 {
+    correct_counts
+        .iter()
+        .zip(total_counts)
+        .zip(quad_points)
+        .map(|((&correct, &total), &theta)| {
+            let logit = discrimination * (theta - difficulty);
+            correct * log_sigmoid(logit) + (total - correct) * log_sigmoid(-logit)
+        })
+        .sum()
+}
+
+fn optimize_dichotomous_item(
+    correct_counts: &[f64],
+    total_counts: &[f64],
+    quad_points: &[f64],
+    initial_discrimination: f64,
+    initial_difficulty: f64,
+    config: DichotomousMstepConfig,
+) -> (f64, f64) {
+    if total_counts.iter().sum::<f64>() <= EPSILON {
+        return (initial_discrimination, initial_difficulty);
+    }
+
+    let mut discrimination = initial_discrimination;
+    let mut difficulty = initial_difficulty;
+
+    for _ in 0..config.max_iter {
+        let intercept = -discrimination * difficulty;
+        let mut gradient_slope = 0.0;
+        let mut gradient_intercept = 0.0;
+        let mut hessian_slope = -config.regularization;
+        let mut hessian_intercept = -config.regularization;
+        let mut hessian_cross = 0.0;
+
+        for ((&correct, &total), &theta) in correct_counts.iter().zip(total_counts).zip(quad_points)
+        {
+            let probability = sigmoid(discrimination * theta + intercept);
+            let residual = correct - total * probability;
+            let information = total * probability * (1.0 - probability);
+
+            gradient_slope += residual * theta;
+            gradient_intercept += residual;
+            hessian_slope -= information * theta * theta;
+            hessian_intercept -= information;
+            hessian_cross -= information * theta;
+        }
+
+        let determinant = hessian_slope * hessian_intercept - hessian_cross * hessian_cross;
+        if determinant.abs() < EPSILON {
+            break;
+        }
+
+        let delta_slope =
+            (hessian_intercept * gradient_slope - hessian_cross * gradient_intercept) / determinant;
+        let delta_intercept =
+            (-hessian_cross * gradient_slope + hessian_slope * gradient_intercept) / determinant;
+        let current_likelihood = expected_log_likelihood_2pl(
+            correct_counts,
+            total_counts,
+            quad_points,
+            discrimination,
+            difficulty,
+        );
+        let likelihood_tolerance = 1e-12 * current_likelihood.abs().max(1.0);
+
+        let mut step = config.damping;
+        let mut accepted = None;
+        for _ in 0..MAX_LINE_SEARCH_STEPS {
+            let candidate_discrimination = (discrimination - step * delta_slope)
+                .clamp(config.disc_bounds.0, config.disc_bounds.1);
+            let candidate_intercept = intercept - step * delta_intercept;
+            let candidate_difficulty = (-candidate_intercept / candidate_discrimination)
+                .clamp(config.diff_bounds.0, config.diff_bounds.1);
+            let candidate_likelihood = expected_log_likelihood_2pl(
+                correct_counts,
+                total_counts,
+                quad_points,
+                candidate_discrimination,
+                candidate_difficulty,
+            );
+            if candidate_likelihood >= current_likelihood - likelihood_tolerance {
+                accepted = Some((candidate_discrimination, candidate_difficulty));
+                break;
+            }
+            step *= 0.5;
+        }
+
+        let Some((candidate_discrimination, candidate_difficulty)) = accepted else {
+            break;
+        };
+        let parameter_change = (candidate_discrimination - discrimination)
+            .abs()
+            .max((candidate_difficulty - difficulty).abs());
+        discrimination = candidate_discrimination;
+        difficulty = candidate_difficulty;
+        if parameter_change < config.tol {
+            break;
+        }
+    }
+
+    (discrimination, difficulty)
+}
+
+/// Parallel M-step optimization for independent 2PL items.
 ///
-/// Uses Newton-Raphson optimization for each item in parallel.
-/// Each item's parameters are optimized independently given the posterior weights.
+/// Uses exact expected-likelihood curvature in slope-intercept space and
+/// backtracking to prevent accepted updates from reducing the objective.
 #[pyfunction]
 #[pyo3(signature = (responses, posterior_weights, quad_points, discrimination, difficulty, max_iter, tol, disc_bounds, diff_bounds, damping, regularization))]
 #[allow(clippy::too_many_arguments)]
@@ -40,6 +162,15 @@ pub fn m_step_dichotomous_parallel<'py>(
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
     let n_quad = quad_points.len();
+    let quad_points_vec = quad_points.to_vec();
+    let config = DichotomousMstepConfig {
+        max_iter,
+        tol,
+        disc_bounds,
+        diff_bounds,
+        damping,
+        regularization,
+    };
 
     let new_params: Vec<(f64, f64)> = (0..n_items)
         .into_par_iter()
@@ -61,56 +192,14 @@ pub fn m_step_dichotomous_parallel<'py>(
                 }
             }
 
-            let mut a = disc_init[j];
-            let mut b = diff_init[j];
-
-            for _ in 0..max_iter {
-                let mut grad_a = 0.0;
-                let mut grad_b = 0.0;
-                let mut hess_aa = 0.0;
-                let mut hess_bb = 0.0;
-                let mut hess_ab = 0.0;
-
-                for q in 0..n_quad {
-                    if n_k[q] < EPSILON {
-                        continue;
-                    }
-                    let theta = quad_points[q];
-                    let z = a * (theta - b);
-                    let p = sigmoid(z);
-                    let p_clipped = p.clamp(EPSILON, 1.0 - EPSILON);
-
-                    let residual = r_k[q] - n_k[q] * p_clipped;
-
-                    grad_a += residual * (theta - b);
-                    grad_b += -residual * a;
-
-                    let info = n_k[q] * p_clipped * (1.0 - p_clipped);
-                    hess_aa += -info * (theta - b) * (theta - b);
-                    hess_bb += -info * a * a;
-                    hess_ab += info * a * (theta - b);
-                }
-
-                hess_aa -= regularization;
-                hess_bb -= regularization;
-
-                let det = hess_aa * hess_bb - hess_ab * hess_ab;
-                if det.abs() < EPSILON {
-                    break;
-                }
-
-                let delta_a = (hess_bb * grad_a - hess_ab * grad_b) / det;
-                let delta_b = (-hess_ab * grad_a + hess_aa * grad_b) / det;
-
-                a = (a - delta_a * damping).clamp(disc_bounds.0, disc_bounds.1);
-                b = (b - delta_b * damping).clamp(diff_bounds.0, diff_bounds.1);
-
-                if delta_a.abs() < tol && delta_b.abs() < tol {
-                    break;
-                }
-            }
-
-            (a, b)
+            optimize_dichotomous_item(
+                &r_k,
+                &n_k,
+                &quad_points_vec,
+                disc_init[j],
+                diff_init[j],
+                config,
+            )
         })
         .collect();
 
@@ -346,4 +435,55 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(m_step_3pl_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(compute_expected_counts_parallel, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(max_iter: usize) -> DichotomousMstepConfig {
+        DichotomousMstepConfig {
+            max_iter,
+            tol: 1e-12,
+            disc_bounds: (0.1, 5.0),
+            diff_bounds: (-6.0, 6.0),
+            damping: 0.5,
+            regularization: 0.01,
+        }
+    }
+
+    #[test]
+    fn canonical_newton_step_matches_reference() {
+        let correct = [0.6, 0.9, 0.5];
+        let total = [1.3, 1.1, 0.6];
+        let points = [-1.5, 0.0, 1.5];
+
+        let (discrimination, difficulty) =
+            optimize_dichotomous_item(&correct, &total, &points, 0.8, -0.2, config(1));
+
+        assert!((discrimination - 0.699_711_024_002_301_7).abs() < 1e-12);
+        assert!((difficulty - -0.843_022_680_797_700_6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn optimization_is_monotone_and_empty_counts_are_unchanged() {
+        let correct = [0.05, 0.4, 0.8, 0.3];
+        let total = [0.8, 1.0, 1.2, 0.9];
+        let points = [-3.0, -1.0, 1.0, 3.0];
+        let initial = (4.8, 5.5);
+        let before = expected_log_likelihood_2pl(&correct, &total, &points, initial.0, initial.1);
+        let updated =
+            optimize_dichotomous_item(&correct, &total, &points, initial.0, initial.1, config(20));
+        let after = expected_log_likelihood_2pl(&correct, &total, &points, updated.0, updated.1);
+
+        assert!(after >= before - 1e-12);
+        assert!((0.1..=5.0).contains(&updated.0));
+        assert!((-6.0..=6.0).contains(&updated.1));
+
+        let empty = [0.0; 4];
+        assert_eq!(
+            optimize_dichotomous_item(&empty, &empty, &points, 1.7, -0.4, config(20)),
+            (1.7, -0.4)
+        );
+    }
 }
