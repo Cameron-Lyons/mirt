@@ -29,6 +29,18 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+_RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
+
+
+@dataclass
+class _ResidualComputation:
+    """Intermediate arrays shared by residual diagnostics."""
+
+    residuals: dict[str, NDArray[np.float64]]
+    expected_values: NDArray[np.float64] | None
+    variances: NDArray[np.float64] | None
+
+
 @dataclass
 class ResidualAnalysisResult:
     """Result from response pattern residual analysis.
@@ -107,6 +119,91 @@ class ResidualAnalysisResult:
         return "\n".join(lines)
 
 
+def _resolve_theta(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64] | None,
+) -> NDArray[np.float64]:
+    """Return ability estimates in the shape expected by item models."""
+    if theta is None:
+        from mirt.scoring import fscores
+
+        theta = fscores(model, responses, method="EAP").theta
+
+    theta_array = np.asarray(theta)
+    if theta_array.ndim == 1:
+        return theta_array.reshape(-1, 1)
+
+    theta_array = np.atleast_2d(theta_array)
+    if theta_array.shape[0] == 1 and responses.shape[0] > 1:
+        theta_array = theta_array.T
+    return theta_array
+
+
+def _compute_residual_arrays(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    residual_types: tuple[str, ...],
+    *,
+    store_expected: bool = False,
+    store_variances: bool = False,
+) -> _ResidualComputation:
+    """Compute requested residual arrays in one pass over model probabilities."""
+    unknown_types = set(residual_types) - _RESIDUAL_TYPES
+    if unknown_types:
+        unknown = next(kind for kind in residual_types if kind in unknown_types)
+        raise ValueError(f"Unknown residual type: {unknown}")
+
+    n_persons, n_items = responses.shape
+    residuals = {kind: np.full((n_persons, n_items), np.nan) for kind in residual_types}
+    expected_values = np.empty((n_persons, n_items)) if store_expected else None
+    variances = np.full((n_persons, n_items), np.nan) if store_variances else None
+
+    for j in range(n_items):
+        probs = model.probability(theta, j)
+
+        if probs.ndim == 2:
+            categories = np.arange(probs.shape[1])
+            expected = probs @ categories
+            variance = probs @ (categories**2) - expected**2
+        else:
+            expected = probs
+            variance = probs * (1 - probs)
+
+        if expected_values is not None:
+            expected_values[:, j] = expected
+
+        valid = responses[:, j] >= 0
+        observed = responses[valid, j]
+        exp_valid = expected[valid]
+        var_valid = variance[valid]
+        raw = observed - exp_valid
+
+        if variances is not None:
+            variances[valid, j] = var_valid
+        if "raw" in residuals:
+            residuals["raw"][valid, j] = raw
+        if "standardized" in residuals:
+            residuals["standardized"][valid, j] = raw / np.sqrt(
+                var_valid + PROB_EPSILON
+            )
+        if "pearson" in residuals:
+            residuals["pearson"][valid, j] = raw / np.sqrt(exp_valid + PROB_EPSILON)
+        if "deviance" in residuals:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                if probs.ndim == 2:
+                    p_obs = probs[valid, observed]
+                else:
+                    p_obs = np.where(observed == 1, probs[valid], 1 - probs[valid])
+                p_obs = np.clip(p_obs, PROB_EPSILON, 1 - PROB_EPSILON)
+                residuals["deviance"][valid, j] = np.sign(raw) * np.sqrt(
+                    -2 * np.log(p_obs)
+                )
+
+    return _ResidualComputation(residuals, expected_values, variances)
+
+
 def compute_residuals(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -132,59 +229,93 @@ def compute_residuals(
         Residual matrix of same shape as responses
     """
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+    if residual_type not in _RESIDUAL_TYPES:
+        raise ValueError(f"Unknown residual type: {residual_type}")
 
-    if theta is None:
-        from mirt.scoring import fscores
+    theta_array = _resolve_theta(model, responses, theta)
+    computation = _compute_residual_arrays(
+        model,
+        responses,
+        theta_array,
+        (residual_type,),
+    )
+    return computation.residuals[residual_type]
 
-        result = fscores(model, responses, method="EAP")
-        theta = result.theta
 
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
+def _analyze_residuals(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64] | None,
+    *,
+    store_variances: bool,
+) -> tuple[ResidualAnalysisResult, NDArray[np.float64] | None]:
+    """Build residual analysis and optionally retain variances for fit statistics."""
+    theta_array = _resolve_theta(model, responses, theta)
+    computation = _compute_residual_arrays(
+        model,
+        responses,
+        theta_array,
+        ("raw", "standardized", "pearson", "deviance"),
+        store_expected=True,
+        store_variances=store_variances,
+    )
+    raw = computation.residuals["raw"]
+    standardized = computation.residuals["standardized"]
+    pearson = computation.residuals["pearson"]
+    deviance = computation.residuals["deviance"]
+    expected = computation.expected_values
+    assert expected is not None
 
-    residuals = np.full((n_persons, n_items), np.nan)
-
+    _, n_items = responses.shape
+    item_residuals = {}
     for j in range(n_items):
-        probs = model.probability(theta, j)
+        valid = ~np.isnan(standardized[:, j])
+        z_j = standardized[valid, j]
+        item_residuals[j] = {
+            "mean": float(np.mean(z_j)),
+            "sd": float(np.std(z_j)),
+            "max_abs_z": float(np.max(np.abs(z_j))) if len(z_j) > 0 else 0,
+        }
 
-        if probs.ndim == 2:
-            n_cats = probs.shape[1]
-            expected = np.sum(probs * np.arange(n_cats), axis=1)
-            variance = np.sum(probs * (np.arange(n_cats) ** 2), axis=1) - expected**2
+    pattern_residuals = {}
+    for response_pattern, z_i in zip(responses, standardized, strict=True):
+        pattern = tuple(response_pattern)
+        valid = ~np.isnan(z_i)
+
+        if pattern not in pattern_residuals:
+            pattern_residuals[pattern] = {
+                "sum_z": 0.0,
+                "sum_z_sq": 0.0,
+                "n": 0,
+                "count": 0,
+            }
+
+        pattern_residuals[pattern]["sum_z"] += np.sum(z_i[valid])
+        pattern_residuals[pattern]["sum_z_sq"] += np.sum(z_i[valid] ** 2)
+        pattern_residuals[pattern]["n"] += np.sum(valid)
+        pattern_residuals[pattern]["count"] += 1
+
+    for stats in pattern_residuals.values():
+        if stats["n"] > 0:
+            stats["mean_z"] = stats["sum_z"] / stats["n"]
+            stats["mean_z_sq"] = stats["sum_z_sq"] / stats["n"]
         else:
-            expected = probs
-            variance = probs * (1 - probs)
+            stats["mean_z"] = 0
+            stats["mean_z_sq"] = 0
 
-        valid = responses[:, j] >= 0
-        observed = responses[valid, j]
-        exp_valid = expected[valid]
-        var_valid = variance[valid]
-
-        raw = observed - exp_valid
-
-        if residual_type == "raw":
-            residuals[valid, j] = raw
-        elif residual_type == "standardized":
-            residuals[valid, j] = raw / np.sqrt(var_valid + PROB_EPSILON)
-        elif residual_type == "pearson":
-            residuals[valid, j] = raw / np.sqrt(exp_valid + PROB_EPSILON)
-        elif residual_type == "deviance":
-            with np.errstate(divide="ignore", invalid="ignore"):
-                if probs.ndim == 2:
-                    p_obs = probs[valid, observed]
-                else:
-                    p_obs = np.where(observed == 1, probs[valid], 1 - probs[valid])
-                p_obs = np.clip(p_obs, PROB_EPSILON, 1 - PROB_EPSILON)
-                deviance = np.sign(raw) * np.sqrt(-2 * np.log(p_obs))
-            residuals[valid, j] = deviance
-        else:
-            raise ValueError(f"Unknown residual type: {residual_type}")
-
-    return residuals
+    result = ResidualAnalysisResult(
+        raw_residuals=raw,
+        standardized_residuals=standardized,
+        pearson_residuals=pearson,
+        deviance_residuals=deviance,
+        expected_values=expected,
+        theta_estimates=(
+            theta_array.ravel() if theta_array.shape[1] == 1 else theta_array
+        ),
+        pattern_residuals=pattern_residuals,
+        item_residuals=item_residuals,
+    )
+    return result, computation.variances
 
 
 def analyze_residuals(
@@ -209,80 +340,31 @@ def analyze_residuals(
         Complete residual analysis results
     """
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP")
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    raw = compute_residuals(model, responses, theta, "raw")
-    standardized = compute_residuals(model, responses, theta, "standardized")
-    pearson = compute_residuals(model, responses, theta, "pearson")
-    deviance = compute_residuals(model, responses, theta, "deviance")
-
-    expected = np.zeros((n_persons, n_items))
-    for j in range(n_items):
-        probs = model.probability(theta, j)
-        if probs.ndim == 2:
-            expected[:, j] = np.sum(probs * np.arange(probs.shape[1]), axis=1)
-        else:
-            expected[:, j] = probs
-
-    item_residuals = {}
-    for j in range(n_items):
-        valid = ~np.isnan(standardized[:, j])
-        z_j = standardized[valid, j]
-        item_residuals[j] = {
-            "mean": float(np.mean(z_j)),
-            "sd": float(np.std(z_j)),
-            "max_abs_z": float(np.max(np.abs(z_j))) if len(z_j) > 0 else 0,
-        }
-
-    pattern_residuals = {}
-    for i in range(n_persons):
-        pattern = tuple(responses[i])
-        z_i = standardized[i]
-        valid = ~np.isnan(z_i)
-
-        if pattern not in pattern_residuals:
-            pattern_residuals[pattern] = {
-                "sum_z": 0.0,
-                "sum_z_sq": 0.0,
-                "n": 0,
-                "count": 0,
-            }
-
-        pattern_residuals[pattern]["sum_z"] += np.sum(z_i[valid])
-        pattern_residuals[pattern]["sum_z_sq"] += np.sum(z_i[valid] ** 2)
-        pattern_residuals[pattern]["n"] += np.sum(valid)
-        pattern_residuals[pattern]["count"] += 1
-
-    for pattern, stats in pattern_residuals.items():
-        if stats["n"] > 0:
-            stats["mean_z"] = stats["sum_z"] / stats["n"]
-            stats["mean_z_sq"] = stats["sum_z_sq"] / stats["n"]
-        else:
-            stats["mean_z"] = 0
-            stats["mean_z_sq"] = 0
-
-    return ResidualAnalysisResult(
-        raw_residuals=raw,
-        standardized_residuals=standardized,
-        pearson_residuals=pearson,
-        deviance_residuals=deviance,
-        expected_values=expected,
-        theta_estimates=theta.ravel() if theta.shape[1] == 1 else theta,
-        pattern_residuals=pattern_residuals,
-        item_residuals=item_residuals,
+    result, _ = _analyze_residuals(
+        model,
+        responses,
+        theta,
+        store_variances=False,
     )
+    return result
+
+
+def _fit_statistics(
+    standardized_residuals: NDArray[np.float64],
+    variances: NDArray[np.float64],
+) -> dict[str, NDArray[np.float64]]:
+    """Aggregate standardized residuals into item and person fit statistics."""
+    z_sq = np.square(standardized_residuals)
+    weighted_z_sq = z_sq * variances
+
+    return {
+        "item_outfit": np.nanmean(z_sq, axis=0),
+        "item_infit": np.nansum(weighted_z_sq, axis=0)
+        / (np.nansum(variances, axis=0) + PROB_EPSILON),
+        "person_outfit": np.nanmean(z_sq, axis=1),
+        "person_infit": np.nansum(weighted_z_sq, axis=1)
+        / (np.nansum(variances, axis=1) + PROB_EPSILON),
+    }
 
 
 def compute_outfit_infit(
@@ -310,61 +392,17 @@ def compute_outfit_infit(
         Dictionary with 'item_outfit', 'item_infit', 'person_outfit', 'person_infit'
     """
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP")
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    z_sq = np.zeros((n_persons, n_items))
-    variances = np.zeros((n_persons, n_items))
-
-    for j in range(n_items):
-        probs = model.probability(theta, j)
-
-        if probs.ndim == 2:
-            n_cats = probs.shape[1]
-            expected = np.sum(probs * np.arange(n_cats), axis=1)
-            var = np.sum(probs * (np.arange(n_cats) ** 2), axis=1) - expected**2
-        else:
-            expected = probs
-            var = probs * (1 - probs)
-
-        valid = responses[:, j] >= 0
-        observed = responses[valid, j]
-
-        raw = observed - expected[valid]
-        z_sq[valid, j] = (raw**2) / (var[valid] + PROB_EPSILON)
-        variances[valid, j] = var[valid]
-
-    missing = responses < 0
-    z_sq[missing] = np.nan
-    variances[missing] = np.nan
-
-    item_outfit = np.nanmean(z_sq, axis=0)
-    item_infit = np.nansum(z_sq * variances, axis=0) / (
-        np.nansum(variances, axis=0) + PROB_EPSILON
+    theta_array = _resolve_theta(model, responses, theta)
+    computation = _compute_residual_arrays(
+        model,
+        responses,
+        theta_array,
+        ("standardized",),
+        store_variances=True,
     )
-
-    person_outfit = np.nanmean(z_sq, axis=1)
-    person_infit = np.nansum(z_sq * variances, axis=1) / (
-        np.nansum(variances, axis=1) + PROB_EPSILON
-    )
-
-    return {
-        "item_outfit": item_outfit,
-        "item_infit": item_infit,
-        "person_outfit": person_outfit,
-        "person_infit": person_infit,
-    }
+    variances = computation.variances
+    assert variances is not None
+    return _fit_statistics(computation.residuals["standardized"], variances)
 
 
 def identify_misfitting_patterns(
@@ -394,45 +432,44 @@ def identify_misfitting_patterns(
     dict
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
-    analysis = analyze_residuals(model, responses, theta)
-    fit_stats = compute_outfit_infit(model, responses, theta)
+    responses = np.asarray(responses)
+    analysis, variances = _analyze_residuals(
+        model,
+        responses,
+        theta,
+        store_variances=True,
+    )
+    assert variances is not None
+    fit_stats = _fit_statistics(analysis.standardized_residuals, variances)
 
-    misfitting_items = []
-    for j in range(responses.shape[1]):
-        if fit_stats["item_outfit"][j] > outfit_threshold:
-            misfitting_items.append(
-                {
-                    "item": j,
-                    "outfit": fit_stats["item_outfit"][j],
-                    "infit": fit_stats["item_infit"][j],
-                }
-            )
+    misfitting_items = [
+        {
+            "item": int(j),
+            "outfit": fit_stats["item_outfit"][j],
+            "infit": fit_stats["item_infit"][j],
+        }
+        for j in np.flatnonzero(fit_stats["item_outfit"] > outfit_threshold)
+    ]
+    misfitting_persons = [
+        {
+            "person": int(i),
+            "outfit": fit_stats["person_outfit"][i],
+            "infit": fit_stats["person_infit"][i],
+        }
+        for i in np.flatnonzero(fit_stats["person_outfit"] > outfit_threshold)
+    ]
 
-    misfitting_persons = []
-    for i in range(responses.shape[0]):
-        if fit_stats["person_outfit"][i] > outfit_threshold:
-            misfitting_persons.append(
-                {
-                    "person": i,
-                    "outfit": fit_stats["person_outfit"][i],
-                    "infit": fit_stats["person_infit"][i],
-                }
-            )
-
-    aberrant = []
     z = analysis.standardized_residuals
-    for i in range(responses.shape[0]):
-        for j in range(responses.shape[1]):
-            if not np.isnan(z[i, j]) and abs(z[i, j]) > z_threshold:
-                aberrant.append(
-                    {
-                        "person": i,
-                        "item": j,
-                        "response": responses[i, j],
-                        "expected": analysis.expected_values[i, j],
-                        "z": z[i, j],
-                    }
-                )
+    aberrant = [
+        {
+            "person": int(i),
+            "item": int(j),
+            "response": responses[i, j],
+            "expected": analysis.expected_values[i, j],
+            "z": z[i, j],
+        }
+        for i, j in np.argwhere(np.isfinite(z) & (np.abs(z) > z_threshold))
+    ]
 
     return {
         "misfitting_persons": misfitting_persons,

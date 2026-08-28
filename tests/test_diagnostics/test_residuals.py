@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.residuals import (
     ResidualAnalysisResult,
     analyze_residuals,
@@ -11,6 +12,18 @@ from mirt.diagnostics.residuals import (
     compute_residuals,
     identify_misfitting_patterns,
 )
+
+
+class FixedProbabilityModel:
+    """Minimal item model with deterministic probabilities and call counting."""
+
+    def __init__(self, probabilities):
+        self.probabilities = probabilities
+        self.probability_calls = 0
+
+    def probability(self, theta, item):
+        self.probability_calls += 1
+        return self.probabilities[item]
 
 
 class TestComputeResiduals:
@@ -104,6 +117,77 @@ class TestComputeResiduals:
 
         assert residuals.shape == dichotomous_responses["responses"].shape
 
+    def test_dichotomous_values_and_missing_data(self):
+        """Test exact residual formulas with missing dichotomous responses."""
+        probabilities = [
+            np.array([0.2, 0.6, 0.8]),
+            np.array([0.7, 0.4, 0.1]),
+        ]
+        model = FixedProbabilityModel(probabilities)
+        responses = np.array([[0, 1], [1, -1], [1, 0]])
+        theta = np.zeros(3)
+        expected = np.column_stack(probabilities)
+        variance = expected * (1 - expected)
+        raw = responses - expected
+        valid = responses >= 0
+        observed_probability = np.where(responses == 1, expected, 1 - expected)
+
+        references = {
+            "raw": raw,
+            "standardized": raw / np.sqrt(variance + PROB_EPSILON),
+            "pearson": raw / np.sqrt(expected + PROB_EPSILON),
+            "deviance": np.sign(raw)
+            * np.sqrt(
+                -2
+                * np.log(
+                    np.clip(
+                        observed_probability,
+                        PROB_EPSILON,
+                        1 - PROB_EPSILON,
+                    )
+                )
+            ),
+        }
+
+        for residual_type, reference in references.items():
+            actual = compute_residuals(model, responses, theta, residual_type)
+            assert_allclose(actual[valid], reference[valid])
+            assert np.all(np.isnan(actual[~valid]))
+
+    def test_polytomous_values_and_missing_data(self):
+        """Test exact residual formulas with polytomous probabilities."""
+        probabilities = [
+            np.array(
+                [
+                    [0.7, 0.2, 0.1],
+                    [0.2, 0.5, 0.3],
+                    [0.1, 0.3, 0.6],
+                ]
+            )
+        ]
+        model = FixedProbabilityModel(probabilities)
+        responses = np.array([[0], [-1], [2]])
+        theta = np.zeros(3)
+        categories = np.arange(3)
+        expected = probabilities[0] @ categories
+        variance = probabilities[0] @ (categories**2) - expected**2
+        valid = responses[:, 0] >= 0
+        observed = responses[valid, 0]
+        raw = observed - expected[valid]
+        observed_probability = probabilities[0][valid, observed]
+
+        references = {
+            "raw": raw,
+            "standardized": raw / np.sqrt(variance[valid] + PROB_EPSILON),
+            "pearson": raw / np.sqrt(expected[valid] + PROB_EPSILON),
+            "deviance": np.sign(raw) * np.sqrt(-2 * np.log(observed_probability)),
+        }
+
+        for residual_type, reference in references.items():
+            actual = compute_residuals(model, responses, theta, residual_type)
+            assert_allclose(actual[valid, 0], reference)
+            assert np.isnan(actual[1, 0])
+
 
 class TestAnalyzeResiduals:
     """Tests for analyze_residuals function."""
@@ -170,6 +254,32 @@ class TestAnalyzeResiduals:
         assert "Residual Analysis" in summary
         assert "Item" in summary
 
+    def test_computes_all_residuals_in_one_probability_pass(self):
+        """Test that comprehensive analysis evaluates each item only once."""
+        probabilities = [
+            np.array([0.2, 0.4, 0.6, 0.8]),
+            np.array([0.7, 0.5, 0.3, 0.1]),
+        ]
+        model = FixedProbabilityModel(probabilities)
+        responses = np.array([[0, 1], [0, -1], [1, 0], [1, 0]])
+
+        result = analyze_residuals(model, responses, np.zeros(4))
+
+        assert model.probability_calls == responses.shape[1]
+        for residual_type, attribute in (
+            ("raw", "raw_residuals"),
+            ("standardized", "standardized_residuals"),
+            ("pearson", "pearson_residuals"),
+            ("deviance", "deviance_residuals"),
+        ):
+            expected = compute_residuals(
+                FixedProbabilityModel(probabilities),
+                responses,
+                np.zeros(4),
+                residual_type,
+            )
+            assert_allclose(getattr(result, attribute), expected, equal_nan=True)
+
 
 class TestComputeOutfitInfit:
     """Tests for compute_outfit_infit function."""
@@ -219,6 +329,40 @@ class TestComputeOutfitInfit:
         assert np.all(result["item_infit"] < 5.0)
         assert np.all(result["person_outfit"] < 5.0)
         assert np.all(result["person_infit"] < 5.0)
+
+    def test_matches_residual_definition_with_missing_data(self):
+        """Test exact outfit and infit aggregation from standardized residuals."""
+        probabilities = [
+            np.array([0.2, 0.4, 0.6, 0.8]),
+            np.array([0.7, 0.5, 0.3, 0.1]),
+        ]
+        model = FixedProbabilityModel(probabilities)
+        responses = np.array([[0, 1], [0, -1], [1, 0], [1, 0]])
+        expected = np.column_stack(probabilities)
+        variance = expected * (1 - expected)
+        variance[responses < 0] = np.nan
+        standardized = compute_residuals(
+            FixedProbabilityModel(probabilities),
+            responses,
+            np.zeros(4),
+        )
+        z_sq = standardized**2
+
+        result = compute_outfit_infit(model, responses, np.zeros(4))
+
+        assert model.probability_calls == responses.shape[1]
+        assert_allclose(result["item_outfit"], np.nanmean(z_sq, axis=0))
+        assert_allclose(result["person_outfit"], np.nanmean(z_sq, axis=1))
+        assert_allclose(
+            result["item_infit"],
+            np.nansum(z_sq * variance, axis=0)
+            / (np.nansum(variance, axis=0) + PROB_EPSILON),
+        )
+        assert_allclose(
+            result["person_infit"],
+            np.nansum(z_sq * variance, axis=1)
+            / (np.nansum(variance, axis=1) + PROB_EPSILON),
+        )
 
 
 class TestIdentifyMisfittingPatterns:
@@ -287,6 +431,28 @@ class TestIdentifyMisfittingPatterns:
         )
 
         assert len(strict["aberrant_responses"]) >= len(lenient["aberrant_responses"])
+
+    def test_reuses_probability_pass_and_preserves_row_major_order(self):
+        """Test shared calculations and deterministic aberrant-response ordering."""
+        probabilities = [
+            np.array([0.99, 0.5, 0.01]),
+            np.array([0.01, 0.5, 0.99]),
+        ]
+        model = FixedProbabilityModel(probabilities)
+        responses = np.array([[0, 1], [1, -1], [1, 0]])
+
+        result = identify_misfitting_patterns(
+            model,
+            responses,
+            np.zeros(3),
+            z_threshold=1.0,
+            outfit_threshold=0.0,
+        )
+
+        assert model.probability_calls == responses.shape[1]
+        assert [
+            (entry["person"], entry["item"]) for entry in result["aberrant_responses"]
+        ] == [(0, 0), (0, 1), (2, 0), (2, 1)]
 
 
 class TestResidualAnalysisResult:
