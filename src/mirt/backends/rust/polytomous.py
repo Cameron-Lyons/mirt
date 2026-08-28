@@ -8,6 +8,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._classical import _alpha_if_deleted_numpy
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     _ensure_f64,
@@ -205,35 +206,4 @@ def compute_alpha_if_deleted(
             responses.astype(np.float64),
         )
 
-    n_persons, n_items = responses.shape
-
-    total_scores = np.nansum(responses, axis=1)
-
-    item_variances = np.zeros(n_items)
-    for j in range(n_items):
-        col = responses[:, j]
-        valid = ~np.isnan(col)
-        if valid.sum() > 1:
-            mean = np.nanmean(col)
-            item_variances[j] = np.nansum((col[valid] - mean) ** 2) / (valid.sum() - 1)
-
-    alpha_if_deleted = np.zeros(n_items)
-    for j in range(n_items):
-        remaining_scores = total_scores - np.where(
-            np.isnan(responses[:, j]), 0, responses[:, j]
-        )
-        remaining_var_sum = np.sum(item_variances[np.arange(n_items) != j])
-        remaining_mean = np.mean(remaining_scores)
-        remaining_total_var = np.sum((remaining_scores - remaining_mean) ** 2) / max(
-            n_persons - 1, 1
-        )
-
-        k = n_items - 1
-        if remaining_total_var > 0 and k > 1:
-            alpha_if_deleted[j] = (k / (k - 1)) * (
-                1 - remaining_var_sum / remaining_total_var
-            )
-        else:
-            alpha_if_deleted[j] = 0.0
-
-    return alpha_if_deleted
+    return _alpha_if_deleted_numpy(np.asarray(responses, dtype=np.float64))

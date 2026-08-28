@@ -3,6 +3,8 @@
 import numpy as np
 import pytest
 
+import mirt._classical as classical_core
+import mirt.backends.rust.polytomous as polytomous_backend
 import mirt.utils.classical as classical
 from mirt.utils import ItemStats
 from mirt.utils import itemstats as exported_itemstats
@@ -140,6 +142,88 @@ def test_traditional_python_fallback_matches_native(
     fallback = traditional(responses).alpha_if_deleted
 
     np.testing.assert_allclose(fallback, native)
+
+
+def test_alpha_if_deleted_batches_match_scalar_sparse_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(20260828)
+    responses = rng.integers(0, 2, size=(37, 13)).astype(np.float64)
+    responses[rng.random(responses.shape) < 0.35] = np.nan
+    responses[0] = np.nan
+    responses[0, 4] = 1.0
+    responses[1] = np.nan
+    responses[1, 9] = 0.0
+    expected = np.array(
+        [
+            classical._cronbach_alpha(np.delete(responses, item, axis=1))
+            for item in range(responses.shape[1])
+        ]
+    )
+    monkeypatch.setattr(
+        classical_core,
+        "_ALPHA_DELETED_CHUNK_ELEMENTS",
+        responses.shape[0] * 3,
+    )
+
+    actual = classical._alpha_if_deleted_numpy(responses)
+
+    np.testing.assert_allclose(
+        actual,
+        expected,
+        rtol=4 * np.finfo(np.float64).eps,
+        atol=4 * np.finfo(np.float64).eps,
+    )
+
+
+@pytest.mark.skipif(not classical.RUST_AVAILABLE, reason="native extension unavailable")
+def test_alpha_if_deleted_native_matches_sparse_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = np.array(
+        [
+            [1.0, np.nan, np.nan, np.nan],
+            [np.nan, 1.0, np.nan, np.nan],
+            [0.0, 1.0, 1.0, np.nan],
+            [1.0, 0.0, np.nan, 1.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    native = traditional(responses).alpha_if_deleted
+    monkeypatch.setattr(classical, "RUST_AVAILABLE", False)
+
+    fallback = traditional(responses).alpha_if_deleted
+
+    np.testing.assert_allclose(
+        native,
+        fallback,
+        rtol=4 * np.finfo(np.float64).eps,
+        atol=4 * np.finfo(np.float64).eps,
+    )
+
+
+def test_alpha_if_deleted_with_two_items_is_zero() -> None:
+    result = traditional([[0, 1], [1, 0], [1, 1]])
+
+    np.testing.assert_array_equal(result.alpha_if_deleted, np.zeros(2))
+
+
+def test_direct_backend_fallback_uses_shared_alpha_kernel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = np.array(
+        [
+            [1.0, np.nan, 0.0, 1.0],
+            [0.0, 1.0, np.nan, 1.0],
+            [1.0, 0.0, 1.0, 0.0],
+        ]
+    )
+    monkeypatch.setattr(polytomous_backend, "rust_enabled", lambda: False)
+
+    actual = polytomous_backend.compute_alpha_if_deleted(responses)
+    expected = classical_core._alpha_if_deleted_numpy(responses)
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_traditional_supports_uncorrected_correlations() -> None:
