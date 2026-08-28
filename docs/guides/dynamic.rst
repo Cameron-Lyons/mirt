@@ -102,14 +102,14 @@ model. The batch filter updates every learner in one vectorized call:
        state_model.extended_kalman_smoother_batch(responses)
    )
 
-   future_means, future_variances = state_model.forecast_batch(
+   future = state_model.forecast_summary_batch(
        responses,
        n_steps=4,
    )
-   future_success = state_model.forecast_response_probabilities_batch(
-       responses,
-       n_steps=4,
-   )
+   future_means = future.state_means
+   future_variances = future.state_variances
+   future_success = future.response_probabilities
+   future_lower, future_upper = future.state_interval(confidence=0.95)
    print(future_success.shape)  # (500, 4, 20)
 
    causal_state_means = diagnostics.predicted_means
@@ -147,13 +147,12 @@ refiltering the complete history:
        prior_mean = step.next_mean
        prior_variance = step.next_variance
 
-   future_success = (
-       state_model.forecast_response_probabilities_from_state(
-           step.updated_mean,
-           step.updated_variance,
-           n_steps=4,
-       )
+   future = state_model.forecast_summary_from_state(
+       step.updated_mean,
+       step.updated_variance,
+       n_steps=4,
    )
+   future_success = future.response_probabilities
 
 ``online_step`` predicts marginal item success, scores the joint observed
 pattern, updates the state, and prepares the next prior in one quadrature pass.
@@ -181,7 +180,10 @@ with ``n_quadpts``. Use ``forecast`` and
 posterior state is already available, ``forecast_from_state`` and
 ``forecast_response_probabilities_from_state`` produce the same multi-step
 forecasts without replaying earlier responses. Their ``_batch`` variants
-accept one current state per learner.
+accept one current state per learner. ``forecast_summary`` and
+``forecast_summary_from_state`` combine latent moments and response
+probabilities in one result, and provide dependency-free Gaussian state
+intervals. Use their ``_batch`` variants for multiple learners.
 
 Predictive log likelihoods score each observed item pattern against the state
 distribution implied by earlier occasions. Items at the same occasion are

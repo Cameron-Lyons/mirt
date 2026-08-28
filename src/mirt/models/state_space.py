@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Literal
 
 import numpy as np
@@ -14,6 +15,26 @@ from mirt.constants import PROB_EPSILON
 from mirt.utils.numeric import standard_normal_quadrature
 
 _STATE_SPACE_MAX_PROBABILITY_VALUES = 1_000_000
+_STANDARD_NORMAL = NormalDist()
+
+
+def _state_interval(
+    means: NDArray[np.float64],
+    variances: NDArray[np.float64],
+    confidence: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return a validated central Gaussian interval for state moments."""
+    if isinstance(confidence, (bool, np.bool_)) or not isinstance(
+        confidence,
+        (int, float, np.integer, np.floating),
+    ):
+        raise ValueError("confidence must be a finite value in (0, 1)")
+    confidence_value = float(confidence)
+    if not np.isfinite(confidence_value) or not 0.0 < confidence_value < 1.0:
+        raise ValueError("confidence must be a finite value in (0, 1)")
+    critical_value = _STANDARD_NORMAL.inv_cdf((1.0 + confidence_value) / 2.0)
+    radius = critical_value * np.sqrt(variances)
+    return means - radius, means + radius
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +134,63 @@ class StateSpaceBatchPredictiveResult:
     def total_log_likelihoods(self) -> NDArray[np.float64]:
         """Joint predictive log-likelihood totals for each person."""
         return np.sum(self.response_log_likelihoods, axis=1)
+
+
+@dataclass(frozen=True, slots=True)
+class StateSpaceForecastResult:
+    """Latent-state and response forecasts for one person."""
+
+    state_means: NDArray[np.float64]
+    state_variances: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+
+    @property
+    def n_steps(self) -> int:
+        """Number of future occasions represented by the result."""
+        return int(self.state_means.size)
+
+    @property
+    def state_standard_deviations(self) -> NDArray[np.float64]:
+        """Standard deviations of the Gaussian state forecasts."""
+        return np.sqrt(self.state_variances)
+
+    def state_interval(
+        self,
+        confidence: float = 0.95,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return a central Gaussian interval for every forecast state."""
+        return _state_interval(self.state_means, self.state_variances, confidence)
+
+
+@dataclass(frozen=True, slots=True)
+class StateSpaceBatchForecastResult:
+    """Latent-state and response forecasts for multiple people."""
+
+    state_means: NDArray[np.float64]
+    state_variances: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of people represented by the result."""
+        return int(self.state_means.shape[0])
+
+    @property
+    def n_steps(self) -> int:
+        """Number of future occasions represented by the result."""
+        return int(self.state_means.shape[1])
+
+    @property
+    def state_standard_deviations(self) -> NDArray[np.float64]:
+        """Standard deviations of the Gaussian state forecasts."""
+        return np.sqrt(self.state_variances)
+
+    def state_interval(
+        self,
+        confidence: float = 0.95,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return central Gaussian intervals for every forecast state."""
+        return _state_interval(self.state_means, self.state_variances, confidence)
 
 
 @dataclass
@@ -1198,6 +1276,117 @@ class StateSpaceIRT:
             n_steps,
         )
         return self._integrated_observation_probabilities(
+            forecast_means,
+            forecast_variances,
+            n_quadpts,
+        )
+
+    def _build_forecast_summary(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> StateSpaceBatchForecastResult:
+        """Combine validated forecast moments and response probabilities."""
+        response_probabilities = self._integrated_observation_probabilities(
+            state_means,
+            state_variances,
+            n_quadpts,
+        )
+        return StateSpaceBatchForecastResult(
+            state_means=state_means,
+            state_variances=state_variances,
+            response_probabilities=response_probabilities,
+        )
+
+    @staticmethod
+    def _single_forecast_summary(
+        result: StateSpaceBatchForecastResult,
+    ) -> StateSpaceForecastResult:
+        """Copy one row from a batched forecast summary."""
+        return StateSpaceForecastResult(
+            state_means=result.state_means[0].copy(),
+            state_variances=result.state_variances[0].copy(),
+            response_probabilities=result.response_probabilities[0].copy(),
+        )
+
+    def forecast_summary(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpaceForecastResult:
+        """Forecast latent states and item probabilities for one history."""
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_filter_responses(responses, batch=False)
+        result = self.forecast_summary_batch(
+            response_values[None, :, :],
+            n_steps,
+            n_quadpts=n_quadpts,
+        )
+        return self._single_forecast_summary(result)
+
+    def forecast_summary_batch(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpaceBatchForecastResult:
+        """Forecast latent states and item probabilities for many histories.
+
+        Filtering and state propagation are shared across all returned fields.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        state_means, state_variances = self.forecast_batch(responses, n_steps)
+        return self._build_forecast_summary(
+            state_means,
+            state_variances,
+            n_quadpts,
+        )
+
+    def forecast_summary_from_state(
+        self,
+        state_mean: float,
+        state_variance: float,
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpaceForecastResult:
+        """Forecast states and item probabilities from one posterior state."""
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        state_means, state_variances = self.forecast_from_state(
+            state_mean,
+            state_variance,
+            n_steps,
+        )
+        result = self._build_forecast_summary(
+            state_means[None, :],
+            state_variances[None, :],
+            n_quadpts,
+        )
+        return self._single_forecast_summary(result)
+
+    def forecast_summary_from_state_batch(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: float | NDArray[np.float64],
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpaceBatchForecastResult:
+        """Forecast states and item probabilities from many posterior states.
+
+        State propagation is shared across all returned fields.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        forecast_means, forecast_variances = self.forecast_from_state_batch(
+            state_means,
+            state_variances,
+            n_steps,
+        )
+        return self._build_forecast_summary(
             forecast_means,
             forecast_variances,
             n_quadpts,
