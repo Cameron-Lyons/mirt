@@ -147,6 +147,8 @@ refiltering the complete history:
        )
        predicted_success = step.response_probabilities
        response_log_score = step.response_log_likelihood
+       item_log_scores = step.item_log_likelihoods
+       predictive_residuals = step.standardized_residuals
        online_means.append(step.updated_mean)
        prior_mean = step.next_mean
        prior_variance = step.next_variance
@@ -154,7 +156,9 @@ refiltering the complete history:
 ``online_step`` predicts marginal item success, scores the joint observed
 pattern, updates the state, and prepares the next prior in one quadrature pass.
 ``online_step_batch`` returns the same fields as arrays for many learners and
-accepts either shared scalar priors or one prior per learner.
+accepts either shared scalar priors or one prior per learner. Both results also
+include item-level marginal log scores, raw residuals, and Pearson residuals;
+missing item diagnostics are ``numpy.nan``.
 
 ``extended_kalman_update_batch`` performs the same one-occasion update for
 many learners, accepting either shared scalar priors or one prior per learner.

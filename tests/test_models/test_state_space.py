@@ -790,6 +790,20 @@ class TestStateSpaceIRT:
             prior_variances=prior_variances,
         )
         expected_next = model.propagate_state_batch(*expected_updated)
+        observed = responses >= 0
+        expected_item_scores = np.where(
+            responses == 1,
+            np.log(expected_probabilities),
+            np.where(responses == 0, np.log1p(-expected_probabilities), np.nan),
+        )
+        expected_residuals = np.where(
+            observed,
+            responses - expected_probabilities,
+            np.nan,
+        )
+        expected_standardized = expected_residuals / np.sqrt(
+            expected_probabilities * (1.0 - expected_probabilities)
+        )
 
         result = model.online_step_batch(
             responses,
@@ -802,12 +816,26 @@ class TestStateSpaceIRT:
         assert result.n_persons == len(responses)
         assert_allclose(result.response_probabilities, expected_probabilities)
         assert_allclose(result.response_log_likelihoods, expected_scores)
+        assert_allclose(
+            result.item_log_likelihoods,
+            expected_item_scores,
+            equal_nan=True,
+        )
+        assert_allclose(result.residuals, expected_residuals, equal_nan=True)
+        assert_allclose(
+            result.standardized_residuals,
+            expected_standardized,
+            equal_nan=True,
+        )
         assert_allclose(result.updated_means, expected_updated[0])
         assert_allclose(result.updated_variances, expected_updated[1])
         assert_allclose(result.next_means, expected_next[0])
         assert_allclose(result.next_variances, expected_next[1])
         assert result.updated_means[2] == prior_means[2]
         assert result.updated_variances[2] == prior_variances[2]
+        assert np.all(np.isnan(result.item_log_likelihoods[2]))
+        assert np.all(np.isnan(result.residuals[2]))
+        assert np.all(np.isnan(result.standardized_residuals[2]))
 
         for person_index in range(len(responses)):
             scalar = model.online_step(
@@ -823,6 +851,21 @@ class TestStateSpaceIRT:
             )
             assert scalar.response_log_likelihood == pytest.approx(
                 result.response_log_likelihoods[person_index]
+            )
+            assert_allclose(
+                scalar.item_log_likelihoods,
+                result.item_log_likelihoods[person_index],
+                equal_nan=True,
+            )
+            assert_allclose(
+                scalar.residuals,
+                result.residuals[person_index],
+                equal_nan=True,
+            )
+            assert_allclose(
+                scalar.standardized_residuals,
+                result.standardized_residuals[person_index],
+                equal_nan=True,
             )
             assert scalar.updated_mean == pytest.approx(
                 result.updated_means[person_index]
@@ -863,6 +906,15 @@ class TestStateSpaceIRT:
             n_quadpts=31,
             pointwise=True,
         )
+        history_residuals = model.predictive_residuals_batch(
+            responses,
+            n_quadpts=31,
+        )
+        history_standardized_residuals = model.predictive_residuals_batch(
+            responses,
+            n_quadpts=31,
+            standardized=True,
+        )
         history_means, history_variances = model.extended_kalman_filter_batch(responses)
         prior_means = np.full(len(responses), model.initial_mean)
         prior_variances = np.full(len(responses), model.initial_var)
@@ -881,6 +933,31 @@ class TestStateSpaceIRT:
             assert_allclose(
                 result.response_log_likelihoods,
                 history_scores[:, time_index],
+            )
+            assert_allclose(
+                result.residuals,
+                history_residuals[:, time_index],
+                equal_nan=True,
+            )
+            assert_allclose(
+                result.standardized_residuals,
+                history_standardized_residuals[:, time_index],
+                equal_nan=True,
+            )
+            time_responses = responses[:, time_index]
+            expected_item_scores = np.where(
+                time_responses == 1,
+                np.log(result.response_probabilities),
+                np.where(
+                    time_responses == 0,
+                    np.log1p(-result.response_probabilities),
+                    np.nan,
+                ),
+            )
+            assert_allclose(
+                result.item_log_likelihoods,
+                expected_item_scores,
+                equal_nan=True,
             )
             assert_allclose(result.updated_means, history_means[:, time_index])
             assert_allclose(result.updated_variances, history_variances[:, time_index])
@@ -905,10 +982,36 @@ class TestStateSpaceIRT:
         assert result.response_log_likelihood == pytest.approx(
             expected.response_log_likelihoods[0]
         )
+        assert_allclose(
+            result.item_log_likelihoods,
+            expected.item_log_likelihoods[0],
+            equal_nan=True,
+        )
+        assert_allclose(result.residuals, expected.residuals[0], equal_nan=True)
+        assert_allclose(
+            result.standardized_residuals,
+            expected.standardized_residuals[0],
+            equal_nan=True,
+        )
         assert result.updated_mean == pytest.approx(expected.updated_means[0])
         assert result.updated_variance == pytest.approx(expected.updated_variances[0])
         assert result.next_mean == pytest.approx(expected.next_means[0])
         assert result.next_variance == pytest.approx(expected.next_variances[0])
+
+    def test_online_item_diagnostics_remain_finite_for_extreme_items(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=2,
+            discrimination=np.array([50.0, 100.0, 150.0, 200.0]),
+            difficulty=np.array([-100.0, -50.0, 50.0, 100.0]),
+        )
+        responses = np.array([0, 1, 0, 1], dtype=np.int32)
+
+        result = model.online_step(responses, prior_mean=0.0, prior_variance=0.5)
+
+        assert np.all(np.isfinite(result.item_log_likelihoods))
+        assert np.all(np.isfinite(result.residuals))
+        assert np.all(np.isfinite(result.standardized_residuals))
 
     @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
     def test_online_steps_require_positive_quadrature_count(self, n_quadpts):

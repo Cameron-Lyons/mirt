@@ -18,10 +18,18 @@ _STATE_SPACE_MAX_PROBABILITY_VALUES = 1_000_000
 
 @dataclass(frozen=True, slots=True)
 class StateSpaceStepResult:
-    """Prediction and state update from one response occasion."""
+    """Prediction and state update from one response occasion.
+
+    The response log likelihood is joint over observed items. Item log
+    likelihoods and residuals use the marginal item probabilities and contain
+    ``numpy.nan`` at missing responses.
+    """
 
     response_probabilities: NDArray[np.float64]
     response_log_likelihood: float
+    item_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
     updated_mean: float
     updated_variance: float
     next_mean: float
@@ -30,10 +38,17 @@ class StateSpaceStepResult:
 
 @dataclass(frozen=True, slots=True)
 class StateSpaceBatchStepResult:
-    """Vectorized predictions and state updates from one occasion."""
+    """Vectorized predictions and state updates from one occasion.
+
+    Item log likelihoods and residuals have shape
+    ``(n_persons, n_items)`` and contain ``numpy.nan`` at missing responses.
+    """
 
     response_probabilities: NDArray[np.float64]
     response_log_likelihoods: NDArray[np.float64]
+    item_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
     updated_means: NDArray[np.float64]
     updated_variances: NDArray[np.float64]
     next_means: NDArray[np.float64]
@@ -1121,6 +1136,41 @@ class StateSpaceIRT:
         )
         return response_probabilities, scores.reshape(state_means.shape)
 
+    @staticmethod
+    def _item_response_diagnostics(
+        responses: NDArray[np.int_],
+        probabilities: NDArray[np.float64],
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return missing-aware item log scores and predictive residuals."""
+        observed = responses >= 0
+        correct = responses == 1
+        incorrect = responses == 0
+        safe_probabilities = np.clip(
+            probabilities,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        item_log_likelihoods = np.where(
+            correct,
+            np.log(safe_probabilities),
+            np.where(incorrect, np.log1p(-safe_probabilities), np.nan),
+        )
+        residuals = np.where(
+            observed,
+            responses - probabilities,
+            np.nan,
+        )
+        response_variances = np.maximum(
+            probabilities * (1.0 - probabilities),
+            PROB_EPSILON,
+        )
+        standardized_residuals = residuals / np.sqrt(response_variances)
+        return item_log_likelihoods, residuals, standardized_residuals
+
     def state_response_log_likelihood(
         self,
         responses: NDArray[np.int_],
@@ -1236,6 +1286,12 @@ class StateSpaceIRT:
                 n_quadpts,
             )
         )
+        item_log_likelihoods, residuals, standardized_residuals = (
+            self._item_response_diagnostics(
+                responses,
+                response_probabilities,
+            )
+        )
         updated_means, updated_variances = self._extended_kalman_update_batch(
             responses,
             prior_means,
@@ -1249,6 +1305,9 @@ class StateSpaceIRT:
         return StateSpaceBatchStepResult(
             response_probabilities=response_probabilities,
             response_log_likelihoods=response_log_likelihoods,
+            item_log_likelihoods=item_log_likelihoods,
+            residuals=residuals,
+            standardized_residuals=standardized_residuals,
             updated_means=updated_means,
             updated_variances=updated_variances,
             next_means=next_means,
@@ -1309,6 +1368,9 @@ class StateSpaceIRT:
         return StateSpaceStepResult(
             response_probabilities=result.response_probabilities[0].copy(),
             response_log_likelihood=float(result.response_log_likelihoods[0]),
+            item_log_likelihoods=result.item_log_likelihoods[0].copy(),
+            residuals=result.residuals[0].copy(),
+            standardized_residuals=result.standardized_residuals[0].copy(),
             updated_mean=float(result.updated_means[0]),
             updated_variance=float(result.updated_variances[0]),
             next_mean=float(result.next_means[0]),
@@ -1485,17 +1547,12 @@ class StateSpaceIRT:
             predicted_variances,
             n_quadpts,
         )
-        residuals = np.where(
-            response_values >= 0,
-            response_values - probabilities,
-            np.nan,
+        _, residuals, standardized_residuals = self._item_response_diagnostics(
+            response_values,
+            probabilities,
         )
         if standardized:
-            response_variance = np.maximum(
-                probabilities * (1.0 - probabilities),
-                PROB_EPSILON,
-            )
-            residuals = residuals / np.sqrt(response_variance)
+            return standardized_residuals
         return residuals
 
     def predictive_log_likelihood(
