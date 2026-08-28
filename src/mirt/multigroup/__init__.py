@@ -26,26 +26,41 @@ Examples
 
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any, Literal
 
-import numpy as np
-from numpy.typing import NDArray
-
-from mirt.multigroup.estimator import MultigroupEMEstimator
-from mirt.multigroup.invariance import (
-    InvarianceSpec,
-    InvarianceTestResult,
-    get_invariance_hierarchy_pairs,
-    invariance_lrt,
-    parse_invariance,
-    test_invariance_step,
-)
-from mirt.multigroup.latent import GroupLatentDistribution, MultigroupLatentDensity
-from mirt.multigroup.model import MultigroupModel, ParameterLink
-from mirt.multigroup.results import MultigroupFitResult
-
 if TYPE_CHECKING:
-    pass
+    import numpy as np
+    from numpy.typing import NDArray
+
+    from mirt.multigroup.invariance import InvarianceSpec
+    from mirt.multigroup.results import MultigroupFitResult
+
+
+_LAZY_IMPORTS = {
+    "MultigroupFitResult": ("mirt.multigroup.results", "MultigroupFitResult"),
+    "MultigroupModel": ("mirt.multigroup.model", "MultigroupModel"),
+    "MultigroupEMEstimator": (
+        "mirt.multigroup.estimator",
+        "MultigroupEMEstimator",
+    ),
+    "MultigroupLatentDensity": (
+        "mirt.multigroup.latent",
+        "MultigroupLatentDensity",
+    ),
+    "GroupLatentDistribution": (
+        "mirt.multigroup.latent",
+        "GroupLatentDistribution",
+    ),
+    "InvarianceSpec": ("mirt.multigroup.invariance", "InvarianceSpec"),
+    "InvarianceTestResult": (
+        "mirt.multigroup.invariance",
+        "InvarianceTestResult",
+    ),
+    "ParameterLink": ("mirt.multigroup.model", "ParameterLink"),
+    "invariance_lrt": ("mirt.multigroup.invariance", "invariance_lrt"),
+    "parse_invariance": ("mirt.multigroup.invariance", "parse_invariance"),
+}
 
 
 def fit_multigroup(
@@ -117,6 +132,8 @@ def fit_multigroup(
     ...     free_items={"discrimination": [5]}
     ... )
     """
+    import numpy as np
+
     from mirt.models.dichotomous import (
         FourParameterLogistic,
         OneParameterLogistic,
@@ -129,6 +146,9 @@ def fit_multigroup(
         NominalResponseModel,
         PartialCreditModel,
     )
+    from mirt.multigroup.estimator import MultigroupEMEstimator
+    from mirt.multigroup.invariance import parse_invariance
+    from mirt.multigroup.model import MultigroupModel
 
     data = np.asarray(data)
     groups = np.asarray(groups)
@@ -326,6 +346,11 @@ def test_invariance_hierarchy(
         Dictionary with 'results' (fit results per level) and
         'comparisons' (LRT test results).
     """
+    from mirt.multigroup.invariance import (
+        get_invariance_hierarchy_pairs,
+        test_invariance_step,
+    )
+
     results = compare_invariance(
         data=data,
         groups=groups,
@@ -390,3 +415,17 @@ __all__ = [
     "invariance_lrt",
     "parse_invariance",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_IMPORTS:
+        module_name, symbol_name = _LAZY_IMPORTS[name]
+        module = importlib.import_module(module_name)
+        value = getattr(module, symbol_name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'mirt.multigroup' has no attribute '{name}'")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
