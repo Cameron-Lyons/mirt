@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
@@ -9,8 +8,114 @@ from numpy.typing import NDArray
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 
-if TYPE_CHECKING:
-    pass
+
+def _positive_integer(value: int, name: str, minimum: int = 1) -> int:
+    """Return a validated positive integer configuration value."""
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < minimum
+    ):
+        qualifier = f"at least {minimum}" if minimum > 1 else "positive"
+        raise ValueError(f"{name} must be an integer that is {qualifier}")
+    return int(value)
+
+
+def _boolean(value: bool, name: str) -> bool:
+    """Return a validated Boolean flag."""
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{name} must be a boolean")
+    return bool(value)
+
+
+def _group_index(group_idx: int, n_groups: int) -> int:
+    """Return a validated group index without accepting Boolean aliases."""
+    if isinstance(group_idx, (bool, np.bool_)) or not isinstance(
+        group_idx, (int, np.integer)
+    ):
+        raise TypeError("group_idx must be an integer")
+    index = int(group_idx)
+    if index < 0 or index >= n_groups:
+        raise IndexError(f"group_idx {index} out of range [0, {n_groups})")
+    return index
+
+
+def _validated_gaussian_parameters(
+    mean: NDArray[np.float64],
+    cov: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Validate and copy a finite, nondegenerate Gaussian specification."""
+    mean_array = np.asarray(mean, dtype=np.float64)
+    if mean_array.ndim != 1 or mean_array.size == 0:
+        raise ValueError("mean must be a nonempty one-dimensional array")
+    if not np.all(np.isfinite(mean_array)):
+        raise ValueError("mean must contain only finite values")
+
+    covariance = np.asarray(cov, dtype=np.float64)
+    expected_shape = (mean_array.size, mean_array.size)
+    if covariance.shape != expected_shape:
+        raise ValueError(f"cov must have shape {expected_shape}")
+    if not np.all(np.isfinite(covariance)):
+        raise ValueError("cov must contain only finite values")
+    if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-12):
+        raise ValueError("cov must be symmetric")
+
+    covariance = (covariance + covariance.T) * 0.5
+    try:
+        cholesky = np.linalg.cholesky(covariance)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("cov must be positive definite") from exc
+    return mean_array.copy(), covariance.copy(), cholesky
+
+
+def _theta_points(
+    theta: NDArray[np.float64],
+    n_factors: int,
+) -> NDArray[np.float64]:
+    """Normalize scalar, vector, and matrix theta input to point rows."""
+    points = np.asarray(theta, dtype=np.float64)
+    if points.ndim == 0:
+        if n_factors != 1:
+            raise ValueError(f"theta must have {n_factors} columns")
+        points = points.reshape(1, 1)
+    elif points.ndim == 1:
+        if n_factors == 1:
+            points = points[:, None]
+        elif points.shape == (n_factors,):
+            points = points[None, :]
+        else:
+            raise ValueError(f"theta must have shape (n_points, {n_factors})")
+    elif points.ndim != 2 or points.shape[1] != n_factors:
+        raise ValueError(f"theta must have shape (n_points, {n_factors})")
+
+    if not np.all(np.isfinite(points)):
+        raise ValueError("theta must contain only finite values")
+    return points
+
+
+def _posterior_weights(
+    weights: NDArray[np.float64],
+    n_points: int,
+) -> NDArray[np.float64]:
+    """Validate posterior counts and return stable normalized weights."""
+    values = np.asarray(weights, dtype=np.float64)
+    if values.shape != (n_points,):
+        raise ValueError(f"weights must have shape ({n_points},)")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("weights must contain only finite values")
+    if np.any(values < 0.0):
+        raise ValueError("weights must be non-negative")
+
+    with np.errstate(over="ignore"):
+        total = float(np.sum(values))
+    if total < PROB_EPSILON:
+        return np.empty(0, dtype=np.float64)
+    if np.isfinite(total):
+        return values / total
+
+    maximum = float(np.max(values))
+    scaled = values / maximum
+    return scaled / np.sum(scaled)
 
 
 @dataclass
@@ -37,27 +142,61 @@ class GroupLatentDistribution:
     estimate_mean: bool = True
     estimate_cov: bool = True
     _precision: NDArray[np.float64] = field(init=False, repr=False)
+    _cov_snapshot: NDArray[np.float64] = field(init=False, repr=False)
     _log_det: float = field(init=False, repr=False)
     _log_norm: float = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.mean = np.asarray(self.mean, dtype=np.float64)
-        self.cov = np.asarray(self.cov, dtype=np.float64)
+        self.is_reference = _boolean(self.is_reference, "is_reference")
+        self.estimate_mean = _boolean(self.estimate_mean, "estimate_mean")
+        self.estimate_cov = _boolean(self.estimate_cov, "estimate_cov")
         if self.is_reference:
             self.estimate_mean = False
             self.estimate_cov = False
         self._update_precision()
 
+    def _set_parameters(
+        self,
+        mean: NDArray[np.float64],
+        cov: NDArray[np.float64],
+    ) -> None:
+        """Validate and atomically install Gaussian parameters and caches."""
+        mean, covariance, cholesky = _validated_gaussian_parameters(mean, cov)
+        identity = np.eye(mean.size, dtype=np.float64)
+        precision = np.linalg.solve(cholesky.T, np.linalg.solve(cholesky, identity))
+        log_det = float(2.0 * np.sum(np.log(np.diag(cholesky))))
+        log_norm = -0.5 * (mean.size * np.log(2 * np.pi) + log_det)
+
+        self.mean = mean
+        self.cov = covariance
+        self._precision = precision
+        self._cov_snapshot = covariance.copy()
+        self._log_det = log_det
+        self._log_norm = log_norm
+
     def _update_precision(self) -> None:
-        """Update precision matrix and normalizing constant."""
-        n_factors = len(self.mean)
-        try:
-            self._precision = np.linalg.inv(self.cov)
-        except np.linalg.LinAlgError:
-            self._precision = np.linalg.pinv(self.cov)
-        sign, log_det = np.linalg.slogdet(self.cov)
-        self._log_det = log_det if sign > 0 else -np.inf
-        self._log_norm = -0.5 * (n_factors * np.log(2 * np.pi) + self._log_det)
+        """Validate public fields and atomically refresh matrix caches."""
+        self._set_parameters(self.mean, self.cov)
+
+    def _validated_state(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Validate public fields and refresh a cache after direct mutation."""
+        mean = np.asarray(self.mean, dtype=np.float64)
+        covariance = np.asarray(self.cov, dtype=np.float64)
+        expected_shape = (mean.size, mean.size) if mean.ndim == 1 else (-1, -1)
+        if (
+            mean.ndim != 1
+            or mean.size == 0
+            or not np.all(np.isfinite(mean))
+            or covariance.shape != expected_shape
+            or not np.all(np.isfinite(covariance))
+        ):
+            _validated_gaussian_parameters(mean, covariance)
+        if not np.array_equal(covariance, self._cov_snapshot):
+            self._update_precision()
+            return self.mean, self.cov
+        return mean, covariance
 
     def log_density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute log density at theta points.
@@ -72,9 +211,11 @@ class GroupLatentDistribution:
         ndarray
             Log density values, shape (n_points,).
         """
-        theta = np.atleast_2d(theta)
-        diff = theta - self.mean
+        mean, _ = self._validated_state()
+        points = _theta_points(theta, mean.size)
+        diff = points - mean
         mahal = np.sum(diff @ self._precision * diff, axis=1)
+        mahal = np.maximum(mahal, 0.0)
         return self._log_norm - 0.5 * mahal
 
     def log_quadrature_mass(
@@ -83,14 +224,17 @@ class GroupLatentDistribution:
         quadrature_weights: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Return normalized group-prior masses on standard-normal GH nodes."""
+        mean, covariance = self._validated_state()
+        points = _theta_points(theta, mean.size)
         return gaussian_log_quadrature_mass(
-            theta, quadrature_weights, self.mean, self.cov
+            points, quadrature_weights, mean, covariance
         )
 
     @property
     def n_factors(self) -> int:
         """Number of latent factors."""
-        return len(self.mean)
+        mean, _ = self._validated_state()
+        return mean.size
 
     @property
     def n_free_parameters(self) -> int:
@@ -135,10 +279,13 @@ class MultigroupLatentDensity:
         n_factors: int = 1,
         reference_group: int = 0,
     ) -> None:
-        if n_groups < 2:
-            raise ValueError("n_groups must be at least 2")
-        if n_factors < 1:
-            raise ValueError("n_factors must be at least 1")
+        n_groups = _positive_integer(n_groups, "n_groups", minimum=2)
+        n_factors = _positive_integer(n_factors, "n_factors")
+        if isinstance(reference_group, (bool, np.bool_)) or not isinstance(
+            reference_group, (int, np.integer)
+        ):
+            raise TypeError("reference_group must be an integer")
+        reference_group = int(reference_group)
         if reference_group < 0 or reference_group >= n_groups:
             raise ValueError(
                 f"reference_group must be in [0, {n_groups}), got {reference_group}"
@@ -160,6 +307,10 @@ class MultigroupLatentDensity:
             )
             self.distributions.append(dist)
 
+    def _distribution(self, group_idx: int) -> GroupLatentDistribution:
+        """Return a distribution after consistently validating its index."""
+        return self.distributions[_group_index(group_idx, self.n_groups)]
+
     def log_density(
         self,
         theta: NDArray[np.float64],
@@ -179,9 +330,22 @@ class MultigroupLatentDensity:
         ndarray
             Log density values, shape (n_points,).
         """
-        if group_idx < 0 or group_idx >= self.n_groups:
-            raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
-        return self.distributions[group_idx].log_density(theta)
+        return self._distribution(group_idx).log_density(theta)
+
+    def log_density_all(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute log densities for every group in one aligned matrix.
+
+        Returns an array with shape ``(n_points, n_groups)``. A vector is
+        interpreted as multiple points for a unidimensional density and as
+        one point for a multidimensional density.
+        """
+        points = _theta_points(theta, self.n_factors)
+        return np.column_stack(
+            [distribution.log_density(points) for distribution in self.distributions]
+        )
 
     def log_quadrature_mass(
         self,
@@ -190,9 +354,7 @@ class MultigroupLatentDensity:
         group_idx: int,
     ) -> NDArray[np.float64]:
         """Return normalized prior masses for one group."""
-        if group_idx < 0 or group_idx >= self.n_groups:
-            raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
-        return self.distributions[group_idx].log_quadrature_mass(
+        return self._distribution(group_idx).log_quadrature_mass(
             theta, quadrature_weights
         )
 
@@ -213,40 +375,35 @@ class MultigroupLatentDensity:
         group_idx : int
             Group index to update.
         """
-        if group_idx < 0 or group_idx >= self.n_groups:
-            raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
-
-        dist = self.distributions[group_idx]
-        if dist.is_reference:
+        dist = self._distribution(group_idx)
+        theta_array = _theta_points(theta_points, self.n_factors)
+        weights_norm = _posterior_weights(weights, len(theta_array))
+        if dist.is_reference or weights_norm.size == 0:
             return
 
-        weights_sum = weights.sum()
-        if weights_sum < PROB_EPSILON:
-            return
-
-        weights_norm = weights / weights_sum
+        mean = dist.mean
+        covariance = dist.cov
 
         if dist.estimate_mean:
-            dist.mean = np.sum(weights_norm[:, None] * theta_points, axis=0)
+            mean = weights_norm @ theta_array
 
         if dist.estimate_cov:
-            diff = theta_points - dist.mean
-            dist.cov = np.sum(
-                weights_norm[:, None, None] * (diff[:, :, None] * diff[:, None, :]),
-                axis=0,
-            )
-            dist.cov = (dist.cov + dist.cov.T) / 2
-            dist.cov += REGULARIZATION_EPSILON * np.eye(self.n_factors)
+            diff = theta_array - mean
+            covariance = diff.T @ (weights_norm[:, None] * diff)
+            covariance = (covariance + covariance.T) * 0.5
+            covariance += REGULARIZATION_EPSILON * np.eye(self.n_factors)
 
-        dist._update_precision()
+        dist._set_parameters(mean, covariance)
 
     def get_group_mean(self, group_idx: int) -> NDArray[np.float64]:
         """Get mean for a specific group."""
-        return self.distributions[group_idx].mean.copy()
+        mean, _ = self._distribution(group_idx)._validated_state()
+        return mean.copy()
 
     def get_group_cov(self, group_idx: int) -> NDArray[np.float64]:
         """Get covariance for a specific group."""
-        return self.distributions[group_idx].cov.copy()
+        _, covariance = self._distribution(group_idx)._validated_state()
+        return covariance.copy()
 
     def set_group_distribution(
         self,
@@ -265,18 +422,13 @@ class MultigroupLatentDensity:
         cov : ndarray, optional
             New covariance matrix.
         """
-        if group_idx < 0 or group_idx >= self.n_groups:
-            raise IndexError(f"group_idx {group_idx} out of range [0, {self.n_groups})")
-
-        dist = self.distributions[group_idx]
+        dist = self._distribution(group_idx)
         if dist.is_reference:
             raise ValueError("Cannot modify reference group distribution")
 
-        if mean is not None:
-            dist.mean = np.asarray(mean, dtype=np.float64)
-        if cov is not None:
-            dist.cov = np.asarray(cov, dtype=np.float64)
-        dist._update_precision()
+        candidate_mean = dist.mean if mean is None else mean
+        candidate_cov = dist.cov if cov is None else cov
+        dist._set_parameters(candidate_mean, candidate_cov)
 
     @property
     def n_parameters(self) -> int:
@@ -293,9 +445,10 @@ class MultigroupLatentDensity:
         """
         result = {}
         for g, dist in enumerate(self.distributions):
+            mean, covariance = dist._validated_state()
             result[g] = {
-                "mean": dist.mean.copy(),
-                "cov": dist.cov.copy(),
+                "mean": mean.copy(),
+                "cov": covariance.copy(),
                 "is_reference": dist.is_reference,
             }
         return result
