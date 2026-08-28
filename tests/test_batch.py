@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
 from typing import Any
 
@@ -86,6 +87,64 @@ def test_process_backend_reports_platform_limit(monkeypatch):
             n_jobs=2,
             parallel_backend="process",
         )
+
+
+def test_process_backend_configures_responses_through_initializer(monkeypatch):
+    initialization_args: list[tuple[Any, ...]] = []
+    submitted_args: list[tuple[Any, ...]] = []
+    monkeypatch.setattr(batch_utils, "_PROCESS_RESPONSES", None)
+
+    class ImmediateProcessPool:
+        def __init__(
+            self,
+            *,
+            initializer,
+            initargs,
+            **kwargs,
+        ):
+            del kwargs
+            initialization_args.append(initargs)
+            initializer(*initargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            del args
+
+        def submit(self, function, *args):
+            submitted_args.append(args)
+            future = Future()
+            try:
+                future.set_result(function(*args))
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    monkeypatch.setattr(batch_utils, "ProcessPoolExecutor", ImmediateProcessPool)
+    monkeypatch.setattr(
+        mirt,
+        "fit_mirt",
+        lambda data, model, **kwargs: _result(model),
+    )
+
+    batch = fit_models(
+        ["1PL", "2PL"],
+        RESPONSES,
+        n_jobs=2,
+        parallel_backend="process",
+    )
+
+    assert list(batch.results) == ["1PL", "2PL"]
+    assert len(initialization_args) == 1
+    assert len(initialization_args[0]) == 1
+    assert initialization_args[0][0] is RESPONSES
+    assert len(submitted_args) == 2
+    assert all(len(args) == 1 for args in submitted_args)
+    assert all(
+        not any(isinstance(value, np.ndarray) for value in vars(args[0]).values())
+        for args in submitted_args
+    )
 
 
 def test_fit_models_validates_responses_before_fitting(monkeypatch):
