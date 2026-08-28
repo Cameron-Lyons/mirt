@@ -47,6 +47,88 @@ def _expected_final_state(responses, anchor_model, result, n_quadpts):
     return posterior @ theta_grid, log_likelihood
 
 
+def _scalar_m_step_reference(
+    responses,
+    posterior,
+    theta_grid,
+    discrimination,
+    difficulty,
+    disc_bounds,
+    diff_bounds,
+    prob_clamp,
+    min_count,
+    min_valid_points,
+):
+    valid = (responses >= 0).astype(float)
+    correct = (responses == 1).astype(float)
+    counts = valid.T @ posterior
+    correct_counts = correct.T @ posterior
+    updated_disc = discrimination.copy()
+    updated_diff = difficulty.copy()
+    for item_index, item_counts in enumerate(counts):
+        valid_points = item_counts > min_count
+        if np.count_nonzero(valid_points) < min_valid_points:
+            continue
+        proportions = correct_counts[item_index] / np.maximum(
+            item_counts, calibration_module.PROB_EPSILON
+        )
+        proportions = np.clip(proportions, *prob_clamp)
+        logits = np.log(proportions / (1.0 - proportions))
+        theta = theta_grid[valid_points]
+        item_logits = logits[valid_points]
+        item_weights = item_counts[valid_points]
+        mean_theta = np.average(theta, weights=item_weights)
+        mean_logit = np.average(item_logits, weights=item_weights)
+        centered_theta = theta - mean_theta
+        variance = np.average(centered_theta**2, weights=item_weights)
+        if variance <= calibration_module.PROB_EPSILON:
+            continue
+        covariance = np.average(
+            centered_theta * (item_logits - mean_logit), weights=item_weights
+        )
+        updated_disc[item_index] = np.clip(covariance / variance, *disc_bounds)
+        updated_diff[item_index] = np.clip(
+            mean_theta - mean_logit / updated_disc[item_index], *diff_bounds
+        )
+    return updated_disc, updated_diff
+
+
+@pytest.mark.parametrize("min_count", [0.0, 1.0, 4.0])
+def test_vectorized_m_step_matches_scalar_reference(min_count):
+    rng = np.random.default_rng(20260828)
+    responses = rng.integers(-1, 2, size=(80, 12), dtype=np.int32)
+    responses[:, 0] = -1
+    responses[1:, 1] = -1
+    posterior = rng.random((80, 17))
+    posterior /= posterior.sum(axis=1, keepdims=True)
+    theta_grid = np.linspace(-4.0, 4.0, 17)
+    discrimination = rng.uniform(0.5, 2.0, size=12)
+    difficulty = rng.uniform(-1.0, 1.0, size=12)
+    controls = ((0.2, 5.0), (-5.0, 5.0), (0.01, 0.99), min_count, 3)
+
+    expected = _scalar_m_step_reference(
+        responses,
+        posterior,
+        theta_grid,
+        discrimination,
+        difficulty,
+        *controls,
+    )
+    actual = calibration_module._fixed_calib_m_step(
+        responses,
+        posterior,
+        theta_grid,
+        discrimination,
+        difficulty,
+        *controls,
+    )
+
+    np.testing.assert_allclose(actual[0], expected[0], rtol=1e-13, atol=1e-13)
+    np.testing.assert_allclose(actual[1], expected[1], rtol=1e-13, atol=1e-13)
+    assert actual[0][0] == discrimination[0]
+    assert actual[1][0] == difficulty[0]
+
+
 def test_negative_and_nan_missing_codes_are_equivalent(calibration_data):
     responses, anchor_model = calibration_data
     responses[::7, 0] = -9
