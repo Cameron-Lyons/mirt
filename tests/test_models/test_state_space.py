@@ -1,16 +1,32 @@
 """Tests for continuous state-space IRT models."""
 
+from dataclasses import FrozenInstanceError
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
-from mirt.models.state_space import StateSpaceIRT
+from mirt.models.state_space import (
+    StateSpaceBatchStepResult,
+    StateSpaceIRT,
+    StateSpaceStepResult,
+)
 
 
 def test_dynamic_module_reexports_state_space_model():
     from mirt.models.dynamic import StateSpaceIRT as DynamicStateSpaceIRT
 
     assert DynamicStateSpaceIRT is StateSpaceIRT
+
+
+def test_models_module_exports_state_space_step_results():
+    from mirt.models import (
+        StateSpaceBatchStepResult as PublicBatchStepResult,
+    )
+    from mirt.models import StateSpaceStepResult as PublicStepResult
+
+    assert PublicStepResult is StateSpaceStepResult
+    assert PublicBatchStepResult is StateSpaceBatchStepResult
 
 
 class TestStateSpaceIRT:
@@ -733,6 +749,95 @@ class TestStateSpaceIRT:
             assert_allclose(scalar_probabilities, probabilities[person_index])
             assert scalar_score == pytest.approx(scores[person_index])
 
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    def test_online_step_matches_individual_operations(self, base_model):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=4,
+            base_model=base_model,
+            transition_matrix=np.array([[0.85]]),
+            process_noise=np.array([[0.09]]),
+            observation_noise=0.1,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+        )
+        responses = np.array(
+            [
+                [1, 0, 1, -1, 0, 1],
+                [0, 1, -1, 1, 1, 0],
+                [-1, -1, -1, -1, -1, -1],
+                [1, 1, 0, 0, 1, 0],
+            ],
+            dtype=np.int32,
+        )
+        prior_means = np.array([-1.2, 0.4, 1.5, -0.3])
+        prior_variances = np.array([0.4, 0.75, 1.3, 0.9])
+        expected_probabilities = model.state_response_probabilities_batch(
+            prior_means,
+            prior_variances,
+            n_quadpts=31,
+        )
+        expected_scores = model.state_response_log_likelihood_batch(
+            responses,
+            prior_means,
+            prior_variances,
+            n_quadpts=31,
+        )
+        expected_updated = model.extended_kalman_update_batch(
+            responses,
+            prior_means=prior_means,
+            prior_variances=prior_variances,
+        )
+        expected_next = model.propagate_state_batch(*expected_updated)
+
+        result = model.online_step_batch(
+            responses,
+            prior_means=prior_means,
+            prior_variances=prior_variances,
+            n_quadpts=31,
+        )
+
+        assert isinstance(result, StateSpaceBatchStepResult)
+        assert result.n_persons == len(responses)
+        assert_allclose(result.response_probabilities, expected_probabilities)
+        assert_allclose(result.response_log_likelihoods, expected_scores)
+        assert_allclose(result.updated_means, expected_updated[0])
+        assert_allclose(result.updated_variances, expected_updated[1])
+        assert_allclose(result.next_means, expected_next[0])
+        assert_allclose(result.next_variances, expected_next[1])
+        assert result.updated_means[2] == prior_means[2]
+        assert result.updated_variances[2] == prior_variances[2]
+
+        for person_index in range(len(responses)):
+            scalar = model.online_step(
+                responses[person_index],
+                prior_mean=prior_means[person_index],
+                prior_variance=prior_variances[person_index],
+                n_quadpts=31,
+            )
+            assert isinstance(scalar, StateSpaceStepResult)
+            assert_allclose(
+                scalar.response_probabilities,
+                result.response_probabilities[person_index],
+            )
+            assert scalar.response_log_likelihood == pytest.approx(
+                result.response_log_likelihoods[person_index]
+            )
+            assert scalar.updated_mean == pytest.approx(
+                result.updated_means[person_index]
+            )
+            assert scalar.updated_variance == pytest.approx(
+                result.updated_variances[person_index]
+            )
+            assert scalar.next_mean == pytest.approx(result.next_means[person_index])
+            assert scalar.next_variance == pytest.approx(
+                result.next_variances[person_index]
+            )
+
+        with pytest.raises(FrozenInstanceError):
+            scalar.updated_mean = 0.0
+
     def test_streaming_predictions_and_scores_match_history_methods(self):
         model = StateSpaceIRT(
             n_items=8,
@@ -758,34 +863,67 @@ class TestStateSpaceIRT:
             n_quadpts=31,
             pointwise=True,
         )
+        history_means, history_variances = model.extended_kalman_filter_batch(responses)
         prior_means = np.full(len(responses), model.initial_mean)
         prior_variances = np.full(len(responses), model.initial_var)
 
         for time_index in range(model.n_timepoints):
-            probabilities = model.state_response_probabilities_batch(
-                prior_means,
-                prior_variances,
-                n_quadpts=31,
-            )
-            scores = model.state_response_log_likelihood_batch(
-                responses[:, time_index],
-                prior_means,
-                prior_variances,
-                n_quadpts=31,
-            )
-            assert_allclose(probabilities, history_probabilities[:, time_index])
-            assert_allclose(scores, history_scores[:, time_index])
-
-            updated_means, updated_variances = model.extended_kalman_update_batch(
+            result = model.online_step_batch(
                 responses[:, time_index],
                 prior_means=prior_means,
                 prior_variances=prior_variances,
+                n_quadpts=31,
             )
-            if time_index < model.n_timepoints - 1:
-                prior_means, prior_variances = model.propagate_state_batch(
-                    updated_means,
-                    updated_variances,
-                )
+            assert_allclose(
+                result.response_probabilities,
+                history_probabilities[:, time_index],
+            )
+            assert_allclose(
+                result.response_log_likelihoods,
+                history_scores[:, time_index],
+            )
+            assert_allclose(result.updated_means, history_means[:, time_index])
+            assert_allclose(result.updated_variances, history_variances[:, time_index])
+            prior_means = result.next_means
+            prior_variances = result.next_variances
+
+    def test_online_step_defaults_to_initial_state(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=3,
+            initial_mean=-0.3,
+            initial_var=0.8,
+        )
+        responses = np.array([1, 0, -1, 1], dtype=np.int32)
+
+        result = model.online_step(responses)
+        expected = model.online_step_batch(responses[None, :])
+
+        assert_allclose(
+            result.response_probabilities, expected.response_probabilities[0]
+        )
+        assert result.response_log_likelihood == pytest.approx(
+            expected.response_log_likelihoods[0]
+        )
+        assert result.updated_mean == pytest.approx(expected.updated_means[0])
+        assert result.updated_variance == pytest.approx(expected.updated_variances[0])
+        assert result.next_mean == pytest.approx(expected.next_means[0])
+        assert result.next_variance == pytest.approx(expected.next_variances[0])
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    def test_online_steps_require_positive_quadrature_count(self, n_quadpts):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            model.online_step_batch(responses, n_quadpts=n_quadpts)
+
+    def test_online_steps_require_positive_prior_variance(self):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros(3, dtype=np.int32)
+
+        with pytest.raises(ValueError, match="prior_variance"):
+            model.online_step(responses, prior_variance=0.0)
 
     @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
     @pytest.mark.parametrize(

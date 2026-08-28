@@ -101,7 +101,11 @@ from mirt.models.sequential import (
     ContinuationRatioModel,
     SequentialResponseModel,
 )
-from mirt.models.state_space import StateSpaceIRT
+from mirt.models.state_space import (
+    StateSpaceBatchStepResult,
+    StateSpaceIRT,
+    StateSpaceStepResult,
+)
 from mirt.models.testlet import (
     BifactorTestletModel,
     RandomTestletEffectsModel,
@@ -189,6 +193,8 @@ __all__ = [
     "LongitudinalIRTModel",
     "LongitudinalResult",
     "StateSpaceIRT",
+    "StateSpaceStepResult",
+    "StateSpaceBatchStepResult",
     "PiecewiseGrowthModel",
     "NonlinearGrowthModel",
     "GrowthMixtureModel",

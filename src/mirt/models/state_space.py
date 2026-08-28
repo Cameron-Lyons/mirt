@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -13,6 +14,35 @@ from mirt.constants import PROB_EPSILON
 from mirt.utils.numeric import standard_normal_quadrature
 
 _STATE_SPACE_MAX_PROBABILITY_VALUES = 1_000_000
+
+
+@dataclass(frozen=True, slots=True)
+class StateSpaceStepResult:
+    """Prediction and state update from one response occasion."""
+
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihood: float
+    updated_mean: float
+    updated_variance: float
+    next_mean: float
+    next_variance: float
+
+
+@dataclass(frozen=True, slots=True)
+class StateSpaceBatchStepResult:
+    """Vectorized predictions and state updates from one occasion."""
+
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    updated_means: NDArray[np.float64]
+    updated_variances: NDArray[np.float64]
+    next_means: NDArray[np.float64]
+    next_variances: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of state distributions represented by the result."""
+        return int(self.updated_means.size)
 
 
 @dataclass
@@ -902,19 +932,35 @@ class StateSpaceIRT:
         n_quadpts: int,
     ) -> NDArray[np.float64]:
         """Integrate item probabilities over Gaussian state distributions."""
+        marginal = np.zeros(
+            (state_means.size, self.n_items),
+            dtype=np.float64,
+        )
+
+        for weight, probabilities in self._state_observation_quadrature(
+            state_means,
+            state_variances,
+            n_quadpts,
+        ):
+            marginal += weight * probabilities
+
+        probabilities = marginal.reshape(state_means.shape + (self.n_items,))
+        return np.clip(probabilities, 0.0, 1.0)
+
+    def _state_observation_quadrature(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> Iterator[tuple[float, NDArray[np.float64]]]:
+        """Yield weighted conditional probabilities over Gaussian states."""
         nodes, weights = standard_normal_quadrature(n_quadpts)
         flat_means = state_means.ravel()
         flat_scales = np.sqrt(state_variances).ravel()
-        marginal = np.zeros((flat_means.size, self.n_items), dtype=np.float64)
 
         for node, weight in zip(nodes, weights, strict=True):
             states = flat_means + flat_scales * node
-            marginal += weight * self._observation_probability(states)
-
-        probabilities = marginal.reshape(
-            state_means.shape + (self.n_items,),
-        )
-        return np.clip(probabilities, 0.0, 1.0)
+            yield float(weight), self._observation_probability(states)
 
     def state_response_probabilities(
         self,
@@ -1007,14 +1053,13 @@ class StateSpaceIRT:
         observed = flat_responses >= 0
         correct = flat_responses == 1
         incorrect = flat_responses == 0
-        nodes, weights = standard_normal_quadrature(n_quadpts)
-        flat_means = state_means.ravel()
-        flat_scales = np.sqrt(state_variances).ravel()
-        scores = np.full(flat_means.size, -np.inf, dtype=np.float64)
+        scores = np.full(state_means.size, -np.inf, dtype=np.float64)
 
-        for node, weight in zip(nodes, weights, strict=True):
-            states = flat_means + flat_scales * node
-            probabilities = self._observation_probability(states)
+        for weight, probabilities in self._state_observation_quadrature(
+            state_means,
+            state_variances,
+            n_quadpts,
+        ):
             conditional_score = np.sum(
                 np.where(
                     correct,
@@ -1030,6 +1075,51 @@ class StateSpaceIRT:
 
         scores[~np.any(observed, axis=1)] = 0.0
         return scores.reshape(state_means.shape)
+
+    def _integrated_response_diagnostics(
+        self,
+        responses: NDArray[np.int_],
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Integrate item probabilities and joint scores in one quadrature pass."""
+        flat_responses = responses.reshape(-1, self.n_items)
+        observed = flat_responses >= 0
+        correct = flat_responses == 1
+        incorrect = flat_responses == 0
+        marginal = np.zeros(
+            (state_means.size, self.n_items),
+            dtype=np.float64,
+        )
+        scores = np.full(state_means.size, -np.inf, dtype=np.float64)
+
+        for weight, probabilities in self._state_observation_quadrature(
+            state_means,
+            state_variances,
+            n_quadpts,
+        ):
+            marginal += weight * probabilities
+            conditional_score = np.sum(
+                np.where(
+                    correct,
+                    np.log(probabilities),
+                    np.where(incorrect, np.log1p(-probabilities), 0.0),
+                ),
+                axis=1,
+            )
+            scores = np.logaddexp(
+                scores,
+                np.log(weight) + conditional_score,
+            )
+
+        scores[~np.any(observed, axis=1)] = 0.0
+        response_probabilities = np.clip(
+            marginal.reshape(state_means.shape + (self.n_items,)),
+            0.0,
+            1.0,
+        )
+        return response_probabilities, scores.reshape(state_means.shape)
 
     def state_response_log_likelihood(
         self,
@@ -1124,6 +1214,156 @@ class StateSpaceIRT:
                 "responses and state moments must contain the same number of people"
             )
         return self._integrated_response_log_likelihoods(
+            response_values,
+            mean_values,
+            variance_values,
+            n_quadpts,
+        )
+
+    def _online_step_batch(
+        self,
+        responses: NDArray[np.int_],
+        prior_means: NDArray[np.float64],
+        prior_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> StateSpaceBatchStepResult:
+        """Process validated response rows and state priors in one pass."""
+        response_probabilities, response_log_likelihoods = (
+            self._integrated_response_diagnostics(
+                responses,
+                prior_means,
+                prior_variances,
+                n_quadpts,
+            )
+        )
+        updated_means, updated_variances = self._extended_kalman_update_batch(
+            responses,
+            prior_means,
+            prior_variances,
+        )
+        next_means, next_variances = self._propagate_state_moments(
+            updated_means,
+            updated_variances,
+            1,
+        )
+        return StateSpaceBatchStepResult(
+            response_probabilities=response_probabilities,
+            response_log_likelihoods=response_log_likelihoods,
+            updated_means=updated_means,
+            updated_variances=updated_variances,
+            next_means=next_means,
+            next_variances=next_variances,
+        )
+
+    def online_step(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        prior_mean: float | None = None,
+        prior_variance: float | None = None,
+        n_quadpts: int = 21,
+    ) -> StateSpaceStepResult:
+        """Predict, score, update, and propagate one response occasion.
+
+        Omitted prior moments use the model's initial state distribution. The
+        returned next moments are ready for the following occasion.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response vector with shape ``(n_items,)``. Use ``-1`` for
+            missing item responses.
+        prior_mean : float, optional
+            Finite predicted state mean for this occasion.
+        prior_variance : float, optional
+            Finite positive predicted state variance for this occasion.
+        n_quadpts : int, default=21
+            Number of quadrature points used for prediction and scoring.
+
+        Returns
+        -------
+        StateSpaceStepResult
+            Response predictions, updated state, and next state prior.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_update_responses(responses, batch=False)
+        prior_means = self._validated_state_vector(
+            prior_mean,
+            1,
+            "prior_mean",
+            default=self.initial_mean,
+        )
+        prior_variances = self._validated_state_vector(
+            prior_variance,
+            1,
+            "prior_variance",
+            default=self.initial_var,
+            constraint="positive",
+        )
+        result = self._online_step_batch(
+            response_values[None, :],
+            prior_means,
+            prior_variances,
+            n_quadpts,
+        )
+        return StateSpaceStepResult(
+            response_probabilities=result.response_probabilities[0].copy(),
+            response_log_likelihood=float(result.response_log_likelihoods[0]),
+            updated_mean=float(result.updated_means[0]),
+            updated_variance=float(result.updated_variances[0]),
+            next_mean=float(result.next_means[0]),
+            next_variance=float(result.next_variances[0]),
+        )
+
+    def online_step_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        prior_means: float | NDArray[np.float64] | None = None,
+        prior_variances: float | NDArray[np.float64] | None = None,
+        n_quadpts: int = 21,
+    ) -> StateSpaceBatchStepResult:
+        """Predict, score, update, and propagate multiple response rows.
+
+        Scalar prior moments are broadcast across people. Omitted moments use
+        the model's initial state distribution.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_items)``. Use
+            ``-1`` for missing item responses.
+        prior_means : float or NDArray, optional
+            Finite predicted state means, either scalar or shape
+            ``(n_persons,)``.
+        prior_variances : float or NDArray, optional
+            Finite positive predicted state variances, either scalar or shape
+            ``(n_persons,)``.
+        n_quadpts : int, default=21
+            Number of quadrature points used for prediction and scoring.
+
+        Returns
+        -------
+        StateSpaceBatchStepResult
+            Response predictions, updated states, and next state priors.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_update_responses(responses, batch=True)
+        n_persons = len(response_values)
+        mean_values = self._validated_state_vector(
+            prior_means,
+            n_persons,
+            "prior_means",
+            default=self.initial_mean,
+        )
+        variance_values = self._validated_state_vector(
+            prior_variances,
+            n_persons,
+            "prior_variances",
+            default=self.initial_var,
+            constraint="positive",
+        )
+        return self._online_step_batch(
             response_values,
             mean_values,
             variance_values,

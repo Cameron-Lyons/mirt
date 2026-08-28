@@ -140,25 +140,21 @@ refiltering the complete history:
    online_means = []
 
    for response_vector in responses[0]:
-       predicted_success = state_model.state_response_probabilities(
-           prior_mean,
-           prior_variance,
-       )
-       response_log_score = state_model.state_response_log_likelihood(
-           response_vector,
-           prior_mean,
-           prior_variance,
-       )
-       updated_mean, updated_variance = state_model.extended_kalman_update(
+       step = state_model.online_step(
            response_vector,
            prior_mean=prior_mean,
            prior_variance=prior_variance,
        )
-       online_means.append(updated_mean)
-       prior_mean, prior_variance = state_model.propagate_state(
-           updated_mean,
-           updated_variance,
-       )
+       predicted_success = step.response_probabilities
+       response_log_score = step.response_log_likelihood
+       online_means.append(step.updated_mean)
+       prior_mean = step.next_mean
+       prior_variance = step.next_variance
+
+``online_step`` predicts marginal item success, scores the joint observed
+pattern, updates the state, and prepares the next prior in one quadrature pass.
+``online_step_batch`` returns the same fields as arrays for many learners and
+accepts either shared scalar priors or one prior per learner.
 
 ``extended_kalman_update_batch`` performs the same one-occasion update for
 many learners, accepting either shared scalar priors or one prior per learner.
