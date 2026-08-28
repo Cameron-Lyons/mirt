@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
@@ -85,6 +86,77 @@ def test_mixed_category_probability_padding_remains_zero():
     np.testing.assert_array_equal(probabilities[:, 0, 2:], 0.0)
     np.testing.assert_array_equal(probabilities[:, 2, 3:], 0.0)
     np.testing.assert_allclose(probabilities.sum(axis=2), 1.0)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        GradedResponseModel(n_items=3, n_categories=5),
+        GradedResponseModel(n_items=3, n_categories=[2, 4, 5]),
+        GradedResponseModel(n_items=3, n_categories=5, n_factors=2),
+        GradedRatingScaleModel(n_items=3, n_categories=5),
+    ],
+)
+def test_graded_information_reuses_category_curves(
+    model, monkeypatch: pytest.MonkeyPatch
+):
+    theta_1d = np.linspace(-4.0, 4.0, 41)
+    theta = (
+        theta_1d.reshape(-1, 1)
+        if model.n_factors == 1
+        else np.column_stack([theta_1d, -0.5 * theta_1d])
+    )
+    expected_items = []
+    for item_idx in range(model.n_items):
+        probabilities = model.probability(theta, item_idx)
+        n_categories = probabilities.shape[1]
+        cumulative = np.empty((theta.shape[0], n_categories + 1))
+        cumulative[:, 0] = 1.0
+        cumulative[:, -1] = 0.0
+        for threshold_idx in range(n_categories - 1):
+            cumulative[:, threshold_idx + 1] = model.cumulative_probability(
+                theta,
+                item_idx,
+                threshold_idx,
+            )
+
+        if isinstance(model, GradedRatingScaleModel):
+            discrimination = model.discrimination
+        elif model.n_factors == 1:
+            discrimination = float(model.discrimination[item_idx])
+        else:
+            discrimination = float(np.linalg.norm(model.discrimination[item_idx]))
+        derivatives = discrimination * (
+            cumulative[:, :-1] * (1.0 - cumulative[:, :-1])
+            - cumulative[:, 1:] * (1.0 - cumulative[:, 1:])
+        )
+        expected_items.append(
+            np.divide(
+                derivatives**2,
+                probabilities,
+                out=np.zeros_like(derivatives),
+                where=probabilities > PROB_EPSILON,
+            ).sum(axis=1)
+        )
+
+    def reject_recomputation(*args, **kwargs):
+        raise AssertionError("information should reuse category probabilities")
+
+    monkeypatch.setattr(model, "cumulative_probability", reject_recomputation)
+
+    for item_idx, expected in enumerate(expected_items):
+        np.testing.assert_allclose(
+            model.information(theta, item_idx),
+            expected,
+            rtol=1e-13,
+            atol=1e-13,
+        )
+    np.testing.assert_allclose(
+        model.information(theta),
+        np.sum(expected_items, axis=0),
+        rtol=1e-13,
+        atol=1e-13,
+    )
 
 
 @pytest.mark.parametrize(
