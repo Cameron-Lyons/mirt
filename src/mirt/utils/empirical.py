@@ -542,12 +542,90 @@ def empirical_rmsea(
     return np.sqrt(mean_squared)
 
 
+def _validate_mantel_haenszel_inputs(
+    responses: NDArray[np.float64],
+    group: NDArray[np.intp],
+    theta: NDArray[np.float64],
+    item_idx: int,
+    n_strata: int,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.intp],
+    NDArray[np.float64],
+    int,
+]:
+    """Validate and filter inputs for the dichotomous MH statistic."""
+    response_values = np.asarray(responses, dtype=np.float64)
+    if response_values.ndim != 2:
+        raise ValueError("responses must be a 2D matrix")
+    if response_values.shape[0] == 0:
+        raise ValueError("responses must contain at least one person")
+    if response_values.shape[1] == 0:
+        raise ValueError("responses must contain at least one item")
+
+    if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+        item_idx, (int, np.integer)
+    ):
+        raise ValueError("item_idx must be an integer")
+    item_idx = int(item_idx)
+    if item_idx < 0 or item_idx >= response_values.shape[1]:
+        raise ValueError(
+            f"item_idx must be between 0 and {response_values.shape[1] - 1}"
+        )
+
+    group_values = np.asarray(group, dtype=np.float64)
+    if group_values.ndim == 2 and group_values.shape[1] == 1:
+        group_values = group_values[:, 0]
+    if group_values.ndim != 1:
+        raise ValueError("group must have shape (n_persons,) or (n_persons, 1)")
+
+    theta_values = np.asarray(theta, dtype=np.float64)
+    if theta_values.ndim == 2 and theta_values.shape[1] == 1:
+        theta_values = theta_values[:, 0]
+    if theta_values.ndim != 1:
+        raise ValueError("theta must have shape (n_persons,) or (n_persons, 1)")
+
+    n_persons = response_values.shape[0]
+    if group_values.shape[0] != n_persons:
+        raise ValueError("group and responses must contain the same number of persons")
+    if theta_values.shape[0] != n_persons:
+        raise ValueError("theta and responses must contain the same number of persons")
+    if not np.all(np.isfinite(group_values)) or np.any(
+        (group_values != 0) & (group_values != 1)
+    ):
+        raise ValueError("group must contain only 0 (reference) and 1 (focal)")
+    if not np.all(np.isfinite(theta_values)):
+        raise ValueError("theta must contain only finite values")
+
+    item_responses = response_values[:, item_idx]
+    if np.any(np.isinf(item_responses)):
+        raise ValueError("item responses must not contain infinite values")
+    observed = np.isfinite(item_responses) & (item_responses >= 0)
+    if not np.any(observed):
+        raise ValueError("item must contain at least one observed response")
+    item_responses = item_responses[observed]
+    if np.any((item_responses != 0) & (item_responses != 1)):
+        raise ValueError("Mantel-Haenszel DIF requires binary item responses")
+
+    group_indices = group_values[observed].astype(np.intp)
+    if group_indices.min() == group_indices.max():
+        raise ValueError("both reference and focal groups must have observed responses")
+
+    return (
+        item_responses,
+        group_indices,
+        theta_values[observed],
+        _validate_positive_integer(n_strata, "n_strata"),
+    )
+
+
 def mantel_haenszel(
     responses: NDArray[np.float64],
     group: NDArray[np.intp],
     theta: NDArray[np.float64],
     item_idx: int,
     n_strata: int = 5,
+    correct: bool = True,
 ) -> tuple[float, float, float]:
     """Compute Mantel-Haenszel DIF statistic.
 
@@ -563,6 +641,8 @@ def mantel_haenszel(
         Index of item to test.
     n_strata : int
         Number of matching strata. Default 5.
+    correct : bool
+        Apply the 0.5 continuity correction when possible. Default True.
 
     Returns
     -------
@@ -571,90 +651,70 @@ def mantel_haenszel(
     p_value : float
         P-value.
     mh_odds : float
-        Mantel-Haenszel odds ratio.
+        Common odds ratio for the reference group relative to the focal group.
+        Returns infinity or NaN when the ratio is infinite or unestimable.
+
+    Notes
+    -----
+    Responses must be dichotomous. Negative and NaN item responses are treated
+    as missing. Matching strata are quantile bins of the observed responses'
+    theta values.
     """
     from scipy import stats
 
-    responses = np.asarray(responses, dtype=np.float64)
-    group = np.asarray(group, dtype=np.intp)
-    theta = np.atleast_1d(theta).ravel()
+    item_resp, group_valid, theta_valid, n_strata = _validate_mantel_haenszel_inputs(
+        responses, group, theta, item_idx, n_strata
+    )
+    if not isinstance(correct, (bool, np.bool_)):
+        raise ValueError("correct must be a boolean")
 
-    item_resp = responses[:, item_idx]
-    valid = ~np.isnan(item_resp)
-    item_resp = item_resp[valid]
-    group_valid = group[valid]
-    theta_valid = theta[valid]
-
-    percentiles = np.linspace(0, 100, n_strata + 1)
+    percentiles = np.linspace(0.0, 100.0, n_strata + 1)
     bins = np.percentile(theta_valid, percentiles)
-    bins[-1] += 1e-10
-    stratum = np.digitize(theta_valid, bins) - 1
-    stratum = np.clip(stratum, 0, n_strata - 1)
+    bins[-1] = np.nextafter(bins[-1], np.inf)
+    stratum = np.clip(np.digitize(theta_valid, bins) - 1, 0, n_strata - 1).astype(
+        np.intp
+    )
 
-    numerator = 0.0
-    denominator = 0.0
-    variance = 0.0
+    cells = stratum * 2 + group_valid
+    counts = np.bincount(cells, minlength=2 * n_strata).reshape(n_strata, 2)
+    correct_counts = np.bincount(
+        cells, weights=item_resp, minlength=2 * n_strata
+    ).reshape(n_strata, 2)
 
-    for s in range(n_strata):
-        mask = stratum == s
+    eligible = (counts[:, 0] > 0) & (counts[:, 1] > 0)
+    counts = counts[eligible].astype(np.float64)
+    correct_counts = correct_counts[eligible]
+    n_ref = counts[:, 0]
+    n_focal = counts[:, 1]
+    a = correct_counts[:, 0]
+    c = correct_counts[:, 1]
+    b = n_ref - a
+    d = n_focal - c
+    n_total = n_ref + n_focal
 
-        ref_mask = mask & (group_valid == 0)
-        focal_mask = mask & (group_valid == 1)
-
-        n_ref = np.sum(ref_mask)
-        n_focal = np.sum(focal_mask)
-        n_total = n_ref + n_focal
-
-        if n_ref < 1 or n_focal < 1:
-            continue
-
-        a = np.sum(item_resp[ref_mask])
-        b = n_ref - a
-        c = np.sum(item_resp[focal_mask])
-        d = n_focal - c
-
-        n1 = a + b
-        n0 = c + d
-        m1 = a + c
-        m0 = b + d
-
-        if n_total > 0:
-            e_a = n1 * m1 / n_total
-            numerator += a - e_a
-
-            if n_total > 1:
-                v_a = n1 * n0 * m1 * m0 / (n_total**2 * (n_total - 1))
-                variance += v_a
-
-            denominator += (a * d) / n_total
+    total_correct = a + c
+    total_incorrect = b + d
+    delta = np.sum(a - n_ref * total_correct / n_total)
+    variance = np.sum(
+        n_ref * n_focal * total_correct * total_incorrect / (n_total**2 * (n_total - 1))
+    )
 
     if variance > 0:
-        mh_chisq = (abs(numerator) - 0.5) ** 2 / variance
-        p_value = 1 - stats.chi2.cdf(mh_chisq, 1)
+        continuity = 0.5 if correct and abs(delta) >= 0.5 else 0.0
+        mh_chisq = (abs(delta) - continuity) ** 2 / variance
+        p_value = stats.chi2.sf(mh_chisq, 1)
     else:
         mh_chisq = 0.0
         p_value = 1.0
 
-    if denominator > 0:
-        bd_sum = sum(
-            (n_ref - np.sum(item_resp[ref_mask]))
-            * np.sum(item_resp[focal_mask])
-            / n_total
-            for s in range(n_strata)
-            if np.sum((stratum == s) & (group_valid == 0)) > 0
-            and np.sum((stratum == s) & (group_valid == 1)) > 0
-            for ref_mask in [(stratum == s) & (group_valid == 0)]
-            for focal_mask in [(stratum == s) & (group_valid == 1)]
-            for n_ref in [np.sum(ref_mask)]
-            for n_focal in [np.sum(focal_mask)]
-            for n_total in [n_ref + n_focal]
-        )
-        if bd_sum > 0:
-            mh_odds = denominator / bd_sum
-        else:
-            mh_odds = 1.0
+    odds_numerator = np.sum(a * d / n_total)
+    odds_denominator = np.sum(b * c / n_total)
+    if odds_denominator > 0:
+        mh_odds = odds_numerator / odds_denominator
+    elif odds_numerator > 0:
+        mh_odds = np.inf
     else:
-        mh_odds = 1.0
+        mh_odds = np.nan
 
     return float(mh_chisq), float(p_value), float(mh_odds)
 

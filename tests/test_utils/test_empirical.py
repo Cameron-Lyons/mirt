@@ -17,6 +17,7 @@ from mirt.utils.empirical import (
     empirical_plot,
     empirical_rmsea,
     itemGAM,
+    mantel_haenszel,
     weighted_RMSD_DIF,
 )
 
@@ -333,3 +334,142 @@ def test_dif_metrics_validate_integration_controls(
 def test_empirical_es_validates_focal_weight() -> None:
     with pytest.raises(ValueError, match="between 0 and 1"):
         empirical_ES(_binary_model(1), _binary_model(1), item_idx=0, focal_weight=1.1)
+
+
+def _mantel_haenszel_data(
+    tables: list[tuple[int, int, int, int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Expand (ref correct, ref incorrect, focal correct, focal incorrect)."""
+    responses: list[float] = []
+    groups: list[int] = []
+    theta: list[float] = []
+    for stratum, (a, b, c, d) in enumerate(tables):
+        responses.extend([1.0] * a + [0.0] * b + [1.0] * c + [0.0] * d)
+        groups.extend([0] * (a + b) + [1] * (c + d))
+        theta.extend([float(stratum)] * (a + b + c + d))
+    return (
+        np.asarray(responses)[:, None],
+        np.asarray(groups, dtype=np.intp),
+        np.asarray(theta),
+    )
+
+
+def _mantel_haenszel_reference(
+    tables: list[tuple[int, int, int, int]], correct: bool
+) -> tuple[float, float, float]:
+    cells = np.asarray(tables, dtype=np.float64)
+    a, b, c, d = cells.T
+    n_ref = a + b
+    n_focal = c + d
+    n_total = n_ref + n_focal
+    total_correct = a + c
+    total_incorrect = b + d
+    delta = np.sum(a - n_ref * total_correct / n_total)
+    variance = np.sum(
+        n_ref * n_focal * total_correct * total_incorrect / (n_total**2 * (n_total - 1))
+    )
+    continuity = 0.5 if correct and abs(delta) >= 0.5 else 0.0
+    chi_square = (abs(delta) - continuity) ** 2 / variance
+    odds = np.sum(a * d / n_total) / np.sum(b * c / n_total)
+    return chi_square, stats.chi2.sf(chi_square, 1), odds
+
+
+@pytest.mark.parametrize("correct", [True, False])
+def test_mantel_haenszel_matches_stratified_reference(correct: bool) -> None:
+    tables = [(6, 4, 3, 7), (5, 5, 4, 6), (7, 3, 5, 5), (4, 6, 2, 8)]
+    responses, group, theta = _mantel_haenszel_data(tables)
+
+    result = mantel_haenszel(
+        responses, group, theta, item_idx=0, n_strata=4, correct=correct
+    )
+
+    assert_allclose(result, _mantel_haenszel_reference(tables, correct))
+
+
+def test_mantel_haenszel_omits_correction_when_delta_is_small() -> None:
+    tables = [(1, 2, 1, 3)]
+    responses, group, theta = _mantel_haenszel_data(tables)
+
+    corrected = mantel_haenszel(responses, group, theta, 0, n_strata=1)
+    uncorrected = mantel_haenszel(responses, group, theta, 0, n_strata=1, correct=False)
+
+    assert_allclose(corrected, uncorrected)
+    assert corrected[0] > 0
+
+
+def test_mantel_haenszel_treats_negative_and_nan_responses_as_missing() -> None:
+    responses, group, theta = _mantel_haenszel_data([(6, 4, 3, 7), (5, 5, 4, 6)])
+    baseline = mantel_haenszel(responses, group, theta, 0, n_strata=2)
+    responses = np.vstack([responses, [[-1.0], [np.nan]]])
+    group = np.concatenate([group, [0, 1]])
+    theta = np.concatenate([theta, [-10.0, 10.0]])
+
+    result = mantel_haenszel(responses, group, theta, 0, n_strata=2)
+
+    assert_allclose(result, baseline)
+
+
+@pytest.mark.parametrize(
+    ("table", "expected"),
+    [
+        ((2, 0, 1, 1), np.inf),
+        ((0, 2, 1, 1), 0.0),
+        ((2, 0, 2, 0), np.nan),
+    ],
+)
+def test_mantel_haenszel_reports_boundary_odds_ratios(
+    table: tuple[int, int, int, int], expected: float
+) -> None:
+    responses, group, theta = _mantel_haenszel_data([table])
+
+    odds = mantel_haenszel(responses, group, theta, 0, n_strata=1)[2]
+
+    if np.isnan(expected):
+        assert np.isnan(odds)
+    else:
+        assert odds == expected
+
+
+def test_mantel_haenszel_uses_two_grouped_reductions(monkeypatch) -> None:
+    rng = np.random.default_rng(20260827)
+    n_persons = 20_000
+    responses = rng.integers(0, 2, size=(n_persons, 1)).astype(float)
+    group = rng.integers(0, 2, size=n_persons, dtype=np.intp)
+    theta = rng.normal(size=n_persons)
+    original_bincount = np.bincount
+    calls = 0
+
+    def counting_bincount(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_bincount(*args, **kwargs)
+
+    monkeypatch.setattr(empirical_module.np, "bincount", counting_bincount)
+
+    mantel_haenszel(responses, group, theta, 0, n_strata=100)
+
+    assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"group": np.array([0, 2, 0, 1])}, "only 0 .* and 1"),
+        ({"theta": np.array([0.0, 1.0, np.nan, 3.0])}, "finite values"),
+        ({"responses": np.array([[0.0], [1.0], [2.0], [0.0]])}, "binary"),
+        ({"group": np.array([0, 1, 0])}, "same number of persons"),
+        ({"n_strata": 0}, "at least 1"),
+        ({"correct": 1}, "boolean"),
+    ],
+)
+def test_mantel_haenszel_validates_inputs(kwargs: dict, message: str) -> None:
+    arguments = {
+        "responses": np.array([[0.0], [1.0], [1.0], [0.0]]),
+        "group": np.array([0, 1, 0, 1]),
+        "theta": np.arange(4.0),
+        "item_idx": 0,
+        **kwargs,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        mantel_haenszel(**arguments)
