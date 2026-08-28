@@ -157,6 +157,67 @@ class BKTBatchStepResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BKTPredictiveResult:
+    """Causal predictions and mastery states for one response history.
+
+    Every array has shape ``(n_trials,)``. Predicted mastery conditions only
+    on earlier opportunities for the assigned skill, while updated mastery
+    additionally conditions on the current response. Missing responses have
+    zero log likelihood and ``numpy.nan`` residuals.
+    """
+
+    predicted_mastery: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
+    updated_mastery: NDArray[np.float64]
+    next_mastery: NDArray[np.float64]
+
+    @property
+    def n_trials(self) -> int:
+        """Number of trial opportunities represented by the result."""
+        return int(self.predicted_mastery.size)
+
+    @property
+    def total_log_likelihood(self) -> float:
+        """Sum of predictive log likelihoods across observed responses."""
+        return float(np.sum(self.response_log_likelihoods))
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchPredictiveResult:
+    """Vectorized causal diagnostics for multiple response histories.
+
+    Every array has shape ``(n_persons, n_trials)``. Missing responses have
+    zero log likelihood and ``numpy.nan`` residuals.
+    """
+
+    predicted_mastery: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
+    updated_mastery: NDArray[np.float64]
+    next_mastery: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.predicted_mastery.shape[0])
+
+    @property
+    def n_trials(self) -> int:
+        """Number of trial opportunities per learner."""
+        return int(self.predicted_mastery.shape[1])
+
+    @property
+    def total_log_likelihoods(self) -> NDArray[np.float64]:
+        """Predictive log-likelihood total for each learner."""
+        return np.sum(self.response_log_likelihoods, axis=1)
+
+
+@dataclass(frozen=True, slots=True)
 class BKTForecastResult:
     """Future mastery and response probabilities for one learner.
 
@@ -533,6 +594,121 @@ class BKTModel:
             skill_values,
             mastery_values,
         )
+
+    def _predictive_diagnostics_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> BKTBatchPredictiveResult:
+        """Build causal diagnostics from validated histories in one pass."""
+        n_persons, n_trials = responses.shape
+        skill_matrix = (
+            np.broadcast_to(skill_assignments, responses.shape)
+            if skill_assignments.ndim == 1
+            else skill_assignments
+        )
+        retained_priors = np.broadcast_to(
+            self.p_init,
+            (n_persons, self.n_skills),
+        ).copy()
+        predicted_mastery = np.empty(responses.shape, dtype=np.float64)
+        response_probabilities = np.empty_like(predicted_mastery)
+        response_log_likelihoods = np.empty_like(predicted_mastery)
+        residuals = np.empty_like(predicted_mastery)
+        standardized_residuals = np.empty_like(predicted_mastery)
+        updated_mastery = np.empty_like(predicted_mastery)
+        next_mastery = np.empty_like(predicted_mastery)
+        rows = np.arange(n_persons)
+
+        for trial in range(n_trials):
+            trial_skills = skill_matrix[:, trial]
+            trial_priors = retained_priors[rows, trial_skills]
+            step = self._online_step_batch(
+                responses[:, trial],
+                trial_skills,
+                trial_priors,
+            )
+            predicted_mastery[:, trial] = trial_priors
+            response_probabilities[:, trial] = step.response_probabilities
+            response_log_likelihoods[:, trial] = step.response_log_likelihoods
+            residuals[:, trial] = step.residuals
+            standardized_residuals[:, trial] = step.standardized_residuals
+            updated_mastery[:, trial] = step.updated_mastery
+            next_mastery[:, trial] = step.next_mastery
+            retained_priors[rows, trial_skills] = step.next_mastery
+
+        return BKTBatchPredictiveResult(
+            predicted_mastery=predicted_mastery,
+            response_probabilities=response_probabilities,
+            response_log_likelihoods=response_log_likelihoods,
+            residuals=residuals,
+            standardized_residuals=standardized_residuals,
+            updated_mastery=updated_mastery,
+            next_mastery=next_mastery,
+        )
+
+    def predictive_diagnostics(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> BKTPredictiveResult:
+        """Return causal predictions and mastery states for one history.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response sequence with shape ``(n_trials,)``. Use ``-1``
+            for a missing response.
+        skill_assignments : NDArray
+            Skill index for every trial.
+
+        Returns
+        -------
+        BKTPredictiveResult
+            Per-trial predictions, log likelihoods, residuals, and states.
+        """
+        response_values, skill_values = self._validate_sequence(
+            responses,
+            skill_assignments,
+        )
+        result = self._predictive_diagnostics_batch(
+            response_values[None, :],
+            skill_values,
+        )
+        return BKTPredictiveResult(
+            predicted_mastery=result.predicted_mastery[0].copy(),
+            response_probabilities=result.response_probabilities[0].copy(),
+            response_log_likelihoods=result.response_log_likelihoods[0].copy(),
+            residuals=result.residuals[0].copy(),
+            standardized_residuals=result.standardized_residuals[0].copy(),
+            updated_mastery=result.updated_mastery[0].copy(),
+            next_mastery=result.next_mastery[0].copy(),
+        )
+
+    def predictive_diagnostics_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> BKTBatchPredictiveResult:
+        """Return one-pass causal diagnostics for multiple histories.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_trials)``.
+        skill_assignments : NDArray
+            Shared trial-to-skill vector or a matrix matching ``responses``.
+
+        Returns
+        -------
+        BKTBatchPredictiveResult
+            Per-trial predictions, log likelihoods, residuals, and states.
+        """
+        response_values, skill_values = self._validate_batch(
+            responses,
+            skill_assignments,
+        )
+        return self._predictive_diagnostics_batch(response_values, skill_values)
 
     @staticmethod
     def _validated_forecast_steps(n_steps: int) -> int:

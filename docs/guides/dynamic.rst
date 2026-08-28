@@ -57,6 +57,30 @@ shared scalars or one value per learner. Missing responses have zero log score
 and ``numpy.nan`` residuals while still applying the configured learning and
 forgetting transition.
 
+History diagnostics
+-------------------
+
+Compute the complete causal record in one pass when a trial history is already
+available:
+
+.. code-block:: python
+
+   diagnostics = model.predictive_diagnostics(responses, skills)
+   causal_mastery = diagnostics.predicted_mastery
+   filtered_mastery = diagnostics.updated_mastery
+   predictive_success = diagnostics.response_probabilities
+   predictive_log_scores = diagnostics.response_log_likelihoods
+   predictive_residuals = diagnostics.standardized_residuals
+   total_log_score = diagnostics.total_log_likelihood
+
+Predicted mastery and success at a trial use only earlier opportunities for
+the assigned skill. Updated mastery additionally conditions on the current
+response, and ``next_mastery`` includes the learning and forgetting transition
+for that skill's next opportunity. ``predictive_diagnostics_batch`` performs
+the same sequential calculation across many learners at once and supports
+shared or person-specific skill layouts. Missing trials retain causal mastery,
+contribute zero log score, and produce ``numpy.nan`` residuals.
+
 Mastery forecasts
 -----------------
 
