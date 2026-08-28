@@ -19,12 +19,14 @@ Oakes, D. (1999). Direct calculation of the information matrix via the EM
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -43,6 +45,41 @@ SEMethod = Literal[
     "sem",
     "fisher",
 ]
+
+
+def _valid_second_derivative(
+    log_likelihood_at_offset: Callable[[float], float],
+    h: float,
+    *,
+    scheme: Literal["central", "forward"],
+    center: float | None = None,
+) -> float:
+    """Evaluate a second derivative without crossing parameter boundaries."""
+    if center is None:
+        center = log_likelihood_at_offset(0.0)
+    if scheme == "central":
+        stencils = ((-1.0, 0.0, 1.0), (0.0, 1.0, 2.0), (0.0, -1.0, -2.0))
+    else:
+        stencils = ((0.0, 1.0, 2.0), (0.0, -1.0, -2.0))
+
+    last_error: MirtValidationError | None = None
+    step = h
+    for _ in range(20):
+        for offsets in stencils:
+            try:
+                evaluations = [
+                    center if offset == 0.0 else log_likelihood_at_offset(offset * step)
+                    for offset in offsets
+                ]
+            except MirtValidationError as exc:
+                last_error = exc
+                continue
+            return (evaluations[0] - 2.0 * evaluations[1] + evaluations[2]) / (step**2)
+        step *= 0.5
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Unable to construct a valid finite-difference stencil")
 
 
 def compute_se(
@@ -295,28 +332,31 @@ def _compute_item_se_curvature(
             model.set_item_parameter(item_idx, param_name, current)
             return ll
 
-    offsets = (-1.0, 0.0, 1.0) if scheme == "central" else (0.0, 1.0, 2.0)
-    coefficients = (1.0, -2.0, 1.0)
-
+    ll_center = log_likelihood(current)
     if is_scalar:
-        hessian = (
-            sum(
-                coefficient * log_likelihood(current + offset * h)
-                for coefficient, offset in zip(coefficients, offsets, strict=True)
-            )
-            / h**2
+        hessian = _valid_second_derivative(
+            lambda offset: log_likelihood(current + offset),
+            h,
+            scheme=scheme,
+            center=ll_center,
         )
         return np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
     else:
         n_params = len(current)
         se = np.zeros(n_params)
         for i in range(n_params):
-            hessian = 0.0
-            for coefficient, offset in zip(coefficients, offsets, strict=True):
+
+            def log_likelihood_at_offset(offset: float) -> float:
                 candidate = current.copy()
-                candidate[i] += offset * h
-                hessian += coefficient * log_likelihood(candidate)
-            hessian /= h**2
+                candidate[i] += offset
+                return log_likelihood(candidate)
+
+            hessian = _valid_second_derivative(
+                log_likelihood_at_offset,
+                h,
+                scheme=scheme,
+                center=ll_center,
+            )
             se[i] = np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
         return se
 
