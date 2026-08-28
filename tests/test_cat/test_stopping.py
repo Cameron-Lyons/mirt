@@ -1,6 +1,8 @@
 """Tests for stopping rules."""
 
+import numpy as np
 import pytest
+from scipy import stats
 
 from mirt.cat.results import CATState
 from mirt.cat.stopping import (
@@ -9,6 +11,7 @@ from mirt.cat.stopping import (
     MaxItemsStop,
     MinItemsStop,
     StandardErrorStop,
+    StoppingRule,
     ThetaChangeStop,
     create_stopping_rule,
 )
@@ -30,6 +33,25 @@ def make_state(
         is_complete=is_complete,
         next_item=None if is_complete else n_items,
     )
+
+
+class _RecordingStop(StoppingRule):
+    """Small stateful rule used to verify composition semantics."""
+
+    def __init__(self, result: bool) -> None:
+        self.result = result
+        self.calls = 0
+        self.resets = 0
+
+    def should_stop(self, state: CATState) -> bool:
+        self.calls += 1
+        return self.result
+
+    def get_reason(self) -> str:
+        return "recorded"
+
+    def reset(self) -> None:
+        self.resets += 1
 
 
 class TestStandardErrorStop:
@@ -274,6 +296,48 @@ class TestClassificationStop:
         reason = class_stop.get_reason()
         assert "Classification" in reason or "classification" in reason.lower()
 
+    @pytest.mark.parametrize(
+        ("theta", "se", "confidence"),
+        [
+            (-2.0, 0.3, 0.99),
+            (-0.2, 0.3, 0.95),
+            (0.0, 0.3, 0.5),
+            (0.2, 0.3, 0.75),
+            (2.0, 0.3, 0.999),
+        ],
+    )
+    def test_precomputed_threshold_matches_normal_probability(
+        self,
+        theta,
+        se,
+        confidence,
+    ):
+        rule = ClassificationStop(cut_score=0.0, confidence=confidence)
+        expected = stats.norm.cdf(abs(theta) / se) >= confidence
+
+        assert rule.should_stop(make_state(theta=theta, se=se)) is bool(expected)
+
+    def test_zero_standard_error_handles_certain_and_boundary_scores(self):
+        rule = ClassificationStop(cut_score=0.0, confidence=0.95)
+
+        assert rule.should_stop(make_state(theta=1.0, se=0.0)) is True
+        rule.reset()
+        assert rule.should_stop(make_state(theta=0.0, se=0.0)) is False
+
+    def test_infinite_standard_error_is_not_confident(self):
+        rule = ClassificationStop(cut_score=0.0, confidence=0.95)
+
+        assert rule.should_stop(make_state(theta=10.0, se=np.inf)) is False
+
+    def test_reset_clears_prior_classification(self):
+        rule = ClassificationStop(cut_score=0.0, confidence=0.95)
+        rule.should_stop(make_state(theta=2.0, se=0.1))
+
+        rule.reset()
+
+        assert rule._classification is None
+        assert rule._triggered is False
+
 
 class TestCombinedStop:
     """Tests for CombinedStop."""
@@ -362,6 +426,60 @@ class TestCombinedStop:
         reason = combined.get_reason()
         assert "SE" in reason
 
+    def test_or_short_circuits_without_mutating_later_rules(self):
+        first = _RecordingStop(True)
+        later = _RecordingStop(False)
+        combined = CombinedStop([first, later], operator="or")
+
+        assert combined.should_stop(make_state()) is True
+        assert first.calls == 1
+        assert later.calls == 0
+
+    def test_or_short_circuit_preserves_theta_tracker_for_next_state(self):
+        tracker = ThetaChangeStop(threshold=0.1, n_stable=1)
+        combined = CombinedStop(
+            [StandardErrorStop(0.3), tracker],
+            operator="or",
+        )
+
+        assert combined.should_stop(make_state(theta=0.0, se=0.1)) is True
+        assert tracker._last_theta is None
+        assert tracker._stable_count == 0
+
+    def test_and_evaluates_all_rules_to_preserve_state_tracking(self):
+        first = _RecordingStop(False)
+        later = _RecordingStop(True)
+        combined = CombinedStop([first, later], operator="and")
+
+        assert combined.should_stop(make_state()) is False
+        assert first.calls == 1
+        assert later.calls == 1
+
+    def test_reset_propagates_to_every_nested_rule(self):
+        first = _RecordingStop(True)
+        nested_rule = _RecordingStop(False)
+        nested = CombinedStop([nested_rule])
+        combined = CombinedStop([first, nested], operator="or")
+        combined.should_stop(make_state())
+
+        combined.reset()
+
+        assert first.resets == 1
+        assert nested_rule.resets == 1
+        assert combined._triggered_rule is None
+
+    def test_reset_prevents_theta_state_leaking_between_sessions(self):
+        tracker = ThetaChangeStop(threshold=0.1, n_stable=2)
+        combined = CombinedStop([tracker])
+        combined.should_stop(make_state(theta=0.0, se=1.0, n_items=1))
+        combined.should_stop(make_state(theta=0.05, se=1.0, n_items=2))
+        assert tracker._stable_count == 1
+
+        combined.reset()
+
+        assert combined.should_stop(make_state(theta=0.0, se=1.0, n_items=1)) is False
+        assert tracker._stable_count == 0
+
 
 class TestCreateStoppingRule:
     """Tests for create_stopping_rule factory."""
@@ -397,3 +515,26 @@ class TestCreateStoppingRule:
 
         assert isinstance(combined, CombinedStop)
         assert len(combined.rules) == 2
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: StandardErrorStop(np.nan), "finite"),
+        (lambda: StandardErrorStop(np.inf), "finite"),
+        (lambda: StandardErrorStop(True), "finite"),
+        (lambda: MaxItemsStop(2.5), "integer"),
+        (lambda: MaxItemsStop(True), "integer"),
+        (lambda: MinItemsStop(1.5), "integer"),
+        (lambda: MinItemsStop(True), "integer"),
+        (lambda: ThetaChangeStop(np.nan), "finite"),
+        (lambda: ThetaChangeStop(n_stable=1.5), "integer"),
+        (lambda: ClassificationStop(np.nan), "cut_score"),
+        (lambda: ClassificationStop(0.0, np.nan), "confidence"),
+        (lambda: CombinedStop([MaxItemsStop(1)], min_items=-1), "non-negative"),
+        (lambda: CombinedStop([MaxItemsStop(1)], min_items=1.5), "integer"),
+    ],
+)
+def test_stopping_rules_reject_invalid_configuration(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()

@@ -2,11 +2,45 @@
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal
+
+from scipy.special import ndtri
 
 if TYPE_CHECKING:
     from mirt.cat.results import CATState
+
+
+def _finite_real(value: Real, name: str) -> float:
+    """Validate and normalize a finite real-valued rule parameter."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise ValueError(f"{name} must be finite")
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _positive_real(value: Real, name: str) -> float:
+    """Validate and normalize a finite positive rule parameter."""
+    result = _finite_real(value, name)
+    if result <= 0.0:
+        raise ValueError(f"{name} must be positive")
+    return result
+
+
+def _integer(value: Integral, name: str, *, minimum: int) -> int:
+    """Validate and normalize an integer rule parameter."""
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        requirement = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{name} must be a {requirement} integer")
+    result = int(value)
+    if result < minimum:
+        requirement = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(f"{name} must be {requirement}")
+    return result
 
 
 class StoppingRule(ABC):
@@ -43,6 +77,9 @@ class StoppingRule(ABC):
         """
         pass
 
+    def reset(self) -> None:
+        """Reset state before the rule is reused for another session."""
+
 
 class StandardErrorStop(StoppingRule):
     """Stop when standard error falls below a threshold.
@@ -57,9 +94,7 @@ class StandardErrorStop(StoppingRule):
     """
 
     def __init__(self, threshold: float = 0.3):
-        if threshold <= 0:
-            raise ValueError("SE threshold must be positive")
-        self.threshold = threshold
+        self.threshold = _positive_real(threshold, "SE threshold")
         self._triggered = False
 
     def should_stop(self, state: CATState) -> bool:
@@ -70,6 +105,10 @@ class StandardErrorStop(StoppingRule):
 
     def get_reason(self) -> str:
         return f"SE threshold reached (SE <= {self.threshold})"
+
+    def reset(self) -> None:
+        """Clear the prior session's trigger state."""
+        self._triggered = False
 
 
 class MaxItemsStop(StoppingRule):
@@ -85,9 +124,7 @@ class MaxItemsStop(StoppingRule):
     """
 
     def __init__(self, max_items: int):
-        if max_items <= 0:
-            raise ValueError("max_items must be positive")
-        self.max_items = max_items
+        self.max_items = _integer(max_items, "max_items", minimum=1)
         self._triggered = False
 
     def should_stop(self, state: CATState) -> bool:
@@ -98,6 +135,10 @@ class MaxItemsStop(StoppingRule):
 
     def get_reason(self) -> str:
         return f"Maximum items reached ({self.max_items})"
+
+    def reset(self) -> None:
+        """Clear the prior session's trigger state."""
+        self._triggered = False
 
 
 class MinItemsStop(StoppingRule):
@@ -114,9 +155,7 @@ class MinItemsStop(StoppingRule):
     """
 
     def __init__(self, min_items: int):
-        if min_items < 0:
-            raise ValueError("min_items must be non-negative")
-        self.min_items = min_items
+        self.min_items = _integer(min_items, "min_items", minimum=0)
 
     def should_stop(self, state: CATState) -> bool:
         return False
@@ -155,15 +194,17 @@ class ThetaChangeStop(StoppingRule):
     """
 
     def __init__(self, threshold: float = 0.01, n_stable: int = 3):
-        if threshold <= 0:
-            raise ValueError("threshold must be positive")
-        if n_stable < 1:
-            raise ValueError("n_stable must be at least 1")
-        self.threshold = threshold
-        self.n_stable = n_stable
-        self._stable_count = 0
+        self.threshold: float = _positive_real(threshold, "threshold")
+        if (
+            isinstance(n_stable, bool)
+            or not isinstance(n_stable, Integral)
+            or n_stable < 1
+        ):
+            raise ValueError("n_stable must be an integer of at least 1")
+        self.n_stable: int = int(n_stable)
+        self._stable_count: int = 0
         self._last_theta: float | None = None
-        self._triggered = False
+        self._triggered: bool = False
 
     def should_stop(self, state: CATState) -> bool:
         if self._last_theta is None:
@@ -210,23 +251,35 @@ class ClassificationStop(StoppingRule):
     """
 
     def __init__(self, cut_score: float, confidence: float = 0.95):
-        if not 0 < confidence < 1:
+        cut_score_value = _finite_real(cut_score, "cut_score")
+        confidence_value = _finite_real(confidence, "confidence")
+        if not 0.0 < confidence_value < 1.0:
             raise ValueError("confidence must be between 0 and 1")
-        self.cut_score = cut_score
-        self.confidence = confidence
+        self.cut_score = cut_score_value
+        self.confidence = confidence_value
+        self._critical_z = float(ndtri(confidence_value))
         self._triggered = False
         self._classification: str | None = None
 
     def should_stop(self, state: CATState) -> bool:
-        z = abs(state.theta - self.cut_score) / state.standard_error
+        theta = float(state.theta)
+        standard_error = float(state.standard_error)
+        if not math.isfinite(theta):
+            raise ValueError("state.theta must be finite")
+        if math.isnan(standard_error) or standard_error < 0.0:
+            raise ValueError("state.standard_error must be non-negative")
 
-        from scipy.stats import norm
+        distance = abs(theta - self.cut_score)
+        if standard_error == 0.0 or math.isinf(standard_error):
+            confident = distance > 0.0 if standard_error == 0.0 else False
+            if self._critical_z <= 0.0:
+                confident = True
+        else:
+            confident = distance >= self._critical_z * standard_error
 
-        conf = norm.cdf(z)
-
-        if conf >= self.confidence:
+        if confident:
             self._triggered = True
-            self._classification = "above" if state.theta > self.cut_score else "below"
+            self._classification = "above" if theta > self.cut_score else "below"
             return True
         return False
 
@@ -236,6 +289,11 @@ class ClassificationStop(StoppingRule):
             f"Classification confidence reached ({self.confidence:.0%} "
             f"confident, {direction} cut score {self.cut_score})"
         )
+
+    def reset(self) -> None:
+        """Clear classification details from the prior session."""
+        self._triggered = False
+        self._classification = None
 
 
 class CombinedStop(StoppingRule):
@@ -264,33 +322,39 @@ class CombinedStop(StoppingRule):
         if operator not in ("and", "or"):
             raise ValueError("operator must be 'and' or 'or'")
 
-        self.rules = rules
+        self.rules = list(rules)
         self.operator = operator
-        self.min_items = min_items
+        self.min_items = _integer(min_items, "min_items", minimum=0)
         self._triggered_rule: StoppingRule | None = None
 
     def should_stop(self, state: CATState) -> bool:
+        self._triggered_rule = None
         if state.n_items < self.min_items:
             return False
 
-        results = [rule.should_stop(state) for rule in self.rules]
-
         if self.operator == "or":
-            for rule, result in zip(self.rules, results):
-                if result:
+            for rule in self.rules:
+                if rule.should_stop(state):
                     self._triggered_rule = rule
                     return True
             return False
-        else:
-            if all(results):
-                self._triggered_rule = self.rules[0]
-                return True
-            return False
+
+        results = [rule.should_stop(state) for rule in self.rules]
+        if all(results):
+            self._triggered_rule = self.rules[0]
+            return True
+        return False
 
     def get_reason(self) -> str:
         if self._triggered_rule is not None:
             return self._triggered_rule.get_reason()
         return f"Combined rule ({self.operator})"
+
+    def reset(self) -> None:
+        """Reset every nested rule before a new adaptive session."""
+        self._triggered_rule = None
+        for rule in self.rules:
+            rule.reset()
 
 
 def create_stopping_rule(
