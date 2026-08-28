@@ -19,12 +19,28 @@ from mirt.utils.batch import fit_models
 from mirt.utils.cv import KFold, LogLikelihoodScorer, cross_validate
 
 
+@pytest.fixture(scope="module")
+def lsat6_data():
+    return load_dataset("LSAT6")
+
+
+@pytest.fixture(scope="module")
+def lsat7_data():
+    return load_dataset("LSAT7")
+
+
+@pytest.fixture(scope="module")
+def sat12_data():
+    return load_dataset("SAT12")
+
+
+@pytest.fixture(scope="module")
+def va_data():
+    return load_dataset("verbal_aggression")
+
+
 class TestLSAT6Workflow:
     """End-to-end tests with LSAT6 dataset."""
-
-    @pytest.fixture(scope="class")
-    def lsat6_data(self):
-        return load_dataset("LSAT6")
 
     def test_load_dataset(self, lsat6_data):
         """Test dataset loading."""
@@ -80,10 +96,6 @@ class TestLSAT6Workflow:
 class TestLSAT7Workflow:
     """End-to-end tests with LSAT7 dataset."""
 
-    @pytest.fixture(scope="class")
-    def lsat7_data(self):
-        return load_dataset("LSAT7")
-
     def test_full_workflow(self, lsat7_data):
         """Test complete workflow."""
         responses = lsat7_data["data"]
@@ -113,10 +125,6 @@ class TestLSAT7Workflow:
 
 class TestSAT12Workflow:
     """End-to-end tests with SAT12 dataset."""
-
-    @pytest.fixture(scope="class")
-    def sat12_data(self):
-        return load_dataset("SAT12")
 
     def test_load_dataset(self, sat12_data):
         """Test SAT12 loading."""
@@ -154,10 +162,6 @@ class TestSAT12Workflow:
 
 class TestVerbalAggressionWorkflow:
     """End-to-end tests with verbal_aggression polytomous dataset."""
-
-    @pytest.fixture(scope="class")
-    def va_data(self):
-        return load_dataset("verbal_aggression")
 
     def test_load_dataset(self, va_data):
         """Test verbal_aggression loading."""

@@ -280,6 +280,71 @@ class BKTBatchForecastResult:
 
 
 @dataclass(frozen=True, slots=True)
+class BKTMasteryTargetResult:
+    """Minimum opportunities for one learner to reach mastery targets.
+
+    Arrays have shape ``(n_skills,)``. Finite opportunity counts are
+    integer-valued; ``numpy.inf`` denotes a target that the model's
+    unconditional mastery path cannot reach.
+    """
+
+    opportunities: NDArray[np.float64]
+    target_mastery: NDArray[np.float64]
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.opportunities.size)
+
+    @property
+    def reachable(self) -> NDArray[np.bool_]:
+        """Whether each skill's target is reached in finite time."""
+        return np.isfinite(self.opportunities)
+
+    @property
+    def all_reachable(self) -> bool:
+        """Whether all requested mastery targets are reachable."""
+        return bool(np.all(self.reachable))
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchMasteryTargetResult:
+    """Vectorized opportunities to mastery targets for multiple learners.
+
+    Arrays have shape ``(n_persons, n_skills)``. Finite opportunity counts
+    are integer-valued; ``numpy.inf`` denotes an unreachable target.
+    """
+
+    opportunities: NDArray[np.float64]
+    target_mastery: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.opportunities.shape[0])
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.opportunities.shape[1])
+
+    @property
+    def reachable(self) -> NDArray[np.bool_]:
+        """Whether each learner-skill target is reached in finite time."""
+        return np.isfinite(self.opportunities)
+
+    @property
+    def all_reachable(self) -> bool:
+        """Whether all requested mastery targets are reachable."""
+        return bool(np.all(self.reachable))
+
+    @property
+    def reachable_counts(self) -> NDArray[np.int_]:
+        """Number of reachable skill targets for each learner."""
+        return np.sum(self.reachable, axis=1, dtype=np.int_)
+
+
+@dataclass(frozen=True, slots=True)
 class BKTSkillRankingResult:
     """Ranked skill opportunities for one learner."""
 
@@ -948,6 +1013,179 @@ class BKTModel:
         )
         return self._forecast_from_priors_batch(mastery_values, n_steps)
 
+    def _validated_mastery_targets(
+        self,
+        target_mastery: float | NDArray[np.float64],
+        *,
+        n_persons: int | None,
+    ) -> NDArray[np.float64]:
+        """Return scalar, shared, or person-specific mastery targets."""
+        raw_targets = np.asarray(target_mastery)
+        if (
+            np.issubdtype(raw_targets.dtype, np.bool_)
+            or np.issubdtype(raw_targets.dtype, np.complexfloating)
+            or not np.issubdtype(raw_targets.dtype, np.number)
+        ):
+            raise ValueError("target_mastery must contain values in [0, 1]")
+
+        output_shape = (
+            (self.n_skills,) if n_persons is None else (n_persons, self.n_skills)
+        )
+        if raw_targets.ndim == 0:
+            target_values = np.full(
+                output_shape,
+                raw_targets.item(),
+                dtype=np.float64,
+            )
+        elif raw_targets.shape == (self.n_skills,):
+            target_values = np.broadcast_to(raw_targets, output_shape).astype(
+                np.float64,
+                copy=True,
+            )
+        elif n_persons is not None and raw_targets.shape == output_shape:
+            target_values = raw_targets.astype(np.float64, copy=True)
+        else:
+            expected_shapes = (
+                "a scalar or shape (n_skills,)"
+                if n_persons is None
+                else "a scalar, shape (n_skills,), or shape (n_persons, n_skills)"
+            )
+            raise ValueError(f"target_mastery must be {expected_shapes}")
+
+        if not np.all(np.isfinite(target_values)) or np.any(
+            (target_values < 0.0) | (target_values > 1.0)
+        ):
+            raise ValueError("target_mastery must contain values in [0, 1]")
+        return target_values
+
+    def _opportunities_to_mastery_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: NDArray[np.float64],
+    ) -> BKTBatchMasteryTargetResult:
+        """Solve validated mastery target crossings without scanning a horizon."""
+        opportunities = np.full(prior_mastery.shape, np.inf, dtype=np.float64)
+        reached = prior_mastery >= target_mastery
+        opportunities[reached] = 0.0
+
+        transition_rate = self.p_learn + self.p_forget
+        persistence = 1.0 - transition_rate
+        next_mastery = prior_mastery * persistence + self.p_learn
+        pending = ~reached
+
+        immediate = (
+            pending & (persistence[None, :] <= 0.0) & (next_mastery >= target_mastery)
+        )
+        opportunities[immediate] = 1.0
+
+        equilibrium = np.divide(
+            self.p_learn,
+            transition_rate,
+            out=np.zeros_like(self.p_learn),
+            where=transition_rate > 0.0,
+        )
+        monotone = (
+            pending
+            & (persistence[None, :] > 0.0)
+            & (persistence[None, :] < 1.0)
+            & (prior_mastery < equilibrium[None, :])
+            & (target_mastery < equilibrium[None, :])
+        )
+        rows, columns = np.nonzero(monotone)
+        if rows.size:
+            initial_gaps = equilibrium[columns] - prior_mastery[rows, columns]
+            target_gaps = equilibrium[columns] - target_mastery[rows, columns]
+            raw_opportunities = np.log(target_gaps / initial_gaps) / np.log(
+                persistence[columns]
+            )
+            counts = np.maximum(
+                np.ceil(np.nextafter(raw_opportunities, -np.inf)),
+                1.0,
+            )
+
+            projected = equilibrium[columns] + (
+                prior_mastery[rows, columns] - equilibrium[columns]
+            ) * np.power(persistence[columns], counts)
+            counts += projected < target_mastery[rows, columns]
+
+            previous_counts = counts - 1.0
+            previous = equilibrium[columns] + (
+                prior_mastery[rows, columns] - equilibrium[columns]
+            ) * np.power(persistence[columns], previous_counts)
+            counts -= (counts > 1.0) & (previous >= target_mastery[rows, columns])
+            opportunities[rows, columns] = counts
+
+        return BKTBatchMasteryTargetResult(
+            opportunities=opportunities,
+            target_mastery=target_mastery,
+        )
+
+    def opportunities_to_mastery(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: float | NDArray[np.float64] = 0.95,
+    ) -> BKTMasteryTargetResult:
+        """Return minimum opportunities for expected mastery to reach targets.
+
+        The calculation follows the unconditional transition used by
+        :meth:`forecast_from_priors`. It solves the closed-form recurrence
+        directly, so runtime and memory do not depend on a forecast horizon.
+
+        Parameters
+        ----------
+        prior_mastery : NDArray
+            Next-opportunity mastery probabilities with shape ``(n_skills,)``.
+        target_mastery : float or NDArray, default=0.95
+            Shared scalar target or one target per skill.
+
+        Returns
+        -------
+        BKTMasteryTargetResult
+            Minimum opportunity counts. Unreachable targets are
+            ``numpy.inf``.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=False,
+        )
+        target_values = self._validated_mastery_targets(
+            target_mastery,
+            n_persons=None,
+        )
+        result = self._opportunities_to_mastery_batch(
+            mastery_values[None, :],
+            target_values[None, :],
+        )
+        return BKTMasteryTargetResult(
+            opportunities=result.opportunities[0].copy(),
+            target_mastery=result.target_mastery[0].copy(),
+        )
+
+    def opportunities_to_mastery_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        target_mastery: float | NDArray[np.float64] = 0.95,
+    ) -> BKTBatchMasteryTargetResult:
+        """Vectorize minimum opportunities to expected mastery targets.
+
+        Targets may be a shared scalar, a shared ``(n_skills,)`` vector, or a
+        person-specific ``(n_persons, n_skills)`` matrix. Counts are measured
+        from each supplied next-opportunity prior; zero means the target is
+        already met.
+        """
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=True,
+        )
+        target_values = self._validated_mastery_targets(
+            target_mastery,
+            n_persons=mastery_values.shape[0],
+        )
+        return self._opportunities_to_mastery_batch(
+            mastery_values,
+            target_values,
+        )
+
     def _validated_skill_ranking_options(
         self,
         criterion: BKTSkillCriterion,
@@ -1166,6 +1404,29 @@ class BKTModel:
             return np.array([self.p_guess[skill_idx], 1.0 - self.p_slip[skill_idx]])
         return np.array([1.0 - self.p_guess[skill_idx], self.p_slip[skill_idx]])
 
+    def _emission_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return row-wise emission pairs for one shared skill."""
+        guess = self.p_guess[skill_idx]
+        slip = self.p_slip[skill_idx]
+        observed = responses >= 0
+        correct = responses == 1
+        emissions = np.ones((responses.size, 2), dtype=np.float64)
+        emissions[:, 0] = np.where(
+            observed,
+            np.where(correct, guess, 1.0 - guess),
+            1.0,
+        )
+        emissions[:, 1] = np.where(
+            observed,
+            np.where(correct, 1.0 - slip, slip),
+            1.0,
+        )
+        return emissions
+
     def _skill_trials(
         self, skill_assignments: NDArray[np.int_]
     ) -> list[NDArray[np.int_]]:
@@ -1293,6 +1554,56 @@ class BKTModel:
 
         return alpha, scaling
 
+    def _forward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        skill_trials: list[NDArray[np.int_]] | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Vectorize forward filtering across a validated shared layout."""
+        n_persons, n_trials = responses.shape
+        alpha = np.zeros((n_persons, n_trials, 2), dtype=np.float64)
+        scaling = np.zeros((n_persons, n_trials), dtype=np.float64)
+        if skill_trials is None:
+            skill_trials = self._skill_trials(skill_assignments)
+
+        for skill_idx, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+
+            first_trial = int(trial_indices[0])
+            emissions = self._emission_batch(
+                responses[:, first_trial],
+                skill_idx,
+            )
+            alpha[:, first_trial, 0] = (1.0 - self.p_init[skill_idx]) * emissions[:, 0]
+            alpha[:, first_trial, 1] = self.p_init[skill_idx] * emissions[:, 1]
+            scaling[:, first_trial] = np.sum(alpha[:, first_trial], axis=1)
+            np.divide(
+                alpha[:, first_trial],
+                scaling[:, first_trial, None],
+                out=alpha[:, first_trial],
+                where=scaling[:, first_trial, None] > 0.0,
+            )
+
+            transition = self.transition_matrix(skill_idx)
+            for previous_trial, trial in zip(
+                trial_indices[:-1],
+                trial_indices[1:],
+                strict=True,
+            ):
+                emissions = self._emission_batch(responses[:, trial], skill_idx)
+                alpha[:, trial] = (alpha[:, previous_trial] @ transition) * emissions
+                scaling[:, trial] = np.sum(alpha[:, trial], axis=1)
+                np.divide(
+                    alpha[:, trial],
+                    scaling[:, trial, None],
+                    out=alpha[:, trial],
+                    where=scaling[:, trial, None] > 0.0,
+                )
+
+        return alpha, scaling
+
     def backward(
         self,
         responses: NDArray[np.int_],
@@ -1374,6 +1685,69 @@ class BKTModel:
                     beta[trial] /= scaling[next_trial]
 
         return beta
+
+    def _backward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        scaling: NDArray[np.float64],
+        skill_trials: list[NDArray[np.int_]] | None = None,
+    ) -> NDArray[np.float64]:
+        """Vectorize backward smoothing across a validated shared layout."""
+        n_persons, n_trials = responses.shape
+        beta = np.zeros((n_persons, n_trials, 2), dtype=np.float64)
+        if skill_trials is None:
+            skill_trials = self._skill_trials(skill_assignments)
+
+        for skill_idx, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+            beta[:, trial_indices[-1]] = 1.0
+            transition = self.transition_matrix(skill_idx)
+
+            for trial, next_trial in zip(
+                trial_indices[-2::-1],
+                trial_indices[:0:-1],
+                strict=True,
+            ):
+                emissions = self._emission_batch(
+                    responses[:, next_trial],
+                    skill_idx,
+                )
+                beta[:, trial] = (emissions * beta[:, next_trial]) @ transition.T
+                valid_scaling = scaling[:, next_trial] > 0.0
+                beta[valid_scaling, trial] /= scaling[valid_scaling, next_trial, None]
+
+        return beta
+
+    def _forward_backward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Run vectorized fallback smoothing for one shared skill layout."""
+        skill_trials = self._skill_trials(skill_assignments)
+        alpha, scaling = self._forward_batch_shared_python(
+            responses,
+            skill_assignments,
+            skill_trials,
+        )
+        beta = self._backward_batch_shared_python(
+            responses,
+            skill_assignments,
+            scaling,
+            skill_trials,
+        )
+        alpha *= beta
+        gamma_sum = np.sum(alpha, axis=2, keepdims=True)
+        np.divide(
+            alpha,
+            gamma_sum,
+            out=alpha,
+            where=gamma_sum > 0.0,
+        )
+        log_likelihoods = np.sum(np.log(scaling + 1e-300), axis=1)
+        return alpha, log_likelihoods
 
     def forward_backward(
         self,
@@ -1499,6 +1873,10 @@ class BKTModel:
             native = self._native_forward_backward_batch(responses, skill_assignments)
             if native is not None:
                 return native
+            return self._forward_backward_batch_shared_python(
+                responses,
+                skill_assignments,
+            )
 
         gamma = np.empty((*responses.shape, 2), dtype=np.float64)
         log_likelihoods = np.empty(responses.shape[0], dtype=np.float64)
