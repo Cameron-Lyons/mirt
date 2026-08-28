@@ -1712,6 +1712,90 @@ class StateSpaceIRT:
 
         return filtered_means, filtered_variances
 
+    def extended_kalman_smoother(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Smooth one response history using evidence from every occasion.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_timepoints, n_items)``.
+            Use ``-1`` for missing item responses.
+
+        Returns
+        -------
+        tuple
+            Smoothed means and variances, each with shape ``(n_timepoints,)``.
+        """
+        response_values = self._validated_filter_responses(responses, batch=False)
+        smoothed_means, smoothed_variances = self.extended_kalman_smoother_batch(
+            response_values[None, :, :]
+        )
+        return smoothed_means[0].copy(), smoothed_variances[0].copy()
+
+    def extended_kalman_smoother_batch(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Smooth multiple response histories in one vectorized pass.
+
+        The forward pass uses the extended Kalman filter. A
+        Rauch--Tung--Striebel backward pass then conditions each state on all
+        response occasions.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+
+        Returns
+        -------
+        tuple
+            Smoothed means and variances, each with shape
+            ``(n_persons, n_timepoints)``.
+        """
+        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+            responses
+        )
+        return self._smooth_filtered_batch(filtered_means, filtered_variances)
+
+    def _smooth_filtered_batch(
+        self,
+        filtered_means: NDArray[np.float64],
+        filtered_variances: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Apply a vectorized RTS pass to validated filter output."""
+        smoothed_means = filtered_means.copy()
+        smoothed_variances = filtered_variances.copy()
+        transition = float(self.transition_matrix[0, 0])
+        transition_squared = transition**2
+        process_variance = float(self.process_noise[0, 0])
+
+        for time_index in range(self.n_timepoints - 2, -1, -1):
+            predicted_mean = transition * filtered_means[:, time_index]
+            predicted_variance = (
+                transition_squared * filtered_variances[:, time_index]
+                + process_variance
+            )
+            smoothing_gain = (
+                filtered_variances[:, time_index] * transition / predicted_variance
+            )
+            smoothed_means[:, time_index] = filtered_means[:, time_index] + (
+                smoothing_gain * (smoothed_means[:, time_index + 1] - predicted_mean)
+            )
+            smoothed_variances[:, time_index] = np.maximum(
+                filtered_variances[:, time_index]
+                + smoothing_gain**2
+                * (smoothed_variances[:, time_index + 1] - predicted_variance),
+                0.0,
+            )
+
+        return smoothed_means, smoothed_variances
+
     def simulate(
         self,
         n_persons: int,

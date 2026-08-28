@@ -96,12 +96,21 @@ model. The batch filter updates every learner in one vectorized call:
    means, variances = state_model.extended_kalman_filter_batch(responses)
    print(means.shape, variances.shape)  # (500, 12) (500, 12)
 
-Use ``extended_kalman_filter`` for one response history. Both methods accept
-only ``1`` (correct), ``0`` (incorrect), and ``-1`` (missing); a fully missing
-occasion propagates the predicted state without an observation update.
-``observation_noise`` adds response-scale variance to the linearized filter,
-reducing the information assigned to each response. It does not change draws
-from ``simulate``.
+   smoothed_means, smoothed_variances = (
+       state_model.extended_kalman_smoother_batch(responses)
+   )
+
+Filtering conditions each state on responses available through that occasion,
+which supports online tracking. Smoothing adds a vectorized
+Rauch--Tung--Striebel backward pass so every state uses the complete response
+history. Use ``extended_kalman_filter`` or ``extended_kalman_smoother`` for one
+response history.
+
+All four methods accept only ``1`` (correct), ``0`` (incorrect), and ``-1``
+(missing); a fully missing occasion propagates the predicted state without an
+observation update. ``observation_noise`` adds response-scale variance to the
+linearized filter, reducing the information assigned to each response. It does
+not change draws from ``simulate``.
 
 Growth-mixture fitting
 ----------------------

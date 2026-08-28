@@ -350,6 +350,36 @@ class TestStateSpaceIRT:
 
         return filtered_means, filtered_variances
 
+    @staticmethod
+    def _reference_smoother(model, responses):
+        filtered_means, filtered_variances = TestStateSpaceIRT._reference_filter(
+            model, responses
+        )
+        smoothed_means = filtered_means.copy()
+        smoothed_variances = filtered_variances.copy()
+        transition = model.transition_matrix[0, 0]
+        process_variance = model.process_noise[0, 0]
+
+        for time_index in range(model.n_timepoints - 2, -1, -1):
+            predicted_mean = transition * filtered_means[time_index]
+            predicted_variance = (
+                transition**2 * filtered_variances[time_index] + process_variance
+            )
+            smoothing_gain = (
+                filtered_variances[time_index] * transition / predicted_variance
+            )
+            smoothed_means[time_index] = filtered_means[time_index] + (
+                smoothing_gain * (smoothed_means[time_index + 1] - predicted_mean)
+            )
+            smoothed_variances[time_index] = max(
+                filtered_variances[time_index]
+                + smoothing_gain**2
+                * (smoothed_variances[time_index + 1] - predicted_variance),
+                0.0,
+            )
+
+        return smoothed_means, smoothed_variances
+
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         assert model.n_items == 5
@@ -458,6 +488,103 @@ class TestStateSpaceIRT:
         assert_allclose(single_mean, means[0])
         assert_allclose(single_variance, variances[0])
 
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    @pytest.mark.parametrize("transition", [0.85, -0.65])
+    def test_batch_smoother_matches_independent_scalar_reference(
+        self,
+        base_model,
+        transition,
+    ):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model=base_model,
+            transition_matrix=np.array([[transition]]),
+            process_noise=np.array([[0.07]]),
+            observation_noise=0.12,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+            initial_mean=-0.2,
+            initial_var=0.8,
+        )
+        responses = np.random.default_rng(41).integers(0, 2, size=(9, 5, 6))
+        responses[np.random.default_rng(42).random(responses.shape) < 0.2] = -1
+        expected_means = np.empty((len(responses), model.n_timepoints))
+        expected_variances = np.empty_like(expected_means)
+        for person_index, person_responses in enumerate(responses):
+            expected_means[person_index], expected_variances[person_index] = (
+                self._reference_smoother(model, person_responses)
+            )
+
+        means, variances = model.extended_kalman_smoother_batch(responses)
+
+        assert_allclose(means, expected_means, rtol=1e-12, atol=1e-12)
+        assert_allclose(variances, expected_variances, rtol=1e-12, atol=1e-12)
+        single_mean, single_variance = model.extended_kalman_smoother(responses[0])
+        assert_allclose(single_mean, means[0])
+        assert_allclose(single_variance, variances[0])
+
+    def test_smoother_uses_future_evidence_and_reduces_uncertainty(self):
+        model = StateSpaceIRT(
+            n_items=8,
+            n_timepoints=4,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.05]]),
+        )
+        responses = np.ones((3, 4, 8), dtype=np.int32)
+        responses[:, 0] = -1
+
+        filtered_means, filtered_variances = model.extended_kalman_filter_batch(
+            responses
+        )
+        smoothed_means, smoothed_variances = model.extended_kalman_smoother_batch(
+            responses
+        )
+
+        assert np.all(smoothed_means[:, 0] > filtered_means[:, 0])
+        assert np.all(smoothed_variances[:, :-1] < filtered_variances[:, :-1])
+        assert_allclose(smoothed_means[:, -1], filtered_means[:, -1])
+        assert_allclose(smoothed_variances[:, -1], filtered_variances[:, -1])
+        assert np.all(smoothed_variances >= 0.0)
+
+    def test_smoother_preserves_all_missing_state_marginals(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=4,
+            transition_matrix=np.array([[0.8]]),
+            process_noise=np.array([[0.2]]),
+            initial_mean=1.0,
+            initial_var=0.5,
+        )
+        responses = np.full((3, 4, 4), -1, dtype=np.int32)
+
+        filtered = model.extended_kalman_filter_batch(responses)
+        smoothed = model.extended_kalman_smoother_batch(responses)
+
+        assert_allclose(smoothed[0], filtered[0])
+        assert_allclose(smoothed[1], filtered[1])
+
+    def test_smoother_improves_simulated_state_recovery(self):
+        model = StateSpaceIRT(
+            n_items=20,
+            n_timepoints=12,
+            base_model="3PL",
+            transition_matrix=np.array([[0.95]]),
+            process_noise=np.array([[0.08]]),
+            discrimination=np.linspace(0.7, 1.8, 20),
+            difficulty=np.linspace(-2.0, 2.0, 20),
+            guessing=np.linspace(0.1, 0.25, 20),
+        )
+        responses, true_states = model.simulate(500, seed=42)
+
+        filtered_means, _ = model.extended_kalman_filter_batch(responses)
+        smoothed_means, _ = model.extended_kalman_smoother_batch(responses)
+        filtered_rmse = np.sqrt(np.mean((filtered_means - true_states) ** 2))
+        smoothed_rmse = np.sqrt(np.mean((smoothed_means - true_states) ** 2))
+
+        assert smoothed_rmse < 0.9 * filtered_rmse
+
     def test_3pl_observation_derivative_matches_finite_difference(self):
         model = StateSpaceIRT(
             n_items=4,
@@ -524,11 +651,15 @@ class TestStateSpaceIRT:
             np.full((2, 4), 2, dtype=np.int32),
         ],
     )
-    def test_single_filter_validates_responses(self, responses):
+    @pytest.mark.parametrize(
+        "method_name",
+        ["extended_kalman_filter", "extended_kalman_smoother"],
+    )
+    def test_single_state_estimator_validates_responses(self, responses, method_name):
         model = StateSpaceIRT(n_items=4, n_timepoints=3)
 
         with pytest.raises(ValueError, match="responses"):
-            model.extended_kalman_filter(responses)
+            getattr(model, method_name)(responses)
 
     @pytest.mark.parametrize(
         "responses",
@@ -540,11 +671,15 @@ class TestStateSpaceIRT:
             np.full((2, 3, 4), 2, dtype=np.int32),
         ],
     )
-    def test_batch_filter_validates_responses(self, responses):
+    @pytest.mark.parametrize(
+        "method_name",
+        ["extended_kalman_filter_batch", "extended_kalman_smoother_batch"],
+    )
+    def test_batch_state_estimator_validates_responses(self, responses, method_name):
         model = StateSpaceIRT(n_items=4, n_timepoints=3)
 
         with pytest.raises(ValueError, match="responses"):
-            model.extended_kalman_filter_batch(responses)
+            getattr(model, method_name)(responses)
 
     def test_ekf_with_missing_data(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=3)
