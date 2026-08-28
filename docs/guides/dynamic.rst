@@ -70,3 +70,27 @@ latent mastery states:
        n_trials_per_skill=20,
        seed=42,
    )
+
+Growth-mixture fitting
+----------------------
+
+Fit heterogeneous longitudinal trajectories with a structured result that
+includes model-selection criteria, classification entropy, class sizes, and
+convergence diagnostics:
+
+.. code-block:: python
+
+   import numpy as np
+   from mirt.models import GrowthMixtureModel
+
+   time_values = np.arange(6, dtype=float)
+   mixture = GrowthMixtureModel(n_classes=3, n_timepoints=6)
+   trajectories, _ = mixture.simulate(500, time_values, seed=42)
+
+   result = mixture.fit(trajectories, time_values)
+   print(result.aic, result.bic)
+   print(result.class_counts)
+   print(result.summary())
+
+``fit_em`` remains available when a mapping is preferred. ``fit`` uses the same
+estimation path and packages its final state into ``GrowthMixtureResult``.
