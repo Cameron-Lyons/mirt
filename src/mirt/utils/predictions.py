@@ -4,6 +4,7 @@ Provides functions for extracting random and fixed effect
 predictions from mixed-effects IRT models.
 """
 
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -47,6 +48,8 @@ class FixedEffects:
         Standard errors keyed identically to ``covariate_effects``.
     person_intercept, item_intercept : float | None
         Intercepts from fitted person and item covariate regressions.
+    person_intercept_standard_error, item_intercept_standard_error : float | None
+        Standard errors for the corresponding intercepts.
     """
 
     item_parameters: dict
@@ -54,6 +57,81 @@ class FixedEffects:
     covariate_standard_errors: dict | None = None
     person_intercept: float | None = None
     item_intercept: float | None = None
+    person_intercept_standard_error: float | None = None
+    item_intercept_standard_error: float | None = None
+
+
+def _effect_metadata(
+    result: "MixedEffectsFitResult",
+    prefix: str,
+) -> tuple[NDArray[np.float64], tuple[str, ...], NDArray[np.float64]] | None:
+    """Return validated coefficients, names, and standard errors for one level."""
+    values = getattr(result, f"{prefix}_effects", None)
+    if values is None:
+        return None
+
+    effects = np.asarray(values, dtype=np.float64)
+    if effects.ndim != 1 or effects.size == 0:
+        raise ValueError(f"result {prefix} effects must be a non-empty vector")
+    if not np.all(np.isfinite(effects)):
+        raise ValueError(f"result {prefix} effects must contain only finite values")
+
+    raw_names = getattr(result, f"{prefix}_covariate_names", ())
+    names = tuple(raw_names) if raw_names is not None else ()
+    if not names:
+        names = tuple(f"{prefix}_{idx}" for idx in range(effects.size))
+    if len(names) != effects.size:
+        raise ValueError(f"result {prefix} effect names have the wrong length")
+    if any(not isinstance(name, str) or not name or ":" in name for name in names):
+        raise ValueError(
+            f"result {prefix} effect names must be non-empty strings without ':'"
+        )
+    if len(set(names)) != len(names):
+        raise ValueError(f"result {prefix} effect names must be unique")
+
+    standard_error_values = getattr(result, f"{prefix}_effect_se", None)
+    if standard_error_values is None:
+        standard_errors = np.full(effects.shape, np.nan)
+    else:
+        standard_errors = np.asarray(standard_error_values, dtype=np.float64)
+        if standard_errors.shape != effects.shape:
+            raise ValueError(
+                f"result {prefix} effects and standard errors must have equal shapes"
+            )
+        if np.any(standard_errors < 0.0) or np.any(
+            ~(np.isfinite(standard_errors) | np.isnan(standard_errors))
+        ):
+            raise ValueError(
+                f"result {prefix} standard errors must be non-negative or NaN"
+            )
+    return effects, names, standard_errors
+
+
+def _intercept_metadata(
+    result: "MixedEffectsFitResult",
+    prefix: str,
+) -> tuple[float, float]:
+    """Return a validated intercept and its optional standard error."""
+    try:
+        intercept = float(getattr(result, f"{prefix}_intercept"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"result does not contain a valid {prefix} intercept") from exc
+    if not np.isfinite(intercept):
+        raise ValueError(f"result {prefix} intercept must be finite")
+
+    try:
+        standard_error = float(getattr(result, f"{prefix}_intercept_se", np.nan))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"result does not contain a valid {prefix} intercept standard error"
+        ) from exc
+    if standard_error < 0.0 or not (
+        np.isfinite(standard_error) or np.isnan(standard_error)
+    ):
+        raise ValueError(
+            f"result {prefix} intercept standard error must be non-negative or NaN"
+        )
+    return intercept, standard_error
 
 
 def randef(
@@ -89,6 +167,8 @@ def randef(
     if theta_values is None:
         raise ValueError("result does not contain estimated person abilities")
     theta = np.asarray(theta_values, dtype=np.float64).copy()
+    if theta.size == 0 or not np.all(np.isfinite(theta)):
+        raise ValueError("result abilities must be non-empty and finite")
 
     theta_se_values = getattr(result, "theta_se", None)
     theta_se = (
@@ -99,6 +179,12 @@ def randef(
     if theta_se.shape != theta.shape:
         raise ValueError(
             "result theta and theta standard errors must have equal shapes"
+        )
+    if theta_se_values is not None and (
+        not np.all(np.isfinite(theta_se)) or np.any(theta_se < 0.0)
+    ):
+        raise ValueError(
+            "result ability standard errors must be finite and non-negative"
         )
 
     group_effects = None
@@ -112,7 +198,7 @@ def randef(
     return RandomEffects(
         theta=theta,
         theta_se=theta_se,
-        group_effects=group_effects,
+        group_effects=deepcopy(group_effects),
     )
 
 
@@ -137,31 +223,28 @@ def fixef(
     >>> fe = fixef(result)
     >>> print(f"Item difficulties: {fe.item_parameters['difficulty']}")
     """
-    if not hasattr(result, "model"):
+    if not hasattr(result, "model") or result.model is None:
         raise ValueError("result does not contain a fitted model")
-    item_params = result.model.parameters
+    try:
+        item_params = deepcopy(result.model.parameters)
+    except AttributeError as exc:
+        raise ValueError("result model does not expose fitted parameters") from exc
 
     covariate_effects: dict[str, float] = {}
     covariate_standard_errors: dict[str, float] = {}
+    intercepts: dict[str, float | None] = {"person": None, "item": None}
+    intercept_standard_errors: dict[str, float | None] = {
+        "person": None,
+        "item": None,
+    }
     for prefix in ("person", "item"):
-        effects = getattr(result, f"{prefix}_effects", None)
-        if effects is None:
+        metadata = _effect_metadata(result, prefix)
+        if metadata is None:
             continue
-        effects = np.asarray(effects, dtype=np.float64)
-        names = getattr(result, f"{prefix}_covariate_names", ()) or tuple(
-            f"{prefix}_{idx}" for idx in range(len(effects))
+        effects, names, standard_errors = metadata
+        intercepts[prefix], intercept_standard_errors[prefix] = _intercept_metadata(
+            result, prefix
         )
-        if len(names) != len(effects):
-            raise ValueError(f"result {prefix} effect names have the wrong length")
-        standard_errors = getattr(result, f"{prefix}_effect_se", None)
-        if standard_errors is None:
-            standard_errors = np.full(effects.shape, np.nan)
-        else:
-            standard_errors = np.asarray(standard_errors, dtype=np.float64)
-            if standard_errors.shape != effects.shape:
-                raise ValueError(
-                    f"result {prefix} effects and standard errors must have equal shapes"
-                )
         for idx, name in enumerate(names):
             key = f"{prefix}:{name}"
             covariate_effects[key] = float(effects[idx])
@@ -171,14 +254,10 @@ def fixef(
         item_parameters=item_params,
         covariate_effects=covariate_effects or None,
         covariate_standard_errors=covariate_standard_errors or None,
-        person_intercept=(
-            float(result.person_intercept)
-            if result.person_effects is not None
-            else None
-        ),
-        item_intercept=(
-            float(result.item_intercept) if result.item_effects is not None else None
-        ),
+        person_intercept=intercepts["person"],
+        item_intercept=intercepts["item"],
+        person_intercept_standard_error=intercept_standard_errors["person"],
+        item_intercept_standard_error=intercept_standard_errors["item"],
     )
 
 
@@ -186,6 +265,7 @@ def predict_mixed(
     result: "MixedEffectsFitResult",
     new_theta: NDArray[np.float64] | None = None,
     new_covariates: NDArray[np.float64] | None = None,
+    item_idx: int | None = None,
 ) -> NDArray[np.float64]:
     """Predict response probabilities from mixed-effects model.
 
@@ -198,11 +278,15 @@ def predict_mixed(
     new_covariates : NDArray[np.float64], optional
         New person covariate values. Abilities are computed from the fitted
         person intercept and effects before response probabilities are evaluated.
+    item_idx : int, optional
+        Zero-based item index. Supplying an index avoids evaluating every item.
 
     Returns
     -------
     NDArray[np.float64]
-        Predicted probabilities. Shape: (n_persons, n_items).
+        Predicted probabilities. Dichotomous models return ``(n_persons,
+        n_items)`` for all items or ``(n_persons,)`` for one item. Polytomous
+        models add a final category dimension.
 
     Examples
     --------
@@ -211,15 +295,36 @@ def predict_mixed(
     >>> new_theta = np.array([[-1], [0], [1]])
     >>> probs = predict_mixed(result, new_theta)
     """
-    model = result.model
+    model = getattr(result, "model", None)
+    if model is None or not callable(getattr(model, "probability", None)):
+        raise ValueError("result does not contain a fitted probability model")
+    n_factors = getattr(model, "n_factors", None)
+    if (
+        isinstance(n_factors, bool)
+        or not isinstance(n_factors, (int, np.integer))
+        or n_factors < 1
+    ):
+        raise ValueError("result model does not expose a valid factor count")
+    if item_idx is not None:
+        n_items = getattr(model, "n_items", None)
+        if (
+            isinstance(item_idx, bool)
+            or not isinstance(item_idx, (int, np.integer))
+            or isinstance(n_items, bool)
+            or not isinstance(n_items, (int, np.integer))
+            or item_idx < 0
+            or item_idx >= n_items
+        ):
+            raise IndexError(f"item_idx must be in [0, {n_items})")
+        item_idx = int(item_idx)
     if new_theta is not None and new_covariates is not None:
         raise ValueError("provide either new_theta or new_covariates, not both")
 
     if new_covariates is not None:
-        effects = result.person_effects
-        if effects is None:
+        metadata = _effect_metadata(result, "person")
+        if metadata is None:
             raise ValueError("result does not contain person covariate effects")
-        effects = np.asarray(effects, dtype=np.float64)
+        effects = metadata[0]
         covariates = np.asarray(new_covariates, dtype=np.float64)
         if covariates.ndim == 1:
             covariates = (
@@ -231,9 +336,12 @@ def predict_mixed(
             raise ValueError(f"new_covariates must have {len(effects)} columns")
         if not np.all(np.isfinite(covariates)):
             raise ValueError("new_covariates must contain only finite values")
-        theta = result.person_intercept + covariates @ effects
+        intercept, _ = _intercept_metadata(result, "person")
+        theta = intercept + covariates @ effects
     else:
-        theta_values = new_theta if new_theta is not None else result.theta
+        theta_values = (
+            new_theta if new_theta is not None else getattr(result, "theta", None)
+        )
         if theta_values is None:
             raise ValueError("result does not contain abilities for prediction")
         theta = np.asarray(theta_values, dtype=np.float64)
@@ -241,13 +349,13 @@ def predict_mixed(
     if theta.ndim == 0:
         theta = theta.reshape(1, 1)
     elif theta.ndim == 1:
-        theta = theta.reshape(-1, 1) if model.n_factors == 1 else theta.reshape(1, -1)
-    if theta.ndim != 2 or theta.shape[1] != model.n_factors:
-        raise ValueError(f"ability values must have {model.n_factors} columns")
+        theta = theta.reshape(-1, 1) if n_factors == 1 else theta.reshape(1, -1)
+    if theta.ndim != 2 or theta.shape[1] != n_factors:
+        raise ValueError(f"ability values must have {n_factors} columns")
     if not np.all(np.isfinite(theta)):
         raise ValueError("ability values must contain only finite values")
 
-    return model.probability(theta)
+    return np.asarray(model.probability(theta, item_idx=item_idx), dtype=np.float64)
 
 
 def conditional_effects(
@@ -272,8 +380,10 @@ def conditional_effects(
         Dictionary with "values", "effects", and "se" arrays.
     """
     values = np.asarray(values, dtype=np.float64)
-    if values.ndim != 1 or not np.all(np.isfinite(values)):
-        raise ValueError("values must be a finite one-dimensional array")
+    if values.ndim != 1 or values.size == 0 or not np.all(np.isfinite(values)):
+        raise ValueError("values must be a non-empty finite one-dimensional array")
+    if not isinstance(covariate_name, str) or not covariate_name:
+        raise ValueError("covariate_name must be a non-empty string")
 
     requested_prefix = None
     requested_name = covariate_name
@@ -286,14 +396,10 @@ def conditional_effects(
     for prefix in ("person", "item"):
         if requested_prefix is not None and prefix != requested_prefix:
             continue
-        effects = getattr(result, f"{prefix}_effects", None)
-        if effects is None:
+        metadata = _effect_metadata(result, prefix)
+        if metadata is None:
             continue
-        names = getattr(result, f"{prefix}_covariate_names", ()) or tuple(
-            f"{prefix}_{idx}" for idx in range(len(effects))
-        )
-        if len(names) != len(effects):
-            raise ValueError(f"result {prefix} effect names have the wrong length")
+        _, names, _ = metadata
         matches.extend(
             (prefix, idx) for idx, name in enumerate(names) if name == requested_name
         )
@@ -306,18 +412,11 @@ def conditional_effects(
         )
 
     prefix, index = matches[0]
-    coefficient = float(getattr(result, f"{prefix}_effects")[index])
-    standard_errors = getattr(result, f"{prefix}_effect_se", None)
-    if standard_errors is None:
-        coefficient_se = np.nan
-    else:
-        standard_errors = np.asarray(standard_errors, dtype=np.float64)
-        effects = np.asarray(getattr(result, f"{prefix}_effects"), dtype=np.float64)
-        if standard_errors.shape != effects.shape:
-            raise ValueError(
-                f"result {prefix} effects and standard errors must have equal shapes"
-            )
-        coefficient_se = float(standard_errors[index])
+    metadata = _effect_metadata(result, prefix)
+    assert metadata is not None
+    effects, _, standard_errors = metadata
+    coefficient = float(effects[index])
+    coefficient_se = float(standard_errors[index])
     return {
         "values": values,
         "effects": coefficient * values,
@@ -376,9 +475,15 @@ def shrinkage_estimates(
     if hasattr(result, "variance_components"):
         vc = result.variance_components
         if "between_group" in vc and "within_group" in vc:
-            total_var = vc["between_group"] + vc["within_group"]
+            between = float(vc["between_group"])
+            within = float(vc["within_group"])
+            if not np.isfinite(between) or not np.isfinite(within):
+                raise ValueError("variance components must be finite")
+            if between < 0.0 or within < 0.0:
+                raise ValueError("variance components must be non-negative")
+            total_var = between + within
             if total_var > 0:
-                icc = vc["between_group"] / total_var
+                icc = between / total_var
 
     return {
         "reliability": float(reliability),
