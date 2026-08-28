@@ -8,7 +8,7 @@ This module provides MCMC estimation for:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -16,21 +16,12 @@ from scipy import stats
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
-
-if TYPE_CHECKING:
-    pass
-
 from mirt.models.dynamic import (
     BKTModel,
     BKTResult,
     LongitudinalIRTModel,
     LongitudinalResult,
 )
-
-try:
-    from mirt._rust_backend import RUST_AVAILABLE
-except ImportError:
-    RUST_AVAILABLE = False
 
 
 @dataclass
@@ -45,6 +36,24 @@ class BKTPriors:
     p_forget: tuple[float, float] = (1.0, 1.0)
     p_slip: tuple[float, float] = (1.0, 1.0)
     p_guess: tuple[float, float] = (1.0, 1.0)
+
+    def __post_init__(self) -> None:
+        for name in ("p_init", "p_learn", "p_forget", "p_slip", "p_guess"):
+            try:
+                shapes = np.asarray(getattr(self, name), dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{name} prior must contain two finite positive values"
+                ) from exc
+            if (
+                shapes.shape != (2,)
+                or not np.all(np.isfinite(shapes))
+                or np.any(shapes <= 0.0)
+            ):
+                raise ValueError(
+                    f"{name} prior must contain two finite positive values"
+                )
+            setattr(self, name, (float(shapes[0]), float(shapes[1])))
 
 
 @dataclass
@@ -99,14 +108,45 @@ class BKTGibbsSampler:
         use_rust : bool
             Use compiled BKT inference kernels when available
         """
-        self.n_iter = n_iter
-        self.burnin = burnin
-        self.thin = thin
-        self.priors = priors or BKTPriors()
-        self.verbose = verbose
-        self.seed = seed
+        if (
+            isinstance(n_iter, (bool, np.bool_))
+            or not isinstance(n_iter, (int, np.integer))
+            or n_iter < 1
+        ):
+            raise ValueError("n_iter must be a positive integer")
+        if (
+            isinstance(burnin, (bool, np.bool_))
+            or not isinstance(burnin, (int, np.integer))
+            or burnin < 0
+        ):
+            raise ValueError("burnin must be a non-negative integer")
+        if burnin >= n_iter:
+            raise ValueError("burnin must be less than n_iter")
+        if (
+            isinstance(thin, (bool, np.bool_))
+            or not isinstance(thin, (int, np.integer))
+            or thin < 1
+        ):
+            raise ValueError("thin must be a positive integer")
+        if priors is not None and not isinstance(priors, BKTPriors):
+            raise TypeError("priors must be a BKTPriors instance or None")
+        if not isinstance(verbose, (bool, np.bool_)):
+            raise TypeError("verbose must be a boolean")
+        if seed is not None and (
+            isinstance(seed, (bool, np.bool_))
+            or not isinstance(seed, (int, np.integer))
+            or seed < 0
+        ):
+            raise ValueError("seed must be a non-negative integer or None")
         if not isinstance(use_rust, (bool, np.bool_)):
             raise TypeError("use_rust must be a boolean")
+
+        self.n_iter = int(n_iter)
+        self.burnin = int(burnin)
+        self.thin = int(thin)
+        self.priors = BKTPriors() if priors is None else priors
+        self.verbose = bool(verbose)
+        self.seed = None if seed is None else int(seed)
         self.use_rust = bool(use_rust)
 
     def fit(
@@ -135,22 +175,17 @@ class BKTGibbsSampler:
             Estimation results
         """
         rng = np.random.default_rng(self.seed)
-
-        n_persons, n_trials = responses.shape
-
-        if n_skills is None:
-            n_skills = int(np.max(skill_assignments) + 1)
-
-        model = BKTModel(
-            n_skills=n_skills,
-            allow_forgetting=allow_forgetting,
-            use_rust=self.use_rust,
+        responses, skill_assignments, model = self._prepare_fit(
+            responses,
+            skill_assignments,
+            n_skills,
+            allow_forgetting,
         )
+        n_persons, n_trials = responses.shape
+        n_skills = model.n_skills
 
-        learning_states = np.zeros((n_persons, n_trials), dtype=np.int32)
-        for i in range(n_persons):
-            for t in range(n_trials):
-                learning_states[i, t] = rng.integers(0, 2)
+        learning_states = rng.integers(0, 2, size=(n_persons, n_trials), dtype=np.int32)
+        skill_trials = model._skill_trials(skill_assignments)
 
         chains: dict[str, list[NDArray]] = {
             "p_init": [],
@@ -168,17 +203,34 @@ class BKTGibbsSampler:
                     skill_assignments,
                     model,
                     rng,
+                    skill_trials,
                 )
 
-            self._sample_p_init(model, learning_states, skill_assignments, rng)
-            self._sample_p_learn(model, learning_states, skill_assignments, rng)
+            self._sample_p_init(
+                model, learning_states, skill_assignments, rng, skill_trials
+            )
+            self._sample_p_learn(
+                model, learning_states, skill_assignments, rng, skill_trials
+            )
             if allow_forgetting:
-                self._sample_p_forget(model, learning_states, skill_assignments, rng)
+                self._sample_p_forget(
+                    model, learning_states, skill_assignments, rng, skill_trials
+                )
             self._sample_p_slip(
-                model, responses, learning_states, skill_assignments, rng
+                model,
+                responses,
+                learning_states,
+                skill_assignments,
+                rng,
+                skill_trials,
             )
             self._sample_p_guess(
-                model, responses, learning_states, skill_assignments, rng
+                model,
+                responses,
+                learning_states,
+                skill_assignments,
+                rng,
+                skill_trials,
             )
 
             if iteration >= self.burnin and (iteration - self.burnin) % self.thin == 0:
@@ -230,12 +282,55 @@ class BKTGibbsSampler:
             converged=True,
         )
 
+    def _prepare_fit(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        n_skills: int | None,
+        allow_forgetting: bool,
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_], BKTModel]:
+        """Validate fit inputs and construct the matching BKT model."""
+        responses = np.asarray(responses)
+        skill_assignments = np.asarray(skill_assignments)
+
+        if responses.ndim != 2:
+            raise ValueError("responses must have shape (n_persons, n_trials)")
+        if responses.shape[0] == 0:
+            raise ValueError("responses must contain at least one person")
+        if responses.shape[1] == 0:
+            raise ValueError("responses must contain at least one trial")
+        if skill_assignments.ndim != 1:
+            raise ValueError("skill_assignments must be one-dimensional")
+        if len(skill_assignments) != responses.shape[1]:
+            raise ValueError("skill_assignments length must match the number of trials")
+        if not np.issubdtype(skill_assignments.dtype, np.integer):
+            raise ValueError("skill_assignments must contain integer values")
+        if np.any(skill_assignments < 0):
+            raise ValueError("skill_assignments must contain non-negative values")
+        if not isinstance(allow_forgetting, (bool, np.bool_)):
+            raise TypeError("allow_forgetting must be a boolean")
+
+        if n_skills is None:
+            n_skills = int(np.max(skill_assignments)) + 1
+        model = BKTModel(
+            n_skills=n_skills,
+            allow_forgetting=bool(allow_forgetting),
+            use_rust=self.use_rust,
+        )
+        responses, skill_assignments = model._validate_batch(
+            responses, skill_assignments
+        )
+        if not np.any(responses >= 0):
+            raise ValueError("responses must contain at least one observed value")
+        return responses, skill_assignments, model
+
     def _sample_states_ffbs(
         self,
         responses: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         model: BKTModel,
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> NDArray[np.int_]:
         """Forward-filtering backward-sampling for hidden states."""
         n_trials = len(responses)
@@ -243,10 +338,10 @@ class BKTGibbsSampler:
         alpha, _ = model.forward(responses, skill_assignments)
 
         states = np.zeros(n_trials, dtype=np.int32)
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for skill_idx, trial_indices in enumerate(
-            model._skill_trials(skill_assignments)
-        ):
+        for skill_idx, trial_indices in enumerate(skill_trials):
             if len(trial_indices) == 0:
                 continue
 
@@ -267,24 +362,20 @@ class BKTGibbsSampler:
         learning_states: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> None:
         """Sample initial knowledge probabilities."""
         n_persons = learning_states.shape[0]
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for j in range(model.n_skills):
-            first_trials = []
-            for i in range(n_persons):
-                skill_trials = np.where(skill_assignments == j)[0]
-                if len(skill_trials) > 0:
-                    first_trials.append(learning_states[i, skill_trials[0]])
-
-            if first_trials:
-                n_learned = sum(first_trials)
-                n_total = len(first_trials)
-
-                alpha = self.priors.p_init[0] + n_learned
-                beta = self.priors.p_init[1] + (n_total - n_learned)
-                model.p_init[j] = rng.beta(alpha, beta)
+        for j, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+            n_learned = int(np.count_nonzero(learning_states[:, int(trial_indices[0])]))
+            alpha = self.priors.p_init[0] + n_learned
+            beta = self.priors.p_init[1] + (n_persons - n_learned)
+            model.p_init[j] = rng.beta(alpha, beta)
 
     def _sample_p_learn(
         self,
@@ -292,24 +383,18 @@ class BKTGibbsSampler:
         learning_states: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> None:
         """Sample learning rate parameters."""
-        n_persons, n_trials = learning_states.shape
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for j in range(model.n_skills):
-            n_transitions = 0
-            n_learned = 0
-
-            for i in range(n_persons):
-                skill_trials = np.where(skill_assignments == j)[0]
-                for t_idx in range(1, len(skill_trials)):
-                    t = skill_trials[t_idx]
-                    t_prev = skill_trials[t_idx - 1]
-
-                    if learning_states[i, t_prev] == 0:
-                        n_transitions += 1
-                        if learning_states[i, t] == 1:
-                            n_learned += 1
+        for j, trial_indices in enumerate(skill_trials):
+            previous = learning_states[:, trial_indices[:-1]]
+            current = learning_states[:, trial_indices[1:]]
+            eligible = previous == 0
+            n_transitions = int(np.count_nonzero(eligible))
+            n_learned = int(np.count_nonzero(eligible & (current == 1)))
 
             alpha = self.priors.p_learn[0] + n_learned
             beta = self.priors.p_learn[1] + (n_transitions - n_learned)
@@ -321,24 +406,18 @@ class BKTGibbsSampler:
         learning_states: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> None:
         """Sample forgetting rate parameters."""
-        n_persons, n_trials = learning_states.shape
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for j in range(model.n_skills):
-            n_transitions = 0
-            n_forgot = 0
-
-            for i in range(n_persons):
-                skill_trials = np.where(skill_assignments == j)[0]
-                for t_idx in range(1, len(skill_trials)):
-                    t = skill_trials[t_idx]
-                    t_prev = skill_trials[t_idx - 1]
-
-                    if learning_states[i, t_prev] == 1:
-                        n_transitions += 1
-                        if learning_states[i, t] == 0:
-                            n_forgot += 1
+        for j, trial_indices in enumerate(skill_trials):
+            previous = learning_states[:, trial_indices[:-1]]
+            current = learning_states[:, trial_indices[1:]]
+            eligible = previous == 1
+            n_transitions = int(np.count_nonzero(eligible))
+            n_forgot = int(np.count_nonzero(eligible & (current == 0)))
 
             alpha = self.priors.p_forget[0] + n_forgot
             beta = self.priors.p_forget[1] + (n_transitions - n_forgot)
@@ -351,21 +430,19 @@ class BKTGibbsSampler:
         learning_states: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> None:
         """Sample slip parameters."""
-        n_persons, n_trials = responses.shape
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for j in range(model.n_skills):
-            n_learned_trials = 0
-            n_slips = 0
-
-            for i in range(n_persons):
-                skill_trials = np.where(skill_assignments == j)[0]
-                for t in skill_trials:
-                    if learning_states[i, t] == 1 and responses[i, t] >= 0:
-                        n_learned_trials += 1
-                        if responses[i, t] == 0:
-                            n_slips += 1
+        for j, trial_indices in enumerate(skill_trials):
+            skill_responses = responses[:, trial_indices]
+            learned_observed = (learning_states[:, trial_indices] == 1) & (
+                skill_responses >= 0
+            )
+            n_learned_trials = int(np.count_nonzero(learned_observed))
+            n_slips = int(np.count_nonzero(learned_observed & (skill_responses == 0)))
 
             alpha = self.priors.p_slip[0] + n_slips
             beta = self.priors.p_slip[1] + (n_learned_trials - n_slips)
@@ -378,21 +455,21 @@ class BKTGibbsSampler:
         learning_states: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
         rng: np.random.Generator,
+        skill_trials: list[NDArray[np.int_]] | None = None,
     ) -> None:
         """Sample guess parameters."""
-        n_persons, n_trials = responses.shape
+        if skill_trials is None:
+            skill_trials = model._skill_trials(skill_assignments)
 
-        for j in range(model.n_skills):
-            n_unlearned_trials = 0
-            n_guessed = 0
-
-            for i in range(n_persons):
-                skill_trials = np.where(skill_assignments == j)[0]
-                for t in skill_trials:
-                    if learning_states[i, t] == 0 and responses[i, t] >= 0:
-                        n_unlearned_trials += 1
-                        if responses[i, t] == 1:
-                            n_guessed += 1
+        for j, trial_indices in enumerate(skill_trials):
+            skill_responses = responses[:, trial_indices]
+            unlearned_observed = (learning_states[:, trial_indices] == 0) & (
+                skill_responses >= 0
+            )
+            n_unlearned_trials = int(np.count_nonzero(unlearned_observed))
+            n_guessed = int(
+                np.count_nonzero(unlearned_observed & (skill_responses == 1))
+            )
 
             alpha = self.priors.p_guess[0] + n_guessed
             beta = self.priors.p_guess[1] + (n_unlearned_trials - n_guessed)
