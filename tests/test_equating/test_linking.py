@@ -11,6 +11,13 @@ from mirt.equating import (
     link,
     transform_parameters,
 )
+from mirt.equating.linking import (
+    _bisector_link,
+    _closed_form_bootstrap_samples,
+    _mean_mean_link,
+    _mean_sigma_link,
+    _orthogonal_link,
+)
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     ThreeParameterLogistic,
@@ -353,6 +360,88 @@ class TestLinkingRobust:
 
         assert first.constants.A_se == second.constants.A_se
         assert first.constants.B_se == second.constants.B_se
+
+
+class TestClosedFormBootstrapBatch:
+    """Regression contracts for batched closed-form bootstrap links."""
+
+    @pytest.mark.parametrize(
+        ("method", "robust"),
+        [
+            ("mean_sigma", False),
+            ("mean_sigma", True),
+            ("mean_mean", False),
+            ("mean_mean", True),
+            ("bisector", False),
+            ("orthogonal", False),
+        ],
+    )
+    def test_batch_matches_scalar_replicates(
+        self, reference_model, scaled_model, method, robust
+    ):
+        """Chunked evaluation preserves every sampled scalar estimate."""
+        new_model, _, _ = scaled_model
+        disc_old = np.asarray(reference_model.discrimination)
+        diff_old = np.asarray(reference_model.difficulty)
+        disc_new = np.asarray(new_model.discrimination)
+        diff_new = np.asarray(new_model.difficulty).copy()
+        diff_new[[0, 3, 7]] += np.array([0.2, -0.1, 0.15])
+        n_bootstrap = 37
+
+        expected_a = np.empty(n_bootstrap)
+        expected_b = np.empty(n_bootstrap)
+        expected_rng = np.random.default_rng(921)
+        for replicate in range(n_bootstrap):
+            sampled = expected_rng.integers(0, disc_old.size, disc_old.size)
+            arrays = (
+                disc_old[sampled],
+                diff_old[sampled],
+                disc_new[sampled],
+                diff_new[sampled],
+            )
+            if method == "mean_sigma":
+                A, B, _ = _mean_sigma_link(*arrays, robust=robust)
+            elif method == "mean_mean":
+                A, B, _ = _mean_mean_link(*arrays, robust=robust)
+            elif method == "bisector":
+                A, B, _ = _bisector_link(*arrays)
+            else:
+                A, B, _ = _orthogonal_link(*arrays)
+            expected_a[replicate] = A
+            expected_b[replicate] = B
+
+        actual_a, actual_b = _closed_form_bootstrap_samples(
+            disc_old,
+            diff_old,
+            disc_new,
+            diff_new,
+            method,
+            n_bootstrap,
+            np.random.default_rng(921),
+            robust=robust,
+            chunk_size=4,
+        )
+
+        np.testing.assert_allclose(actual_a, expected_a, rtol=2e-14, atol=2e-14)
+        np.testing.assert_allclose(actual_b, expected_b, rtol=2e-14, atol=2e-14)
+
+    @pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+    def test_rejects_invalid_chunk_size(
+        self, reference_model, scaled_model, chunk_size
+    ):
+        """The private batching boundary rejects unusable chunk sizes."""
+        new_model, _, _ = scaled_model
+        with pytest.raises(ValueError, match="chunk_size"):
+            _closed_form_bootstrap_samples(
+                np.asarray(reference_model.discrimination),
+                np.asarray(reference_model.difficulty),
+                np.asarray(new_model.discrimination),
+                np.asarray(new_model.difficulty),
+                "mean_mean",
+                10,
+                np.random.default_rng(1),
+                chunk_size=chunk_size,
+            )
 
 
 class TestLinkingFitStatistics:

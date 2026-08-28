@@ -5,6 +5,7 @@ import warnings
 import numpy as np
 import pytest
 
+import mirt.equating.diagnostics as diagnostics
 from mirt.equating.diagnostics import (
     bootstrap_linking_se,
     compare_linking_methods,
@@ -140,6 +141,64 @@ class TestBootstrapLinkingSE:
 
         assert se_a > 0
         assert se_b > 0
+
+    @pytest.mark.parametrize(
+        "method", ["mean_sigma", "mean_mean", "bisector", "orthogonal"]
+    )
+    def test_anchor_bootstrap_batches_closed_form_methods(
+        self, linked_models_pair, monkeypatch, method
+    ):
+        """Closed-form anchor bootstraps bypass scalar replicate dispatch."""
+        model_old, model_new, anchors = linked_models_pair
+
+        def unexpected_scalar_dispatch(*args, **kwargs):
+            raise AssertionError("scalar replicate dispatch should not run")
+
+        monkeypatch.setattr(
+            diagnostics, "_estimate_constants", unexpected_scalar_dispatch
+        )
+        result = bootstrap_linking_se(
+            model_old,
+            model_new,
+            None,
+            None,
+            anchors,
+            anchors,
+            method=method,
+            n_bootstrap=25,
+            seed=19,
+        )
+
+        assert all(np.all(np.isfinite(values)) for values in result)
+
+    def test_mean_sigma_batch_preserves_degenerate_scale_fallback(
+        self, linked_models_pair
+    ):
+        """A zero old-form scale still falls back to discrimination means."""
+        model_old, model_new, anchors = linked_models_pair
+        model_old.set_parameters(difficulty=np.zeros(model_old.n_items))
+        n_bootstrap = 30
+
+        _, _, A_samples, _ = bootstrap_linking_se(
+            model_old,
+            model_new,
+            None,
+            None,
+            anchors,
+            anchors,
+            method="mean_sigma",
+            n_bootstrap=n_bootstrap,
+            seed=73,
+        )
+
+        old_disc = np.asarray(model_old.discrimination)[anchors]
+        new_disc = np.asarray(model_new.discrimination)[anchors]
+        rng = np.random.default_rng(73)
+        sampled = rng.integers(0, len(anchors), size=(n_bootstrap, len(anchors)))
+        expected = np.mean(new_disc[sampled], axis=1) / np.mean(
+            old_disc[sampled], axis=1
+        )
+        np.testing.assert_allclose(A_samples, expected)
 
     @pytest.mark.parametrize("n_bootstrap", [0, 1, 1.5, True])
     def test_rejects_invalid_replicate_count(self, linked_models_pair, n_bootstrap):

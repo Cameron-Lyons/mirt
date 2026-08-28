@@ -28,6 +28,10 @@ _LINKING_METHODS = frozenset(
         "orthogonal",
     }
 )
+_CLOSED_FORM_LINKING_METHODS = frozenset(
+    {"mean_sigma", "mean_mean", "bisector", "orthogonal"}
+)
+_BOOTSTRAP_CHUNK_ELEMENTS = 1_000_000
 
 
 @dataclass
@@ -1055,6 +1059,188 @@ def _robust_z_scores(values: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.where(matches_median, 0.0, np.inf)
 
 
+def _batch_ols_slope(
+    x: NDArray[np.float64], y: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Compute one OLS slope per row without constructing covariance matrices."""
+    centered_x = x - np.mean(x, axis=1, keepdims=True)
+    centered_y = y - np.mean(y, axis=1, keepdims=True)
+    degrees_of_freedom = x.shape[1] - 1
+    variance = np.sum(centered_x * centered_x, axis=1) / degrees_of_freedom
+    covariance = np.sum(centered_x * centered_y, axis=1) / degrees_of_freedom
+    slopes = np.zeros(x.shape[0], dtype=np.float64)
+    np.divide(covariance, variance, out=slopes, where=variance >= 1e-10)
+    return slopes
+
+
+def _batch_bisector_links(
+    disc_old: NDArray[np.float64],
+    diff_old: NDArray[np.float64],
+    disc_new: NDArray[np.float64],
+    diff_new: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute bisector links for a batch of paired anchor samples."""
+    slope_a_on_b = _batch_ols_slope(disc_new, disc_old)
+    slope_b_on_a = _batch_ols_slope(disc_old, disc_new)
+    bisector_slope = np.zeros_like(slope_a_on_b)
+    valid_disc = np.abs(slope_b_on_a) >= 1e-10
+    np.divide(
+        slope_a_on_b,
+        slope_b_on_a,
+        out=bisector_slope,
+        where=valid_disc,
+    )
+    bisector_slope = np.sign(slope_a_on_b) * np.sqrt(np.abs(bisector_slope))
+    A_disc = np.ones_like(bisector_slope)
+    invertible_disc = valid_disc & (np.abs(bisector_slope) >= 1e-10)
+    np.divide(1.0, bisector_slope, out=A_disc, where=invertible_disc)
+
+    slope_b_y_on_x = _batch_ols_slope(diff_new, diff_old)
+    slope_b_x_on_y = _batch_ols_slope(diff_old, diff_new)
+    bisector_slope_b = np.zeros_like(slope_b_y_on_x)
+    valid_diff = np.abs(slope_b_x_on_y) >= 1e-10
+    np.divide(
+        slope_b_y_on_x,
+        slope_b_x_on_y,
+        out=bisector_slope_b,
+        where=valid_diff,
+    )
+    bisector_slope_b = np.sign(slope_b_y_on_x) * np.sqrt(np.abs(bisector_slope_b))
+    A_diff = np.where(valid_diff, bisector_slope_b, 1.0)
+
+    A = (A_disc + A_diff) / 2.0
+    B = np.mean(diff_old, axis=1) - A * np.mean(diff_new, axis=1)
+    return A, B
+
+
+def _batch_orthogonal_component(
+    old: NDArray[np.float64], new: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Compute one Deming-regression slope per paired sample."""
+    var_old = np.var(old, axis=1, ddof=1)
+    var_new = np.var(new, axis=1, ddof=1)
+    centered_old = old - np.mean(old, axis=1, keepdims=True)
+    centered_new = new - np.mean(new, axis=1, keepdims=True)
+    covariance = np.sum(centered_old * centered_new, axis=1) / (old.shape[1] - 1)
+    variance_difference = var_old - var_new
+    discriminant = variance_difference**2 + 4.0 * covariance**2
+    slopes = np.ones(old.shape[0], dtype=np.float64)
+    valid = np.abs(covariance) >= 1e-10
+    np.divide(
+        variance_difference + np.sqrt(discriminant),
+        2.0 * covariance,
+        out=slopes,
+        where=valid,
+    )
+    return slopes
+
+
+def _batch_orthogonal_links(
+    disc_old: NDArray[np.float64],
+    diff_old: NDArray[np.float64],
+    disc_new: NDArray[np.float64],
+    diff_new: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute orthogonal links for a batch of paired anchor samples."""
+    A_disc = _batch_orthogonal_component(disc_old, disc_new)
+    A_diff = _batch_orthogonal_component(diff_old, diff_new)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        A = (1.0 / A_disc + A_diff) / 2.0
+    B = np.mean(diff_old, axis=1) - A * np.mean(diff_new, axis=1)
+    return A, B
+
+
+def _closed_form_bootstrap_samples(
+    disc_old: NDArray[np.float64],
+    diff_old: NDArray[np.float64],
+    disc_new: NDArray[np.float64],
+    diff_new: NDArray[np.float64],
+    method: str,
+    n_bootstrap: int,
+    rng: np.random.Generator,
+    *,
+    robust: bool = False,
+    fallback_on_either_scale: bool = False,
+    chunk_size: int | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Evaluate closed-form paired-anchor bootstrap replicates in chunks."""
+    if method not in _CLOSED_FORM_LINKING_METHODS:
+        raise ValueError(f"{method} is not a closed-form linking method")
+    n_items = disc_old.size
+    if chunk_size is None:
+        chunk_size = max(
+            1,
+            min(n_bootstrap, _BOOTSTRAP_CHUNK_ELEMENTS // max(1, n_items)),
+        )
+    elif isinstance(chunk_size, bool) or not isinstance(chunk_size, (int, np.integer)):
+        raise ValueError("chunk_size must be a positive integer")
+    elif chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+
+    A_samples = np.empty(n_bootstrap, dtype=np.float64)
+    B_samples = np.empty(n_bootstrap, dtype=np.float64)
+    for start in range(0, n_bootstrap, int(chunk_size)):
+        stop = min(start + int(chunk_size), n_bootstrap)
+        sampled = rng.integers(0, n_items, size=(stop - start, n_items))
+        sampled_disc_old = disc_old[sampled]
+        sampled_diff_old = diff_old[sampled]
+        sampled_disc_new = disc_new[sampled]
+        sampled_diff_new = diff_new[sampled]
+
+        if method in {"mean_sigma", "mean_mean"}:
+            location = np.median if robust else np.mean
+            disc_location_old = location(sampled_disc_old, axis=1)
+            disc_location_new = location(sampled_disc_new, axis=1)
+            diff_location_old = location(sampled_diff_old, axis=1)
+            diff_location_new = location(sampled_diff_new, axis=1)
+            if method == "mean_mean":
+                A = disc_location_new / disc_location_old
+            else:
+                if robust:
+                    scale_old = (
+                        np.median(
+                            np.abs(sampled_diff_old - diff_location_old[:, None]),
+                            axis=1,
+                        )
+                        * 1.4826
+                    )
+                    scale_new = (
+                        np.median(
+                            np.abs(sampled_diff_new - diff_location_new[:, None]),
+                            axis=1,
+                        )
+                        * 1.4826
+                    )
+                else:
+                    scale_old = np.std(sampled_diff_old, axis=1, ddof=1)
+                    scale_new = np.std(sampled_diff_new, axis=1, ddof=1)
+                fallback = scale_new < 1e-10
+                if fallback_on_either_scale:
+                    fallback |= scale_old < 1e-10
+                A = np.empty(stop - start, dtype=np.float64)
+                np.divide(scale_old, scale_new, out=A, where=~fallback)
+                A[fallback] = disc_location_new[fallback] / disc_location_old[fallback]
+            B = diff_location_old - A * diff_location_new
+        elif method == "bisector":
+            A, B = _batch_bisector_links(
+                sampled_disc_old,
+                sampled_diff_old,
+                sampled_disc_new,
+                sampled_diff_new,
+            )
+        else:
+            A, B = _batch_orthogonal_links(
+                sampled_disc_old,
+                sampled_diff_old,
+                sampled_disc_new,
+                sampled_diff_new,
+            )
+
+        A_samples[start:stop] = A
+        B_samples[start:stop] = B
+    return A_samples, B_samples
+
+
 def _bootstrap_linking_se(
     disc_old: NDArray[np.float64],
     diff_old: NDArray[np.float64],
@@ -1074,6 +1260,25 @@ def _bootstrap_linking_se(
     """Compute bootstrap standard errors for linking constants."""
     rng = np.random.default_rng(random_state)
     n_items = len(disc_old)
+
+    if method in _CLOSED_FORM_LINKING_METHODS:
+        A_samples, B_samples = _closed_form_bootstrap_samples(
+            disc_old,
+            diff_old,
+            disc_new,
+            diff_new,
+            method,
+            n_bootstrap,
+            rng,
+            robust=robust,
+        )
+        invalid = np.flatnonzero(
+            (~np.isfinite(A_samples)) | (A_samples <= 0.0) | (~np.isfinite(B_samples))
+        )
+        if invalid.size:
+            index = int(invalid[0])
+            _validate_linking_constants(A_samples[index], B_samples[index], method)
+        return float(np.std(A_samples, ddof=1)), float(np.std(B_samples, ddof=1))
 
     if lower_old is None:
         lower_old = np.zeros(n_items)
@@ -1102,11 +1307,7 @@ def _bootstrap_linking_se(
         l_new_b = lower_new[idx]
         u_new_b = upper_new[idx]
 
-        if method == "mean_sigma":
-            A, B, _ = _mean_sigma_link(d_old_b, b_old_b, d_new_b, b_new_b, robust)
-        elif method == "mean_mean":
-            A, B, _ = _mean_mean_link(d_old_b, b_old_b, d_new_b, b_new_b, robust)
-        elif method in ("stocking_lord", "tcc"):
+        if method in ("stocking_lord", "tcc"):
             A, B, _ = _stocking_lord_link(
                 d_old_b,
                 b_old_b,
@@ -1132,10 +1333,6 @@ def _bootstrap_linking_se(
                 l_new_b,
                 u_new_b,
             )
-        elif method == "bisector":
-            A, B, _ = _bisector_link(d_old_b, b_old_b, d_new_b, b_new_b)
-        elif method == "orthogonal":
-            A, B, _ = _orthogonal_link(d_old_b, b_old_b, d_new_b, b_new_b)
         else:
             raise ValueError(f"Unknown linking method: {method}")
 

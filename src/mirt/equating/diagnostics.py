@@ -11,9 +11,11 @@ from scipy import optimize, stats
 from scipy.special import expit
 
 from mirt.equating.linking import (
+    _CLOSED_FORM_LINKING_METHODS,
     LinkingFitStatistics,
     LinkingResult,
     _bisector_link,
+    _closed_form_bootstrap_samples,
     _orthogonal_link,
     link,
 )
@@ -99,6 +101,36 @@ def bootstrap_linking_se(
     parameters_old = _extract_link_parameters(model_old, anchors_old, "old")
     parameters_new = _extract_link_parameters(model_new, anchors_new, "new")
     n_anchors = len(anchors_old)
+
+    if response_matrices is None and method in _CLOSED_FORM_LINKING_METHODS:
+        A_samples, B_samples = _closed_form_bootstrap_samples(
+            parameters_old[0],
+            parameters_old[1],
+            parameters_new[0],
+            parameters_new[1],
+            method,
+            n_bootstrap,
+            rng,
+            fallback_on_either_scale=True,
+        )
+        invalid = np.flatnonzero(
+            (~np.isfinite(A_samples)) | (A_samples <= 0.0) | (~np.isfinite(B_samples))
+        )
+        if invalid.size:
+            replicate = int(invalid[0])
+            try:
+                _validate_constants(A_samples[replicate], B_samples[replicate])
+            except (ValueError, RuntimeError, ArithmeticError) as exc:
+                raise RuntimeError(
+                    f"Bootstrap replicate {replicate + 1} failed: {exc}"
+                ) from exc
+        return (
+            float(np.std(A_samples, ddof=1)),
+            float(np.std(B_samples, ddof=1)),
+            A_samples,
+            B_samples,
+        )
+
     A_samples = np.empty(n_bootstrap, dtype=np.float64)
     B_samples = np.empty(n_bootstrap, dtype=np.float64)
 
