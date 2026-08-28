@@ -16,7 +16,7 @@ from numpy.typing import NDArray
 from scipy.optimize import LinearConstraint, minimize
 
 from mirt._core import sigmoid
-from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN, PROB_EPSILON
+from mirt.constants import PROB_EPSILON
 from mirt.models.cdm import BaseCDM
 from mirt.utils.numeric import logsumexp
 
@@ -611,7 +611,7 @@ class GDINA(BaseCDM):
         mastered: NDArray[np.bool_],
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
-    ) -> tuple[float, int]:
+    ) -> tuple[NDArray[np.float64], float, int]:
         categories = mastered.astype(np.int_)
         category_successes = np.bincount(
             categories,
@@ -632,7 +632,12 @@ class GDINA(BaseCDM):
         probabilities = rates[categories]
         n_parameters = int(np.unique(categories).size)
         return (
-            self._selection_log_likelihood(probabilities, successes, totals),
+            rates,
+            self._selection_log_likelihood(
+                probabilities,
+                successes,
+                totals,
+            ),
             n_parameters,
         )
 
@@ -642,7 +647,7 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         global_rate: float,
-    ) -> float:
+    ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (np.ones(group_patterns.shape[0], dtype=np.float64), group_patterns)
         )
@@ -692,10 +697,8 @@ class GDINA(BaseCDM):
         )
         if not feasible:
             parameters = initial
-        return self._selection_log_likelihood(
-            design @ parameters,
-            successes,
-            totals,
+        return parameters, self._selection_log_likelihood(
+            design @ parameters, successes, totals
         )
 
     def _fit_llm_candidate(
@@ -704,7 +707,7 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         global_rate: float,
-    ) -> float:
+    ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (np.ones(group_patterns.shape[0], dtype=np.float64), group_patterns)
         )
@@ -737,7 +740,11 @@ class GDINA(BaseCDM):
         ):
             parameters = initial
         probabilities = np.asarray(sigmoid(design @ parameters), dtype=np.float64)
-        return self._selection_log_likelihood(probabilities, successes, totals)
+        return parameters, self._selection_log_likelihood(
+            probabilities,
+            successes,
+            totals,
+        )
 
     def _fit_rrum_candidate(
         self,
@@ -745,7 +752,7 @@ class GDINA(BaseCDM):
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
         rates: NDArray[np.float64],
-    ) -> float:
+    ) -> tuple[NDArray[np.float64], float]:
         design = np.column_stack(
             (
                 np.ones(group_patterns.shape[0], dtype=np.float64),
@@ -788,21 +795,30 @@ class GDINA(BaseCDM):
         ):
             log_parameters = initial
         probabilities = np.exp(design @ log_parameters)
-        return self._selection_log_likelihood(probabilities, successes, totals)
+        return np.exp(log_parameters), self._selection_log_likelihood(
+            probabilities,
+            successes,
+            totals,
+        )
 
-    def _fit_selection_candidate(
+    def _fit_reduced_parameters(
         self,
         model_type: ReducedModelType,
         group_patterns: NDArray[np.int_],
         successes: NDArray[np.float64],
         totals: NDArray[np.float64],
-    ) -> tuple[float, int]:
+    ) -> tuple[NDArray[np.float64], float, int]:
         rates, global_rate = self._selection_group_rates(successes, totals)
         n_attributes = group_patterns.shape[1]
 
         if model_type == "saturated":
             return (
-                self._selection_log_likelihood(rates, successes, totals),
+                rates,
+                self._selection_log_likelihood(
+                    rates,
+                    successes,
+                    totals,
+                ),
                 group_patterns.shape[0],
             )
         if model_type == "DINA":
@@ -818,27 +834,42 @@ class GDINA(BaseCDM):
                 totals,
             )
         if model_type == "ACDM":
-            log_likelihood = self._fit_acdm_candidate(
+            parameters, log_likelihood = self._fit_acdm_candidate(
                 group_patterns,
                 successes,
                 totals,
                 global_rate,
             )
         elif model_type == "LLM":
-            log_likelihood = self._fit_llm_candidate(
+            parameters, log_likelihood = self._fit_llm_candidate(
                 group_patterns,
                 successes,
                 totals,
                 global_rate,
             )
         else:
-            log_likelihood = self._fit_rrum_candidate(
+            parameters, log_likelihood = self._fit_rrum_candidate(
                 group_patterns,
                 successes,
                 totals,
                 rates,
             )
-        return log_likelihood, n_attributes + 1
+        return parameters, log_likelihood, n_attributes + 1
+
+    def _fit_selection_candidate(
+        self,
+        model_type: ReducedModelType,
+        group_patterns: NDArray[np.int_],
+        successes: NDArray[np.float64],
+        totals: NDArray[np.float64],
+    ) -> tuple[float, int]:
+        _, log_likelihood, n_parameters = self._fit_reduced_parameters(
+            model_type,
+            group_patterns,
+            successes,
+            totals,
+        )
+        return log_likelihood, n_parameters
 
     @staticmethod
     def _validate_selection_candidates(
@@ -864,7 +895,7 @@ class GDINA(BaseCDM):
             validated.append(model_type)
         return validated
 
-    def _validate_selection_responses(
+    def _validate_responses(
         self,
         responses: NDArray[np.int_],
     ) -> NDArray[np.int_]:
@@ -916,7 +947,7 @@ class GDINA(BaseCDM):
             Best model type for each item.
         """
         candidates = self._validate_selection_candidates(candidate_models)
-        response_values = self._validate_selection_responses(responses)
+        response_values = self._validate_responses(responses)
         patterns = self._attribute_patterns
         probabilities = np.asarray(self.probability(patterns), dtype=np.float64)
         if not np.all(np.isfinite(probabilities)):
@@ -1432,70 +1463,117 @@ def fit_gdina(
     tuple
         (fitted_model, class_probabilities)
     """
-    responses = np.asarray(responses)
-    q_matrix = np.asarray(q_matrix)
+    raw_responses = np.asarray(responses)
+    if raw_responses.ndim != 2:
+        raise ValueError("responses must be a two-dimensional matrix")
+    if raw_responses.shape[0] == 0 or raw_responses.shape[1] == 0:
+        raise ValueError("responses must contain at least one person and one item")
+    raw_q_matrix = np.asarray(q_matrix)
+    if raw_q_matrix.ndim != 2:
+        raise ValueError("q_matrix must be a two-dimensional matrix")
+    if (
+        isinstance(max_iter, (bool, np.bool_))
+        or not isinstance(max_iter, (int, np.integer))
+        or max_iter <= 0
+    ):
+        raise ValueError("max_iter must be a positive integer")
+    if (
+        isinstance(tol, (bool, np.bool_))
+        or not isinstance(tol, (int, float, np.integer, np.floating))
+        or not np.isfinite(tol)
+        or tol <= 0.0
+    ):
+        raise ValueError("tol must be a positive finite number")
 
-    n_persons, n_items = responses.shape
-    n_attributes = q_matrix.shape[1]
+    n_items = raw_responses.shape[1]
+    n_attributes = raw_q_matrix.shape[1]
 
     model = GDINA(
         n_items=n_items,
         n_attributes=n_attributes,
-        q_matrix=q_matrix,
+        q_matrix=raw_q_matrix,
         reduced_models=reduced_models,
     )
+    response_values = model._validate_responses(raw_responses)
 
     patterns = model.attribute_patterns
     n_patterns = len(patterns)
+    observed = response_values >= 0
+    response_float = np.where(observed, response_values, 0).astype(
+        np.float64,
+        copy=False,
+    )
+    observed_float = observed.astype(np.float64)
+    group_indices = [
+        model._latent_group_idx(patterns, item_idx) for item_idx in range(n_items)
+    ]
+    required_attributes = [
+        np.flatnonzero(model._q_matrix[item_idx] == 1) for item_idx in range(n_items)
+    ]
+    group_patterns = [
+        model._latent_groups[item_idx][:, required_attributes[item_idx]]
+        for item_idx in range(n_items)
+    ]
 
-    class_probs = np.ones(n_patterns) / n_patterns
+    class_probs = np.full(n_patterns, 1.0 / n_patterns, dtype=np.float64)
     prev_ll = -np.inf
 
     for iteration in range(max_iter):
-        log_like_matrix = np.zeros((n_persons, n_patterns))
-        for p_idx, pattern in enumerate(patterns):
-            alpha = np.tile(pattern, (n_persons, 1))
-            log_like_matrix[:, p_idx] = model.log_likelihood(responses, alpha)
-
-        log_posterior = log_like_matrix + np.log(class_probs + PROB_EPSILON)
+        probabilities = np.asarray(model.probability(patterns), dtype=np.float64)
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("model probabilities must contain only finite values")
+        probabilities = np.clip(
+            probabilities,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        log_correct = np.log(probabilities)
+        log_incorrect = np.log1p(-probabilities)
+        log_like_matrix = (
+            response_float @ log_correct.T
+            + (observed_float - response_float) @ log_incorrect.T
+        )
+        log_posterior = log_like_matrix + np.log(class_probs)
         log_sum = np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
         posterior = np.exp(log_posterior - log_sum)
-
-        class_probs = posterior.mean(axis=0)
-
-        for j in range(n_items):
-            model_type = model._reduced_models[j]
-            delta = model._delta_params[j]
-            n_params = len(delta)
-
-            if model_type == "saturated":
-                n_groups = n_params
-                for g in range(n_groups):
-                    group_idx = model._latent_group_idx(patterns, j)
-                    in_group = group_idx == g
-
-                    num = 0.0
-                    denom = 0.0
-
-                    for p_idx in range(n_patterns):
-                        if in_group[p_idx]:
-                            weight = posterior[:, p_idx]
-                            valid = responses[:, j] >= 0
-                            num += np.sum(weight[valid] * responses[valid, j])
-                            denom += np.sum(weight[valid])
-
-                    if denom > PROB_EPSILON:
-                        model._delta_params[j][g] = np.clip(
-                            num / denom, PROB_CLIP_MIN, PROB_CLIP_MAX
-                        )
-
-        current_ll = np.sum(log_sum)
+        current_ll = float(np.sum(log_sum))
 
         if verbose:
             print(f"Iteration {iteration + 1}: LL = {current_ll:.4f}")
 
-        if abs(current_ll - prev_ll) < tol:
+        if iteration > 0 and abs(current_ll - prev_ll) < tol:
             break
+
+        class_probs = np.maximum(np.mean(posterior, axis=0), PROB_EPSILON)
+        class_probs /= np.sum(class_probs)
+
+        for item_idx in range(n_items):
+            item_observed = observed[:, item_idx]
+            observed_posterior = posterior[item_observed]
+            pattern_totals = np.sum(observed_posterior, axis=0)
+            pattern_successes = np.sum(
+                observed_posterior
+                * response_float[item_observed, item_idx, np.newaxis],
+                axis=0,
+            )
+            n_groups = group_patterns[item_idx].shape[0]
+            item_totals = np.bincount(
+                group_indices[item_idx],
+                weights=pattern_totals,
+                minlength=n_groups,
+            )
+            item_successes = np.bincount(
+                group_indices[item_idx],
+                weights=pattern_successes,
+                minlength=n_groups,
+            )
+            parameters, _, _ = model._fit_reduced_parameters(
+                model._reduced_models[item_idx],
+                group_patterns[item_idx],
+                item_successes,
+                item_totals,
+            )
+            model._delta_params[item_idx] = parameters
 
         prev_ll = current_ll
 
