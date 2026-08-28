@@ -179,27 +179,35 @@ def compute_ld_statistics(
     residuals = _compute_residuals(model, responses, theta)
 
     q3_matrix = _compute_q3(residuals, responses)
-
-    adj_residual_corr = _compute_adjusted_residual_corr(
-        model, responses, theta, n_quadpts
-    )
+    adj_residual_corr = _adjust_q3(q3_matrix)
 
     ld_chi2_matrix, g2_matrix = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
-    q3_flagged = []
-    chi2_flagged = []
+    rows, columns = np.triu_indices(n_items, k=1)
+    q3_values = q3_matrix[rows, columns]
+    q3_mask = np.abs(q3_values) > q3_threshold
+    q3_flagged = [
+        (int(i), int(j), float(value))
+        for i, j, value in zip(
+            rows[q3_mask], columns[q3_mask], q3_values[q3_mask], strict=True
+        )
+    ]
 
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            if np.abs(q3_matrix[i, j]) > q3_threshold:
-                q3_flagged.append((i, j, float(q3_matrix[i, j])))
-
-            if not np.isnan(ld_chi2_matrix[i, j]):
-                p_value = 1 - stats.chi2.cdf(ld_chi2_matrix[i, j], df=1)
-                if p_value < alpha:
-                    chi2_flagged.append(
-                        (i, j, float(ld_chi2_matrix[i, j]), float(p_value))
-                    )
+    chi2_values = ld_chi2_matrix[rows, columns]
+    finite = np.isfinite(chi2_values)
+    p_values = np.full(chi2_values.shape, np.nan)
+    p_values[finite] = stats.chi2.sf(chi2_values[finite], df=1)
+    chi2_mask = finite & (p_values < alpha)
+    chi2_flagged = [
+        (int(i), int(j), float(value), float(p_value))
+        for i, j, value, p_value in zip(
+            rows[chi2_mask],
+            columns[chi2_mask],
+            chi2_values[chi2_mask],
+            p_values[chi2_mask],
+            strict=True,
+        )
+    ]
 
     item_names = model.item_names if hasattr(model, "item_names") else None
 
@@ -325,11 +333,14 @@ def compute_ld_chi2(
         chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
     p_value_matrix = np.zeros_like(chi2_matrix)
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            if not np.isnan(chi2_matrix[i, j]):
-                p_value_matrix[i, j] = 1 - stats.chi2.cdf(chi2_matrix[i, j], df=1)
-                p_value_matrix[j, i] = p_value_matrix[i, j]
+    rows, columns = np.triu_indices(n_items, k=1)
+    values = chi2_matrix[rows, columns]
+    finite = np.isfinite(values)
+    p_values = stats.chi2.sf(values[finite], df=1)
+    finite_rows = rows[finite]
+    finite_columns = columns[finite]
+    p_value_matrix[finite_rows, finite_columns] = p_values
+    p_value_matrix[finite_columns, finite_rows] = p_values
 
     return chi2_matrix, p_value_matrix
 
@@ -382,42 +393,42 @@ def _compute_q3(
     n_items = residuals.shape[1]
     q3_matrix = np.zeros((n_items, n_items))
 
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
-            valid &= ~np.isnan(residuals[:, i]) & ~np.isnan(residuals[:, j])
+    valid = (responses >= 0) & ~np.isnan(residuals)
+    valid_float = valid.astype(np.float64)
+    values = np.where(valid, residuals, 0.0)
 
-            if valid.sum() > 2:
-                r_i = residuals[valid, i]
-                r_j = residuals[valid, j]
+    pair_counts = valid_float.T @ valid_float
+    safe_counts = np.where(pair_counts > 0, pair_counts, 1.0)
+    pair_sums = values.T @ valid_float
+    pair_square_sums = (values * values).T @ valid_float
+    pair_cross_products = values.T @ values
 
-                q3 = np.corrcoef(r_i, r_j)[0, 1]
-                q3_matrix[i, j] = q3
-                q3_matrix[j, i] = q3
+    covariance = pair_cross_products - (pair_sums * pair_sums.T) / safe_counts
+    variance_rows = pair_square_sums - (pair_sums * pair_sums) / safe_counts
+    variance_columns = pair_square_sums.T - (pair_sums.T * pair_sums.T) / safe_counts
+    np.maximum(variance_rows, 0.0, out=variance_rows)
+    np.maximum(variance_columns, 0.0, out=variance_columns)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlations = covariance / np.sqrt(variance_rows * variance_columns)
+
+    rows, columns = np.triu_indices(n_items, k=1)
+    eligible = pair_counts[rows, columns] > 2
+    eligible_rows = rows[eligible]
+    eligible_columns = columns[eligible]
+    q3_values = correlations[eligible_rows, eligible_columns]
+    q3_matrix[eligible_rows, eligible_columns] = q3_values
+    q3_matrix[eligible_columns, eligible_rows] = q3_values
 
     return q3_matrix
 
 
-def _compute_adjusted_residual_corr(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    theta: NDArray[np.float64],
-    n_quadpts: int,
-) -> NDArray[np.float64]:
-    """Compute adjusted residual correlations.
-
-    Adjusts for the expected negative correlation under local independence.
-    """
-    n_items = responses.shape[1]
-
-    residuals = _compute_residuals(model, responses, theta)
-    q3 = _compute_q3(residuals, responses)
-
-    expected_q3 = -1.0 / (n_items - 1)
-
-    adj_corr = q3 - expected_q3
-
-    return adj_corr
+def _adjust_q3(q3_matrix: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Adjust Q3 for its expected negative correlation under independence."""
+    n_items = q3_matrix.shape[0]
+    if n_items < 2:
+        return q3_matrix.copy()
+    return q3_matrix + 1.0 / (n_items - 1)
 
 
 def _compute_ld_chi2_g2(
@@ -431,56 +442,61 @@ def _compute_ld_chi2_g2(
     Uses the Chen & Thissen (1997) approach comparing observed and
     expected cross-classification frequencies.
     """
+    del n_quadpts  # Retained for compatibility with the public call path.
     n_persons, n_items = responses.shape
+
+    positive_probabilities = np.empty((n_persons, n_items), dtype=np.float64)
+    for item_idx in range(n_items):
+        probabilities = np.asarray(model.probability(theta, item_idx))
+        if probabilities.ndim == 2:
+            probabilities = 1.0 - probabilities[:, 0]
+        positive_probabilities[:, item_idx] = probabilities
+
+    valid = responses >= 0
+    valid_float = valid.astype(np.float64)
+    observed_positive = ((responses > 0) & valid).astype(np.float64)
+    observed_zero = valid_float - observed_positive
+    expected_positive = np.where(valid, positive_probabilities, 0.0)
+    expected_zero = valid_float - expected_positive
+
+    chi2_values = np.zeros((n_items, n_items), dtype=np.float64)
+    g2_values = np.zeros((n_items, n_items), dtype=np.float64)
+    tables = (
+        (observed_zero, observed_zero, expected_zero, expected_zero),
+        (observed_zero, observed_positive, expected_zero, expected_positive),
+        (observed_positive, observed_zero, expected_positive, expected_zero),
+        (
+            observed_positive,
+            observed_positive,
+            expected_positive,
+            expected_positive,
+        ),
+    )
+    for observed_left, observed_right, expected_left, expected_right in tables:
+        observed_counts = observed_left.T @ observed_right
+        expected_counts = expected_left.T @ expected_right
+        np.maximum(expected_counts, 0.5, out=expected_counts)
+        chi2_values += (observed_counts - expected_counts) ** 2 / expected_counts
+        g2_values += (
+            2.0
+            * observed_counts
+            * np.log(observed_counts / expected_counts + PROB_EPSILON)
+        )
+
+    pair_counts = valid_float.T @ valid_float
+    rows, columns = np.triu_indices(n_items, k=1)
+    eligible = pair_counts[rows, columns] >= 10
+    eligible_rows = rows[eligible]
+    eligible_columns = columns[eligible]
 
     chi2_matrix = np.full((n_items, n_items), np.nan)
     g2_matrix = np.full((n_items, n_items), np.nan)
-
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
-            n_valid = valid.sum()
-
-            if n_valid < 10:
-                continue
-
-            resp_i = responses[valid, i]
-            resp_j = responses[valid, j]
-            theta_valid = theta[valid]
-
-            prob_i = model.probability(theta_valid, i)
-            prob_j = model.probability(theta_valid, j)
-
-            if prob_i.ndim == 2:
-                prob_i = 1 - prob_i[:, 0]
-            if prob_j.ndim == 2:
-                prob_j = 1 - prob_j[:, 0]
-
-            resp_i_bin = (resp_i > 0).astype(int)
-            resp_j_bin = (resp_j > 0).astype(int)
-
-            obs_00 = np.sum((resp_i_bin == 0) & (resp_j_bin == 0))
-            obs_01 = np.sum((resp_i_bin == 0) & (resp_j_bin == 1))
-            obs_10 = np.sum((resp_i_bin == 1) & (resp_j_bin == 0))
-            obs_11 = np.sum((resp_i_bin == 1) & (resp_j_bin == 1))
-
-            exp_00 = np.sum((1 - prob_i) * (1 - prob_j))
-            exp_01 = np.sum((1 - prob_i) * prob_j)
-            exp_10 = np.sum(prob_i * (1 - prob_j))
-            exp_11 = np.sum(prob_i * prob_j)
-
-            observed = np.array([obs_00, obs_01, obs_10, obs_11])
-            expected = np.array([exp_00, exp_01, exp_10, exp_11])
-
-            expected = np.maximum(expected, 0.5)
-
-            chi2 = np.sum((observed - expected) ** 2 / expected)
-            chi2_matrix[i, j] = chi2
-            chi2_matrix[j, i] = chi2
-
-            g2 = 2 * np.sum(observed * np.log(observed / expected + PROB_EPSILON))
-            g2_matrix[i, j] = g2
-            g2_matrix[j, i] = g2
+    pair_chi2 = chi2_values[eligible_rows, eligible_columns]
+    pair_g2 = g2_values[eligible_rows, eligible_columns]
+    chi2_matrix[eligible_rows, eligible_columns] = pair_chi2
+    chi2_matrix[eligible_columns, eligible_rows] = pair_chi2
+    g2_matrix[eligible_rows, eligible_columns] = pair_g2
+    g2_matrix[eligible_columns, eligible_rows] = pair_g2
 
     return chi2_matrix, g2_matrix
 
