@@ -373,9 +373,7 @@ def _compute_person_loglik(
         if not np.all(np.isfinite(log_likelihood)):
             raise ValueError("model produced non-finite person log-likelihoods")
 
-        marginal[start:stop] = logsumexp_axis1(
-            log_likelihood + log_weights[None, :]
-        )
+        marginal[start:stop] = logsumexp_axis1(log_likelihood + log_weights[None, :])
 
     if not np.all(np.isfinite(marginal)):
         raise ValueError("model produced non-finite marginal log-likelihoods")

@@ -51,9 +51,7 @@ class _BatchLogLikelihoodModel:
         self.n_items = n_items
 
     def log_likelihood_batch(self, responses, theta):
-        offsets = np.where(
-            responses[:, 0] == 1, self.one_loglik, self.zero_loglik
-        )
+        offsets = np.where(responses[:, 0] == 1, self.one_loglik, self.zero_loglik)
         slopes = np.where(responses[:, 0] == 1, self.node_slope, -self.node_slope)
         return offsets[:, None] + slopes[:, None] * theta[None, :, 0]
 
@@ -182,12 +180,8 @@ class TestVuongTest:
         responses = np.concatenate(
             [np.ones((5_500, 1), dtype=int), np.zeros((4_500, 1), dtype=int)]
         )
-        first = _BatchLogLikelihoodModel(
-            "first", zero_loglik=-3.0, one_loglik=-1.0
-        )
-        second = _BatchLogLikelihoodModel(
-            "second", zero_loglik=-2.0, one_loglik=-2.0
-        )
+        first = _BatchLogLikelihoodModel("first", zero_loglik=-3.0, one_loglik=-1.0)
+        second = _BatchLogLikelihoodModel("second", zero_loglik=-2.0, one_loglik=-2.0)
 
         result = vuong_test(_result(first), _result(second), responses, n_quadpts=5)
         differences = np.where(responses[:, 0] == 1, 1.0, -1.0)
@@ -209,12 +203,8 @@ class TestVuongTest:
         responses = np.concatenate(
             [np.ones((7, 1), dtype=int), np.zeros((3, 1), dtype=int)]
         )
-        first = _BatchLogLikelihoodModel(
-            "first", zero_loglik=-3.0, one_loglik=-1.0
-        )
-        second = _BatchLogLikelihoodModel(
-            "second", zero_loglik=-2.0, one_loglik=-2.0
-        )
+        first = _BatchLogLikelihoodModel("first", zero_loglik=-3.0, one_loglik=-1.0)
+        second = _BatchLogLikelihoodModel("second", zero_loglik=-2.0, one_loglik=-2.0)
 
         default = vuong_test(_result(first), _result(second), responses, n_quadpts=5)
         relaxed = vuong_test(
@@ -265,9 +255,7 @@ class TestVuongTest:
 
     def test_rejects_models_with_different_item_counts(self):
         """Only compare models fitted to the same observed variables."""
-        first = _BatchLogLikelihoodModel(
-            "first", zero_loglik=-2.0, one_loglik=-1.0
-        )
+        first = _BatchLogLikelihoodModel("first", zero_loglik=-2.0, one_loglik=-1.0)
         second = _BatchLogLikelihoodModel(
             "second", zero_loglik=-2.0, one_loglik=-1.0, n_items=2
         )
@@ -281,12 +269,8 @@ class TestVuongTest:
 
     def test_rejects_models_with_different_response_categories(self):
         """Require both models to describe the same response outcomes."""
-        first = _BatchLogLikelihoodModel(
-            "first", zero_loglik=-2.0, one_loglik=-1.0
-        )
-        second = _BatchLogLikelihoodModel(
-            "second", zero_loglik=-2.0, one_loglik=-1.0
-        )
+        first = _BatchLogLikelihoodModel("first", zero_loglik=-2.0, one_loglik=-1.0)
+        second = _BatchLogLikelihoodModel("second", zero_loglik=-2.0, one_loglik=-1.0)
         second.is_polytomous = True
         second.n_categories = [3]
 
