@@ -495,6 +495,77 @@ class TestGrowthMixtureModel:
         assert lik.shape == (10, 2)
         assert np.all(lik >= 0)
 
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic"])
+    def test_class_log_likelihood_matches_scalar_reference(self, growth_type):
+        model = GrowthMixtureModel(
+            n_classes=3,
+            growth_type=growth_type,
+            class_intercepts=np.array([-0.8, 0.2, 1.1]),
+            class_slopes=np.array([0.1, -0.3, 0.5]),
+            class_quadratics=np.array([0.04, -0.02, 0.01]),
+            intercept_var=0.4,
+            residual_variance=0.2,
+        )
+        rng = np.random.default_rng(123)
+        observations = rng.normal(size=(12, 7))
+        time_values = np.linspace(-1.0, 2.0, 7)
+        total_variance = model.intercept_var + model.residual_variance
+
+        expected = np.empty((len(observations), model.n_classes))
+        for person_index, observation in enumerate(observations):
+            for class_index in range(model.n_classes):
+                residual = observation - model.compute_class_trajectory(
+                    class_index, time_values
+                )
+                expected[person_index, class_index] = -0.5 * np.sum(
+                    residual**2
+                ) / total_variance - 0.5 * len(time_values) * np.log(
+                    2.0 * np.pi * total_variance
+                )
+
+        actual = model.class_log_likelihood(observations, time_values)
+
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            model.class_likelihood(observations, time_values), np.exp(expected)
+        )
+
+    def test_long_trajectory_posteriors_remain_normalized(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.4, 0.6]),
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.1, 0.2]),
+        )
+        time_values = np.arange(2_000, dtype=np.float64)
+        observation = np.zeros(2_000)
+
+        likelihoods = model.class_likelihood(observation, time_values)
+        posteriors = model.posterior_probabilities(observation, time_values)
+
+        assert likelihoods.shape == (1, 2)
+        assert np.all(likelihoods == 0.0)
+        assert np.all(np.isfinite(posteriors))
+        assert_allclose(posteriors.sum(axis=1), 1.0)
+        assert model.classify(observation, time_values)[0] == np.argmax(posteriors[0])
+
+    def test_class_log_likelihood_preserves_small_large_offset_residuals(self):
+        model = GrowthMixtureModel(
+            n_classes=1,
+            class_intercepts=np.array([1e8]),
+            class_slopes=np.array([0.0]),
+        )
+        observations = np.array([[1e8, 1e8 + 1.0, 1e8 - 1.0]])
+        time_values = np.arange(3.0)
+        total_variance = model.intercept_var + model.residual_variance
+        expected = -1.0 / total_variance - 0.5 * len(time_values) * np.log(
+            2.0 * np.pi * total_variance
+        )
+
+        actual = model.class_log_likelihood(observations, time_values)
+
+        assert actual[0, 0] == pytest.approx(expected)
+
     def test_classify(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)
         rng = np.random.default_rng(42)
@@ -544,6 +615,101 @@ class TestGrowthMixtureModel:
         assert "posteriors" in result
         assert "log_likelihood" in result
         assert "converged" in result
+
+    def test_fit_em_vectorized_quadratic_update_matches_scalar_reference(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="quadratic",
+            class_proportions=np.array([0.45, 0.55]),
+            class_intercepts=np.array([-0.7, 0.8]),
+            class_slopes=np.array([0.2, -0.1]),
+            class_quadratics=np.array([0.03, -0.02]),
+        )
+        rng = np.random.default_rng(9)
+        time_values = np.linspace(-2.0, 2.0, 8)
+        observations = rng.normal(size=(30, len(time_values)))
+        posteriors = model.posterior_probabilities(observations, time_values)
+        design = np.column_stack(
+            [np.ones(len(time_values)), time_values, time_values**2]
+        )
+        expected_coefficients = np.empty((model.n_classes, design.shape[1]))
+        for class_index in range(model.n_classes):
+            weights = posteriors[:, class_index]
+            weighted_mean = weights @ observations / weights.sum()
+            expected_coefficients[class_index] = np.linalg.solve(
+                design.T @ design,
+                design.T @ weighted_mean,
+            )
+
+        result = model.fit_em(observations, time_values, max_iter=1)
+
+        assert_allclose(model.class_proportions, posteriors.mean(axis=0))
+        assert_allclose(model.class_intercepts, expected_coefficients[:, 0])
+        assert_allclose(model.class_slopes, expected_coefficients[:, 1])
+        assert_allclose(model.class_quadratics, expected_coefficients[:, 2])
+        assert np.isfinite(result["log_likelihood"])
+
+    def test_fit_em_reports_convergence_on_last_allowed_iteration(self):
+        model = GrowthMixtureModel(n_classes=2)
+        observations = np.zeros((4, 5))
+
+        result = model.fit_em(
+            observations,
+            np.arange(5.0),
+            max_iter=1,
+            tol=1e9,
+        )
+
+        assert result["converged"] is True
+
+    @pytest.mark.parametrize(
+        ("observations", "time_values", "message"),
+        [
+            (np.empty((0, 3)), np.arange(3.0), "non-empty"),
+            (np.zeros((2, 3)), np.arange(2.0), "one value per observation"),
+            (np.array([[0.0, np.nan]]), np.arange(2.0), "finite"),
+            (np.zeros((2, 2)), np.array([0.0, np.inf]), "finite"),
+        ],
+    )
+    def test_likelihood_validates_trajectory_data(
+        self, observations, time_values, message
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError, match=message):
+            model.class_log_likelihood(observations, time_values)
+
+    @pytest.mark.parametrize(
+        "fit_options",
+        [
+            {"max_iter": 0},
+            {"max_iter": True},
+            {"max_iter": 1.5},
+            {"tol": 0.0},
+            {"tol": np.nan},
+            {"tol": "invalid"},
+        ],
+    )
+    def test_fit_em_validates_controls(self, fit_options):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError):
+            model.fit_em(np.zeros((3, 5)), np.arange(5.0), **fit_options)
+
+    def test_fit_em_rejects_rank_deficient_time_values(self):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError, match="full-rank"):
+            model.fit_em(np.zeros((3, 5)), np.ones(5))
+
+    def test_posterior_probabilities_validate_class_proportions(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.zeros(2),
+        )
+
+        with pytest.raises(ValueError, match="positive value"):
+            model.posterior_probabilities(np.zeros((2, 5)), np.arange(5.0))
 
 
 class TestBKTResult:
