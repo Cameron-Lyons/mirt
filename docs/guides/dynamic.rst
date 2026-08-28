@@ -71,6 +71,38 @@ latent mastery states:
        seed=42,
    )
 
+State-space filtering
+---------------------
+
+Track a continuously evolving ability state with a 2PL or 3PL observation
+model. The batch filter updates every learner in one vectorized call:
+
+.. code-block:: python
+
+   import numpy as np
+   from mirt.models import StateSpaceIRT
+
+   state_model = StateSpaceIRT(
+       n_items=20,
+       n_timepoints=12,
+       base_model="3PL",
+       transition_matrix=np.array([[0.95]]),
+       process_noise=np.array([[0.08]]),
+       observation_noise=0.05,
+   )
+   responses, true_states = state_model.simulate(500, seed=42)
+   responses[0, 3, 5] = -1
+
+   means, variances = state_model.extended_kalman_filter_batch(responses)
+   print(means.shape, variances.shape)  # (500, 12) (500, 12)
+
+Use ``extended_kalman_filter`` for one response history. Both methods accept
+only ``1`` (correct), ``0`` (incorrect), and ``-1`` (missing); a fully missing
+occasion propagates the predicted state without an observation update.
+``observation_noise`` adds response-scale variance to the linearized filter,
+reducing the information assigned to each response. It does not change draws
+from ``simulate``.
+
 Growth-mixture fitting
 ----------------------
 

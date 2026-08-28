@@ -258,6 +258,98 @@ class TestStateSpaceIRT:
                 responses[person, time] = rng.random(model.n_items) < probabilities
         return responses, theta
 
+    @staticmethod
+    def _reference_filter(model, responses):
+        filtered_means = np.empty(model.n_timepoints)
+        filtered_variances = np.empty(model.n_timepoints)
+        predicted_mean = model.initial_mean
+        predicted_variance = model.initial_var
+        transition = model.transition_matrix[0, 0]
+        process_variance = model.process_noise[0, 0]
+
+        for time_index in range(model.n_timepoints):
+            observed = responses[time_index] >= 0
+            if np.any(observed):
+                candidate_mean = predicted_mean
+                for _ in range(5):
+                    logits = model.discrimination * (candidate_mean - model.difficulty)
+                    base_probability = 1.0 / (1.0 + np.exp(-logits))
+                    if model.base_model == "3PL":
+                        guessing_scale = 1.0 - model.guessing
+                        probability = model.guessing + guessing_scale * base_probability
+                        derivative = (
+                            model.discrimination
+                            * guessing_scale
+                            * base_probability
+                            * (1.0 - base_probability)
+                        )
+                    else:
+                        probability = base_probability
+                        derivative = (
+                            model.discrimination
+                            * base_probability
+                            * (1.0 - base_probability)
+                        )
+                    probability = np.clip(
+                        probability,
+                        1e-10,
+                        1.0 - 1e-10,
+                    )
+                    response_variance = (
+                        probability * (1.0 - probability) + model.observation_noise
+                    )
+                    score = (
+                        np.sum(
+                            derivative[observed]
+                            * (responses[time_index, observed] - probability[observed])
+                            / response_variance[observed]
+                        )
+                        - (candidate_mean - predicted_mean) / predicted_variance
+                    )
+                    information = 1.0 / predicted_variance + np.sum(
+                        derivative[observed] ** 2 / response_variance[observed]
+                    )
+                    candidate_mean += score / information
+
+                logits = model.discrimination * (candidate_mean - model.difficulty)
+                base_probability = 1.0 / (1.0 + np.exp(-logits))
+                if model.base_model == "3PL":
+                    guessing_scale = 1.0 - model.guessing
+                    probability = model.guessing + guessing_scale * base_probability
+                    derivative = (
+                        model.discrimination
+                        * guessing_scale
+                        * base_probability
+                        * (1.0 - base_probability)
+                    )
+                else:
+                    probability = base_probability
+                    derivative = (
+                        model.discrimination
+                        * base_probability
+                        * (1.0 - base_probability)
+                    )
+                probability = np.clip(probability, 1e-10, 1.0 - 1e-10)
+                response_variance = (
+                    probability * (1.0 - probability) + model.observation_noise
+                )
+                information = 1.0 / predicted_variance + np.sum(
+                    derivative[observed] ** 2 / response_variance[observed]
+                )
+                updated_mean = candidate_mean
+                updated_variance = 1.0 / information
+            else:
+                updated_mean = predicted_mean
+                updated_variance = predicted_variance
+
+            filtered_means[time_index] = updated_mean
+            filtered_variances[time_index] = updated_variance
+            if time_index < model.n_timepoints - 1:
+                predicted_mean = transition * updated_mean
+                predicted_variance = transition**2 * updated_variance + process_variance
+
+        return filtered_means, filtered_variances
+
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         assert model.n_items == 5
@@ -271,6 +363,55 @@ class TestStateSpaceIRT:
         assert model.guessing is not None
         assert model.guessing.shape == (5,)
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"n_items": 0}, "n_items"),
+            ({"n_items": True}, "n_items"),
+            ({"n_timepoints": 0}, "n_timepoints"),
+            ({"n_timepoints": 2.5}, "n_timepoints"),
+            ({"base_model": "4PL"}, "base_model"),
+            ({"transition_matrix": np.eye(2)}, "transition_matrix"),
+            ({"transition_matrix": np.array([[np.nan]])}, "transition_matrix"),
+            ({"process_noise": np.array([[-0.1]])}, "process_noise"),
+            ({"process_noise": np.ones(2)}, "process_noise"),
+            (
+                {
+                    "transition_matrix": np.zeros((1, 1)),
+                    "process_noise": np.zeros((1, 1)),
+                },
+                "zero variance propagation",
+            ),
+            ({"discrimination": np.array([1.0, 1.0])}, "discrimination"),
+            ({"discrimination": np.array([1.0, 0.0, 1.0])}, "discrimination"),
+            ({"difficulty": np.array([0.0, np.inf, 0.0])}, "difficulty"),
+            ({"guessing": np.full(3, 0.2)}, "guessing"),
+            ({"observation_noise": -0.1}, "observation_noise"),
+            ({"observation_noise": True}, "observation_noise"),
+            ({"initial_mean": np.nan}, "initial_mean"),
+            ({"initial_var": 0.0}, "initial_var"),
+        ],
+    )
+    def test_initialization_validates_parameters(self, kwargs, message):
+        options = {"n_items": 3, "n_timepoints": 2}
+        options.update(kwargs)
+
+        with pytest.raises(ValueError, match=message):
+            StateSpaceIRT(**options)
+
+    @pytest.mark.parametrize(
+        "guessing",
+        [np.array([0.2, 0.3]), np.array([0.2, -0.1, 0.3]), np.ones(3)],
+    )
+    def test_3pl_initialization_validates_guessing(self, guessing):
+        with pytest.raises(ValueError, match="guessing"):
+            StateSpaceIRT(
+                n_items=3,
+                n_timepoints=2,
+                base_model="3PL",
+                guessing=guessing,
+            )
+
     def test_extended_kalman_filter(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         rng = np.random.default_rng(42)
@@ -279,6 +420,131 @@ class TestStateSpaceIRT:
         assert means.shape == (4,)
         assert vars.shape == (4,)
         assert np.all(vars > 0)
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    @pytest.mark.parametrize("observation_noise", [0.0, 0.15])
+    def test_batch_filter_matches_independent_scalar_reference(
+        self,
+        base_model,
+        observation_noise,
+    ):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model=base_model,
+            transition_matrix=np.array([[0.85]]),
+            process_noise=np.array([[0.07]]),
+            observation_noise=observation_noise,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+            initial_mean=-0.2,
+            initial_var=0.8,
+        )
+        responses = np.random.default_rng(31).integers(0, 2, size=(9, 5, 6))
+        responses[np.random.default_rng(32).random(responses.shape) < 0.2] = -1
+        expected_means = np.empty((len(responses), model.n_timepoints))
+        expected_variances = np.empty_like(expected_means)
+        for person_index, person_responses in enumerate(responses):
+            expected_means[person_index], expected_variances[person_index] = (
+                self._reference_filter(model, person_responses)
+            )
+
+        means, variances = model.extended_kalman_filter_batch(responses)
+
+        assert_allclose(means, expected_means, rtol=1e-12, atol=1e-12)
+        assert_allclose(variances, expected_variances, rtol=1e-12, atol=1e-12)
+        single_mean, single_variance = model.extended_kalman_filter(responses[0])
+        assert_allclose(single_mean, means[0])
+        assert_allclose(single_variance, variances[0])
+
+    def test_3pl_observation_derivative_matches_finite_difference(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=2,
+            base_model="3PL",
+            discrimination=np.array([0.6, 1.0, 1.4, 2.0]),
+            difficulty=np.array([-1.0, -0.2, 0.4, 1.2]),
+            guessing=np.array([0.1, 0.15, 0.2, 0.25]),
+        )
+        theta = np.array([-1.5, 0.0, 1.8])
+        step = 1e-6
+
+        _, derivative = model._observation_probability_and_derivative(theta)
+        plus, _ = model._observation_probability_and_derivative(theta + step)
+        minus, _ = model._observation_probability_and_derivative(theta - step)
+
+        assert_allclose(derivative, (plus - minus) / (2.0 * step), rtol=1e-9)
+
+    def test_observation_noise_reduces_update_information(self):
+        responses = np.ones((1, 5), dtype=np.int32)
+        precise = StateSpaceIRT(n_items=5, n_timepoints=1, observation_noise=0.0)
+        noisy = StateSpaceIRT(n_items=5, n_timepoints=1, observation_noise=2.0)
+
+        precise_mean, precise_variance = precise.extended_kalman_filter(responses)
+        noisy_mean, noisy_variance = noisy.extended_kalman_filter(responses)
+
+        assert 0.0 < noisy_mean[0] < precise_mean[0]
+        assert precise_variance[0] < noisy_variance[0] < noisy.initial_var
+
+    def test_all_missing_batch_propagates_state_prior(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=4,
+            transition_matrix=np.array([[0.8]]),
+            process_noise=np.array([[0.2]]),
+            initial_mean=1.0,
+            initial_var=0.5,
+        )
+        responses = np.full((3, 4, 4), -1, dtype=np.int32)
+        expected_means = np.empty(4)
+        expected_variances = np.empty(4)
+        expected_means[0] = model.initial_mean
+        expected_variances[0] = model.initial_var
+        for time_index in range(1, model.n_timepoints):
+            expected_means[time_index] = 0.8 * expected_means[time_index - 1]
+            expected_variances[time_index] = (
+                0.8**2 * expected_variances[time_index - 1] + 0.2
+            )
+
+        means, variances = model.extended_kalman_filter_batch(responses)
+
+        assert_allclose(means, np.broadcast_to(expected_means, means.shape))
+        assert_allclose(
+            variances,
+            np.broadcast_to(expected_variances, variances.shape),
+        )
+
+    @pytest.mark.parametrize(
+        "responses",
+        [
+            np.zeros((2, 3), dtype=np.int32),
+            np.zeros((2, 3, 4), dtype=np.int32),
+            np.zeros((2, 4), dtype=np.float64),
+            np.full((2, 4), 2, dtype=np.int32),
+        ],
+    )
+    def test_single_filter_validates_responses(self, responses):
+        model = StateSpaceIRT(n_items=4, n_timepoints=3)
+
+        with pytest.raises(ValueError, match="responses"):
+            model.extended_kalman_filter(responses)
+
+    @pytest.mark.parametrize(
+        "responses",
+        [
+            np.zeros((3, 4), dtype=np.int32),
+            np.empty((0, 3, 4), dtype=np.int32),
+            np.zeros((2, 2, 4), dtype=np.int32),
+            np.zeros((2, 3, 4), dtype=np.float64),
+            np.full((2, 3, 4), 2, dtype=np.int32),
+        ],
+    )
+    def test_batch_filter_validates_responses(self, responses):
+        model = StateSpaceIRT(n_items=4, n_timepoints=3)
+
+        with pytest.raises(ValueError, match="responses"):
+            model.extended_kalman_filter_batch(responses)
 
     def test_ekf_with_missing_data(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=3)
@@ -347,9 +613,10 @@ class TestStateSpaceIRT:
         assert corr > 0.5
 
     def test_summary(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
+        model = StateSpaceIRT(n_items=5, n_timepoints=4, observation_noise=0.2)
         summary = model.summary()
         assert "State-Space IRT" in summary
+        assert "Observation Noise:  0.2000" in summary
 
 
 class TestPiecewiseGrowthModel:

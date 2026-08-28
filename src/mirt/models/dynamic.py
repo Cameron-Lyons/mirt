@@ -1382,8 +1382,21 @@ class StateSpaceIRT:
         State transition matrix A (default: identity = random walk)
     process_noise : NDArray, optional
         Process noise covariance Q
+    observation_noise : float
+        Additional non-negative response-scale variance used by the
+        linearized observation update
     base_model : str
-        IRT model for observations
+        IRT model for observations, either ``"2PL"`` or ``"3PL"``
+    discrimination : NDArray, optional
+        Positive item discrimination parameters
+    difficulty : NDArray, optional
+        Item difficulty parameters
+    guessing : NDArray, optional
+        Item guessing parameters for a 3PL observation model
+    initial_mean : float
+        Mean of the initial latent-state distribution
+    initial_var : float
+        Positive variance of the initial latent-state distribution
     """
 
     n_items: int
@@ -1401,17 +1414,181 @@ class StateSpaceIRT:
     initial_var: float = 1.0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.n_items, bool)
+            or not isinstance(self.n_items, (int, np.integer))
+            or self.n_items < 1
+        ):
+            raise ValueError("n_items must be a positive integer")
+        if (
+            isinstance(self.n_timepoints, bool)
+            or not isinstance(self.n_timepoints, (int, np.integer))
+            or self.n_timepoints < 1
+        ):
+            raise ValueError("n_timepoints must be a positive integer")
+        self.n_items = int(self.n_items)
+        self.n_timepoints = int(self.n_timepoints)
+        if self.base_model not in ("2PL", "3PL"):
+            raise ValueError("base_model must be '2PL' or '3PL'")
+
         if self.transition_matrix is None:
             self.transition_matrix = np.array([[1.0]])
+        else:
+            self.transition_matrix = np.asarray(
+                self.transition_matrix,
+                dtype=np.float64,
+            ).copy()
+        if self.transition_matrix.shape != (1, 1) or not np.all(
+            np.isfinite(self.transition_matrix)
+        ):
+            raise ValueError("transition_matrix must be a finite 1x1 matrix")
+
         if self.process_noise is None:
             self.process_noise = np.array([[0.1]])
+        else:
+            self.process_noise = np.asarray(
+                self.process_noise,
+                dtype=np.float64,
+            ).copy()
+        if (
+            self.process_noise.shape != (1, 1)
+            or not np.all(np.isfinite(self.process_noise))
+            or self.process_noise[0, 0] < 0.0
+        ):
+            raise ValueError("process_noise must be a finite non-negative 1x1 matrix")
+        if (
+            self.n_timepoints > 1
+            and self.transition_matrix[0, 0] == 0.0
+            and self.process_noise[0, 0] == 0.0
+        ):
+            raise ValueError(
+                "transition_matrix and process_noise cannot both have zero variance "
+                "propagation"
+            )
 
         if self.discrimination is None:
             self.discrimination = np.ones(self.n_items)
+        else:
+            self.discrimination = np.asarray(
+                self.discrimination,
+                dtype=np.float64,
+            ).copy()
+        if (
+            self.discrimination.shape != (self.n_items,)
+            or not np.all(np.isfinite(self.discrimination))
+            or np.any(self.discrimination <= 0.0)
+        ):
+            raise ValueError(
+                f"discrimination must contain {self.n_items} finite positive values"
+            )
+
         if self.difficulty is None:
             self.difficulty = np.zeros(self.n_items)
-        if self.base_model == "3PL" and self.guessing is None:
-            self.guessing = np.full(self.n_items, 0.2)
+        else:
+            self.difficulty = np.asarray(
+                self.difficulty,
+                dtype=np.float64,
+            ).copy()
+        if self.difficulty.shape != (self.n_items,) or not np.all(
+            np.isfinite(self.difficulty)
+        ):
+            raise ValueError(f"difficulty must contain {self.n_items} finite values")
+
+        if self.base_model == "3PL":
+            if self.guessing is None:
+                self.guessing = np.full(self.n_items, 0.2)
+            else:
+                self.guessing = np.asarray(
+                    self.guessing,
+                    dtype=np.float64,
+                ).copy()
+            if (
+                self.guessing.shape != (self.n_items,)
+                or not np.all(np.isfinite(self.guessing))
+                or np.any((self.guessing < 0.0) | (self.guessing >= 1.0))
+            ):
+                raise ValueError(
+                    f"guessing must contain {self.n_items} finite values in [0, 1)"
+                )
+        elif self.guessing is not None:
+            raise ValueError("guessing is only supported for base_model='3PL'")
+
+        for parameter_name in ("observation_noise", "initial_mean", "initial_var"):
+            if isinstance(getattr(self, parameter_name), bool):
+                raise ValueError(f"{parameter_name} must be finite")
+            try:
+                value = float(getattr(self, parameter_name))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{parameter_name} must be finite") from exc
+            if not np.isfinite(value):
+                raise ValueError(f"{parameter_name} must be finite")
+            setattr(self, parameter_name, value)
+        if self.observation_noise < 0.0:
+            raise ValueError("observation_noise must be non-negative")
+        if self.initial_var <= 0.0:
+            raise ValueError("initial_var must be positive")
+
+    def _validated_filter_responses(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        batch: bool,
+    ) -> NDArray[np.int_]:
+        """Validate and normalize state-space response arrays."""
+        response_values = np.asarray(responses)
+        expected_shape = (
+            (self.n_timepoints, self.n_items)
+            if not batch
+            else (None, self.n_timepoints, self.n_items)
+        )
+        valid_shape = (
+            response_values.shape == expected_shape
+            if not batch
+            else response_values.ndim == 3
+            and response_values.shape[0] > 0
+            and response_values.shape[1:] == expected_shape[1:]
+        )
+        if not valid_shape:
+            if batch:
+                raise ValueError(
+                    "responses must have shape "
+                    f"(n_persons, {self.n_timepoints}, {self.n_items})"
+                )
+            raise ValueError(
+                f"responses must have shape ({self.n_timepoints}, {self.n_items})"
+            )
+        if not np.issubdtype(response_values.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if not np.all(np.isin(response_values, (-1, 0, 1))):
+            raise ValueError("responses must contain only -1, 0, or 1")
+        return response_values.astype(np.int32, copy=False)
+
+    def _observation_probability_and_derivative(
+        self,
+        theta: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return response probabilities and derivatives by person and item."""
+        logits = self.discrimination[None, :] * (
+            theta[:, None] - self.difficulty[None, :]
+        )
+        base_probability = np.asarray(sigmoid(logits), dtype=np.float64)
+        if self.base_model == "3PL":
+            guessing_scale = 1.0 - self.guessing[None, :]
+            probability = self.guessing[None, :] + guessing_scale * base_probability
+            derivative = (
+                self.discrimination[None, :]
+                * guessing_scale
+                * base_probability
+                * (1.0 - base_probability)
+            )
+        else:
+            probability = base_probability
+            derivative = (
+                self.discrimination[None, :]
+                * base_probability
+                * (1.0 - base_probability)
+            )
+        return np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON), derivative
 
     def extended_kalman_filter(
         self,
@@ -1422,58 +1599,118 @@ class StateSpaceIRT:
         Parameters
         ----------
         responses : NDArray
-            Response matrix (n_timepoints, n_items)
+            Integer response matrix with shape ``(n_timepoints, n_items)``.
+            Use ``-1`` for missing item responses.
 
         Returns
         -------
         tuple
-            (filtered_means, filtered_vars)
+            Filtered means and variances, each with shape ``(n_timepoints,)``.
         """
-        n_times = responses.shape[0]
-        A = self.transition_matrix[0, 0]
-        Q = self.process_noise[0, 0]
+        response_values = self._validated_filter_responses(responses, batch=False)
+        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+            response_values[None, :, :]
+        )
+        return filtered_means[0].copy(), filtered_variances[0].copy()
 
-        filtered_means = np.zeros(n_times)
-        filtered_vars = np.zeros(n_times)
+    def extended_kalman_filter_batch(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Filter multiple response histories in one vectorized pass.
 
-        mean_pred = self.initial_mean
-        var_pred = self.initial_var
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
 
-        for t in range(n_times):
-            valid = responses[t] >= 0
-            if not np.any(valid):
-                filtered_means[t] = mean_pred
-                filtered_vars[t] = var_pred
-            else:
+        Returns
+        -------
+        tuple
+            Filtered means and variances, each with shape
+            ``(n_persons, n_timepoints)``.
+        """
+        response_values = self._validated_filter_responses(responses, batch=True)
+        n_persons = response_values.shape[0]
+        filtered_means = np.empty(
+            (n_persons, self.n_timepoints),
+            dtype=np.float64,
+        )
+        filtered_variances = np.empty_like(filtered_means)
+        transition = float(self.transition_matrix[0, 0])
+        process_variance = float(self.process_noise[0, 0])
+        predicted_mean = np.full(n_persons, self.initial_mean, dtype=np.float64)
+        predicted_variance = np.full(n_persons, self.initial_var, dtype=np.float64)
+
+        for time_index in range(self.n_timepoints):
+            time_responses = response_values[:, time_index]
+            observed = time_responses >= 0
+            has_observations = np.any(observed, axis=1)
+            updated_mean = predicted_mean.copy()
+            updated_variance = predicted_variance.copy()
+
+            if np.any(has_observations):
+                candidate_mean = predicted_mean.copy()
                 for _ in range(5):
-                    z = self.discrimination[valid] * (
-                        mean_pred - self.difficulty[valid]
+                    probability, derivative = (
+                        self._observation_probability_and_derivative(candidate_mean)
                     )
-                    p = sigmoid(z)
+                    response_variance = (
+                        probability * (1.0 - probability) + self.observation_noise
+                    )
+                    score = (
+                        np.sum(
+                            np.where(
+                                observed,
+                                derivative
+                                * (time_responses - probability)
+                                / response_variance,
+                                0.0,
+                            ),
+                            axis=1,
+                        )
+                        - (candidate_mean - predicted_mean) / predicted_variance
+                    )
+                    information = 1.0 / predicted_variance + np.sum(
+                        np.where(
+                            observed,
+                            derivative**2 / response_variance,
+                            0.0,
+                        ),
+                        axis=1,
+                    )
+                    candidate_mean[has_observations] += (
+                        score[has_observations] / information[has_observations]
+                    )
 
-                    if self.base_model == "3PL":
-                        p = self.guessing[valid] + (1 - self.guessing[valid]) * p
+                probability, derivative = self._observation_probability_and_derivative(
+                    candidate_mean
+                )
+                response_variance = (
+                    probability * (1.0 - probability) + self.observation_noise
+                )
+                final_information = 1.0 / predicted_variance + np.sum(
+                    np.where(
+                        observed,
+                        derivative**2 / response_variance,
+                        0.0,
+                    ),
+                    axis=1,
+                )
+                updated_mean[has_observations] = candidate_mean[has_observations]
+                updated_variance[has_observations] = (
+                    1.0 / final_information[has_observations]
+                )
 
-                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
+            filtered_means[:, time_index] = updated_mean
+            filtered_variances[:, time_index] = updated_variance
+            if time_index < self.n_timepoints - 1:
+                predicted_mean = transition * updated_mean
+                predicted_variance = transition**2 * updated_variance + process_variance
 
-                    H = self.discrimination[valid] * p * (1 - p)
-                    R_inv = p * (1 - p)
-
-                    S = np.sum(H**2 / R_inv) + 1.0 / var_pred
-                    K = H / R_inv / S
-
-                    residual = responses[t, valid] - p
-                    mean_pred = mean_pred + np.sum(K * residual)
-
-                var_update = 1.0 / S
-                filtered_means[t] = mean_pred
-                filtered_vars[t] = var_update
-
-            if t < n_times - 1:
-                mean_pred = A * filtered_means[t]
-                var_pred = A**2 * filtered_vars[t] + Q
-
-        return filtered_means, filtered_vars
+        return filtered_means, filtered_variances
 
     def simulate(
         self,
@@ -1555,6 +1792,7 @@ class StateSpaceIRT:
         lines.append(f"Number of Times:    {self.n_timepoints}")
         lines.append(f"Transition (A):     {self.transition_matrix[0, 0]:.4f}")
         lines.append(f"Process Noise (Q):  {self.process_noise[0, 0]:.4f}")
+        lines.append(f"Observation Noise:  {self.observation_noise:.4f}")
         lines.append(f"Initial Mean:       {self.initial_mean:.4f}")
         lines.append(f"Initial Variance:   {self.initial_var:.4f}")
 
