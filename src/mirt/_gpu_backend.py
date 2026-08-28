@@ -748,6 +748,72 @@ def gvem_m_step_gpu(
     return to_numpy(new_slopes), to_numpy(new_intercepts)
 
 
+def _validate_polytomous_likelihood_inputs(
+    responses: NDArray[np.int_],
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    thresholds: NDArray[np.float64],
+) -> int:
+    """Validate shared polytomous likelihood inputs and return category count."""
+    response_values = np.asarray(responses)
+    point_values = np.asarray(quad_points)
+    discrimination_values = np.asarray(discrimination)
+    threshold_values = np.asarray(thresholds)
+
+    if response_values.ndim != 2:
+        raise ValueError("responses must be a two-dimensional matrix")
+    n_items = response_values.shape[1]
+    if point_values.ndim != 1 or point_values.size == 0:
+        raise ValueError("quad_points must be a non-empty one-dimensional array")
+    if discrimination_values.shape != (n_items,):
+        raise ValueError(f"discrimination must have shape ({n_items},)")
+    if (
+        threshold_values.ndim != 2
+        or threshold_values.shape[0] != n_items
+        or threshold_values.shape[1] == 0
+    ):
+        raise ValueError("thresholds must have shape (n_items, n_categories - 1)")
+    if not np.all(np.isfinite(response_values)) or np.any(
+        response_values != np.floor(response_values)
+    ):
+        raise ValueError("response category codes must be finite integers")
+    if (
+        not np.all(np.isfinite(point_values))
+        or not np.all(np.isfinite(discrimination_values))
+        or not np.all(np.isfinite(threshold_values))
+    ):
+        raise ValueError("model parameters and quadrature points must be finite")
+
+    n_categories = threshold_values.shape[1] + 1
+    observed = response_values >= 0
+    if np.any(response_values[observed] >= n_categories):
+        raise ValueError(
+            "responses must be negative for missing values or between "
+            f"0 and {n_categories - 1}"
+        )
+    return n_categories
+
+
+def _aggregate_polytomous_log_likelihoods(
+    torch: ModuleType,
+    responses: Any,
+    log_category_probabilities: Any,
+) -> Any:
+    """Sum selected item-category log probabilities for every person."""
+    valid = responses >= 0
+    safe_responses = responses.clamp_min(0)
+    indicators = torch.nn.functional.one_hot(
+        safe_responses,
+        num_classes=log_category_probabilities.shape[2],
+    ).to(dtype=log_category_probabilities.dtype)
+    indicators *= valid.unsqueeze(-1)
+    return torch.einsum(
+        "pik,qik->pq",
+        indicators,
+        log_category_probabilities,
+    )
+
+
 def compute_log_likelihoods_grm_gpu(
     responses: NDArray[np.int_],
     quad_points: NDArray[np.float64],
@@ -772,44 +838,41 @@ def compute_log_likelihoods_grm_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    torch, device = _load_torch_runtime()
-
-    resp = torch.from_numpy(responses.astype(np.int64)).to(device)
-    theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
-    a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
-    b = torch.from_numpy(thresholds.astype(np.float64)).to(device)
-
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    n_categories = thresholds.shape[1] + 1
-
-    cum_probs = torch.ones(
-        (n_quad, n_items, n_categories), device=device, dtype=torch.float64
+    n_categories = _validate_polytomous_likelihood_inputs(
+        responses,
+        quad_points,
+        discrimination,
+        thresholds,
     )
+    if np.any(np.diff(thresholds, axis=1) <= 0.0):
+        raise ValueError("GRM thresholds must be strictly increasing within each item")
 
-    for k in range(n_categories - 1):
-        z = a[None, :] * (theta[:, None] - b[:, k][None, :])
-        cum_probs[:, :, k + 1] = torch.sigmoid(z)
+    torch, device = _load_torch_runtime()
+    resp = torch.as_tensor(responses, device=device, dtype=torch.int64)
+    theta = torch.as_tensor(quad_points, device=device, dtype=torch.float64)
+    a = torch.as_tensor(discrimination, device=device, dtype=torch.float64)
+    b = torch.as_tensor(thresholds, device=device, dtype=torch.float64)
 
-    cum_probs = torch.cat(
-        [
-            cum_probs,
-            torch.zeros((n_quad, n_items, 1), device=device, dtype=torch.float64),
-        ],
+    boundary_logits = a[None, :, None] * (theta[:, None, None] - b[None, :, :])
+    boundary_probabilities = torch.sigmoid(boundary_logits)
+    shape = (theta.shape[0], responses.shape[1], 1)
+    cumulative_probabilities = torch.cat(
+        (
+            torch.ones(shape, device=device, dtype=torch.float64),
+            boundary_probabilities,
+            torch.zeros(shape, device=device, dtype=torch.float64),
+        ),
         dim=2,
     )
-    cat_probs = cum_probs[:, :, :-1] - cum_probs[:, :, 1:]
-    cat_probs = cat_probs.clamp(PROB_EPSILON, 1.0)
-
-    valid = resp >= 0
-    log_likes = torch.zeros((n_persons, n_quad), device=device, dtype=torch.float64)
-
-    for i in range(n_persons):
-        for j in range(n_items):
-            if valid[i, j]:
-                k = resp[i, j].item()
-                log_likes[i, :] += torch.log(cat_probs[:, j, k])
-
+    category_probabilities = (
+        cumulative_probabilities[:, :, :n_categories]
+        - cumulative_probabilities[:, :, 1:]
+    ).clamp(PROB_EPSILON, 1.0)
+    log_likes = _aggregate_polytomous_log_likelihoods(
+        torch,
+        resp,
+        torch.log(category_probabilities),
+    )
     return to_numpy(log_likes)
 
 
@@ -837,38 +900,34 @@ def compute_log_likelihoods_gpcm_gpu(
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    torch, device = _load_torch_runtime()
-
-    resp = torch.from_numpy(responses.astype(np.int64)).to(device)
-    theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
-    a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
-    b = torch.from_numpy(thresholds.astype(np.float64)).to(device)
-
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    n_categories = thresholds.shape[1] + 1
-
-    numerators = torch.zeros(
-        (n_quad, n_items, n_categories), device=device, dtype=torch.float64
+    _validate_polytomous_likelihood_inputs(
+        responses,
+        quad_points,
+        discrimination,
+        thresholds,
     )
+    torch, device = _load_torch_runtime()
+    resp = torch.as_tensor(responses, device=device, dtype=torch.int64)
+    theta = torch.as_tensor(quad_points, device=device, dtype=torch.float64)
+    a = torch.as_tensor(discrimination, device=device, dtype=torch.float64)
+    b = torch.as_tensor(thresholds, device=device, dtype=torch.float64)
 
-    for k in range(n_categories):
-        cumsum = torch.zeros((n_quad, n_items), device=device, dtype=torch.float64)
-        for v in range(k):
-            cumsum += a[None, :] * (theta[:, None] - b[:, v][None, :])
-        numerators[:, :, k] = torch.exp(cumsum)
-
-    denominators = numerators.sum(dim=2, keepdim=True)
-    cat_probs = numerators / denominators
-    cat_probs = cat_probs.clamp(PROB_EPSILON, 1.0)
-
-    valid = resp >= 0
-    log_likes = torch.zeros((n_persons, n_quad), device=device, dtype=torch.float64)
-
-    for i in range(n_persons):
-        for j in range(n_items):
-            if valid[i, j]:
-                k = resp[i, j].item()
-                log_likes[i, :] += torch.log(cat_probs[:, j, k])
-
+    step_logits = a[None, :, None] * (theta[:, None, None] - b[None, :, :])
+    zero_logits = torch.zeros(
+        (theta.shape[0], responses.shape[1], 1),
+        device=device,
+        dtype=torch.float64,
+    )
+    category_logits = torch.cat(
+        (zero_logits, torch.cumsum(step_logits, dim=2)),
+        dim=2,
+    )
+    log_category_probabilities = torch.log_softmax(category_logits, dim=2).clamp_min(
+        float(np.log(PROB_EPSILON))
+    )
+    log_likes = _aggregate_polytomous_log_likelihoods(
+        torch,
+        resp,
+        log_category_probabilities,
+    )
     return to_numpy(log_likes)
