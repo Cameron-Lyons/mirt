@@ -147,6 +147,14 @@ refiltering the complete history:
        prior_mean = step.next_mean
        prior_variance = step.next_variance
 
+   future_success = (
+       state_model.forecast_response_probabilities_from_state(
+           step.updated_mean,
+           step.updated_variance,
+           n_steps=4,
+       )
+   )
+
 ``online_step`` predicts marginal item success, scores the joint observed
 pattern, updates the state, and prepares the next prior in one quadrature pass.
 ``online_step_batch`` returns the same fields as arrays for many learners and
@@ -169,7 +177,11 @@ state means and process uncertainty. Item-success forecasts integrate the 2PL
 or 3PL response curve over each Gaussian forecast distribution rather than
 evaluating it only at the mean. The default 21-point quadrature can be adjusted
 with ``n_quadpts``. Use ``forecast`` and
-``forecast_response_probabilities`` for one response history.
+``forecast_response_probabilities`` for one response history. When the current
+posterior state is already available, ``forecast_from_state`` and
+``forecast_response_probabilities_from_state`` produce the same multi-step
+forecasts without replaying earlier responses. Their ``_batch`` variants
+accept one current state per learner.
 
 Predictive log likelihoods score each observed item pattern against the state
 distribution implied by earlier occasions. Items at the same occasion are
