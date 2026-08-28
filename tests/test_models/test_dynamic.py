@@ -597,6 +597,150 @@ class TestGrowthMixtureModel:
         obs, classes = model.simulate(10, time_values=t, seed=42)
         assert obs.shape == (10, 5)
 
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic"])
+    def test_simulate_matches_seeded_scalar_reference(self, growth_type):
+        model = GrowthMixtureModel(
+            n_classes=3,
+            growth_type=growth_type,
+            class_proportions=np.array([0.2, 0.3, 0.5]),
+            class_intercepts=np.array([-0.8, 0.2, 1.1]),
+            class_slopes=np.array([0.1, -0.3, 0.5]),
+            class_quadratics=np.array([0.04, -0.02, 0.01]),
+            intercept_var=0.4,
+            slope_var=0.15,
+            residual_variance=0.2,
+        )
+        n_persons = 37
+        time_values = np.linspace(-1.0, 2.0, 7)
+        seed = 987
+        rng = np.random.default_rng(seed)
+        expected_classes = rng.choice(
+            model.n_classes,
+            size=n_persons,
+            p=model.class_proportions,
+        )
+        expected_observations = np.empty((n_persons, len(time_values)))
+        for person_index, class_index in enumerate(expected_classes):
+            mean = model.compute_class_trajectory(class_index, time_values)
+            intercept_deviation = rng.normal(0, np.sqrt(model.intercept_var))
+            slope_deviation = rng.normal(0, np.sqrt(model.slope_var))
+            expected_observations[person_index] = (
+                mean
+                + intercept_deviation
+                + slope_deviation * time_values
+                + rng.normal(
+                    0,
+                    np.sqrt(model.residual_variance),
+                    len(time_values),
+                )
+            )
+
+        observations, classes = model.simulate(
+            n_persons,
+            time_values,
+            seed=seed,
+        )
+
+        assert np.array_equal(classes, expected_classes)
+        assert np.array_equal(observations, expected_observations)
+
+    def test_simulate_is_seeded_independently_of_internal_chunks(self, monkeypatch):
+        model = GrowthMixtureModel(n_classes=3)
+        time_values = np.linspace(0.0, 4.0, 9)
+        expected_observations, expected_classes = model.simulate(
+            53,
+            time_values,
+            seed=321,
+        )
+        monkeypatch.setattr(
+            "mirt.models.dynamic._GROWTH_MIXTURE_MAX_RANDOM_VALUES",
+            23,
+        )
+
+        observations, classes = model.simulate(53, time_values, seed=321)
+
+        assert np.array_equal(classes, expected_classes)
+        assert np.array_equal(observations, expected_observations)
+
+    def test_simulate_normalizes_class_weights(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([2.0, 1.0]),
+        )
+        rng = np.random.default_rng(44)
+        expected_classes = rng.choice(2, size=20, p=np.array([2.0, 1.0]) / 3.0)
+
+        _, classes = model.simulate(20, seed=44)
+
+        assert np.array_equal(classes, expected_classes)
+
+    def test_simulate_supports_deterministic_zero_variances(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=0.0,
+        )
+        time_values = np.arange(5.0)
+
+        observations, classes = model.simulate(12, time_values, seed=8)
+
+        expected = np.vstack(
+            [
+                model.compute_class_trajectory(class_index, time_values)
+                for class_index in classes
+            ]
+        )
+        assert np.array_equal(observations, expected)
+
+    @pytest.mark.parametrize("n_persons", [0, -1, True, 1.5])
+    def test_simulate_validates_n_persons(self, n_persons):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError, match="positive integer"):
+            model.simulate(n_persons)
+
+    @pytest.mark.parametrize("n_timepoints", [0, -1, True, 1.5])
+    def test_simulate_validates_default_n_timepoints(self, n_timepoints):
+        model = GrowthMixtureModel(n_classes=2, n_timepoints=n_timepoints)
+
+        with pytest.raises(ValueError, match="positive integer"):
+            model.simulate(3)
+
+    @pytest.mark.parametrize(
+        "time_values",
+        [
+            np.array([]),
+            np.zeros((2, 2)),
+            np.array([0.0, np.nan]),
+            np.array(["invalid"]),
+        ],
+    )
+    def test_simulate_validates_time_values(self, time_values):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError):
+            model.simulate(3, time_values)
+
+    @pytest.mark.parametrize(
+        ("variance_name", "invalid_value"),
+        [
+            ("intercept_var", -0.1),
+            ("slope_var", np.inf),
+            ("residual_variance", "invalid"),
+        ],
+    )
+    def test_simulate_validates_variance_components(
+        self,
+        variance_name,
+        invalid_value,
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+        setattr(model, variance_name, invalid_value)
+
+        with pytest.raises(ValueError, match="variance components"):
+            model.simulate(3)
+
     def test_entropy(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)
         rng = np.random.default_rng(42)
