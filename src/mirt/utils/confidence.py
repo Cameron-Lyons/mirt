@@ -322,8 +322,30 @@ def delta_method(
     vcov: ArrayLike,
     transform_func: Callable[[NDArray[np.float64]], float],
     eps: float = 1e-6,
+    gradient_func: Callable[[NDArray[np.float64]], ArrayLike] | None = None,
 ) -> tuple[float, float]:
-    """Compute a transformed estimate and delta-method standard error."""
+    """Compute a transformed estimate and delta-method standard error.
+
+    Parameters
+    ----------
+    estimates : array-like
+        Parameter estimates at which to evaluate the transformation.
+    vcov : array-like
+        Parameter covariance matrix.
+    transform_func : callable
+        Scalar transformation of the parameter vector.
+    eps : float, default=1e-6
+        Relative central-difference step. Each numerical perturbation is
+        ``eps * max(1, abs(estimate))`` so large estimates remain resolvable.
+    gradient_func : callable, optional
+        Analytic gradient of ``transform_func``. It must return one finite
+        derivative per estimate. Supplying it avoids numerical perturbations.
+
+    Returns
+    -------
+    transformed, standard_error : tuple[float, float]
+        Transformed estimate and its delta-method standard error.
+    """
     estimate_values = _as_finite_vector(estimates, "estimates")
     covariance = _validate_covariance(vcov, estimate_values.size)
     if not callable(transform_func):
@@ -332,18 +354,17 @@ def delta_method(
             parameter="transform_func",
         )
     step = _validate_positive_scalar(eps, "eps")
-    transformed = _evaluate_transform(transform_func, estimate_values)
+    transformed = _evaluate_transform(transform_func, estimate_values.copy())
 
-    gradient = np.empty(estimate_values.size, dtype=np.float64)
-    for index in range(estimate_values.size):
-        plus = estimate_values.copy()
-        minus = estimate_values.copy()
-        plus[index] += step
-        minus[index] -= step
-        gradient[index] = (
-            _evaluate_transform(transform_func, plus)
-            - _evaluate_transform(transform_func, minus)
-        ) / (2.0 * step)
+    if gradient_func is None:
+        gradient = _numerical_gradient(transform_func, estimate_values, step)
+    else:
+        if not callable(gradient_func):
+            raise MirtValidationError(
+                "gradient_func must be callable",
+                parameter="gradient_func",
+            )
+        gradient = _evaluate_gradient(gradient_func, estimate_values)
 
     variance = float(gradient @ covariance @ gradient)
     scale = max(1.0, float(np.max(np.abs(covariance))))
@@ -354,6 +375,66 @@ def delta_method(
         )
     standard_error = np.sqrt(max(variance, 0.0))
     return transformed, float(standard_error)
+
+
+def _numerical_gradient(
+    transform_func: Callable[[NDArray[np.float64]], float],
+    estimates: NDArray[np.float64],
+    relative_step: float,
+) -> NDArray[np.float64]:
+    """Differentiate a scalar transform with scale-aware central differences."""
+    gradient = np.empty(estimates.size, dtype=np.float64)
+    for index, estimate in enumerate(estimates):
+        delta = relative_step * max(1.0, abs(float(estimate)))
+        plus = estimates.copy()
+        minus = estimates.copy()
+        plus[index] = estimate + delta
+        minus[index] = estimate - delta
+        span = plus[index] - minus[index]
+        if (
+            not np.isfinite(plus[index])
+            or not np.isfinite(minus[index])
+            or not np.isfinite(span)
+            or span == 0.0
+        ):
+            raise MirtValidationError(
+                "eps must produce distinct finite parameter perturbations",
+                parameter="eps",
+                value=relative_step,
+            )
+        gradient[index] = (
+            _evaluate_transform(transform_func, plus)
+            - _evaluate_transform(transform_func, minus)
+        ) / span
+    return gradient
+
+
+def _evaluate_gradient(
+    gradient_func: Callable[[NDArray[np.float64]], ArrayLike],
+    estimates: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate and validate an analytic transformation gradient."""
+    raw_gradient = gradient_func(estimates.copy())
+    try:
+        gradient = np.asarray(raw_gradient, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "gradient_func must return numeric derivatives",
+            parameter="gradient_func",
+        ) from exc
+    if gradient.shape != estimates.shape:
+        raise MirtValidationError(
+            "gradient_func must return one derivative per estimate",
+            parameter="gradient_func",
+            value=gradient.shape,
+            expected=str(estimates.shape),
+        )
+    if not np.all(np.isfinite(gradient)):
+        raise MirtValidationError(
+            "gradient_func must return only finite derivatives",
+            parameter="gradient_func",
+        )
+    return gradient
 
 
 def _marginal_log_likelihood(
