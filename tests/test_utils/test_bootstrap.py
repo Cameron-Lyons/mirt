@@ -12,6 +12,38 @@ from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.dichotomous import FourParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
+from mirt.utils.bootstrap import _elementwise_percentile, _simulate_model_responses
+
+
+def test_elementwise_percentile_matches_independent_numpy_quantiles():
+    rng = np.random.default_rng(42)
+    samples = rng.normal(size=(31, 4, 5))
+    quantiles = rng.uniform(0.01, 0.99, size=(4, 5))
+
+    actual = _elementwise_percentile(samples, quantiles)
+    expected = np.empty((4, 5))
+    for index in np.ndindex(expected.shape):
+        expected[index] = np.percentile(
+            samples[(slice(None), *index)], 100 * quantiles[index]
+        )
+
+    np.testing.assert_allclose(actual, expected, atol=3e-15, rtol=0.0)
+
+
+def test_elementwise_percentile_requires_one_quantile_per_element():
+    with pytest.raises(ValueError, match="one value per sample element"):
+        _elementwise_percentile(np.ones((10, 2, 3)), np.ones(5))
+
+
+@pytest.mark.parametrize("quantile", [-0.1, 1.1, np.nan])
+def test_elementwise_percentile_rejects_invalid_quantiles(quantile):
+    with pytest.raises(ValueError, match="finite values"):
+        _elementwise_percentile(np.ones((10, 2)), np.full(2, quantile))
+
+
+def test_elementwise_percentile_rejects_empty_samples():
+    with pytest.raises(ValueError, match="at least one"):
+        _elementwise_percentile(np.empty((0, 2)), np.full(2, 0.5))
 
 
 class TestBootstrapSE:
@@ -52,6 +84,18 @@ class TestBootstrapSE:
                 fitted_2pl_model,
                 responses,
                 n_bootstrap=n_bootstrap,
+            )
+
+    @pytest.mark.parametrize("n_jobs", [0, -2, 1.5, True])
+    def test_rejects_invalid_worker_count(
+        self, fitted_2pl_model, dichotomous_responses, n_jobs
+    ):
+        with pytest.raises(MirtValidationError, match="n_jobs"):
+            bootstrap_se(
+                fitted_2pl_model,
+                dichotomous_responses["responses"],
+                n_bootstrap=2,
+                n_jobs=n_jobs,
             )
 
     def test_rejects_unknown_statistic(self, fitted_2pl_model, dichotomous_responses):
@@ -196,6 +240,51 @@ class TestBootstrapSE:
         assert fit_calls == 2
         assert set(result) == {"discrimination", "difficulty"}
         assert np.isfinite(result["difficulty"]).all()
+
+    def test_parallel_replicates_match_serial_results(self, monkeypatch):
+        model = TwoParameterLogistic(3)
+        responses = np.array(
+            [
+                [0, 0, 1],
+                [0, 1, 1],
+                [1, 0, 0],
+                [1, 1, 0],
+                [1, 1, 1],
+            ]
+        )
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: False)
+
+        serial = bootstrap_se(model, responses, n_bootstrap=4, seed=42)
+        parallel = bootstrap_se(
+            model,
+            responses,
+            n_bootstrap=4,
+            seed=42,
+            n_jobs=2,
+        )
+
+        assert serial.keys() == parallel.keys()
+        for name in serial:
+            np.testing.assert_allclose(
+                parallel[name], serial[name], rtol=0.0, atol=1e-12
+            )
+
+    def test_parallel_replicates_reject_unpicklable_statistics(self, monkeypatch):
+        model = TwoParameterLogistic(2)
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]])
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: False)
+
+        with pytest.raises(MirtValidationError, match="picklable"):
+            bootstrap_se(
+                model,
+                responses,
+                n_bootstrap=2,
+                statistic=lambda fitted_model, sample: {"mean": sample.mean()},
+                seed=42,
+                n_jobs=2,
+            )
 
 
 class TestBootstrapCI:
@@ -355,6 +444,47 @@ class TestBootstrapCI:
             intervals["difficulty"][1], np.percentile(values + 0.5, 90, axis=0)
         )
 
+    def test_parallel_confidence_intervals_match_serial_results(self, monkeypatch):
+        model = TwoParameterLogistic(3)
+        responses = np.array(
+            [
+                [0, 0, 1],
+                [0, 1, 1],
+                [1, 0, 0],
+                [1, 1, 0],
+                [1, 1, 1],
+            ]
+        )
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: False)
+
+        serial = bootstrap_ci(
+            model,
+            responses,
+            n_bootstrap=12,
+            alpha=0.2,
+            method="BCa",
+            seed=42,
+        )
+        parallel = bootstrap_ci(
+            model,
+            responses,
+            n_bootstrap=12,
+            alpha=0.2,
+            method="BCa",
+            seed=42,
+            n_jobs=3,
+        )
+
+        assert serial.keys() == parallel.keys()
+        for name in serial:
+            np.testing.assert_allclose(
+                parallel[name][0], serial[name][0], rtol=0.0, atol=1e-12
+            )
+            np.testing.assert_allclose(
+                parallel[name][1], serial[name][1], rtol=0.0, atol=1e-12
+            )
+
 
 class TestParametricBootstrap:
     """Tests for parametric bootstrap."""
@@ -383,6 +513,56 @@ class TestParametricBootstrap:
 
         variances = np.var(disc_estimates, axis=0)
         assert np.all(variances >= 0)
+
+    def test_parallel_parametric_bootstrap_matches_serial_results(self):
+        model = FourParameterLogistic(n_items=3)
+
+        serial = parametric_bootstrap(
+            model,
+            n_bootstrap=4,
+            n_persons=80,
+            seed=42,
+        )
+        parallel = parametric_bootstrap(
+            model,
+            n_bootstrap=4,
+            n_persons=80,
+            seed=42,
+            n_jobs=2,
+        )
+
+        assert serial.keys() == parallel.keys()
+        for name in serial:
+            np.testing.assert_allclose(
+                parallel[name], serial[name], rtol=0.0, atol=1e-12
+            )
+
+    def test_seeded_simulations_preserve_the_serial_random_stream(self, monkeypatch):
+        model = GradedResponseModel(n_items=2, n_categories=3, n_factors=2)
+        captured = []
+
+        def fake_fit(self, fitted_model, responses):
+            captured.append(responses.copy())
+            return SimpleNamespace(model=fitted_model)
+
+        monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+
+        expected = []
+        rng = np.random.default_rng(42)
+        for _ in range(3):
+            theta = rng.standard_normal((30, model.n_factors))
+            expected.append(_simulate_model_responses(model, theta, rng))
+
+        parametric_bootstrap(
+            model,
+            n_bootstrap=3,
+            n_persons=30,
+            seed=42,
+        )
+
+        assert len(captured) == len(expected)
+        for actual, reference in zip(captured, expected, strict=True):
+            np.testing.assert_array_equal(actual, reference)
 
     @pytest.mark.parametrize("n_persons", [0, -1, 1.5, True])
     def test_rejects_invalid_person_count(self, fitted_2pl_model, n_persons):

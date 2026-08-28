@@ -23,6 +23,55 @@ from mirt.models.dynamic import (
     LongitudinalResult,
 )
 
+_LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
+
+
+def _binary_log_likelihood(
+    probabilities: NDArray[np.float64],
+    responses: NDArray[np.int_],
+    *,
+    axis: int,
+) -> NDArray[np.float64]:
+    """Sum clipped binary log-likelihood contributions along one axis."""
+    np.clip(
+        probabilities,
+        PROB_EPSILON,
+        1.0 - PROB_EPSILON,
+        out=probabilities,
+    )
+    contributions = np.zeros_like(probabilities)
+    correct = responses == 1
+    incorrect = responses == 0
+    np.log(probabilities, out=contributions, where=correct)
+    np.log1p(-probabilities, out=contributions, where=incorrect)
+    return np.sum(contributions, axis=axis)
+
+
+def _longitudinal_log_likelihood_rows(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    model: LongitudinalIRTModel,
+) -> NDArray[np.float64]:
+    """Return one binary-response log-likelihood per person-occasion row."""
+    n_rows, n_items = responses.shape
+    log_likelihood = np.empty(n_rows, dtype=np.float64)
+    rows_per_chunk = max(1, _LONGITUDINAL_MAX_PROBABILITY_VALUES // n_items)
+
+    for start in range(0, n_rows, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_rows)
+        chunk_responses = responses[start:stop]
+        probabilities = np.asarray(
+            model.probability(theta[start:stop]),
+            dtype=np.float64,
+        )
+        log_likelihood[start:stop] = _binary_log_likelihood(
+            probabilities,
+            chunk_responses,
+            axis=1,
+        )
+
+    return log_likelihood
+
 
 @dataclass
 class BKTPriors:
@@ -70,6 +119,83 @@ class LongitudinalPriors:
     growth_cov_prior_scale: NDArray[np.float64] | None = None
     residual_var_prior_shape: float = 2.0
     residual_var_prior_rate: float = 1.0
+
+    def __post_init__(self) -> None:
+        positive_fields = (
+            "discrimination_mean",
+            "discrimination_var",
+            "difficulty_var",
+            "growth_cov_prior_df",
+            "residual_var_prior_shape",
+            "residual_var_prior_rate",
+        )
+        for name in positive_fields:
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError(f"{name} must be finite and positive")
+            try:
+                normalized = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{name} must be finite and positive") from exc
+            if not np.isfinite(normalized) or normalized <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
+            setattr(self, name, normalized)
+
+        if isinstance(self.difficulty_mean, (bool, np.bool_)):
+            raise ValueError("difficulty_mean must be finite")
+        try:
+            self.difficulty_mean = float(self.difficulty_mean)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("difficulty_mean must be finite") from exc
+        if not np.isfinite(self.difficulty_mean):
+            raise ValueError("difficulty_mean must be finite")
+
+        if self.growth_mean_prior_mean is not None:
+            self.growth_mean_prior_mean = np.asarray(
+                self.growth_mean_prior_mean,
+                dtype=np.float64,
+            ).copy()
+            if self.growth_mean_prior_mean.ndim != 1 or not np.all(
+                np.isfinite(self.growth_mean_prior_mean)
+            ):
+                raise ValueError(
+                    "growth_mean_prior_mean must be a finite one-dimensional array"
+                )
+
+        for name in ("growth_mean_prior_cov", "growth_cov_prior_scale"):
+            values = getattr(self, name)
+            if values is None:
+                continue
+            matrix = np.asarray(values, dtype=np.float64).copy()
+            if (
+                matrix.ndim != 2
+                or matrix.shape[0] != matrix.shape[1]
+                or not np.all(np.isfinite(matrix))
+                or not np.allclose(matrix, matrix.T, rtol=0.0, atol=1e-12)
+                or np.min(np.linalg.eigvalsh(matrix)) <= 0.0
+            ):
+                raise ValueError(f"{name} must be a finite positive-definite matrix")
+            setattr(self, name, matrix)
+
+    def _validate_growth_dimension(self, n_growth: int) -> None:
+        """Validate growth prior shapes once the growth model is known."""
+        expected_vector = (n_growth,)
+        expected_matrix = (n_growth, n_growth)
+        if (
+            self.growth_mean_prior_mean is not None
+            and self.growth_mean_prior_mean.shape != expected_vector
+        ):
+            raise ValueError(
+                f"growth_mean_prior_mean must have shape {expected_vector}"
+            )
+        for name in ("growth_mean_prior_cov", "growth_cov_prior_scale"):
+            values = getattr(self, name)
+            if values is not None and values.shape != expected_matrix:
+                raise ValueError(f"{name} must have shape {expected_matrix}")
+        if self.growth_cov_prior_df < n_growth:
+            raise ValueError(
+                f"growth_cov_prior_df must be at least {n_growth} for this model"
+            )
 
 
 class BKTGibbsSampler:
@@ -522,12 +648,43 @@ class LongitudinalGibbsSampler:
         seed : int, optional
             Random seed
         """
-        self.n_iter = n_iter
-        self.burnin = burnin
-        self.thin = thin
-        self.priors = priors or LongitudinalPriors()
-        self.verbose = verbose
-        self.seed = seed
+        if (
+            isinstance(n_iter, (bool, np.bool_))
+            or not isinstance(n_iter, (int, np.integer))
+            or n_iter < 1
+        ):
+            raise ValueError("n_iter must be a positive integer")
+        if (
+            isinstance(burnin, (bool, np.bool_))
+            or not isinstance(burnin, (int, np.integer))
+            or burnin < 0
+        ):
+            raise ValueError("burnin must be a non-negative integer")
+        if burnin >= n_iter:
+            raise ValueError("burnin must be less than n_iter")
+        if (
+            isinstance(thin, (bool, np.bool_))
+            or not isinstance(thin, (int, np.integer))
+            or thin < 1
+        ):
+            raise ValueError("thin must be a positive integer")
+        if priors is not None and not isinstance(priors, LongitudinalPriors):
+            raise TypeError("priors must be a LongitudinalPriors instance or None")
+        if not isinstance(verbose, (bool, np.bool_)):
+            raise TypeError("verbose must be a boolean")
+        if seed is not None and (
+            isinstance(seed, (bool, np.bool_))
+            or not isinstance(seed, (int, np.integer))
+            or seed < 0
+        ):
+            raise ValueError("seed must be a non-negative integer or None")
+
+        self.n_iter = int(n_iter)
+        self.burnin = int(burnin)
+        self.thin = int(thin)
+        self.priors = LongitudinalPriors() if priors is None else priors
+        self.verbose = bool(verbose)
+        self.seed = None if seed is None else int(seed)
 
     def fit(
         self,
@@ -554,19 +711,13 @@ class LongitudinalGibbsSampler:
         LongitudinalResult
             Estimation results
         """
+        responses, time_values = self._prepare_fit_inputs(
+            responses,
+            n_items,
+            time_values,
+        )
+        n_persons, n_timepoints, n_items = responses.shape
         rng = np.random.default_rng(self.seed)
-
-        if responses.ndim == 2:
-            n_persons, total = responses.shape
-            if n_items is None:
-                raise ValueError("n_items required for 2D response matrix")
-            n_timepoints = total // n_items
-            responses = responses.reshape(n_persons, n_timepoints, n_items)
-        else:
-            n_persons, n_timepoints, n_items = responses.shape
-
-        if time_values is None:
-            time_values = np.arange(n_timepoints, dtype=np.float64)
 
         model = LongitudinalIRTModel(
             n_items=n_items,
@@ -575,6 +726,7 @@ class LongitudinalGibbsSampler:
         )
 
         n_growth = model.n_growth_factors
+        self.priors._validate_growth_dimension(n_growth)
         growth_factors = rng.multivariate_normal(
             np.zeros(n_growth), np.eye(n_growth), size=n_persons
         )
@@ -650,6 +802,69 @@ class LongitudinalGibbsSampler:
             n_iterations=self.n_iter,
         )
 
+    @staticmethod
+    def _prepare_fit_inputs(
+        responses: NDArray[np.int_],
+        n_items: int | None,
+        time_values: NDArray[np.float64] | None,
+    ) -> tuple[NDArray[np.int_], NDArray[np.float64]]:
+        """Validate and normalize longitudinal response inputs."""
+        response_values = np.asarray(responses)
+        if response_values.ndim not in (2, 3):
+            raise ValueError(
+                "responses must have shape (n_persons, n_timepoints, n_items) "
+                "or (n_persons, n_timepoints * n_items)"
+            )
+        if not np.issubdtype(response_values.dtype, np.integer):
+            raise ValueError("responses must contain integer values")
+        if np.any((response_values < -1) | (response_values > 1)):
+            raise ValueError("responses must contain only -1, 0, or 1")
+
+        if response_values.ndim == 2:
+            if (
+                isinstance(n_items, (bool, np.bool_))
+                or not isinstance(n_items, (int, np.integer))
+                or n_items < 1
+            ):
+                raise ValueError("n_items must be a positive integer for 2D responses")
+            if response_values.shape[1] % int(n_items) != 0:
+                raise ValueError("2D response columns must be divisible by n_items")
+            n_timepoints = response_values.shape[1] // int(n_items)
+            response_values = response_values.reshape(
+                response_values.shape[0],
+                n_timepoints,
+                int(n_items),
+            )
+        elif n_items is not None:
+            if (
+                isinstance(n_items, (bool, np.bool_))
+                or not isinstance(n_items, (int, np.integer))
+                or int(n_items) != response_values.shape[2]
+            ):
+                raise ValueError("n_items must match the final response dimension")
+
+        if any(size == 0 for size in response_values.shape):
+            raise ValueError("responses must have non-empty dimensions")
+        if not np.any(response_values >= 0):
+            raise ValueError("responses must contain at least one observed value")
+
+        n_timepoints = response_values.shape[1]
+        if time_values is None:
+            times = np.arange(n_timepoints, dtype=np.float64)
+        else:
+            try:
+                times = np.asarray(time_values, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"time_values must have shape ({n_timepoints},) and be finite"
+                ) from exc
+            if times.shape != (n_timepoints,) or not np.all(np.isfinite(times)):
+                raise ValueError(
+                    f"time_values must have shape ({n_timepoints},) and be finite"
+                )
+
+        return response_values.astype(np.int_, copy=False), times
+
     def _sample_theta(
         self,
         responses: NDArray[np.int_],
@@ -659,46 +874,36 @@ class LongitudinalGibbsSampler:
         rng: np.random.Generator,
     ) -> NDArray[np.float64]:
         """Sample theta trajectories using MH."""
-        n_persons = responses.shape[0]
-        n_timepoints = responses.shape[1]
-
         theta_pred = model.compute_theta(growth_factors, time_values)
-
-        theta = theta_pred.copy()
         proposal_sd = 0.3
+        current = theta_pred.reshape(-1).copy()
+        proposed = np.empty_like(current)
+        log_uniform = np.empty_like(current)
 
-        for i in range(n_persons):
-            for t in range(n_timepoints):
-                theta_prop = theta[i, t] + rng.normal(0, proposal_sd)
+        # Keep proposal and acceptance draws interleaved for seeded compatibility.
+        for index, value in enumerate(current):
+            proposed[index] = value + rng.normal(0, proposal_sd)
+            log_uniform[index] = np.log(rng.random())
 
-                prior_curr = stats.norm.logpdf(
-                    theta[i, t], theta_pred[i, t], np.sqrt(model.residual_variance)
-                )
-                prior_prop = stats.norm.logpdf(
-                    theta_prop, theta_pred[i, t], np.sqrt(model.residual_variance)
-                )
-
-                ll_curr = 0.0
-                ll_prop = 0.0
-                for j in range(model.n_items):
-                    if responses[i, t, j] >= 0:
-                        p_curr = model.probability(np.array([theta[i, t]]), j)[0]
-                        p_prop = model.probability(np.array([theta_prop]), j)[0]
-                        p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
-                        p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                        if responses[i, t, j] == 1:
-                            ll_curr += np.log(p_curr)
-                            ll_prop += np.log(p_prop)
-                        else:
-                            ll_curr += np.log(1 - p_curr)
-                            ll_prop += np.log(1 - p_prop)
-
-                log_alpha = (ll_prop + prior_prop) - (ll_curr + prior_curr)
-                if np.log(rng.random()) < log_alpha:
-                    theta[i, t] = theta_prop
-
-        return theta
+        flat_responses = responses.reshape(-1, model.n_items)
+        ll_current = _longitudinal_log_likelihood_rows(
+            flat_responses,
+            current,
+            model,
+        )
+        ll_proposed = _longitudinal_log_likelihood_rows(
+            flat_responses,
+            proposed,
+            model,
+        )
+        residual_sd = np.sqrt(model.residual_variance)
+        prior_current = stats.norm.logpdf(current, current, residual_sd)
+        prior_proposed = stats.norm.logpdf(proposed, current, residual_sd)
+        accepted = log_uniform < (
+            ll_proposed + prior_proposed - ll_current - prior_current
+        )
+        current[accepted] = proposed[accepted]
+        return current.reshape(theta_pred.shape)
 
     def _sample_growth_factors(
         self,
@@ -742,65 +947,85 @@ class LongitudinalGibbsSampler:
         rng: np.random.Generator,
     ) -> None:
         """Sample item parameters using MH."""
-        n_persons, n_timepoints, n_items = responses.shape
+        n_items = responses.shape[2]
         proposal_sd_a = 0.1
         proposal_sd_b = 0.15
+        a_current = model.discrimination.copy()
+        b_current = model.difficulty.copy()
+        a_proposed = np.empty_like(a_current)
+        b_proposed = np.empty_like(b_current)
+        log_uniform = np.empty(n_items, dtype=np.float64)
 
+        # Preserve the original per-item draw order while batching likelihood work.
         for j in range(n_items):
-            a_curr = model.discrimination[j]
-            b_curr = model.difficulty[j]
-
-            a_prop = np.clip(a_curr + rng.normal(0, proposal_sd_a), 0.2, 5.0)
-            b_prop = np.clip(b_curr + rng.normal(0, proposal_sd_b), -5.0, 5.0)
-
-            ll_curr = 0.0
-            ll_prop = 0.0
-
-            for i in range(n_persons):
-                for t in range(n_timepoints):
-                    if responses[i, t, j] >= 0:
-                        theta = theta_trajectories[i, t]
-
-                        z_curr = a_curr * (theta - b_curr)
-                        z_prop = a_prop * (theta - b_prop)
-
-                        p_curr = sigmoid(z_curr)
-                        p_prop = sigmoid(z_prop)
-
-                        p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
-                        p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                        if responses[i, t, j] == 1:
-                            ll_curr += np.log(p_curr)
-                            ll_prop += np.log(p_prop)
-                        else:
-                            ll_curr += np.log(1 - p_curr)
-                            ll_prop += np.log(1 - p_prop)
-
-            prior_a_curr = stats.lognorm.logpdf(
-                a_curr,
-                s=np.sqrt(self.priors.discrimination_var),
-                scale=self.priors.discrimination_mean,
+            a_proposed[j] = np.clip(
+                a_current[j] + rng.normal(0, proposal_sd_a),
+                0.2,
+                5.0,
             )
-            prior_a_prop = stats.lognorm.logpdf(
-                a_prop,
-                s=np.sqrt(self.priors.discrimination_var),
-                scale=self.priors.discrimination_mean,
+            b_proposed[j] = np.clip(
+                b_current[j] + rng.normal(0, proposal_sd_b),
+                -5.0,
+                5.0,
             )
-            prior_b_curr = stats.norm.logpdf(
-                b_curr, self.priors.difficulty_mean, np.sqrt(self.priors.difficulty_var)
+            log_uniform[j] = np.log(rng.random())
+
+        flat_responses = responses.reshape(-1, n_items)
+        flat_theta = theta_trajectories.reshape(-1)
+        ll_current = np.zeros(n_items, dtype=np.float64)
+        ll_proposed = np.zeros(n_items, dtype=np.float64)
+        rows_per_chunk = max(
+            1,
+            _LONGITUDINAL_MAX_PROBABILITY_VALUES // n_items,
+        )
+        for start in range(0, flat_theta.size, rows_per_chunk):
+            stop = min(start + rows_per_chunk, flat_theta.size)
+            theta_chunk = flat_theta[start:stop, None]
+            response_chunk = flat_responses[start:stop]
+            current_probability = np.asarray(
+                sigmoid(a_current * (theta_chunk - b_current)),
+                dtype=np.float64,
             )
-            prior_b_prop = stats.norm.logpdf(
-                b_prop, self.priors.difficulty_mean, np.sqrt(self.priors.difficulty_var)
+            proposed_probability = np.asarray(
+                sigmoid(a_proposed * (theta_chunk - b_proposed)),
+                dtype=np.float64,
+            )
+            ll_current += _binary_log_likelihood(
+                current_probability,
+                response_chunk,
+                axis=0,
+            )
+            ll_proposed += _binary_log_likelihood(
+                proposed_probability,
+                response_chunk,
+                axis=0,
             )
 
-            log_alpha = (ll_prop + prior_a_prop + prior_b_prop) - (
-                ll_curr + prior_a_curr + prior_b_curr
-            )
-
-            if np.log(rng.random()) < log_alpha:
-                model.discrimination[j] = a_prop
-                model.difficulty[j] = b_prop
+        prior_scale_a = np.sqrt(self.priors.discrimination_var)
+        prior_scale_b = np.sqrt(self.priors.difficulty_var)
+        prior_current = stats.lognorm.logpdf(
+            a_current,
+            s=prior_scale_a,
+            scale=self.priors.discrimination_mean,
+        ) + stats.norm.logpdf(
+            b_current,
+            self.priors.difficulty_mean,
+            prior_scale_b,
+        )
+        prior_proposed = stats.lognorm.logpdf(
+            a_proposed,
+            s=prior_scale_a,
+            scale=self.priors.discrimination_mean,
+        ) + stats.norm.logpdf(
+            b_proposed,
+            self.priors.difficulty_mean,
+            prior_scale_b,
+        )
+        accepted = log_uniform < (
+            ll_proposed + prior_proposed - ll_current - prior_current
+        )
+        model.discrimination[accepted] = a_proposed[accepted]
+        model.difficulty[accepted] = b_proposed[accepted]
 
     def _sample_population_params(
         self,
@@ -877,21 +1102,9 @@ class LongitudinalGibbsSampler:
         model: LongitudinalIRTModel,
     ) -> float:
         """Compute total log-likelihood."""
-        n_persons, n_timepoints, n_items = responses.shape
-        ll = 0.0
-
-        for i in range(n_persons):
-            for t in range(n_timepoints):
-                for j in range(n_items):
-                    if responses[i, t, j] >= 0:
-                        p = model.probability(np.array([theta_trajectories[i, t]]), j)[
-                            0
-                        ]
-                        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                        if responses[i, t, j] == 1:
-                            ll += np.log(p)
-                        else:
-                            ll += np.log(1 - p)
-
-        return ll
+        row_log_likelihood = _longitudinal_log_likelihood_rows(
+            responses.reshape(-1, model.n_items),
+            theta_trajectories.reshape(-1),
+            model,
+        )
+        return float(np.sum(row_log_likelihood))
