@@ -53,7 +53,8 @@ class TestPSISLOO:
 
         result = psis_loo(log_lik)
 
-        assert np.all(result.pareto_k >= 0)
+        # Light-tailed importance ratios can legitimately produce negative k.
+        assert np.all(np.isfinite(result.pareto_k))
         assert result.n_high_k >= 0
 
     def test_summary(self):

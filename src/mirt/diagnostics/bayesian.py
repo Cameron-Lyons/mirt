@@ -16,9 +16,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.estimation.mcmc import MCMCResult
@@ -425,81 +426,153 @@ class PPCResult:
         return "\n".join(lines)
 
 
-def _pareto_k_estimate(log_weights: NDArray[np.float64], min_tail: int = 10) -> float:
-    """Estimate Pareto k parameter using the Zhang-Stephens method.
+def _validate_log_likelihood(log_lik: ArrayLike) -> NDArray[np.float64]:
+    """Return a finite sample-by-observation log-likelihood matrix."""
+    values = np.asarray(log_lik, dtype=np.float64)
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    if values.ndim != 2:
+        raise ValueError("log_lik must be a one- or two-dimensional array")
+    if values.shape[0] < 2:
+        raise ValueError("log_lik must contain at least two posterior samples")
+    if values.shape[1] == 0:
+        raise ValueError("log_lik must contain at least one observation")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("log_lik must contain only finite values")
+    return values
 
-    Parameters
-    ----------
-    log_weights : ndarray
-        Log importance weights.
-    min_tail : int
-        Minimum tail length for estimation.
 
-    Returns
-    -------
-    float
-        Estimated Pareto k parameter.
-    """
-    n = len(log_weights)
-    if n < min_tail:
-        return np.inf
+def _validate_relative_efficiency(
+    relative_eff: ArrayLike,
+    n_observations: int,
+) -> NDArray[np.float64]:
+    """Broadcast positive relative efficiencies across observations."""
+    raw_values = np.asarray(relative_eff)
+    if np.issubdtype(raw_values.dtype, np.bool_):
+        raise ValueError("relative_eff must contain positive finite values")
+    try:
+        values = raw_values.astype(np.float64, copy=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("relative_eff must contain positive finite values") from exc
+    if values.ndim == 0:
+        values = np.full(n_observations, float(values), dtype=np.float64)
+    elif values.shape != (n_observations,):
+        raise ValueError(
+            "relative_eff must be a scalar or contain one value per observation"
+        )
+    if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+        raise ValueError("relative_eff must contain positive finite values")
+    return values
 
-    log_weights = np.sort(log_weights)
 
-    log_cutoff = log_weights[-min_tail]
-    tail = log_weights[log_weights > log_cutoff]
+def _fit_generalized_pareto(
+    excesses: NDArray[np.float64],
+) -> tuple[float, float]:
+    """Fit a generalized Pareto tail with the Zhang-Stephens estimator."""
+    sorted_excesses = np.sort(np.asarray(excesses, dtype=np.float64))
+    n_tail = sorted_excesses.size
+    if n_tail <= 4 or sorted_excesses[0] < 0.0:
+        return np.inf, np.nan
+    if sorted_excesses[-1] <= 0.0:
+        return 0.0, 0.0
 
-    if len(tail) < min_tail:
-        tail = log_weights[-min_tail:]
+    n_candidates = 30 + int(np.sqrt(n_tail))
+    candidate_index = np.arange(1, n_candidates + 1, dtype=np.float64) - 0.5
+    inverse_scales = 1.0 - np.sqrt(n_candidates / candidate_index)
+    quartile = sorted_excesses[int(n_tail / 4.0 + 0.5) - 1]
+    if quartile <= 0.0:
+        return np.inf, np.nan
+    inverse_scales /= 3.0 * quartile
+    inverse_scales += 1.0 / sorted_excesses[-1]
 
-    m = len(tail)
-    if m < 2:
-        return np.inf
+    log_terms = np.log1p(-inverse_scales[:, None] * sorted_excesses[None, :])
+    shape_candidates = np.mean(log_terms, axis=1)
+    objective = n_tail * (
+        np.log(-(inverse_scales / shape_candidates)) - shape_candidates - 1.0
+    )
+    posterior_weights = np.exp(objective - np.max(objective))
+    keep = posterior_weights >= 10.0 * np.finfo(np.float64).eps
+    posterior_weights = posterior_weights[keep]
+    inverse_scales = inverse_scales[keep]
+    posterior_weights /= np.sum(posterior_weights)
 
-    tail_shifted = tail - tail.min()
-    if tail_shifted.max() == 0:
-        return 0.0
+    inverse_scale = float(np.sum(inverse_scales * posterior_weights))
+    shape = float(np.mean(np.log1p(-inverse_scale * sorted_excesses)))
+    scale = float(-shape / inverse_scale)
 
-    log_tail = np.log(tail_shifted[tail_shifted > 0] + PROB_EPSILON)
+    prior_weight = 10.0
+    shape = (n_tail * shape + prior_weight * 0.5) / (n_tail + prior_weight)
+    return shape, scale
 
-    k = np.mean(log_tail) - log_tail[0] if len(log_tail) > 1 else 0.0
-    k = max(0.0, k)
 
-    return k
+def _generalized_pareto_quantile(
+    probabilities: NDArray[np.float64],
+    shape: float,
+    scale: float,
+) -> NDArray[np.float64]:
+    """Return generalized Pareto quantiles for probabilities in ``(0, 1)``."""
+    if not np.isfinite(scale) or scale <= 0.0:
+        return np.full(probabilities.shape, np.nan, dtype=np.float64)
+    log_survival = np.log1p(-probabilities)
+    if abs(shape) < np.finfo(np.float64).eps:
+        return -scale * log_survival
+    return scale * np.expm1(-shape * log_survival) / shape
+
+
+def _pareto_smooth_log_weights(
+    log_weights: NDArray[np.float64],
+    relative_eff: float,
+) -> tuple[NDArray[np.float64], float]:
+    """Return normalized Pareto-smoothed log importance weights."""
+    values = np.asarray(log_weights, dtype=np.float64).copy()
+    if values.ndim != 1 or values.size < 2 or not np.all(np.isfinite(values)):
+        raise ValueError("log_weights must contain at least two finite values")
+
+    values -= np.max(values)
+    if np.all(values == values[0]):
+        values.fill(-np.log(values.size))
+        return values, 0.0
+
+    tail_size = int(
+        np.ceil(min(0.2 * values.size, 3.0 * np.sqrt(values.size / relative_eff)))
+    )
+    cutoff_index = -tail_size - 1
+    order = np.argsort(values)
+    cutoff = max(values[order[cutoff_index]], np.log(np.finfo(np.float64).tiny))
+    tail_indices = np.flatnonzero(values > cutoff)
+
+    if tail_indices.size <= 4:
+        shape = np.inf
+    else:
+        tail_order = np.argsort(values[tail_indices])
+        cutoff_weight = np.exp(cutoff)
+        excesses = np.exp(values[tail_indices][tail_order]) - cutoff_weight
+        shape, scale = _fit_generalized_pareto(excesses)
+        if shape >= 1.0 / 3.0 and np.isfinite(shape):
+            probabilities = (
+                np.arange(tail_indices.size, dtype=np.float64) + 0.5
+            ) / tail_indices.size
+            smoothed = _generalized_pareto_quantile(probabilities, shape, scale)
+            smoothed += cutoff_weight
+            values[tail_indices[tail_order]] = np.log(smoothed)
+
+    np.minimum(values, 0.0, out=values)
+    values -= float(logsumexp(values))
+    return values, float(shape)
 
 
 def _pareto_smooth_weights(
-    log_weights: NDArray[np.float64], k_threshold: float = 0.7
+    log_weights: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], float]:
-    """Apply Pareto smoothing to importance weights.
-
-    Parameters
-    ----------
-    log_weights : ndarray
-        Log importance weights.
-    k_threshold : float
-        Threshold for Pareto k warning.
-
-    Returns
-    -------
-    weights : ndarray
-        Smoothed and normalized weights.
-    k : float
-        Estimated Pareto k value.
-    """
-    log_weights_centered = log_weights - np.max(log_weights)
-
-    k = _pareto_k_estimate(log_weights_centered)
-
-    weights = np.exp(log_weights_centered)
-    weights = weights / weights.sum()
-
-    return weights, k
+    """Return normalized Pareto-smoothed importance weights and tail shape."""
+    smoothed, shape = _pareto_smooth_log_weights(log_weights, relative_eff=1.0)
+    return np.exp(smoothed), shape
 
 
 def psis_loo(
-    log_lik: NDArray[np.float64],
+    log_lik: ArrayLike,
     k_threshold: float = 0.7,
+    relative_eff: ArrayLike = 1.0,
 ) -> PSISResult:
     """Compute PSIS-LOO cross-validation.
 
@@ -513,6 +586,10 @@ def psis_loo(
         each column is an observation (person-item combination or person).
     k_threshold : float, default=0.7
         Threshold for Pareto k diagnostic warning.
+    relative_eff : float or array-like, default=1.0
+        Relative effective sample size of the inverse importance ratios. A
+        scalar is shared across observations; an array supplies one value per
+        observation. Independent posterior draws may use the default.
 
     Returns
     -------
@@ -536,36 +613,44 @@ def psis_loo(
     evaluation using leave-one-out cross-validation and WAIC.
     Statistics and Computing, 27(5), 1413-1432.
     """
-    log_lik = np.asarray(log_lik)
-    if log_lik.ndim == 1:
-        log_lik = log_lik.reshape(-1, 1)
-
+    log_lik = _validate_log_likelihood(log_lik)
+    if isinstance(k_threshold, (bool, np.bool_)):
+        raise ValueError("k_threshold must be a positive finite number")
+    try:
+        k_threshold = float(k_threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("k_threshold must be a positive finite number") from exc
+    if not np.isfinite(k_threshold) or k_threshold <= 0.0:
+        raise ValueError("k_threshold must be a positive finite number")
     n_samples, n_obs = log_lik.shape
+    relative_efficiency = _validate_relative_efficiency(relative_eff, n_obs)
 
-    pointwise_elpd = np.zeros(n_obs)
-    pareto_k = np.zeros(n_obs)
+    pointwise_elpd = np.empty(n_obs, dtype=np.float64)
+    pareto_k = np.empty(n_obs, dtype=np.float64)
 
     for i in range(n_obs):
         log_ratios = -log_lik[:, i]
-
-        weights, k = _pareto_smooth_weights(log_ratios, k_threshold)
+        log_weights, k = _pareto_smooth_log_weights(
+            log_ratios,
+            relative_eff=float(relative_efficiency[i]),
+        )
         pareto_k[i] = k
 
-        log_lik_i = log_lik[:, i]
-        loo_elpd = np.log(np.sum(weights * np.exp(log_lik_i - np.max(log_lik_i))))
-        loo_elpd += np.max(log_lik_i)
-        pointwise_elpd[i] = loo_elpd
+        pointwise_elpd[i] = float(logsumexp(log_lik[:, i] + log_weights))
 
     elpd_loo = np.sum(pointwise_elpd)
 
-    lppd = np.sum(np.log(np.mean(np.exp(log_lik), axis=0)))
+    lppd_i = logsumexp(log_lik, axis=0) - np.log(n_samples)
+    lppd = np.sum(lppd_i)
     p_loo = lppd - elpd_loo
 
     looic = -2 * elpd_loo
 
     n_high_k = int(np.sum(pareto_k > k_threshold))
 
-    se_elpd = float(np.sqrt(n_obs * np.var(pointwise_elpd)))
+    se_elpd = (
+        0.0 if n_obs == 1 else float(np.sqrt(n_obs * np.var(pointwise_elpd, ddof=1)))
+    )
 
     return PSISResult(
         elpd_loo=float(elpd_loo),
@@ -578,7 +663,7 @@ def psis_loo(
     )
 
 
-def waic(log_lik: NDArray[np.float64]) -> WAICResult:
+def waic(log_lik: ArrayLike) -> WAICResult:
     """Compute WAIC (Widely Applicable Information Criterion).
 
     WAIC uses the full posterior distribution to estimate out-of-sample
@@ -610,14 +695,10 @@ def waic(log_lik: NDArray[np.float64]) -> WAICResult:
     and widely applicable information criterion in singular learning theory.
     Journal of Machine Learning Research, 11, 3571-3594.
     """
-    log_lik = np.asarray(log_lik)
-    if log_lik.ndim == 1:
-        log_lik = log_lik.reshape(-1, 1)
-
+    log_lik = _validate_log_likelihood(log_lik)
     n_samples, n_obs = log_lik.shape
 
-    max_log_lik = np.max(log_lik, axis=0)
-    lppd_i = np.log(np.mean(np.exp(log_lik - max_log_lik), axis=0)) + max_log_lik
+    lppd_i = logsumexp(log_lik, axis=0) - np.log(n_samples)
     lppd = np.sum(lppd_i)
 
     p_waic_i = np.var(log_lik, axis=0, ddof=1)
@@ -628,7 +709,7 @@ def waic(log_lik: NDArray[np.float64]) -> WAICResult:
 
     pointwise = -2 * (lppd_i - p_waic_i)
 
-    se_waic = float(np.sqrt(n_obs * np.var(pointwise)))
+    se_waic = 0.0 if n_obs == 1 else float(np.sqrt(n_obs * np.var(pointwise, ddof=1)))
 
     return WAICResult(
         waic=float(waic_val),
