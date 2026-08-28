@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 import numpy as np
+from numpy.polynomial.hermite import hermgauss
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
@@ -15,6 +17,26 @@ if TYPE_CHECKING:
 
 
 _PROBABILITY_TOLERANCE = 1e-10
+
+
+@lru_cache(maxsize=16)
+def standard_normal_quadrature(
+    n_points: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return immutable Gauss--Hermite nodes and standard-normal weights."""
+    if (
+        isinstance(n_points, (bool, np.bool_))
+        or not isinstance(n_points, (int, np.integer))
+        or n_points < 1
+    ):
+        raise ValueError("n_points must be a positive integer")
+
+    nodes, weights = hermgauss(int(n_points))
+    normal_nodes = np.asarray(nodes * np.sqrt(2.0), dtype=np.float64)
+    normal_weights = np.asarray(weights / np.sqrt(np.pi), dtype=np.float64)
+    normal_nodes.setflags(write=False)
+    normal_weights.setflags(write=False)
+    return normal_nodes, normal_weights
 
 
 def logsumexp(
