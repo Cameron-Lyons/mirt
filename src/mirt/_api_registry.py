@@ -141,6 +141,8 @@ BASE_EXPORTS = [
     "coef",
     "MDIFF",
     "MDISC",
+    "direction_cosines",
+    "composite_score_weights",
     "empirical_ES",
     "empirical_plot",
     "RMSD_DIF",
@@ -517,7 +519,12 @@ TOP_LEVEL_IMPORT_GROUPS = {
         "testinfo",
         "theta_for_score",
     ),
-    "mirt.utils.multidimensional": ("MDIFF", "MDISC"),
+    "mirt.utils.multidimensional": (
+        "MDIFF",
+        "MDISC",
+        "composite_score_weights",
+        "direction_cosines",
+    ),
     "mirt.utils.plausible": (
         "combine_plausible_values",
         "generate_plausible_values",
