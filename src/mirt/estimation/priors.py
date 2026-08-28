@@ -20,7 +20,45 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
+from scipy import special, stats
+
+_LOG_TWO_PI = float(np.log(2.0 * np.pi))
+
+
+def _finite_scalar(value: float, name: str) -> float:
+    """Validate a finite real-valued distribution parameter."""
+    if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
+        raise ValueError(f"{name} must be finite")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be finite") from exc
+    if not np.isfinite(result):
+        raise ValueError(f"{name} must be finite")
+    return result
+
+
+def _bound_scalar(value: float, name: str) -> float:
+    """Validate a real-valued bound while permitting either infinity."""
+    if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
+        raise ValueError(f"{name} must be a real-valued bound")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a real-valued bound") from exc
+    if np.isnan(result):
+        raise ValueError(f"{name} must not be NaN")
+    return result
+
+
+def _generator(rng: np.random.Generator | None) -> np.random.Generator:
+    """Return the provided generator or create an independent default."""
+    return np.random.default_rng() if rng is None else rng
+
+
+def _float_values(x: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Coerce density inputs once for predictable vectorized arithmetic."""
+    return np.asarray(x, dtype=np.float64)
 
 
 class Prior(ABC):
@@ -71,23 +109,28 @@ class NormalPrior(Prior):
     """
 
     def __init__(self, mu: float = 0.0, sigma: float = 1.0) -> None:
-        if sigma <= 0:
+        mu_value = _finite_scalar(mu, "mu")
+        sigma_value = _finite_scalar(sigma, "sigma")
+        if sigma_value <= 0:
             raise ValueError("sigma must be positive")
         self.mu = mu
         self.sigma = sigma
-        self._dist = stats.norm(loc=mu, scale=sigma)
+        self._mu = mu_value
+        self._sigma = sigma_value
+        self._log_normalizer = -np.log(sigma_value) - 0.5 * _LOG_TWO_PI
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._dist.logpdf(x)
+        values = _float_values(x)
+        with np.errstate(over="ignore", invalid="ignore"):
+            standardized = (values - self._mu) / self._sigma
+            return self._log_normalizer - 0.5 * standardized * standardized
 
     def sample(
         self,
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        if rng is None:
-            rng = np.random.default_rng()
-        return rng.normal(self.mu, self.sigma, size)
+        return _generator(rng).normal(self._mu, self._sigma, size)
 
     @property
     def mean(self) -> float:
@@ -123,9 +166,13 @@ class TruncatedNormalPrior(Prior):
         lower: float = -np.inf,
         upper: float = np.inf,
     ) -> None:
-        if sigma <= 0:
+        mu_value = _finite_scalar(mu, "mu")
+        sigma_value = _finite_scalar(sigma, "sigma")
+        lower_value = _bound_scalar(lower, "lower")
+        upper_value = _bound_scalar(upper, "upper")
+        if sigma_value <= 0:
             raise ValueError("sigma must be positive")
-        if lower >= upper:
+        if lower_value >= upper_value:
             raise ValueError("lower must be less than upper")
 
         self.mu = mu
@@ -133,9 +180,9 @@ class TruncatedNormalPrior(Prior):
         self.lower = lower
         self.upper = upper
 
-        a = (lower - mu) / sigma
-        b = (upper - mu) / sigma
-        self._dist = stats.truncnorm(a, b, loc=mu, scale=sigma)
+        a = (lower_value - mu_value) / sigma_value
+        b = (upper_value - mu_value) / sigma_value
+        self._dist = stats.truncnorm(a, b, loc=mu_value, scale=sigma_value)
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         return self._dist.logpdf(x)
@@ -145,7 +192,7 @@ class TruncatedNormalPrior(Prior):
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        return self._dist.rvs(size, random_state=rng)
+        return self._dist.rvs(size, random_state=_generator(rng))
 
     @property
     def mean(self) -> float:
@@ -176,23 +223,36 @@ class LogNormalPrior(Prior):
     """
 
     def __init__(self, mu: float = 0.0, sigma: float = 0.5) -> None:
-        if sigma <= 0:
+        mu_value = _finite_scalar(mu, "mu")
+        sigma_value = _finite_scalar(sigma, "sigma")
+        if sigma_value <= 0:
             raise ValueError("sigma must be positive")
         self.mu = mu
         self.sigma = sigma
-        self._dist = stats.lognorm(s=sigma, scale=np.exp(mu))
+        self._mu = mu_value
+        self._sigma = sigma_value
+        self._log_normalizer = -np.log(sigma_value) - 0.5 * _LOG_TWO_PI
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._dist.logpdf(x)
+        values = _float_values(x)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_values = np.log(values)
+            standardized = (log_values - self._mu) / self._sigma
+            log_density = (
+                self._log_normalizer - log_values - 0.5 * standardized * standardized
+            )
+        return np.where(
+            np.isnan(values),
+            np.nan,
+            np.where(values > 0.0, log_density, -np.inf),
+        )
 
     def sample(
         self,
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        if rng is None:
-            rng = np.random.default_rng()
-        return np.exp(rng.normal(self.mu, self.sigma, size))
+        return _generator(rng).lognormal(self._mu, self._sigma, size)
 
     @property
     def mean(self) -> float:
@@ -220,21 +280,36 @@ class BetaPrior(Prior):
     """
 
     def __init__(self, alpha: float = 2.0, beta: float = 8.0) -> None:
-        if alpha <= 0 or beta <= 0:
+        alpha_value = _finite_scalar(alpha, "alpha")
+        beta_value = _finite_scalar(beta, "beta")
+        if alpha_value <= 0 or beta_value <= 0:
             raise ValueError("alpha and beta must be positive")
         self.alpha = alpha
         self.beta = beta
-        self._dist = stats.beta(alpha, beta)
+        self._alpha = alpha_value
+        self._beta = beta_value
+        self._log_normalizer = -special.betaln(alpha_value, beta_value)
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._dist.logpdf(x)
+        values = _float_values(x)
+        log_density = (
+            special.xlogy(self._alpha - 1.0, values)
+            + special.xlog1py(self._beta - 1.0, -values)
+            + self._log_normalizer
+        )
+        in_support = (values >= 0.0) & (values <= 1.0)
+        return np.where(
+            np.isnan(values),
+            np.nan,
+            np.where(in_support, log_density, -np.inf),
+        )
 
     def sample(
         self,
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        return self._dist.rvs(size, random_state=rng)
+        return _generator(rng).beta(self._alpha, self._beta, size)
 
     @property
     def mean(self) -> float:
@@ -261,23 +336,31 @@ class UniformPrior(Prior):
     """
 
     def __init__(self, lower: float = 0.0, upper: float = 1.0) -> None:
-        if lower >= upper:
+        lower_value = _finite_scalar(lower, "lower")
+        upper_value = _finite_scalar(upper, "upper")
+        if lower_value >= upper_value:
             raise ValueError("lower must be less than upper")
         self.lower = lower
         self.upper = upper
-        self._dist = stats.uniform(loc=lower, scale=upper - lower)
+        self._lower = lower_value
+        self._upper = upper_value
+        self._log_density = -np.log(upper_value - lower_value)
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._dist.logpdf(x)
+        values = _float_values(x)
+        in_support = (values >= self._lower) & (values <= self._upper)
+        return np.where(
+            np.isnan(values),
+            np.nan,
+            np.where(in_support, self._log_density, -np.inf),
+        )
 
     def sample(
         self,
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        if rng is None:
-            rng = np.random.default_rng()
-        return rng.uniform(self.lower, self.upper, size)
+        return _generator(rng).uniform(self._lower, self._upper, size)
 
     @property
     def mean(self) -> float:
@@ -305,21 +388,38 @@ class GammaPrior(Prior):
     """
 
     def __init__(self, shape: float = 1.0, rate: float = 1.0) -> None:
-        if shape <= 0 or rate <= 0:
+        shape_value = _finite_scalar(shape, "shape")
+        rate_value = _finite_scalar(rate, "rate")
+        if shape_value <= 0 or rate_value <= 0:
             raise ValueError("shape and rate must be positive")
         self.shape = shape
         self.rate = rate
-        self._dist = stats.gamma(a=shape, scale=1 / rate)
+        self._shape = shape_value
+        self._rate = rate_value
+        self._log_normalizer = shape_value * np.log(rate_value) - special.gammaln(
+            shape_value
+        )
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._dist.logpdf(x)
+        values = _float_values(x)
+        log_density = (
+            special.xlogy(self._shape - 1.0, values)
+            - self._rate * values
+            + self._log_normalizer
+        )
+        in_support = (values >= 0.0) & np.isfinite(values)
+        return np.where(
+            np.isnan(values),
+            np.nan,
+            np.where(in_support, log_density, -np.inf),
+        )
 
     def sample(
         self,
         size: int | tuple[int, ...],
         rng: np.random.Generator | None = None,
     ) -> NDArray[np.float64]:
-        return self._dist.rvs(size, random_state=rng)
+        return _generator(rng).gamma(self._shape, 1.0 / self._rate, size)
 
     @property
     def mean(self) -> float:

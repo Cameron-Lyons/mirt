@@ -452,3 +452,100 @@ class TestComputePriorLogPdf:
         )
         assert isinstance(result, float)
         assert np.isfinite(result)
+
+
+@pytest.mark.parametrize(
+    ("prior", "reference", "values"),
+    [
+        (
+            NormalPrior(0.3, 1.7),
+            stats.norm(0.3, 1.7),
+            [-np.inf, -3.0, 0.0, 2.5, np.inf, np.nan],
+        ),
+        (
+            LogNormalPrior(0.2, 0.7),
+            stats.lognorm(s=0.7, scale=np.exp(0.2)),
+            [-np.inf, -1.0, 0.0, 1e-12, 1.0, np.inf, np.nan],
+        ),
+        (
+            BetaPrior(0.5, 1.0),
+            stats.beta(0.5, 1.0),
+            [-np.inf, -1.0, 0.0, 0.25, 1.0, 2.0, np.inf, np.nan],
+        ),
+        (
+            BetaPrior(1.0, 2.0),
+            stats.beta(1.0, 2.0),
+            [-np.inf, -1.0, 0.0, 0.25, 1.0, 2.0, np.inf, np.nan],
+        ),
+        (
+            UniformPrior(-2.0, 3.0),
+            stats.uniform(-2.0, 5.0),
+            [-np.inf, -2.1, -2.0, 0.0, 3.0, 3.1, np.inf, np.nan],
+        ),
+        (
+            GammaPrior(0.5, 1.2),
+            stats.gamma(a=0.5, scale=1 / 1.2),
+            [-np.inf, -1.0, 0.0, 1e-12, 0.5, np.inf, np.nan],
+        ),
+        (
+            GammaPrior(1.0, 1.2),
+            stats.gamma(a=1.0, scale=1 / 1.2),
+            [-np.inf, -1.0, 0.0, 1e-12, 0.5, np.inf, np.nan],
+        ),
+    ],
+)
+def test_vectorized_log_pdf_matches_scipy_on_support_boundaries(
+    prior,
+    reference,
+    values,
+):
+    points = np.asarray(values, dtype=np.float64)
+
+    with np.errstate(all="raise"):
+        actual = prior.log_pdf(points)
+    expected = reference.logpdf(points)
+
+    assert_allclose(actual, expected, rtol=2e-14, atol=2e-14, equal_nan=True)
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: NormalPrior(mu=np.inf), "mu must be finite"),
+        (lambda: NormalPrior(sigma=np.nan), "sigma must be finite"),
+        (lambda: TruncatedNormalPrior(mu=-np.inf), "mu must be finite"),
+        (lambda: TruncatedNormalPrior(lower=np.nan), "lower must not be NaN"),
+        (lambda: LogNormalPrior(mu=np.nan), "mu must be finite"),
+        (lambda: LogNormalPrior(sigma=np.inf), "sigma must be finite"),
+        (lambda: BetaPrior(alpha=True), "alpha must be finite"),
+        (lambda: BetaPrior(beta=np.nan), "beta must be finite"),
+        (lambda: UniformPrior(lower=-np.inf), "lower must be finite"),
+        (lambda: UniformPrior(upper=np.inf), "upper must be finite"),
+        (lambda: GammaPrior(shape=np.nan), "shape must be finite"),
+        (lambda: GammaPrior(rate=np.inf), "rate must be finite"),
+    ],
+)
+def test_priors_reject_nonfinite_distribution_parameters(factory, message):
+    with pytest.raises(ValueError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    ("prior", "draw"),
+    [
+        (
+            LogNormalPrior(0.2, 0.7),
+            lambda rng, size: np.exp(rng.normal(0.2, 0.7, size)),
+        ),
+        (BetaPrior(2.0, 8.0), lambda rng, size: rng.beta(2.0, 8.0, size)),
+        (GammaPrior(2.5, 1.2), lambda rng, size: rng.gamma(2.5, 1 / 1.2, size)),
+    ],
+)
+def test_direct_samplers_preserve_generator_reproducibility(prior, draw):
+    actual_rng = np.random.default_rng(1729)
+    expected_rng = np.random.default_rng(1729)
+
+    actual = prior.sample((4, 3), rng=actual_rng)
+    expected = draw(expected_rng, (4, 3))
+
+    assert_allclose(actual, expected, rtol=0.0, atol=0.0)
