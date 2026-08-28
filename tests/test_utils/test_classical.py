@@ -23,6 +23,44 @@ def _alpha(responses: np.ndarray) -> float:
     )
 
 
+def _scalar_item_fit_groups(
+    responses: np.ndarray,
+    expected: np.ndarray,
+    missing: np.ndarray,
+    group_idx: np.ndarray,
+    n_groups: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Reference the former one-item-at-a-time grouped reductions."""
+    n_items = responses.shape[1]
+    group_counts = np.zeros((n_items, n_groups), dtype=np.intp)
+    observed_counts = np.zeros((n_items, n_groups), dtype=np.float64)
+    expected_counts = np.zeros((n_items, n_groups), dtype=np.float64)
+    expected_variances = np.zeros((n_items, n_groups), dtype=np.float64)
+
+    for item_idx in range(n_items):
+        valid = (group_idx >= 0) & ~missing[:, item_idx]
+        item_groups = group_idx[valid]
+        probabilities = expected[valid, item_idx]
+        group_counts[item_idx] = np.bincount(item_groups, minlength=n_groups)
+        observed_counts[item_idx] = np.bincount(
+            item_groups,
+            weights=responses[valid, item_idx],
+            minlength=n_groups,
+        )
+        expected_counts[item_idx] = np.bincount(
+            item_groups,
+            weights=probabilities,
+            minlength=n_groups,
+        )
+        expected_variances[item_idx] = np.bincount(
+            item_groups,
+            weights=probabilities * (1.0 - probabilities),
+            minlength=n_groups,
+        )
+
+    return group_counts, observed_counts, expected_counts, expected_variances
+
+
 def test_itemstats_is_exported_from_utils() -> None:
     result = exported_itemstats([[0, 1], [1, 0]])
 
@@ -194,6 +232,79 @@ def test_item_fit_uses_expected_count_variance() -> None:
 
     np.testing.assert_allclose(chisq, expected_chisq)
     assert np.all((p_values >= 0.0) & (p_values <= 1.0))
+
+
+def test_item_fit_group_aggregation_matches_scalar_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(20260828)
+    n_persons, n_items, n_groups = 19, 11, 4
+    responses = rng.integers(0, 2, size=(n_persons, n_items)).astype(float)
+    expected = rng.uniform(0.05, 0.95, size=responses.shape)
+    missing = rng.random(responses.shape) < 0.2
+    responses[missing] = np.nan
+    expected[missing] = np.nan
+    group_idx = rng.integers(0, n_groups, size=n_persons, dtype=np.intp)
+    group_idx[[0, 7]] = -1
+    monkeypatch.setattr(
+        classical,
+        "_ITEM_FIT_CHUNK_ELEMENTS",
+        n_persons * 2,
+    )
+
+    actual = classical._aggregate_item_fit_groups(
+        responses,
+        expected,
+        missing,
+        group_idx,
+        n_groups,
+    )
+    reference = _scalar_item_fit_groups(
+        responses,
+        expected,
+        missing,
+        group_idx,
+        n_groups,
+    )
+
+    np.testing.assert_array_equal(actual[0], reference[0])
+    for actual_values, reference_values in zip(actual[1:], reference[1:], strict=True):
+        np.testing.assert_allclose(actual_values, reference_values, rtol=0.0, atol=0.0)
+
+
+def test_item_fit_batches_group_reductions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(808)
+    n_persons, n_items = 12, 7
+    expected = rng.uniform(0.1, 0.9, size=(n_persons, n_items))
+    responses = (rng.random(expected.shape) < expected).astype(int)
+    grouping = np.arange(n_persons, dtype=float)
+    monkeypatch.setattr(
+        classical,
+        "_ITEM_FIT_CHUNK_ELEMENTS",
+        n_persons * 2,
+    )
+    original_bincount = np.bincount
+    call_count = 0
+
+    def counted_bincount(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original_bincount(*args, **kwargs)
+
+    monkeypatch.setattr(classical.np, "bincount", counted_bincount)
+
+    item_fit_chisq(
+        responses,
+        expected,
+        n_groups=3,
+        grouping=grouping,
+        min_group_size=1,
+    )
+
+    n_chunks = (n_items + 1) // 2
+    assert call_count == 4 * n_chunks
 
 
 def test_item_fit_excludes_missing_responses() -> None:
