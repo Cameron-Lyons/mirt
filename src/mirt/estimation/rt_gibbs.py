@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
+from scipy.special import logsumexp
 
 from mirt._core import sigmoid
 from mirt.backends.rust.response_time import rt_accept_person_proposals
@@ -62,12 +63,122 @@ class RTModelPriors:
     sigma_scale: NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
+        for name in ("disc_mean", "diff_mean", "time_disc_mean", "time_int_mean"):
+            value = getattr(self, name)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must be finite",
+                    parameter=name,
+                    value=value,
+                    expected="finite number",
+                ) from exc
+            if isinstance(value, (bool, np.bool_)) or not np.isfinite(numeric):
+                raise MirtValidationError(
+                    f"{name} must be finite",
+                    parameter=name,
+                    value=value,
+                    expected="finite number",
+                )
+            setattr(self, name, numeric)
+
+        for name in ("disc_var", "diff_var", "time_disc_var", "time_int_var"):
+            value = getattr(self, name)
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must be finite and positive",
+                    parameter=name,
+                    value=value,
+                    expected="> 0",
+                ) from exc
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not np.isfinite(numeric)
+                or numeric <= 0.0
+            ):
+                raise MirtValidationError(
+                    f"{name} must be finite and positive",
+                    parameter=name,
+                    value=value,
+                    expected="> 0",
+                )
+            setattr(self, name, numeric)
+
+        if (
+            isinstance(self.sigma_df, (bool, np.bool_))
+            or not isinstance(self.sigma_df, (int, np.integer))
+            or self.sigma_df < 2
+        ):
+            raise MirtValidationError(
+                "sigma_df must be an integer of at least 2",
+                parameter="sigma_df",
+                value=self.sigma_df,
+                expected="integer >= 2",
+            )
+        self.sigma_df = int(self.sigma_df)
+
         if self.mu_mean is None:
             self.mu_mean = np.zeros(2)
+        else:
+            self.mu_mean = self._validated_array("mu_mean", self.mu_mean, (2,))
         if self.mu_cov is None:
             self.mu_cov = np.eye(2) * 10
+        else:
+            self.mu_cov = self._validated_array(
+                "mu_cov", self.mu_cov, (2, 2), positive_definite=True
+            )
         if self.sigma_scale is None:
             self.sigma_scale = np.eye(2)
+        else:
+            self.sigma_scale = self._validated_array(
+                "sigma_scale", self.sigma_scale, (2, 2), positive_definite=True
+            )
+
+    @staticmethod
+    def _validated_array(
+        name: str,
+        values: NDArray[np.float64],
+        shape: tuple[int, ...],
+        *,
+        positive_definite: bool = False,
+    ) -> NDArray[np.float64]:
+        try:
+            array = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=values,
+                expected=f"finite array with shape {shape}",
+            ) from exc
+        if array.shape != shape or not np.all(np.isfinite(array)):
+            raise MirtValidationError(
+                f"{name} must be a finite array with shape {shape}",
+                parameter=name,
+                value=array.shape,
+                expected=f"finite array with shape {shape}",
+            )
+        if positive_definite:
+            if not np.allclose(array, array.T, rtol=0.0, atol=1e-12):
+                raise MirtValidationError(
+                    f"{name} must be symmetric positive definite",
+                    parameter=name,
+                    value=array,
+                    expected="symmetric positive-definite matrix",
+                )
+            try:
+                np.linalg.cholesky(array)
+            except np.linalg.LinAlgError as exc:
+                raise MirtValidationError(
+                    f"{name} must be symmetric positive definite",
+                    parameter=name,
+                    value=array,
+                    expected="symmetric positive-definite matrix",
+                ) from exc
+        return array.copy()
 
 
 class ResponseTimeGibbsSampler:
@@ -85,7 +196,7 @@ class ResponseTimeGibbsSampler:
     thin : int
         Thinning interval
     n_chains : int
-        Number of parallel chains
+        Number of independent chains
     priors : RTModelPriors, optional
         Prior specifications
     proposal_sd : float
@@ -113,15 +224,86 @@ class ResponseTimeGibbsSampler:
         seed: int | None = None,
         use_rust: bool = True,
     ) -> None:
-        self.n_iter = n_iter
-        self.burnin = burnin
-        self.thin = thin
-        self.n_chains = n_chains
-        self.priors = priors or RTModelPriors()
-        self.proposal_sd = proposal_sd
-        self.adapt_interval = adapt_interval
-        self.verbose = verbose
-        self.seed = seed
+        for name, value in (
+            ("n_iter", n_iter),
+            ("thin", thin),
+            ("n_chains", n_chains),
+            ("adapt_interval", adapt_interval),
+        ):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+                or value < 1
+            ):
+                raise MirtValidationError(
+                    f"{name} must be a positive integer",
+                    parameter=name,
+                    value=value,
+                    expected="positive integer",
+                )
+        if (
+            isinstance(burnin, (bool, np.bool_))
+            or not isinstance(burnin, (int, np.integer))
+            or burnin < 0
+        ):
+            raise MirtValidationError(
+                "burnin must be a non-negative integer",
+                parameter="burnin",
+                value=burnin,
+                expected="non-negative integer",
+            )
+        if burnin >= n_iter:
+            raise MirtValidationError(
+                "burnin must be less than n_iter",
+                parameter="burnin",
+                value=burnin,
+                expected=f"< {n_iter}",
+            )
+        if priors is not None and not isinstance(priors, RTModelPriors):
+            raise MirtValidationError(
+                "priors must be an RTModelPriors instance or None",
+                parameter="priors",
+                value=type(priors).__name__,
+                expected="RTModelPriors or None",
+            )
+        try:
+            proposal_sd_value = float(proposal_sd)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "proposal_sd must be finite and positive",
+                parameter="proposal_sd",
+                value=proposal_sd,
+                expected="> 0",
+            ) from exc
+        if (
+            isinstance(proposal_sd, (bool, np.bool_))
+            or not np.isfinite(proposal_sd_value)
+            or proposal_sd_value <= 0.0
+        ):
+            raise MirtValidationError(
+                "proposal_sd must be finite and positive",
+                parameter="proposal_sd",
+                value=proposal_sd,
+                expected="> 0",
+            )
+        if not isinstance(verbose, (bool, np.bool_)):
+            raise MirtValidationError(
+                "verbose must be a boolean",
+                parameter="verbose",
+                value=verbose,
+                expected="boolean",
+            )
+        if seed is not None and (
+            isinstance(seed, (bool, np.bool_))
+            or not isinstance(seed, (int, np.integer))
+            or seed < 0
+        ):
+            raise MirtValidationError(
+                "seed must be a non-negative integer or None",
+                parameter="seed",
+                value=seed,
+                expected="non-negative integer or None",
+            )
         if not isinstance(use_rust, (bool, np.bool_)):
             raise MirtValidationError(
                 "use_rust must be a boolean",
@@ -129,11 +311,21 @@ class ResponseTimeGibbsSampler:
                 value=use_rust,
                 expected="boolean",
             )
+
+        self.n_iter = int(n_iter)
+        self.burnin = int(burnin)
+        self.thin = int(thin)
+        self.n_chains = int(n_chains)
+        self.priors = RTModelPriors() if priors is None else priors
+        self.proposal_sd = proposal_sd_value
+        self.adapt_interval = int(adapt_interval)
+        self.verbose = bool(verbose)
+        self.seed = None if seed is None else int(seed)
         self.use_rust = bool(use_rust)
 
     def fit(
         self,
-        responses: NDArray[np.int_],
+        responses: NDArray[np.int_] | NDArray[np.float64],
         response_times: NDArray[np.float64],
         accuracy_model: Literal["2PL", "3PL"] = "2PL",
     ) -> ResponseTimeResult:
@@ -155,17 +347,226 @@ class ResponseTimeGibbsSampler:
         """
         from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
 
-        responses = np.asarray(responses, dtype=np.int32)
-        response_times = np.asarray(response_times, dtype=np.float64)
-
-        if responses.shape != response_times.shape:
-            raise ValueError("responses and response_times must have same shape")
-
+        responses, log_rt = self._validate_fit_data(
+            responses, response_times, accuracy_model
+        )
         n_persons, n_items = responses.shape
-        log_rt = np.log(response_times + PROB_EPSILON)
+        chain_runs = [
+            self._run_chain(
+                responses,
+                log_rt,
+                accuracy_model,
+                rng,
+                chain_idx,
+            )
+            for chain_idx, rng in enumerate(self._chain_generators())
+        ]
+        diagnostic_chains = {
+            name: np.stack([run[0][name] for run in chain_runs], axis=0)
+            for name in chain_runs[0][0]
+        }
+        chains = {
+            name: values.reshape((-1,) + values.shape[2:])
+            for name, values in diagnostic_chains.items()
+        }
+        theta_by_chain = np.stack([run[1] for run in chain_runs], axis=0)
+        tau_by_chain = np.stack([run[2] for run in chain_runs], axis=0)
+        theta_samples = theta_by_chain.reshape(-1, n_persons)
+        tau_samples = tau_by_chain.reshape(-1, n_persons)
 
-        rng = np.random.default_rng(self.seed)
+        theta_est = np.mean(theta_samples, axis=0)
+        tau_est = np.mean(tau_samples, axis=0)
+        theta_se = np.std(theta_samples, axis=0)
+        tau_se = np.std(tau_samples, axis=0)
 
+        model = ResponseTimeModel(
+            n_items=n_items,
+            accuracy_model=accuracy_model,
+            discrimination=np.mean(chains["discrimination"], axis=0),
+            difficulty=np.mean(chains["difficulty"], axis=0),
+            guessing=np.mean(chains["guessing"], axis=0)
+            if accuracy_model == "3PL"
+            else None,
+            time_discrimination=np.mean(chains["time_discrimination"], axis=0),
+            time_intensity=np.mean(chains["time_intensity"], axis=0),
+            ability_speed_mean=np.array(
+                [np.mean(chains["mu_theta"]), np.mean(chains["mu_tau"])]
+            ),
+            ability_speed_cov=np.array(
+                [
+                    [np.mean(chains["sigma_11"]), np.mean(chains["sigma_12"])],
+                    [np.mean(chains["sigma_12"]), np.mean(chains["sigma_22"])],
+                ]
+            ),
+            use_rust=self.use_rust,
+        )
+
+        sample_log_likelihoods = self._posterior_log_likelihoods(
+            model, responses, log_rt, theta_samples, tau_samples
+        )
+        log_likelihood = float(np.mean(np.sum(sample_log_likelihoods, axis=1)))
+
+        dic = self._compute_dic(
+            model,
+            responses,
+            log_rt,
+            theta_samples,
+            tau_samples,
+            sample_log_likelihoods,
+        )
+        waic = self._compute_waic(
+            model,
+            responses,
+            log_rt,
+            theta_samples,
+            tau_samples,
+            sample_log_likelihoods,
+        )
+
+        rhat = self._compute_rhat(diagnostic_chains)
+        ess = self._compute_ess(diagnostic_chains)
+
+        converged = all(np.isfinite(r) and r < 1.1 for r in rhat.values())
+
+        return ResponseTimeResult(
+            model=model,
+            theta_estimates=theta_est,
+            tau_estimates=tau_est,
+            theta_se=theta_se,
+            tau_se=tau_se,
+            chains=chains,
+            log_likelihood=log_likelihood,
+            dic=dic,
+            waic=waic,
+            rhat=rhat,
+            ess=ess,
+            n_iterations=self.n_iter,
+            n_chains=self.n_chains,
+            converged=converged,
+        )
+
+    def _validate_fit_data(
+        self,
+        responses: NDArray[np.int_] | NDArray[np.float64],
+        response_times: NDArray[np.float64],
+        accuracy_model: str,
+    ) -> tuple[NDArray[np.int_], NDArray[np.float64]]:
+        """Validate and normalize observed accuracy and timing data."""
+        if not isinstance(accuracy_model, str) or accuracy_model not in ("2PL", "3PL"):
+            raise MirtValidationError(
+                "accuracy_model must be '2PL' or '3PL'",
+                parameter="accuracy_model",
+                value=accuracy_model,
+                expected="'2PL' or '3PL'",
+            )
+
+        response_values = np.asarray(responses)
+        if response_values.ndim != 2:
+            raise MirtValidationError(
+                "responses must have shape (n_persons, n_items)",
+                parameter="responses",
+                value=response_values.shape,
+                expected="two-dimensional matrix",
+            )
+        if response_values.shape[0] == 0 or response_values.shape[1] == 0:
+            raise MirtValidationError(
+                "responses must contain at least one person and one item",
+                parameter="responses",
+                value=response_values.shape,
+                expected="non-empty two-dimensional matrix",
+            )
+
+        if np.issubdtype(response_values.dtype, np.integer) or np.issubdtype(
+            response_values.dtype, np.bool_
+        ):
+            observed = response_values >= 0
+            invalid = observed & (response_values != 0) & (response_values != 1)
+            response_numeric = response_values
+        else:
+            try:
+                response_numeric = response_values.astype(np.float64, copy=False)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    "responses must be numeric",
+                    parameter="responses",
+                    value=response_values,
+                    expected="0, 1, or a negative/NaN missing value",
+                ) from exc
+            finite = np.isfinite(response_numeric)
+            missing = np.isnan(response_numeric) | (finite & (response_numeric < 0.0))
+            observed = finite & (response_numeric >= 0.0)
+            invalid = (~missing & ~observed) | (
+                observed & (response_numeric != 0.0) & (response_numeric != 1.0)
+            )
+        if np.any(invalid):
+            raise MirtValidationError(
+                "observed responses must be 0 or 1",
+                parameter="responses",
+                value=response_numeric[invalid],
+                expected="0, 1, or a negative/NaN missing value",
+            )
+        response_integers = np.where(observed, response_numeric, -1).astype(np.int32)
+
+        try:
+            time_values = np.asarray(response_times, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "response_times must be numeric",
+                parameter="response_times",
+                value=response_times,
+                expected="positive finite values or NaN",
+            ) from exc
+        if time_values.shape != response_values.shape:
+            raise MirtValidationError(
+                "response_times must have the same shape as responses",
+                parameter="response_times",
+                value=time_values.shape,
+                expected=str(response_values.shape),
+            )
+        finite_times = np.isfinite(time_values)
+        invalid_times = np.isinf(time_values) | (finite_times & (time_values <= 0.0))
+        if np.any(invalid_times):
+            raise MirtValidationError(
+                "observed response_times must be finite and positive",
+                parameter="response_times",
+                value=time_values[invalid_times],
+                expected="positive finite values or NaN",
+            )
+        if not np.any(observed) and not np.any(finite_times):
+            raise MirtValidationError(
+                "at least one accuracy or timing observation is required",
+                parameter="responses",
+                expected="at least one observed value",
+            )
+
+        log_rt = np.full(time_values.shape, np.nan, dtype=np.float64)
+        np.log(time_values, out=log_rt, where=finite_times)
+        return response_integers, log_rt
+
+    def _chain_generators(self) -> list[np.random.Generator]:
+        """Create reproducible independent random streams for every chain."""
+        if self.n_chains == 1:
+            return [np.random.default_rng(self.seed)]
+        seed_sequence = np.random.SeedSequence(self.seed)
+        return [
+            np.random.default_rng(child) for child in seed_sequence.spawn(self.n_chains)
+        ]
+
+    def _run_chain(
+        self,
+        responses: NDArray[np.int_],
+        log_rt: NDArray[np.float64],
+        accuracy_model: Literal["2PL", "3PL"],
+        rng: np.random.Generator,
+        chain_idx: int,
+    ) -> tuple[
+        dict[str, NDArray[np.float64]],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Run one independent chain and return its retained draws."""
+        n_persons, n_items = responses.shape
+        n_samples = len(range(self.burnin, self.n_iter, self.thin))
         disc = np.ones(n_items)
         diff = np.zeros(n_items)
         guess = np.full(n_items, 0.2) if accuracy_model == "3PL" else None
@@ -173,11 +574,9 @@ class ResponseTimeGibbsSampler:
         time_int = np.zeros(n_items)
         mu = np.zeros(2)
         sigma = np.eye(2)
-
         theta = rng.standard_normal(n_persons)
         tau = rng.standard_normal(n_persons)
 
-        n_samples = (self.n_iter - self.burnin) // self.thin
         chains = {
             "discrimination": np.zeros((n_samples, n_items)),
             "difficulty": np.zeros((n_samples, n_items)),
@@ -191,13 +590,10 @@ class ResponseTimeGibbsSampler:
         }
         if accuracy_model == "3PL":
             chains["guessing"] = np.zeros((n_samples, n_items))
-
         theta_samples = np.zeros((n_samples, n_persons))
         tau_samples = np.zeros((n_samples, n_persons))
-
         acceptance_counts = np.zeros(n_persons)
         current_proposal_sd = self.proposal_sd
-
         sample_idx = 0
 
         for iteration in range(self.n_iter):
@@ -227,16 +623,13 @@ class ResponseTimeGibbsSampler:
                 acceptance_counts[:] = 0
 
             disc, diff = self._sample_accuracy_params(responses, theta, disc, diff, rng)
-
             if accuracy_model == "3PL":
                 guess = self._sample_guessing_params(
                     responses, theta, disc, diff, guess, rng
                 )
-
             time_disc, time_int = self._sample_time_params(
                 log_rt, tau, time_disc, time_int, rng
             )
-
             mu, sigma = self._sample_population_params(theta, tau, mu, sigma, rng)
 
             if iteration >= self.burnin and (iteration - self.burnin) % self.thin == 0:
@@ -251,77 +644,19 @@ class ResponseTimeGibbsSampler:
                 chains["sigma_12"][sample_idx] = sigma[0, 1]
                 if accuracy_model == "3PL":
                     chains["guessing"][sample_idx] = guess
-
                 theta_samples[sample_idx] = theta
                 tau_samples[sample_idx] = tau
-
                 sample_idx += 1
 
             if self.verbose and (iteration + 1) % 500 == 0:
-                print(f"Iteration {iteration + 1}/{self.n_iter}")
-
-        theta_est = np.mean(theta_samples, axis=0)
-        tau_est = np.mean(tau_samples, axis=0)
-        theta_se = np.std(theta_samples, axis=0)
-        tau_se = np.std(tau_samples, axis=0)
-
-        model = ResponseTimeModel(
-            n_items=n_items,
-            accuracy_model=accuracy_model,
-            discrimination=np.mean(chains["discrimination"], axis=0),
-            difficulty=np.mean(chains["difficulty"], axis=0),
-            guessing=np.mean(chains["guessing"], axis=0)
-            if accuracy_model == "3PL"
-            else None,
-            time_discrimination=np.mean(chains["time_discrimination"], axis=0),
-            time_intensity=np.mean(chains["time_intensity"], axis=0),
-            ability_speed_mean=np.array(
-                [np.mean(chains["mu_theta"]), np.mean(chains["mu_tau"])]
-            ),
-            ability_speed_cov=np.array(
-                [
-                    [np.mean(chains["sigma_11"]), np.mean(chains["sigma_12"])],
-                    [np.mean(chains["sigma_12"]), np.mean(chains["sigma_22"])],
-                ]
-            ),
-            use_rust=self.use_rust,
-        )
-
-        log_likelihood = np.mean(
-            [
-                np.sum(
-                    model.joint_log_likelihood(
-                        responses, log_rt, theta_samples[s], tau_samples[s]
-                    )
+                prefix = (
+                    f"Chain {chain_idx + 1}/{self.n_chains}, "
+                    if self.n_chains > 1
+                    else ""
                 )
-                for s in range(n_samples)
-            ]
-        )
+                print(f"{prefix}iteration {iteration + 1}/{self.n_iter}")
 
-        dic = self._compute_dic(model, responses, log_rt, theta_samples, tau_samples)
-        waic = self._compute_waic(model, responses, log_rt, theta_samples, tau_samples)
-
-        rhat = self._compute_rhat(chains)
-        ess = self._compute_ess(chains)
-
-        converged = all(r < 1.1 for r in rhat.values())
-
-        return ResponseTimeResult(
-            model=model,
-            theta_estimates=theta_est,
-            tau_estimates=tau_est,
-            theta_se=theta_se,
-            tau_se=tau_se,
-            chains=chains,
-            log_likelihood=log_likelihood,
-            dic=dic,
-            waic=waic,
-            rhat=rhat,
-            ess=ess,
-            n_iterations=self.n_iter,
-            n_chains=self.n_chains,
-            converged=converged,
-        )
+        return chains, theta_samples, tau_samples
 
     def _sample_person_params(
         self,
@@ -378,7 +713,6 @@ class ResponseTimeGibbsSampler:
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Sample accuracy item parameters via MH."""
         n_items = len(disc)
-        n_persons = len(theta)
 
         new_disc = disc.copy()
         new_diff = diff.copy()
@@ -390,26 +724,33 @@ class ResponseTimeGibbsSampler:
 
             diff_prop = diff[j] + rng.normal(0, 0.1)
 
-            log_like_curr = 0.0
-            log_like_prop = 0.0
-
-            for i in range(n_persons):
-                if responses[i, j] >= 0:
-                    z_curr = disc[j] * (theta[i] - diff[j])
-                    z_prop = disc_prop * (theta[i] - diff_prop)
-
-                    p_curr = sigmoid(z_curr)
-                    p_prop = sigmoid(z_prop)
-
-                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
-                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                    if responses[i, j] == 1:
-                        log_like_curr += np.log(p_curr)
-                        log_like_prop += np.log(p_prop)
-                    else:
-                        log_like_curr += np.log(1 - p_curr)
-                        log_like_prop += np.log(1 - p_prop)
+            observed = responses[:, j] >= 0
+            observed_theta = theta[observed]
+            observed_responses = responses[observed, j]
+            p_curr = np.clip(
+                sigmoid(disc[j] * (observed_theta - diff[j])),
+                PROB_EPSILON,
+                1 - PROB_EPSILON,
+            )
+            p_prop = np.clip(
+                sigmoid(disc_prop * (observed_theta - diff_prop)),
+                PROB_EPSILON,
+                1 - PROB_EPSILON,
+            )
+            log_like_curr = np.sum(
+                np.where(
+                    observed_responses == 1,
+                    np.log(p_curr),
+                    np.log1p(-p_curr),
+                )
+            )
+            log_like_prop = np.sum(
+                np.where(
+                    observed_responses == 1,
+                    np.log(p_prop),
+                    np.log1p(-p_prop),
+                )
+            )
 
             log_prior_curr = (
                 -0.5
@@ -449,7 +790,6 @@ class ResponseTimeGibbsSampler:
     ) -> NDArray[np.float64]:
         """Sample guessing parameters via MH."""
         n_items = len(guess)
-        n_persons = len(theta)
 
         new_guess = guess.copy()
 
@@ -457,26 +797,33 @@ class ResponseTimeGibbsSampler:
             guess_prop = guess[j] + rng.normal(0, 0.02)
             guess_prop = np.clip(guess_prop, 0.01, 0.5)
 
-            log_like_curr = 0.0
-            log_like_prop = 0.0
-
-            for i in range(n_persons):
-                if responses[i, j] >= 0:
-                    z = disc[j] * (theta[i] - diff[j])
-                    p_star = sigmoid(z)
-
-                    p_curr = guess[j] + (1 - guess[j]) * p_star
-                    p_prop = guess_prop + (1 - guess_prop) * p_star
-
-                    p_curr = np.clip(p_curr, PROB_EPSILON, 1 - PROB_EPSILON)
-                    p_prop = np.clip(p_prop, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                    if responses[i, j] == 1:
-                        log_like_curr += np.log(p_curr)
-                        log_like_prop += np.log(p_prop)
-                    else:
-                        log_like_curr += np.log(1 - p_curr)
-                        log_like_prop += np.log(1 - p_prop)
+            observed = responses[:, j] >= 0
+            observed_responses = responses[observed, j]
+            p_star = sigmoid(disc[j] * (theta[observed] - diff[j]))
+            p_curr = np.clip(
+                guess[j] + (1 - guess[j]) * p_star,
+                PROB_EPSILON,
+                1 - PROB_EPSILON,
+            )
+            p_prop = np.clip(
+                guess_prop + (1 - guess_prop) * p_star,
+                PROB_EPSILON,
+                1 - PROB_EPSILON,
+            )
+            log_like_curr = np.sum(
+                np.where(
+                    observed_responses == 1,
+                    np.log(p_curr),
+                    np.log1p(-p_curr),
+                )
+            )
+            log_like_prop = np.sum(
+                np.where(
+                    observed_responses == 1,
+                    np.log(p_prop),
+                    np.log1p(-p_prop),
+                )
+            )
 
             log_accept = log_like_prop - log_like_curr
 
@@ -572,19 +919,14 @@ class ResponseTimeGibbsSampler:
         log_rt: NDArray[np.float64],
         theta_samples: NDArray[np.float64],
         tau_samples: NDArray[np.float64],
+        log_likes: NDArray[np.float64] | None = None,
     ) -> float:
         """Compute Deviance Information Criterion."""
-        n_samples = theta_samples.shape[0]
-
-        deviances = np.zeros(n_samples)
-        for s in range(n_samples):
-            ll = np.sum(
-                model.joint_log_likelihood(
-                    responses, log_rt, theta_samples[s], tau_samples[s]
-                )
+        if log_likes is None:
+            log_likes = self._posterior_log_likelihoods(
+                model, responses, log_rt, theta_samples, tau_samples
             )
-            deviances[s] = -2 * ll
-
+        deviances = -2.0 * np.sum(log_likes, axis=1)
         d_bar = np.mean(deviances)
 
         theta_mean = np.mean(theta_samples, axis=0)
@@ -597,7 +939,7 @@ class ResponseTimeGibbsSampler:
         p_d = d_bar - d_theta_bar
         dic = d_bar + p_d
 
-        return dic
+        return float(dic)
 
     def _compute_waic(
         self,
@@ -606,92 +948,121 @@ class ResponseTimeGibbsSampler:
         log_rt: NDArray[np.float64],
         theta_samples: NDArray[np.float64],
         tau_samples: NDArray[np.float64],
+        log_likes: NDArray[np.float64] | None = None,
     ) -> float:
         """Compute Watanabe-Akaike Information Criterion."""
-        n_samples = theta_samples.shape[0]
-        n_persons = responses.shape[0]
-
-        log_likes = np.zeros((n_samples, n_persons))
-        for s in range(n_samples):
-            log_likes[s] = model.joint_log_likelihood(
-                responses, log_rt, theta_samples[s], tau_samples[s]
+        if log_likes is None:
+            log_likes = self._posterior_log_likelihoods(
+                model, responses, log_rt, theta_samples, tau_samples
             )
+        n_samples = log_likes.shape[0]
 
-        lppd = np.sum(np.log(np.mean(np.exp(log_likes), axis=0)))
-
-        p_waic = np.sum(np.var(log_likes, axis=0))
+        lppd = np.sum(logsumexp(log_likes, axis=0) - np.log(n_samples))
+        p_waic = np.sum(np.var(log_likes, axis=0, ddof=1)) if n_samples > 1 else 0.0
 
         waic = -2 * (lppd - p_waic)
 
-        return waic
+        return float(waic)
+
+    @staticmethod
+    def _posterior_log_likelihoods(
+        model: ResponseTimeModel,
+        responses: NDArray[np.int_],
+        log_rt: NDArray[np.float64],
+        theta_samples: NDArray[np.float64],
+        tau_samples: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate every retained person-level log likelihood once."""
+        n_samples = theta_samples.shape[0]
+        log_likes = np.empty((n_samples, responses.shape[0]), dtype=np.float64)
+        for sample_idx in range(n_samples):
+            log_likes[sample_idx] = model.joint_log_likelihood(
+                responses,
+                log_rt,
+                theta_samples[sample_idx],
+                tau_samples[sample_idx],
+            )
+        return log_likes
 
     def _compute_rhat(self, chains: dict[str, NDArray[np.float64]]) -> dict[str, float]:
-        """Compute Gelman-Rubin convergence diagnostic."""
-        rhat = {}
+        """Compute split-chain Gelman-Rubin convergence diagnostics."""
+        return {
+            name: self._rhat_for_array(np.asarray(samples, dtype=np.float64))
+            for name, samples in chains.items()
+        }
 
-        for name, samples in chains.items():
-            if samples.ndim == 1:
-                n = len(samples)
-                if n < 4:
-                    rhat[name] = np.nan
-                    continue
+    @staticmethod
+    def _rhat_for_array(samples: NDArray[np.float64]) -> float:
+        """Compute split R-hat averaged across trailing parameter dimensions."""
+        if samples.ndim < 2:
+            raise ValueError("diagnostic samples must have chain and draw dimensions")
+        n_chains, n_draws = samples.shape[:2]
+        if n_draws < 4:
+            return float("nan")
 
-                mid = n // 2
-                chain1 = samples[:mid]
-                chain2 = samples[mid:]
+        half = n_draws // 2
+        flat = samples.reshape(n_chains, n_draws, -1)
+        split = np.concatenate((flat[:, :half], flat[:, -half:]), axis=0)
+        chain_means = np.mean(split, axis=1)
+        within = np.mean(np.var(split, axis=1, ddof=1), axis=0)
+        between = half * np.var(chain_means, axis=0, ddof=1)
+        variance = ((half - 1) / half) * within + between / half
 
-                mean1, mean2 = np.mean(chain1), np.mean(chain2)
-                var1, var2 = np.var(chain1, ddof=1), np.var(chain2, ddof=1)
-
-                W = (var1 + var2) / 2
-                B = mid * (
-                    (mean1 - (mean1 + mean2) / 2) ** 2
-                    + (mean2 - (mean1 + mean2) / 2) ** 2
-                )
-                var_est = (1 - 1 / mid) * W + B / mid
-
-                rhat[name] = np.sqrt(var_est / W) if W > 0 else 1.0
-            else:
-                rhat[name] = np.mean(
-                    [
-                        self._compute_rhat({f"{name}_{j}": samples[:, j]})[
-                            f"{name}_{j}"
-                        ]
-                        for j in range(samples.shape[1])
-                    ]
-                )
-
-        return rhat
+        values = np.ones_like(within)
+        varying = within > 0.0
+        values[varying] = np.sqrt(variance[varying] / within[varying])
+        values[(~varying) & (between > 0.0)] = np.inf
+        return float(np.mean(values))
 
     def _compute_ess(self, chains: dict[str, NDArray[np.float64]]) -> dict[str, float]:
-        """Compute effective sample size."""
-        ess = {}
+        """Compute effective sample sizes using FFT autocorrelations."""
+        return {
+            name: self._ess_for_array(np.asarray(samples, dtype=np.float64))
+            for name, samples in chains.items()
+        }
 
-        for name, samples in chains.items():
-            if samples.ndim == 1:
-                n = len(samples)
-                if n < 4:
-                    ess[name] = float(n)
-                    continue
+    @staticmethod
+    def _ess_for_array(samples: NDArray[np.float64]) -> float:
+        """Compute ESS averaged across trailing parameter dimensions."""
+        if samples.ndim < 2:
+            raise ValueError("diagnostic samples must have chain and draw dimensions")
+        n_chains, n_draws = samples.shape[:2]
+        total_draws = n_chains * n_draws
+        if n_draws < 4:
+            return float(total_draws)
 
-                acf = np.correlate(
-                    samples - np.mean(samples), samples - np.mean(samples), mode="full"
-                )
-                acf = acf[n - 1 :] / acf[n - 1]
+        flat = samples.reshape(n_chains, n_draws, -1)
+        centered = flat - np.mean(flat, axis=1, keepdims=True)
+        fft_size = 1 << (2 * n_draws - 1).bit_length()
+        transformed = np.fft.rfft(centered, n=fft_size, axis=1)
+        autocovariance = np.fft.irfft(
+            transformed * np.conjugate(transformed), n=fft_size, axis=1
+        )[:, :n_draws]
+        autocovariance /= np.arange(n_draws, 0, -1)[None, :, None]
 
-                tau = 1.0
-                for k in range(1, min(n // 2, 100)):
-                    if acf[k] < 0:
-                        break
-                    tau += 2 * acf[k]
+        variances = autocovariance[:, 0]
+        valid = variances > 0.0
+        correlations = np.divide(
+            autocovariance,
+            variances[:, None, :],
+            out=np.zeros_like(autocovariance),
+            where=valid[:, None, :],
+        )
+        valid_counts = np.sum(valid, axis=0)
+        mean_correlations = np.divide(
+            np.sum(correlations, axis=0),
+            valid_counts[None, :],
+            out=np.zeros_like(correlations[0]),
+            where=valid_counts[None, :] > 0,
+        )
 
-                ess[name] = n / tau
-            else:
-                ess[name] = np.mean(
-                    [
-                        self._compute_ess({f"{name}_{j}": samples[:, j]})[f"{name}_{j}"]
-                        for j in range(samples.shape[1])
-                    ]
-                )
+        integrated_time = np.ones(flat.shape[2])
+        active = valid_counts > 0
+        for lag in range(1, n_draws - 1, 2):
+            pair = mean_correlations[lag] + mean_correlations[lag + 1]
+            active &= pair > 0.0
+            integrated_time[active] += 2.0 * pair[active]
 
-        return ess
+        effective = total_draws / integrated_time
+        effective[valid_counts == 0] = total_draws
+        return float(np.mean(np.minimum(effective, total_draws)))
