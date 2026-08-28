@@ -12,12 +12,211 @@ from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
+    _entry_chunk_size,
     mirt_rs,
     rust_enabled,
 )
 from mirt.constants import PROB_EPSILON
 
 FALLBACK_MODE = "numpy"
+
+
+def _prepare_binary_diagnostic_inputs(
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.int32],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Validate and normalize shared binary diagnostic inputs."""
+    response_values = np.asarray(responses)
+    if response_values.dtype.kind not in "biuf":
+        raise ValueError("responses must contain numeric values")
+    response_float = np.asarray(response_values, dtype=np.float64)
+    theta_values = np.asarray(theta, dtype=np.float64)
+    discrimination_values = np.asarray(discrimination, dtype=np.float64)
+    difficulty_values = np.asarray(difficulty, dtype=np.float64)
+
+    if response_float.ndim != 2 or not all(response_float.shape):
+        raise ValueError("responses must be a non-empty two-dimensional matrix")
+    n_persons, n_items = response_float.shape
+    if theta_values.shape == (n_persons, 1):
+        theta_values = theta_values[:, 0]
+    if theta_values.shape != (n_persons,):
+        raise ValueError(f"theta must have shape ({n_persons},)")
+    if discrimination_values.shape != (n_items,):
+        raise ValueError(f"discrimination must have shape ({n_items},)")
+    if difficulty_values.shape != (n_items,):
+        raise ValueError(f"difficulty must have shape ({n_items},)")
+
+    if np.any(np.isinf(response_float)):
+        raise ValueError("responses must contain finite values or NaN for missing")
+    observed = np.isfinite(response_float) & (response_float >= 0.0)
+    if np.any(observed & (response_float != 0.0) & (response_float != 1.0)):
+        raise ValueError("observed responses must contain only 0 or 1")
+    if not np.all(np.isfinite(theta_values)):
+        raise ValueError("theta must contain only finite values")
+    if not np.all(np.isfinite(discrimination_values)):
+        raise ValueError("discrimination must contain only finite values")
+    if not np.all(np.isfinite(difficulty_values)):
+        raise ValueError("difficulty must contain only finite values")
+
+    normalized_responses = np.where(observed, response_float, -1.0)
+    responses_i32 = _ensure_i32(normalized_responses)
+    theta_f64 = _ensure_f64(theta_values)
+    discrimination_f64 = _ensure_f64(discrimination_values)
+    difficulty_f64 = _ensure_f64(difficulty_values)
+    assert responses_i32 is not None
+    assert theta_f64 is not None
+    assert discrimination_f64 is not None
+    assert difficulty_f64 is not None
+    return responses_i32, theta_f64, discrimination_f64, difficulty_f64
+
+
+def _standardized_residuals_numpy(
+    responses: NDArray[np.int32],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute standardized residuals with one broadcasted probability pass."""
+    probabilities = np.asarray(
+        sigmoid(discrimination[None, :] * (theta[:, None] - difficulty[None, :])),
+        dtype=np.float64,
+    )
+    np.clip(
+        probabilities,
+        PROB_EPSILON,
+        1.0 - PROB_EPSILON,
+        out=probabilities,
+    )
+    variance = probabilities * (1.0 - probabilities)
+    residuals = (responses - probabilities) / np.sqrt(variance + PROB_EPSILON)
+    residuals[responses < 0] = np.nan
+    return residuals
+
+
+def _q3_from_residuals_numpy(
+    responses: NDArray[np.int32],
+    residuals: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute pairwise-complete residual correlations in bounded chunks."""
+    n_persons, n_items = responses.shape
+    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
+    pair_sums = np.zeros((n_items, n_items), dtype=np.float64)
+    pair_square_sums = np.zeros((n_items, n_items), dtype=np.float64)
+    pair_cross_products = np.zeros((n_items, n_items), dtype=np.float64)
+    chunk_size = _entry_chunk_size(n_persons, n_items)
+
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        valid = (responses[start:stop] >= 0) & np.isfinite(residuals[start:stop])
+        valid_float = valid.astype(np.float64)
+        values = np.where(valid, residuals[start:stop], 0.0)
+        pair_counts += valid_float.T @ valid_float
+        pair_sums += values.T @ valid_float
+        pair_square_sums += (values * values).T @ valid_float
+        pair_cross_products += values.T @ values
+
+    safe_counts = np.where(pair_counts > 0.0, pair_counts, 1.0)
+    covariance = pair_cross_products - pair_sums * pair_sums.T / safe_counts
+    variance_rows = pair_square_sums - pair_sums * pair_sums / safe_counts
+    variance_columns = pair_square_sums.T - pair_sums.T * pair_sums.T / safe_counts
+    np.maximum(variance_rows, 0.0, out=variance_rows)
+    np.maximum(variance_columns, 0.0, out=variance_columns)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        correlations = covariance / np.sqrt(variance_rows * variance_columns)
+
+    q3_matrix = np.zeros((n_items, n_items), dtype=np.float64)
+    rows, columns = np.triu_indices(n_items, k=1)
+    eligible = pair_counts[rows, columns] > 2.0
+    rows = rows[eligible]
+    columns = columns[eligible]
+    values = correlations[rows, columns]
+    q3_matrix[rows, columns] = values
+    q3_matrix[columns, rows] = values
+    return q3_matrix
+
+
+def _ld_chi2_numpy(
+    responses: NDArray[np.int32],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute all binary LD chi-square tables with matrix products."""
+    n_persons, n_items = responses.shape
+    observed_tables = np.zeros((4, n_items, n_items), dtype=np.float64)
+    expected_tables = np.zeros((4, n_items, n_items), dtype=np.float64)
+    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
+    chunk_size = _entry_chunk_size(n_persons, n_items)
+
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        response_chunk = responses[start:stop]
+        valid = response_chunk >= 0
+        valid_float = valid.astype(np.float64)
+        observed_positive = ((response_chunk > 0) & valid).astype(np.float64)
+        observed_zero = valid_float - observed_positive
+        probabilities = np.asarray(
+            sigmoid(
+                discrimination[None, :]
+                * (theta[start:stop, None] - difficulty[None, :])
+            ),
+            dtype=np.float64,
+        )
+        expected_positive = np.where(valid, probabilities, 0.0)
+        expected_zero = valid_float - expected_positive
+
+        pair_counts += valid_float.T @ valid_float
+        tables = (
+            (observed_zero, observed_zero, expected_zero, expected_zero),
+            (
+                observed_zero,
+                observed_positive,
+                expected_zero,
+                expected_positive,
+            ),
+            (
+                observed_positive,
+                observed_zero,
+                expected_positive,
+                expected_zero,
+            ),
+            (
+                observed_positive,
+                observed_positive,
+                expected_positive,
+                expected_positive,
+            ),
+        )
+        for index, (
+            observed_left,
+            observed_right,
+            expected_left,
+            expected_right,
+        ) in enumerate(tables):
+            observed_tables[index] += observed_left.T @ observed_right
+            expected_tables[index] += expected_left.T @ expected_right
+
+    np.maximum(expected_tables, 0.5, out=expected_tables)
+    chi2_values = np.sum(
+        (observed_tables - expected_tables) ** 2 / expected_tables,
+        axis=0,
+    )
+    chi2_matrix = np.full((n_items, n_items), np.nan)
+    rows, columns = np.triu_indices(n_items, k=1)
+    eligible = pair_counts[rows, columns] >= 10.0
+    rows = rows[eligible]
+    columns = columns[eligible]
+    values = chi2_values[rows, columns]
+    chi2_matrix[rows, columns] = values
+    chi2_matrix[columns, rows] = values
+    return chi2_matrix
 
 
 def _prepare_item_information_inputs(
@@ -295,32 +494,25 @@ def compute_standardized_residuals(
     NDArray
         Standardized residuals (n_persons, n_items)
     """
+    responses, theta, discrimination, difficulty = _prepare_binary_diagnostic_inputs(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
+    )
     if rust_enabled():
-        theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_standardized_residuals(
-            _ensure_i32(responses),
-            theta_f64.ravel()
-            if theta_f64 is not None
-            else theta.astype(np.float64).ravel(),
-            _ensure_f64(discrimination),
-            _ensure_f64(difficulty),
+            responses,
+            theta,
+            discrimination,
+            difficulty,
         )
-
-    n_persons, n_items = responses.shape
-    residuals = np.full((n_persons, n_items), np.nan)
-
-    for j in range(n_items):
-        z = discrimination[j] * (theta - difficulty[j])
-        p = sigmoid(z)
-        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-        variance = p * (1 - p)
-
-        valid = responses[:, j] >= 0
-        residuals[valid, j] = (responses[valid, j] - p[valid]) / np.sqrt(
-            variance[valid] + PROB_EPSILON
-        )
-
-    return residuals
+    return _standardized_residuals_numpy(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
+    )
 
 
 def compute_q3_matrix(
@@ -347,37 +539,26 @@ def compute_q3_matrix(
     NDArray
         Q3 correlation matrix (n_items, n_items)
     """
-    if rust_enabled():
-        theta_f64 = _ensure_f64(theta)
-        return mirt_rs.compute_q3_matrix(
-            _ensure_i32(responses),
-            theta_f64.ravel()
-            if theta_f64 is not None
-            else theta.astype(np.float64).ravel(),
-            _ensure_f64(discrimination),
-            _ensure_f64(difficulty),
-        )
-
-    residuals = compute_standardized_residuals(
-        responses, theta, discrimination, difficulty
+    responses, theta, discrimination, difficulty = _prepare_binary_diagnostic_inputs(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
     )
-
-    n_items = responses.shape[1]
-    q3_matrix = np.zeros((n_items, n_items))
-
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
-            valid &= ~np.isnan(residuals[:, i]) & ~np.isnan(residuals[:, j])
-
-            if valid.sum() > 2:
-                r_i = residuals[valid, i]
-                r_j = residuals[valid, j]
-                q3 = np.corrcoef(r_i, r_j)[0, 1]
-                q3_matrix[i, j] = q3
-                q3_matrix[j, i] = q3
-
-    return q3_matrix
+    if rust_enabled():
+        return mirt_rs.compute_q3_matrix(
+            responses,
+            theta,
+            discrimination,
+            difficulty,
+        )
+    residuals = _standardized_residuals_numpy(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
+    )
+    return _q3_from_residuals_numpy(responses, residuals)
 
 
 def compute_ld_chi2_matrix(
@@ -404,59 +585,20 @@ def compute_ld_chi2_matrix(
     NDArray
         LD chi-square matrix (n_items, n_items)
     """
+    responses, theta, discrimination, difficulty = _prepare_binary_diagnostic_inputs(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
+    )
     if rust_enabled():
-        theta_f64 = _ensure_f64(theta)
         return mirt_rs.compute_ld_chi2_matrix(
-            _ensure_i32(responses),
-            theta_f64.ravel()
-            if theta_f64 is not None
-            else theta.astype(np.float64).ravel(),
-            _ensure_f64(discrimination),
-            _ensure_f64(difficulty),
+            responses,
+            theta,
+            discrimination,
+            difficulty,
         )
-
-    n_persons, n_items = responses.shape
-    chi2_matrix = np.full((n_items, n_items), np.nan)
-
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            valid = (responses[:, i] >= 0) & (responses[:, j] >= 0)
-            n_valid = valid.sum()
-
-            if n_valid < 10:
-                continue
-
-            resp_i = responses[valid, i]
-            resp_j = responses[valid, j]
-            theta_valid = theta[valid]
-
-            z_i = discrimination[i] * (theta_valid - difficulty[i])
-            z_j = discrimination[j] * (theta_valid - difficulty[j])
-            prob_i = sigmoid(z_i)
-            prob_j = sigmoid(z_j)
-
-            resp_i_bin = (resp_i > 0).astype(int)
-            resp_j_bin = (resp_j > 0).astype(int)
-
-            obs_00 = np.sum((resp_i_bin == 0) & (resp_j_bin == 0))
-            obs_01 = np.sum((resp_i_bin == 0) & (resp_j_bin == 1))
-            obs_10 = np.sum((resp_i_bin == 1) & (resp_j_bin == 0))
-            obs_11 = np.sum((resp_i_bin == 1) & (resp_j_bin == 1))
-
-            exp_00 = np.sum((1 - prob_i) * (1 - prob_j))
-            exp_01 = np.sum((1 - prob_i) * prob_j)
-            exp_10 = np.sum(prob_i * (1 - prob_j))
-            exp_11 = np.sum(prob_i * prob_j)
-
-            observed = np.array([obs_00, obs_01, obs_10, obs_11])
-            expected = np.array([exp_00, exp_01, exp_10, exp_11])
-            expected = np.maximum(expected, 0.5)
-
-            chi2 = np.sum((observed - expected) ** 2 / expected)
-            chi2_matrix[i, j] = chi2
-            chi2_matrix[j, i] = chi2
-
-    return chi2_matrix
+    return _ld_chi2_numpy(responses, theta, discrimination, difficulty)
 
 
 def compute_item_se_parallel(
@@ -618,29 +760,39 @@ def compute_fit_statistics(
     tuple
         (item_outfit, item_infit, person_outfit, person_infit)
     """
+    responses, theta, discrimination, difficulty = _prepare_binary_diagnostic_inputs(
+        responses,
+        theta,
+        discrimination,
+        difficulty,
+    )
     if rust_enabled():
         return mirt_rs.compute_fit_statistics(
-            responses.astype(np.int32),
-            theta.astype(np.float64).ravel(),
-            discrimination.astype(np.float64),
-            difficulty.astype(np.float64),
+            responses,
+            theta,
+            discrimination,
+            difficulty,
         )
 
-    n_persons, n_items = responses.shape
-
-    z_sq = np.full((n_persons, n_items), np.nan)
-    variance = np.full((n_persons, n_items), np.nan)
-
-    for j in range(n_items):
-        z = discrimination[j] * (theta - difficulty[j])
-        p = sigmoid(z)
-        p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
-        var = p * (1 - p)
-
-        valid = responses[:, j] >= 0
-        raw_resid = responses[valid, j] - p[valid]
-        z_sq[valid, j] = (raw_resid**2) / (var[valid] + PROB_EPSILON)
-        variance[valid, j] = var[valid]
+    probabilities = np.asarray(
+        sigmoid(discrimination[None, :] * (theta[:, None] - difficulty[None, :])),
+        dtype=np.float64,
+    )
+    np.clip(
+        probabilities,
+        PROB_EPSILON,
+        1.0 - PROB_EPSILON,
+        out=probabilities,
+    )
+    valid = responses >= 0
+    variance_values = probabilities * (1.0 - probabilities)
+    raw_residuals = responses - probabilities
+    z_sq = np.where(
+        valid,
+        raw_residuals**2 / (variance_values + PROB_EPSILON),
+        np.nan,
+    )
+    variance = np.where(valid, variance_values, np.nan)
 
     item_outfit = np.nanmean(z_sq, axis=0)
     item_infit = np.nansum(z_sq * variance, axis=0) / np.nansum(variance, axis=0)
