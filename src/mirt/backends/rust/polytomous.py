@@ -10,6 +10,9 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
+    _ensure_f64,
+    _ensure_i32,
+    _entry_chunk_size,
     mirt_rs,
     rust_enabled,
 )
@@ -47,42 +50,54 @@ def compute_log_likelihoods_grm(
     """
     if rust_enabled():
         return mirt_rs.compute_log_likelihoods_grm(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            discrimination.astype(np.float64),
-            thresholds.astype(np.float64),
-            n_categories.astype(np.int32),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(discrimination),
+            _ensure_f64(thresholds),
+            _ensure_i32(n_categories),
         )
 
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
-    eps = PROB_EPSILON
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    thresholds = np.asarray(thresholds, dtype=np.float64)
+    n_categories = np.asarray(n_categories)
 
-    for q in range(n_quad):
-        theta = quad_points[q]
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                resp = responses[i, j]
-                if resp < 0:
-                    continue
-                n_cat = n_categories[j]
-                if resp == 0:
-                    z = discrimination[j] * (theta - thresholds[j, 0])
-                    p_above = sigmoid(z)
-                    prob = max(1.0 - p_above, eps)
-                elif resp == n_cat - 1:
-                    z = discrimination[j] * (theta - thresholds[j, resp - 1])
-                    prob = max(sigmoid(z), eps)
-                else:
-                    z_upper = discrimination[j] * (theta - thresholds[j, resp - 1])
-                    z_lower = discrimination[j] * (theta - thresholds[j, resp])
-                    p_upper = sigmoid(z_upper)
-                    p_lower = sigmoid(z_lower)
-                    prob = max(p_upper - p_lower, eps)
-                ll += np.log(prob)
-            log_likes[i, q] = ll
+    n_persons, n_items = responses.shape
+    n_quad = quad_points.shape[0]
+    max_categories = int(np.max(n_categories, initial=1))
+    chunk_size = _entry_chunk_size(
+        n_quad,
+        n_persons + max_categories,
+    )
+    log_likes = np.zeros((n_persons, n_quad), dtype=np.float64)
+
+    for start in range(0, n_quad, chunk_size):
+        stop = min(start + chunk_size, n_quad)
+        theta_chunk = quad_points[start:stop]
+
+        for item_idx in range(n_items):
+            item_responses = responses[:, item_idx]
+            observed = item_responses >= 0
+            if not np.any(observed):
+                continue
+
+            n_cat = int(n_categories[item_idx])
+            cumulative = sigmoid(
+                discrimination[item_idx]
+                * (theta_chunk[:, None] - thresholds[item_idx, : n_cat - 1][None, :])
+            )
+            probabilities = np.empty((stop - start, n_cat), dtype=np.float64)
+            probabilities[:, 0] = 1.0 - cumulative[:, 0]
+            probabilities[:, -1] = cumulative[:, -1]
+            if n_cat > 2:
+                probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
+            np.maximum(probabilities, PROB_EPSILON, out=probabilities)
+            log_probabilities = np.log(probabilities)
+
+            log_likes[observed, start:stop] += log_probabilities[
+                :, item_responses[observed]
+            ].T
 
     return log_likes
 
@@ -116,36 +131,56 @@ def compute_log_likelihoods_gpcm(
     """
     if rust_enabled():
         return mirt_rs.compute_log_likelihoods_gpcm(
-            responses.astype(np.int32),
-            quad_points.astype(np.float64),
-            discrimination.astype(np.float64),
-            steps.astype(np.float64),
-            n_categories.astype(np.int32),
+            _ensure_i32(responses),
+            _ensure_f64(quad_points),
+            _ensure_f64(discrimination),
+            _ensure_f64(steps),
+            _ensure_i32(n_categories),
         )
 
-    n_persons, n_items = responses.shape
-    n_quad = len(quad_points)
-    log_likes = np.zeros((n_persons, n_quad))
+    responses = np.asarray(responses)
+    quad_points = np.asarray(quad_points, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    steps = np.asarray(steps, dtype=np.float64)
+    n_categories = np.asarray(n_categories)
 
-    for q in range(n_quad):
-        theta = quad_points[q]
-        for i in range(n_persons):
-            ll = 0.0
-            for j in range(n_items):
-                resp = responses[i, j]
-                if resp < 0:
-                    continue
-                n_cat = n_categories[j]
-                a = discrimination[j]
-                numerators = np.zeros(n_cat)
-                for k in range(1, n_cat):
-                    numerators[k] = numerators[k - 1] + a * (theta - steps[j, k])
-                max_num = np.max(numerators)
-                sum_exp = np.sum(np.exp(numerators - max_num))
-                log_denom = max_num + np.log(sum_exp)
-                prob = np.exp(numerators[resp] - log_denom)
-                ll += np.log(max(prob, PROB_EPSILON))
-            log_likes[i, q] = ll
+    n_persons, n_items = responses.shape
+    n_quad = quad_points.shape[0]
+    max_categories = int(np.max(n_categories, initial=1))
+    chunk_size = _entry_chunk_size(
+        n_quad,
+        n_persons + max_categories,
+    )
+    log_likes = np.zeros((n_persons, n_quad), dtype=np.float64)
+    log_epsilon = np.log(PROB_EPSILON)
+
+    for start in range(0, n_quad, chunk_size):
+        stop = min(start + chunk_size, n_quad)
+        theta_chunk = quad_points[start:stop]
+
+        for item_idx in range(n_items):
+            item_responses = responses[:, item_idx]
+            observed = item_responses >= 0
+            if not np.any(observed):
+                continue
+
+            n_cat = int(n_categories[item_idx])
+            numerators = np.zeros((stop - start, n_cat), dtype=np.float64)
+            numerators[:, 1:] = np.cumsum(
+                discrimination[item_idx]
+                * (theta_chunk[:, None] - steps[item_idx, 1:n_cat][None, :]),
+                axis=1,
+            )
+            log_probabilities = numerators - np.logaddexp.reduce(
+                numerators,
+                axis=1,
+                keepdims=True,
+            )
+            np.maximum(log_probabilities, log_epsilon, out=log_probabilities)
+
+            log_likes[observed, start:stop] += log_probabilities[
+                :, item_responses[observed]
+            ].T
 
     return log_likes
 
