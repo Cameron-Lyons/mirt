@@ -81,8 +81,8 @@ class MixtureIRT(BaseItemModel):
 
     @property
     def class_proportions(self) -> NDArray[np.float64]:
-        """Class mixing proportions."""
-        return self._parameters["class_proportions"]
+        """Return an independent copy of the class mixing proportions."""
+        return self._parameters["class_proportions"].copy()
 
     @property
     def convergence_info(self) -> dict[str, object] | None:
@@ -228,22 +228,32 @@ class MixtureIRT(BaseItemModel):
             raise MirtValidationError("Stored class item parameters are invalid")
         return discrimination, difficulty, guessing
 
-    def get_class_parameters(self, class_idx: int) -> dict[str, NDArray[np.float64]]:
-        """Return item parameter arrays for one class."""
-        index = self._validate_class_index(class_idx)
+    def _class_parameter_arrays(
+        self, class_idx: int
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
         if self._base_model == "1PL":
             discrimination = np.ones(self.n_items, dtype=np.float64)
         else:
-            discrimination = self._parameters[f"discrimination_class{index}"]
-        difficulty = self._parameters[f"difficulty_class{index}"]
+            discrimination = self._parameters[f"discrimination_class{class_idx}"]
+        difficulty = self._parameters[f"difficulty_class{class_idx}"]
         if self._base_model == "3PL":
-            guessing = self._parameters[f"guessing_class{index}"]
+            guessing = self._parameters[f"guessing_class{class_idx}"]
         else:
             guessing = np.zeros(self.n_items, dtype=np.float64)
+        return discrimination, difficulty, guessing
+
+    def get_class_parameters(self, class_idx: int) -> dict[str, NDArray[np.float64]]:
+        """Return independent item parameter arrays for one class."""
+        index = self._validate_class_index(class_idx)
+        discrimination, difficulty, guessing = self._class_parameter_arrays(index)
         return {
-            "discrimination": discrimination,
-            "difficulty": difficulty,
-            "guessing": guessing,
+            "discrimination": discrimination.copy(),
+            "difficulty": difficulty.copy(),
+            "guessing": guessing.copy(),
         }
 
     def _class_curves(
@@ -286,32 +296,29 @@ class MixtureIRT(BaseItemModel):
         """Compute response probabilities conditional on one class."""
         index = self._validate_class_index(class_idx)
         theta_values = self._ensure_theta_2d(theta).ravel()
-        parameters = self.get_class_parameters(index)
+        discrimination, difficulty, guessing = self._class_parameter_arrays(index)
         if (
-            not np.all(np.isfinite(parameters["discrimination"]))
-            or np.any(parameters["discrimination"] <= 0.0)
-            or not np.all(np.isfinite(parameters["difficulty"]))
-            or not np.all(np.isfinite(parameters["guessing"]))
-            or np.any(parameters["guessing"] < 0.0)
-            or np.any(parameters["guessing"] >= 1.0)
+            not np.all(np.isfinite(discrimination))
+            or np.any(discrimination <= 0.0)
+            or not np.all(np.isfinite(difficulty))
+            or not np.all(np.isfinite(guessing))
+            or np.any(guessing < 0.0)
+            or np.any(guessing >= 1.0)
         ):
             raise MirtValidationError(
                 f"Stored item parameters for class {index} are invalid"
             )
         if item_idx is None:
-            discrimination = parameters["discrimination"]
-            difficulty = parameters["difficulty"]
-            guessing = parameters["guessing"]
             z = discrimination[None, :] * (theta_values[:, None] - difficulty[None, :])
             logistic = sigmoid(z)
             return guessing[None, :] + (1.0 - guessing[None, :]) * logistic
 
         item = self._validate_item_index(item_idx)
-        discrimination = parameters["discrimination"][item]
-        difficulty = parameters["difficulty"][item]
-        guessing = parameters["guessing"][item]
-        logistic = sigmoid(discrimination * (theta_values - difficulty))
-        return guessing + (1.0 - guessing) * logistic
+        item_discrimination = discrimination[item]
+        item_difficulty = difficulty[item]
+        item_guessing = guessing[item]
+        logistic = sigmoid(item_discrimination * (theta_values - item_difficulty))
+        return item_guessing + (1.0 - item_guessing) * logistic
 
     def probability(
         self,
