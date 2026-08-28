@@ -69,15 +69,113 @@ class MultigroupFitResult:
     @property
     def group_labels(self) -> list[str]:
         """Group labels."""
-        return self.model.group_labels
+        return self.model.group_labels.copy()
 
-    def coef(self, group: int | str | None = None) -> Any:
+    def _resolve_group(self, group: int | str) -> int:
+        """Resolve a group label or validate a numeric group index."""
+        if isinstance(group, str):
+            try:
+                return self.group_labels.index(group)
+            except ValueError as exc:
+                raise ValueError(f"Unknown group label: {group}") from exc
+        if isinstance(group, (bool, np.bool_)) or not isinstance(
+            group, (int, np.integer)
+        ):
+            raise TypeError("group must be an integer index or string label")
+        group_idx = int(group)
+        if group_idx < 0 or group_idx >= self.n_groups:
+            raise IndexError(
+                f"group index {group_idx} out of range [0, {self.n_groups})"
+            )
+        return group_idx
+
+    @staticmethod
+    def _item_parameter_components(
+        name: str,
+        values: NDArray[np.float64],
+        item_idx: int,
+        n_items: int,
+    ) -> list[tuple[str, float]]:
+        """Flatten one item's parameter block into stable table columns."""
+        array = np.asarray(values, dtype=np.float64)
+        item_values = (
+            array[item_idx] if array.ndim and array.shape[0] == n_items else array
+        )
+        item_values = np.asarray(item_values, dtype=np.float64)
+        if item_values.ndim == 0:
+            return [(name, float(item_values))]
+        return [
+            (
+                f"{name}_{'_'.join(str(index) for index in component)}",
+                float(item_values[component]),
+            )
+            for component in np.ndindex(item_values.shape)
+        ]
+
+    def _coefficient_rows(
+        self,
+        group_idx: int,
+        *,
+        include_standard_errors: bool,
+    ) -> list[dict[str, str | float]]:
+        """Build flattened item rows for one group."""
+        params = self.model.get_group_parameters(group_idx)
+        rows: list[dict[str, str | float]] = []
+        for item_idx in range(self.model.n_items):
+            row: dict[str, str | float] = {}
+            for param_name, values in params.items():
+                components = self._item_parameter_components(
+                    param_name,
+                    values,
+                    item_idx,
+                    self.model.n_items,
+                )
+                row.update(components)
+                if not include_standard_errors:
+                    continue
+
+                group_errors = self.standard_errors.get(param_name, {})
+                errors = group_errors.get(group_idx)
+                if errors is None:
+                    row.update({f"{column}_se": np.nan for column, _ in components})
+                    continue
+                errors_array = np.asarray(errors, dtype=np.float64)
+                if errors_array.shape != np.asarray(values).shape:
+                    raise ValueError(
+                        f"standard errors for {param_name} in group {group_idx} "
+                        "must match the parameter shape"
+                    )
+                error_components = self._item_parameter_components(
+                    param_name,
+                    errors_array,
+                    item_idx,
+                    self.model.n_items,
+                )
+                row.update(
+                    {
+                        f"{column}_se": error
+                        for (column, _), (_, error) in zip(
+                            components, error_components, strict=True
+                        )
+                    }
+                )
+            rows.append(row)
+        return rows
+
+    def coef(
+        self,
+        group: int | str | None = None,
+        *,
+        include_standard_errors: bool = False,
+    ) -> Any:
         """Extract coefficients for one or all groups.
 
         Parameters
         ----------
         group : int, str, or None
             Group index, label, or None for all groups.
+        include_standard_errors : bool
+            Add ``_se`` columns. Missing standard errors are represented by NaN.
 
         Returns
         -------
@@ -86,43 +184,30 @@ class MultigroupFitResult:
         """
         from mirt.utils.dataframe import create_dataframe
 
+        if not isinstance(include_standard_errors, (bool, np.bool_)):
+            raise TypeError("include_standard_errors must be a boolean")
+
         if group is None:
             rows = []
             for g in range(self.n_groups):
-                params = self.model.get_group_parameters(g)
-                for item_idx in range(self.model.n_items):
-                    row = {
+                group_rows = self._coefficient_rows(
+                    g,
+                    include_standard_errors=bool(include_standard_errors),
+                )
+                for item_idx, values in enumerate(group_rows):
+                    row: dict[str, str | float] = {
                         "group": self.group_labels[g],
                         "item": self.model.item_names[item_idx],
                     }
-                    for param_name, values in params.items():
-                        if values.ndim == 1:
-                            row[param_name] = values[item_idx]
-                        else:
-                            for j in range(values.shape[1]):
-                                row[f"{param_name}_{j}"] = values[item_idx, j]
+                    row.update(values)
                     rows.append(row)
             return create_dataframe(rows)
 
-        if isinstance(group, str):
-            try:
-                group_idx = self.group_labels.index(group)
-            except ValueError:
-                raise ValueError(f"Unknown group label: {group}")
-        else:
-            group_idx = group
-
-        params = self.model.get_group_parameters(group_idx)
-        rows = []
-        for item_idx in range(self.model.n_items):
-            row = {"item": self.model.item_names[item_idx]}
-            for param_name, values in params.items():
-                if values.ndim == 1:
-                    row[param_name] = values[item_idx]
-                else:
-                    for j in range(values.shape[1]):
-                        row[f"{param_name}_{j}"] = values[item_idx, j]
-            rows.append(row)
+        group_idx = self._resolve_group(group)
+        rows = self._coefficient_rows(
+            group_idx,
+            include_standard_errors=bool(include_standard_errors),
+        )
         return create_dataframe(rows, index=self.model.item_names, index_name="item")
 
     def latent_pars(self) -> Any:
@@ -156,7 +241,7 @@ class MultigroupFitResult:
             rows.append(row)
         return create_dataframe(rows)
 
-    def fit_statistics(self) -> dict[str, float]:
+    def fit_statistics(self) -> dict[str, float | int | bool]:
         """Return fit statistics as dictionary.
 
         Returns
