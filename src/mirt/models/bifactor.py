@@ -131,6 +131,42 @@ class BifactorModel(DichotomousItemModel):
         a_sq_total = a_g**2 + a_s**2
         return a_sq_total[None, :] * p * q
 
+    def item_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return item Fisher matrices across multidimensional theta points."""
+        if item_idx < 0 or item_idx >= self.n_items:
+            raise IndexError(f"item_idx {item_idx} out of range [0, {self.n_items})")
+
+        theta = self._ensure_theta_2d(theta)
+        probability = self.probability(theta, item_idx)
+        slope = self._item_slope(item_idx)
+        slope_outer = np.outer(slope, slope)
+        return (
+            probability[:, None, None]
+            * (1.0 - probability[:, None, None])
+            * (slope_outer[None, :, :])
+        )
+
+    def test_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return summed Fisher matrices across all items and theta points."""
+        theta = self._ensure_theta_2d(theta)
+        probability = self.probability(theta)
+        variance = probability * (1.0 - probability)
+        slopes = self.get_loading_matrix()
+        return np.einsum(
+            "ni,ij,ik->njk",
+            variance,
+            slopes,
+            slopes,
+            optimize=True,
+        )
+
     def omega_hierarchical(self) -> float:
         """Estimate general-factor reliability for the total score."""
         general_variance, specific_variance = self._score_variance_components()
@@ -211,13 +247,17 @@ class BifactorModel(DichotomousItemModel):
     ) -> dict[str, float | NDArray[np.float64]]:
         """Return item parameters plus its full multidimensional slope vector."""
         parameters = super().get_item_parameters(item_idx)
+        parameters["slopes"] = self._item_slope(item_idx)
+        return parameters
+
+    def _item_slope(self, item_idx: int) -> NDArray[np.float64]:
+        """Return one sparse multidimensional slope vector."""
         slopes = np.zeros(self.n_factors, dtype=np.float64)
         slopes[0] = self._parameters["general_loadings"][item_idx]
         slopes[1 + self._specific_factor_indices[item_idx]] = self._parameters[
             "specific_loadings"
         ][item_idx]
-        parameters["slopes"] = slopes
-        return parameters
+        return slopes
 
     def copy(self) -> "BifactorModel":
         """Return an independent copy that preserves the bifactor structure."""

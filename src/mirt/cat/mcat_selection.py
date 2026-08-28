@@ -123,8 +123,10 @@ def _compute_item_information_matrix(
 ) -> NDArray[np.float64]:
     """Compute the Fisher information matrix for a single item.
 
-    For multidimensional IRT with compensatory model:
-    I_j(theta) = p_j * q_j * a_j @ a_j.T
+    Prefer a model's native matrix implementation so noncompensatory response
+    functions use their true probability gradients. Models without that API
+    fall back to the compensatory approximation
+    ``I_j(theta) = p_j * q_j * a_j @ a_j.T``.
 
     Parameters
     ----------
@@ -140,15 +142,37 @@ def _compute_item_information_matrix(
     NDArray[np.float64]
         Information matrix of shape (n_factors, n_factors).
     """
+    theta = np.asarray(theta, dtype=np.float64)
+    expected_theta_shape = (model.n_factors,)
+    if theta.shape != expected_theta_shape or not np.all(np.isfinite(theta)):
+        raise ValueError(f"theta must contain {model.n_factors} finite factor values")
+    if item_idx < 0 or item_idx >= model.n_items:
+        raise IndexError(f"item_idx {item_idx} out of range [0, {model.n_items})")
+
     theta_2d = theta.reshape(1, -1)
-    n_factors = theta.shape[0]
+    n_factors = model.n_factors
+
+    native_information = getattr(model, "item_information_matrix", None)
+    if callable(native_information):
+        information = np.asarray(
+            native_information(theta_2d, item_idx),
+            dtype=np.float64,
+        )
+        if information.shape == (1, n_factors, n_factors):
+            information = information[0]
+        elif information.shape != (n_factors, n_factors):
+            raise ValueError(
+                "item_information_matrix must return shape "
+                f"({n_factors}, {n_factors}) or "
+                f"(1, {n_factors}, {n_factors}), got {information.shape}"
+            )
+        if not np.all(np.isfinite(information)):
+            raise ValueError("item_information_matrix must return finite values")
+        return information
 
     p = model.probability(theta_2d, item_idx=item_idx)
     p = np.asarray(p).ravel()
-    if len(p) == 1:
-        p_val = float(p[0])
-    else:
-        p_val = float(p[0])
+    p_val = float(p[0])
     p_val = np.clip(p_val, PROB_EPSILON, 1 - PROB_EPSILON)
     q = 1 - p_val
 
@@ -165,8 +189,7 @@ def _compute_item_information_matrix(
     if len(a) != n_factors:
         a = np.ones(n_factors)
 
-    info_matrix = p_val * q * np.outer(a, a)
-    return info_matrix
+    return p_val * q * np.outer(a, a)
 
 
 def _compute_posterior_covariance_update(
