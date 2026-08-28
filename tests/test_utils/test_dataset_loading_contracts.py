@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import numpy as np
 import pytest
 
@@ -61,3 +63,30 @@ def test_unknown_dataset_suggests_a_close_match() -> None:
 def test_non_string_dataset_name_has_clear_error() -> None:
     with pytest.raises(TypeError, match="name must be a string"):
         load_dataset(6)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_digest"),
+    [
+        (
+            "verbal_aggression",
+            "1eaa34548483ba5321093eb047643219a962f83d9276793bc193bdd4e1484a95",
+        ),
+        (
+            "Attitude",
+            "8549c0b7c51fb49c6460bf643c9933ee0a60b3598b7003ab8cebf7579de7da75",
+        ),
+        (
+            "Bock1997",
+            "ca83becdba38f232e9386debbb9bf59eb8da48830f19203abdd067ea15f0d01a",
+        ),
+        ("deAyala", "61114ced9031dbe6ab90bbc214358574aba2bc7c7b0a8db8ab99c6967b9fb5e6"),
+    ],
+)
+def test_vectorized_generators_preserve_dataset_values(
+    name: str,
+    expected_digest: str,
+) -> None:
+    responses = load_dataset(name, copy=False)["data"].astype("<i8", copy=False)
+
+    assert hashlib.sha256(responses.tobytes()).hexdigest() == expected_digest

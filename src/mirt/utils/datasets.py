@@ -11,6 +11,7 @@ from functools import cache
 from typing import Any
 
 import numpy as np
+from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
 
@@ -166,6 +167,17 @@ def describe_dataset(name: str) -> dict[str, Any]:
 def list_datasets() -> list[str]:
     """List available dataset names in stable display order."""
     return list(_DATASET_LOADERS.keys())
+
+
+def _inverse_cdf_sample(
+    probabilities: np.ndarray,
+    uniforms: np.ndarray,
+) -> NDArray[np.int_]:
+    """Draw categorical values from pre-generated uniforms in one batch."""
+    cumulative = np.cumsum(probabilities[..., :-1], axis=-1)
+    return np.sum(uniforms[..., None] >= cumulative, axis=-1).astype(
+        np.int_, copy=False
+    )
 
 
 def _load_lsat6() -> dict[str, Any]:
@@ -436,26 +448,14 @@ def _load_verbal_aggression() -> dict[str, Any]:
     threshold1 = rng.uniform(-1.5, 0.5, n_items)
     threshold2 = threshold1 + rng.uniform(0.5, 2.0, n_items)
 
-    data = np.zeros((n_persons, n_items), dtype=np.int_)
-    for j in range(n_items):
-        a = discrimination[j]
-        b1, b2 = threshold1[j], threshold2[j]
-
-        for i in range(n_persons):
-            t = theta[i]
-            p_star1 = 1 / (1 + np.exp(-a * (t - b1)))
-            p_star2 = 1 / (1 + np.exp(-a * (t - b2)))
-
-            p0 = 1 - p_star1
-            p1 = p_star1 - p_star2
-
-            u = rng.random()
-            if u < p0:
-                data[i, j] = 0
-            elif u < p0 + p1:
-                data[i, j] = 1
-            else:
-                data[i, j] = 2
+    logits = discrimination[None, :] * (theta[:, None] - threshold1[None, :])
+    upper_logits = discrimination[None, :] * (theta[:, None] - threshold2[None, :])
+    first_cumulative = 1.0 / (1.0 + np.exp(-logits))
+    second_cumulative = 1.0 / (1.0 + np.exp(-upper_logits))
+    uniforms = rng.random((n_items, n_persons)).T
+    data = (uniforms >= 1.0 - first_cumulative).astype(np.int_) + (
+        uniforms >= 1.0 - second_cumulative
+    ).astype(np.int_)
 
     behaviors = ["Curse", "Scold", "Shout", "Curse", "Scold", "Shout"] * 4
     situations = ["Bus", "Bus", "Bus", "Train", "Train", "Train"] * 4
@@ -626,30 +626,27 @@ def _load_attitude() -> dict[str, Any]:
     theta = rng.standard_normal(n_persons)
 
     discrimination = rng.uniform(0.8, 1.8, n_items)
-    thresholds = np.zeros((n_items, n_categories - 1))
-    for j in range(n_items):
-        base = rng.uniform(-2, 0)
-        for k in range(n_categories - 1):
-            thresholds[j, k] = base + k * rng.uniform(0.5, 1.5)
+    threshold_draws = rng.random((n_items, n_categories))
+    bases = -2.0 + 2.0 * threshold_draws[:, 0]
+    increments = 0.5 + threshold_draws[:, 1:]
+    thresholds = bases[:, None] + np.arange(n_categories - 1)[None, :] * increments
 
-    data = np.zeros((n_persons, n_items), dtype=np.int_)
-    for j in range(n_items):
-        a = discrimination[j]
-        for i in range(n_persons):
-            t = theta[i]
-            p_star = np.zeros(n_categories - 1)
-            for k in range(n_categories - 1):
-                p_star[k] = 1 / (1 + np.exp(-a * (t - thresholds[j, k])))
-
-            p = np.zeros(n_categories)
-            p[0] = 1 - p_star[0]
-            for k in range(1, n_categories - 1):
-                p[k] = p_star[k - 1] - p_star[k]
-            p[n_categories - 1] = p_star[n_categories - 2]
-
-            p = np.clip(p, PROB_EPSILON, 1)
-            p = p / p.sum()
-            data[i, j] = rng.choice(n_categories, p=p)
+    logits = discrimination[None, :, None] * (
+        theta[:, None, None] - thresholds[None, :, :]
+    )
+    cumulative = 1.0 / (1.0 + np.exp(-logits))
+    probabilities = np.concatenate(
+        (
+            1.0 - cumulative[..., :1],
+            cumulative[..., :-1] - cumulative[..., 1:],
+            cumulative[..., -1:],
+        ),
+        axis=-1,
+    )
+    probabilities = np.clip(probabilities, PROB_EPSILON, 1.0)
+    probabilities /= probabilities.sum(axis=-1, keepdims=True)
+    uniforms = rng.random((n_items, n_persons)).T
+    data = _inverse_cdf_sample(probabilities, uniforms)
 
     return {
         "data": data,
@@ -705,14 +702,11 @@ def _load_bock1997() -> dict[str, Any]:
         ]
     )
 
-    data = np.zeros((n_persons, n_items), dtype=np.int_)
-    for j in range(n_items):
-        z = a[j, :] * theta[:, None] + c[j, :]
-        exp_z = np.exp(z - z.max(axis=1, keepdims=True))
-        probs = exp_z / exp_z.sum(axis=1, keepdims=True)
-
-        for i in range(n_persons):
-            data[i, j] = rng.choice(n_categories, p=probs[i])
+    logits = theta[:, None, None] * a[None, :, :] + c[None, :, :]
+    exponentials = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    probabilities = exponentials / exponentials.sum(axis=-1, keepdims=True)
+    uniforms = rng.random((n_items, n_persons)).T
+    data = _inverse_cdf_sample(probabilities, uniforms)
 
     return {
         "data": data,
@@ -752,18 +746,14 @@ def _load_deayala() -> dict[str, Any]:
         steps = np.sort(rng.uniform(-2, 2, k - 1))
         step_params.append(steps)
 
-        a = discrimination[j]
-        for i in range(n_persons):
-            t = theta[i]
-
-            z = np.zeros(k)
-            z[0] = 0
-            for m in range(1, k):
-                z[m] = z[m - 1] + a * (t - steps[m - 1])
-
-            exp_z = np.exp(z - z.max())
-            probs = exp_z / exp_z.sum()
-            data[i, j] = rng.choice(k, p=probs)
+        increments = discrimination[j] * (theta[:, None] - steps[None, :])
+        logits = np.concatenate(
+            (np.zeros((n_persons, 1)), np.cumsum(increments, axis=1)),
+            axis=1,
+        )
+        exponentials = np.exp(logits - logits.max(axis=1, keepdims=True))
+        probabilities = exponentials / exponentials.sum(axis=1, keepdims=True)
+        data[:, j] = _inverse_cdf_sample(probabilities, rng.random(n_persons))
 
     return {
         "data": data,
