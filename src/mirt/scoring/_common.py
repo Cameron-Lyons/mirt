@@ -122,11 +122,16 @@ def validate_scoring_responses(
     if raw.dtype.kind not in "biuf":
         raise ValueError("responses must contain numeric values")
 
-    values = np.asarray(raw, dtype=np.float64)
-    if not np.all(np.isfinite(values)):
-        raise ValueError("responses must contain only finite values")
+    if raw.dtype.kind in "biu":
+        values = raw
+    else:
+        values = np.asarray(raw, dtype=np.float64)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("responses must contain only finite values")
     observed = values >= 0.0
-    if np.any(values[observed] != np.floor(values[observed])):
+    if values.dtype.kind == "f" and np.any(
+        values[observed] != np.floor(values[observed])
+    ):
         raise ValueError("observed responses must be integer-valued")
 
     if model.is_polytomous:
@@ -139,6 +144,8 @@ def validate_scoring_responses(
             "dichotomous responses must contain only 0, 1, or missing values"
         )
 
+    if values.dtype == np.dtype(np.int_) and np.all(observed | (values == -1)):
+        return values
     return np.where(observed, values, -1.0).astype(np.int_, copy=False)
 
 
