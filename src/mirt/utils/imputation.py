@@ -20,7 +20,10 @@ from mirt.utils.data import validate_responses
 
 LARGE_DF = 1e10
 _PAIRWISE_BLOCK_SIZE = np.iinfo(np.uint8).max
-_IMPUTATION_METHODS = ("mean", "mode", "random", "EM", "multiple")
+_MAX_VECTORIZED_CATEGORIES = 32
+_MAX_CATEGORY_FREQUENCY_ENTRIES = 5_000_000
+_IMPUTATION_METHODS = ("mean", "median", "mode", "random", "EM", "multiple")
+ImputationMethod = Literal["mean", "median", "mode", "random", "EM", "multiple"]
 
 
 def _prepare_response_matrix(
@@ -76,7 +79,7 @@ def _draw_categorical(
 
 def impute_responses(
     responses: NDArray[np.int_],
-    method: Literal["mean", "mode", "random", "EM", "multiple"] = "EM",
+    method: ImputationMethod = "EM",
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] | None = None,
     n_imputations: int = 5,
     missing_code: int = -1,
@@ -91,6 +94,7 @@ def impute_responses(
     method : str
         Imputation method:
         - 'mean': Replace with item mean (rounded)
+        - 'median': Replace with item median (rounded)
         - 'mode': Replace with item mode
         - 'random': Random draw from item distribution
         - 'EM': Model-based imputation using IRT
@@ -147,6 +151,9 @@ def impute_responses(
     if method == "mean":
         return _impute_mean(responses, missing_mask)
 
+    if method == "median":
+        return _impute_median(responses, missing_mask)
+
     if method == "mode":
         return _impute_mode(responses, missing_mask)
 
@@ -169,14 +176,93 @@ def _impute_mean(
 ) -> NDArray[np.int_]:
     """Impute with item means (rounded)."""
     imputed = responses.copy()
+    valid = ~missing_mask
+    counts = np.sum(valid, axis=0, dtype=np.intp)
+    sums = np.sum(
+        responses,
+        axis=0,
+        dtype=np.float64,
+        where=valid,
+        initial=0.0,
+    )
+    means = np.divide(
+        sums,
+        counts,
+        out=np.zeros_like(sums),
+        where=counts > 0,
+    )
+    _fill_missing_items(imputed, missing_mask, np.rint(means), counts > 0)
+
+    return imputed
+
+
+def _item_category_frequencies(
+    responses: NDArray[np.int_],
+    missing_mask: NDArray[np.bool_],
+) -> NDArray[np.intp] | None:
+    """Count item categories together when the bounded table stays compact."""
+    valid = ~missing_mask
+    maximum = int(np.max(responses, where=valid, initial=-1))
+    n_categories = maximum + 1
     n_items = responses.shape[1]
+    if (
+        n_categories < 1
+        or n_categories > _MAX_VECTORIZED_CATEGORIES
+        or n_categories * n_items > _MAX_CATEGORY_FREQUENCY_ENTRIES
+    ):
+        return None
 
-    for j in range(n_items):
-        valid = ~missing_mask[:, j]
-        if valid.any():
-            mean_val = np.round(np.mean(responses[valid, j])).astype(np.int_)
-            imputed[missing_mask[:, j], j] = mean_val
+    frequencies = np.empty((n_categories, n_items), dtype=np.intp)
+    for category in range(n_categories):
+        frequencies[category] = np.count_nonzero(
+            (responses == category) & valid,
+            axis=0,
+        )
+    return frequencies
 
+
+def _fill_missing_items(
+    imputed: NDArray[np.int_],
+    missing_mask: NDArray[np.bool_],
+    fill_values: NDArray[np.integer] | NDArray[np.floating],
+    has_observations: NDArray[np.bool_],
+) -> None:
+    """Broadcast item fill values only into eligible missing cells."""
+    values = np.asarray(fill_values, dtype=np.int_)
+    if np.all(has_observations):
+        np.copyto(imputed, values[None, :], where=missing_mask)
+    else:
+        np.copyto(
+            imputed,
+            values[None, :],
+            where=missing_mask & has_observations[None, :],
+        )
+
+
+def _impute_median(
+    responses: NDArray[np.int_],
+    missing_mask: NDArray[np.bool_],
+) -> NDArray[np.int_]:
+    """Impute with rounded item medians."""
+    imputed = responses.copy()
+    frequencies = _item_category_frequencies(responses, missing_mask)
+    if frequencies is None:
+        for item in range(responses.shape[1]):
+            observed = responses[~missing_mask[:, item], item]
+            if observed.size:
+                imputed[missing_mask[:, item], item] = np.rint(
+                    np.median(observed)
+                ).astype(np.int_)
+        return imputed
+
+    counts = np.sum(frequencies, axis=0, dtype=np.intp)
+    cumulative = np.cumsum(frequencies, axis=0, dtype=np.intp)
+    lower_ranks = (counts - 1) // 2
+    upper_ranks = counts // 2
+    lower = np.argmax(cumulative > lower_ranks[None, :], axis=0)
+    upper = np.argmax(cumulative > upper_ranks[None, :], axis=0)
+    medians = np.rint((lower.astype(np.float64) + upper) * 0.5)
+    _fill_missing_items(imputed, missing_mask, medians, counts > 0)
     return imputed
 
 
@@ -186,14 +272,18 @@ def _impute_mode(
 ) -> NDArray[np.int_]:
     """Impute with item modes."""
     imputed = responses.copy()
-    n_items = responses.shape[1]
+    frequencies = _item_category_frequencies(responses, missing_mask)
+    if frequencies is None:
+        for item in range(responses.shape[1]):
+            observed = responses[~missing_mask[:, item], item]
+            if observed.size:
+                values, counts = np.unique(observed, return_counts=True)
+                imputed[missing_mask[:, item], item] = values[np.argmax(counts)]
+        return imputed
 
-    for j in range(n_items):
-        valid = ~missing_mask[:, j]
-        if valid.any():
-            values, counts = np.unique(responses[valid, j], return_counts=True)
-            mode_val = values[np.argmax(counts)]
-            imputed[missing_mask[:, j], j] = mode_val
+    counts = np.sum(frequencies, axis=0, dtype=np.intp)
+    modes = np.argmax(frequencies, axis=0)
+    _fill_missing_items(imputed, missing_mask, modes, counts > 0)
 
     return imputed
 
