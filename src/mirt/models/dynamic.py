@@ -17,7 +17,7 @@ from mirt.backends.rust.dynamic import (
     bkt_viterbi,
 )
 from mirt.constants import PROB_EPSILON
-from mirt.utils.numeric import logsumexp
+from mirt.utils.numeric import logsumexp, standard_normal_quadrature
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 _GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
@@ -1563,15 +1563,48 @@ class StateSpaceIRT:
             raise ValueError("responses must contain only -1, 0, or 1")
         return response_values.astype(np.int32, copy=False)
 
+    @staticmethod
+    def _validated_positive_integer(value: int, name: str) -> int:
+        """Return a validated positive integer parameter."""
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+        return int(value)
+
+    def _base_observation_probability(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return logistic response probabilities before 3PL scaling."""
+        logits = self.discrimination[None, :] * (
+            theta[:, None] - self.difficulty[None, :]
+        )
+        return np.asarray(sigmoid(logits), dtype=np.float64)
+
+    def _observation_probability(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return item response probabilities for one state per row."""
+        base_probability = self._base_observation_probability(theta)
+        if self.base_model == "3PL":
+            probability = (
+                self.guessing[None, :]
+                + (1.0 - self.guessing[None, :]) * base_probability
+            )
+        else:
+            probability = base_probability
+        return np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON)
+
     def _observation_probability_and_derivative(
         self,
         theta: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return response probabilities and derivatives by person and item."""
-        logits = self.discrimination[None, :] * (
-            theta[:, None] - self.difficulty[None, :]
-        )
-        base_probability = np.asarray(sigmoid(logits), dtype=np.float64)
+        base_probability = self._base_observation_probability(theta)
         if self.base_model == "3PL":
             guessing_scale = 1.0 - self.guessing[None, :]
             probability = self.guessing[None, :] + guessing_scale * base_probability
@@ -1795,6 +1828,144 @@ class StateSpaceIRT:
             )
 
         return smoothed_means, smoothed_variances
+
+    def forecast(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Forecast latent-state moments after one response history.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_timepoints, n_items)``.
+            Use ``-1`` for missing item responses.
+        n_steps : int
+            Number of future occasions to forecast.
+
+        Returns
+        -------
+        tuple
+            Forecast means and variances, each with shape ``(n_steps,)``.
+        """
+        response_values = self._validated_filter_responses(responses, batch=False)
+        forecast_means, forecast_variances = self.forecast_batch(
+            response_values[None, :, :],
+            n_steps,
+        )
+        return forecast_means[0].copy(), forecast_variances[0].copy()
+
+    def forecast_batch(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Forecast latent-state moments for multiple response histories.
+
+        Forecasts begin one step after the last modeled response occasion.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+        n_steps : int
+            Number of future occasions to forecast.
+
+        Returns
+        -------
+        tuple
+            Forecast means and variances, each with shape
+            ``(n_persons, n_steps)``.
+        """
+        n_steps = self._validated_positive_integer(n_steps, "n_steps")
+        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+            responses
+        )
+        n_persons = filtered_means.shape[0]
+        forecast_means = np.empty((n_persons, n_steps), dtype=np.float64)
+        forecast_variances = np.empty_like(forecast_means)
+        transition = float(self.transition_matrix[0, 0])
+        transition_squared = transition**2
+        process_variance = float(self.process_noise[0, 0])
+        current_mean = filtered_means[:, -1]
+        current_variance = filtered_variances[:, -1]
+
+        for step_index in range(n_steps):
+            current_mean = transition * current_mean
+            current_variance = transition_squared * current_variance + process_variance
+            forecast_means[:, step_index] = current_mean
+            forecast_variances[:, step_index] = current_variance
+
+        return forecast_means, forecast_variances
+
+    def forecast_response_probabilities(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Forecast marginal item-success probabilities for one person."""
+        response_values = self._validated_filter_responses(responses, batch=False)
+        probabilities = self.forecast_response_probabilities_batch(
+            response_values[None, :, :],
+            n_steps,
+            n_quadpts=n_quadpts,
+        )
+        return probabilities[0].copy()
+
+    def forecast_response_probabilities_batch(
+        self,
+        responses: NDArray[np.int_],
+        n_steps: int,
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Forecast marginal item-success probabilities for multiple people.
+
+        Item probabilities are integrated over each Gaussian forecast-state
+        distribution with standard-normal Gauss--Hermite quadrature.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+        n_steps : int
+            Number of future occasions to forecast.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        NDArray
+            Marginal success probabilities with shape
+            ``(n_persons, n_steps, n_items)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        forecast_means, forecast_variances = self.forecast_batch(
+            responses,
+            n_steps,
+        )
+        nodes, weights = standard_normal_quadrature(n_quadpts)
+        flat_means = forecast_means.ravel()
+        flat_scales = np.sqrt(forecast_variances).ravel()
+        marginal = np.zeros((flat_means.size, self.n_items), dtype=np.float64)
+
+        for node, weight in zip(nodes, weights, strict=True):
+            states = flat_means + flat_scales * node
+            marginal += weight * self._observation_probability(states)
+
+        probabilities = marginal.reshape(
+            forecast_means.shape[0],
+            forecast_means.shape[1],
+            self.n_items,
+        )
+        return np.clip(probabilities, 0.0, 1.0)
 
     def simulate(
         self,

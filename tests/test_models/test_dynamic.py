@@ -380,6 +380,26 @@ class TestStateSpaceIRT:
 
         return smoothed_means, smoothed_variances
 
+    @staticmethod
+    def _reference_forecast(model, responses, n_steps):
+        filtered_means, filtered_variances = TestStateSpaceIRT._reference_filter(
+            model, responses
+        )
+        forecast_means = np.empty(n_steps)
+        forecast_variances = np.empty(n_steps)
+        current_mean = filtered_means[-1]
+        current_variance = filtered_variances[-1]
+        transition = model.transition_matrix[0, 0]
+        process_variance = model.process_noise[0, 0]
+
+        for step_index in range(n_steps):
+            current_mean = transition * current_mean
+            current_variance = transition**2 * current_variance + process_variance
+            forecast_means[step_index] = current_mean
+            forecast_variances[step_index] = current_variance
+
+        return forecast_means, forecast_variances
+
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         assert model.n_items == 5
@@ -584,6 +604,141 @@ class TestStateSpaceIRT:
         smoothed_rmse = np.sqrt(np.mean((smoothed_means - true_states) ** 2))
 
         assert smoothed_rmse < 0.9 * filtered_rmse
+
+    @pytest.mark.parametrize("transition", [0.9, -0.65])
+    def test_batch_forecast_matches_independent_scalar_reference(self, transition):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model="3PL",
+            transition_matrix=np.array([[transition]]),
+            process_noise=np.array([[0.07]]),
+            observation_noise=0.12,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6),
+            initial_mean=-0.2,
+            initial_var=0.8,
+        )
+        responses = np.random.default_rng(51).integers(0, 2, size=(9, 5, 6))
+        responses[np.random.default_rng(52).random(responses.shape) < 0.2] = -1
+        expected_means = np.empty((len(responses), 4))
+        expected_variances = np.empty_like(expected_means)
+        for person_index, person_responses in enumerate(responses):
+            expected_means[person_index], expected_variances[person_index] = (
+                self._reference_forecast(model, person_responses, 4)
+            )
+
+        means, variances = model.forecast_batch(responses, 4)
+
+        assert_allclose(means, expected_means, rtol=1e-12, atol=1e-12)
+        assert_allclose(variances, expected_variances, rtol=1e-12, atol=1e-12)
+        single_mean, single_variance = model.forecast(responses[0], 4)
+        assert_allclose(single_mean, means[0])
+        assert_allclose(single_variance, variances[0])
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    def test_response_forecast_integrates_symmetric_state_distribution(
+        self,
+        base_model,
+    ):
+        guessing = np.array([0.1, 0.2, 0.3])
+        model = StateSpaceIRT(
+            n_items=3,
+            n_timepoints=2,
+            base_model=base_model,
+            transition_matrix=np.zeros((1, 1)),
+            process_noise=np.array([[0.4]]),
+            discrimination=np.array([0.7, 1.2, 2.0]),
+            difficulty=np.zeros(3),
+            guessing=guessing if base_model == "3PL" else None,
+        )
+        responses = np.zeros((4, 2, 3), dtype=np.int32)
+        expected = (
+            guessing + (1.0 - guessing) * 0.5
+            if base_model == "3PL"
+            else np.full(3, 0.5)
+        )
+
+        probabilities = model.forecast_response_probabilities_batch(
+            responses,
+            3,
+            n_quadpts=31,
+        )
+
+        assert probabilities.shape == (4, 3, 3)
+        assert_allclose(
+            probabilities,
+            np.broadcast_to(expected, probabilities.shape),
+            atol=1e-14,
+        )
+        single = model.forecast_response_probabilities(
+            responses[0],
+            3,
+            n_quadpts=31,
+        )
+        assert_allclose(single, probabilities[0])
+
+    def test_response_forecast_matches_high_resolution_direct_quadrature(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=3,
+            base_model="3PL",
+            transition_matrix=np.array([[0.8]]),
+            process_noise=np.array([[0.15]]),
+            discrimination=np.array([0.6, 1.0, 1.5, 2.0]),
+            difficulty=np.array([-1.0, -0.2, 0.5, 1.3]),
+            guessing=np.array([0.1, 0.15, 0.2, 0.25]),
+        )
+        responses = np.random.default_rng(61).integers(0, 2, size=(2, 3, 4))
+        forecast_means, forecast_variances = model.forecast_batch(responses, 2)
+        nodes, weights = np.polynomial.hermite.hermgauss(101)
+        nodes = nodes * np.sqrt(2.0)
+        weights = weights / np.sqrt(np.pi)
+        expected = np.zeros((2, 2, 4))
+        for node, weight in zip(nodes, weights, strict=True):
+            states = forecast_means + np.sqrt(forecast_variances) * node
+            logits = model.discrimination[None, None, :] * (
+                states[:, :, None] - model.difficulty[None, None, :]
+            )
+            base_probability = 1.0 / (1.0 + np.exp(-logits))
+            expected += weight * (
+                model.guessing[None, None, :]
+                + (1.0 - model.guessing[None, None, :]) * base_probability
+            )
+
+        probabilities = model.forecast_response_probabilities_batch(
+            responses,
+            2,
+            n_quadpts=31,
+        )
+
+        assert_allclose(probabilities, expected, rtol=2e-11, atol=1e-11)
+        assert np.all((probabilities >= 0.0) & (probabilities <= 1.0))
+
+    @pytest.mark.parametrize("n_steps", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        "method_name",
+        ["forecast_batch", "forecast_response_probabilities_batch"],
+    )
+    def test_forecasts_require_positive_step_count(self, n_steps, method_name):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="n_steps"):
+            getattr(model, method_name)(responses, n_steps)
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    def test_response_forecast_requires_positive_quadrature_count(self, n_quadpts):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            model.forecast_response_probabilities_batch(
+                responses,
+                2,
+                n_quadpts=n_quadpts,
+            )
 
     def test_3pl_observation_derivative_matches_finite_difference(self):
         model = StateSpaceIRT(

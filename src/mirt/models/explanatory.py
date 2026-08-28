@@ -3,17 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Self
 
 import numpy as np
-from numpy.polynomial.hermite import hermgauss
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
-from mirt.utils.numeric import logsumexp_axis1
+from mirt.utils.numeric import logsumexp_axis1, standard_normal_quadrature
 
 
 def _positive_integer(value: int, name: str) -> int:
@@ -115,18 +113,6 @@ def _person_vector(
     if vector.shape == (1,) and n_persons != 1:
         return np.full(n_persons, vector[0], dtype=np.float64)
     return vector.copy()
-
-
-@lru_cache(maxsize=16)
-def _standard_normal_quadrature(
-    n_points: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    nodes, weights = hermgauss(n_points)
-    nodes = np.asarray(nodes * np.sqrt(2.0), dtype=np.float64)
-    weights = np.asarray(weights / np.sqrt(np.pi), dtype=np.float64)
-    nodes.setflags(write=False)
-    weights.setflags(write=False)
-    return nodes, weights
 
 
 @dataclass
@@ -853,7 +839,7 @@ class ExplanatoryIRT(DichotomousItemModel):
         n_quadpts = _positive_integer(n_quadpts, "n_quadpts")
         index = _item_index(item_idx, self.n_items)
         mean = self._latent_regression.predict_mean(covariates)
-        nodes, weights = _standard_normal_quadrature(n_quadpts)
+        nodes, weights = standard_normal_quadrature(n_quadpts)
         scale = np.sqrt(self._latent_regression.residual_variance)
         shape = (mean.size,) if index is not None else (mean.size, self.n_items)
         marginal = np.zeros(shape, dtype=np.float64)
@@ -900,7 +886,7 @@ class ExplanatoryIRT(DichotomousItemModel):
             )
         values = np.where(observed, response_values, 0.0)
         incorrect = observed.astype(np.float64) - values
-        nodes, weights = _standard_normal_quadrature(n_quadpts)
+        nodes, weights = standard_normal_quadrature(n_quadpts)
         scale = np.sqrt(self._latent_regression.residual_variance)
         log_integrand = np.empty((mean.size, n_quadpts), dtype=np.float64)
 

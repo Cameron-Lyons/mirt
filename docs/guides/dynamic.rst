@@ -100,17 +100,34 @@ model. The batch filter updates every learner in one vectorized call:
        state_model.extended_kalman_smoother_batch(responses)
    )
 
+   future_means, future_variances = state_model.forecast_batch(
+       responses,
+       n_steps=4,
+   )
+   future_success = state_model.forecast_response_probabilities_batch(
+       responses,
+       n_steps=4,
+   )
+   print(future_success.shape)  # (500, 4, 20)
+
 Filtering conditions each state on responses available through that occasion,
 which supports online tracking. Smoothing adds a vectorized
 Rauch--Tung--Striebel backward pass so every state uses the complete response
 history. Use ``extended_kalman_filter`` or ``extended_kalman_smoother`` for one
 response history.
 
-All four methods accept only ``1`` (correct), ``0`` (incorrect), and ``-1``
-(missing); a fully missing occasion propagates the predicted state without an
-observation update. ``observation_noise`` adds response-scale variance to the
-linearized filter, reducing the information assigned to each response. It does
-not change draws from ``simulate``.
+Forecasts start one step after the final response occasion and propagate both
+state means and process uncertainty. Item-success forecasts integrate the 2PL
+or 3PL response curve over each Gaussian forecast distribution rather than
+evaluating it only at the mean. The default 21-point quadrature can be adjusted
+with ``n_quadpts``. Use ``forecast`` and
+``forecast_response_probabilities`` for one response history.
+
+State estimation and forecasting accept only ``1`` (correct), ``0``
+(incorrect), and ``-1`` (missing); a fully missing occasion propagates the
+predicted state without an observation update. ``observation_noise`` adds
+response-scale variance to the linearized filter, reducing the information
+assigned to each response. It does not change draws from ``simulate``.
 
 Growth-mixture fitting
 ----------------------
