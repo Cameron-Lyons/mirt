@@ -36,6 +36,32 @@ class TestAttributeHierarchy:
         with pytest.raises(ValueError, match="attribute_names length"):
             AttributeHierarchy(adjacency=adjacency, attribute_names=["A"])
 
+    @pytest.mark.parametrize(
+        "adjacency",
+        [
+            np.array([0, 1]),
+            np.zeros((2, 3)),
+            np.array([[0.0, 0.5], [0.0, 0.0]]),
+            np.array([[1, 0], [0, 0]]),
+            np.array([[0, 1], [1, 0]]),
+        ],
+    )
+    def test_init_rejects_invalid_graphs(self, adjacency):
+        """Reject malformed, non-binary, reflexive, and cyclic graphs."""
+        with pytest.raises(ValueError):
+            AttributeHierarchy(adjacency=adjacency)
+
+    def test_init_owns_immutable_adjacency(self):
+        """Prevent caller mutation from invalidating the hierarchy."""
+        adjacency = np.array([[0, 1], [0, 0]])
+        hierarchy = AttributeHierarchy(adjacency=adjacency)
+
+        adjacency[0, 1] = 0
+
+        assert hierarchy.prerequisites(1) == [0]
+        with pytest.raises(ValueError, match="read-only"):
+            hierarchy.adjacency[0, 1] = 0
+
     def test_prerequisites(self):
         """Test direct prerequisites."""
         adjacency = np.array([[0, 1, 0], [0, 0, 1], [0, 0, 0]])
@@ -67,6 +93,17 @@ class TestAttributeHierarchy:
         assert not hierarchy.is_valid_pattern(np.array([0, 1, 0]))
         assert not hierarchy.is_valid_pattern(np.array([0, 0, 1]))
         assert not hierarchy.is_valid_pattern(np.array([1, 0, 1]))
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [np.array([1]), np.array([[1, 1]]), np.array([0, 2]), np.array([0, np.nan])],
+    )
+    def test_is_valid_pattern_rejects_invalid_inputs(self, pattern):
+        """Require one finite binary value per attribute."""
+        hierarchy = AttributeHierarchy(adjacency=np.array([[0, 1], [0, 0]]))
+
+        with pytest.raises(ValueError):
+            hierarchy.is_valid_pattern(pattern)
 
     def test_valid_patterns(self):
         """Test generating valid patterns."""
@@ -291,6 +328,30 @@ class TestHigherOrderCDM:
         with pytest.raises(ValueError, match="thresholds shape"):
             model.set_higher_order_params(np.array([1.0, 1.0]), np.array([0.0]))
 
+    def test_set_parameters_is_finite_atomic_and_owned(self):
+        """Validate both arrays before changing state and retain owned copies."""
+        q_matrix = np.array([[1, 0], [0, 1]])
+        model = HigherOrderCDM(n_items=2, n_attributes=2, q_matrix=q_matrix)
+        original_loadings = model.loadings
+        original_thresholds = model.thresholds
+
+        with pytest.raises(ValueError, match="thresholds must contain"):
+            model.set_parameters(
+                loadings=np.array([2.0, 3.0]),
+                thresholds=np.array([0.0, np.nan]),
+            )
+
+        np.testing.assert_array_equal(model.loadings, original_loadings)
+        np.testing.assert_array_equal(model.thresholds, original_thresholds)
+
+        loadings = np.array([1.2, 1.4])
+        thresholds = np.array([-0.2, 0.3])
+        model.set_higher_order_params(loadings, thresholds)
+        loadings[:] = 99.0
+        thresholds[:] = 99.0
+        np.testing.assert_array_equal(model.loadings, np.array([1.2, 1.4]))
+        np.testing.assert_array_equal(model.thresholds, np.array([-0.2, 0.3]))
+
     def test_attribute_probability(self):
         """Test attribute mastery probabilities."""
         q_matrix = np.array([[1, 0], [0, 1]])
@@ -305,6 +366,29 @@ class TestHigherOrderCDM:
         assert np.all(attr_prob <= 1)
 
         np.testing.assert_almost_equal(attr_prob[0, 0], 0.5)
+
+    def test_extreme_theta_is_stable(self):
+        """Keep mastery and hierarchy-conditioned pattern probabilities finite."""
+        hierarchy = AttributeHierarchy(adjacency=np.array([[0, 1], [0, 0]]))
+        q_matrix = np.array([[1, 0], [0, 1]])
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=q_matrix,
+            hierarchy=hierarchy,
+        )
+        model.set_higher_order_params(
+            np.ones(2),
+            np.array([1e308, -1e308]),
+        )
+
+        attribute_probability = model.attribute_probability(np.array([-1e308, 1e308]))
+        pattern_probability = model.pattern_probability(np.array([0.0]))
+
+        assert np.all(np.isfinite(attribute_probability))
+        assert np.all(np.isfinite(pattern_probability))
+        np.testing.assert_allclose(pattern_probability.sum(axis=1), 1.0)
+        np.testing.assert_allclose(pattern_probability[0], np.array([0.5, 0.0, 0.5]))
 
     def test_pattern_probability(self):
         """Test pattern probability computation."""
@@ -343,6 +427,30 @@ class TestHigherOrderCDM:
         assert np.all(probs >= 0)
         assert np.all(probs <= 1)
 
+    def test_probability_matches_pattern_marginalization(self):
+        """Match explicit pattern marginalization for all and single items."""
+        q_matrix = np.array([[1, 0], [0, 1], [1, 1]])
+        model = HigherOrderCDM(n_items=3, n_attributes=2, q_matrix=q_matrix)
+        theta = np.array([-1.2, 0.3, 1.7])
+        pattern_probability = model.pattern_probability(theta)
+        conditional = model._base_cdm.probability(model.valid_patterns)
+        expected = pattern_probability @ conditional
+
+        np.testing.assert_allclose(model.probability(theta), expected)
+        np.testing.assert_allclose(model.probability(theta, 1), expected[:, 1])
+
+    @pytest.mark.parametrize("item_idx", [-1, 2, True])
+    def test_probability_rejects_invalid_item_index(self, item_idx):
+        """Reject negative, out-of-range, and boolean item indices."""
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1]]),
+        )
+
+        with pytest.raises(IndexError, match="item_idx"):
+            model.probability(np.array([0.0]), item_idx=item_idx)
+
     def test_probability_monotonic(self):
         """Test probability is generally increasing in theta."""
         q_matrix = np.array([[1, 1]])
@@ -366,6 +474,40 @@ class TestHigherOrderCDM:
         assert ll.shape == (3,)
         assert np.all(ll <= 0)
 
+    @pytest.mark.parametrize(
+        ("responses", "theta"),
+        [
+            (np.array([1, 0]), np.array([0.0])),
+            (np.array([[1, 0, 1]]), np.array([0.0])),
+            (np.array([[1, 2]]), np.array([0.0])),
+            (np.array([[1, 0], [0, 1]]), np.array([0.0, 1.0, 2.0])),
+        ],
+    )
+    def test_log_likelihood_rejects_invalid_inputs(self, responses, theta):
+        """Validate response matrices, response codes, and paired row counts."""
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1]]),
+        )
+
+        with pytest.raises(ValueError):
+            model.log_likelihood(responses, theta)
+
+    def test_log_likelihood_supports_scalar_theta_and_missing_responses(self):
+        """Broadcast a scalar trait and ignore negative missing responses."""
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1]]),
+        )
+        responses = np.array([[1, -1], [0, -1]])
+
+        result = model.log_likelihood(responses, np.array(0.0))
+
+        assert result.shape == (2,)
+        assert np.all(np.isfinite(result))
+
     def test_estimate_theta_eap(self):
         """Test EAP theta estimation."""
         q_matrix = np.array([[1, 0], [0, 1], [1, 1]])
@@ -388,6 +530,54 @@ class TestHigherOrderCDM:
 
         assert theta_mle.shape == (2,)
         assert theta_mle[0] > theta_mle[1]
+
+    @pytest.mark.parametrize("method", ["MAP", "eap", ""])
+    def test_estimate_theta_rejects_unknown_method(self, method):
+        """Reject estimation method typos instead of silently using EAP."""
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1]]),
+        )
+
+        with pytest.raises(ValueError, match="method"):
+            model.estimate_theta(np.array([[1, 0]]), method=method)
+
+    @pytest.mark.parametrize("n_quad", [0, -1, 2.5, True])
+    def test_estimate_theta_rejects_invalid_quadrature_count(self, n_quad):
+        """Require a positive integer quadrature count."""
+        model = HigherOrderCDM(
+            n_items=2,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1]]),
+        )
+
+        with pytest.raises(ValueError, match="n_quad"):
+            model.estimate_theta(np.array([[1, 0]]), n_quad=n_quad)
+
+    def test_estimate_theta_matches_grid_reference(self):
+        """Match the direct per-grid likelihood calculation for EAP and MLE."""
+        model = HigherOrderCDM(
+            n_items=3,
+            n_attributes=2,
+            q_matrix=np.array([[1, 0], [0, 1], [1, 1]]),
+        )
+        responses = np.array([[1, 0, -1], [0, 1, 1], [1, 1, 0]])
+        quad_points = np.linspace(-4, 4, 15)
+        log_likes = np.column_stack(
+            [model.log_likelihood(responses, np.array(point)) for point in quad_points]
+        )
+        log_posterior = log_likes - 0.5 * quad_points**2
+        log_posterior -= np.logaddexp.reduce(log_posterior, axis=1, keepdims=True)
+        expected_eap = np.exp(log_posterior) @ quad_points
+        expected_mle = quad_points[np.argmax(log_likes, axis=1)]
+
+        np.testing.assert_allclose(
+            model.estimate_theta(responses, method="EAP", n_quad=15), expected_eap
+        )
+        np.testing.assert_array_equal(
+            model.estimate_theta(responses, method="MLE", n_quad=15), expected_mle
+        )
 
     def test_copy(self):
         """Test model copying."""
