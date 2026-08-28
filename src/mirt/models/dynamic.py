@@ -1404,6 +1404,29 @@ class BKTModel:
             return np.array([self.p_guess[skill_idx], 1.0 - self.p_slip[skill_idx]])
         return np.array([1.0 - self.p_guess[skill_idx], self.p_slip[skill_idx]])
 
+    def _emission_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return row-wise emission pairs for one shared skill."""
+        guess = self.p_guess[skill_idx]
+        slip = self.p_slip[skill_idx]
+        observed = responses >= 0
+        correct = responses == 1
+        emissions = np.ones((responses.size, 2), dtype=np.float64)
+        emissions[:, 0] = np.where(
+            observed,
+            np.where(correct, guess, 1.0 - guess),
+            1.0,
+        )
+        emissions[:, 1] = np.where(
+            observed,
+            np.where(correct, 1.0 - slip, slip),
+            1.0,
+        )
+        return emissions
+
     def _skill_trials(
         self, skill_assignments: NDArray[np.int_]
     ) -> list[NDArray[np.int_]]:
@@ -1531,6 +1554,56 @@ class BKTModel:
 
         return alpha, scaling
 
+    def _forward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        skill_trials: list[NDArray[np.int_]] | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Vectorize forward filtering across a validated shared layout."""
+        n_persons, n_trials = responses.shape
+        alpha = np.zeros((n_persons, n_trials, 2), dtype=np.float64)
+        scaling = np.zeros((n_persons, n_trials), dtype=np.float64)
+        if skill_trials is None:
+            skill_trials = self._skill_trials(skill_assignments)
+
+        for skill_idx, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+
+            first_trial = int(trial_indices[0])
+            emissions = self._emission_batch(
+                responses[:, first_trial],
+                skill_idx,
+            )
+            alpha[:, first_trial, 0] = (1.0 - self.p_init[skill_idx]) * emissions[:, 0]
+            alpha[:, first_trial, 1] = self.p_init[skill_idx] * emissions[:, 1]
+            scaling[:, first_trial] = np.sum(alpha[:, first_trial], axis=1)
+            np.divide(
+                alpha[:, first_trial],
+                scaling[:, first_trial, None],
+                out=alpha[:, first_trial],
+                where=scaling[:, first_trial, None] > 0.0,
+            )
+
+            transition = self.transition_matrix(skill_idx)
+            for previous_trial, trial in zip(
+                trial_indices[:-1],
+                trial_indices[1:],
+                strict=True,
+            ):
+                emissions = self._emission_batch(responses[:, trial], skill_idx)
+                alpha[:, trial] = (alpha[:, previous_trial] @ transition) * emissions
+                scaling[:, trial] = np.sum(alpha[:, trial], axis=1)
+                np.divide(
+                    alpha[:, trial],
+                    scaling[:, trial, None],
+                    out=alpha[:, trial],
+                    where=scaling[:, trial, None] > 0.0,
+                )
+
+        return alpha, scaling
+
     def backward(
         self,
         responses: NDArray[np.int_],
@@ -1612,6 +1685,69 @@ class BKTModel:
                     beta[trial] /= scaling[next_trial]
 
         return beta
+
+    def _backward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        scaling: NDArray[np.float64],
+        skill_trials: list[NDArray[np.int_]] | None = None,
+    ) -> NDArray[np.float64]:
+        """Vectorize backward smoothing across a validated shared layout."""
+        n_persons, n_trials = responses.shape
+        beta = np.zeros((n_persons, n_trials, 2), dtype=np.float64)
+        if skill_trials is None:
+            skill_trials = self._skill_trials(skill_assignments)
+
+        for skill_idx, trial_indices in enumerate(skill_trials):
+            if len(trial_indices) == 0:
+                continue
+            beta[:, trial_indices[-1]] = 1.0
+            transition = self.transition_matrix(skill_idx)
+
+            for trial, next_trial in zip(
+                trial_indices[-2::-1],
+                trial_indices[:0:-1],
+                strict=True,
+            ):
+                emissions = self._emission_batch(
+                    responses[:, next_trial],
+                    skill_idx,
+                )
+                beta[:, trial] = (emissions * beta[:, next_trial]) @ transition.T
+                valid_scaling = scaling[:, next_trial] > 0.0
+                beta[valid_scaling, trial] /= scaling[valid_scaling, next_trial, None]
+
+        return beta
+
+    def _forward_backward_batch_shared_python(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Run vectorized fallback smoothing for one shared skill layout."""
+        skill_trials = self._skill_trials(skill_assignments)
+        alpha, scaling = self._forward_batch_shared_python(
+            responses,
+            skill_assignments,
+            skill_trials,
+        )
+        beta = self._backward_batch_shared_python(
+            responses,
+            skill_assignments,
+            scaling,
+            skill_trials,
+        )
+        alpha *= beta
+        gamma_sum = np.sum(alpha, axis=2, keepdims=True)
+        np.divide(
+            alpha,
+            gamma_sum,
+            out=alpha,
+            where=gamma_sum > 0.0,
+        )
+        log_likelihoods = np.sum(np.log(scaling + 1e-300), axis=1)
+        return alpha, log_likelihoods
 
     def forward_backward(
         self,
@@ -1737,6 +1873,10 @@ class BKTModel:
             native = self._native_forward_backward_batch(responses, skill_assignments)
             if native is not None:
                 return native
+            return self._forward_backward_batch_shared_python(
+                responses,
+                skill_assignments,
+            )
 
         gamma = np.empty((*responses.shape, 2), dtype=np.float64)
         log_likelihoods = np.empty(responses.shape[0], dtype=np.float64)
