@@ -807,6 +807,69 @@ class TestGrowthMixtureModel:
         assert result["converged"] is True
 
     @pytest.mark.parametrize(
+        ("growth_type", "expected"),
+        [("linear", 8), ("piecewise", 8), ("quadratic", 11)],
+    )
+    def test_n_fitted_parameters(self, growth_type, expected):
+        model = GrowthMixtureModel(n_classes=3, growth_type=growth_type)
+
+        assert model.n_fitted_parameters == expected
+
+    def test_fit_returns_structured_diagnostics(self):
+        source = GrowthMixtureModel(
+            n_classes=2,
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.2, 0.4]),
+        )
+        time_values = np.arange(5.0)
+        observations, _ = source.simulate(40, time_values, seed=14)
+        model = GrowthMixtureModel(n_classes=2)
+
+        result = model.fit(observations, time_values, max_iter=5)
+
+        assert isinstance(result, GrowthMixtureResult)
+        assert result.model is model
+        assert result.classifications.shape == (40,)
+        assert result.posteriors.shape == (40, 2)
+        assert result.n_observations == 40
+        assert result.n_parameters == model.n_fitted_parameters == 5
+        assert result.aic == pytest.approx(
+            2 * result.n_parameters - 2 * result.log_likelihood
+        )
+        assert result.bic == pytest.approx(
+            np.log(result.n_observations) * result.n_parameters
+            - 2 * result.log_likelihood
+        )
+        assert result.entropy == pytest.approx(model.entropy(observations, time_values))
+        assert result.n_iterations <= 5
+
+    def test_fit_matches_fit_em_final_state(self):
+        time_values = np.arange(5.0)
+        observations = np.random.default_rng(22).normal(size=(25, 5))
+        mapping_model = GrowthMixtureModel(n_classes=2)
+        result_model = GrowthMixtureModel(n_classes=2)
+
+        mapping = mapping_model.fit_em(
+            observations,
+            time_values,
+            max_iter=4,
+        )
+        result = result_model.fit(
+            observations,
+            time_values,
+            max_iter=4,
+        )
+
+        assert np.array_equal(result.classifications, mapping["classifications"])
+        assert_allclose(result.posteriors, mapping["posteriors"])
+        assert result.log_likelihood == pytest.approx(mapping["log_likelihood"])
+        assert result.converged is mapping["converged"]
+        assert result.n_iterations == mapping["n_iterations"]
+        assert_allclose(result_model.class_proportions, mapping_model.class_proportions)
+        assert_allclose(result_model.class_intercepts, mapping_model.class_intercepts)
+        assert_allclose(result_model.class_slopes, mapping_model.class_slopes)
+
+    @pytest.mark.parametrize(
         ("observations", "time_values", "message"),
         [
             (np.empty((0, 3)), np.arange(3.0), "non-empty"),
@@ -916,3 +979,48 @@ class TestGrowthMixtureResult:
         assert "Class 0" in summary
         assert "Class 1" in summary
         assert "Entropy" in summary
+
+    def test_class_counts_and_shares(self):
+        model = GrowthMixtureModel(n_classes=3)
+        result = GrowthMixtureResult(
+            model=model,
+            classifications=np.array([0, 2, 1, 2, 2]),
+            posteriors=np.full((5, 3), 1 / 3),
+            log_likelihood=-20.0,
+            aic=50.0,
+            bic=55.0,
+            entropy=0.8,
+            converged=True,
+            n_iterations=7,
+        )
+
+        assert np.array_equal(result.class_counts, np.array([1, 1, 3]))
+        assert_allclose(result.class_shares, np.array([0.2, 0.2, 0.6]))
+        assert result.n_observations == 5
+        assert result.n_parameters == 8
+
+    def test_quadratic_summary_includes_curvature_and_iterations(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="quadratic",
+            class_quadratics=np.array([-0.2, 0.3]),
+        )
+        result = GrowthMixtureResult(
+            model=model,
+            classifications=np.array([0, 1, 1]),
+            posteriors=np.array([[0.8, 0.2], [0.1, 0.9], [0.2, 0.8]]),
+            log_likelihood=-10.0,
+            aic=34.0,
+            bic=31.0,
+            entropy=0.4,
+            converged=False,
+            n_iterations=12,
+        )
+
+        summary = result.summary()
+
+        assert "Observations:       3" in summary
+        assert "Fitted Parameters:  7" in summary
+        assert "Iterations:         12" in summary
+        assert "Quadratic=-0.200" in summary
+        assert "Quadratic=0.300" in summary
