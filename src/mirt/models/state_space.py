@@ -246,7 +246,7 @@ class StateSpaceIRT:
         name: str,
         *,
         default: float,
-        positive: bool = False,
+        constraint: Literal["finite", "nonnegative", "positive"] = "finite",
     ) -> NDArray[np.float64]:
         """Return finite state values broadcast across a batch."""
         raw_values = np.asarray(default if values is None else values)
@@ -255,8 +255,7 @@ class StateSpaceIRT:
             or np.issubdtype(raw_values.dtype, np.complexfloating)
             or not np.issubdtype(raw_values.dtype, np.number)
         ):
-            qualifier = "finite positive" if positive else "finite"
-            raise ValueError(f"{name} must contain {qualifier} values")
+            raise ValueError(f"{name} must contain {constraint} values")
         if raw_values.ndim == 0:
             state_values = np.full(
                 n_persons,
@@ -267,12 +266,37 @@ class StateSpaceIRT:
             state_values = raw_values.astype(np.float64, copy=True)
         else:
             raise ValueError(f"{name} must be scalar or have shape ({n_persons},)")
-        if not np.all(np.isfinite(state_values)) or (
-            positive and np.any(state_values <= 0.0)
-        ):
-            qualifier = "finite positive" if positive else "finite"
-            raise ValueError(f"{name} must contain {qualifier} values")
+        violates_constraint = (
+            constraint == "positive" and np.any(state_values <= 0.0)
+        ) or (constraint == "nonnegative" and np.any(state_values < 0.0))
+        if not np.all(np.isfinite(state_values)) or violates_constraint:
+            raise ValueError(f"{name} must contain {constraint} values")
         return state_values
+
+    def _validated_state_moments_batch(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: float | NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Validate a non-empty batch of Gaussian state moments."""
+        raw_means = np.asarray(state_means)
+        if raw_means.ndim != 1 or raw_means.size < 1:
+            raise ValueError("state_means must have shape (n_persons,)")
+        n_persons = raw_means.size
+        mean_values = self._validated_state_vector(
+            raw_means,
+            n_persons,
+            "state_means",
+            default=self.initial_mean,
+        )
+        variance_values = self._validated_state_vector(
+            state_variances,
+            n_persons,
+            "state_variances",
+            default=self.initial_var,
+            constraint="nonnegative",
+        )
+        return mean_values, variance_values
 
     @staticmethod
     def _validated_positive_integer(value: int, name: str) -> int:
@@ -435,7 +459,7 @@ class StateSpaceIRT:
             1,
             "prior_variance",
             default=self.initial_var,
-            positive=True,
+            constraint="positive",
         )
         updated_means, updated_variances = self._extended_kalman_update_batch(
             response_values[None, :],
@@ -486,7 +510,7 @@ class StateSpaceIRT:
             n_persons,
             "prior_variances",
             default=self.initial_var,
-            positive=True,
+            constraint="positive",
         )
         return self._extended_kalman_update_batch(
             response_values,
@@ -526,7 +550,7 @@ class StateSpaceIRT:
         state_mean : float
             Finite mean of the current state distribution.
         state_variance : float
-            Finite positive variance of the current state distribution.
+            Finite non-negative variance of the current state distribution.
         n_steps : int, default=1
             Number of state transitions to apply.
 
@@ -547,7 +571,7 @@ class StateSpaceIRT:
             1,
             "state_variance",
             default=self.initial_var,
-            positive=True,
+            constraint="nonnegative",
         )
         propagated_means, propagated_variances = self._propagate_state_moments(
             state_means,
@@ -569,7 +593,7 @@ class StateSpaceIRT:
         state_means : NDArray
             Finite current state means with shape ``(n_persons,)``.
         state_variances : float or NDArray
-            Finite positive current state variances, either scalar or shape
+            Finite non-negative current state variances, either scalar or shape
             ``(n_persons,)``.
         n_steps : int, default=1
             Number of state transitions to apply.
@@ -580,22 +604,9 @@ class StateSpaceIRT:
             Propagated means and variances, each with shape ``(n_persons,)``.
         """
         n_steps = self._validated_positive_integer(n_steps, "n_steps")
-        raw_means = np.asarray(state_means)
-        if raw_means.ndim != 1 or raw_means.size < 1:
-            raise ValueError("state_means must have shape (n_persons,)")
-        n_persons = raw_means.size
-        mean_values = self._validated_state_vector(
-            raw_means,
-            n_persons,
-            "state_means",
-            default=self.initial_mean,
-        )
-        variance_values = self._validated_state_vector(
+        mean_values, variance_values = self._validated_state_moments_batch(
+            state_means,
             state_variances,
-            n_persons,
-            "state_variances",
-            default=self.initial_var,
-            positive=True,
         )
         return self._propagate_state_moments(
             mean_values,
@@ -901,11 +912,223 @@ class StateSpaceIRT:
             marginal += weight * self._observation_probability(states)
 
         probabilities = marginal.reshape(
-            state_means.shape[0],
-            state_means.shape[1],
-            self.n_items,
+            state_means.shape + (self.n_items,),
         )
         return np.clip(probabilities, 0.0, 1.0)
+
+    def state_response_probabilities(
+        self,
+        state_mean: float,
+        state_variance: float,
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Return marginal item probabilities from one state distribution.
+
+        Parameters
+        ----------
+        state_mean : float
+            Finite mean of the Gaussian state distribution.
+        state_variance : float
+            Finite non-negative variance of the Gaussian state distribution.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        NDArray
+            Item-success probabilities with shape ``(n_items,)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        state_means = self._validated_state_vector(
+            state_mean,
+            1,
+            "state_mean",
+            default=self.initial_mean,
+        )
+        state_variances = self._validated_state_vector(
+            state_variance,
+            1,
+            "state_variance",
+            default=self.initial_var,
+            constraint="nonnegative",
+        )
+        probabilities = self._integrated_observation_probabilities(
+            state_means,
+            state_variances,
+            n_quadpts,
+        )
+        return probabilities[0].copy()
+
+    def state_response_probabilities_batch(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: float | NDArray[np.float64],
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Return marginal item probabilities from multiple state distributions.
+
+        Parameters
+        ----------
+        state_means : NDArray
+            Finite Gaussian state means with shape ``(n_persons,)``.
+        state_variances : float or NDArray
+            Finite non-negative state variances, either scalar or shape
+            ``(n_persons,)``.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        NDArray
+            Item-success probabilities with shape ``(n_persons, n_items)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        mean_values, variance_values = self._validated_state_moments_batch(
+            state_means,
+            state_variances,
+        )
+        return self._integrated_observation_probabilities(
+            mean_values,
+            variance_values,
+            n_quadpts,
+        )
+
+    def _integrated_response_log_likelihoods(
+        self,
+        responses: NDArray[np.int_],
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> NDArray[np.float64]:
+        """Integrate joint response-pattern likelihoods over Gaussian states."""
+        flat_responses = responses.reshape(-1, self.n_items)
+        observed = flat_responses >= 0
+        correct = flat_responses == 1
+        incorrect = flat_responses == 0
+        nodes, weights = standard_normal_quadrature(n_quadpts)
+        flat_means = state_means.ravel()
+        flat_scales = np.sqrt(state_variances).ravel()
+        scores = np.full(flat_means.size, -np.inf, dtype=np.float64)
+
+        for node, weight in zip(nodes, weights, strict=True):
+            states = flat_means + flat_scales * node
+            probabilities = self._observation_probability(states)
+            conditional_score = np.sum(
+                np.where(
+                    correct,
+                    np.log(probabilities),
+                    np.where(incorrect, np.log1p(-probabilities), 0.0),
+                ),
+                axis=1,
+            )
+            scores = np.logaddexp(
+                scores,
+                np.log(weight) + conditional_score,
+            )
+
+        scores[~np.any(observed, axis=1)] = 0.0
+        return scores.reshape(state_means.shape)
+
+    def state_response_log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        state_mean: float,
+        state_variance: float,
+        *,
+        n_quadpts: int = 21,
+    ) -> float:
+        """Score one response pattern against a Gaussian state distribution.
+
+        The joint likelihood integrates over the shared latent state. Missing
+        items are omitted, and a fully missing pattern returns zero.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response vector with shape ``(n_items,)``. Use ``-1`` for
+            missing item responses.
+        state_mean : float
+            Finite mean of the Gaussian state distribution.
+        state_variance : float
+            Finite non-negative variance of the Gaussian state distribution.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        float
+            Joint response-pattern log likelihood.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_update_responses(responses, batch=False)
+        state_means = self._validated_state_vector(
+            state_mean,
+            1,
+            "state_mean",
+            default=self.initial_mean,
+        )
+        state_variances = self._validated_state_vector(
+            state_variance,
+            1,
+            "state_variance",
+            default=self.initial_var,
+            constraint="nonnegative",
+        )
+        scores = self._integrated_response_log_likelihoods(
+            response_values[None, :],
+            state_means,
+            state_variances,
+            n_quadpts,
+        )
+        return float(scores[0])
+
+    def state_response_log_likelihood_batch(
+        self,
+        responses: NDArray[np.int_],
+        state_means: NDArray[np.float64],
+        state_variances: float | NDArray[np.float64],
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Score response patterns against multiple state distributions.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_items)``. Use
+            ``-1`` for missing item responses.
+        state_means : NDArray
+            Finite Gaussian state means with shape ``(n_persons,)``.
+        state_variances : float or NDArray
+            Finite non-negative state variances, either scalar or shape
+            ``(n_persons,)``.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        NDArray
+            Joint response-pattern log likelihoods with shape
+            ``(n_persons,)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_update_responses(responses, batch=True)
+        mean_values, variance_values = self._validated_state_moments_batch(
+            state_means,
+            state_variances,
+        )
+        if len(response_values) != len(mean_values):
+            raise ValueError(
+                "responses and state moments must contain the same number of people"
+            )
+        return self._integrated_response_log_likelihoods(
+            response_values,
+            mean_values,
+            variance_values,
+            n_quadpts,
+        )
 
     def _predicted_state_moments_batch(
         self,
@@ -1111,34 +1334,12 @@ class StateSpaceIRT:
         predicted_means, predicted_variances = self._predicted_state_moments_batch(
             response_values
         )
-
-        observed = response_values >= 0
-        correct = response_values == 1
-        incorrect = response_values == 0
-        nodes, weights = standard_normal_quadrature(n_quadpts)
-        flat_means = predicted_means.ravel()
-        flat_scales = np.sqrt(predicted_variances).ravel()
-        pointwise_scores = np.full(predicted_means.shape, -np.inf, dtype=np.float64)
-
-        for node, weight in zip(nodes, weights, strict=True):
-            states = flat_means + flat_scales * node
-            probabilities = self._observation_probability(states).reshape(
-                response_values.shape
-            )
-            conditional_score = np.sum(
-                np.where(
-                    correct,
-                    np.log(probabilities),
-                    np.where(incorrect, np.log1p(-probabilities), 0.0),
-                ),
-                axis=2,
-            )
-            pointwise_scores = np.logaddexp(
-                pointwise_scores,
-                np.log(weight) + conditional_score,
-            )
-
-        pointwise_scores[~np.any(observed, axis=2)] = 0.0
+        pointwise_scores = self._integrated_response_log_likelihoods(
+            response_values,
+            predicted_means,
+            predicted_variances,
+            n_quadpts,
+        )
         if pointwise:
             return pointwise_scores
         return np.sum(pointwise_scores, axis=1)

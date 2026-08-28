@@ -140,6 +140,15 @@ refiltering the complete history:
    online_means = []
 
    for response_vector in responses[0]:
+       predicted_success = state_model.state_response_probabilities(
+           prior_mean,
+           prior_variance,
+       )
+       response_log_score = state_model.state_response_log_likelihood(
+           response_vector,
+           prior_mean,
+           prior_variance,
+       )
        updated_mean, updated_variance = state_model.extended_kalman_update(
            response_vector,
            prior_mean=prior_mean,
@@ -155,6 +164,11 @@ refiltering the complete history:
 many learners, accepting either shared scalar priors or one prior per learner.
 ``propagate_state_batch`` advances their state distributions by one or more
 occasions. Fully missing response rows leave the supplied priors unchanged.
+``state_response_probabilities_batch`` and
+``state_response_log_likelihood_batch`` vectorize the corresponding prediction
+and scoring steps. Probabilities integrate state uncertainty item by item; the
+log score integrates the complete observed response pattern over its shared
+state. A fully missing pattern has a zero log score.
 
 Forecasts start one step after the final response occasion and propagate both
 state means and process uncertainty. Item-success forecasts integrate the 2PL

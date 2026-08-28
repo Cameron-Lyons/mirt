@@ -206,74 +206,107 @@ class TestStateSpaceIRT:
         return predicted_means, predicted_variances
 
     @staticmethod
+    def _reference_state_probabilities(
+        model,
+        state_mean,
+        state_variance,
+        n_quadpts=101,
+    ):
+        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+        nodes = nodes * np.sqrt(2.0)
+        weights = weights / np.sqrt(np.pi)
+        states = state_mean + np.sqrt(state_variance) * nodes
+        logits = model.discrimination[None, :] * (
+            states[:, None] - model.difficulty[None, :]
+        )
+        base_probability = 1.0 / (1.0 + np.exp(-logits))
+        conditional = (
+            model.guessing[None, :] + (1.0 - model.guessing[None, :]) * base_probability
+            if model.base_model == "3PL"
+            else base_probability
+        )
+        return weights @ conditional
+
+    @staticmethod
+    def _reference_state_log_score(
+        model,
+        responses,
+        state_mean,
+        state_variance,
+        n_quadpts=101,
+    ):
+        observed = responses >= 0
+        if not np.any(observed):
+            return 0.0
+        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+        nodes = nodes * np.sqrt(2.0)
+        weights = weights / np.sqrt(np.pi)
+        states = state_mean + np.sqrt(state_variance) * nodes
+        logits = model.discrimination[None, :] * (
+            states[:, None] - model.difficulty[None, :]
+        )
+        base_probability = 1.0 / (1.0 + np.exp(-logits))
+        probability = (
+            model.guessing[None, :] + (1.0 - model.guessing[None, :]) * base_probability
+            if model.base_model == "3PL"
+            else base_probability
+        )
+        probability = np.clip(probability, 1e-10, 1.0 - 1e-10)
+        conditional_scores = np.sum(
+            np.where(
+                responses[observed][None, :] == 1,
+                np.log(probability[:, observed]),
+                np.log1p(-probability[:, observed]),
+            ),
+            axis=1,
+        )
+        log_integrand = np.log(weights) + conditional_scores
+        maximum = np.max(log_integrand)
+        return maximum + np.log(np.sum(np.exp(log_integrand - maximum)))
+
+    @staticmethod
     def _reference_predictive_probabilities(model, responses, n_quadpts=101):
         predicted_means, predicted_variances = (
             TestStateSpaceIRT._reference_predicted_state_moments(model, responses)
         )
-        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
-        nodes = nodes * np.sqrt(2.0)
-        weights = weights / np.sqrt(np.pi)
-        probabilities = np.zeros((model.n_timepoints, model.n_items))
-
-        for node, weight in zip(nodes, weights, strict=True):
-            states = predicted_means + np.sqrt(predicted_variances) * node
-            logits = model.discrimination[None, :] * (
-                states[:, None] - model.difficulty[None, :]
-            )
-            base_probability = 1.0 / (1.0 + np.exp(-logits))
-            conditional = (
-                model.guessing[None, :]
-                + (1.0 - model.guessing[None, :]) * base_probability
-                if model.base_model == "3PL"
-                else base_probability
-            )
-            probabilities += weight * conditional
-
-        return probabilities
+        return np.vstack(
+            [
+                TestStateSpaceIRT._reference_state_probabilities(
+                    model,
+                    predicted_mean,
+                    predicted_variance,
+                    n_quadpts,
+                )
+                for predicted_mean, predicted_variance in zip(
+                    predicted_means,
+                    predicted_variances,
+                    strict=True,
+                )
+            ]
+        )
 
     @staticmethod
     def _reference_predictive_log_scores(model, responses, n_quadpts=101):
         predicted_means, predicted_variances = (
             TestStateSpaceIRT._reference_predicted_state_moments(model, responses)
         )
-        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
-        nodes = nodes * np.sqrt(2.0)
-        weights = weights / np.sqrt(np.pi)
-        scores = np.zeros(model.n_timepoints)
-
-        for time_index in range(model.n_timepoints):
-            observed = responses[time_index] >= 0
-            if not np.any(observed):
-                continue
-            log_integrand = np.empty(n_quadpts)
-            for point_index, (node, weight) in enumerate(
-                zip(nodes, weights, strict=True)
-            ):
-                theta = (
-                    predicted_means[time_index]
-                    + np.sqrt(predicted_variances[time_index]) * node
+        return np.array(
+            [
+                TestStateSpaceIRT._reference_state_log_score(
+                    model,
+                    time_responses,
+                    predicted_mean,
+                    predicted_variance,
+                    n_quadpts,
                 )
-                logits = model.discrimination * (theta - model.difficulty)
-                base_probability = 1.0 / (1.0 + np.exp(-logits))
-                probability = (
-                    model.guessing + (1.0 - model.guessing) * base_probability
-                    if model.base_model == "3PL"
-                    else base_probability
+                for time_responses, predicted_mean, predicted_variance in zip(
+                    responses,
+                    predicted_means,
+                    predicted_variances,
+                    strict=True,
                 )
-                probability = np.clip(probability, 1e-10, 1.0 - 1e-10)
-                log_integrand[point_index] = np.log(weight) + np.sum(
-                    np.where(
-                        responses[time_index, observed] == 1,
-                        np.log(probability[observed]),
-                        np.log1p(-probability[observed]),
-                    )
-                )
-            maximum = np.max(log_integrand)
-            scores[time_index] = maximum + np.log(
-                np.sum(np.exp(log_integrand - maximum))
-            )
-
-        return scores
+            ]
+        )
 
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
@@ -579,7 +612,7 @@ class TestStateSpaceIRT:
         ("method_name", "args", "kwargs", "message"),
         [
             ("propagate_state", (np.nan, 1.0), {}, "state_mean"),
-            ("propagate_state", (0.0, 0.0), {}, "state_variance"),
+            ("propagate_state", (0.0, -0.1), {}, "state_variance"),
             ("propagate_state", (0.0, 1.0), {"n_steps": 0}, "n_steps"),
             (
                 "propagate_state_batch",
@@ -603,7 +636,7 @@ class TestStateSpaceIRT:
                 "propagate_state_batch",
                 (np.zeros(3), np.array([1.0, -0.1, 1.0])),
                 {},
-                "positive",
+                "nonnegative",
             ),
         ],
     )
@@ -618,6 +651,190 @@ class TestStateSpaceIRT:
 
         with pytest.raises(ValueError, match=message):
             getattr(model, method_name)(*args, **kwargs)
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    def test_state_response_predictions_match_high_resolution_reference(
+        self,
+        base_model,
+    ):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=4,
+            base_model=base_model,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+        )
+        responses = np.array(
+            [
+                [1, 0, 1, -1, 0, 1],
+                [0, 1, -1, 1, 1, 0],
+                [-1, -1, -1, -1, -1, -1],
+            ],
+            dtype=np.int32,
+        )
+        state_means = np.array([-1.2, 0.4, 1.5])
+        state_variances = np.array([0.0, 0.75, 1.3])
+        expected_probabilities = np.vstack(
+            [
+                self._reference_state_probabilities(model, mean, variance)
+                for mean, variance in zip(
+                    state_means,
+                    state_variances,
+                    strict=True,
+                )
+            ]
+        )
+        expected_scores = np.array(
+            [
+                self._reference_state_log_score(
+                    model,
+                    person_responses,
+                    mean,
+                    variance,
+                )
+                for person_responses, mean, variance in zip(
+                    responses,
+                    state_means,
+                    state_variances,
+                    strict=True,
+                )
+            ]
+        )
+
+        probabilities = model.state_response_probabilities_batch(
+            state_means,
+            state_variances,
+            n_quadpts=41,
+        )
+        scores = model.state_response_log_likelihood_batch(
+            responses,
+            state_means,
+            state_variances,
+            n_quadpts=41,
+        )
+
+        assert_allclose(probabilities, expected_probabilities, rtol=5e-9, atol=1e-9)
+        assert_allclose(scores, expected_scores, rtol=5e-9, atol=2e-8)
+        assert scores[2] == 0.0
+        assert np.all((probabilities >= 0.0) & (probabilities <= 1.0))
+        for person_index in range(len(state_means)):
+            scalar_probabilities = model.state_response_probabilities(
+                state_means[person_index],
+                state_variances[person_index],
+                n_quadpts=41,
+            )
+            scalar_score = model.state_response_log_likelihood(
+                responses[person_index],
+                state_means[person_index],
+                state_variances[person_index],
+                n_quadpts=41,
+            )
+            assert_allclose(scalar_probabilities, probabilities[person_index])
+            assert scalar_score == pytest.approx(scores[person_index])
+
+    def test_streaming_predictions_and_scores_match_history_methods(self):
+        model = StateSpaceIRT(
+            n_items=8,
+            n_timepoints=6,
+            base_model="3PL",
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.07]]),
+            observation_noise=0.1,
+            discrimination=np.linspace(0.7, 1.8, 8),
+            difficulty=np.linspace(-1.3, 1.4, 8),
+            guessing=np.linspace(0.08, 0.24, 8),
+            initial_mean=-0.1,
+            initial_var=0.9,
+        )
+        responses = np.random.default_rng(87).integers(0, 2, size=(13, 6, 8))
+        responses[np.random.default_rng(88).random(responses.shape) < 0.2] = -1
+        history_probabilities = model.predictive_response_probabilities_batch(
+            responses,
+            n_quadpts=31,
+        )
+        history_scores = model.predictive_log_likelihood_batch(
+            responses,
+            n_quadpts=31,
+            pointwise=True,
+        )
+        prior_means = np.full(len(responses), model.initial_mean)
+        prior_variances = np.full(len(responses), model.initial_var)
+
+        for time_index in range(model.n_timepoints):
+            probabilities = model.state_response_probabilities_batch(
+                prior_means,
+                prior_variances,
+                n_quadpts=31,
+            )
+            scores = model.state_response_log_likelihood_batch(
+                responses[:, time_index],
+                prior_means,
+                prior_variances,
+                n_quadpts=31,
+            )
+            assert_allclose(probabilities, history_probabilities[:, time_index])
+            assert_allclose(scores, history_scores[:, time_index])
+
+            updated_means, updated_variances = model.extended_kalman_update_batch(
+                responses[:, time_index],
+                prior_means=prior_means,
+                prior_variances=prior_variances,
+            )
+            if time_index < model.n_timepoints - 1:
+                prior_means, prior_variances = model.propagate_state_batch(
+                    updated_means,
+                    updated_variances,
+                )
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        "method_name",
+        [
+            "state_response_probabilities_batch",
+            "state_response_log_likelihood_batch",
+        ],
+    )
+    def test_state_response_predictions_require_positive_quadrature_count(
+        self,
+        n_quadpts,
+        method_name,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        state_means = np.zeros(2)
+        state_variances = np.ones(2)
+        args = (
+            (np.zeros((2, 3), dtype=np.int32), state_means, state_variances)
+            if method_name.endswith("log_likelihood_batch")
+            else (state_means, state_variances)
+        )
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            getattr(model, method_name)(*args, n_quadpts=n_quadpts)
+
+    def test_state_response_log_scores_require_matching_batch_sizes(self):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((3, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="same number"):
+            model.state_response_log_likelihood_batch(
+                responses,
+                np.zeros(2),
+                np.ones(2),
+            )
+
+    def test_deterministic_state_propagation_preserves_zero_variance(self):
+        model = StateSpaceIRT(
+            n_items=3,
+            n_timepoints=2,
+            transition_matrix=np.array([[0.5]]),
+            process_noise=np.zeros((1, 1)),
+        )
+
+        mean, variance = model.propagate_state(2.0, 0.0, n_steps=3)
+
+        assert mean == pytest.approx(0.25)
+        assert variance == 0.0
 
     @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
     @pytest.mark.parametrize("transition", [0.85, -0.65])
