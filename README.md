@@ -444,6 +444,7 @@ plot_person_item_map(result.model, scores.theta)
 | `bootstrap_ci()` | Bootstrap confidence intervals |
 | `generate_plausible_values()` | Plausible values |
 | `plausible_value_statistics()` | Mean, variance, SD, or percentiles for one or all latent factors |
+| `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |

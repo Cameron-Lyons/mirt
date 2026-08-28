@@ -405,6 +405,26 @@ class TestCombinePlausibleValues:
 class TestPlausibleValueRegression:
     """Tests for regression using plausible values."""
 
+    @staticmethod
+    def _regression_data():
+        rng = np.random.default_rng(20260828)
+        n_people = 80
+        latent = rng.normal(size=(n_people, 2))
+        pvs = latent[:, :, None] + rng.normal(
+            scale=0.2,
+            size=(n_people, 2, 4),
+        )
+        covariate = rng.normal(size=n_people)
+        outcome = (
+            0.7
+            + 1.2 * latent[:, 0]
+            - 0.8 * latent[:, 1]
+            + 0.4 * covariate
+            + rng.normal(scale=0.3, size=n_people)
+        )
+        weights = rng.uniform(0.25, 3.0, size=n_people)
+        return pvs, outcome, covariate, weights
+
     def test_pv_regression(self, fitted_2pl_model, dichotomous_responses):
         """Test regression with PVs as predictor."""
         responses = dichotomous_responses["responses"]
@@ -444,6 +464,168 @@ class TestPlausibleValueRegression:
         reg_result = plausible_value_regression(pvs, y)
 
         assert reg_result["coefficients"][1] > 0
+
+    def test_weighted_regression_matches_drawwise_reference(self):
+        """Weighted coefficients and uncertainty follow Rubin's rules."""
+        pvs, outcome, covariate, weights = self._regression_data()
+        sqrt_weights = np.sqrt(weights)
+        residual_df = len(outcome) - 4
+        coefficients = []
+        variances = []
+        identity = np.eye(4)
+        for draw in range(pvs.shape[2]):
+            design = np.column_stack(
+                [np.ones(len(outcome)), pvs[:, :, draw], covariate]
+            )
+            weighted_design = design * sqrt_weights[:, None]
+            coefficient = np.linalg.lstsq(
+                weighted_design,
+                outcome * sqrt_weights,
+                rcond=None,
+            )[0]
+            residual = outcome - design @ coefficient
+            mse = np.dot(weights, residual**2) / residual_df
+            inverse_gram = np.linalg.solve(
+                weighted_design.T @ weighted_design,
+                identity,
+            )
+            coefficients.append(coefficient)
+            variances.append(mse * np.diag(inverse_gram))
+
+        coefficients = np.asarray(coefficients)
+        variances = np.asarray(variances)
+        expected_coefficients = np.mean(coefficients, axis=0)
+        expected_within = np.mean(variances, axis=0)
+        expected_between = np.var(coefficients, axis=0, ddof=1)
+        expected_se = np.sqrt(expected_within + 1.25 * expected_between)
+
+        result = plausible_value_regression(
+            pvs,
+            outcome,
+            X=covariate,
+            weights=weights,
+        )
+
+        np.testing.assert_allclose(result["coefficients"], expected_coefficients)
+        np.testing.assert_allclose(result["se"], expected_se)
+        assert np.isfinite(result["pvalues"]).all()
+        assert np.isfinite(result["df"]).all()
+        assert result["n_observations"] == len(outcome)
+        assert result["n_plausible"] == pvs.shape[2]
+
+    def test_weight_scale_does_not_change_regression(self):
+        """Case-weight normalization has no effect on estimates or inference."""
+        pvs, outcome, covariate, weights = self._regression_data()
+
+        result = plausible_value_regression(pvs, outcome, covariate, weights)
+        scaled = plausible_value_regression(
+            pvs,
+            outcome,
+            covariate,
+            weights * 1000.0,
+        )
+
+        for key in ("coefficients", "se", "pvalues", "df"):
+            np.testing.assert_allclose(result[key], scaled[key], rtol=1e-11)
+
+    def test_single_plausible_value_matches_ordinary_least_squares(self):
+        """One plausible value retains standard regression inference."""
+        pvs, outcome, covariate, _ = self._regression_data()
+        single = pvs[:, :, :1]
+        design = np.column_stack([np.ones(len(outcome)), single[:, :, 0], covariate])
+        coefficient = np.linalg.lstsq(design, outcome, rcond=None)[0]
+        residual_df = len(outcome) - design.shape[1]
+        residual = outcome - design @ coefficient
+        mse = (residual @ residual) / residual_df
+        expected_se = np.sqrt(
+            mse * np.diag(np.linalg.solve(design.T @ design, np.eye(4)))
+        )
+
+        result = plausible_value_regression(single, outcome, X=covariate)
+
+        np.testing.assert_allclose(result["coefficients"], coefficient)
+        np.testing.assert_allclose(result["se"], expected_se)
+        np.testing.assert_array_equal(result["df"], np.full(4, residual_df))
+        assert np.isfinite(result["pvalues"]).all()
+
+    def test_one_dimensional_covariates_match_column_matrix(self):
+        """A single covariate accepts either common array shape."""
+        pvs, outcome, covariate, _ = self._regression_data()
+
+        one_dimensional = plausible_value_regression(pvs, outcome, covariate)
+        column_matrix = plausible_value_regression(pvs, outcome, covariate[:, None])
+
+        for key in ("coefficients", "se", "pvalues", "df"):
+            np.testing.assert_allclose(one_dimensional[key], column_matrix[key])
+
+    @pytest.mark.parametrize(
+        ("pvs", "message"),
+        [
+            (np.ones((4, 2)), "shape"),
+            (np.empty((0, 1, 2)), "positive"),
+            (np.full((4, 1, 2), np.nan), "finite"),
+            (np.full((4, 1, 2), "invalid"), "numeric"),
+        ],
+    )
+    def test_validates_plausible_values(self, pvs, message):
+        """Malformed plausible-value arrays fail before regression."""
+        with pytest.raises(ValueError, match=message):
+            plausible_value_regression(pvs, np.ones(4))
+
+    @pytest.mark.parametrize(
+        ("argument", "value", "message"),
+        [
+            ("y", np.ones((8, 1)), "one outcome"),
+            ("y", np.ones(7), "one outcome"),
+            ("y", np.full(8, np.nan), "finite"),
+            ("y", np.full(8, "invalid"), "numeric"),
+            ("X", np.ones((8, 1, 1)), "one row"),
+            ("X", np.ones((7, 1)), "one row"),
+            ("X", np.full((8, 1), np.nan), "finite"),
+            ("X", np.full((8, 1), "invalid"), "numeric"),
+            ("weights", np.ones((8, 1)), "one value"),
+            ("weights", np.ones(7), "one value"),
+            ("weights", np.zeros(8), "positive finite"),
+            ("weights", np.full(8, np.inf), "positive finite"),
+            ("weights", np.full(8, "invalid"), "numeric"),
+        ],
+    )
+    def test_validates_regression_inputs(self, argument, value, message):
+        """Outcomes, covariates, and weights have explicit contracts."""
+        rng = np.random.default_rng(7)
+        kwargs = {"y": rng.normal(size=8), argument: value}
+
+        with pytest.raises(ValueError, match=message):
+            plausible_value_regression(rng.normal(size=(8, 1, 2)), **kwargs)
+
+    def test_requires_residual_degrees_of_freedom(self):
+        """Regression requires more rows than fitted coefficients."""
+        pvs = np.arange(4, dtype=float).reshape(2, 1, 2)
+
+        with pytest.raises(ValueError, match="more people"):
+            plausible_value_regression(pvs, np.ones(2))
+
+    def test_rejects_rank_deficient_design(self):
+        """Collinear predictors produce a useful error instead of NaNs."""
+        rng = np.random.default_rng(11)
+        pvs = rng.normal(size=(12, 1, 2))
+
+        with pytest.raises(ValueError, match="rank deficient"):
+            plausible_value_regression(pvs, rng.normal(size=12), X=np.ones(12))
+
+    def test_reports_linear_algebra_failure(self, monkeypatch):
+        """Numerical failures identify the affected plausible value."""
+
+        def fail_lstsq(*args, **kwargs):
+            raise np.linalg.LinAlgError("did not converge")
+
+        monkeypatch.setattr(np.linalg, "lstsq", fail_lstsq)
+
+        with pytest.raises(ValueError, match="plausible value 0"):
+            plausible_value_regression(
+                np.arange(16, dtype=float).reshape(8, 1, 2),
+                np.arange(8, dtype=float),
+            )
 
 
 class TestPlausibleValueStatistics:
