@@ -11,7 +11,11 @@ from mirt.estimation.standard_errors import (
     compute_observed_information,
     compute_sandwich_se,
 )
-from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
+from mirt.models.dichotomous import (
+    OneParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
+)
 
 
 def _balanced_problem(
@@ -114,6 +118,27 @@ def test_parallel_item_curvature_preserves_model_state() -> None:
 
     for name, values in original.items():
         np.testing.assert_array_equal(parallel[name], serial[name])
+        np.testing.assert_array_equal(model.parameters[name], values)
+
+
+@pytest.mark.parametrize("method", ["central", "forward", "richardson"])
+def test_numerical_curvature_respects_guessing_lower_bound(method: str) -> None:
+    model = ThreeParameterLogistic(n_items=1).set_parameters(guessing=np.array([0.0]))
+    responses = np.array([[0], [1]] * 20, dtype=np.int_)
+    quadrature = GaussHermiteQuadrature(n_points=15)
+    posterior = _posterior_from_model(model, responses, quadrature)
+    original = model.parameters
+
+    result = compute_se(
+        model,
+        responses,
+        quadrature,
+        posterior,
+        method=method,
+    )
+
+    assert np.isfinite(result["guessing"][0])
+    for name, values in original.items():
         np.testing.assert_array_equal(model.parameters[name], values)
 
 

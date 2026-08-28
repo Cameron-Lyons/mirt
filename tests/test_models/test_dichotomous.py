@@ -3,11 +3,16 @@
 import numpy as np
 import pytest
 
+from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import (
+    ComplementaryLogLog,
+    FiveParameterLogistic,
     FourParameterLogistic,
+    NegativeLogLog,
     OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
+    UnipolarLogLogistic,
 )
 
 
@@ -193,3 +198,148 @@ class TestFourParameterLogistic:
         for i in range(3):
             assert np.all(probs[:, i] >= model.guessing[i] - 1e-6)
             assert np.all(probs[:, i] <= model.upper[i] + 1e-6)
+
+
+@pytest.mark.parametrize(
+    ("model", "parameter", "values", "message"),
+    [
+        (
+            TwoParameterLogistic(2),
+            "discrimination",
+            np.array([1.0, np.nan]),
+            "finite",
+        ),
+        (
+            TwoParameterLogistic(2),
+            "difficulty",
+            np.array([0.0, np.nan]),
+            "finite",
+        ),
+        (
+            ThreeParameterLogistic(2),
+            "guessing",
+            np.array([-0.01, 0.2]),
+            r"\[0, 1\)",
+        ),
+        (
+            ThreeParameterLogistic(2),
+            "guessing",
+            np.array([0.2, 1.0]),
+            r"\[0, 1\)",
+        ),
+        (
+            FourParameterLogistic(2),
+            "upper",
+            np.array([-0.01, 0.9]),
+            r"\[0, 1\]",
+        ),
+        (
+            FourParameterLogistic(2),
+            "upper",
+            np.array([0.9, 1.01]),
+            r"\[0, 1\]",
+        ),
+        (
+            FiveParameterLogistic(2),
+            "asymmetry",
+            np.array([1.0, 0.0]),
+            "strictly positive",
+        ),
+        (
+            UnipolarLogLogistic(2),
+            "discrimination",
+            np.array([1.0, 0.0]),
+            "strictly positive",
+        ),
+        (
+            ComplementaryLogLog(2),
+            "discrimination",
+            np.array([np.nan, 1.0]),
+            "finite",
+        ),
+        (
+            NegativeLogLog(2),
+            "difficulty",
+            np.array([0.0, -np.inf]),
+            "finite",
+        ),
+    ],
+)
+def test_parameter_domains_are_validated(model, parameter, values, message):
+    before = model.parameters
+
+    with pytest.raises(MirtValidationError, match=message):
+        model.set_parameters(**{parameter: values})
+
+    for name, expected in before.items():
+        np.testing.assert_array_equal(model.parameters[name], expected)
+
+
+def test_parameter_updates_are_atomic_and_detached():
+    model = FourParameterLogistic(2)
+    difficulty = np.array([0.2, 0.4])
+
+    with pytest.raises(MirtValidationError, match="guessing"):
+        model.set_parameters(
+            difficulty=difficulty,
+            guessing=np.array([0.1, 1.2]),
+        )
+    np.testing.assert_array_equal(model.difficulty, [0.0, 0.0])
+
+    model.set_parameters(difficulty=difficulty)
+    difficulty[0] = 99.0
+    np.testing.assert_array_equal(model.difficulty, [0.2, 0.4])
+
+
+def test_asymptotes_are_validated_against_joint_proposed_state():
+    model = FourParameterLogistic(2)
+
+    model.set_parameters(
+        guessing=np.array([0.8, 0.7]),
+        upper=np.array([0.9, 0.95]),
+    )
+    np.testing.assert_array_equal(model.guessing, [0.8, 0.7])
+    np.testing.assert_array_equal(model.upper, [0.9, 0.95])
+
+    with pytest.raises(MirtValidationError, match="cannot exceed"):
+        model.set_parameters(guessing=np.array([0.91, 0.7]))
+    np.testing.assert_array_equal(model.guessing, [0.8, 0.7])
+
+
+def test_logistic_discrimination_allows_signed_loadings():
+    unidimensional = TwoParameterLogistic(2)
+    unidimensional.set_parameters(discrimination=np.array([-1.0, 0.0]))
+    np.testing.assert_array_equal(unidimensional.discrimination, [-1.0, 0.0])
+
+    model = TwoParameterLogistic(2, n_factors=2)
+    loadings = np.array([[1.0, -0.2], [-0.4, 0.8]])
+
+    model.set_parameters(discrimination=loadings)
+    np.testing.assert_array_equal(model.discrimination, loadings)
+
+
+def test_item_parameter_updates_preserve_validation():
+    model = FourParameterLogistic(2)
+    model.set_item_parameter(1, "guessing", 0.4)
+    assert model.guessing[1] == pytest.approx(0.4)
+
+    with pytest.raises(MirtValidationError, match="cannot exceed"):
+        model.set_item_parameter(1, "upper", 0.3)
+    assert model.upper[1] == pytest.approx(1.0)
+
+    with pytest.raises(MirtValidationError, match="scalar"):
+        model.set_item_parameter(1, "guessing", np.array([0.2]))
+
+
+def test_one_parameter_item_update_allows_fixed_value_only():
+    model = OneParameterLogistic(2)
+    model.set_item_parameter(0, "discrimination", 1.0)
+
+    with pytest.raises(ValueError, match="Cannot set discrimination"):
+        model.set_item_parameter(0, "discrimination", 1.1)
+
+
+@pytest.mark.parametrize("item_idx", [-1, 2, 1.5, True])
+def test_item_parameter_updates_reject_invalid_indices(item_idx):
+    with pytest.raises((IndexError, MirtValidationError), match="item_idx|Item index"):
+        TwoParameterLogistic(2).set_item_parameter(item_idx, "difficulty", 0.0)

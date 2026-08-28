@@ -1,7 +1,10 @@
+from typing import Self
+
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt.exceptions import MirtValidationError
 from mirt.models.base import DichotomousItemModel
 
 _MIN_EXP_INPUT = -745.0
@@ -27,7 +30,145 @@ def _bounded_exponential(value: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.exp(np.clip(value, _MIN_EXP_INPUT, _MAX_DOUBLE_EXP_INPUT))
 
 
-class TwoParameterLogistic(DichotomousItemModel):
+class _ParameterizedDichotomousModel(DichotomousItemModel):
+    """Shared parameter-domain validation for dichotomous response curves."""
+
+    _requires_positive_discrimination = False
+
+    def _validate_parameter_state(
+        self,
+        parameters: dict[str, NDArray[np.float64]],
+    ) -> None:
+        for name, values in parameters.items():
+            if not np.all(np.isfinite(values)):
+                raise MirtValidationError(
+                    f"{name} must contain only finite values",
+                    parameter=name,
+                    value=values,
+                    expected="finite values",
+                )
+
+        discrimination = parameters["discrimination"]
+        if self._requires_positive_discrimination and np.any(discrimination <= 0.0):
+            raise MirtValidationError(
+                "discrimination must be strictly positive",
+                parameter="discrimination",
+                value=discrimination,
+                expected="> 0",
+            )
+
+        guessing = parameters.get("guessing")
+        if guessing is not None and np.any((guessing < 0.0) | (guessing >= 1.0)):
+            raise MirtValidationError(
+                "guessing must be in [0, 1)",
+                parameter="guessing",
+                value=guessing,
+                expected="[0, 1)",
+            )
+
+        upper = parameters.get("upper")
+        if upper is not None:
+            if np.any((upper < 0.0) | (upper > 1.0)):
+                raise MirtValidationError(
+                    "upper must be in [0, 1]",
+                    parameter="upper",
+                    value=upper,
+                    expected="[0, 1]",
+                )
+            if guessing is not None and np.any(guessing > upper):
+                raise MirtValidationError(
+                    "guessing cannot exceed upper",
+                    parameter="guessing",
+                    value=guessing,
+                    expected="guessing <= upper",
+                )
+
+        asymmetry = parameters.get("asymmetry")
+        if asymmetry is not None and np.any(asymmetry <= 0.0):
+            raise MirtValidationError(
+                "asymmetry must be strictly positive",
+                parameter="asymmetry",
+                value=asymmetry,
+                expected="> 0",
+            )
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set parameters atomically after validating the complete model state."""
+        candidate = {name: values.copy() for name, values in self._parameters.items()}
+        for name, value in params.items():
+            if name not in candidate:
+                valid_params = ", ".join(candidate)
+                raise MirtValidationError(
+                    f"Unknown parameter: {name}. Valid parameters: {valid_params}",
+                    parameter=name,
+                    expected=valid_params,
+                )
+
+            value_array = np.asarray(value, dtype=np.float64)
+            expected_shape = candidate[name].shape
+            if value_array.shape != expected_shape:
+                raise MirtValidationError(
+                    f"Shape mismatch for {name}: expected {expected_shape}, "
+                    f"got {value_array.shape}",
+                    parameter=name,
+                    value=value_array.shape,
+                    expected=str(expected_shape),
+                )
+            candidate[name] = value_array.copy()
+
+        self._validate_parameter_state(candidate)
+        self._parameters = candidate
+        return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        """Set one item parameter while preserving the model's domain."""
+        item_idx = self._validate_item_idx(item_idx)
+        if param_name not in self._parameters:
+            valid_params = ", ".join(self._parameters)
+            raise MirtValidationError(
+                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}",
+                parameter=param_name,
+                expected=valid_params,
+            )
+
+        current = self._parameters[param_name]
+        value_array = np.asarray(value, dtype=np.float64)
+        expected_shape = current.shape[1:]
+        if value_array.shape != expected_shape:
+            expected = "scalar" if not expected_shape else str(expected_shape)
+            raise MirtValidationError(
+                f"{param_name} for one item must have shape {expected}",
+                parameter=param_name,
+                value=value_array.shape,
+                expected=expected,
+            )
+
+        updated = current.copy()
+        updated[item_idx] = value_array
+        self.set_parameters(**{param_name: updated})
+
+    def _validate_item_idx(self, item_idx: int) -> int:
+        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+            item_idx, (int, np.integer)
+        ):
+            raise MirtValidationError(
+                "item_idx must be an integer",
+                parameter="item_idx",
+                value=item_idx,
+                expected="integer",
+            )
+        item_idx = int(item_idx)
+        if item_idx < 0 or item_idx >= self.n_items:
+            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
+        return item_idx
+
+
+class TwoParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "2PL"
     n_params_per_item = 2
     supports_multidimensional = True
@@ -141,8 +282,22 @@ class OneParameterLogistic(TwoParameterLogistic):
             raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")
         return super().set_parameters(**params)
 
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        if param_name == "discrimination":
+            self._validate_item_idx(item_idx)
+            value_array = np.asarray(value, dtype=np.float64)
+            if value_array.ndim == 0 and float(value_array) == 1.0:
+                return
+            raise ValueError("Cannot set discrimination in 1PL model (fixed to 1)")
+        super().set_item_parameter(item_idx, param_name, value)
 
-class ThreeParameterLogistic(DichotomousItemModel):
+
+class ThreeParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "3PL"
     n_params_per_item = 3
     supports_multidimensional = False
@@ -220,7 +375,7 @@ class ThreeParameterLogistic(DichotomousItemModel):
         return _fisher_information(probability, derivative)
 
 
-class FourParameterLogistic(DichotomousItemModel):
+class FourParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "4PL"
     n_params_per_item = 4
     supports_multidimensional = False
@@ -313,7 +468,7 @@ Rasch = OneParameterLogistic
 ThreeParameterLogisticUpper = FourParameterLogistic
 
 
-class UnipolarLogLogistic(DichotomousItemModel):
+class UnipolarLogLogistic(_ParameterizedDichotomousModel):
     """Unipolar Log-Logistic (ULL) model for dichotomous items.
 
     The ULL model is designed for items where only positive trait levels
@@ -361,6 +516,7 @@ class UnipolarLogLogistic(DichotomousItemModel):
     model_name = "ULL"
     n_params_per_item = 2
     supports_multidimensional = False
+    _requires_positive_discrimination = True
 
     def __init__(
         self,
@@ -426,7 +582,7 @@ class UnipolarLogLogistic(DichotomousItemModel):
         return _fisher_information(probability, derivative)
 
 
-class FiveParameterLogistic(DichotomousItemModel):
+class FiveParameterLogistic(_ParameterizedDichotomousModel):
     """Five-Parameter Logistic (5PL) model with asymmetric curves.
 
     The 5PL model extends the 4PL with an asymmetry parameter that allows
@@ -572,7 +728,7 @@ class FiveParameterLogistic(DichotomousItemModel):
         return _fisher_information(probability, derivative)
 
 
-class ComplementaryLogLog(DichotomousItemModel):
+class ComplementaryLogLog(_ParameterizedDichotomousModel):
     """Complementary Log-Log (CLL) model for dichotomous items.
 
     The CLL model uses an asymmetric link function instead of the
@@ -678,7 +834,7 @@ class ComplementaryLogLog(DichotomousItemModel):
         return _fisher_information(probability, derivative)
 
 
-class NegativeLogLog(DichotomousItemModel):
+class NegativeLogLog(_ParameterizedDichotomousModel):
     """Negative Log-Log (NLL) model for dichotomous items.
 
     The NLL model is the mirror image of CLL, approaching 1 slowly

@@ -20,6 +20,7 @@ from mirt._rust_backend import RUST_AVAILABLE, em_iteration_3pl
 from mirt.constants import PROB_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.se_methods import _valid_second_derivative
 from mirt.exceptions import MirtValidationError
 from mirt.utils.numeric import logsumexp
 
@@ -901,12 +902,13 @@ class EMEstimator(BaseEstimator):
 
         h = self.se_step_size
         ll_center = log_likelihood(current)
-
         if is_scalar:
-            ll_plus = log_likelihood(current + h)
-            ll_minus = log_likelihood(current - h)
-
-            hessian = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+            hessian = _valid_second_derivative(
+                lambda offset: log_likelihood(current + offset),
+                h,
+                scheme="central",
+                center=ll_center,
+            )
 
             if hessian < 0:
                 se = np.sqrt(-1.0 / hessian)
@@ -919,15 +921,18 @@ class EMEstimator(BaseEstimator):
             se = np.zeros(n_params)
 
             for i in range(n_params):
-                param_plus = current.copy()
-                param_plus[i] += h
-                param_minus = current.copy()
-                param_minus[i] -= h
 
-                ll_plus = log_likelihood(param_plus)
-                ll_minus = log_likelihood(param_minus)
+                def log_likelihood_at_offset(offset: float) -> float:
+                    candidate = current.copy()
+                    candidate[i] += offset
+                    return log_likelihood(candidate)
 
-                hessian = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+                hessian = _valid_second_derivative(
+                    log_likelihood_at_offset,
+                    h,
+                    scheme="central",
+                    center=ll_center,
+                )
 
                 if hessian < 0:
                     se[i] = np.sqrt(-1.0 / hessian)
