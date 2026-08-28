@@ -93,7 +93,9 @@ model. The batch filter updates every learner in one vectorized call:
    responses, true_states = state_model.simulate(500, seed=42)
    responses[0, 3, 5] = -1
 
-   means, variances = state_model.extended_kalman_filter_batch(responses)
+   diagnostics = state_model.predictive_diagnostics_batch(responses)
+   means = diagnostics.filtered_means
+   variances = diagnostics.filtered_variances
    print(means.shape, variances.shape)  # (500, 12) (500, 12)
 
    smoothed_means, smoothed_variances = (
@@ -110,19 +112,11 @@ model. The batch filter updates every learner in one vectorized call:
    )
    print(future_success.shape)  # (500, 4, 20)
 
-   predictive_by_time = state_model.predictive_log_likelihood_batch(
-       responses,
-       pointwise=True,
-   )
-   predictive_total = predictive_by_time.sum(axis=1)
-
-   predictive_success = (
-       state_model.predictive_response_probabilities_batch(responses)
-   )
-   predictive_residuals = state_model.predictive_residuals_batch(
-       responses,
-       standardized=True,
-   )
+   causal_state_means = diagnostics.predicted_means
+   predictive_success = diagnostics.response_probabilities
+   predictive_by_time = diagnostics.response_log_likelihoods
+   predictive_total = diagnostics.total_log_likelihoods
+   predictive_residuals = diagnostics.standardized_residuals
 
 Filtering conditions each state on responses available through that occasion,
 which supports online tracking. Smoothing adds a vectorized
@@ -189,6 +183,11 @@ initial distribution and earlier responses, never its own or future outcomes.
 Raw residuals are observed minus predicted success; ``standardized=True``
 returns Pearson residuals. Missing responses produce ``numpy.nan`` residuals,
 while their model probabilities remain available for inspection.
+``predictive_diagnostics_batch`` returns the causal state predictions,
+filtered states, probabilities, joint and marginal item log scores, and both
+residual forms from one filtering and quadrature pass. Use
+``predictive_diagnostics`` for one response history; the separate predictive
+methods remain convenient when only one output is needed.
 
 State estimation and forecasting accept only ``1`` (correct), ``0``
 (incorrect), and ``-1`` (missing); a fully missing occasion propagates the

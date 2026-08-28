@@ -102,8 +102,10 @@ from mirt.models.sequential import (
     SequentialResponseModel,
 )
 from mirt.models.state_space import (
+    StateSpaceBatchPredictiveResult,
     StateSpaceBatchStepResult,
     StateSpaceIRT,
+    StateSpacePredictiveResult,
     StateSpaceStepResult,
 )
 from mirt.models.testlet import (
@@ -195,6 +197,8 @@ __all__ = [
     "StateSpaceIRT",
     "StateSpaceStepResult",
     "StateSpaceBatchStepResult",
+    "StateSpacePredictiveResult",
+    "StateSpaceBatchPredictiveResult",
     "PiecewiseGrowthModel",
     "NonlinearGrowthModel",
     "GrowthMixtureModel",

@@ -60,6 +60,61 @@ class StateSpaceBatchStepResult:
         return int(self.updated_means.size)
 
 
+@dataclass(frozen=True, slots=True)
+class StateSpacePredictiveResult:
+    """Causal predictions, diagnostics, and states for one response history.
+
+    Predicted state moments condition only on earlier occasions. Filtered
+    moments additionally condition on responses from the corresponding
+    occasion. Item diagnostics contain ``numpy.nan`` at missing responses.
+    """
+
+    predicted_means: NDArray[np.float64]
+    predicted_variances: NDArray[np.float64]
+    filtered_means: NDArray[np.float64]
+    filtered_variances: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    item_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
+
+    @property
+    def total_log_likelihood(self) -> float:
+        """Sum of joint predictive log likelihoods across occasions."""
+        return float(np.sum(self.response_log_likelihoods))
+
+
+@dataclass(frozen=True, slots=True)
+class StateSpaceBatchPredictiveResult:
+    """Causal predictions, diagnostics, and states for multiple histories.
+
+    Predicted state moments condition only on earlier occasions. Filtered
+    moments additionally condition on the corresponding responses. Item
+    diagnostics contain ``numpy.nan`` at missing responses.
+    """
+
+    predicted_means: NDArray[np.float64]
+    predicted_variances: NDArray[np.float64]
+    filtered_means: NDArray[np.float64]
+    filtered_variances: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+    response_log_likelihoods: NDArray[np.float64]
+    item_log_likelihoods: NDArray[np.float64]
+    residuals: NDArray[np.float64]
+    standardized_residuals: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of response histories represented by the result."""
+        return int(self.predicted_means.shape[0])
+
+    @property
+    def total_log_likelihoods(self) -> NDArray[np.float64]:
+        """Joint predictive log-likelihood totals for each person."""
+        return np.sum(self.response_log_likelihoods, axis=1)
+
+
 @dataclass
 class StateSpaceIRT:
     """State-space formulation for continuous latent trait evolution.
@@ -682,6 +737,66 @@ class StateSpaceIRT:
         )
         return filtered_means[0].copy(), filtered_variances[0].copy()
 
+    def _filter_state_moments_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        predicted_means: NDArray[np.float64] | None = None,
+        predicted_variances: NDArray[np.float64] | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Filter validated histories, optionally recording state priors."""
+        n_persons = responses.shape[0]
+        shape = (n_persons, self.n_timepoints)
+        filtered_means = np.empty(shape, dtype=np.float64)
+        filtered_variances = np.empty(shape, dtype=np.float64)
+        predicted_mean = np.full(n_persons, self.initial_mean, dtype=np.float64)
+        predicted_variance = np.full(n_persons, self.initial_var, dtype=np.float64)
+
+        for time_index in range(self.n_timepoints):
+            if predicted_means is not None and predicted_variances is not None:
+                predicted_means[:, time_index] = predicted_mean
+                predicted_variances[:, time_index] = predicted_variance
+            updated_mean, updated_variance = self._extended_kalman_update_batch(
+                responses[:, time_index],
+                predicted_mean,
+                predicted_variance,
+            )
+            filtered_means[:, time_index] = updated_mean
+            filtered_variances[:, time_index] = updated_variance
+            if time_index < self.n_timepoints - 1:
+                predicted_mean, predicted_variance = self._propagate_state_moments(
+                    updated_mean,
+                    updated_variance,
+                    1,
+                )
+
+        return filtered_means, filtered_variances
+
+    def _predictive_state_moments_batch(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return predicted and filtered moments for validated histories."""
+        shape = (responses.shape[0], self.n_timepoints)
+        predicted_means = np.empty(shape, dtype=np.float64)
+        predicted_variances = np.empty(shape, dtype=np.float64)
+        filtered_means, filtered_variances = self._filter_state_moments_batch(
+            responses,
+            predicted_means=predicted_means,
+            predicted_variances=predicted_variances,
+        )
+        return (
+            predicted_means,
+            predicted_variances,
+            filtered_means,
+            filtered_variances,
+        )
+
     def extended_kalman_filter_batch(
         self,
         responses: NDArray[np.int_],
@@ -702,33 +817,7 @@ class StateSpaceIRT:
             ``(n_persons, n_timepoints)``.
         """
         response_values = self._validated_filter_responses(responses, batch=True)
-        n_persons = response_values.shape[0]
-        filtered_means = np.empty(
-            (n_persons, self.n_timepoints),
-            dtype=np.float64,
-        )
-        filtered_variances = np.empty_like(filtered_means)
-        predicted_mean = np.full(n_persons, self.initial_mean, dtype=np.float64)
-        predicted_variance = np.full(n_persons, self.initial_var, dtype=np.float64)
-
-        for time_index in range(self.n_timepoints):
-            time_responses = response_values[:, time_index]
-            updated_mean, updated_variance = self._extended_kalman_update_batch(
-                time_responses,
-                predicted_mean,
-                predicted_variance,
-            )
-
-            filtered_means[:, time_index] = updated_mean
-            filtered_variances[:, time_index] = updated_variance
-            if time_index < self.n_timepoints - 1:
-                predicted_mean, predicted_variance = self._propagate_state_moments(
-                    updated_mean,
-                    updated_variance,
-                    1,
-                )
-
-        return filtered_means, filtered_variances
+        return self._filter_state_moments_batch(response_values)
 
     def extended_kalman_smoother(
         self,
@@ -1437,21 +1526,121 @@ class StateSpaceIRT:
         responses: NDArray[np.int_],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Return causal state predictions for validated response histories."""
-        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
-            responses
-        )
-        predicted_means = np.empty_like(filtered_means)
-        predicted_variances = np.empty_like(filtered_variances)
-        predicted_means[:, 0] = self.initial_mean
-        predicted_variances[:, 0] = self.initial_var
-        predicted_means[:, 1:], predicted_variances[:, 1:] = (
-            self._propagate_state_moments(
-                filtered_means[:, :-1],
-                filtered_variances[:, :-1],
-                1,
-            )
+        predicted_means, predicted_variances, _, _ = (
+            self._predictive_state_moments_batch(responses)
         )
         return predicted_means, predicted_variances
+
+    def _predictive_diagnostics_batch(
+        self,
+        responses: NDArray[np.int_],
+        n_quadpts: int,
+    ) -> StateSpaceBatchPredictiveResult:
+        """Build complete causal diagnostics from validated histories."""
+        (
+            predicted_means,
+            predicted_variances,
+            filtered_means,
+            filtered_variances,
+        ) = self._predictive_state_moments_batch(responses)
+        response_probabilities, response_log_likelihoods = (
+            self._integrated_response_diagnostics(
+                responses,
+                predicted_means,
+                predicted_variances,
+                n_quadpts,
+            )
+        )
+        item_log_likelihoods, residuals, standardized_residuals = (
+            self._item_response_diagnostics(
+                responses,
+                response_probabilities,
+            )
+        )
+        return StateSpaceBatchPredictiveResult(
+            predicted_means=predicted_means,
+            predicted_variances=predicted_variances,
+            filtered_means=filtered_means,
+            filtered_variances=filtered_variances,
+            response_probabilities=response_probabilities,
+            response_log_likelihoods=response_log_likelihoods,
+            item_log_likelihoods=item_log_likelihoods,
+            residuals=residuals,
+            standardized_residuals=standardized_residuals,
+        )
+
+    def predictive_diagnostics(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpacePredictiveResult:
+        """Return complete causal diagnostics for one response history.
+
+        The result combines state predictions, filtered states, response
+        probabilities, joint and item log scores, and residuals in one pass.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_timepoints, n_items)``.
+            Use ``-1`` for missing item responses.
+        n_quadpts : int, default=21
+            Number of quadrature points used for prediction and scoring.
+
+        Returns
+        -------
+        StateSpacePredictiveResult
+            Causal state trajectories and response diagnostics.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_filter_responses(responses, batch=False)
+        result = self._predictive_diagnostics_batch(
+            response_values[None, :, :],
+            n_quadpts,
+        )
+        return StateSpacePredictiveResult(
+            predicted_means=result.predicted_means[0].copy(),
+            predicted_variances=result.predicted_variances[0].copy(),
+            filtered_means=result.filtered_means[0].copy(),
+            filtered_variances=result.filtered_variances[0].copy(),
+            response_probabilities=result.response_probabilities[0].copy(),
+            response_log_likelihoods=result.response_log_likelihoods[0].copy(),
+            item_log_likelihoods=result.item_log_likelihoods[0].copy(),
+            residuals=result.residuals[0].copy(),
+            standardized_residuals=result.standardized_residuals[0].copy(),
+        )
+
+    def predictive_diagnostics_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+    ) -> StateSpaceBatchPredictiveResult:
+        """Return complete causal diagnostics for multiple histories.
+
+        All outputs are computed from one vectorized filtering pass and one
+        shared quadrature pass. State arrays have shape
+        ``(n_persons, n_timepoints)``; response arrays additionally have an
+        item dimension.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+        n_quadpts : int, default=21
+            Number of quadrature points used for prediction and scoring.
+
+        Returns
+        -------
+        StateSpaceBatchPredictiveResult
+            Batched causal state trajectories and response diagnostics.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_filter_responses(responses, batch=True)
+        return self._predictive_diagnostics_batch(response_values, n_quadpts)
 
     def predictive_response_probabilities(
         self,

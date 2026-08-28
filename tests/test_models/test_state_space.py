@@ -7,8 +7,10 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.models.state_space import (
+    StateSpaceBatchPredictiveResult,
     StateSpaceBatchStepResult,
     StateSpaceIRT,
+    StateSpacePredictiveResult,
     StateSpaceStepResult,
 )
 
@@ -19,14 +21,20 @@ def test_dynamic_module_reexports_state_space_model():
     assert DynamicStateSpaceIRT is StateSpaceIRT
 
 
-def test_models_module_exports_state_space_step_results():
+def test_models_module_exports_state_space_results():
+    from mirt.models import (
+        StateSpaceBatchPredictiveResult as PublicBatchPredictiveResult,
+    )
     from mirt.models import (
         StateSpaceBatchStepResult as PublicBatchStepResult,
     )
+    from mirt.models import StateSpacePredictiveResult as PublicPredictiveResult
     from mirt.models import StateSpaceStepResult as PublicStepResult
 
     assert PublicStepResult is StateSpaceStepResult
     assert PublicBatchStepResult is StateSpaceBatchStepResult
+    assert PublicPredictiveResult is StateSpacePredictiveResult
+    assert PublicBatchPredictiveResult is StateSpaceBatchPredictiveResult
 
 
 class TestStateSpaceIRT:
@@ -1308,6 +1316,179 @@ class TestStateSpaceIRT:
                 2,
                 n_quadpts=n_quadpts,
             )
+
+    def test_predictive_diagnostics_match_individual_history_operations(self):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model="3PL",
+            transition_matrix=np.array([[0.88]]),
+            process_noise=np.array([[0.07]]),
+            observation_noise=0.1,
+            discrimination=np.linspace(0.7, 1.8, 6),
+            difficulty=np.linspace(-1.2, 1.1, 6),
+            guessing=np.linspace(0.08, 0.24, 6),
+            initial_mean=-0.15,
+            initial_var=0.9,
+        )
+        responses = np.random.default_rng(64).integers(0, 2, size=(7, 5, 6))
+        responses[np.random.default_rng(65).random(responses.shape) < 0.2] = -1
+
+        result = model.predictive_diagnostics_batch(responses, n_quadpts=31)
+
+        assert isinstance(result, StateSpaceBatchPredictiveResult)
+        assert result.n_persons == len(responses)
+        predicted = tuple(
+            np.vstack(
+                [
+                    self._reference_predicted_state_moments(
+                        model,
+                        person_responses,
+                    )[moment_index]
+                    for person_responses in responses
+                ]
+            )
+            for moment_index in range(2)
+        )
+        filtered = model.extended_kalman_filter_batch(responses)
+        probabilities = model.predictive_response_probabilities_batch(
+            responses,
+            n_quadpts=31,
+        )
+        scores = model.predictive_log_likelihood_batch(
+            responses,
+            n_quadpts=31,
+            pointwise=True,
+        )
+        residuals = model.predictive_residuals_batch(responses, n_quadpts=31)
+        standardized = model.predictive_residuals_batch(
+            responses,
+            n_quadpts=31,
+            standardized=True,
+        )
+        expected_item_scores = np.where(
+            responses == 1,
+            np.log(probabilities),
+            np.where(responses == 0, np.log1p(-probabilities), np.nan),
+        )
+        assert_allclose(result.predicted_means, predicted[0])
+        assert_allclose(result.predicted_variances, predicted[1])
+        assert_allclose(result.filtered_means, filtered[0])
+        assert_allclose(result.filtered_variances, filtered[1])
+        assert_allclose(result.response_probabilities, probabilities)
+        assert_allclose(result.response_log_likelihoods, scores)
+        assert_allclose(
+            result.item_log_likelihoods,
+            expected_item_scores,
+            equal_nan=True,
+        )
+        assert_allclose(result.residuals, residuals, equal_nan=True)
+        assert_allclose(
+            result.standardized_residuals,
+            standardized,
+            equal_nan=True,
+        )
+        assert_allclose(result.total_log_likelihoods, np.sum(scores, axis=1))
+
+        scalar = model.predictive_diagnostics(responses[0], n_quadpts=31)
+        assert isinstance(scalar, StateSpacePredictiveResult)
+        for field_name in (
+            "predicted_means",
+            "predicted_variances",
+            "filtered_means",
+            "filtered_variances",
+            "response_probabilities",
+            "response_log_likelihoods",
+            "item_log_likelihoods",
+            "residuals",
+            "standardized_residuals",
+        ):
+            assert_allclose(
+                getattr(scalar, field_name),
+                getattr(result, field_name)[0],
+                equal_nan=True,
+            )
+        assert scalar.total_log_likelihood == pytest.approx(
+            result.total_log_likelihoods[0]
+        )
+        with pytest.raises(FrozenInstanceError):
+            scalar.predicted_means = np.zeros(model.n_timepoints)
+
+    def test_predictive_diagnostics_treat_missing_histories_consistently(self):
+        model = StateSpaceIRT(
+            n_items=4,
+            n_timepoints=3,
+            transition_matrix=np.array([[0.8]]),
+            process_noise=np.array([[0.12]]),
+            initial_mean=0.5,
+            initial_var=0.7,
+        )
+        responses = np.full((5, 3, 4), -1, dtype=np.int32)
+
+        result = model.predictive_diagnostics_batch(responses)
+
+        assert_allclose(result.filtered_means, result.predicted_means)
+        assert_allclose(result.filtered_variances, result.predicted_variances)
+        assert_allclose(result.response_log_likelihoods, 0.0)
+        assert_allclose(result.total_log_likelihoods, 0.0)
+        assert np.all(np.isnan(result.item_log_likelihoods))
+        assert np.all(np.isnan(result.residuals))
+        assert np.all(np.isnan(result.standardized_residuals))
+
+    def test_predictive_diagnostics_are_causal(self):
+        model = StateSpaceIRT(
+            n_items=8,
+            n_timepoints=5,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.05]]),
+            difficulty=np.linspace(-1.0, 1.0, 8),
+        )
+        baseline = np.zeros((3, 5, 8), dtype=np.int32)
+        changed = baseline.copy()
+        changed[:, 2:] = 1
+
+        baseline_result = model.predictive_diagnostics_batch(baseline)
+        changed_result = model.predictive_diagnostics_batch(changed)
+
+        assert_allclose(
+            baseline_result.predicted_means[:, :3],
+            changed_result.predicted_means[:, :3],
+        )
+        assert_allclose(
+            baseline_result.predicted_variances[:, :3],
+            changed_result.predicted_variances[:, :3],
+        )
+        assert_allclose(
+            baseline_result.response_probabilities[:, :3],
+            changed_result.response_probabilities[:, :3],
+        )
+        assert (
+            np.max(
+                np.abs(
+                    baseline_result.response_probabilities[:, 3:]
+                    - changed_result.response_probabilities[:, 3:]
+                )
+            )
+            > 0.05
+        )
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        "method_name",
+        ["predictive_diagnostics", "predictive_diagnostics_batch"],
+    )
+    def test_predictive_diagnostics_require_positive_quadrature_count_for_results(
+        self,
+        n_quadpts,
+        method_name,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 3), dtype=np.int32)
+        if method_name.endswith("_batch"):
+            responses = responses[None, :, :]
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            getattr(model, method_name)(responses, n_quadpts=n_quadpts)
 
     @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
     @pytest.mark.parametrize("transition", [0.85, -0.6])
