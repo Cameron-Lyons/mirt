@@ -6,9 +6,11 @@ import numpy as np
 import pytest
 
 from mirt import bootstrap_ci, bootstrap_se, parametric_bootstrap
+from mirt.backends.rust import _helpers as rust_helpers
+from mirt.backends.rust import estimation as rust_estimation
 from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtDataError, MirtValidationError
-from mirt.models.dichotomous import FourParameterLogistic
+from mirt.models.dichotomous import FourParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 
 
@@ -98,6 +100,102 @@ class TestBootstrapSE:
         assert result["theta"].shape == (responses.shape[0],)
         assert len(scored_responses) == 2
         assert all(np.array_equal(scored, responses) for scored in scored_responses)
+
+    def test_2pl_parameter_bootstrap_uses_native_parallel_samples(self, monkeypatch):
+        """Eligible parameter bootstraps use warm-started native samples."""
+        model = TwoParameterLogistic(2)
+        model.set_parameters(
+            discrimination=np.array([1.25, 0.75]),
+            difficulty=np.array([-0.5, 0.25]),
+        )
+        model._is_fitted = True
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]])
+        calls = []
+
+        def fake_bootstrap(responses, **kwargs):
+            calls.append((responses.copy(), kwargs))
+            n_bootstrap = kwargs["n_bootstrap"]
+            values = np.arange(n_bootstrap * 2, dtype=float).reshape(n_bootstrap, 2)
+            return values, values + 0.5
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: True)
+        monkeypatch.setattr(rust_estimation, "bootstrap_fit_2pl", fake_bootstrap)
+
+        result = bootstrap_se(model, responses, n_bootstrap=10, seed=42)
+
+        values = np.arange(20, dtype=float).reshape(10, 2)
+        np.testing.assert_allclose(
+            result["discrimination"], np.std(values, axis=0, ddof=1)
+        )
+        np.testing.assert_allclose(
+            result["difficulty"], np.std(values + 0.5, axis=0, ddof=1)
+        )
+        assert len(calls) == 1
+        np.testing.assert_array_equal(calls[0][0], responses)
+        np.testing.assert_array_equal(
+            calls[0][1]["initial_discrimination"], model.discrimination
+        )
+        np.testing.assert_array_equal(
+            calls[0][1]["initial_difficulty"], model.difficulty
+        )
+        assert calls[0][1]["max_iter"] == 100
+        assert calls[0][1]["tol"] == pytest.approx(1e-3)
+
+    def test_native_cold_start_omits_initial_parameters(self, monkeypatch):
+        """Cold-start configuration is preserved by the native path."""
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]])
+        calls = []
+
+        def fake_bootstrap(responses, **kwargs):
+            calls.append(kwargs)
+            return np.ones((2, 2)), np.zeros((2, 2))
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: True)
+        monkeypatch.setattr(rust_estimation, "bootstrap_fit_2pl", fake_bootstrap)
+
+        bootstrap_se(
+            model,
+            responses,
+            n_bootstrap=2,
+            warm_start=False,
+            seed=42,
+        )
+
+        assert calls[0]["initial_discrimination"] is None
+        assert calls[0]["initial_difficulty"] is None
+        assert calls[0]["max_iter"] == 200
+
+    def test_2pl_parameter_bootstrap_falls_back_when_native_is_disabled(
+        self, monkeypatch
+    ):
+        """Global backend selection retains the general implementation."""
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]])
+        fit_calls = 0
+
+        def fake_fit(self, fitted_model, sample):
+            nonlocal fit_calls
+            fit_calls += 1
+            fitted_model._parameters["difficulty"] += 0.1 * fit_calls
+            return SimpleNamespace(model=fitted_model)
+
+        def unexpected_native_call(*args, **kwargs):
+            raise AssertionError("native bootstrap should not be called")
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: False)
+        monkeypatch.setattr(
+            rust_estimation, "bootstrap_fit_2pl", unexpected_native_call
+        )
+        monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+
+        result = bootstrap_se(model, responses, n_bootstrap=2, seed=42)
+
+        assert fit_calls == 2
+        assert set(result) == {"discrimination", "difficulty"}
+        assert np.isfinite(result["difficulty"]).all()
 
 
 class TestBootstrapCI:
@@ -220,6 +318,42 @@ class TestBootstrapCI:
             assert upper.shape == model.parameters[name].shape
             assert np.all(np.isfinite(lower))
             assert np.all(np.isfinite(upper))
+
+    def test_2pl_percentile_ci_uses_native_parallel_samples(self, monkeypatch):
+        """Parameter confidence intervals consume native bootstrap draws."""
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]])
+        values = np.arange(20, dtype=float).reshape(10, 2)
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: True)
+        monkeypatch.setattr(
+            rust_estimation,
+            "bootstrap_fit_2pl",
+            lambda responses, **kwargs: (values, values + 0.5),
+        )
+
+        intervals = bootstrap_ci(
+            model,
+            responses,
+            n_bootstrap=10,
+            alpha=0.2,
+            method="percentile",
+            seed=42,
+        )
+
+        np.testing.assert_allclose(
+            intervals["discrimination"][0], np.percentile(values, 10, axis=0)
+        )
+        np.testing.assert_allclose(
+            intervals["discrimination"][1], np.percentile(values, 90, axis=0)
+        )
+        np.testing.assert_allclose(
+            intervals["difficulty"][0], np.percentile(values + 0.5, 10, axis=0)
+        )
+        np.testing.assert_allclose(
+            intervals["difficulty"][1], np.percentile(values + 0.5, 90, axis=0)
+        )
 
 
 class TestParametricBootstrap:

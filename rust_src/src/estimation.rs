@@ -1,7 +1,8 @@
 //! Parameter estimation functions (EM, Gibbs, MHRM, Bootstrap).
 
 use numpy::ndarray::{Array1, Array2, Array3};
-use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray2, ToPyArray};
+use numpy::{PyArray1, PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
@@ -641,6 +642,8 @@ pub fn mhrm_fit_2pl<'py>(
 
 /// Bootstrap parameter estimation for 2PL
 #[pyfunction]
+#[pyo3(signature = (responses, n_bootstrap, n_quadpts, max_iter, tol, seed, initial_discrimination=None, initial_difficulty=None))]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn bootstrap_fit_2pl<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -649,11 +652,36 @@ pub fn bootstrap_fit_2pl<'py>(
     max_iter: usize,
     tol: f64,
     seed: u64,
-) -> (Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>) {
+    initial_discrimination: Option<PyReadonlyArray1<f64>>,
+    initial_difficulty: Option<PyReadonlyArray1<f64>>,
+) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray2<f64>>)> {
     let responses = responses.as_array();
     let n_persons = responses.nrows();
     let n_items = responses.ncols();
     let (quad_points, quad_weights) = gauss_hermite_quadrature(n_quadpts);
+    let initial_parameters = match (initial_discrimination, initial_difficulty) {
+        (None, None) => None,
+        (Some(discrimination), Some(difficulty)) => {
+            let discrimination = discrimination.as_array().to_vec();
+            let difficulty = difficulty.as_array().to_vec();
+            if discrimination.len() != n_items || difficulty.len() != n_items {
+                return Err(PyValueError::new_err(
+                    "initial parameters must contain one value per item",
+                ));
+            }
+            if !discrimination.iter().all(|value| value.is_finite())
+                || !difficulty.iter().all(|value| value.is_finite())
+            {
+                return Err(PyValueError::new_err("initial parameters must be finite"));
+            }
+            Some((discrimination, difficulty))
+        }
+        _ => {
+            return Err(PyValueError::new_err(
+                "initial_discrimination and initial_difficulty must be provided together",
+            ));
+        }
+    };
 
     let results: Vec<(Vec<f64>, Vec<f64>)> = (0..n_bootstrap)
         .into_par_iter()
@@ -671,22 +699,26 @@ pub fn bootstrap_fit_2pl<'py>(
                 }
             }
 
-            let mut discrimination: Vec<f64> = vec![1.0; n_items];
-            let mut difficulty: Vec<f64> = vec![0.0; n_items];
+            let (mut discrimination, mut difficulty) = initial_parameters
+                .as_ref()
+                .map(|(discrimination, difficulty)| (discrimination.clone(), difficulty.clone()))
+                .unwrap_or_else(|| (vec![1.0; n_items], vec![0.0; n_items]));
 
-            for j in 0..n_items {
-                let mut sum = 0.0;
-                let mut count = 0;
-                for i in 0..n_persons {
-                    let r = boot_responses[[i, j]];
-                    if r >= 0 {
-                        sum += r as f64;
-                        count += 1;
+            if initial_parameters.is_none() {
+                for j in 0..n_items {
+                    let mut sum = 0.0;
+                    let mut count = 0;
+                    for i in 0..n_persons {
+                        let r = boot_responses[[i, j]];
+                        if r >= 0 {
+                            sum += r as f64;
+                            count += 1;
+                        }
                     }
-                }
-                if count > 0 {
-                    let p = (sum / count as f64).clamp(0.01, 0.99);
-                    difficulty[j] = -p.ln() / (1.0 - p).ln().abs().max(0.01);
+                    if count > 0 {
+                        let p = (sum / count as f64).clamp(0.01, 0.99);
+                        difficulty[j] = -p.ln() / (1.0 - p).ln().abs().max(0.01);
+                    }
                 }
             }
 
@@ -740,7 +772,7 @@ pub fn bootstrap_fit_2pl<'py>(
         }
     }
 
-    (disc_samples.to_pyarray(py), diff_samples.to_pyarray(py))
+    Ok((disc_samples.to_pyarray(py), diff_samples.to_pyarray(py)))
 }
 
 /// Single EM iteration for 2PL model (combined E+M step to reduce FFI overhead)
