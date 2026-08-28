@@ -449,6 +449,113 @@ class TestPlausibleValueRegression:
 class TestPlausibleValueStatistics:
     """Tests for computing statistics with PVs."""
 
+    @staticmethod
+    def _multidimensional_values() -> np.ndarray:
+        rng = np.random.default_rng(20260828)
+        return rng.normal(size=(40, 3, 5))
+
+    @pytest.mark.parametrize("statistic", ["mean", "variance", "sd", "percentile_25"])
+    def test_all_factors_match_drawwise_reference(self, statistic):
+        """All-factor summaries retain one result per latent dimension."""
+        pvs = self._multidimensional_values()
+        if statistic == "mean":
+            draw_estimates = np.mean(pvs, axis=0)
+        elif statistic == "variance":
+            draw_estimates = np.var(pvs, axis=0, ddof=1)
+        elif statistic == "sd":
+            draw_estimates = np.std(pvs, axis=0, ddof=1)
+        else:
+            draw_estimates = np.percentile(pvs, 25, axis=0)
+        expected_estimate = np.mean(draw_estimates, axis=1)
+        expected_between = np.var(draw_estimates, axis=1, ddof=1)
+        expected_se = np.sqrt(expected_between * 1.2)
+
+        result = plausible_value_statistics(
+            pvs,
+            statistic=statistic,
+            factor="all",
+        )
+
+        np.testing.assert_allclose(result["estimate"], expected_estimate)
+        np.testing.assert_allclose(result["between_var"], expected_between)
+        np.testing.assert_allclose(result["se"], expected_se)
+        assert result["n_plausible"] == 5
+
+    def test_specific_factor_and_default_return_scalars(self):
+        """Selecting one factor preserves the scalar result contract."""
+        pvs = self._multidimensional_values()
+        all_factors = plausible_value_statistics(pvs, factor="all")
+
+        default = plausible_value_statistics(pvs)
+        second = plausible_value_statistics(pvs, factor=1)
+
+        assert isinstance(default["estimate"], float)
+        assert default["estimate"] == pytest.approx(all_factors["estimate"][0])
+        assert default["se"] == pytest.approx(all_factors["se"][0])
+        assert second["estimate"] == pytest.approx(all_factors["estimate"][1])
+        assert second["between_var"] == pytest.approx(all_factors["between_var"][1])
+
+    @pytest.mark.parametrize(
+        ("pvs", "message"),
+        [
+            (np.ones((3, 2)), "shape"),
+            (np.empty((0, 2, 3)), "one person"),
+            (np.empty((3, 0, 3)), "one person"),
+            (np.ones((3, 2, 0)), "one plausible"),
+            (np.full((3, 2, 3), np.nan), "finite"),
+            (np.full((3, 2, 3), "invalid"), "numeric"),
+        ],
+    )
+    def test_validates_plausible_value_matrix(self, pvs, message):
+        with pytest.raises(ValueError, match=message):
+            plausible_value_statistics(pvs)
+
+    @pytest.mark.parametrize("factor", [-1, 3, True, 1.5, "first"])
+    def test_validates_factor_selection(self, factor):
+        with pytest.raises(ValueError, match="factor"):
+            plausible_value_statistics(
+                self._multidimensional_values(),
+                factor=factor,
+            )
+
+    @pytest.mark.parametrize(
+        ("statistic", "message"),
+        [
+            ("median", "Unknown"),
+            ("percentile_", "end with"),
+            ("percentile_nan", "finite"),
+            ("percentile_-1", "from 0 to 100"),
+            ("percentile_101", "from 0 to 100"),
+            ("percentile_50_extra", "end with"),
+            (1, "string"),
+        ],
+    )
+    def test_validates_statistic(self, statistic, message):
+        with pytest.raises(ValueError, match=message):
+            plausible_value_statistics(
+                self._multidimensional_values(),
+                statistic=statistic,
+            )
+
+    @pytest.mark.parametrize("statistic", ["variance", "sd"])
+    def test_dispersion_requires_two_people(self, statistic):
+        with pytest.raises(ValueError, match="two people"):
+            plausible_value_statistics(
+                np.ones((1, 2, 3)),
+                statistic=statistic,
+                factor="all",
+            )
+
+    def test_single_plausible_value_has_undefined_uncertainty(self):
+        pvs = np.arange(8, dtype=float).reshape(4, 2, 1)
+
+        result = plausible_value_statistics(pvs, factor="all")
+
+        np.testing.assert_allclose(result["estimate"], [3.0, 4.0])
+        assert np.isnan(result["between_var"]).all()
+        assert np.isnan(result["se"]).all()
+        assert result["n_plausible"] == 1
+
     def test_pv_mean(self, fitted_2pl_model, dichotomous_responses):
         """Test population mean estimation."""
         responses = dichotomous_responses["responses"]

@@ -450,7 +450,8 @@ def plausible_value_regression(
 def plausible_value_statistics(
     pvs: NDArray[np.float64],
     statistic: str = "mean",
-) -> dict[str, float]:
+    factor: int | Literal["all"] = 0,
+) -> dict[str, float | int | NDArray[np.float64]]:
     """Compute population statistics using plausible values.
 
     Parameters
@@ -458,38 +459,94 @@ def plausible_value_statistics(
     pvs : NDArray
         Plausible values (n_persons, n_factors, n_plausible)
     statistic : str
-        Statistic to compute: 'mean', 'variance', 'percentile_10', etc.
+        Statistic to compute: ``"mean"``, ``"variance"``, ``"sd"``, or
+        ``"percentile_<value>``.
+    factor : int or "all", default=0
+        Zero-based latent factor to summarize. Use ``"all"`` to return one
+        estimate and standard error per factor.
 
     Returns
     -------
     dict
-        Combined statistic with standard error
+        Combined estimate, standard error, between-draw variance, and number
+        of plausible values. Values are scalars for one factor and arrays with
+        shape ``(n_factors,)`` when ``factor="all"``.
+
+    Notes
+    -----
+    With one plausible value, the estimate is returned while ``se`` and
+    ``between_var`` are NaN because between-draw uncertainty is undefined.
     """
-    n_persons, n_factors, n_plausible = pvs.shape
+    try:
+        values = np.asarray(pvs, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pvs must contain numeric plausible values") from exc
+    if values.ndim != 3:
+        raise ValueError("pvs must have shape (n_persons, n_factors, n_plausible)")
+    n_persons, n_factors, n_plausible = values.shape
+    if n_persons < 1 or n_factors < 1:
+        raise ValueError("pvs must contain at least one person and one factor")
+    if n_plausible < 1:
+        raise ValueError("pvs must contain at least one plausible value")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("pvs must contain only finite plausible values")
+    if not isinstance(statistic, str):
+        raise ValueError("statistic must be a string")
 
-    estimates = []
+    if factor == "all":
+        selected = values
+        return_arrays = True
+    else:
+        if isinstance(factor, (bool, np.bool_)) or not isinstance(
+            factor, (int, np.integer)
+        ):
+            raise ValueError("factor must be an integer or 'all'")
+        factor_index = int(factor)
+        if factor_index < 0 or factor_index >= n_factors:
+            raise ValueError(f"factor must be between 0 and {n_factors - 1}")
+        selected = values[:, factor_index : factor_index + 1, :]
+        return_arrays = False
 
-    for p in range(n_plausible):
-        theta_p = pvs[:, 0, p]
-
-        if statistic == "mean":
-            est = np.mean(theta_p)
-        elif statistic == "variance":
-            est = np.var(theta_p, ddof=1)
-        elif statistic == "sd":
-            est = np.std(theta_p, ddof=1)
-        elif statistic.startswith("percentile_"):
-            pct = float(statistic.split("_")[1])
-            est = np.percentile(theta_p, pct)
+    if statistic == "mean":
+        estimates = np.mean(selected, axis=0)
+    elif statistic in {"variance", "sd"}:
+        if n_persons < 2:
+            raise ValueError(f"{statistic} requires at least two people")
+        if statistic == "variance":
+            estimates = np.var(selected, axis=0, ddof=1)
         else:
-            raise ValueError(f"Unknown statistic: {statistic}")
+            estimates = np.std(selected, axis=0, ddof=1)
+    elif isinstance(statistic, str) and statistic.startswith("percentile_"):
+        suffix = statistic.removeprefix("percentile_")
+        try:
+            percentile = float(suffix)
+        except ValueError as exc:
+            raise ValueError(
+                "percentile statistic must end with a number from 0 to 100"
+            ) from exc
+        if not np.isfinite(percentile) or percentile < 0.0 or percentile > 100.0:
+            raise ValueError("percentile must be a finite number from 0 to 100")
+        estimates = np.percentile(selected, percentile, axis=0)
+    else:
+        raise ValueError(f"Unknown statistic: {statistic}")
 
-        estimates.append(est)
-
-    combined = combine_plausible_values(estimates)
-
+    combined = np.mean(estimates, axis=1)
+    if n_plausible == 1:
+        between_variance = np.full(n_factors if return_arrays else 1, np.nan)
+        standard_error = np.full_like(between_variance, np.nan)
+    else:
+        between_variance = np.var(estimates, axis=1, ddof=1)
+        standard_error = np.sqrt(between_variance * (1.0 + 1.0 / n_plausible))
+    if return_arrays:
+        return {
+            "estimate": combined,
+            "se": standard_error,
+            "between_var": between_variance,
+            "n_plausible": n_plausible,
+        }
     return {
-        "estimate": float(combined["estimate"]),
-        "se": float(np.sqrt(combined["between_var"] * (1 + 1 / n_plausible))),
+        "estimate": float(combined[0]),
+        "se": float(standard_error[0]),
+        "between_var": float(between_variance[0]),
         "n_plausible": n_plausible,
     }

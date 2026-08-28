@@ -204,6 +204,10 @@ Utils
    validate_responses
    itemstats
    traditional
+   generate_plausible_values
+   combine_plausible_values
+   plausible_value_regression
+   plausible_value_statistics
 
 Exceptions
 ----------
