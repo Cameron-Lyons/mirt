@@ -168,6 +168,9 @@ def link(
 
     Finds transformation constants A and B that place the new calibration
     onto the old/reference scale:
+
+    .. code-block:: text
+
         theta_old_scale = A * theta_new_scale + B
         a_new_on_old_scale = a_new / A
         b_new_on_old_scale = A * b_new + B

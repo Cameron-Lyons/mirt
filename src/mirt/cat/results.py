@@ -93,7 +93,7 @@ class MCATResult:
         Standard errors for each dimension.
     items_administered : list[int]
         Indices of all items administered in order.
-    responses : NDArray[np.int_]
+    responses : numpy.ndarray
         Array of responses to administered items.
     n_items_administered : int
         Total number of items administered.
@@ -308,7 +308,7 @@ class CATResult:
         Standard error of the final ability estimate.
     items_administered : list[int]
         Indices of all items administered in order.
-    responses : NDArray[np.int_]
+    responses : numpy.ndarray
         Array of responses to administered items.
     n_items_administered : int
         Total number of items administered.

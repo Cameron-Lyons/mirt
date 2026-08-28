@@ -22,7 +22,7 @@ bench:
 	uv run python benchmarks/run_benchmarks.py
 
 docs:
-	cd docs && uv run sphinx-build -b html . _build/html
+	cd docs && uv run sphinx-build -W --keep-going -b html . _build/html
 
 develop:
 	uv run maturin develop --release
