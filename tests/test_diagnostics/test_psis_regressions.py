@@ -1,5 +1,6 @@
 """Regression coverage for stable Pareto-smoothed model diagnostics."""
 
+import concurrent.futures
 from collections.abc import Callable
 
 import numpy as np
@@ -92,6 +93,53 @@ def test_relative_efficiency_accepts_per_observation_values() -> None:
 
     assert_allclose(vector.pointwise, scalar.pointwise)
     assert_allclose(vector.pareto_k, scalar.pareto_k)
+
+
+def test_parallel_psis_matches_serial_results() -> None:
+    """Threaded observation smoothing preserves deterministic outputs."""
+    log_likelihood = _reference_log_likelihood()
+
+    serial = psis_loo(log_likelihood, n_jobs=1)
+    parallel = psis_loo(log_likelihood, n_jobs=3)
+
+    assert parallel.elpd_loo == serial.elpd_loo
+    assert parallel.p_loo == serial.p_loo
+    assert parallel.looic == serial.looic
+    assert parallel.se_elpd == serial.se_elpd
+    assert parallel.n_high_k == serial.n_high_k
+    np.testing.assert_array_equal(parallel.pointwise, serial.pointwise)
+    np.testing.assert_array_equal(parallel.pareto_k, serial.pareto_k)
+
+
+def test_parallel_psis_caps_threads_at_observation_count(monkeypatch) -> None:
+    """Parallel execution never creates idle observation workers."""
+    requested_workers = []
+
+    class ImmediateExecutor:
+        def __init__(self, max_workers):
+            requested_workers.append(max_workers)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def map(self, function, values):
+            return map(function, values)
+
+    monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", ImmediateExecutor)
+
+    parallel = psis_loo(_reference_log_likelihood(), n_jobs=20)
+
+    assert requested_workers == [6]
+    assert parallel.pointwise.shape == (6,)
+
+
+@pytest.mark.parametrize("n_jobs", [0, -2, True, 1.5, "2"])
+def test_psis_loo_validates_worker_count(n_jobs: object) -> None:
+    with pytest.raises(ValueError, match="n_jobs"):
+        psis_loo(_reference_log_likelihood(), n_jobs=n_jobs)
 
 
 @pytest.mark.parametrize("function", [psis_loo, waic])

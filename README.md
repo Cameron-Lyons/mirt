@@ -435,6 +435,7 @@ plot_person_item_map(result.model, scores.theta)
 | `sibtest()` | SIBTEST DIF detection |
 | `compute_grdif()` | Multi-group GRDIF with robust scaling |
 | `vertical_scale()` | Vertical scaling for grade linking |
+| `mirt.diagnostics.psis_loo()` | PSIS-LOO with optional threaded observation smoothing |
 
 ### Utility Functions
 
