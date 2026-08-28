@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -459,8 +460,22 @@ class KullbackLeibler(ItemSelectionStrategy):
     """
 
     def __init__(self, delta: float = 0.1, n_points: int = 5):
-        self.delta = delta
-        self.n_points = n_points
+        if isinstance(delta, (bool, np.bool_)) or not isinstance(delta, Real):
+            raise ValueError("delta must be a finite positive number")
+        delta_value = float(delta)
+        if not np.isfinite(delta_value) or delta_value <= 0.0:
+            raise ValueError("delta must be a finite positive number")
+        if (
+            isinstance(n_points, (bool, np.bool_))
+            or not isinstance(n_points, Integral)
+            or n_points < 2
+        ):
+            raise ValueError("n_points must be an integer of at least 2")
+
+        self.delta = delta_value
+        self.n_points = int(n_points)
+        offsets = np.linspace(-self.delta, self.delta, self.n_points)
+        self._neighbor_offsets = offsets[offsets != 0.0]
 
     def select_item(
         self,
@@ -473,17 +488,137 @@ class KullbackLeibler(ItemSelectionStrategy):
         if not available_items:
             raise ValueError("No available items to select from")
 
-        best_item = -1
-        best_kl = -np.inf
+        criteria = self.get_item_criteria(model, theta, available_items)
+        return max(criteria, key=lambda item_idx: (criteria[item_idx], -item_idx))
 
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Evaluate the KL grid once for a dichotomous item bank."""
+        if model.n_factors != 1:
+            raise ValueError("KL selection only supports unidimensional models")
+
+        item_indices = self._validate_available_items(model, available_items)
+        if not item_indices:
+            return {}
+
+        theta_values = self._evaluation_thetas(theta)
+        if not model.is_polytomous:
+            probabilities = np.asarray(
+                model.probability(theta_values),
+                dtype=np.float64,
+            ).reshape(len(theta_values), model.n_items)
+            candidate_probabilities = probabilities[:, item_indices]
+            criteria = self._mean_bernoulli_kl(candidate_probabilities)
+            return {
+                item_idx: float(criterion)
+                for item_idx, criterion in zip(
+                    item_indices,
+                    criteria,
+                    strict=True,
+                )
+            }
+
+        return {
+            item_idx: self._mean_categorical_kl(
+                np.asarray(
+                    model.probability(theta_values, item_idx=item_idx),
+                    dtype=np.float64,
+                )
+            )
+            for item_idx in item_indices
+        }
+
+    @staticmethod
+    def _validate_available_items(
+        model: BaseItemModel,
+        available_items: set[int],
+    ) -> list[int]:
+        """Normalize candidate indices and reject invalid model access."""
+        normalized: list[int] = []
         for item_idx in available_items:
-            kl = self._compute_kl_info(model, theta, item_idx)
+            if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+                item_idx, Integral
+            ):
+                raise ValueError("available item indices must be integers")
+            item = int(item_idx)
+            if item < 0 or item >= model.n_items:
+                raise ValueError(
+                    f"available item {item} is out of range [0, {model.n_items})"
+                )
+            normalized.append(item)
+        normalized.sort()
+        return normalized
 
-            if kl > best_kl:
-                best_kl = kl
-                best_item = item_idx
+    def _evaluation_thetas(self, theta: float) -> NDArray[np.float64]:
+        """Return the current theta followed by every nonzero grid neighbor."""
+        if isinstance(theta, (bool, np.bool_)) or not isinstance(theta, Real):
+            raise ValueError("theta must be finite")
+        theta_value = float(theta)
+        if not np.isfinite(theta_value):
+            raise ValueError("theta must be finite")
 
-        return best_item
+        with np.errstate(over="ignore", invalid="ignore"):
+            neighbors = theta_value + self._neighbor_offsets
+        if not np.all(np.isfinite(neighbors)):
+            raise ValueError("theta neighborhood must be finite")
+        return np.concatenate(([theta_value], neighbors))[:, None]
+
+    @staticmethod
+    def _validate_probabilities(
+        probabilities: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Reject invalid model output before evaluating divergence."""
+        if (
+            not np.all(np.isfinite(probabilities))
+            or np.any(probabilities < 0.0)
+            or np.any(probabilities > 1.0)
+        ):
+            raise ValueError("model probabilities must be finite values in [0, 1]")
+        return probabilities
+
+    def _mean_bernoulli_kl(
+        self,
+        probabilities: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return mean Bernoulli KL divergence for each item column."""
+        probabilities = self._validate_probabilities(probabilities)
+        current = np.clip(
+            probabilities[0],
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        neighbors = np.clip(
+            probabilities[1:],
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        complement = 1.0 - current
+        divergences = current * np.log(current / neighbors) + complement * np.log(
+            complement / (1.0 - neighbors)
+        )
+        return np.maximum(np.mean(divergences, axis=0), 0.0)
+
+    def _mean_categorical_kl(
+        self,
+        probabilities: NDArray[np.float64],
+    ) -> float:
+        """Return mean categorical KL divergence across neighboring thetas."""
+        probabilities = self._validate_probabilities(probabilities)
+        probabilities = probabilities.reshape(probabilities.shape[0], -1)
+        probabilities = np.clip(probabilities, PROB_EPSILON, 1.0)
+        probabilities /= probabilities.sum(axis=1, keepdims=True)
+        current = probabilities[0]
+        divergences = np.sum(
+            current * np.log(current / probabilities[1:]),
+            axis=1,
+        )
+        return max(float(np.mean(divergences)), 0.0)
 
     def _compute_kl_info(
         self,
@@ -492,24 +627,14 @@ class KullbackLeibler(ItemSelectionStrategy):
         item_idx: int,
     ) -> float:
         """Compute KL information for an item at theta."""
-        theta_arr = np.array([[theta]])
-        prob_theta = model.probability(theta_arr, item_idx=item_idx)
-
-        theta_points = np.linspace(
-            theta - self.delta, theta + self.delta, self.n_points
+        theta_values = self._evaluation_thetas(theta)
+        probabilities = np.asarray(
+            model.probability(theta_values, item_idx=item_idx),
+            dtype=np.float64,
         )
-
-        kl_sum = 0.0
-        for t in theta_points:
-            if t == theta:
-                continue
-            t_arr = np.array([[t]])
-            prob_t = model.probability(t_arr, item_idx=item_idx)
-
-            kl = self._kl_divergence(prob_theta, prob_t)
-            kl_sum += kl
-
-        return kl_sum / (self.n_points - 1)
+        if model.is_polytomous:
+            return self._mean_categorical_kl(probabilities)
+        return float(self._mean_bernoulli_kl(probabilities.reshape(-1, 1))[0])
 
     def _kl_divergence(
         self,
@@ -517,17 +642,17 @@ class KullbackLeibler(ItemSelectionStrategy):
         q: NDArray[np.float64],
     ) -> float:
         """Compute KL divergence D(p || q)."""
-        p = np.clip(p.ravel(), PROB_EPSILON, 1 - PROB_EPSILON)
-        q = np.clip(q.ravel(), PROB_EPSILON, 1 - PROB_EPSILON)
+        p = self._validate_probabilities(np.asarray(p, dtype=np.float64).ravel())
+        q = self._validate_probabilities(np.asarray(q, dtype=np.float64).ravel())
+        if p.shape != q.shape:
+            raise ValueError("probability vectors must have the same shape")
 
         if len(p) == 1:
-            p_full = np.array([p[0], 1 - p[0]])
-            q_full = np.array([q[0], 1 - q[0]])
+            probabilities = np.array([[p[0]], [q[0]]], dtype=np.float64)
+            return float(self._mean_bernoulli_kl(probabilities)[0])
         else:
-            p_full = p
-            q_full = q
-
-        return float(np.sum(p_full * np.log(p_full / q_full)))
+            probabilities = np.vstack((p, q))
+            return self._mean_categorical_kl(probabilities)
 
     def _compute_criterion(
         self,
