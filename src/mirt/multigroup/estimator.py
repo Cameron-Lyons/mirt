@@ -597,67 +597,106 @@ class MultigroupEMEstimator:
         posterior_weights: list[NDArray[np.float64]],
         quad_points: NDArray[np.float64],
     ) -> None:
-        """Optimize a shared parameter by aggregating across groups."""
+        """Optimize one parameter against the joint expected likelihood."""
         group_model = model.get_group_model(0)
         current_params, bounds = self._get_param_and_bounds(
             group_model, item_idx, param_name
         )
 
         eps = self.prob_epsilon
+        contexts_match = self._item_contexts_match(model, item_idx, param_name)
 
         if model.is_polytomous:
             n_categories = group_model._n_categories[item_idx]
             n_quad = quad_points.shape[0]
-
-            aggregated_r_kc = np.zeros((n_quad, n_categories))
-            aggregated_n_k = np.zeros(n_quad)
+            group_r_kc = []
 
             for g in range(model.n_groups):
                 item_responses = responses[g][:, item_idx]
                 valid_mask = item_responses >= 0
                 group_weights = posterior_weights[g]
-
-                aggregated_n_k += np.sum(group_weights[valid_mask], axis=0)
-
+                r_kc = np.zeros((n_quad, n_categories))
                 for c in range(n_categories):
                     cat_mask = valid_mask & (item_responses == c)
-                    aggregated_r_kc[:, c] += np.sum(group_weights[cat_mask, :], axis=0)
+                    r_kc[:, c] = np.sum(group_weights[cat_mask, :], axis=0)
+                group_r_kc.append(r_kc)
 
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_param(group_model, item_idx, param_name, params)
+            if contexts_match:
+                aggregated_r_kc = np.sum(group_r_kc, axis=0)
 
-                probs = group_model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
+                def neg_expected_log_likelihood(
+                    params: NDArray[np.float64],
+                ) -> float:
+                    self._set_param(group_model, item_idx, param_name, params)
 
-                ll = np.sum(aggregated_r_kc * np.log(probs))
-                return -ll
+                    probs = group_model.probability(quad_points, item_idx)
+                    probs = np.clip(probs, eps, 1 - eps)
+
+                    return -float(np.sum(aggregated_r_kc * np.log(probs)))
+
+            else:
+
+                def neg_expected_log_likelihood(
+                    params: NDArray[np.float64],
+                ) -> float:
+                    expected_ll = 0.0
+                    for g, r_kc in enumerate(group_r_kc):
+                        current_model = model.get_group_model(g)
+                        self._set_param(current_model, item_idx, param_name, params)
+                        probs = current_model.probability(quad_points, item_idx)
+                        probs = np.clip(probs, eps, 1 - eps)
+                        expected_ll += float(np.sum(r_kc * np.log(probs)))
+                    return -expected_ll
 
         else:
-            aggregated_r_k = np.zeros(quad_points.shape[0])
-            aggregated_n_k = np.zeros(quad_points.shape[0])
+            group_stats = []
 
             for g in range(model.n_groups):
                 item_responses = responses[g][:, item_idx]
                 valid_mask = item_responses >= 0
                 group_weights = posterior_weights[g]
-
-                aggregated_n_k += np.sum(group_weights[valid_mask], axis=0)
-                aggregated_r_k += np.sum(
+                n_k = np.sum(group_weights[valid_mask], axis=0)
+                r_k = np.sum(
                     item_responses[valid_mask, None] * group_weights[valid_mask, :],
                     axis=0,
                 )
+                group_stats.append((r_k, n_k))
 
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_param(group_model, item_idx, param_name, params)
+            if contexts_match:
+                aggregated_r_k = np.sum([stats[0] for stats in group_stats], axis=0)
+                aggregated_n_k = np.sum([stats[1] for stats in group_stats], axis=0)
 
-                probs = group_model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
+                def neg_expected_log_likelihood(
+                    params: NDArray[np.float64],
+                ) -> float:
+                    self._set_param(group_model, item_idx, param_name, params)
 
-                ll = np.sum(
-                    aggregated_r_k * np.log(probs)
-                    + (aggregated_n_k - aggregated_r_k) * np.log(1 - probs)
-                )
-                return -ll
+                    probs = group_model.probability(quad_points, item_idx)
+                    probs = np.clip(probs, eps, 1 - eps)
+
+                    expected_ll = np.sum(
+                        aggregated_r_k * np.log(probs)
+                        + (aggregated_n_k - aggregated_r_k) * np.log(1 - probs)
+                    )
+                    return -float(expected_ll)
+
+            else:
+
+                def neg_expected_log_likelihood(
+                    params: NDArray[np.float64],
+                ) -> float:
+                    expected_ll = 0.0
+                    for g, (r_k, n_k) in enumerate(group_stats):
+                        current_model = model.get_group_model(g)
+                        self._set_param(current_model, item_idx, param_name, params)
+                        probs = current_model.probability(quad_points, item_idx)
+                        probs = np.clip(probs, eps, 1 - eps)
+                        expected_ll += float(
+                            np.sum(
+                                r_k * np.log(probs) + (n_k - r_k) * np.log(1 - probs)
+                            )
+                        )
+                    return -expected_ll
 
         result = minimize(
             neg_expected_log_likelihood,
@@ -672,6 +711,24 @@ class MultigroupEMEstimator:
             self._set_param(
                 model.get_group_model(g), item_idx, param_name, optimized_value
             )
+
+    @staticmethod
+    def _item_contexts_match(
+        model: MultigroupModel,
+        item_idx: int,
+        excluded_param: str,
+    ) -> bool:
+        """Return whether non-optimized item parameters match across groups."""
+        reference = model.get_group_model(0).parameters
+        for param_name in model.parameter_names:
+            if param_name == excluded_param:
+                continue
+            reference_value = reference[param_name][item_idx]
+            for group_idx in range(1, model.n_groups):
+                candidate = model.get_group_model(group_idx).parameters[param_name]
+                if not np.array_equal(reference_value, candidate[item_idx]):
+                    return False
+        return True
 
     def _optimize_group_item_param(
         self,
