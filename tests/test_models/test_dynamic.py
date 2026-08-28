@@ -13,7 +13,6 @@ from mirt.models.dynamic import (
     LongitudinalResult,
     NonlinearGrowthModel,
     PiecewiseGrowthModel,
-    StateSpaceIRT,
 )
 
 
@@ -223,133 +222,6 @@ class TestLongitudinalIRTModel:
         assert "Longitudinal IRT" in summary
         assert "Intercept" in summary
         assert "Slope" in summary
-
-
-class TestStateSpaceIRT:
-    @staticmethod
-    def _reference_simulation(model, n_persons, seed):
-        rng = np.random.default_rng(seed)
-        transition = model.transition_matrix[0, 0]
-        process_noise = model.process_noise[0, 0]
-        theta = np.zeros((n_persons, model.n_timepoints))
-        responses = np.zeros(
-            (n_persons, model.n_timepoints, model.n_items),
-            dtype=np.int32,
-        )
-        theta[:, 0] = rng.normal(
-            model.initial_mean,
-            np.sqrt(model.initial_var),
-            n_persons,
-        )
-        for time in range(1, model.n_timepoints):
-            theta[:, time] = transition * theta[:, time - 1] + rng.normal(
-                0,
-                np.sqrt(process_noise),
-                n_persons,
-            )
-        for person in range(n_persons):
-            for time in range(model.n_timepoints):
-                logits = model.discrimination * (theta[person, time] - model.difficulty)
-                probabilities = 1.0 / (1.0 + np.exp(-logits))
-                if model.base_model == "3PL":
-                    probabilities = (
-                        model.guessing + (1.0 - model.guessing) * probabilities
-                    )
-                responses[person, time] = rng.random(model.n_items) < probabilities
-        return responses, theta
-
-    def test_default_initialization(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        assert model.n_items == 5
-        assert model.n_timepoints == 4
-        assert model.transition_matrix.shape == (1, 1)
-        assert model.process_noise.shape == (1, 1)
-        assert model.guessing is None
-
-    def test_3pl_initialization(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4, base_model="3PL")
-        assert model.guessing is not None
-        assert model.guessing.shape == (5,)
-
-    def test_extended_kalman_filter(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        rng = np.random.default_rng(42)
-        responses = rng.integers(0, 2, (4, 5))
-        means, vars = model.extended_kalman_filter(responses)
-        assert means.shape == (4,)
-        assert vars.shape == (4,)
-        assert np.all(vars > 0)
-
-    def test_ekf_with_missing_data(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=3)
-        responses = np.array(
-            [
-                [1, 0, -1, 1, 0],
-                [-1, -1, -1, -1, -1],
-                [1, 1, 0, 1, 1],
-            ]
-        )
-        means, vars = model.extended_kalman_filter(responses)
-        assert means.shape == (3,)
-        assert np.all(np.isfinite(means))
-
-    def test_simulate(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=6)
-        n_persons = 20
-        responses, theta = model.simulate(n_persons, seed=42)
-        assert responses.shape == (n_persons, model.n_timepoints, model.n_items)
-        assert theta.shape == (n_persons, model.n_timepoints)
-        assert set(np.unique(responses)).issubset({0, 1})
-
-    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
-    def test_vectorized_simulation_preserves_seeded_draws(
-        self,
-        base_model,
-        monkeypatch,
-    ):
-        """Chunked broadcasting preserves the prior seeded response stream."""
-        from mirt.models import dynamic as dynamic_module
-
-        model = StateSpaceIRT(
-            n_items=7,
-            n_timepoints=5,
-            base_model=base_model,
-            discrimination=np.linspace(0.6, 1.8, 7),
-            difficulty=np.linspace(-1.0, 1.0, 7),
-        )
-        monkeypatch.setattr(
-            dynamic_module,
-            "_LONGITUDINAL_MAX_PROBABILITY_VALUES",
-            17,
-        )
-        expected_responses, expected_theta = self._reference_simulation(model, 13, 42)
-
-        responses, theta = model.simulate(13, seed=42)
-
-        np.testing.assert_array_equal(responses, expected_responses)
-        np.testing.assert_array_equal(theta, expected_theta)
-
-    @pytest.mark.parametrize("n_persons", [0, -1, True, 1.5])
-    def test_simulate_requires_positive_person_count(self, n_persons):
-        model = StateSpaceIRT(n_items=3, n_timepoints=2)
-
-        with pytest.raises(ValueError, match="n_persons"):
-            model.simulate(n_persons)
-
-    def test_simulate_theta_autocorrelation(self):
-        model = StateSpaceIRT(
-            n_items=5,
-            n_timepoints=10,
-            process_noise=np.array([[0.01]]),
-        )
-        _, theta = model.simulate(100, seed=42)
-        corr = np.corrcoef(theta[:, :-1].ravel(), theta[:, 1:].ravel())[0, 1]
-        assert corr > 0.5
-
-    def test_summary(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        summary = model.summary()
-        assert "State-Space IRT" in summary
 
 
 class TestPiecewiseGrowthModel:
@@ -571,6 +443,106 @@ class TestGrowthMixtureModel:
             model.class_likelihood(observations, time_values), np.exp(expected)
         )
 
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic", "piecewise"])
+    def test_incomplete_class_log_likelihood_matches_observed_marginals(
+        self,
+        growth_type,
+    ):
+        model = GrowthMixtureModel(
+            n_classes=3,
+            growth_type=growth_type,
+            class_intercepts=np.array([-0.8, 0.2, 1.1]),
+            class_slopes=np.array([0.1, -0.3, 0.5]),
+            class_quadratics=np.array([0.04, -0.02, 0.01]),
+            class_post_slopes=np.array([0.6, 0.2, -0.1]),
+            changepoint=0.5,
+            intercept_var=0.4,
+            slope_var=0.25,
+            residual_variance=0.2,
+        )
+        observations = np.array(
+            [
+                [0.1, np.nan, -0.4, 0.5, np.nan, 0.8, 1.0],
+                [np.nan, -0.2, 0.0, np.nan, 0.3, 0.5, np.nan],
+                [0.4, np.nan, -0.1, 0.2, np.nan, 0.6, 0.9],
+                [np.nan, np.nan, np.nan, 0.7, np.nan, np.nan, np.nan],
+            ]
+        )
+        time_values = np.linspace(-1.0, 2.0, observations.shape[1])
+        expected = np.empty((len(observations), model.n_classes))
+
+        for person_index, observation in enumerate(observations):
+            observed = ~np.isnan(observation)
+            observed_times = time_values[observed]
+            covariance = (
+                model.intercept_var * np.ones((observed.sum(), observed.sum()))
+                + model.slope_var * np.outer(observed_times, observed_times)
+                + model.residual_variance * np.eye(observed.sum())
+            )
+            _, log_determinant = np.linalg.slogdet(covariance)
+            for class_index in range(model.n_classes):
+                trajectory = model.compute_class_trajectory(
+                    class_index,
+                    time_values,
+                )[observed]
+                residual = observation[observed] - trajectory
+                expected[person_index, class_index] = -0.5 * (
+                    residual @ np.linalg.solve(covariance, residual)
+                    + observed.sum() * np.log(2.0 * np.pi)
+                    + log_determinant
+                )
+
+        actual = model.class_log_likelihood(observations, time_values)
+        posteriors = model.posterior_probabilities(observations, time_values)
+
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            model.class_likelihood(observations, time_values),
+            np.exp(expected),
+        )
+        assert_allclose(posteriors.sum(axis=1), 1.0)
+
+    def test_one_dimensional_incomplete_trajectory_is_one_person(self):
+        model = GrowthMixtureModel(n_classes=2)
+        observations = np.array([np.nan, 0.2, np.nan, 0.8])
+
+        log_likelihoods = model.class_log_likelihood(
+            observations,
+            np.arange(4.0),
+        )
+
+        assert log_likelihoods.shape == (1, 2)
+        assert np.all(np.isfinite(log_likelihoods))
+
+    def test_incomplete_likelihood_without_random_effects(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=0.3,
+        )
+        observations = np.array(
+            [[0.2, np.nan, 0.7], [np.nan, 0.3, 1.2]],
+        )
+        time_values = np.arange(3.0)
+        expected = np.empty((2, 2))
+        for person_index, observation in enumerate(observations):
+            observed = ~np.isnan(observation)
+            for class_index in range(model.n_classes):
+                trajectory = model.compute_class_trajectory(
+                    class_index,
+                    time_values,
+                )
+                residual = observation[observed] - trajectory[observed]
+                expected[person_index, class_index] = -0.5 * (
+                    np.sum(residual**2) / model.residual_variance
+                    + observed.sum() * np.log(2.0 * np.pi * model.residual_variance)
+                )
+
+        actual = model.class_log_likelihood(observations, time_values)
+
+        assert_allclose(actual, expected)
+
     def test_long_trajectory_posteriors_remain_normalized(self):
         model = GrowthMixtureModel(
             n_classes=2,
@@ -723,6 +695,266 @@ class TestGrowthMixtureModel:
         posteriors = model.posterior_probabilities(obs, t)
         assert posteriors.shape == (10, 3)
         assert_allclose(posteriors.sum(axis=1), np.ones(10), atol=1e-6)
+
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic", "piecewise"])
+    @pytest.mark.parametrize(
+        ("intercept_var", "slope_var"),
+        [(0.4, 0.25), (0.4, 0.0), (0.0, 0.25)],
+    )
+    def test_predict_trajectories_matches_dense_conditional_reference(
+        self,
+        growth_type,
+        intercept_var,
+        slope_var,
+    ):
+        model = GrowthMixtureModel(
+            n_classes=3,
+            growth_type=growth_type,
+            class_proportions=np.array([0.2, 0.5, 0.3]),
+            class_intercepts=np.array([-0.8, 0.2, 1.1]),
+            class_slopes=np.array([0.1, -0.3, 0.5]),
+            class_quadratics=np.array([0.04, -0.02, 0.01]),
+            class_post_slopes=np.array([0.6, 0.2, -0.1]),
+            changepoint=0.5,
+            intercept_var=intercept_var,
+            slope_var=slope_var,
+            residual_variance=0.2,
+        )
+        observations = np.array(
+            [
+                [0.1, np.nan, -0.4, 0.5, np.nan, 0.8, 1.0],
+                [np.nan, -0.2, 0.0, np.nan, 0.3, 0.5, np.nan],
+                [0.4, np.nan, -0.1, 0.2, np.nan, 0.6, 0.9],
+                [np.nan, np.nan, np.nan, 0.7, np.nan, np.nan, np.nan],
+            ]
+        )
+        time_values = np.linspace(-1.0, 2.0, observations.shape[1])
+        prediction_times = np.array([-2.0, 0.25, 1.75, 4.0])
+        posteriors = model.posterior_probabilities(observations, time_values)
+        class_predictions = np.vstack(
+            [
+                model.compute_class_trajectory(class_index, prediction_times)
+                for class_index in range(model.n_classes)
+            ]
+        )
+        expected = np.empty((len(observations), len(prediction_times)))
+        expected_variances = np.empty_like(expected)
+
+        for person_index, observation in enumerate(observations):
+            observed = ~np.isnan(observation)
+            observed_times = time_values[observed]
+            covariance = (
+                model.intercept_var * np.ones((observed.sum(), observed.sum()))
+                + model.slope_var * np.outer(observed_times, observed_times)
+                + model.residual_variance * np.eye(observed.sum())
+            )
+            cross_covariance = model.intercept_var * np.ones(
+                (len(prediction_times), observed.sum())
+            ) + model.slope_var * np.outer(prediction_times, observed_times)
+            conditional_variance = (
+                model.intercept_var
+                + model.slope_var * prediction_times**2
+                - np.einsum(
+                    "ij,ji->i",
+                    cross_covariance,
+                    np.linalg.solve(covariance, cross_covariance.T),
+                )
+            )
+            expected[person_index] = 0.0
+            expected_second_moment = conditional_variance.copy()
+            for class_index in range(model.n_classes):
+                observed_mean = model.compute_class_trajectory(
+                    class_index,
+                    time_values,
+                )[observed]
+                conditional_mean = class_predictions[class_index] + (
+                    cross_covariance
+                    @ np.linalg.solve(
+                        covariance,
+                        observation[observed] - observed_mean,
+                    )
+                )
+                expected[person_index] += (
+                    posteriors[person_index, class_index] * conditional_mean
+                )
+                expected_second_moment += (
+                    posteriors[person_index, class_index] * conditional_mean**2
+                )
+            expected_variances[person_index] = (
+                expected_second_moment - expected[person_index] ** 2
+            )
+
+        actual = model.predict_trajectories(
+            observations,
+            time_values,
+            prediction_times,
+        )
+        moment_mean, actual_variances = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
+
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(moment_mean, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            actual_variances,
+            expected_variances,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+
+    def test_predict_trajectories_without_random_effects_uses_class_means(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.4, 0.6]),
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.2, -0.1]),
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=0.3,
+        )
+        observations = np.array(
+            [[-0.8, np.nan, 0.0], [np.nan, 0.7, 0.5]],
+        )
+        time_values = np.arange(3.0)
+        prediction_times = np.array([-1.0, 0.5, 4.0])
+        posteriors = model.posterior_probabilities(observations, time_values)
+        class_predictions = np.vstack(
+            [
+                model.compute_class_trajectory(class_index, prediction_times)
+                for class_index in range(model.n_classes)
+            ]
+        )
+
+        actual = model.predict_trajectories(
+            observations,
+            time_values,
+            prediction_times,
+        )
+        moment_mean, latent_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
+        observation_mean, observation_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+            include_residual=True,
+        )
+        expected_mean = posteriors @ class_predictions
+        expected_latent_variance = posteriors @ class_predictions**2 - expected_mean**2
+
+        assert_allclose(actual, expected_mean)
+        assert_allclose(moment_mean, expected_mean)
+        assert_allclose(observation_mean, expected_mean)
+        assert_allclose(latent_variance, expected_latent_variance)
+        assert_allclose(
+            observation_variance,
+            expected_latent_variance + model.residual_variance,
+        )
+
+    def test_piecewise_prediction_preserves_observed_grid_midpoint(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.2, -0.1]),
+            class_post_slopes=np.array([0.8, -0.5]),
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=0.3,
+        )
+        observations = np.array(
+            [[-0.8, -0.4, 0.1, 0.9, 1.7], [1.0, 0.8, 0.7, 0.1, -0.4]],
+        )
+        time_values = np.arange(5.0)
+        prediction_times = np.array([5.0, 6.0, 8.0])
+        posteriors = model.posterior_probabilities(observations, time_values)
+        observed_midpoint = 0.5 * (time_values.min() + time_values.max())
+        hinge = np.maximum(prediction_times - observed_midpoint, 0.0)
+        expected_class_predictions = (
+            model.class_intercepts[:, None]
+            + model.class_slopes[:, None] * prediction_times
+            + (model.class_post_slopes - model.class_slopes)[:, None] * hinge[None, :]
+        )
+
+        actual = model.predict_trajectories(
+            observations,
+            time_values,
+            prediction_times,
+        )
+
+        assert_allclose(actual, posteriors @ expected_class_predictions)
+
+    def test_predict_trajectories_defaults_to_observed_time_grid(self):
+        model = GrowthMixtureModel(n_classes=2)
+        observations = np.array([np.nan, 0.2, 0.4, np.nan])
+        original = observations.copy()
+
+        predictions = model.predict_trajectories(
+            observations,
+            np.arange(4.0),
+        )
+
+        assert predictions.shape == (1, 4)
+        assert np.all(np.isfinite(predictions))
+        assert np.array_equal(observations, original, equal_nan=True)
+
+    def test_predictive_variance_preserves_small_class_spread_at_large_offset(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.5, 0.5]),
+            class_intercepts=np.array([1.0e12, 1.0e12 + 1.0]),
+            class_slopes=np.zeros(2),
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=1.0,
+        )
+        observations = np.array([[1.0e12 + 0.5]])
+        time_values = np.array([0.0])
+        posteriors = model.posterior_probabilities(observations, time_values)[0]
+
+        mean, variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+        )
+
+        assert mean[0, 0] == pytest.approx(posteriors @ model.class_intercepts)
+        assert variance[0, 0] == pytest.approx(posteriors[0] * posteriors[1])
+        assert variance[0, 0] > 0.0
+
+    @pytest.mark.parametrize("include_residual", [1, 0.0, "yes", None])
+    def test_predict_trajectory_moments_validates_include_residual(
+        self,
+        include_residual,
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(TypeError, match="include_residual must be a boolean"):
+            model.predict_trajectory_moments(
+                np.zeros((2, 3)),
+                np.arange(3.0),
+                include_residual=include_residual,
+            )
+
+    @pytest.mark.parametrize(
+        "prediction_times",
+        [np.array([]), np.zeros((2, 2)), np.array([0.0, np.nan]), np.array(["x"])],
+    )
+    def test_predict_trajectories_validates_prediction_times(
+        self,
+        prediction_times,
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(ValueError, match="time_values"):
+            model.predict_trajectories(
+                np.zeros((2, 3)),
+                np.arange(3.0),
+                prediction_times,
+            )
 
     def test_simulate(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)
@@ -971,6 +1203,143 @@ class TestGrowthMixtureModel:
         )
         assert np.isfinite(result["log_likelihood"])
 
+    def test_incomplete_fit_update_matches_dense_gls_reference(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_proportions=np.array([0.45, 0.55]),
+            class_intercepts=np.array([-0.7, 0.8]),
+            class_slopes=np.array([0.2, -0.1]),
+            class_post_slopes=np.array([0.5, -0.4]),
+            changepoint=0.25,
+            intercept_var=0.4,
+            slope_var=0.2,
+            residual_variance=0.3,
+        )
+        observations = np.array(
+            [
+                [-0.7, np.nan, -0.1, 0.2, 0.8, np.nan],
+                [np.nan, 0.1, 0.4, np.nan, 1.0, 1.4],
+                [0.9, 0.7, np.nan, 0.4, np.nan, -0.2],
+                [1.1, np.nan, 0.8, 0.2, -0.1, -0.6],
+                [-0.4, -0.2, 0.0, np.nan, 0.7, 1.1],
+            ]
+        )
+        time_values = np.linspace(-1.0, 2.0, observations.shape[1])
+        hinge = np.maximum(time_values - model.changepoint, 0.0)
+        design = np.column_stack([np.ones(len(time_values)), time_values, hinge])
+        posteriors = model.posterior_probabilities(observations, time_values)
+        expected_coefficients = np.empty((model.n_classes, design.shape[1]))
+
+        for class_index in range(model.n_classes):
+            normal_matrix = np.zeros((design.shape[1], design.shape[1]))
+            right_hand_side = np.zeros(design.shape[1])
+            for person_index, observation in enumerate(observations):
+                observed = ~np.isnan(observation)
+                observed_times = time_values[observed]
+                observed_design = design[observed]
+                covariance = (
+                    model.intercept_var * np.ones((observed.sum(), observed.sum()))
+                    + model.slope_var * np.outer(observed_times, observed_times)
+                    + model.residual_variance * np.eye(observed.sum())
+                )
+                precision_design = np.linalg.solve(covariance, observed_design)
+                weight = posteriors[person_index, class_index]
+                normal_matrix += weight * observed_design.T @ precision_design
+                right_hand_side += (
+                    weight
+                    * observed_design.T
+                    @ np.linalg.solve(covariance, observation[observed])
+                )
+            expected_coefficients[class_index] = np.linalg.solve(
+                normal_matrix,
+                right_hand_side,
+            )
+
+        result = model.fit_em(observations, time_values, max_iter=1)
+
+        assert_allclose(model.class_proportions, posteriors.mean(axis=0))
+        assert_allclose(model.class_intercepts, expected_coefficients[:, 0])
+        assert_allclose(model.class_slopes, expected_coefficients[:, 1])
+        assert_allclose(
+            model.class_post_slopes,
+            expected_coefficients[:, 1] + expected_coefficients[:, 2],
+        )
+        assert np.isfinite(result["log_likelihood"])
+
+    def test_shared_missing_pattern_matches_reduced_dataset_fit(self):
+        time_values = np.arange(6.0)
+        observations = np.random.default_rng(18).normal(size=(40, 6))
+        observations[:, 2] = np.nan
+        observed = ~np.isnan(observations[0])
+        incomplete_model = GrowthMixtureModel(n_classes=2)
+        reduced_model = GrowthMixtureModel(n_classes=2)
+
+        incomplete = incomplete_model.fit_em(
+            observations,
+            time_values,
+            max_iter=5,
+        )
+        reduced = reduced_model.fit_em(
+            observations[:, observed],
+            time_values[observed],
+            max_iter=5,
+        )
+
+        assert_allclose(
+            incomplete_model.class_proportions,
+            reduced_model.class_proportions,
+        )
+        assert_allclose(
+            incomplete_model.class_intercepts,
+            reduced_model.class_intercepts,
+        )
+        assert_allclose(incomplete_model.class_slopes, reduced_model.class_slopes)
+        assert_allclose(incomplete["posteriors"], reduced["posteriors"])
+        assert incomplete["log_likelihood"] == pytest.approx(reduced["log_likelihood"])
+
+    def test_piecewise_fit_recovers_classes_with_incomplete_trajectories(self):
+        time_values = np.arange(7.0)
+        source = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_proportions=np.array([0.5, 0.5]),
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.2, -0.2]),
+            class_post_slopes=np.array([0.8, -0.8]),
+            changepoint=3.0,
+            intercept_var=0.05,
+            slope_var=0.01,
+            residual_variance=0.05,
+        )
+        observations, expected_classes = source.simulate(
+            500,
+            time_values,
+            seed=42,
+        )
+        missing = np.random.default_rng(43).random(observations.shape) < 0.25
+        missing[:, 0] = False
+        observations[missing] = np.nan
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_intercepts=np.array([-0.7, 0.7]),
+            class_slopes=np.array([0.1, -0.1]),
+            class_post_slopes=np.array([0.5, -0.5]),
+            changepoint=3.0,
+            intercept_var=0.05,
+            slope_var=0.01,
+            residual_variance=0.05,
+        )
+
+        result = model.fit(observations, time_values, max_iter=50)
+
+        assert np.mean(result.classifications == expected_classes) > 0.95
+        assert_allclose(model.class_intercepts, source.class_intercepts, atol=0.06)
+        assert_allclose(model.class_slopes, source.class_slopes, atol=0.06)
+        assert_allclose(model.class_post_slopes, source.class_post_slopes, atol=0.06)
+        assert result.converged is True
+
     def test_piecewise_fit_recovers_segment_slopes_and_classes(self):
         time_values = np.arange(6.0)
         source = GrowthMixtureModel(
@@ -1091,7 +1460,8 @@ class TestGrowthMixtureModel:
         [
             (np.empty((0, 3)), np.arange(3.0), "non-empty"),
             (np.zeros((2, 3)), np.arange(2.0), "one value per observation"),
-            (np.array([[0.0, np.nan]]), np.arange(2.0), "finite"),
+            (np.array([[0.0, np.inf]]), np.arange(2.0), "finite values or NaN"),
+            (np.array([[np.nan, np.nan]]), np.arange(2.0), "at least one"),
             (np.zeros((2, 2)), np.array([0.0, np.inf]), "finite"),
         ],
     )
@@ -1125,6 +1495,14 @@ class TestGrowthMixtureModel:
 
         with pytest.raises(ValueError, match="full-rank"):
             model.fit_em(np.zeros((3, 5)), np.ones(5))
+
+    def test_fit_em_requires_full_rank_across_observed_occasions(self):
+        model = GrowthMixtureModel(n_classes=2, growth_type="quadratic")
+        observations = np.full((4, 5), np.nan)
+        observations[:, :2] = 0.0
+
+        with pytest.raises(ValueError, match="observed time_values.*full-rank"):
+            model.fit_em(observations, np.arange(5.0))
 
     @pytest.mark.parametrize("changepoint", [np.nan, np.inf, "invalid"])
     def test_piecewise_model_validates_changepoint(self, changepoint):
