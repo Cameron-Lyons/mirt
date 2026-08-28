@@ -4,7 +4,10 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt.models import GradedResponseModel, TwoParameterLogistic
+from mirt.scoring._common import build_quadrature, validate_scoring_responses
 from mirt.scoring.eap import EAPScorer
+from mirt.utils.numeric import logsumexp_axis1
 
 
 class TestEAPScorerInitialization:
@@ -29,6 +32,12 @@ class TestEAPScorerInitialization:
         with pytest.raises(ValueError, match="at least 5"):
             EAPScorer(n_quadpts=3)
 
+    @pytest.mark.parametrize("n_quadpts", [True, 5.5, "7"])
+    def test_rejects_non_integer_n_quadpts(self, n_quadpts):
+        """Reject ambiguous quadrature-size inputs during construction."""
+        with pytest.raises(ValueError, match="at least 5"):
+            EAPScorer(n_quadpts=n_quadpts)
+
     def test_custom_prior_mean(self):
         """Test initialization with custom prior mean."""
         prior_mean = np.array([0.5])
@@ -42,6 +51,18 @@ class TestEAPScorerInitialization:
         scorer = EAPScorer(prior_cov=prior_cov)
 
         assert_allclose(scorer.prior_cov, prior_cov)
+
+    def test_prior_inputs_are_detached(self):
+        """Later caller mutations cannot reconfigure an existing scorer."""
+        prior_mean = np.array([0.5])
+        prior_cov = np.array([[2.0]])
+
+        scorer = EAPScorer(prior_mean=prior_mean, prior_cov=prior_cov)
+        prior_mean[0] = 9.0
+        prior_cov[0, 0] = 9.0
+
+        assert_allclose(scorer.prior_mean, [0.5])
+        assert_allclose(scorer.prior_cov, [[2.0]])
 
     def test_repr(self):
         """Test __repr__ method."""
@@ -94,6 +115,111 @@ class TestEAPScorerScoring:
 
         with pytest.raises(ValueError, match="fitted"):
             scorer.score(model, dichotomous_responses["responses"])
+
+    @pytest.mark.parametrize(
+        ("responses", "message"),
+        [
+            ([0, 1], "2D"),
+            ([[0, 1, 0]], "items, expected"),
+            ([[0.0, 0.5]], "integer-valued"),
+            ([[0.0, np.nan]], "finite"),
+            ([[0, 2]], "only 0, 1"),
+            ([["yes", "no"]], "numeric"),
+        ],
+    )
+    def test_validates_response_contracts(self, responses, message):
+        """Reject malformed dichotomous response matrices before scoring."""
+        model = TwoParameterLogistic(n_items=2)
+        model._is_fitted = True
+
+        with pytest.raises(ValueError, match=message):
+            EAPScorer().score(model, responses)
+
+    def test_validates_polytomous_categories(self):
+        """Reject categories outside an item's configured range."""
+        model = GradedResponseModel(n_items=2, n_categories=[3, 4])
+        model._is_fitted = True
+
+        with pytest.raises(ValueError, match="category range"):
+            EAPScorer().score(model, np.array([[3, 0]]))
+
+    def test_normalizes_missing_codes_before_likelihood(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Equivalent negative missing codes share the canonical representation."""
+        model = TwoParameterLogistic(n_items=2)
+        model._is_fitted = True
+        original = model.log_likelihood_batch
+        received = []
+
+        def capture(responses, theta):
+            received.append(responses.copy())
+            return original(responses, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", capture)
+        result = EAPScorer(n_quadpts=9).score(
+            model,
+            np.array([[-1, 0], [-999, 0]]),
+        )
+
+        assert_allclose(received[0], [[-1, 0], [-1, 0]])
+        assert_allclose(result.theta[0], result.theta[1])
+        assert_allclose(result.standard_error[0], result.standard_error[1])
+
+    def test_reuses_canonical_integer_response_storage(self):
+        """Validation does not copy an already normalized native integer matrix."""
+        model = TwoParameterLogistic(n_items=2)
+        responses = np.array([[0, 1], [-1, 0]], dtype=np.int_)
+
+        normalized = validate_scoring_responses(model, responses)
+
+        assert np.shares_memory(normalized, responses)
+
+    def test_supports_empty_batches(self):
+        """Return empty score arrays for an empty, correctly shaped matrix."""
+        model = TwoParameterLogistic(n_items=2)
+        model._is_fitted = True
+
+        result = EAPScorer().score(model, np.empty((0, 2), dtype=int))
+
+        assert result.theta.shape == (0,)
+        assert result.standard_error.shape == (0,)
+
+    def test_centered_moments_match_reference_calculation(self):
+        """The allocation-light moment kernel preserves EAP estimates."""
+        model = TwoParameterLogistic(n_items=3, n_factors=2)
+        model.set_parameters(
+            discrimination=np.array([[1.2, 0.2], [0.1, 1.4], [0.8, 0.9]]),
+            difficulty=np.array([-0.5, 0.2, 0.8]),
+        )
+        model._is_fitted = True
+        responses = np.array([[1, 0, 1], [0, 1, -7], [1, 1, 0]])
+        prior_mean = np.array([100_000.0, -100_000.0])
+        prior_cov = np.array([[1.5, 0.2], [0.2, 0.8]])
+        scorer = EAPScorer(
+            n_quadpts=5,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
+
+        result = scorer.score(model, responses)
+        normalized = validate_scoring_responses(model, responses)
+        points, weights = build_quadrature(
+            n_quadpts=5,
+            n_factors=2,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
+        log_posterior = model.log_likelihood_batch(normalized, points)
+        log_posterior += np.log(weights + 1e-300)[None, :]
+        log_posterior -= logsumexp_axis1(log_posterior)[:, None]
+        posterior = np.exp(log_posterior)
+        expected_theta = posterior @ points
+        deviation = points[None, :, :] - expected_theta[:, None, :]
+        expected_se = np.sqrt(np.sum(posterior[:, :, None] * deviation**2, axis=1))
+
+        assert_allclose(result.theta, expected_theta, rtol=1e-12, atol=1e-9)
+        assert_allclose(result.standard_error, expected_se, rtol=1e-10, atol=1e-10)
 
 
 class TestEAPScorerCustomPrior:
