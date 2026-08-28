@@ -70,6 +70,32 @@ class TestMixtureIRT:
         assert "guessing" in params
         assert len(params["difficulty"]) == 10
 
+    def test_public_parameter_accessors_return_detached_arrays(self):
+        """Public accessors cannot mutate stored class parameters."""
+        model = MixtureIRT(n_items=2, n_classes=2, base_model="3PL")
+        before = model.parameters
+
+        model.class_proportions[:] = [1.0, 0.0]
+        class_parameters = model.get_class_parameters(0)
+        for values in class_parameters.values():
+            values[:] = 99.0
+
+        for name, values in before.items():
+            assert_allclose(model.parameters[name], values)
+
+    def test_item_updates_preserve_class_parameter_domains(self):
+        """Per-item edits run the mixture model's domain validation."""
+        model = MixtureIRT(n_items=2, n_classes=2, base_model="3PL")
+        before = model.parameters
+
+        with pytest.raises(ValueError, match="Discriminations must be positive"):
+            model.set_item_parameter(0, "discrimination_class0", 0.0)
+        with pytest.raises(ValueError, match="Guessing parameters"):
+            model.set_item_parameter(1, "guessing_class1", 1.0)
+
+        for name, values in before.items():
+            assert_allclose(model.parameters[name], values)
+
     def test_probability(self):
         """Test marginal probability computation."""
         model = MixtureIRT(n_items=10, n_classes=2)

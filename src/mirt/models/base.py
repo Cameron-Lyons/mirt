@@ -115,6 +115,7 @@ class BaseItemModel(ABC):
         return np.asarray(values, dtype=np.float64).copy()
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        validated: dict[str, NDArray[np.float64]] = {}
         for name, value in params.items():
             if name not in self._parameters:
                 valid_params = ", ".join(self._parameters.keys())
@@ -123,7 +124,14 @@ class BaseItemModel(ABC):
                     parameter=name,
                     expected=valid_params,
                 )
-            value_arr = np.asarray(value, dtype=np.float64)
+            try:
+                value_arr = np.array(value, dtype=np.float64, copy=True)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must contain numeric values",
+                    parameter=name,
+                    value=value,
+                ) from exc
             if value_arr.shape != self._parameters[name].shape:
                 raise MirtValidationError(
                     f"Shape mismatch for {name}: expected {self._parameters[name].shape}, "
@@ -132,14 +140,24 @@ class BaseItemModel(ABC):
                     value=value_arr.shape,
                     expected=str(self._parameters[name].shape),
                 )
-            self._parameters[name] = value_arr
+            validated[name] = value_arr
+        self._parameters.update(validated)
         return self
+
+    def _validate_item_index(self, item_idx: int) -> int:
+        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+            item_idx, (int, np.integer)
+        ):
+            raise IndexError("item_idx must be an integer")
+        index = int(item_idx)
+        if index < 0 or index >= self.n_items:
+            raise IndexError(f"Item index {index} out of range [0, {self.n_items})")
+        return index
 
     def get_item_parameters(
         self, item_idx: int
     ) -> dict[str, float | NDArray[np.float64]]:
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
+        item_idx = self._validate_item_index(item_idx)
 
         result: dict[str, float | NDArray[np.float64]] = {}
         for name, values in self._parameters.items():
@@ -168,8 +186,7 @@ class BaseItemModel(ABC):
             IndexError: If item_idx is out of range.
             MirtValidationError: If param_name is not a valid parameter.
         """
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
+        item_idx = self._validate_item_index(item_idx)
         if param_name not in self._parameters:
             valid_params = ", ".join(self._parameters.keys())
             raise MirtValidationError(
@@ -178,16 +195,31 @@ class BaseItemModel(ABC):
                 expected=valid_params,
             )
 
-        values = self._parameters[param_name]
-        if values.ndim == 1 and len(values) == self.n_items:
-            values[item_idx] = float(value)
-        elif values.ndim == 2 and values.shape[0] == self.n_items:
-            values[item_idx] = np.asarray(value, dtype=np.float64)
-        else:
+        current = self._parameters[param_name]
+        if not (
+            (current.ndim == 1 and len(current) == self.n_items)
+            or (current.ndim == 2 and current.shape[0] == self.n_items)
+        ):
             raise MirtValidationError(
                 f"Parameter {param_name} does not have per-item values",
                 parameter=param_name,
             )
+
+        updated = current.copy()
+        try:
+            if updated.ndim == 1:
+                updated[item_idx] = float(value)
+            else:
+                updated[item_idx] = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"Invalid per-item value for {param_name}",
+                parameter=param_name,
+                value=value,
+            ) from exc
+        if np.array_equal(updated, current):
+            return
+        self.set_parameters(**{param_name: updated})
 
     def _ensure_theta_2d(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         theta = np.asarray(theta, dtype=np.float64)
