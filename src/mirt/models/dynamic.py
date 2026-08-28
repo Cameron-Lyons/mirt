@@ -2233,6 +2233,8 @@ class GrowthMixtureModel:
     def _validated_class_trajectories(
         self,
         times: NDArray[np.float64],
+        *,
+        piecewise_changepoint: float | None = None,
     ) -> NDArray[np.float64]:
         """Build finite class trajectories from validated time values."""
         try:
@@ -2265,7 +2267,12 @@ class GrowthMixtureModel:
                 np.isfinite(post_slopes)
             ):
                 raise ValueError("class post slopes must be finite and match n_classes")
-            hinge = np.maximum(times - self._resolved_changepoint(times), 0.0)
+            changepoint = (
+                self._resolved_changepoint(times)
+                if piecewise_changepoint is None
+                else piecewise_changepoint
+            )
+            hinge = np.maximum(times - changepoint, 0.0)
             trajectories += (post_slopes - slopes)[:, None] * hinge[None, :]
         return trajectories
 
@@ -2568,6 +2575,106 @@ class GrowthMixtureModel:
         log_likelihoods = self.class_log_likelihood(observations, time_values)
         posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
         return posteriors
+
+    def predict_trajectories(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+        prediction_times: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Predict person-level latent trajectories from observed histories.
+
+        Predictions average over posterior class probabilities and condition
+        each class's random intercept and slope on the person's observed
+        values. They represent the latent trajectory mean and exclude new
+        occasion-specific residual error.
+
+        Parameters
+        ----------
+        observations : NDArray
+            Observed trajectories with shape ``(n_persons, n_timepoints)``.
+            Use ``NaN`` for missing occasions; every person must have at least
+            one observed value.
+        time_values : NDArray
+            One finite time value per observation column.
+        prediction_times : NDArray, optional
+            Finite times at which to predict. The observed time grid is used
+            when omitted.
+
+        Returns
+        -------
+        NDArray
+            Posterior mean latent trajectories with shape
+            ``(n_persons, n_prediction_times)``.
+        """
+        values, times, trajectories, variances, observation_mask = (
+            self._validated_trajectory_data(
+                observations,
+                time_values,
+            )
+        )
+        if prediction_times is None:
+            prediction_values = times
+            prediction_trajectories = trajectories
+        else:
+            prediction_values = self._validated_time_values(prediction_times)
+            prediction_changepoint = (
+                self._resolved_changepoint(times)
+                if self.growth_type == "piecewise"
+                else None
+            )
+            prediction_trajectories = self._validated_class_trajectories(
+                prediction_values,
+                piecewise_changepoint=prediction_changepoint,
+            )
+
+        patterns = self._prepare_observation_patterns(
+            values,
+            times,
+            variances,
+            observation_mask,
+        )
+        log_likelihoods = self._class_log_likelihood_from_patterns(
+            values,
+            trajectories,
+            patterns,
+        )
+        posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
+        intercept_variance, slope_variance, _ = variances
+        predictions = np.empty(
+            (values.shape[0], prediction_values.size),
+            dtype=np.float64,
+        )
+
+        for pattern in patterns:
+            pattern_posteriors = posteriors[pattern.rows]
+            pattern_predictions = pattern_posteriors @ prediction_trajectories
+            if intercept_variance > 0.0 or slope_variance > 0.0:
+                observed_times = times[pattern.columns]
+                cross_covariance = np.full(
+                    (prediction_values.size, pattern.columns.size),
+                    intercept_variance,
+                    dtype=np.float64,
+                )
+                if slope_variance > 0.0:
+                    cross_covariance += slope_variance * np.outer(
+                        prediction_values,
+                        observed_times,
+                    )
+                pattern_values = values[np.ix_(pattern.rows, pattern.columns)]
+                for class_index in range(self.n_classes):
+                    residuals = (
+                        pattern_values - trajectories[class_index, pattern.columns]
+                    )
+                    precision_residuals = pattern.covariance.solve(residuals.T).T
+                    correction = precision_residuals @ cross_covariance.T
+                    pattern_predictions += (
+                        pattern_posteriors[:, class_index, None] * correction
+                    )
+
+            predictions[pattern.rows] = pattern_predictions
+
+        return predictions
 
     def simulate(
         self,

@@ -117,6 +117,29 @@ growth curve. Infinite values remain invalid. Rows with identical observation
 patterns share covariance work, while complete inputs continue through the
 optimized complete-data path.
 
+Person-level trajectory prediction
+----------------------------------
+
+Predict smoothed latent trajectories on the observed grid or extrapolate them
+to new times after fitting:
+
+.. code-block:: python
+
+   future_times = np.arange(0.0, 10.0)
+   predicted = mixture.predict_trajectories(
+       incomplete,
+       time_values,
+       prediction_times=future_times,
+   )
+   print(predicted.shape)  # (500, 10)
+
+Predictions combine posterior class probabilities with empirical-Bayes random
+intercept and slope estimates conditioned on each person's available history.
+They are latent trajectory means, so they exclude new occasion-specific
+residual error. Missing occasions are handled directly and need not be imputed
+first. For piecewise growth with an implicit changepoint, extrapolation keeps
+the midpoint resolved from the observed time grid.
+
 For continuous two-segment trajectories, use piecewise growth with a shared
 changepoint and class-specific slopes on each side:
 
