@@ -226,6 +226,38 @@ class TestLongitudinalIRTModel:
 
 
 class TestStateSpaceIRT:
+    @staticmethod
+    def _reference_simulation(model, n_persons, seed):
+        rng = np.random.default_rng(seed)
+        transition = model.transition_matrix[0, 0]
+        process_noise = model.process_noise[0, 0]
+        theta = np.zeros((n_persons, model.n_timepoints))
+        responses = np.zeros(
+            (n_persons, model.n_timepoints, model.n_items),
+            dtype=np.int32,
+        )
+        theta[:, 0] = rng.normal(
+            model.initial_mean,
+            np.sqrt(model.initial_var),
+            n_persons,
+        )
+        for time in range(1, model.n_timepoints):
+            theta[:, time] = transition * theta[:, time - 1] + rng.normal(
+                0,
+                np.sqrt(process_noise),
+                n_persons,
+            )
+        for person in range(n_persons):
+            for time in range(model.n_timepoints):
+                logits = model.discrimination * (theta[person, time] - model.difficulty)
+                probabilities = 1.0 / (1.0 + np.exp(-logits))
+                if model.base_model == "3PL":
+                    probabilities = (
+                        model.guessing + (1.0 - model.guessing) * probabilities
+                    )
+                responses[person, time] = rng.random(model.n_items) < probabilities
+        return responses, theta
+
     def test_default_initialization(self):
         model = StateSpaceIRT(n_items=5, n_timepoints=4)
         assert model.n_items == 5
@@ -268,6 +300,41 @@ class TestStateSpaceIRT:
         assert responses.shape == (n_persons, model.n_timepoints, model.n_items)
         assert theta.shape == (n_persons, model.n_timepoints)
         assert set(np.unique(responses)).issubset({0, 1})
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    def test_vectorized_simulation_preserves_seeded_draws(
+        self,
+        base_model,
+        monkeypatch,
+    ):
+        """Chunked broadcasting preserves the prior seeded response stream."""
+        from mirt.models import dynamic as dynamic_module
+
+        model = StateSpaceIRT(
+            n_items=7,
+            n_timepoints=5,
+            base_model=base_model,
+            discrimination=np.linspace(0.6, 1.8, 7),
+            difficulty=np.linspace(-1.0, 1.0, 7),
+        )
+        monkeypatch.setattr(
+            dynamic_module,
+            "_LONGITUDINAL_MAX_PROBABILITY_VALUES",
+            17,
+        )
+        expected_responses, expected_theta = self._reference_simulation(model, 13, 42)
+
+        responses, theta = model.simulate(13, seed=42)
+
+        np.testing.assert_array_equal(responses, expected_responses)
+        np.testing.assert_array_equal(theta, expected_theta)
+
+    @pytest.mark.parametrize("n_persons", [0, -1, True, 1.5])
+    def test_simulate_requires_positive_person_count(self, n_persons):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+
+        with pytest.raises(ValueError, match="n_persons"):
+            model.simulate(n_persons)
 
     def test_simulate_theta_autocorrelation(self):
         model = StateSpaceIRT(

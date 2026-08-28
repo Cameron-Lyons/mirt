@@ -1388,16 +1388,19 @@ class StateSpaceIRT:
         tuple
             (responses, theta_trajectories)
         """
+        if (
+            isinstance(n_persons, bool)
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        n_persons = int(n_persons)
         rng = np.random.default_rng(seed)
 
         A = self.transition_matrix[0, 0]
         Q = self.process_noise[0, 0]
 
         theta = np.zeros((n_persons, self.n_timepoints))
-        responses = np.zeros(
-            (n_persons, self.n_timepoints, self.n_items), dtype=np.int32
-        )
-
         theta[:, 0] = rng.normal(
             self.initial_mean, np.sqrt(self.initial_var), n_persons
         )
@@ -1405,15 +1408,30 @@ class StateSpaceIRT:
         for t in range(1, self.n_timepoints):
             theta[:, t] = A * theta[:, t - 1] + rng.normal(0, np.sqrt(Q), n_persons)
 
-        for i in range(n_persons):
-            for t in range(self.n_timepoints):
-                z = self.discrimination * (theta[i, t] - self.difficulty)
-                p = sigmoid(z)
+        flat_theta = theta.reshape(-1)
+        flat_responses = np.empty((flat_theta.size, self.n_items), dtype=np.int32)
+        rows_per_chunk = max(
+            1,
+            _LONGITUDINAL_MAX_PROBABILITY_VALUES // self.n_items,
+        )
+        for start in range(0, flat_theta.size, rows_per_chunk):
+            stop = min(start + rows_per_chunk, flat_theta.size)
+            logits = self.discrimination[None, :] * (
+                flat_theta[start:stop, None] - self.difficulty[None, :]
+            )
+            probabilities = sigmoid(logits)
+            if self.base_model == "3PL":
+                probabilities = (
+                    self.guessing[None, :]
+                    + (1.0 - self.guessing[None, :]) * probabilities
+                )
+            flat_responses[start:stop] = rng.random(probabilities.shape) < probabilities
 
-                if self.base_model == "3PL":
-                    p = self.guessing + (1 - self.guessing) * p
-
-                responses[i, t] = (rng.random(self.n_items) < p).astype(np.int32)
+        responses = flat_responses.reshape(
+            n_persons,
+            self.n_timepoints,
+            self.n_items,
+        )
 
         return responses, theta
 
