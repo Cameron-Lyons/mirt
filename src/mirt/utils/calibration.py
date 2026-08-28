@@ -281,32 +281,51 @@ def _fixed_calib_m_step(
 
     updated_disc = discrimination.copy()
     updated_diff = difficulty.copy()
-    for item_index, item_counts in enumerate(counts):
-        valid_points = item_counts > min_count
-        if np.count_nonzero(valid_points) < min_valid_points:
-            continue
+    valid_points = counts > min_count
+    eligible = np.count_nonzero(valid_points, axis=1) >= min_valid_points
+    if not np.any(eligible):
+        return updated_disc, updated_diff
 
-        proportions = correct_counts[item_index] / np.maximum(item_counts, PROB_EPSILON)
-        proportions = np.clip(proportions, *prob_clamp)
-        logits = np.log(proportions / (1.0 - proportions))
+    proportions = correct_counts / np.maximum(counts, PROB_EPSILON)
+    proportions = np.clip(proportions, *prob_clamp)
+    logits = np.log(proportions / (1.0 - proportions))
+    regression_weights = np.where(valid_points, counts, 0.0)
+    weight_sums = np.sum(regression_weights, axis=1)
+    safe_weight_sums = np.where(weight_sums > 0.0, weight_sums, 1.0)
 
-        theta = theta_grid[valid_points]
-        item_logits = logits[valid_points]
-        item_weights = item_counts[valid_points]
-        mean_theta = np.average(theta, weights=item_weights)
-        mean_logit = np.average(item_logits, weights=item_weights)
-        centered_theta = theta - mean_theta
-        variance = np.average(centered_theta**2, weights=item_weights)
-        if variance <= PROB_EPSILON:
-            continue
-
-        covariance = np.average(
-            centered_theta * (item_logits - mean_logit), weights=item_weights
+    mean_theta = (
+        np.sum(regression_weights * theta_grid[None, :], axis=1) / safe_weight_sums
+    )
+    mean_logit = np.sum(regression_weights * logits, axis=1) / safe_weight_sums
+    centered_theta = theta_grid[None, :] - mean_theta[:, None]
+    variance = (
+        np.sum(
+            regression_weights * centered_theta * centered_theta,
+            axis=1,
         )
-        updated_disc[item_index] = np.clip(covariance / variance, *disc_bounds)
-        updated_diff[item_index] = np.clip(
-            mean_theta - mean_logit / updated_disc[item_index], *diff_bounds
+        / safe_weight_sums
+    )
+    covariance = (
+        np.sum(
+            regression_weights * centered_theta * (logits - mean_logit[:, None]),
+            axis=1,
         )
+        / safe_weight_sums
+    )
+
+    eligible &= variance > PROB_EPSILON
+    fitted_disc = np.clip(
+        np.divide(
+            covariance,
+            variance,
+            out=np.zeros_like(covariance),
+            where=eligible,
+        ),
+        *disc_bounds,
+    )
+    fitted_diff = np.clip(mean_theta - mean_logit / fitted_disc, *diff_bounds)
+    updated_disc[eligible] = fitted_disc[eligible]
+    updated_diff[eligible] = fitted_diff[eligible]
 
     return updated_disc, updated_diff
 
