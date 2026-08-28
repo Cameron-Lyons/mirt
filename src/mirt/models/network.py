@@ -195,6 +195,7 @@ class IsingModel:
         self._n_iterations = 0
         self._converged = False
         self._objective_history: list[float] = []
+        self._log_partition_cache: float | None = None
 
     @property
     def n_nodes(self) -> int:
@@ -241,6 +242,7 @@ class IsingModel:
                 parameter="thresholds",
             )
         self._thresholds = values.copy()
+        self._log_partition_cache = None
         return self
 
     def set_interactions(self, interactions: NDArray[np.float64]) -> Self:
@@ -259,6 +261,7 @@ class IsingModel:
         values = (values + values.T) / 2.0
         np.fill_diagonal(values, 0.0)
         self._interactions = values
+        self._log_partition_cache = None
         return self
 
     def _linear_predictors(self, responses: IntArray) -> FloatArray:
@@ -304,13 +307,17 @@ class IsingModel:
                 value=max_nodes,
                 expected=f">= {self._n_nodes}",
             )
+        if self._log_partition_cache is not None:
+            return self._log_partition_cache
+
         state_ids = np.arange(2**self._n_nodes, dtype=np.uint64)[:, None]
         bit_positions = np.arange(self._n_nodes, dtype=np.uint64)
         states = ((state_ids >> bit_positions) & 1).astype(np.float64)
         energies = states @ self._thresholds + 0.5 * np.einsum(
             "bi,ij,bj->b", states, self._interactions, states, optimize=True
         )
-        return float(np.logaddexp.reduce(energies))
+        self._log_partition_cache = float(np.logaddexp.reduce(energies))
+        return self._log_partition_cache
 
     def log_probability(
         self,
@@ -398,6 +405,7 @@ class IsingModel:
         copied._n_iterations = self._n_iterations
         copied._converged = self._converged
         copied._objective_history = self._objective_history.copy()
+        copied._log_partition_cache = self._log_partition_cache
         return copied
 
 
@@ -416,6 +424,8 @@ class GaussianGraphicalModel:
         self._n_iterations = 0
         self._converged = False
         self._objective_history: list[float] = []
+        self._covariance_cache: FloatArray | None = None
+        self._log_precision_determinant = 0.0
 
     @property
     def n_nodes(self) -> int:
@@ -437,7 +447,12 @@ class GaussianGraphicalModel:
     def covariance_matrix(self) -> FloatArray:
         """Return the inverse precision matrix."""
 
-        return np.linalg.solve(self._precision, np.eye(self._n_nodes))
+        if self._covariance_cache is None:
+            self._covariance_cache = np.linalg.solve(
+                self._precision,
+                np.eye(self._n_nodes),
+            )
+        return self._covariance_cache.copy()
 
     @property
     def is_fitted(self) -> bool:
@@ -483,13 +498,15 @@ class GaussianGraphicalModel:
             )
         values = (values + values.T) / 2.0
         try:
-            np.linalg.cholesky(values)
+            cholesky = np.linalg.cholesky(values)
         except np.linalg.LinAlgError as error:
             raise MirtValidationError(
                 "precision matrix must be positive definite",
                 parameter="precision",
             ) from error
         self._precision = values
+        self._covariance_cache = None
+        self._log_precision_determinant = float(2.0 * np.log(np.diag(cholesky)).sum())
         return self
 
     def partial_correlations(self) -> FloatArray:
@@ -547,13 +564,12 @@ class GaussianGraphicalModel:
 
         values = _validate_continuous_data(data, n_nodes=self._n_nodes)
         centered = values - self._means
-        log_det = 2.0 * np.log(np.diag(np.linalg.cholesky(self._precision))).sum()
         quadratic = np.einsum(
             "bi,ij,bj->", centered, self._precision, centered, optimize=True
         )
         return float(
             -0.5 * values.shape[0] * self._n_nodes * np.log(2.0 * np.pi)
-            + 0.5 * values.shape[0] * log_det
+            + 0.5 * values.shape[0] * self._log_precision_determinant
             - 0.5 * quadratic
         )
 
@@ -599,6 +615,10 @@ class GaussianGraphicalModel:
         copied._n_iterations = self._n_iterations
         copied._converged = self._converged
         copied._objective_history = self._objective_history.copy()
+        copied._covariance_cache = (
+            None if self._covariance_cache is None else self._covariance_cache.copy()
+        )
+        copied._log_precision_determinant = self._log_precision_determinant
         return copied
 
 
