@@ -54,6 +54,8 @@ serialized:
        include_standard_errors=False,
    )
 
+   json_text = result.to_json(indent=2)
+
 The export contains model metadata and scalar fit statistics. Parameter and uncertainty
 arrays are converted to nested Python lists.
 
@@ -69,9 +71,13 @@ Person-score results
 
    values = scores.to_array(include_se=True)
    payload = scores.to_dict()
+   json_text = scores.to_json(indent=2)
+   restored = mirt.ScoreResult.from_json(json_text)
    print(scores.summary())
 
 Person identifiers may be lists or NumPy arrays and must contain one identifier per
-score row. ``to_dataframe()`` preserves those identifiers with either supported
-dataframe backend. Score and uncertainty arrays must have identical shapes, and finite
-standard errors cannot be negative.
+score row. NumPy scalar identifiers are converted to standard Python scalars in
+portable exports. ``from_dict()`` and ``from_json()`` validate reconstructed array
+shapes and any supplied ``n_persons`` or ``n_factors`` metadata. ``to_dataframe()``
+preserves identifiers with either supported dataframe backend. Score and uncertainty
+arrays must have identical shapes, and finite standard errors cannot be negative.
