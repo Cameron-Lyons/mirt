@@ -42,12 +42,20 @@ _FIT_FAILURES = (
 class _FitTask:
     key: str
     model: ModelType
-    responses: NDArray[np.int_]
     n_categories: int | None
     n_factors: int
     n_quadpts: int
     max_iter: int
     tol: float
+
+
+_PROCESS_RESPONSES: NDArray[np.int_] | None = None
+
+
+def _initialize_process_worker(responses: NDArray[np.int_]) -> None:
+    """Retain one response matrix per process instead of one copy per task."""
+    global _PROCESS_RESPONSES
+    _PROCESS_RESPONSES = responses
 
 
 def _validate_models(models: Sequence[ModelType]) -> list[ModelType]:
@@ -157,7 +165,7 @@ def _validate_parallel_backend(backend: ParallelBackend) -> ParallelBackend:
     return backend
 
 
-def _fit_task(task: _FitTask) -> FitResult:
+def _fit_task(task: _FitTask, responses: NDArray[np.int_]) -> FitResult:
     """Fit one batch task without importing the public API at module load."""
     from mirt import fit_mirt
 
@@ -169,7 +177,7 @@ def _fit_task(task: _FitTask) -> FitResult:
         )
 
     result = fit_mirt(
-        task.responses,
+        responses,
         model=task.model,
         n_categories=task.n_categories,
         n_factors=task.n_factors,
@@ -184,8 +192,16 @@ def _fit_task(task: _FitTask) -> FitResult:
     return result
 
 
+def _fit_process_task(task: _FitTask) -> FitResult:
+    """Fit a task against the matrix installed by the process initializer."""
+    if _PROCESS_RESPONSES is None:
+        raise RuntimeError("process worker response data were not initialized")
+    return _fit_task(task, _PROCESS_RESPONSES)
+
+
 def _execute_tasks(
     tasks: Sequence[_FitTask],
+    responses: NDArray[np.int_],
     *,
     n_jobs: int,
     on_error: OnError,
@@ -205,7 +221,7 @@ def _execute_tasks(
     if worker_count == 1:
         for task in tasks:
             try:
-                completed[task.key] = _fit_task(task)
+                completed[task.key] = _fit_task(task, responses)
             except _FIT_FAILURES as exc:
                 record_failure(task, exc)
     else:
@@ -219,6 +235,8 @@ def _execute_tasks(
                 executor = ProcessPoolExecutor(
                     max_workers=worker_count,
                     mp_context=get_context("spawn"),
+                    initializer=_initialize_process_worker,
+                    initargs=(responses,),
                 )
         except OSError as exc:
             raise RuntimeError(
@@ -226,7 +244,14 @@ def _execute_tasks(
                 "use parallel_backend='thread' or n_jobs=1"
             ) from exc
         with executor:
-            future_tasks = {executor.submit(_fit_task, task): task for task in tasks}
+            if parallel_backend == "thread":
+                future_tasks = {
+                    executor.submit(_fit_task, task, responses): task for task in tasks
+                }
+            else:
+                future_tasks = {
+                    executor.submit(_fit_process_task, task): task for task in tasks
+                }
             for future in as_completed(future_tasks):
                 task = future_tasks[future]
                 try:
@@ -404,7 +429,8 @@ def fit_models(
     parallel_backend : {"thread", "process"}, default="thread"
         Standard-library executor used when ``n_jobs`` is greater than one.
         Threads minimize transfer overhead; processes can improve CPU-bound
-        grids at the cost of copying response data.
+        grids. Process workers receive one response-matrix copy at startup
+        and reuse it for every assigned fit.
 
     Returns
     -------
@@ -438,7 +464,6 @@ def fit_models(
         _FitTask(
             key=model,
             model=model,
-            responses=validated_responses,
             n_categories=n_categories,
             n_factors=n_factors,
             n_quadpts=n_quadpts,
@@ -454,6 +479,7 @@ def fit_models(
 
     results, failures = _execute_tasks(
         tasks,
+        validated_responses,
         n_jobs=n_jobs,
         on_error=on_error,
         parallel_backend=parallel_backend,
@@ -572,7 +598,6 @@ def fit_model_grid(
         _FitTask(
             key=f"{model}_f{n_factors}_q{n_quadpts}",
             model=model,
-            responses=validated_responses,
             n_categories=n_categories,
             n_factors=n_factors,
             n_quadpts=n_quadpts,
@@ -590,6 +615,7 @@ def fit_model_grid(
 
     results, failures = _execute_tasks(
         tasks,
+        validated_responses,
         n_jobs=n_jobs,
         on_error=on_error,
         parallel_backend=parallel_backend,
