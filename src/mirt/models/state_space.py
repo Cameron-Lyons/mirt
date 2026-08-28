@@ -601,9 +601,22 @@ class StateSpaceIRT:
             responses,
             n_steps,
         )
+        return self._integrated_observation_probabilities(
+            forecast_means,
+            forecast_variances,
+            n_quadpts,
+        )
+
+    def _integrated_observation_probabilities(
+        self,
+        state_means: NDArray[np.float64],
+        state_variances: NDArray[np.float64],
+        n_quadpts: int,
+    ) -> NDArray[np.float64]:
+        """Integrate item probabilities over Gaussian state distributions."""
         nodes, weights = standard_normal_quadrature(n_quadpts)
-        flat_means = forecast_means.ravel()
-        flat_scales = np.sqrt(forecast_variances).ravel()
+        flat_means = state_means.ravel()
+        flat_scales = np.sqrt(state_variances).ravel()
         marginal = np.zeros((flat_means.size, self.n_items), dtype=np.float64)
 
         for node, weight in zip(nodes, weights, strict=True):
@@ -611,11 +624,139 @@ class StateSpaceIRT:
             marginal += weight * self._observation_probability(states)
 
         probabilities = marginal.reshape(
-            forecast_means.shape[0],
-            forecast_means.shape[1],
+            state_means.shape[0],
+            state_means.shape[1],
             self.n_items,
         )
         return np.clip(probabilities, 0.0, 1.0)
+
+    def _predicted_state_moments_batch(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return causal state predictions for validated response histories."""
+        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+            responses
+        )
+        predicted_means = np.empty_like(filtered_means)
+        predicted_variances = np.empty_like(filtered_variances)
+        predicted_means[:, 0] = self.initial_mean
+        predicted_variances[:, 0] = self.initial_var
+        transition = float(self.transition_matrix[0, 0])
+        transition_squared = transition**2
+        process_variance = float(self.process_noise[0, 0])
+        predicted_means[:, 1:] = transition * filtered_means[:, :-1]
+        predicted_variances[:, 1:] = (
+            transition_squared * filtered_variances[:, :-1] + process_variance
+        )
+        return predicted_means, predicted_variances
+
+    def predictive_response_probabilities(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Return one-step-ahead item probabilities for one response history."""
+        response_values = self._validated_filter_responses(responses, batch=False)
+        probabilities = self.predictive_response_probabilities_batch(
+            response_values[None, :, :],
+            n_quadpts=n_quadpts,
+        )
+        return probabilities[0].copy()
+
+    def predictive_response_probabilities_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+    ) -> NDArray[np.float64]:
+        """Return causal item probabilities for multiple response histories.
+
+        Each occasion is predicted only from the initial state and responses
+        observed at earlier occasions. Probabilities are integrated over the
+        Gaussian state prediction with standard-normal Gauss--Hermite
+        quadrature.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response array with shape
+            ``(n_persons, n_timepoints, n_items)``. Use ``-1`` for missing
+            item responses.
+        n_quadpts : int, default=21
+            Number of quadrature points used for predictive integration.
+
+        Returns
+        -------
+        NDArray
+            Success probabilities with shape
+            ``(n_persons, n_timepoints, n_items)``.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        response_values = self._validated_filter_responses(responses, batch=True)
+        predicted_means, predicted_variances = self._predicted_state_moments_batch(
+            response_values
+        )
+        return self._integrated_observation_probabilities(
+            predicted_means,
+            predicted_variances,
+            n_quadpts,
+        )
+
+    def predictive_residuals(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+        standardized: bool = False,
+    ) -> NDArray[np.float64]:
+        """Return one-step-ahead residuals for one response history."""
+        response_values = self._validated_filter_responses(responses, batch=False)
+        residuals = self.predictive_residuals_batch(
+            response_values[None, :, :],
+            n_quadpts=n_quadpts,
+            standardized=standardized,
+        )
+        return residuals[0].copy()
+
+    def predictive_residuals_batch(
+        self,
+        responses: NDArray[np.int_],
+        *,
+        n_quadpts: int = 21,
+        standardized: bool = False,
+    ) -> NDArray[np.float64]:
+        """Return missing-aware predictive residuals for multiple people.
+
+        Raw residuals are observed minus predicted success probabilities.
+        ``standardized=True`` returns Pearson residuals. Missing responses are
+        represented by ``numpy.nan`` in either form.
+        """
+        n_quadpts = self._validated_positive_integer(n_quadpts, "n_quadpts")
+        if not isinstance(standardized, (bool, np.bool_)):
+            raise ValueError("standardized must be boolean")
+        response_values = self._validated_filter_responses(responses, batch=True)
+        predicted_means, predicted_variances = self._predicted_state_moments_batch(
+            response_values
+        )
+        probabilities = self._integrated_observation_probabilities(
+            predicted_means,
+            predicted_variances,
+            n_quadpts,
+        )
+        residuals = np.where(
+            response_values >= 0,
+            response_values - probabilities,
+            np.nan,
+        )
+        if standardized:
+            response_variance = np.maximum(
+                probabilities * (1.0 - probabilities),
+                PROB_EPSILON,
+            )
+            residuals = residuals / np.sqrt(response_variance)
+        return residuals
 
     def predictive_log_likelihood(
         self,
@@ -690,19 +831,8 @@ class StateSpaceIRT:
         if not isinstance(pointwise, (bool, np.bool_)):
             raise ValueError("pointwise must be boolean")
         response_values = self._validated_filter_responses(responses, batch=True)
-        filtered_means, filtered_variances = self.extended_kalman_filter_batch(
+        predicted_means, predicted_variances = self._predicted_state_moments_batch(
             response_values
-        )
-        predicted_means = np.empty_like(filtered_means)
-        predicted_variances = np.empty_like(filtered_variances)
-        predicted_means[:, 0] = self.initial_mean
-        predicted_variances[:, 0] = self.initial_var
-        transition = float(self.transition_matrix[0, 0])
-        transition_squared = transition**2
-        process_variance = float(self.process_noise[0, 0])
-        predicted_means[:, 1:] = transition * filtered_means[:, :-1]
-        predicted_variances[:, 1:] = (
-            transition_squared * filtered_variances[:, :-1] + process_variance
         )
 
         observed = response_values >= 0

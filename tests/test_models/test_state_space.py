@@ -189,7 +189,7 @@ class TestStateSpaceIRT:
         return forecast_means, forecast_variances
 
     @staticmethod
-    def _reference_predictive_log_scores(model, responses, n_quadpts=101):
+    def _reference_predicted_state_moments(model, responses):
         filtered_means, filtered_variances = TestStateSpaceIRT._reference_filter(
             model, responses
         )
@@ -202,6 +202,39 @@ class TestStateSpaceIRT:
         predicted_means[1:] = transition * filtered_means[:-1]
         predicted_variances[1:] = (
             transition**2 * filtered_variances[:-1] + process_variance
+        )
+        return predicted_means, predicted_variances
+
+    @staticmethod
+    def _reference_predictive_probabilities(model, responses, n_quadpts=101):
+        predicted_means, predicted_variances = (
+            TestStateSpaceIRT._reference_predicted_state_moments(model, responses)
+        )
+        nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+        nodes = nodes * np.sqrt(2.0)
+        weights = weights / np.sqrt(np.pi)
+        probabilities = np.zeros((model.n_timepoints, model.n_items))
+
+        for node, weight in zip(nodes, weights, strict=True):
+            states = predicted_means + np.sqrt(predicted_variances) * node
+            logits = model.discrimination[None, :] * (
+                states[:, None] - model.difficulty[None, :]
+            )
+            base_probability = 1.0 / (1.0 + np.exp(-logits))
+            conditional = (
+                model.guessing[None, :]
+                + (1.0 - model.guessing[None, :]) * base_probability
+                if model.base_model == "3PL"
+                else base_probability
+            )
+            probabilities += weight * conditional
+
+        return probabilities
+
+    @staticmethod
+    def _reference_predictive_log_scores(model, responses, n_quadpts=101):
+        predicted_means, predicted_variances = (
+            TestStateSpaceIRT._reference_predicted_state_moments(model, responses)
         )
         nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
         nodes = nodes * np.sqrt(2.0)
@@ -580,6 +613,140 @@ class TestStateSpaceIRT:
                 responses,
                 2,
                 n_quadpts=n_quadpts,
+            )
+
+    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+    @pytest.mark.parametrize("transition", [0.85, -0.6])
+    def test_predictive_probabilities_match_high_resolution_scalar_reference(
+        self,
+        base_model,
+        transition,
+    ):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model=base_model,
+            transition_matrix=np.array([[transition]]),
+            process_noise=np.array([[0.08]]),
+            observation_noise=0.1,
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6) if base_model == "3PL" else None,
+            initial_mean=-0.2,
+            initial_var=0.8,
+        )
+        responses = np.random.default_rng(66).integers(0, 2, size=(7, 5, 6))
+        responses[np.random.default_rng(67).random(responses.shape) < 0.2] = -1
+        expected = np.stack(
+            [
+                self._reference_predictive_probabilities(model, person_responses)
+                for person_responses in responses
+            ]
+        )
+
+        probabilities = model.predictive_response_probabilities_batch(
+            responses,
+            n_quadpts=31,
+        )
+
+        assert_allclose(probabilities, expected, rtol=5e-9, atol=1e-9)
+        single = model.predictive_response_probabilities(
+            responses[0],
+            n_quadpts=31,
+        )
+        assert_allclose(single, probabilities[0])
+        assert np.all((probabilities >= 0.0) & (probabilities <= 1.0))
+
+    def test_predictive_probabilities_are_causal(self):
+        model = StateSpaceIRT(
+            n_items=8,
+            n_timepoints=5,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.05]]),
+            difficulty=np.linspace(-1.0, 1.0, 8),
+        )
+        baseline = np.zeros((3, 5, 8), dtype=np.int32)
+        changed = baseline.copy()
+        changed[:, 2:] = 1
+
+        baseline_probabilities = model.predictive_response_probabilities_batch(baseline)
+        changed_probabilities = model.predictive_response_probabilities_batch(changed)
+
+        assert_allclose(
+            baseline_probabilities[:, :3],
+            changed_probabilities[:, :3],
+        )
+        assert (
+            np.max(np.abs(baseline_probabilities[:, 3:] - changed_probabilities[:, 3:]))
+            > 0.05
+        )
+
+    def test_predictive_residuals_match_raw_and_pearson_definitions(self):
+        model = StateSpaceIRT(n_items=4, n_timepoints=3)
+        responses = np.array(
+            [
+                [[1, 0, -1, 1], [0, 1, 1, -1], [1, 1, 0, 0]],
+                [[0, -1, 1, 0], [1, 0, -1, 1], [-1, 0, 1, 1]],
+            ],
+            dtype=np.int32,
+        )
+        probabilities = model.predictive_response_probabilities_batch(responses)
+
+        raw = model.predictive_residuals_batch(responses)
+        pearson = model.predictive_residuals_batch(
+            responses,
+            standardized=True,
+        )
+
+        observed = responses >= 0
+        assert np.array_equal(np.isnan(raw), ~observed)
+        assert np.array_equal(np.isnan(pearson), ~observed)
+        assert_allclose(raw[observed], (responses - probabilities)[observed])
+        expected_pearson = raw / np.sqrt(probabilities * (1.0 - probabilities))
+        assert_allclose(pearson[observed], expected_pearson[observed])
+        single_raw = model.predictive_residuals(responses[0])
+        assert_allclose(single_raw, raw[0], equal_nan=True)
+
+    def test_predictive_residuals_are_calibrated_under_generating_model(self):
+        model = StateSpaceIRT(
+            n_items=12,
+            n_timepoints=8,
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.1]]),
+            discrimination=np.linspace(0.7, 1.8, 12),
+            difficulty=np.linspace(-1.5, 1.5, 12),
+        )
+        responses, _ = model.simulate(1_000, seed=68)
+
+        residuals = model.predictive_residuals_batch(responses)
+
+        assert abs(np.mean(residuals)) < 0.01
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        "method_name",
+        ["predictive_response_probabilities_batch", "predictive_residuals_batch"],
+    )
+    def test_predictive_diagnostics_require_positive_quadrature_count(
+        self,
+        n_quadpts,
+        method_name,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            getattr(model, method_name)(responses, n_quadpts=n_quadpts)
+
+    @pytest.mark.parametrize("standardized", [0, 1, "yes", None])
+    def test_predictive_residuals_require_boolean_standardized(self, standardized):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+        responses = np.zeros((2, 2, 3), dtype=np.int32)
+
+        with pytest.raises(ValueError, match="standardized"):
+            model.predictive_residuals_batch(
+                responses,
+                standardized=standardized,
             )
 
     @pytest.mark.parametrize("base_model", ["2PL", "3PL"])

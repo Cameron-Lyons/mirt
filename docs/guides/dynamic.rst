@@ -116,6 +116,14 @@ model. The batch filter updates every learner in one vectorized call:
    )
    predictive_total = predictive_by_time.sum(axis=1)
 
+   predictive_success = (
+       state_model.predictive_response_probabilities_batch(responses)
+   )
+   predictive_residuals = state_model.predictive_residuals_batch(
+       responses,
+       standardized=True,
+   )
+
 Filtering conditions each state on responses available through that occasion,
 which supports online tracking. Smoothing adds a vectorized
 Rauch--Tung--Striebel backward pass so every state uses the complete response
@@ -135,6 +143,12 @@ integrated jointly over their shared state, and the pointwise form supports
 occasion-level diagnostics. Fully missing occasions contribute zero. These
 scores use the extended Kalman approximation and are useful for comparing
 state-space configurations on the same histories.
+
+Predictive response probabilities are causal: an occasion uses only the
+initial distribution and earlier responses, never its own or future outcomes.
+Raw residuals are observed minus predicted success; ``standardized=True``
+returns Pearson residuals. Missing responses produce ``numpy.nan`` residuals,
+while their model probabilities remain available for inspection.
 
 State estimation and forecasting accept only ``1`` (correct), ``0``
 (incorrect), and ``-1`` (missing); a fully missing occasion propagates the
