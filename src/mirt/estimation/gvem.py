@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -22,6 +23,7 @@ from mirt._rust_backend import (
 )
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation.base import BaseEstimator
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -79,12 +81,45 @@ class GVEMEstimator(BaseEstimator):
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
-        if n_inner_iter < 1:
-            raise ValueError("n_inner_iter must be at least 1")
+        if (
+            not isinstance(n_inner_iter, Integral)
+            or isinstance(n_inner_iter, (bool, np.bool_))
+            or n_inner_iter < 1
+        ):
+            raise MirtValidationError(
+                "n_inner_iter must be at least 1 and an integer",
+                parameter="n_inner_iter",
+                value=n_inner_iter,
+                expected="positive integer",
+            )
+        if (
+            not isinstance(se_step_size, Real)
+            or isinstance(se_step_size, (bool, np.bool_))
+            or not np.isfinite(se_step_size)
+            or se_step_size <= 0
+        ):
+            raise MirtValidationError(
+                "se_step_size must be finite and positive",
+                parameter="se_step_size",
+                value=se_step_size,
+                expected="finite value > 0",
+            )
+        if not (
+            isinstance(use_gpu, (bool, np.bool_))
+            or (isinstance(use_gpu, str) and use_gpu == "auto")
+        ):
+            raise MirtValidationError(
+                "use_gpu must be a boolean or 'auto'",
+                parameter="use_gpu",
+                value=use_gpu,
+                expected="True, False, or 'auto'",
+            )
 
-        self.n_inner_iter = n_inner_iter
-        self.se_step_size = se_step_size
-        self.use_gpu = use_gpu
+        self.n_inner_iter: int = int(n_inner_iter)
+        self.se_step_size: float = float(se_step_size)
+        self.use_gpu: bool | Literal["auto"] = (
+            bool(use_gpu) if isinstance(use_gpu, np.bool_) else use_gpu
+        )
 
         self._mu: NDArray[np.float64] | None = None
         self._sigma: NDArray[np.float64] | None = None
@@ -143,17 +178,24 @@ class GVEMEstimator(BaseEstimator):
         n_items = model.n_items
         n_factors = model.n_factors
 
-        if prior_mean is None:
-            prior_mean = np.zeros(n_factors)
-        if prior_cov is None:
-            prior_cov = np.eye(n_factors)
+        prior_mean, prior_cov = self._validate_prior(
+            prior_mean,
+            prior_cov,
+            n_factors,
+        )
 
         if not model._is_fitted:
             model._initialize_parameters()
 
         self._convert_to_slope_intercept(model)
 
-        self._initialize_variational_params(n_persons, n_factors, n_items)
+        self._initialize_variational_params(
+            n_persons,
+            n_factors,
+            n_items,
+            prior_mean,
+            prior_cov,
+        )
 
         self._convergence_history = []
         self._elbo_history = []
@@ -161,7 +203,7 @@ class GVEMEstimator(BaseEstimator):
         converged = False
 
         for iteration in range(self.max_iter):
-            self._e_step(model, responses, prior_cov)
+            self._e_step(model, responses, prior_mean, prior_cov)
 
             current_elbo = self._compute_elbo(model, responses, prior_mean, prior_cov)
             self._elbo_history.append(current_elbo)
@@ -179,7 +221,7 @@ class GVEMEstimator(BaseEstimator):
 
             self._m_step(model, responses)
         else:
-            self._e_step(model, responses, prior_cov)
+            self._e_step(model, responses, prior_mean, prior_cov)
             current_elbo = self._compute_elbo(model, responses, prior_mean, prior_cov)
             self._elbo_history.append(current_elbo)
             self._convergence_history.append(current_elbo)
@@ -189,7 +231,12 @@ class GVEMEstimator(BaseEstimator):
 
         model._is_fitted = True
 
-        standard_errors = self._compute_standard_errors(model, responses)
+        standard_errors = self._compute_standard_errors(
+            model,
+            responses,
+            prior_mean,
+            prior_cov,
+        )
 
         n_params = model.n_parameters
         aic = self._compute_aic(current_elbo, n_params)
@@ -206,6 +253,72 @@ class GVEMEstimator(BaseEstimator):
             n_observations=n_persons,
             n_parameters=n_params,
         )
+
+    @staticmethod
+    def _validate_prior(
+        prior_mean: NDArray[np.float64] | None,
+        prior_cov: NDArray[np.float64] | None,
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return finite prior arrays with a positive-definite covariance."""
+        try:
+            mean = (
+                np.zeros(n_factors, dtype=np.float64)
+                if prior_mean is None
+                else np.asarray(prior_mean, dtype=np.float64)
+            )
+            cov = (
+                np.eye(n_factors, dtype=np.float64)
+                if prior_cov is None
+                else np.asarray(prior_cov, dtype=np.float64)
+            )
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "prior_mean and prior_cov must be numeric arrays"
+            ) from exc
+
+        if mean.shape != (n_factors,):
+            raise MirtValidationError(
+                "prior_mean shape must match the model dimensions",
+                parameter="prior_mean",
+                value=mean.shape,
+                expected=f"({n_factors},)",
+            )
+        if not np.all(np.isfinite(mean)):
+            raise MirtValidationError(
+                "prior_mean must contain only finite values",
+                parameter="prior_mean",
+                expected="finite values",
+            )
+        if cov.shape != (n_factors, n_factors):
+            raise MirtValidationError(
+                "prior_cov shape must match the model dimensions",
+                parameter="prior_cov",
+                value=cov.shape,
+                expected=f"({n_factors}, {n_factors})",
+            )
+        if not np.all(np.isfinite(cov)):
+            raise MirtValidationError(
+                "prior_cov must contain only finite values",
+                parameter="prior_cov",
+                expected="finite values",
+            )
+        if not np.allclose(cov, cov.T, rtol=1e-10, atol=1e-12):
+            raise MirtValidationError(
+                "prior_cov must be symmetric",
+                parameter="prior_cov",
+                expected="symmetric positive-definite matrix",
+            )
+        try:
+            np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError as exc:
+            raise MirtValidationError(
+                "prior_cov must be positive definite",
+                parameter="prior_cov",
+                expected="symmetric positive-definite matrix",
+            ) from exc
+
+        return mean.copy(), cov.copy()
 
     def _convert_to_slope_intercept(self, model: BaseItemModel) -> None:
         """Convert model parameters from discrimination-difficulty to slope-intercept form."""
@@ -242,10 +355,19 @@ class GVEMEstimator(BaseEstimator):
         n_persons: int,
         n_factors: int,
         n_items: int,
+        prior_mean: NDArray[np.float64] | None = None,
+        prior_cov: NDArray[np.float64] | None = None,
     ) -> None:
         """Initialize variational parameters."""
-        self._mu = np.zeros((n_persons, n_factors))
-        self._sigma = np.tile(np.eye(n_factors), (n_persons, 1, 1))
+        if prior_mean is None:
+            prior_mean = np.zeros(n_factors, dtype=np.float64)
+        if prior_cov is None:
+            prior_cov = np.eye(n_factors, dtype=np.float64)
+        self._mu = np.broadcast_to(prior_mean, (n_persons, n_factors)).copy()
+        self._sigma = np.broadcast_to(
+            prior_cov,
+            (n_persons, n_factors, n_factors),
+        ).copy()
         self._xi = np.ones((n_persons, n_items))
 
     @staticmethod
@@ -272,102 +394,93 @@ class GVEMEstimator(BaseEstimator):
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
         prior_cov: NDArray[np.float64],
     ) -> None:
         """E-step: update variational parameters with closed-form updates."""
-        prior_cov_inv = np.linalg.inv(prior_cov)
+        prior_cov_inv = np.linalg.solve(prior_cov, np.eye(model.n_factors))
+        centered_mu = self._mu - prior_mean
+        centered_intercepts = self._intercepts + self._slopes @ prior_mean
 
         if self._should_use_gpu:
             gpu_result = gvem_e_step_gpu(
                 responses,
                 self._slopes,
-                self._intercepts,
+                centered_intercepts,
                 prior_cov_inv,
-                self._mu,
+                centered_mu,
                 self._sigma,
                 self._xi,
                 self.n_inner_iter,
             )
             if gpu_result is not None:
-                self._mu, self._sigma, self._xi = gpu_result
+                centered_mu, self._sigma, self._xi = gpu_result
+                self._mu = centered_mu + prior_mean
                 return
 
         rust_result = _rust_gvem_e_step(
             responses,
             self._slopes,
-            self._intercepts,
+            centered_intercepts,
             prior_cov_inv,
-            self._mu,
+            centered_mu,
             self._sigma,
             self._xi,
             self.n_inner_iter,
         )
 
         if rust_result is not None:
-            self._mu, self._sigma, self._xi = rust_result
+            centered_mu, self._sigma, self._xi = rust_result
+            self._mu = centered_mu + prior_mean
             return
 
-        self._e_step_python(model, responses, prior_cov_inv)
+        self._e_step_python(responses, prior_mean, prior_cov_inv)
 
     def _e_step_python(
         self,
-        model: BaseItemModel,
         responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
         prior_cov_inv: NDArray[np.float64],
     ) -> None:
         """Python fallback for E-step."""
-        n_persons, n_items = responses.shape
-
         valid_mask = responses >= 0
+        prior_natural_mean = prior_cov_inv @ prior_mean
 
         for _ in range(self.n_inner_iter):
             lam = self._lambda(self._xi)
+            weights = np.where(valid_mask, 2.0 * lam, 0.0)
+            precision = prior_cov_inv + np.einsum(
+                "ij,jf,jg->ifg",
+                weights,
+                self._slopes,
+                self._slopes,
+                optimize=True,
+            )
+            self._sigma = np.linalg.inv(precision)
 
-            for i in range(n_persons):
-                valid_items = valid_mask[i]
-                if not valid_items.any():
-                    continue
+            coeffs = np.where(
+                valid_mask,
+                responses - 0.5 - 2.0 * lam * self._intercepts,
+                0.0,
+            )
+            natural_mean = coeffs @ self._slopes + prior_natural_mean
+            self._mu = np.einsum(
+                "ifg,ig->if",
+                self._sigma,
+                natural_mean,
+                optimize=True,
+            )
 
-                a_valid = self._slopes[valid_items]
-                d_valid = self._intercepts[valid_items]
-                y_valid = responses[i, valid_items].astype(np.float64)
-                lam_valid = lam[i, valid_items]
-
-                sigma_inv = prior_cov_inv + np.einsum(
-                    "j,jk,jl->kl", 2 * lam_valid, a_valid, a_valid
-                )
-
-                try:
-                    self._sigma[i] = np.linalg.inv(sigma_inv)
-                except np.linalg.LinAlgError:
-                    self._sigma[i] = np.linalg.pinv(sigma_inv)
-
-                coeffs = y_valid - 0.5 - 2 * lam_valid * d_valid
-                mu_term = np.einsum("j,jk->k", coeffs, a_valid)
-
-                self._mu[i] = self._sigma[i] @ mu_term
-
-            for i in range(n_persons):
-                valid_items = valid_mask[i]
-                if not valid_items.any():
-                    continue
-
-                mu_i = self._mu[i]
-                sigma_i = self._sigma[i]
-                second_moment = sigma_i + np.outer(mu_i, mu_i)
-
-                for j in range(n_items):
-                    if not valid_items[j]:
-                        continue
-
-                    a_j = self._slopes[j]
-                    d_j = self._intercepts[j]
-
-                    quad_term = a_j @ second_moment @ a_j
-                    linear_term = 2 * d_j * (a_j @ mu_i)
-                    const_term = d_j**2
-
-                    self._xi[i, j] = np.sqrt(quad_term + linear_term + const_term)
+            eta_mean = self._mu @ self._slopes.T + self._intercepts
+            eta_variance = np.einsum(
+                "jf,ifg,jg->ij",
+                self._slopes,
+                self._sigma,
+                self._slopes,
+                optimize=True,
+            )
+            updated_xi = np.sqrt(np.maximum(eta_variance + eta_mean**2, 0.0))
+            self._xi = np.where(valid_mask, updated_xi, self._xi)
 
     def _m_step(
         self,
@@ -512,74 +625,65 @@ class GVEMEstimator(BaseEstimator):
         prior_cov: NDArray[np.float64],
     ) -> float:
         """Python fallback for ELBO computation."""
-        n_persons, n_items = responses.shape
         n_factors = model.n_factors
 
         valid_mask = responses >= 0
 
         lam = self._lambda(self._xi)
+        eta_mean = self._mu @ self._slopes.T + self._intercepts
+        eta_variance = np.einsum(
+            "jf,ifg,jg->ij",
+            self._slopes,
+            self._sigma,
+            self._slopes,
+            optimize=True,
+        )
+        eta_second = eta_variance + eta_mean**2
+        likelihood_terms = (
+            -np.logaddexp(0.0, -self._xi)
+            + (responses - 0.5) * eta_mean
+            - 0.5 * self._xi
+            - lam * (eta_second - self._xi**2)
+        )
+        expected_log_likelihood = float(np.sum(likelihood_terms[valid_mask]))
 
-        elbo = 0.0
+        prior_cov_inv = np.linalg.solve(prior_cov, np.eye(n_factors))
+        log_det_prior = float(np.linalg.slogdet(prior_cov)[1])
+        log_det_q = np.linalg.slogdet(self._sigma)[1]
+        diff = self._mu - prior_mean
+        kl_mean = 0.5 * np.einsum(
+            "if,fg,ig->i",
+            diff,
+            prior_cov_inv,
+            diff,
+            optimize=True,
+        )
+        kl_trace = 0.5 * np.einsum(
+            "fg,igf->i",
+            prior_cov_inv,
+            self._sigma,
+            optimize=True,
+        )
+        kl = kl_mean + kl_trace + 0.5 * (log_det_prior - log_det_q) - 0.5 * n_factors
 
-        for i in range(n_persons):
-            valid_items = valid_mask[i]
-            if not valid_items.any():
-                continue
-
-            mu_i = self._mu[i]
-            sigma_i = self._sigma[i]
-            second_moment = sigma_i + np.outer(mu_i, mu_i)
-
-            for j in range(n_items):
-                if not valid_items[j]:
-                    continue
-
-                a_j = self._slopes[j]
-                d_j = self._intercepts[j]
-                y_ij = responses[i, j]
-                xi_ij = self._xi[i, j]
-                lam_ij = lam[i, j]
-
-                eta_mean = a_j @ mu_i + d_j
-
-                eta_second = a_j @ second_moment @ a_j + 2 * d_j * (a_j @ mu_i) + d_j**2
-
-                log_sigmoid_xi = -np.log(1 + np.exp(-xi_ij))
-
-                elbo += (
-                    log_sigmoid_xi
-                    + (y_ij - 0.5) * eta_mean
-                    - 0.5 * xi_ij
-                    - lam_ij * (eta_second - xi_ij**2)
-                )
-
-        prior_cov_inv = np.linalg.inv(prior_cov)
-        sign, log_det_prior = np.linalg.slogdet(prior_cov)
-
-        for i in range(n_persons):
-            mu_i = self._mu[i]
-            sigma_i = self._sigma[i]
-
-            diff = mu_i - prior_mean
-            kl_mean = 0.5 * (diff @ prior_cov_inv @ diff)
-            kl_trace = 0.5 * np.trace(prior_cov_inv @ sigma_i)
-
-            sign_q, log_det_q = np.linalg.slogdet(sigma_i)
-            kl_logdet = 0.5 * (log_det_prior - log_det_q)
-
-            kl = kl_mean + kl_trace + kl_logdet - 0.5 * n_factors
-
-            elbo -= kl
-
-        return float(elbo)
+        return expected_log_likelihood - float(np.sum(kl))
 
     def _compute_standard_errors(
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        prior_cov: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
         """Compute standard errors using numerical differentiation of ELBO."""
         standard_errors: dict[str, NDArray[np.float64]] = {}
+        self._convert_to_slope_intercept(model)
+        center_elbo = self._compute_elbo(
+            model,
+            responses,
+            prior_mean,
+            prior_cov,
+        )
 
         for name, values in model.parameters.items():
             if name == "discrimination" and model.model_name == "1PL":
@@ -599,8 +703,8 @@ class GVEMEstimator(BaseEstimator):
                     elbo_plus = self._compute_elbo(
                         model,
                         responses,
-                        np.zeros(model.n_factors),
-                        np.eye(model.n_factors),
+                        prior_mean,
+                        prior_cov,
                     )
 
                     model._parameters[name][item_idx] = original - h
@@ -608,20 +712,14 @@ class GVEMEstimator(BaseEstimator):
                     elbo_minus = self._compute_elbo(
                         model,
                         responses,
-                        np.zeros(model.n_factors),
-                        np.eye(model.n_factors),
+                        prior_mean,
+                        prior_cov,
                     )
 
                     model._parameters[name][item_idx] = original
                     self._convert_to_slope_intercept(model)
-                    elbo_center = self._compute_elbo(
-                        model,
-                        responses,
-                        np.zeros(model.n_factors),
-                        np.eye(model.n_factors),
-                    )
 
-                    hessian = (elbo_plus - 2 * elbo_center + elbo_minus) / (h**2)
+                    hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / (h**2)
 
                     if hessian < 0:
                         se[item_idx] = np.sqrt(-1.0 / hessian)
@@ -636,8 +734,8 @@ class GVEMEstimator(BaseEstimator):
                         elbo_plus = self._compute_elbo(
                             model,
                             responses,
-                            np.zeros(model.n_factors),
-                            np.eye(model.n_factors),
+                            prior_mean,
+                            prior_cov,
                         )
 
                         model._parameters[name][item_idx, factor_idx] = original - h
@@ -645,20 +743,14 @@ class GVEMEstimator(BaseEstimator):
                         elbo_minus = self._compute_elbo(
                             model,
                             responses,
-                            np.zeros(model.n_factors),
-                            np.eye(model.n_factors),
+                            prior_mean,
+                            prior_cov,
                         )
 
                         model._parameters[name][item_idx, factor_idx] = original
                         self._convert_to_slope_intercept(model)
-                        elbo_center = self._compute_elbo(
-                            model,
-                            responses,
-                            np.zeros(model.n_factors),
-                            np.eye(model.n_factors),
-                        )
 
-                        hessian = (elbo_plus - 2 * elbo_center + elbo_minus) / (h**2)
+                        hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / (h**2)
 
                         if hessian < 0:
                             se[item_idx, factor_idx] = np.sqrt(-1.0 / hessian)
