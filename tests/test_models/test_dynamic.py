@@ -509,7 +509,12 @@ class TestGrowthMixtureModel:
         rng = np.random.default_rng(123)
         observations = rng.normal(size=(12, 7))
         time_values = np.linspace(-1.0, 2.0, 7)
-        total_variance = model.intercept_var + model.residual_variance
+        covariance = (
+            model.intercept_var * np.ones((len(time_values), len(time_values)))
+            + model.slope_var * np.outer(time_values, time_values)
+            + model.residual_variance * np.eye(len(time_values))
+        )
+        _, log_determinant = np.linalg.slogdet(covariance)
 
         expected = np.empty((len(observations), model.n_classes))
         for person_index, observation in enumerate(observations):
@@ -517,10 +522,10 @@ class TestGrowthMixtureModel:
                 residual = observation - model.compute_class_trajectory(
                     class_index, time_values
                 )
-                expected[person_index, class_index] = -0.5 * np.sum(
-                    residual**2
-                ) / total_variance - 0.5 * len(time_values) * np.log(
-                    2.0 * np.pi * total_variance
+                expected[person_index, class_index] = -0.5 * (
+                    residual @ np.linalg.solve(covariance, residual)
+                    + len(time_values) * np.log(2.0 * np.pi)
+                    + log_determinant
                 )
 
         actual = model.class_log_likelihood(observations, time_values)
@@ -538,7 +543,7 @@ class TestGrowthMixtureModel:
             class_slopes=np.array([0.1, 0.2]),
         )
         time_values = np.arange(2_000, dtype=np.float64)
-        observation = np.zeros(2_000)
+        observation = 100.0 * (-1.0) ** time_values
 
         likelihoods = model.class_likelihood(observation, time_values)
         posteriors = model.posterior_probabilities(observation, time_values)
@@ -557,14 +562,113 @@ class TestGrowthMixtureModel:
         )
         observations = np.array([[1e8, 1e8 + 1.0, 1e8 - 1.0]])
         time_values = np.arange(3.0)
-        total_variance = model.intercept_var + model.residual_variance
-        expected = -1.0 / total_variance - 0.5 * len(time_values) * np.log(
-            2.0 * np.pi * total_variance
+        covariance = (
+            model.intercept_var * np.ones((len(time_values), len(time_values)))
+            + model.slope_var * np.outer(time_values, time_values)
+            + model.residual_variance * np.eye(len(time_values))
+        )
+        residual = observations[0] - model.compute_class_trajectory(0, time_values)
+        _, log_determinant = np.linalg.slogdet(covariance)
+        expected = -0.5 * (
+            residual @ np.linalg.solve(covariance, residual)
+            + len(time_values) * np.log(2.0 * np.pi)
+            + log_determinant
         )
 
         actual = model.class_log_likelihood(observations, time_values)
 
         assert actual[0, 0] == pytest.approx(expected)
+
+    def test_class_log_likelihood_uses_slope_variance(self):
+        observations = np.array([[0.0, 0.4, -0.2, 0.8]])
+        time_values = np.arange(4.0)
+        without_random_slopes = GrowthMixtureModel(n_classes=2, slope_var=0.0)
+        with_random_slopes = GrowthMixtureModel(n_classes=2, slope_var=2.0)
+
+        without = without_random_slopes.class_log_likelihood(
+            observations,
+            time_values,
+        )
+        with_slope = with_random_slopes.class_log_likelihood(
+            observations,
+            time_values,
+        )
+
+        assert not np.allclose(without, with_slope)
+
+    def test_class_log_likelihood_without_random_effects_matches_independent_normal(
+        self,
+    ):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=0.3,
+        )
+        observations = np.array([[0.2, -0.1, 0.7], [-0.4, 0.3, 1.2]])
+        time_values = np.arange(3.0)
+        expected = np.empty((2, 2))
+        for person_index, observation in enumerate(observations):
+            for class_index in range(model.n_classes):
+                residual = observation - model.compute_class_trajectory(
+                    class_index,
+                    time_values,
+                )
+                expected[person_index, class_index] = -0.5 * (
+                    np.sum(residual**2) / model.residual_variance
+                    + len(time_values) * np.log(2.0 * np.pi * model.residual_variance)
+                )
+
+        actual = model.class_log_likelihood(observations, time_values)
+
+        assert_allclose(actual, expected)
+
+    def test_class_log_likelihood_requires_positive_residual_variance(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            residual_variance=0.0,
+        )
+
+        with pytest.raises(ValueError, match="residual_variance must be positive"):
+            model.class_log_likelihood(np.zeros((2, 3)), np.arange(3.0))
+
+    @pytest.mark.parametrize(
+        "time_values",
+        [np.array([2.0]), np.ones(4)],
+    )
+    def test_class_log_likelihood_handles_rank_deficient_random_effect_basis(
+        self,
+        time_values,
+    ):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            intercept_var=0.4,
+            slope_var=0.3,
+            residual_variance=0.2,
+        )
+        observations = np.random.default_rng(6).normal(size=(5, len(time_values)))
+        covariance = (
+            model.intercept_var * np.ones((len(time_values), len(time_values)))
+            + model.slope_var * np.outer(time_values, time_values)
+            + model.residual_variance * np.eye(len(time_values))
+        )
+        _, log_determinant = np.linalg.slogdet(covariance)
+        expected = np.empty((len(observations), model.n_classes))
+        for person_index, observation in enumerate(observations):
+            for class_index in range(model.n_classes):
+                residual = observation - model.compute_class_trajectory(
+                    class_index,
+                    time_values,
+                )
+                expected[person_index, class_index] = -0.5 * (
+                    residual @ np.linalg.solve(covariance, residual)
+                    + len(time_values) * np.log(2.0 * np.pi)
+                    + log_determinant
+                )
+
+        actual = model.class_log_likelihood(observations, time_values)
+
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
 
     def test_classify(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)

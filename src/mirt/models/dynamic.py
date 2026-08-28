@@ -2088,7 +2088,8 @@ class GrowthMixtureModel:
         Notes
         -----
         For long trajectories, use :meth:`class_log_likelihood` or
-        :meth:`posterior_probabilities` to avoid probability underflow.
+        :meth:`posterior_probabilities` to avoid probability underflow or
+        overflow.
         """
         return np.exp(self.class_log_likelihood(observations, time_values))
 
@@ -2177,7 +2178,7 @@ class GrowthMixtureModel:
         NDArray[np.float64],
         NDArray[np.float64],
         NDArray[np.float64],
-        float,
+        tuple[float, float, float],
     ]:
         """Validate growth-mixture inputs and build class trajectories."""
         try:
@@ -2200,11 +2201,12 @@ class GrowthMixtureModel:
             expected_length=observation_values.shape[1],
         )
         trajectories = self._validated_class_trajectories(times)
-        intercept_variance, _, residual_variance = self._validated_variance_components()
-        total_variance = intercept_variance + residual_variance
-        if total_variance <= 0.0:
-            raise ValueError("intercept_var plus residual_variance must be positive")
-        return observation_values, times, trajectories, total_variance
+        variances = self._validated_variance_components()
+        if variances[2] <= 0.0:
+            raise ValueError(
+                "residual_variance must be positive for likelihood evaluation"
+            )
+        return observation_values, times, trajectories, variances
 
     def class_log_likelihood(
         self,
@@ -2225,14 +2227,75 @@ class GrowthMixtureModel:
         -------
         NDArray
             Log likelihoods with shape ``(n_persons, n_classes)``.
+
+        Notes
+        -----
+        The marginal trajectory covariance is
+        ``intercept_var * 1 1^T + slope_var * t t^T + residual_variance * I``.
+        It is evaluated through its low-rank random-effect basis without
+        constructing a dense time-by-time covariance matrix.
         """
-        values, _, trajectories, total_variance = self._validated_trajectory_data(
+        values, times, trajectories, variances = self._validated_trajectory_data(
             observations,
             time_values,
         )
-        squared_distance = cdist(values, trajectories, metric="sqeuclidean")
-        normalization = 0.5 * values.shape[1] * np.log(2.0 * np.pi * total_variance)
-        return -0.5 * squared_distance / total_variance - normalization
+        intercept_variance, slope_variance, residual_variance = variances
+        n_timepoints = times.size
+
+        random_effect_columns = []
+        if intercept_variance > 0.0:
+            random_effect_columns.append(
+                np.full(n_timepoints, np.sqrt(intercept_variance))
+            )
+        if slope_variance > 0.0:
+            random_effect_columns.append(times * np.sqrt(slope_variance))
+
+        if not random_effect_columns:
+            quadratic_forms = (
+                cdist(values, trajectories, metric="sqeuclidean") / residual_variance
+            )
+            log_determinant = n_timepoints * np.log(residual_variance)
+        else:
+            random_effect_basis = np.column_stack(random_effect_columns)
+            orthonormal_basis, triangular_basis = np.linalg.qr(
+                random_effect_basis,
+                mode="reduced",
+            )
+            basis_covariance = (
+                residual_variance * np.eye(orthonormal_basis.shape[1])
+                + triangular_basis @ triangular_basis.T
+            )
+            covariance_factor = np.linalg.cholesky(basis_covariance)
+            log_determinant = (n_timepoints - orthonormal_basis.shape[1]) * np.log(
+                residual_variance
+            ) + 2.0 * np.sum(np.log(np.diag(covariance_factor)))
+
+            quadratic_forms = np.empty(
+                (values.shape[0], self.n_classes),
+                dtype=np.float64,
+            )
+            for class_index, trajectory in enumerate(trajectories):
+                residuals = values - trajectory
+                basis_coordinates = residuals @ orthonormal_basis
+                orthogonal_residuals = (
+                    residuals - basis_coordinates @ orthonormal_basis.T
+                )
+                whitened_coordinates = np.linalg.solve(
+                    covariance_factor,
+                    basis_coordinates.T,
+                )
+                quadratic_forms[:, class_index] = np.einsum(
+                    "ij,ij->i",
+                    orthogonal_residuals,
+                    orthogonal_residuals,
+                ) / residual_variance + np.einsum(
+                    "ij,ij->j",
+                    whitened_coordinates,
+                    whitened_coordinates,
+                )
+
+        normalization = n_timepoints * np.log(2.0 * np.pi) + log_determinant
+        return -0.5 * (quadratic_forms + normalization)
 
     def _posterior_from_log_likelihoods(
         self,
