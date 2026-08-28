@@ -219,6 +219,67 @@ def draw_parameters(
     )
 
 
+def _optional_sample_array(
+    values: NDArray[np.float64] | None,
+    name: str,
+    expected_shape: tuple[int, int],
+) -> NDArray[np.float64] | None:
+    """Validate an optional sampled item parameter."""
+    if values is None:
+        return None
+    array = np.asarray(values, dtype=np.float64)
+    if array.shape != expected_shape:
+        raise ValueError(f"samples.{name} must have shape {expected_shape}")
+    if not np.all(np.isfinite(array)):
+        raise ValueError(f"samples.{name} must contain only finite values")
+    return array
+
+
+def _validated_parameter_samples(
+    samples: ParameterSamples,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+]:
+    """Return consistently shaped, finite arrays from a sample container."""
+    try:
+        discrimination = np.asarray(samples.discrimination, dtype=np.float64)
+        difficulty = np.asarray(samples.difficulty, dtype=np.float64)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "samples must expose numeric discrimination and difficulty arrays"
+        ) from exc
+
+    if discrimination.ndim not in {2, 3}:
+        raise ValueError("samples.discrimination must be two- or three-dimensional")
+    if any(size == 0 for size in discrimination.shape):
+        raise ValueError(
+            "samples.discrimination must contain at least one draw, item, and factor"
+        )
+    if not np.all(np.isfinite(discrimination)):
+        raise ValueError("samples.discrimination must contain only finite values")
+
+    n_samples, n_items = discrimination.shape[:2]
+    expected_shape = (n_samples, n_items)
+    if difficulty.shape != expected_shape:
+        raise ValueError(f"samples.difficulty must have shape {expected_shape}")
+    if not np.all(np.isfinite(difficulty)):
+        raise ValueError("samples.difficulty must contain only finite values")
+
+    return (
+        discrimination,
+        difficulty,
+        _optional_sample_array(samples.guessing, "guessing", expected_shape),
+        _optional_sample_array(samples.slipping, "slipping", expected_shape),
+        _optional_sample_array(samples.upper, "upper", expected_shape),
+        _optional_sample_array(samples.asymmetry, "asymmetry", expected_shape),
+    )
+
+
 def posterior_summary(
     samples: ParameterSamples,
     credible_level: float = 0.95,
@@ -251,14 +312,21 @@ def posterior_summary(
     lower_q = alpha / 2 * 100
     upper_q = (1 - alpha / 2) * 100
 
-    parameter_arrays = {
-        "discrimination": samples.discrimination,
-        "difficulty": samples.difficulty,
-        "guessing": samples.guessing,
-        "slipping": samples.slipping,
-        "upper": samples.upper,
-        "asymmetry": samples.asymmetry,
-    }
+    validated = _validated_parameter_samples(samples)
+    parameter_arrays = dict(
+        zip(
+            (
+                "discrimination",
+                "difficulty",
+                "guessing",
+                "slipping",
+                "upper",
+                "asymmetry",
+            ),
+            validated,
+            strict=True,
+        )
+    )
 
     return {
         name: {
@@ -271,22 +339,6 @@ def posterior_summary(
         for name, values in parameter_arrays.items()
         if values is not None
     }
-
-
-def _optional_sample_array(
-    values: NDArray[np.float64] | None,
-    name: str,
-    expected_shape: tuple[int, int],
-) -> NDArray[np.float64] | None:
-    """Validate an optional sampled item parameter."""
-    if values is None:
-        return None
-    array = np.asarray(values, dtype=np.float64)
-    if array.shape != expected_shape:
-        raise ValueError(f"samples.{name} must have shape {expected_shape}")
-    if not np.all(np.isfinite(array)):
-        raise ValueError(f"samples.{name} must contain only finite values")
-    return array
 
 
 def _sigmoid_inplace(values: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -303,6 +355,7 @@ def sample_expected_scores(
     theta: NDArray[np.float64],
     samples: ParameterSamples,
     *,
+    item_idx: int | None = None,
     chunk_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Compute expected scores using parameter samples.
@@ -317,6 +370,9 @@ def sample_expected_scores(
         Ability values. Shape: (n_persons,) or (n_persons, n_dims).
     samples : ParameterSamples
         Parameter samples from draw_parameters().
+    item_idx : int, optional
+        Zero-based item index. When provided, uncertainty is propagated for
+        only that item instead of allocating logits for the full item bank.
     chunk_size : int, optional
         Number of parameter samples to evaluate per vectorized chunk. By
         default, a memory-aware chunk size is selected automatically.
@@ -324,8 +380,9 @@ def sample_expected_scores(
     Returns
     -------
     NDArray[np.float64]
-        Expected scores for each sample.
-        Shape: (n_samples, n_persons).
+        Expected scores for each sample. Shape: ``(n_samples, n_persons)``.
+        With ``item_idx``, each value is that item's expected score; otherwise
+        it is the expected total score across all items.
     """
     if model.model_name not in {"1PL", "2PL", "3PL", "4PL", "5PL"}:
         raise ValueError("sample_expected_scores requires a logistic item model")
@@ -338,40 +395,40 @@ def sample_expected_scores(
     if not np.all(np.isfinite(theta)):
         raise ValueError("theta must contain only finite values")
 
-    disc = np.asarray(samples.discrimination, dtype=np.float64)
+    (
+        disc,
+        diff,
+        guessing,
+        sampled_slipping,
+        sampled_upper,
+        asymmetry,
+    ) = _validated_parameter_samples(samples)
     if disc.ndim == 2:
         disc = disc[:, :, np.newaxis]
-    elif disc.ndim != 3:
-        raise ValueError("samples.discrimination must be two- or three-dimensional")
-    if not np.all(np.isfinite(disc)):
-        raise ValueError("samples.discrimination must contain only finite values")
 
     n_samples, n_items, n_dims = disc.shape
-    if n_samples == 0:
-        raise ValueError("samples must contain at least one draw")
     if n_items != model.n_items or n_dims != model.n_factors:
         raise ValueError(
             "sample discrimination dimensions must match the model's items and factors"
         )
+    if item_idx is not None:
+        if (
+            isinstance(item_idx, bool)
+            or not isinstance(item_idx, (int, np.integer))
+            or item_idx < 0
+            or item_idx >= n_items
+        ):
+            raise IndexError(f"item_idx must be an integer in [0, {n_items})")
+        item_idx = int(item_idx)
 
-    expected_shape = (n_samples, n_items)
-    diff = np.asarray(samples.difficulty, dtype=np.float64)
-    if diff.shape != expected_shape or not np.all(np.isfinite(diff)):
-        raise ValueError(f"samples.difficulty must have shape {expected_shape}")
-
-    guessing = _optional_sample_array(samples.guessing, "guessing", expected_shape)
-    sampled_slipping = _optional_sample_array(
-        samples.slipping, "slipping", expected_shape
-    )
-    sampled_upper = _optional_sample_array(samples.upper, "upper", expected_shape)
-    asymmetry = _optional_sample_array(samples.asymmetry, "asymmetry", expected_shape)
+    all_item_shape = (n_samples, n_items)
 
     if sampled_upper is not None and sampled_slipping is not None:
         raise ValueError("samples.upper and samples.slipping are mutually exclusive")
 
     def fixed_parameter(name: str) -> NDArray[np.float64] | None:
         values = _optional_model_parameter(model, name, n_items)
-        return None if values is None else np.broadcast_to(values, expected_shape)
+        return None if values is None else np.broadcast_to(values, all_item_shape)
 
     if guessing is None:
         guessing = fixed_parameter("guessing")
@@ -397,15 +454,25 @@ def sample_expected_scores(
     if asymmetry is not None and np.any(asymmetry <= 0.0):
         raise ValueError("samples.asymmetry must be positive")
 
-    lower = guessing if guessing is not None else np.zeros(expected_shape)
+    lower = guessing if guessing is not None else np.zeros(all_item_shape)
     if upper is not None:
         effective_upper = upper
     elif slipping is not None:
         effective_upper = 1.0 - slipping
     else:
-        effective_upper = np.ones(expected_shape)
+        effective_upper = np.ones(all_item_shape)
     if np.any(lower > effective_upper):
         raise ValueError("sample lower asymptotes cannot exceed upper asymptotes")
+
+    if item_idx is not None:
+        item_selection = slice(item_idx, item_idx + 1)
+        disc = disc[:, item_selection, :]
+        diff = diff[:, item_selection]
+        lower = lower[:, item_selection]
+        effective_upper = effective_upper[:, item_selection]
+        if asymmetry is not None:
+            asymmetry = asymmetry[:, item_selection]
+    n_scored_items = disc.shape[1]
 
     n_persons = theta.shape[0]
     expected = np.empty((n_samples, n_persons), dtype=np.float64)
@@ -413,7 +480,7 @@ def sample_expected_scores(
         return expected
 
     if chunk_size is None:
-        elements_per_sample = max(1, n_persons * n_items)
+        elements_per_sample = max(1, n_persons * n_scored_items)
         chunk_size = max(1, min(n_samples, 4_000_000 // elements_per_sample))
     elif (
         not isinstance(chunk_size, int)
