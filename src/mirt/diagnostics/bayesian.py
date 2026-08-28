@@ -573,6 +573,7 @@ def psis_loo(
     log_lik: ArrayLike,
     k_threshold: float = 0.7,
     relative_eff: ArrayLike = 1.0,
+    n_jobs: int = 1,
 ) -> PSISResult:
     """Compute PSIS-LOO cross-validation.
 
@@ -590,6 +591,10 @@ def psis_loo(
         Relative effective sample size of the inverse importance ratios. A
         scalar is shared across observations; an array supplies one value per
         observation. Independent posterior draws may use the default.
+    n_jobs : int, default=1
+        Number of threads used to smooth independent observation tails. Use
+        ``-1`` for all available processors. The serial default avoids thread
+        overhead for small log-likelihood matrices.
 
     Returns
     -------
@@ -624,19 +629,44 @@ def psis_loo(
         raise ValueError("k_threshold must be a positive finite number")
     n_samples, n_obs = log_lik.shape
     relative_efficiency = _validate_relative_efficiency(relative_eff, n_obs)
+    if (
+        isinstance(n_jobs, (bool, np.bool_))
+        or not isinstance(n_jobs, (int, np.integer))
+        or n_jobs == 0
+        or n_jobs < -1
+    ):
+        raise ValueError("n_jobs must be -1 or a positive integer")
+    if n_jobs == -1:
+        import os
+
+        worker_count = os.cpu_count() or 1
+    else:
+        worker_count = int(n_jobs)
 
     pointwise_elpd = np.empty(n_obs, dtype=np.float64)
     pareto_k = np.empty(n_obs, dtype=np.float64)
 
-    for i in range(n_obs):
-        log_ratios = -log_lik[:, i]
+    def smooth_observation(observation: int) -> tuple[float, float]:
+        column = log_lik[:, observation]
         log_weights, k = _pareto_smooth_log_weights(
-            log_ratios,
-            relative_eff=float(relative_efficiency[i]),
+            -column,
+            relative_eff=float(relative_efficiency[observation]),
         )
-        pareto_k[i] = k
+        return float(logsumexp(column + log_weights)), k
 
-        pointwise_elpd[i] = float(logsumexp(log_lik[:, i] + log_weights))
+    if worker_count == 1 or n_obs == 1:
+        smoothed_results = map(smooth_observation, range(n_obs))
+        for observation, (elpd, k) in enumerate(smoothed_results):
+            pointwise_elpd[observation] = elpd
+            pareto_k[observation] = k
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(worker_count, n_obs)) as executor:
+            smoothed_results = executor.map(smooth_observation, range(n_obs))
+            for observation, (elpd, k) in enumerate(smoothed_results):
+                pointwise_elpd[observation] = elpd
+                pareto_k[observation] = k
 
     elpd_loo = np.sum(pointwise_elpd)
 

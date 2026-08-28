@@ -102,6 +102,8 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   diagnostics.psis_loo
+   diagnostics.waic
 
 Plotting
 --------
