@@ -87,6 +87,33 @@ contribute zero log score, and produce ``numpy.nan`` residuals. Both result
 types retain final per-skill posteriors and next-opportunity priors, so a
 forecast can continue without replaying the history.
 
+Adaptive skill ranking
+----------------------
+
+Rank the next skill opportunity directly from retained mastery priors:
+
+.. code-block:: python
+
+   ranking = model.rank_skills(
+       diagnostics.next_mastery_priors,
+       criterion="information_gain",
+       top_k=2,
+   )
+   next_skill = ranking.best_skill_index
+   next_skill_name = model.skill_names[next_skill]
+
+``information_gain`` measures the exact mutual information, in nats, between
+the latent mastery state and the next binary response. It favors opportunities
+whose outcome is expected to be most diagnostic. Other objectives prioritize
+expected net ``mastery_gain``, ``lowest_mastery`` for remediation, or the
+highest ``success_probability``. Pass ``available_skills`` to restrict the
+candidate set. Equal scores are ordered by the lower skill index.
+
+``rank_skills_batch`` evaluates an ``(n_persons, n_skills)`` matrix together
+and returns one ranked row per learner. The retained priors from
+``predictive_diagnostics`` or ``predictive_diagnostics_batch`` can be passed
+directly to the ranking methods, without replaying response histories.
+
 Mastery forecasts
 -----------------
 
@@ -116,6 +143,36 @@ future responses and use a closed-form transition, so their runtime does not
 include a Python loop over the horizon. Skills absent from a response history
 begin at their configured initial mastery probability.
 
+Mastery targets
+---------------
+
+Calculate the minimum additional opportunities needed for each skill's
+expected mastery probability to reach a target:
+
+.. code-block:: python
+
+   progress = model.opportunities_to_mastery(
+       diagnostics.next_mastery_priors,
+       target_mastery=0.9,
+   )
+   practice_counts = progress.opportunities
+   reachable = progress.reachable
+
+A count of zero means the retained prior already meets the target.
+``numpy.inf`` explicitly marks a target that cannot be reached under the
+model's unconditional transition path, including a target equal to a limiting
+probability that is approached only asymptotically. This avoids choosing an
+arbitrary forecast horizon or mistaking horizon exhaustion for
+unreachability.
+
+``opportunities_to_mastery_batch`` evaluates every learner and skill together.
+It accepts a shared scalar target, a shared ``(n_skills,)`` vector, or a
+person-specific ``(n_persons, n_skills)`` matrix. Both methods solve the
+transition recurrence directly, so memory and runtime do not grow with the
+number of opportunities returned. The calculation describes expected mastery
+before future responses are known; new evidence can be incorporated with an
+online update and the target recomputed.
+
 Batch inference
 ---------------
 
@@ -141,10 +198,12 @@ one call:
 
 ``skill_assignments`` may also be a matrix matching the response matrix when
 learners receive different trial layouts. Shared layouts use the compiled
-parallel implementation when it is available. Set ``use_rust=False`` on
-``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy implementation for a
-specific workflow; the global ``mirt.set_backend("numpy")`` preference is also
-honored.
+parallel implementation when it is available. The NumPy fallback also filters
+and smooths shared layouts across all learners at once, and BKT Gibbs sampling
+uses the same vectorized filtering path for hidden-state draws. Set
+``use_rust=False`` on ``BKTModel`` or ``BKTGibbsSampler`` to select the NumPy
+implementation for a specific workflow; the global
+``mirt.set_backend("numpy")`` preference is also honored.
 
 Terminal helpers such as ``predict_mastery_batch`` and
 ``next_mastery_priors_batch`` avoid backward smoothing when a compiled shared
