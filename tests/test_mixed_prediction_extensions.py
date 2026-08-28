@@ -18,7 +18,7 @@ from mirt import (
     randef,
     shrinkage_estimates,
 )
-from mirt.models import TwoParameterLogistic
+from mirt.models import GradedResponseModel, TwoParameterLogistic
 
 
 @pytest.fixture
@@ -90,6 +90,40 @@ def test_predict_mixed_transforms_person_covariates(
     assert actual.shape == (2, 2)
 
 
+def test_predict_mixed_can_evaluate_one_item_without_building_full_matrix(
+    mixed_result: MixedEffectsFitResult,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    full = predict_mixed(mixed_result)
+    calls: list[int | None] = []
+    probability = mixed_result.model.probability
+
+    def tracked_probability(theta, item_idx=None):
+        calls.append(item_idx)
+        return probability(theta, item_idx=item_idx)
+
+    monkeypatch.setattr(mixed_result.model, "probability", tracked_probability)
+
+    selected = predict_mixed(mixed_result, item_idx=1)
+
+    assert calls == [1]
+    assert selected.shape == (3,)
+    np.testing.assert_allclose(selected, full[:, 1])
+
+
+def test_predict_mixed_documents_polytomous_output_shapes() -> None:
+    model = GradedResponseModel(n_items=2, n_categories=[3, 4])
+    theta = np.array([-1.0, 0.5])
+    result = SimpleNamespace(model=model, theta=theta)
+
+    full = predict_mixed(result)
+    selected = predict_mixed(result, item_idx=0)
+
+    assert full.shape == (2, 2, 4)
+    assert selected.shape == (2, 3)
+    np.testing.assert_allclose(selected, full[:, 0, :3])
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -111,6 +145,15 @@ def test_predict_mixed_validates_inputs(
         predict_mixed(mixed_result, **kwargs)
 
 
+@pytest.mark.parametrize("item_idx", [-1, 2, True])
+def test_predict_mixed_rejects_invalid_item_indices(
+    mixed_result: MixedEffectsFitResult,
+    item_idx: int,
+) -> None:
+    with pytest.raises(IndexError, match="item_idx"):
+        predict_mixed(mixed_result, item_idx=item_idx)
+
+
 def test_random_effect_extraction_returns_independent_arrays(
     mixed_result: MixedEffectsFitResult,
 ) -> None:
@@ -127,6 +170,24 @@ def test_random_effect_extraction_returns_independent_arrays(
         randef(mixed_result, level="group")
     with pytest.raises(ValueError, match="Unknown level"):
         randef(mixed_result, level="school")
+
+
+def test_random_effect_extraction_validates_uncertainty_and_copies_groups(
+    mixed_result: MixedEffectsFitResult,
+) -> None:
+    with pytest.raises(ValueError, match="non-empty and finite"):
+        randef(replace(mixed_result, theta=np.array([np.nan])))
+    with pytest.raises(ValueError, match="non-negative"):
+        randef(replace(mixed_result, theta_se=np.array([-0.1, 0.2, 0.3])))
+
+    source = SimpleNamespace(
+        theta=np.array([0.0]),
+        theta_se=np.array([0.1]),
+        group_effects={"school": np.array([1.0])},
+    )
+    extracted = randef(source, level="group")
+    extracted.group_effects["school"][0] = 9.0
+    assert source.group_effects["school"][0] == pytest.approx(1.0)
 
 
 def test_fixed_effect_extraction_preserves_names_and_uncertainty(
@@ -146,9 +207,30 @@ def test_fixed_effect_extraction_preserves_names_and_uncertainty(
         "person:z": 0.2,
         "item:complexity": 0.05,
     }
+    assert effects.person_intercept_standard_error == pytest.approx(0.08)
+    assert effects.item_intercept_standard_error == pytest.approx(0.06)
 
     effects.item_parameters["difficulty"][0] = 99.0
     assert mixed_result.model.parameters["difficulty"][0] == pytest.approx(-0.5)
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"person_effects": np.ones((1, 2))}, "non-empty vector"),
+        ({"person_effects": np.array([np.inf, 0.0])}, "finite"),
+        ({"person_covariate_names": ("x", "x")}, "unique"),
+        ({"person_effect_se": np.array([-0.1, 0.2])}, "non-negative"),
+        ({"person_intercept": np.inf}, "intercept must be finite"),
+    ],
+)
+def test_fixed_effect_extraction_rejects_malformed_fitted_state(
+    mixed_result: MixedEffectsFitResult,
+    changes: dict,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        fixef(replace(mixed_result, **changes))
 
 
 def test_conditional_effects_support_named_person_and_item_terms(
@@ -178,6 +260,8 @@ def test_conditional_effects_reject_unknown_and_ambiguous_names(
     np.testing.assert_allclose(
         conditional_effects(ambiguous, "person:x", [2.0])["effects"], [4.0]
     )
+    with pytest.raises(ValueError, match="non-empty"):
+        conditional_effects(mixed_result, "x", [])
 
 
 def test_shrinkage_uses_fitted_ability_uncertainty(
@@ -191,6 +275,19 @@ def test_shrinkage_uses_fitted_ability_uncertainty(
 
     with pytest.raises(ValueError, match="abilities"):
         shrinkage_estimates(replace(mixed_result, theta_se=None))
+
+
+def test_shrinkage_validates_variance_components(
+    mixed_result: MixedEffectsFitResult,
+) -> None:
+    result = SimpleNamespace(
+        theta=mixed_result.theta,
+        theta_se=mixed_result.theta_se,
+        variance_components={"between_group": -0.1, "within_group": 1.0},
+    )
+
+    with pytest.raises(ValueError, match="non-negative"):
+        shrinkage_estimates(result)
 
 
 def test_fit_retains_effect_metadata_and_honors_controls(monkeypatch) -> None:
