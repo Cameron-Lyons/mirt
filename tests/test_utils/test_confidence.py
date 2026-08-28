@@ -266,6 +266,59 @@ class TestDeltaMethod:
         assert transformed == pytest.approx(6.0)
         assert standard_error == pytest.approx(expected_se)
 
+    def test_scale_aware_differences_resolve_large_estimates(self):
+        transformed, standard_error = delta_method(
+            [1e12],
+            [[1.0]],
+            lambda values: values[0] ** 2,
+        )
+
+        assert transformed == pytest.approx(1e24)
+        assert standard_error == pytest.approx(2e12, rel=1e-9)
+
+    def test_analytic_gradient_avoids_numerical_transform_evaluations(self):
+        calls = {"transform": 0, "gradient": 0}
+        covariance = np.array([[0.04, 0.01], [0.01, 0.09]])
+
+        def transform(values):
+            calls["transform"] += 1
+            return values[0] * values[1]
+
+        def gradient(values):
+            calls["gradient"] += 1
+            return np.array([values[1], values[0]])
+
+        transformed, standard_error = delta_method(
+            [2.0, 3.0],
+            covariance,
+            transform,
+            gradient_func=gradient,
+        )
+
+        expected_gradient = np.array([3.0, 2.0])
+        expected_se = np.sqrt(expected_gradient @ covariance @ expected_gradient)
+        assert transformed == pytest.approx(6.0)
+        assert standard_error == pytest.approx(expected_se)
+        assert calls == {"transform": 1, "gradient": 1}
+
+    @pytest.mark.parametrize(
+        ("gradient_func", "match"),
+        [
+            (1.0, "callable"),
+            (lambda _values: [1.0], "one derivative per estimate"),
+            (lambda _values: [1.0, np.nan], "finite derivatives"),
+            (lambda _values: ["bad", "values"], "numeric derivatives"),
+        ],
+    )
+    def test_rejects_invalid_analytic_gradients(self, gradient_func, match):
+        with pytest.raises(MirtValidationError, match=match):
+            delta_method(
+                [1.0, 2.0],
+                np.eye(2),
+                np.sum,
+                gradient_func=gradient_func,
+            )
+
     @pytest.mark.parametrize(
         ("vcov", "match"),
         [
