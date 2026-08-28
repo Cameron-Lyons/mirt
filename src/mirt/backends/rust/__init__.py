@@ -53,6 +53,7 @@ from mirt.backends.rust.eapsum import (
     lord_wingersky_polytomous,
     lord_wingersky_recursion,
 )
+from mirt.backends.rust.equating import observed_score_distribution_2pl
 from mirt.backends.rust.estep import (
     compute_expected_counts,
     compute_expected_counts_parallel,
@@ -194,4 +195,5 @@ __all__ = [
     "bkt_ffbs_batch",
     "longitudinal_log_likelihood",
     "compute_growth_trajectory",
+    "observed_score_distribution_2pl",
 ]
