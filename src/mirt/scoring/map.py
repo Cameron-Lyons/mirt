@@ -9,11 +9,13 @@ from scipy.optimize import minimize, minimize_scalar
 from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import (
     finite_difference_se,
+    resolve_n_jobs,
     resolve_prior_distribution,
     score_responses_parallel,
     unique_response_patterns,
     validate_scoring_responses,
 )
+from mirt.scoring._optimization import validate_theta_bounds
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -28,10 +30,19 @@ class MAPScorer:
         theta_bounds: tuple[float, float] = (-6.0, 6.0),
         n_jobs: int = 1,
     ) -> None:
-        self.prior_mean = prior_mean
-        self.prior_cov = prior_cov
-        self.theta_bounds = theta_bounds
-        self.n_jobs = n_jobs
+        self.prior_mean = (
+            None
+            if prior_mean is None
+            else np.array(prior_mean, dtype=np.float64, copy=True)
+        )
+        self.prior_cov = (
+            None
+            if prior_cov is None
+            else np.array(prior_cov, dtype=np.float64, copy=True)
+        )
+        self.theta_bounds = validate_theta_bounds(theta_bounds)
+        resolve_n_jobs(n_jobs)
+        self.n_jobs = int(n_jobs)
 
     def score(
         self,
@@ -100,7 +111,13 @@ class MAPScorer:
         )
 
         theta_est = result.x
-        se_est = finite_difference_se(neg_log_posterior, theta_est)
+
+        def objective_with_cached_optimum(theta: float) -> float:
+            if theta == theta_est:
+                return float(result.fun)
+            return neg_log_posterior(theta)
+
+        se_est = finite_difference_se(objective_with_cached_optimum, theta_est)
 
         return theta_est, se_est
 

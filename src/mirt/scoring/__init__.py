@@ -57,7 +57,7 @@ def fscores(
     person_ids : list, optional
         Identifiers for each person in the output.
     bounds : tuple of float, default=(-6.0, 6.0)
-        Bounds for theta estimation (used by WLE).
+        Bounds for theta estimation used by MAP, ML, and WLE.
     n_jobs : int, default=1
         Number of response patterns to optimize in parallel for MAP, ML, and
         WLE scoring. ``-1`` uses all available CPU cores. EAP methods already
@@ -118,10 +118,11 @@ def fscores(
         scorer = MAPScorer(
             prior_mean=prior_mean,
             prior_cov=prior_cov,
+            theta_bounds=bounds,
             n_jobs=n_jobs,
         )
     elif method == "ML":
-        scorer = MLScorer(n_jobs=n_jobs)
+        scorer = MLScorer(theta_bounds=bounds, n_jobs=n_jobs)
     elif method == "WLE":
         scorer = WLEScorer(bounds=bounds, n_jobs=n_jobs)
     else:

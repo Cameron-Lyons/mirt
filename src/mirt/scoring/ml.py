@@ -10,10 +10,12 @@ from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import (
     finite_difference_se,
     observed_test_information,
+    resolve_n_jobs,
     score_responses_parallel,
     unique_response_patterns,
     validate_scoring_responses,
 )
+from mirt.scoring._optimization import validate_theta_bounds
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -26,8 +28,9 @@ class MLScorer:
         theta_bounds: tuple[float, float] = (-6.0, 6.0),
         n_jobs: int = 1,
     ) -> None:
-        self.theta_bounds = theta_bounds
-        self.n_jobs = n_jobs
+        self.theta_bounds = validate_theta_bounds(theta_bounds)
+        resolve_n_jobs(n_jobs)
+        self.n_jobs = int(n_jobs)
 
     def score(
         self,
@@ -78,11 +81,12 @@ class MLScorer:
         if len(valid_responses) == 0:
             return 0.0, np.inf
 
-        prop_correct = valid_responses.mean()
-        if prop_correct == 0:
-            return self.theta_bounds[0], np.inf
-        if prop_correct == 1:
-            return self.theta_bounds[1], np.inf
+        if not model.is_polytomous:
+            prop_correct = valid_responses.mean()
+            if prop_correct == 0:
+                return self.theta_bounds[0], np.inf
+            if prop_correct == 1:
+                return self.theta_bounds[1], np.inf
 
         result = minimize_scalar(
             neg_log_likelihood,

@@ -26,6 +26,7 @@ from mirt.scoring._common import (
     unique_response_patterns,
     validate_scoring_responses,
 )
+from mirt.scoring._optimization import validate_theta_bounds
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -78,12 +79,7 @@ class WLEScorer:
         tol: float = 1e-6,
         n_jobs: int = 1,
     ) -> None:
-        try:
-            lower, upper = (float(value) for value in bounds)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("bounds must contain exactly two finite values") from exc
-        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-            raise ValueError("bounds must contain finite values with lower < upper")
+        lower, upper = validate_theta_bounds(bounds)
         if not np.isfinite(tol) or tol <= 0.0:
             raise ValueError("tol must be finite and positive")
         resolve_n_jobs(n_jobs)
