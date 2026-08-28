@@ -13,7 +13,6 @@ from mirt.models.dynamic import (
     LongitudinalResult,
     NonlinearGrowthModel,
     PiecewiseGrowthModel,
-    StateSpaceIRT,
 )
 
 
@@ -223,133 +222,6 @@ class TestLongitudinalIRTModel:
         assert "Longitudinal IRT" in summary
         assert "Intercept" in summary
         assert "Slope" in summary
-
-
-class TestStateSpaceIRT:
-    @staticmethod
-    def _reference_simulation(model, n_persons, seed):
-        rng = np.random.default_rng(seed)
-        transition = model.transition_matrix[0, 0]
-        process_noise = model.process_noise[0, 0]
-        theta = np.zeros((n_persons, model.n_timepoints))
-        responses = np.zeros(
-            (n_persons, model.n_timepoints, model.n_items),
-            dtype=np.int32,
-        )
-        theta[:, 0] = rng.normal(
-            model.initial_mean,
-            np.sqrt(model.initial_var),
-            n_persons,
-        )
-        for time in range(1, model.n_timepoints):
-            theta[:, time] = transition * theta[:, time - 1] + rng.normal(
-                0,
-                np.sqrt(process_noise),
-                n_persons,
-            )
-        for person in range(n_persons):
-            for time in range(model.n_timepoints):
-                logits = model.discrimination * (theta[person, time] - model.difficulty)
-                probabilities = 1.0 / (1.0 + np.exp(-logits))
-                if model.base_model == "3PL":
-                    probabilities = (
-                        model.guessing + (1.0 - model.guessing) * probabilities
-                    )
-                responses[person, time] = rng.random(model.n_items) < probabilities
-        return responses, theta
-
-    def test_default_initialization(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        assert model.n_items == 5
-        assert model.n_timepoints == 4
-        assert model.transition_matrix.shape == (1, 1)
-        assert model.process_noise.shape == (1, 1)
-        assert model.guessing is None
-
-    def test_3pl_initialization(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4, base_model="3PL")
-        assert model.guessing is not None
-        assert model.guessing.shape == (5,)
-
-    def test_extended_kalman_filter(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        rng = np.random.default_rng(42)
-        responses = rng.integers(0, 2, (4, 5))
-        means, vars = model.extended_kalman_filter(responses)
-        assert means.shape == (4,)
-        assert vars.shape == (4,)
-        assert np.all(vars > 0)
-
-    def test_ekf_with_missing_data(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=3)
-        responses = np.array(
-            [
-                [1, 0, -1, 1, 0],
-                [-1, -1, -1, -1, -1],
-                [1, 1, 0, 1, 1],
-            ]
-        )
-        means, vars = model.extended_kalman_filter(responses)
-        assert means.shape == (3,)
-        assert np.all(np.isfinite(means))
-
-    def test_simulate(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=6)
-        n_persons = 20
-        responses, theta = model.simulate(n_persons, seed=42)
-        assert responses.shape == (n_persons, model.n_timepoints, model.n_items)
-        assert theta.shape == (n_persons, model.n_timepoints)
-        assert set(np.unique(responses)).issubset({0, 1})
-
-    @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
-    def test_vectorized_simulation_preserves_seeded_draws(
-        self,
-        base_model,
-        monkeypatch,
-    ):
-        """Chunked broadcasting preserves the prior seeded response stream."""
-        from mirt.models import dynamic as dynamic_module
-
-        model = StateSpaceIRT(
-            n_items=7,
-            n_timepoints=5,
-            base_model=base_model,
-            discrimination=np.linspace(0.6, 1.8, 7),
-            difficulty=np.linspace(-1.0, 1.0, 7),
-        )
-        monkeypatch.setattr(
-            dynamic_module,
-            "_LONGITUDINAL_MAX_PROBABILITY_VALUES",
-            17,
-        )
-        expected_responses, expected_theta = self._reference_simulation(model, 13, 42)
-
-        responses, theta = model.simulate(13, seed=42)
-
-        np.testing.assert_array_equal(responses, expected_responses)
-        np.testing.assert_array_equal(theta, expected_theta)
-
-    @pytest.mark.parametrize("n_persons", [0, -1, True, 1.5])
-    def test_simulate_requires_positive_person_count(self, n_persons):
-        model = StateSpaceIRT(n_items=3, n_timepoints=2)
-
-        with pytest.raises(ValueError, match="n_persons"):
-            model.simulate(n_persons)
-
-    def test_simulate_theta_autocorrelation(self):
-        model = StateSpaceIRT(
-            n_items=5,
-            n_timepoints=10,
-            process_noise=np.array([[0.01]]),
-        )
-        _, theta = model.simulate(100, seed=42)
-        corr = np.corrcoef(theta[:, :-1].ravel(), theta[:, 1:].ravel())[0, 1]
-        assert corr > 0.5
-
-    def test_summary(self):
-        model = StateSpaceIRT(n_items=5, n_timepoints=4)
-        summary = model.summary()
-        assert "State-Space IRT" in summary
 
 
 class TestPiecewiseGrowthModel:
@@ -866,6 +738,7 @@ class TestGrowthMixtureModel:
             ]
         )
         expected = np.empty((len(observations), len(prediction_times)))
+        expected_variances = np.empty_like(expected)
 
         for person_index, observation in enumerate(observations):
             observed = ~np.isnan(observation)
@@ -878,7 +751,17 @@ class TestGrowthMixtureModel:
             cross_covariance = model.intercept_var * np.ones(
                 (len(prediction_times), observed.sum())
             ) + model.slope_var * np.outer(prediction_times, observed_times)
+            conditional_variance = (
+                model.intercept_var
+                + model.slope_var * prediction_times**2
+                - np.einsum(
+                    "ij,ji->i",
+                    cross_covariance,
+                    np.linalg.solve(covariance, cross_covariance.T),
+                )
+            )
             expected[person_index] = 0.0
+            expected_second_moment = conditional_variance.copy()
             for class_index in range(model.n_classes):
                 observed_mean = model.compute_class_trajectory(
                     class_index,
@@ -894,14 +777,32 @@ class TestGrowthMixtureModel:
                 expected[person_index] += (
                     posteriors[person_index, class_index] * conditional_mean
                 )
+                expected_second_moment += (
+                    posteriors[person_index, class_index] * conditional_mean**2
+                )
+            expected_variances[person_index] = (
+                expected_second_moment - expected[person_index] ** 2
+            )
 
         actual = model.predict_trajectories(
             observations,
             time_values,
             prediction_times,
         )
+        moment_mean, actual_variances = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
 
         assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(moment_mean, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            actual_variances,
+            expected_variances,
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
     def test_predict_trajectories_without_random_effects_uses_class_means(self):
         model = GrowthMixtureModel(
@@ -931,8 +832,28 @@ class TestGrowthMixtureModel:
             time_values,
             prediction_times,
         )
+        moment_mean, latent_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
+        observation_mean, observation_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+            include_residual=True,
+        )
+        expected_mean = posteriors @ class_predictions
+        expected_latent_variance = posteriors @ class_predictions**2 - expected_mean**2
 
-        assert_allclose(actual, posteriors @ class_predictions)
+        assert_allclose(actual, expected_mean)
+        assert_allclose(moment_mean, expected_mean)
+        assert_allclose(observation_mean, expected_mean)
+        assert_allclose(latent_variance, expected_latent_variance)
+        assert_allclose(
+            observation_variance,
+            expected_latent_variance + model.residual_variance,
+        )
 
     def test_piecewise_prediction_preserves_observed_grid_midpoint(self):
         model = GrowthMixtureModel(
@@ -980,6 +901,43 @@ class TestGrowthMixtureModel:
         assert predictions.shape == (1, 4)
         assert np.all(np.isfinite(predictions))
         assert np.array_equal(observations, original, equal_nan=True)
+
+    def test_predictive_variance_preserves_small_class_spread_at_large_offset(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.5, 0.5]),
+            class_intercepts=np.array([1.0e12, 1.0e12 + 1.0]),
+            class_slopes=np.zeros(2),
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=1.0,
+        )
+        observations = np.array([[1.0e12 + 0.5]])
+        time_values = np.array([0.0])
+        posteriors = model.posterior_probabilities(observations, time_values)[0]
+
+        mean, variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+        )
+
+        assert mean[0, 0] == pytest.approx(posteriors @ model.class_intercepts)
+        assert variance[0, 0] == pytest.approx(posteriors[0] * posteriors[1])
+        assert variance[0, 0] > 0.0
+
+    @pytest.mark.parametrize("include_residual", [1, 0.0, "yes", None])
+    def test_predict_trajectory_moments_validates_include_residual(
+        self,
+        include_residual,
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(TypeError, match="include_residual must be a boolean"):
+            model.predict_trajectory_moments(
+                np.zeros((2, 3)),
+                np.arange(3.0),
+                include_residual=include_residual,
+            )
 
     @pytest.mark.parametrize(
         "prediction_times",

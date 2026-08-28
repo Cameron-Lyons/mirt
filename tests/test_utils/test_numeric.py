@@ -14,7 +14,32 @@ from mirt.utils.numeric import (
     compute_probability_moments,
     logsumexp,
     logsumexp_axis1,
+    standard_normal_quadrature,
 )
+
+
+class TestStandardNormalQuadrature:
+    def test_reproduces_standard_normal_moments(self) -> None:
+        nodes, weights = standard_normal_quadrature(21)
+
+        assert np.sum(weights) == pytest.approx(1.0)
+        assert np.sum(weights * nodes) == pytest.approx(0.0, abs=1e-15)
+        assert np.sum(weights * nodes**2) == pytest.approx(1.0)
+        assert np.sum(weights * nodes**4) == pytest.approx(3.0)
+
+    @pytest.mark.parametrize("n_points", [0, -1, True, 1.5])
+    def test_requires_positive_integer(self, n_points) -> None:
+        with pytest.raises(ValueError, match="positive integer"):
+            standard_normal_quadrature(n_points)
+
+    def test_cached_arrays_are_immutable(self) -> None:
+        first = standard_normal_quadrature(17)
+        second = standard_normal_quadrature(17)
+
+        assert first[0] is second[0]
+        assert first[1] is second[1]
+        assert not first[0].flags.writeable
+        assert not first[1].flags.writeable
 
 
 class TestLogSumExp:
