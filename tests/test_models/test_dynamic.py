@@ -866,6 +866,7 @@ class TestGrowthMixtureModel:
             ]
         )
         expected = np.empty((len(observations), len(prediction_times)))
+        expected_variances = np.empty_like(expected)
 
         for person_index, observation in enumerate(observations):
             observed = ~np.isnan(observation)
@@ -878,7 +879,17 @@ class TestGrowthMixtureModel:
             cross_covariance = model.intercept_var * np.ones(
                 (len(prediction_times), observed.sum())
             ) + model.slope_var * np.outer(prediction_times, observed_times)
+            conditional_variance = (
+                model.intercept_var
+                + model.slope_var * prediction_times**2
+                - np.einsum(
+                    "ij,ji->i",
+                    cross_covariance,
+                    np.linalg.solve(covariance, cross_covariance.T),
+                )
+            )
             expected[person_index] = 0.0
+            expected_second_moment = conditional_variance.copy()
             for class_index in range(model.n_classes):
                 observed_mean = model.compute_class_trajectory(
                     class_index,
@@ -894,14 +905,32 @@ class TestGrowthMixtureModel:
                 expected[person_index] += (
                     posteriors[person_index, class_index] * conditional_mean
                 )
+                expected_second_moment += (
+                    posteriors[person_index, class_index] * conditional_mean**2
+                )
+            expected_variances[person_index] = (
+                expected_second_moment - expected[person_index] ** 2
+            )
 
         actual = model.predict_trajectories(
             observations,
             time_values,
             prediction_times,
         )
+        moment_mean, actual_variances = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
 
         assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(moment_mean, expected, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            actual_variances,
+            expected_variances,
+            rtol=1e-12,
+            atol=1e-12,
+        )
 
     def test_predict_trajectories_without_random_effects_uses_class_means(self):
         model = GrowthMixtureModel(
@@ -931,8 +960,28 @@ class TestGrowthMixtureModel:
             time_values,
             prediction_times,
         )
+        moment_mean, latent_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+        )
+        observation_mean, observation_variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+            prediction_times,
+            include_residual=True,
+        )
+        expected_mean = posteriors @ class_predictions
+        expected_latent_variance = posteriors @ class_predictions**2 - expected_mean**2
 
-        assert_allclose(actual, posteriors @ class_predictions)
+        assert_allclose(actual, expected_mean)
+        assert_allclose(moment_mean, expected_mean)
+        assert_allclose(observation_mean, expected_mean)
+        assert_allclose(latent_variance, expected_latent_variance)
+        assert_allclose(
+            observation_variance,
+            expected_latent_variance + model.residual_variance,
+        )
 
     def test_piecewise_prediction_preserves_observed_grid_midpoint(self):
         model = GrowthMixtureModel(
@@ -980,6 +1029,43 @@ class TestGrowthMixtureModel:
         assert predictions.shape == (1, 4)
         assert np.all(np.isfinite(predictions))
         assert np.array_equal(observations, original, equal_nan=True)
+
+    def test_predictive_variance_preserves_small_class_spread_at_large_offset(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            class_proportions=np.array([0.5, 0.5]),
+            class_intercepts=np.array([1.0e12, 1.0e12 + 1.0]),
+            class_slopes=np.zeros(2),
+            intercept_var=0.0,
+            slope_var=0.0,
+            residual_variance=1.0,
+        )
+        observations = np.array([[1.0e12 + 0.5]])
+        time_values = np.array([0.0])
+        posteriors = model.posterior_probabilities(observations, time_values)[0]
+
+        mean, variance = model.predict_trajectory_moments(
+            observations,
+            time_values,
+        )
+
+        assert mean[0, 0] == pytest.approx(posteriors @ model.class_intercepts)
+        assert variance[0, 0] == pytest.approx(posteriors[0] * posteriors[1])
+        assert variance[0, 0] > 0.0
+
+    @pytest.mark.parametrize("include_residual", [1, 0.0, "yes", None])
+    def test_predict_trajectory_moments_validates_include_residual(
+        self,
+        include_residual,
+    ):
+        model = GrowthMixtureModel(n_classes=2)
+
+        with pytest.raises(TypeError, match="include_residual must be a boolean"):
+            model.predict_trajectory_moments(
+                np.zeros((2, 3)),
+                np.arange(3.0),
+                include_residual=include_residual,
+            )
 
     @pytest.mark.parametrize(
         "prediction_times",

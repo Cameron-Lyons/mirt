@@ -2607,6 +2607,73 @@ class GrowthMixtureModel:
             Posterior mean latent trajectories with shape
             ``(n_persons, n_prediction_times)``.
         """
+        predictions, _ = self._trajectory_prediction_moments(
+            observations,
+            time_values,
+            prediction_times,
+            include_residual=False,
+            compute_variance=False,
+        )
+        return predictions
+
+    def predict_trajectory_moments(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+        prediction_times: NDArray[np.float64] | None = None,
+        *,
+        include_residual: bool = False,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return exact posterior predictive means and pointwise variances.
+
+        The variance combines uncertainty over latent classes with conditional
+        random-intercept and random-slope uncertainty. By default it describes
+        the latent trajectory. Set ``include_residual=True`` to add the model's
+        occasion-specific residual variance for future observed values.
+
+        Parameters
+        ----------
+        observations : NDArray
+            Observed trajectories with shape ``(n_persons, n_timepoints)``.
+            Use ``NaN`` for missing occasions; every person must have at least
+            one observed value.
+        time_values : NDArray
+            One finite time value per observation column.
+        prediction_times : NDArray, optional
+            Finite times at which to predict. The observed time grid is used
+            when omitted.
+        include_residual : bool
+            Whether to include new occasion-specific residual variance.
+
+        Returns
+        -------
+        tuple
+            Posterior predictive mean and marginal variance arrays, each with
+            shape ``(n_persons, n_prediction_times)``.
+        """
+        if not isinstance(include_residual, (bool, np.bool_)):
+            raise TypeError("include_residual must be a boolean")
+        predictions, prediction_variances = self._trajectory_prediction_moments(
+            observations,
+            time_values,
+            prediction_times,
+            include_residual=bool(include_residual),
+            compute_variance=True,
+        )
+        if prediction_variances is None:  # pragma: no cover - internal invariant
+            raise RuntimeError("trajectory prediction variance was not computed")
+        return predictions, prediction_variances
+
+    def _trajectory_prediction_moments(
+        self,
+        observations: NDArray[np.float64],
+        time_values: NDArray[np.float64],
+        prediction_times: NDArray[np.float64] | None,
+        *,
+        include_residual: bool,
+        compute_variance: bool,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+        """Compute grouped conditional trajectory moments."""
         values, times, trajectories, variances, observation_mask = (
             self._validated_trajectory_data(
                 observations,
@@ -2645,11 +2712,33 @@ class GrowthMixtureModel:
             (values.shape[0], prediction_values.size),
             dtype=np.float64,
         )
+        prediction_variances = np.empty_like(predictions) if compute_variance else None
+        prior_random_variance = (
+            intercept_variance + slope_variance * prediction_values**2
+            if compute_variance
+            else None
+        )
 
         for pattern in patterns:
             pattern_posteriors = posteriors[pattern.rows]
-            pattern_predictions = pattern_posteriors @ prediction_trajectories
-            if intercept_variance > 0.0 or slope_variance > 0.0:
+            if compute_variance:
+                pattern_predictions = np.zeros(
+                    (pattern.rows.size, prediction_values.size),
+                    dtype=np.float64,
+                )
+                between_class_variance = np.zeros_like(pattern_predictions)
+                cumulative_class_mass = np.zeros(pattern.rows.size, dtype=np.float64)
+            else:
+                pattern_predictions = pattern_posteriors @ prediction_trajectories
+                between_class_variance = None
+                cumulative_class_mass = None
+            conditional_variance = (
+                prior_random_variance.copy()
+                if prior_random_variance is not None
+                else None
+            )
+            has_random_effects = intercept_variance > 0.0 or slope_variance > 0.0
+            if has_random_effects:
                 observed_times = times[pattern.columns]
                 cross_covariance = np.full(
                     (prediction_values.size, pattern.columns.size),
@@ -2661,20 +2750,79 @@ class GrowthMixtureModel:
                         prediction_values,
                         observed_times,
                     )
+                if conditional_variance is not None:
+                    precision_cross_covariance = pattern.covariance.solve(
+                        cross_covariance.T
+                    )
+                    conditional_variance -= np.einsum(
+                        "ij,ji->i",
+                        cross_covariance,
+                        precision_cross_covariance,
+                    )
                 pattern_values = values[np.ix_(pattern.rows, pattern.columns)]
+            else:
+                cross_covariance = None
+                pattern_values = None
+
+            if has_random_effects or compute_variance:
                 for class_index in range(self.n_classes):
-                    residuals = (
-                        pattern_values - trajectories[class_index, pattern.columns]
-                    )
-                    precision_residuals = pattern.covariance.solve(residuals.T).T
-                    correction = precision_residuals @ cross_covariance.T
-                    pattern_predictions += (
-                        pattern_posteriors[:, class_index, None] * correction
-                    )
+                    if pattern_values is not None and cross_covariance is not None:
+                        residuals = (
+                            pattern_values - trajectories[class_index, pattern.columns]
+                        )
+                        precision_residuals = pattern.covariance.solve(residuals.T).T
+                        correction = precision_residuals @ cross_covariance.T
+                    else:
+                        correction = 0.0
+
+                    class_weights = pattern_posteriors[:, class_index]
+                    if (
+                        between_class_variance is not None
+                        and cumulative_class_mass is not None
+                    ):
+                        class_predictions = (
+                            prediction_trajectories[class_index] + correction
+                        )
+                        updated_class_mass = cumulative_class_mass + class_weights
+                        relative_weight = np.divide(
+                            class_weights,
+                            updated_class_mass,
+                            out=np.zeros_like(class_weights),
+                            where=updated_class_mass > 0.0,
+                        )
+                        difference = class_predictions - pattern_predictions
+                        updated_predictions = (
+                            pattern_predictions + relative_weight[:, None] * difference
+                        )
+                        between_class_variance += class_weights[:, None] * (
+                            difference * (class_predictions - updated_predictions)
+                        )
+                        pattern_predictions = updated_predictions
+                        cumulative_class_mass = updated_class_mass
+                    else:
+                        pattern_predictions += class_weights[:, None] * correction
 
             predictions[pattern.rows] = pattern_predictions
+            if (
+                prediction_variances is not None
+                and between_class_variance is not None
+                and cumulative_class_mass is not None
+                and conditional_variance is not None
+            ):
+                if include_residual:
+                    conditional_variance += variances[2]
+                prediction_variances[pattern.rows] = np.maximum(
+                    conditional_variance
+                    + np.divide(
+                        between_class_variance,
+                        cumulative_class_mass[:, None],
+                        out=np.zeros_like(between_class_variance),
+                        where=cumulative_class_mass[:, None] > 0.0,
+                    ),
+                    0.0,
+                )
 
-        return predictions
+        return predictions, prediction_variances
 
     def simulate(
         self,

@@ -133,12 +133,27 @@ to new times after fitting:
    )
    print(predicted.shape)  # (500, 10)
 
+   mean, latent_variance = mixture.predict_trajectory_moments(
+       incomplete,
+       time_values,
+       prediction_times=future_times,
+   )
+   _, observation_variance = mixture.predict_trajectory_moments(
+       incomplete,
+       time_values,
+       prediction_times=future_times,
+       include_residual=True,
+   )
+
 Predictions combine posterior class probabilities with empirical-Bayes random
 intercept and slope estimates conditioned on each person's available history.
 They are latent trajectory means, so they exclude new occasion-specific
 residual error. Missing occasions are handled directly and need not be imputed
 first. For piecewise growth with an implicit changepoint, extrapolation keeps
-the midpoint resolved from the observed time grid.
+the midpoint resolved from the observed time grid. The moment method returns
+exact mixture means and pointwise variances without assuming the class mixture
+is normal; ``include_residual=True`` adds new occasion-specific observation
+noise.
 
 For continuous two-segment trajectories, use piecewise growth with a shared
 changepoint and class-specific slopes on each side:
