@@ -17,7 +17,13 @@ def compute_itemfit(
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
     theta: NDArray[np.float64] | None = None,
+    n_groups: int = 10,
 ) -> dict[str, NDArray[np.float64]]:
+    """Compute requested item-fit statistics.
+
+    S-X2 results include the statistic, degrees of freedom, and p-value under
+    the keys ``"S_X2"``, ``"df"``, and ``"p_value"``.
+    """
     if statistics is None:
         statistics = ["infit", "outfit"]
 
@@ -37,18 +43,116 @@ def compute_itemfit(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
+    expected, variance = compute_expected_variance(model, theta, n_items)
     result: dict[str, NDArray[np.float64]] = {}
 
-    expected, variance = compute_expected_variance(model, theta, n_items)
-    infit, outfit = compute_fit_stats(responses, expected, variance, axis=0)
+    if "outfit" in statistics or "infit" in statistics:
+        infit, outfit = compute_fit_stats(responses, expected, variance, axis=0)
 
-    if "outfit" in statistics:
-        result["outfit"] = outfit
+        if "outfit" in statistics:
+            result["outfit"] = outfit
 
-    if "infit" in statistics:
-        result["infit"] = infit
+        if "infit" in statistics:
+            result["infit"] = infit
+
+    if "S_X2" in statistics:
+        result.update(
+            _compute_s_x2_from_expected(
+                model,
+                responses,
+                expected,
+                n_groups=n_groups,
+            )
+        )
 
     return result
+
+
+def _validate_n_groups(n_groups: int) -> int:
+    """Validate and normalize the number of score groups."""
+    if isinstance(n_groups, (bool, np.bool_)) or not isinstance(
+        n_groups, (int, np.integer)
+    ):
+        raise ValueError("n_groups must be an integer")
+    if int(n_groups) < 2:
+        raise ValueError("n_groups must be at least 2")
+    return int(n_groups)
+
+
+def _compute_s_x2_from_expected(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    expected: NDArray[np.float64],
+    *,
+    n_groups: int,
+) -> dict[str, NDArray[np.float64]]:
+    """Aggregate observed and expected scores into S-X2 statistics."""
+    from scipy import special
+
+    n_groups = _validate_n_groups(n_groups)
+    n_persons, n_items = responses.shape
+    if n_persons == 0:
+        raise ValueError("responses must contain at least one person")
+
+    valid_mask = responses >= 0
+    sum_scores = np.sum(np.where(valid_mask, responses, 0), axis=1)
+    score_cuts = np.percentile(
+        sum_scores,
+        np.linspace(0.0, 100.0, n_groups + 1),
+    )
+    group_indices = np.searchsorted(
+        score_cuts[1:-1],
+        sum_scores,
+        side="right",
+    )
+
+    if model.is_polytomous:
+        score_scales = np.asarray(model.n_categories, dtype=np.float64) - 1.0
+    else:
+        score_scales = np.ones(n_items, dtype=np.float64)
+
+    observed_scaled = responses / score_scales
+    expected_scaled = expected / score_scales
+    s_x2 = np.zeros(n_items, dtype=np.float64)
+    degrees = np.zeros(n_items, dtype=np.int64)
+
+    for item_idx in range(n_items):
+        item_valid = valid_mask[:, item_idx]
+        item_groups = group_indices[item_valid]
+        counts = np.bincount(item_groups, minlength=n_groups)
+        eligible = counts >= 5
+        if not np.any(eligible):
+            continue
+
+        observed_sums = np.bincount(
+            item_groups,
+            weights=observed_scaled[item_valid, item_idx],
+            minlength=n_groups,
+        )
+        expected_sums = np.bincount(
+            item_groups,
+            weights=expected_scaled[item_valid, item_idx],
+            minlength=n_groups,
+        )
+        observed_means = observed_sums[eligible] / counts[eligible]
+        expected_means = np.clip(
+            expected_sums[eligible] / counts[eligible],
+            PROB_CLIP_MIN,
+            PROB_CLIP_MAX,
+        )
+        s_x2[item_idx] = np.sum(
+            counts[eligible]
+            * (observed_means - expected_means) ** 2
+            / (expected_means * (1.0 - expected_means))
+        )
+        degrees[item_idx] = np.count_nonzero(eligible)
+
+    df = np.maximum(degrees - 1, 1).astype(np.float64)
+    return {
+        "S_X2": s_x2,
+        "df": df,
+        "p_value": special.chdtrc(df, s_x2),
+    }
 
 
 def compute_s_x2(
@@ -57,10 +161,10 @@ def compute_s_x2(
     theta: NDArray[np.float64] | None = None,
     n_groups: int = 10,
 ) -> dict[str, NDArray[np.float64]]:
-    from scipy import stats
-
+    """Compute grouped Orlando-Thissen S-X2 item-fit statistics."""
+    n_groups = _validate_n_groups(n_groups)
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+    _, n_items = responses.shape
 
     if theta is None:
         from mirt.scoring import fscores
@@ -68,59 +172,14 @@ def compute_s_x2(
         score_result = fscores(model, responses, method="EAP")
         theta = score_result.theta
 
-    theta = np.asarray(theta).ravel()
+    theta_array = np.asarray(theta)
+    if theta_array.ndim == 1:
+        theta_array = theta_array.reshape(-1, 1)
 
-    valid_mask = responses >= 0
-    sum_scores = np.sum(np.where(valid_mask, responses, 0), axis=1)
-
-    percentiles = np.linspace(0, 100, n_groups + 1)
-    score_cuts = np.percentile(sum_scores, percentiles)
-
-    s_x2 = np.zeros(n_items)
-    df = np.zeros(n_items)
-    p_values = np.zeros(n_items)
-
-    for i in range(n_items):
-        chi2 = 0.0
-        degrees = 0
-
-        for g in range(n_groups):
-            if g < n_groups - 1:
-                in_group = (sum_scores >= score_cuts[g]) & (
-                    sum_scores < score_cuts[g + 1]
-                )
-            else:
-                in_group = sum_scores >= score_cuts[g]
-
-            valid_in_group = in_group & valid_mask[:, i]
-            n_g = valid_in_group.sum()
-
-            if n_g < 5:
-                continue
-
-            observed = responses[valid_in_group, i].mean()
-
-            group_theta = theta[valid_in_group]
-            probs = model.probability(group_theta.reshape(-1, 1), i)
-            if probs.ndim == 1:
-                expected = probs.mean()
-            else:
-                n_cat = probs.shape[1]
-                exp_score = np.sum(probs * np.arange(n_cat), axis=1).mean()
-                expected = exp_score / (n_cat - 1)
-
-            expected = np.clip(expected, PROB_CLIP_MIN, PROB_CLIP_MAX)
-
-            if expected > 0 and expected < 1:
-                chi2 += n_g * (observed - expected) ** 2 / (expected * (1 - expected))
-                degrees += 1
-
-        s_x2[i] = chi2
-        df[i] = max(degrees - 1, 1)
-        p_values[i] = 1 - stats.chi2.cdf(chi2, df[i])
-
-    return {
-        "S_X2": s_x2,
-        "df": df,
-        "p_value": p_values,
-    }
+    expected, _ = compute_expected_variance(model, theta_array, n_items)
+    return _compute_s_x2_from_expected(
+        model,
+        responses,
+        expected,
+        n_groups=n_groups,
+    )

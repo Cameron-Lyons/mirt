@@ -359,6 +359,7 @@ def itemfit(
     result: FitResult,
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
+    n_groups: int = 10,
 ) -> Any:
     """Compute item fit statistics for a fitted IRT model.
 
@@ -382,6 +383,9 @@ def itemfit(
         - "S_X2": Orlando-Thissen S-X2 statistic
 
         Default is ["infit", "outfit"].
+    n_groups : int
+        Number of observed-score groups used for S-X2. Must be at least 2.
+        Default is 10.
 
     Returns
     -------
@@ -394,7 +398,7 @@ def itemfit(
     >>> from mirt import fit_mirt, itemfit, simdata
     >>> data = simdata(n_persons=500, n_items=20)
     >>> result = fit_mirt(data)
-    >>> fit_stats = itemfit(result)
+    >>> fit_stats = itemfit(result, data)
     >>> # Flag items with infit > 1.2 or < 0.8
     >>> print(fit_stats[(fit_stats['infit'] > 1.2) | (fit_stats['infit'] < 0.8)])
     """
@@ -404,7 +408,12 @@ def itemfit(
     if statistics is None:
         statistics = ["infit", "outfit"]
 
-    fit_stats = compute_itemfit(result.model, responses, statistics)
+    fit_stats = compute_itemfit(
+        result.model,
+        responses,
+        statistics,
+        n_groups=n_groups,
+    )
 
     return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")
 
