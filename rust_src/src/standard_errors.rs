@@ -10,10 +10,56 @@ use rayon::prelude::*;
 
 use crate::utils::{EPSILON, log_sigmoid, sigmoid};
 
-/// Compute per-item Fisher information (observed information) in parallel.
+/// Compute the exact complete-data Hessian block for one 2PL item.
+fn compute_item_hessian_block(
+    r_k: &[f64],
+    n_k: &[f64],
+    quad_points: &numpy::ndarray::ArrayView1<f64>,
+    a: f64,
+    b: f64,
+) -> [[f64; 2]; 2] {
+    let mut hess_aa = 0.0;
+    let mut hess_ab = 0.0;
+    let mut hess_bb = 0.0;
+
+    for q in 0..quad_points.len() {
+        if n_k[q] < EPSILON {
+            continue;
+        }
+        let centered_theta = quad_points[q] - b;
+        let probability = sigmoid(a * centered_theta);
+        let curvature = n_k[q] * probability * (1.0 - probability);
+        let score_residual = r_k[q] - n_k[q] * probability;
+
+        hess_aa -= curvature * centered_theta * centered_theta;
+        hess_ab += curvature * a * centered_theta - score_residual;
+        hess_bb -= curvature * a * a;
+    }
+
+    [[hess_aa, hess_ab], [hess_ab, hess_bb]]
+}
+
+/// Invert a negative 2x2 Hessian block and return marginal standard errors.
+fn standard_errors_from_block(block: [[f64; 2]; 2]) -> (f64, f64) {
+    let information_aa = -block[0][0];
+    let information_ab = -block[0][1];
+    let information_bb = -block[1][1];
+    let determinant = information_aa * information_bb - information_ab * information_ab;
+
+    if information_aa > EPSILON && information_bb > EPSILON && determinant > EPSILON {
+        (
+            (information_bb / determinant).sqrt(),
+            (information_aa / determinant).sqrt(),
+        )
+    } else {
+        (f64::NAN, f64::NAN)
+    }
+}
+
+/// Compute covariance-aware standard errors from exact 2PL Hessian blocks.
 ///
 /// Exploits the block diagonal structure: items are independent,
-/// so we only need to compute 2x2 blocks (for 2PL: discrimination, difficulty).
+/// so each discrimination/difficulty pair requires one 2x2 inversion.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn compute_item_se_parallel<'py>(
@@ -25,6 +71,7 @@ pub fn compute_item_se_parallel<'py>(
     difficulty: PyReadonlyArray1<f64>,
     h: f64,
 ) -> (Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>) {
+    let _ = h;
     let responses = responses.as_array();
     let posterior_weights = posterior_weights.as_array();
     let quad_points = quad_points.as_array();
@@ -57,30 +104,8 @@ pub fn compute_item_se_parallel<'py>(
 
             let a = disc[j];
             let b = diff[j];
-
-            let ll_center = compute_item_ll(&r_k, &n_k, &quad_points, a, b);
-
-            let ll_a_plus = compute_item_ll(&r_k, &n_k, &quad_points, a + h, b);
-            let ll_a_minus = compute_item_ll(&r_k, &n_k, &quad_points, a - h, b);
-            let hess_aa = (ll_a_plus - 2.0 * ll_center + ll_a_minus) / (h * h);
-
-            let ll_b_plus = compute_item_ll(&r_k, &n_k, &quad_points, a, b + h);
-            let ll_b_minus = compute_item_ll(&r_k, &n_k, &quad_points, a, b - h);
-            let hess_bb = (ll_b_plus - 2.0 * ll_center + ll_b_minus) / (h * h);
-
-            let se_a = if hess_aa < -EPSILON {
-                (-1.0 / hess_aa).sqrt()
-            } else {
-                f64::NAN
-            };
-
-            let se_b = if hess_bb < -EPSILON {
-                (-1.0 / hess_bb).sqrt()
-            } else {
-                f64::NAN
-            };
-
-            (se_a, se_b)
+            let block = compute_item_hessian_block(&r_k, &n_k, &quad_points, a, b);
+            standard_errors_from_block(block)
         })
         .collect();
 
@@ -98,32 +123,7 @@ pub fn compute_item_se_parallel<'py>(
     (se_disc.to_pyarray(py), se_diff.to_pyarray(py))
 }
 
-/// Compute expected log-likelihood for a single item
-fn compute_item_ll(
-    r_k: &[f64],
-    n_k: &[f64],
-    quad_points: &numpy::ndarray::ArrayView1<f64>,
-    a: f64,
-    b: f64,
-) -> f64 {
-    let n_quad = quad_points.len();
-    let mut ll = 0.0;
-
-    for q in 0..n_quad {
-        if n_k[q] < EPSILON {
-            continue;
-        }
-        let theta = quad_points[q];
-        let z = a * (theta - b);
-        let p = sigmoid(z).clamp(EPSILON, 1.0 - EPSILON);
-
-        ll += r_k[q] * p.ln() + (n_k[q] - r_k[q]) * (1.0 - p).ln();
-    }
-
-    ll
-}
-
-/// Compute full observed information matrix with block diagonal structure.
+/// Compute the exact complete-data Hessian with block diagonal structure.
 ///
 /// For 2PL model, the Hessian is block diagonal with 2x2 blocks per item.
 /// This function computes the full matrix but exploits the block structure.
@@ -138,6 +138,7 @@ pub fn compute_hessian_block_diagonal<'py>(
     difficulty: PyReadonlyArray1<f64>,
     h: f64,
 ) -> Bound<'py, PyArray2<f64>> {
+    let _ = h;
     let responses = responses.as_array();
     let posterior_weights = posterior_weights.as_array();
     let quad_points = quad_points.as_array();
@@ -179,24 +180,7 @@ pub fn compute_hessian_block_diagonal<'py>(
             let (ref r_k, ref n_k) = expected_counts[j];
             let a = disc[j];
             let b = diff[j];
-
-            let ll_center = compute_item_ll(r_k, n_k, &quad_points, a, b);
-
-            let ll_a_plus = compute_item_ll(r_k, n_k, &quad_points, a + h, b);
-            let ll_a_minus = compute_item_ll(r_k, n_k, &quad_points, a - h, b);
-            let hess_aa = (ll_a_plus - 2.0 * ll_center + ll_a_minus) / (h * h);
-
-            let ll_b_plus = compute_item_ll(r_k, n_k, &quad_points, a, b + h);
-            let ll_b_minus = compute_item_ll(r_k, n_k, &quad_points, a, b - h);
-            let hess_bb = (ll_b_plus - 2.0 * ll_center + ll_b_minus) / (h * h);
-
-            let ll_pp = compute_item_ll(r_k, n_k, &quad_points, a + h, b + h);
-            let ll_pm = compute_item_ll(r_k, n_k, &quad_points, a + h, b - h);
-            let ll_mp = compute_item_ll(r_k, n_k, &quad_points, a - h, b + h);
-            let ll_mm = compute_item_ll(r_k, n_k, &quad_points, a - h, b - h);
-            let hess_ab = (ll_pp - ll_pm - ll_mp + ll_mm) / (4.0 * h * h);
-
-            [[hess_aa, hess_ab], [hess_ab, hess_bb]]
+            compute_item_hessian_block(r_k, n_k, &quad_points, a, b)
         })
         .collect();
 
@@ -330,4 +314,45 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_se_from_hessian, m)?)?;
     m.add_function(wrap_pyfunction!(compute_complete_data_ll, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use numpy::ndarray::arr1;
+
+    #[test]
+    fn analytic_hessian_block_matches_closed_form_components() {
+        let r_k = [1.5];
+        let n_k = [4.0];
+        let quad_points = arr1(&[1.25]);
+        let a = 1.4;
+        let b = -0.25;
+        let centered_theta = quad_points[0] - b;
+        let probability = sigmoid(a * centered_theta);
+        let curvature = n_k[0] * probability * (1.0 - probability);
+        let score_residual = r_k[0] - n_k[0] * probability;
+
+        let block = compute_item_hessian_block(&r_k, &n_k, &quad_points.view(), a, b);
+
+        let expected_aa = -curvature * centered_theta * centered_theta;
+        let expected_ab = curvature * a * centered_theta - score_residual;
+        let expected_bb = -curvature * a * a;
+        assert!((block[0][0] - expected_aa).abs() < 1e-14);
+        assert!((block[0][1] - expected_ab).abs() < 1e-14);
+        assert!((block[1][0] - expected_ab).abs() < 1e-14);
+        assert!((block[1][1] - expected_bb).abs() < 1e-14);
+    }
+
+    #[test]
+    fn standard_errors_invert_the_full_information_block() {
+        let (se_a, se_b) = standard_errors_from_block([[-4.0, -1.0], [-1.0, -9.0]]);
+
+        assert!((se_a - (9.0_f64 / 35.0).sqrt()).abs() < 1e-14);
+        assert!((se_b - (4.0_f64 / 35.0).sqrt()).abs() < 1e-14);
+
+        let singular = standard_errors_from_block([[-1.0, -1.0], [-1.0, -1.0]]);
+        assert!(singular.0.is_nan());
+        assert!(singular.1.is_nan());
+    }
 }
