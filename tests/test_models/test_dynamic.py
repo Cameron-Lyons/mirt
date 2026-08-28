@@ -473,6 +473,11 @@ class TestGrowthMixtureModel:
         model = GrowthMixtureModel(n_classes=2, growth_type="quadratic")
         assert model.class_quadratics.shape == (2,)
 
+    def test_piecewise_initialization(self):
+        model = GrowthMixtureModel(n_classes=2, growth_type="piecewise")
+
+        assert_allclose(model.class_post_slopes, model.class_slopes)
+
     def test_compute_class_trajectory(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)
         t = np.arange(5.0)
@@ -486,6 +491,35 @@ class TestGrowthMixtureModel:
         traj1 = model.compute_class_trajectory(1, t)
         assert not np.allclose(traj0, traj1)
 
+    def test_piecewise_trajectory_is_continuous_with_distinct_slopes(self):
+        model = GrowthMixtureModel(
+            n_classes=1,
+            growth_type="piecewise",
+            class_intercepts=np.array([1.0]),
+            class_slopes=np.array([0.5]),
+            class_post_slopes=np.array([-0.25]),
+            changepoint=2.0,
+        )
+        time_values = np.array([0.0, 1.0, 2.0, 3.0, 4.0])
+
+        trajectory = model.compute_class_trajectory(0, time_values)
+
+        assert_allclose(trajectory, np.array([1.0, 1.5, 2.0, 1.75, 1.5]))
+
+    def test_piecewise_trajectory_uses_time_range_midpoint_by_default(self):
+        model = GrowthMixtureModel(
+            n_classes=1,
+            growth_type="piecewise",
+            class_intercepts=np.array([0.0]),
+            class_slopes=np.array([1.0]),
+            class_post_slopes=np.array([2.0]),
+        )
+        time_values = np.array([10.0, 12.0, 14.0])
+
+        trajectory = model.compute_class_trajectory(0, time_values)
+
+        assert_allclose(trajectory, np.array([10.0, 12.0, 16.0]))
+
     def test_class_likelihood(self):
         model = GrowthMixtureModel(n_classes=2, n_timepoints=5)
         rng = np.random.default_rng(42)
@@ -495,7 +529,7 @@ class TestGrowthMixtureModel:
         assert lik.shape == (10, 2)
         assert np.all(lik >= 0)
 
-    @pytest.mark.parametrize("growth_type", ["linear", "quadratic"])
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic", "piecewise"])
     def test_class_log_likelihood_matches_scalar_reference(self, growth_type):
         model = GrowthMixtureModel(
             n_classes=3,
@@ -503,6 +537,8 @@ class TestGrowthMixtureModel:
             class_intercepts=np.array([-0.8, 0.2, 1.1]),
             class_slopes=np.array([0.1, -0.3, 0.5]),
             class_quadratics=np.array([0.04, -0.02, 0.01]),
+            class_post_slopes=np.array([0.6, 0.2, -0.1]),
+            changepoint=0.5,
             intercept_var=0.4,
             residual_variance=0.2,
         )
@@ -701,7 +737,7 @@ class TestGrowthMixtureModel:
         obs, classes = model.simulate(10, time_values=t, seed=42)
         assert obs.shape == (10, 5)
 
-    @pytest.mark.parametrize("growth_type", ["linear", "quadratic"])
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic", "piecewise"])
     def test_simulate_matches_seeded_scalar_reference(self, growth_type):
         model = GrowthMixtureModel(
             n_classes=3,
@@ -710,6 +746,8 @@ class TestGrowthMixtureModel:
             class_intercepts=np.array([-0.8, 0.2, 1.1]),
             class_slopes=np.array([0.1, -0.3, 0.5]),
             class_quadratics=np.array([0.04, -0.02, 0.01]),
+            class_post_slopes=np.array([0.6, 0.2, -0.1]),
+            changepoint=0.5,
             intercept_var=0.4,
             slope_var=0.15,
             residual_variance=0.2,
@@ -897,6 +935,81 @@ class TestGrowthMixtureModel:
         assert_allclose(model.class_quadratics, expected_coefficients[:, 2])
         assert np.isfinite(result["log_likelihood"])
 
+    def test_fit_em_vectorized_piecewise_update_matches_scalar_reference(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_proportions=np.array([0.45, 0.55]),
+            class_intercepts=np.array([-0.7, 0.8]),
+            class_slopes=np.array([0.2, -0.1]),
+            class_post_slopes=np.array([0.5, -0.4]),
+            changepoint=0.25,
+        )
+        rng = np.random.default_rng(19)
+        time_values = np.linspace(-2.0, 2.0, 8)
+        observations = rng.normal(size=(30, len(time_values)))
+        posteriors = model.posterior_probabilities(observations, time_values)
+        hinge = np.maximum(time_values - model.changepoint, 0.0)
+        design = np.column_stack([np.ones(len(time_values)), time_values, hinge])
+        expected_coefficients = np.empty((model.n_classes, design.shape[1]))
+        for class_index in range(model.n_classes):
+            weights = posteriors[:, class_index]
+            weighted_mean = weights @ observations / weights.sum()
+            expected_coefficients[class_index] = np.linalg.solve(
+                design.T @ design,
+                design.T @ weighted_mean,
+            )
+
+        result = model.fit_em(observations, time_values, max_iter=1)
+
+        assert_allclose(model.class_proportions, posteriors.mean(axis=0))
+        assert_allclose(model.class_intercepts, expected_coefficients[:, 0])
+        assert_allclose(model.class_slopes, expected_coefficients[:, 1])
+        assert_allclose(
+            model.class_post_slopes,
+            expected_coefficients[:, 1] + expected_coefficients[:, 2],
+        )
+        assert np.isfinite(result["log_likelihood"])
+
+    def test_piecewise_fit_recovers_segment_slopes_and_classes(self):
+        time_values = np.arange(6.0)
+        source = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_proportions=np.array([0.5, 0.5]),
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.2, -0.2]),
+            class_post_slopes=np.array([0.8, -0.8]),
+            changepoint=2.0,
+            intercept_var=0.05,
+            slope_var=0.01,
+            residual_variance=0.05,
+        )
+        observations, expected_classes = source.simulate(
+            500,
+            time_values,
+            seed=42,
+        )
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_intercepts=np.array([-0.7, 0.7]),
+            class_slopes=np.array([0.1, -0.1]),
+            class_post_slopes=np.array([0.5, -0.5]),
+            changepoint=2.0,
+            intercept_var=0.05,
+            slope_var=0.01,
+            residual_variance=0.05,
+        )
+
+        result = model.fit(observations, time_values, max_iter=50)
+
+        assert np.mean(result.classifications == expected_classes) > 0.95
+        assert_allclose(model.class_intercepts, source.class_intercepts, atol=0.05)
+        assert_allclose(model.class_slopes, source.class_slopes, atol=0.05)
+        assert_allclose(model.class_post_slopes, source.class_post_slopes, atol=0.05)
+        assert result.converged is True
+
     def test_fit_em_reports_convergence_on_last_allowed_iteration(self):
         model = GrowthMixtureModel(n_classes=2)
         observations = np.zeros((4, 5))
@@ -912,7 +1025,7 @@ class TestGrowthMixtureModel:
 
     @pytest.mark.parametrize(
         ("growth_type", "expected"),
-        [("linear", 8), ("piecewise", 8), ("quadratic", 11)],
+        [("linear", 8), ("piecewise", 11), ("quadratic", 11)],
     )
     def test_n_fitted_parameters(self, growth_type, expected):
         model = GrowthMixtureModel(n_classes=3, growth_type=growth_type)
@@ -1012,6 +1125,31 @@ class TestGrowthMixtureModel:
 
         with pytest.raises(ValueError, match="full-rank"):
             model.fit_em(np.zeros((3, 5)), np.ones(5))
+
+    @pytest.mark.parametrize("changepoint", [np.nan, np.inf, "invalid"])
+    def test_piecewise_model_validates_changepoint(self, changepoint):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            changepoint=changepoint,
+        )
+
+        with pytest.raises(ValueError, match="changepoint"):
+            model.class_log_likelihood(np.zeros((2, 5)), np.arange(5.0))
+
+    @pytest.mark.parametrize(
+        "post_slopes",
+        [np.array([0.2]), np.array([0.2, np.nan]), np.array(["a", "b"])],
+    )
+    def test_piecewise_model_validates_post_slopes(self, post_slopes):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_post_slopes=post_slopes,
+        )
+
+        with pytest.raises(ValueError, match="post slopes"):
+            model.class_log_likelihood(np.zeros((2, 5)), np.arange(5.0))
 
     def test_posterior_probabilities_validate_class_proportions(self):
         model = GrowthMixtureModel(
@@ -1128,3 +1266,31 @@ class TestGrowthMixtureResult:
         assert "Iterations:         12" in summary
         assert "Quadratic=-0.200" in summary
         assert "Quadratic=0.300" in summary
+
+    def test_piecewise_summary_includes_changepoint_and_segment_slopes(self):
+        model = GrowthMixtureModel(
+            n_classes=2,
+            growth_type="piecewise",
+            class_slopes=np.array([0.1, 0.2]),
+            class_post_slopes=np.array([0.8, -0.3]),
+            changepoint=2.5,
+        )
+        result = GrowthMixtureResult(
+            model=model,
+            classifications=np.array([0, 1, 1]),
+            posteriors=np.array([[0.8, 0.2], [0.1, 0.9], [0.2, 0.8]]),
+            log_likelihood=-10.0,
+            aic=34.0,
+            bic=31.0,
+            entropy=0.4,
+            converged=True,
+            n_iterations=9,
+        )
+
+        summary = result.summary()
+
+        assert "Changepoint:        2.5000" in summary
+        assert "Pre-Slope=0.100" in summary
+        assert "Post-Slope=0.800" in summary
+        assert "Pre-Slope=0.200" in summary
+        assert "Post-Slope=-0.300" in summary

@@ -94,3 +94,19 @@ convergence diagnostics:
 
 ``fit_em`` remains available when a mapping is preferred. ``fit`` uses the same
 estimation path and packages its final state into ``GrowthMixtureResult``.
+
+For continuous two-segment trajectories, use piecewise growth with a shared
+changepoint and class-specific slopes on each side:
+
+.. code-block:: python
+
+   piecewise = GrowthMixtureModel(
+       n_classes=2,
+       growth_type="piecewise",
+       changepoint=3.0,
+       class_slopes=np.array([0.2, 0.5]),
+       class_post_slopes=np.array([0.8, -0.1]),
+   )
+
+Omit ``changepoint`` to use the midpoint of the supplied time range. Piecewise
+trajectories remain continuous at the changepoint.

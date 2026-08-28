@@ -2009,6 +2009,11 @@ class GrowthMixtureModel:
         Number of time points.
     class_proportions : NDArray, optional
         Prior class proportions.
+    class_post_slopes : NDArray, optional
+        Post-changepoint slopes for piecewise growth.
+    changepoint : float, optional
+        Shared piecewise changepoint. The time-range midpoint is used when
+        omitted.
     """
 
     n_classes: int
@@ -2024,6 +2029,9 @@ class GrowthMixtureModel:
     slope_var: float = 0.1
     residual_variance: float = 0.1
 
+    class_post_slopes: NDArray[np.float64] = field(default_factory=lambda: np.array([]))
+    changepoint: float | None = None
+
     def __post_init__(self) -> None:
         if len(self.class_proportions) == 0:
             self.class_proportions = np.ones(self.n_classes) / self.n_classes
@@ -2036,6 +2044,9 @@ class GrowthMixtureModel:
 
         if self.growth_type == "quadratic" and len(self.class_quadratics) == 0:
             self.class_quadratics = np.zeros(self.n_classes)
+
+        if self.growth_type == "piecewise" and len(self.class_post_slopes) == 0:
+            self.class_post_slopes = self.class_slopes.copy()
 
     def compute_class_trajectory(
         self,
@@ -2056,15 +2067,15 @@ class GrowthMixtureModel:
         NDArray
             Mean trajectory for the class.
         """
-        trajectory = (
-            self.class_intercepts[class_idx]
-            + self.class_slopes[class_idx] * time_values
-        )
-
-        if self.growth_type == "quadratic":
-            trajectory += self.class_quadratics[class_idx] * time_values**2
-
-        return trajectory
+        if (
+            isinstance(class_idx, bool)
+            or not isinstance(class_idx, (int, np.integer))
+            or not 0 <= class_idx < self.n_classes
+        ):
+            raise ValueError("class_idx must identify an existing class")
+        times = self._validated_time_values(time_values)
+        trajectories = self._validated_class_trajectories(times)
+        return trajectories[int(class_idx)].copy()
 
     def class_likelihood(
         self,
@@ -2140,7 +2151,30 @@ class GrowthMixtureModel:
             ):
                 raise ValueError("class quadratics must be finite and match n_classes")
             trajectories += quadratics[:, None] * times[None, :] ** 2
+        elif self.growth_type == "piecewise":
+            try:
+                post_slopes = np.asarray(self.class_post_slopes, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("class post slopes must be numeric") from exc
+            if post_slopes.shape != (self.n_classes,) or not np.all(
+                np.isfinite(post_slopes)
+            ):
+                raise ValueError("class post slopes must be finite and match n_classes")
+            hinge = np.maximum(times - self._resolved_changepoint(times), 0.0)
+            trajectories += (post_slopes - slopes)[:, None] * hinge[None, :]
         return trajectories
+
+    def _resolved_changepoint(self, times: NDArray[np.float64]) -> float:
+        """Resolve and validate the shared piecewise changepoint."""
+        if self.changepoint is None:
+            return 0.5 * float(np.min(times) + np.max(times))
+        try:
+            changepoint = float(self.changepoint)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("changepoint must be numeric") from exc
+        if not np.isfinite(changepoint):
+            raise ValueError("changepoint must be finite")
+        return changepoint
 
     def _validated_class_proportions(self) -> NDArray[np.float64]:
         """Return normalized, finite class weights."""
@@ -2483,6 +2517,9 @@ class GrowthMixtureModel:
         design = np.column_stack([np.ones(len(times)), times])
         if self.growth_type == "quadratic":
             design = np.column_stack([design, times**2])
+        elif self.growth_type == "piecewise":
+            hinge = np.maximum(times - self._resolved_changepoint(times), 0.0)
+            design = np.column_stack([design, hinge])
         if np.linalg.matrix_rank(design) < design.shape[1]:
             raise ValueError("time_values must provide a full-rank growth design")
 
@@ -2495,6 +2532,8 @@ class GrowthMixtureModel:
             prev_slopes = self.class_slopes.copy()
             if self.growth_type == "quadratic":
                 prev_quadratics = self.class_quadratics.copy()
+            elif self.growth_type == "piecewise":
+                prev_post_slopes = self.class_post_slopes.copy()
 
             self.class_proportions = np.mean(posteriors, axis=0)
 
@@ -2511,6 +2550,10 @@ class GrowthMixtureModel:
             self.class_slopes[active] = coefficients[active, 1]
             if self.growth_type == "quadratic":
                 self.class_quadratics[active] = coefficients[active, 2]
+            elif self.growth_type == "piecewise":
+                self.class_post_slopes[active] = (
+                    coefficients[active, 1] + coefficients[active, 2]
+                )
 
             prop_change = np.max(np.abs(self.class_proportions - prev_proportions))
             int_change = np.max(np.abs(self.class_intercepts - prev_intercepts))
@@ -2521,6 +2564,11 @@ class GrowthMixtureModel:
                     np.abs(self.class_quadratics - prev_quadratics)
                 )
                 parameter_change = max(parameter_change, quadratic_change)
+            elif self.growth_type == "piecewise":
+                post_slope_change = np.max(
+                    np.abs(self.class_post_slopes - prev_post_slopes)
+                )
+                parameter_change = max(parameter_change, post_slope_change)
 
             if parameter_change < tolerance:
                 converged = True
@@ -2545,12 +2593,15 @@ class GrowthMixtureModel:
     def n_fitted_parameters(self) -> int:
         """Number of parameters updated by :meth:`fit_em`.
 
-        The count includes one intercept and slope per class, one quadratic
-        coefficient per class for quadratic growth, and ``n_classes - 1``
-        independent mixture weights. Variance components are fixed during the
-        current EM fit and are therefore excluded.
+        The count includes one intercept and slope per class, one additional
+        coefficient per class for quadratic or piecewise growth, and
+        ``n_classes - 1`` independent mixture weights. The shared changepoint
+        and variance components are fixed during the current EM fit and are
+        therefore excluded.
         """
-        coefficients_per_class = 3 if self.growth_type == "quadratic" else 2
+        coefficients_per_class = (
+            3 if self.growth_type in {"quadratic", "piecewise"} else 2
+        )
         return self.n_classes * coefficients_per_class + self.n_classes - 1
 
     @staticmethod
@@ -2687,6 +2738,13 @@ class GrowthMixtureResult:
         lines.append(f"Observations:       {self.n_observations}")
         lines.append(f"Fitted Parameters:  {self.n_parameters}")
         lines.append(f"Growth Type:        {self.model.growth_type}")
+        if self.model.growth_type == "piecewise":
+            changepoint = (
+                "automatic midpoint"
+                if self.model.changepoint is None
+                else f"{self.model.changepoint:.4f}"
+            )
+            lines.append(f"Changepoint:        {changepoint}")
         lines.append(f"Log-Likelihood:     {self.log_likelihood:.4f}")
         lines.append(f"AIC:                {self.aic:.4f}")
         lines.append(f"BIC:                {self.bic:.4f}")
@@ -2701,9 +2759,15 @@ class GrowthMixtureResult:
         for k in range(self.model.n_classes):
             parameters = (
                 f"  Class {k}: N={counts[k]} ({100 * shares[k]:.1f}%), "
-                f"Intercept={self.model.class_intercepts[k]:.3f}, "
-                f"Slope={self.model.class_slopes[k]:.3f}"
+                f"Intercept={self.model.class_intercepts[k]:.3f}"
             )
+            if self.model.growth_type == "piecewise":
+                parameters += (
+                    f", Pre-Slope={self.model.class_slopes[k]:.3f}, "
+                    f"Post-Slope={self.model.class_post_slopes[k]:.3f}"
+                )
+            else:
+                parameters += f", Slope={self.model.class_slopes[k]:.3f}"
             if self.model.growth_type == "quadratic":
                 parameters += f", Quadratic={self.model.class_quadratics[k]:.3f}"
             lines.append(parameters)
