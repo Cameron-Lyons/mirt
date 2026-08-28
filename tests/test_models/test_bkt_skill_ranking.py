@@ -115,14 +115,16 @@ def test_information_gain_is_zero_without_mastery_uncertainty_or_separation() ->
     [
         (
             "mastery_gain",
-            lambda model, priors: (1.0 - priors) * model.p_learn
-            - priors * model.p_forget,
+            lambda model, priors: (
+                (1.0 - priors) * model.p_learn - priors * model.p_forget
+            ),
         ),
         ("lowest_mastery", lambda _model, priors: 1.0 - priors),
         (
             "success_probability",
-            lambda model, priors: priors * (1.0 - model.p_slip)
-            + (1.0 - priors) * model.p_guess,
+            lambda model, priors: (
+                priors * (1.0 - model.p_slip) + (1.0 - priors) * model.p_guess
+            ),
         ),
     ],
 )
