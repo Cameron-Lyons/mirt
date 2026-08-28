@@ -45,7 +45,6 @@ from mirt.models.dynamic import (
     LongitudinalResult,
     NonlinearGrowthModel,
     PiecewiseGrowthModel,
-    StateSpaceIRT,
 )
 from mirt.models.explanatory import (
     LLTM,
@@ -102,6 +101,7 @@ from mirt.models.sequential import (
     ContinuationRatioModel,
     SequentialResponseModel,
 )
+from mirt.models.state_space import StateSpaceIRT
 from mirt.models.testlet import (
     BifactorTestletModel,
     RandomTestletEffectsModel,
