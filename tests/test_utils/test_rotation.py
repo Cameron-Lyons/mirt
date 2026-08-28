@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -188,6 +190,54 @@ def test_zero_loading_rows_remain_finite_with_kaiser_normalization() -> None:
             assert np.all(np.isfinite(correlation))
 
 
+@pytest.mark.parametrize("scale", [1e-300, 1e300])
+@pytest.mark.parametrize(
+    "method", ["varimax", "quartimax", "equamax", "oblimin", "geomin", "promax"]
+)
+def test_kaiser_normalization_is_stable_across_finite_scales(
+    method: str, scale: float
+) -> None:
+    expected, expected_rotation, expected_correlation = rotate_loadings(
+        CORRELATED_UNROTATED,
+        method=method,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        rotated, rotation, correlation = rotate_loadings(
+            CORRELATED_UNROTATED * scale,
+            method=method,
+        )
+
+    assert np.all(np.isfinite(rotated))
+    assert np.all(np.isfinite(rotation))
+    assert_allclose(rotated / scale, expected, atol=1e-10)
+    assert_allclose(rotation, expected_rotation, atol=1e-10)
+    if expected_correlation is None:
+        assert correlation is None
+    else:
+        assert_allclose(correlation, expected_correlation, atol=1e-10)
+
+
+@pytest.mark.parametrize(
+    "loadings",
+    [
+        np.zeros((6, 2)),
+        np.column_stack((np.linspace(-1.0, 1.0, 6), np.zeros(6))),
+        np.column_stack((np.linspace(-1.0, 1.0, 6),) * 2),
+    ],
+)
+def test_promax_falls_back_safely_for_rank_deficient_loadings(
+    loadings: np.ndarray,
+) -> None:
+    rotated, rotation, correlation = rotate_loadings(loadings, method="promax")
+
+    assert correlation is not None
+    _assert_oblique_invariants(loadings, rotated, rotation, correlation)
+    assert_allclose(rotation.T @ rotation, np.eye(2), atol=1e-10)
+    assert_allclose(correlation, np.eye(2), atol=1e-10)
+
+
 def test_none_and_single_factor_are_noops() -> None:
     loadings = np.array([[0.2], [0.5], [0.8]])
 
@@ -299,6 +349,8 @@ def test_apply_rotation_rejects_confirmatory_and_inconsistent_inputs() -> None:
         apply_rotation_to_model(exploratory, np.eye(3))
     with pytest.raises(ValueError, match="nonsingular"):
         apply_rotation_to_model(exploratory, np.ones((2, 2)))
+    with pytest.raises(ValueError, match="well-conditioned"):
+        apply_rotation_to_model(exploratory, np.diag([1.0, 1e-9]))
     with pytest.raises(ValueError, match="inconsistent"):
         apply_rotation_to_model(
             exploratory,

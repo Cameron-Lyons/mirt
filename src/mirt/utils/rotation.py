@@ -30,6 +30,7 @@ RotationObjective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.floa
 _VALID_ROTATIONS = frozenset(
     {"varimax", "quartimax", "equamax", "oblimin", "promax", "geomin", "none"}
 )
+_MAX_ROTATION_CONDITION = 1.0 / np.sqrt(np.finfo(np.float64).eps)
 
 
 def _is_finite_real(value: object) -> bool:
@@ -39,6 +40,22 @@ def _is_finite_real(value: object) -> bool:
         and isinstance(value, (int, float, np.integer, np.floating))
         and np.isfinite(value)
     )
+
+
+def _kaiser_normalize(
+    loadings: NDArray[np.float64],
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Normalize rows without squaring values at their original scale."""
+    row_scales = np.max(np.abs(loadings), axis=1, keepdims=True)
+    row_scales = np.where(row_scales > 0.0, row_scales, 1.0)
+    scaled = loadings / row_scales
+    scaled_norms = np.sqrt(np.sum(scaled * scaled, axis=1, keepdims=True))
+    scaled_norms = np.where(scaled_norms > 0.0, scaled_norms, 1.0)
+    return scaled / scaled_norms, row_scales, scaled_norms
 
 
 def rotate_loadings(
@@ -133,13 +150,11 @@ def rotate_loadings(
         return loadings.copy(), np.eye(n_factors), None
 
     if normalize:
-        h2 = np.sum(loadings**2, axis=1, keepdims=True)
-        h2 = np.where(h2 > 0, h2, 1.0)
-        h = np.sqrt(h2)
-        normalized = loadings / h
+        normalized, row_scales, scaled_norms = _kaiser_normalize(loadings)
     else:
         normalized = loadings
-        h = np.ones((n_items, 1))
+        row_scales = np.ones((n_items, 1))
+        scaled_norms = np.ones((n_items, 1))
 
     if normalized_method == "varimax":
         rotated, T = _varimax(normalized, max_iter, tol)
@@ -170,7 +185,10 @@ def rotate_loadings(
         raise AssertionError("unreachable rotation method")
 
     if normalize:
-        rotated = rotated * h
+        with np.errstate(over="ignore", invalid="ignore"):
+            rotated = (rotated * scaled_norms) * row_scales
+        if not np.all(np.isfinite(rotated)):
+            raise ValueError("rotated loadings exceed the finite floating-point range")
 
     return rotated, T, factor_corr
 
@@ -221,11 +239,13 @@ def _orthomax(
     n_items, n_factors = A.shape
     rotation = np.eye(n_factors)
     objective = 0.0
+    gamma_per_item = gamma / n_items
 
     for _ in range(max_iter):
         basis = A @ rotation
-        column_sums = np.sum(basis**2, axis=0, keepdims=True)
-        transformed = A.T @ (basis**3 - (gamma / n_items) * basis * column_sums)
+        squared = basis * basis
+        column_sums = np.sum(squared, axis=0, keepdims=True)
+        transformed = A.T @ (basis * (squared - gamma_per_item * column_sums))
         left, singular_values, right_transpose = np.linalg.svd(
             transformed, full_matrices=False
         )
@@ -266,7 +286,7 @@ def _oblimin_objective(
     gamma: float,
 ) -> tuple[float, NDArray[np.float64]]:
     """Return the oblimin-family criterion and loading gradient."""
-    squared = loadings**2
+    squared = loadings * loadings
     cross_products = squared.sum(axis=1, keepdims=True) - squared
     if gamma != 0:
         cross_products = cross_products - (
@@ -283,7 +303,7 @@ def _geomin_objective(
     epsilon: float,
 ) -> tuple[float, NDArray[np.float64]]:
     """Return the geomin criterion and loading gradient."""
-    stabilized = loadings**2 + epsilon
+    stabilized = loadings * loadings + epsilon
     geometric_means = np.exp(np.mean(np.log(stabilized), axis=1))
     gradient = (
         (2.0 / loadings.shape[1]) * (loadings / stabilized) * geometric_means[:, None]
@@ -397,6 +417,9 @@ def _standardize_oblique_solution(
     rotation: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Scale an oblique solution so its factor covariance is a correlation."""
+    condition_number = float(np.linalg.cond(rotation))
+    if not np.isfinite(condition_number) or condition_number >= _MAX_ROTATION_CONDITION:
+        raise ValueError("oblique rotation produced an ill-conditioned transform")
     try:
         inverse_rotation = np.linalg.inv(rotation)
     except np.linalg.LinAlgError as exc:
@@ -422,18 +445,29 @@ def _promax(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
     """Promax rotation (oblique).
 
-    Starts from varimax, then applies power transformation.
+    Starts from varimax, then applies power transformation. When the loading
+    matrix is rank deficient, retain the identified varimax solution and an
+    identity factor correlation instead of constructing a singular transform.
     """
     varimax_rotated, T_varimax = _varimax(A, max_iter, tol)
 
     target = np.sign(varimax_rotated) * np.abs(varimax_rotated) ** kappa
     try:
-        oblique_transform = np.linalg.lstsq(varimax_rotated, target, rcond=None)[0]
+        oblique_transform, _, rank, _ = np.linalg.lstsq(
+            varimax_rotated, target, rcond=None
+        )
     except np.linalg.LinAlgError:
         oblique_transform = np.linalg.pinv(varimax_rotated) @ target
+        rank = np.linalg.matrix_rank(varimax_rotated)
+
+    if rank < A.shape[1]:
+        return varimax_rotated, T_varimax, np.eye(A.shape[1])
 
     rotation = T_varimax @ oblique_transform
-    return _standardize_oblique_solution(A, rotation)
+    try:
+        return _standardize_oblique_solution(A, rotation)
+    except ValueError:
+        return varimax_rotated, T_varimax, np.eye(A.shape[1])
 
 
 def _geomin(
@@ -500,11 +534,8 @@ def apply_rotation_to_model(
     if not np.all(np.isfinite(rotation)):
         raise ValueError("rotation_matrix must contain only finite values")
     condition_number = float(np.linalg.cond(rotation))
-    if (
-        not np.isfinite(condition_number)
-        or condition_number >= 1 / np.finfo(np.float64).eps
-    ):
-        raise ValueError("rotation_matrix must be nonsingular")
+    if not np.isfinite(condition_number) or condition_number >= _MAX_ROTATION_CONDITION:
+        raise ValueError("rotation_matrix must be well-conditioned and nonsingular")
 
     correlation: NDArray[np.float64] | None
     if factor_correlation is None:
