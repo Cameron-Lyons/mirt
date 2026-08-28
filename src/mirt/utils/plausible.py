@@ -8,6 +8,7 @@ properly account for measurement error in secondary analyses.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -309,9 +310,9 @@ def _generate_pv_mcmc(
 
 
 def combine_plausible_values(
-    estimates: list[float | NDArray],
-    variances: list[float | NDArray] | None = None,
-) -> dict[str, float | NDArray]:
+    estimates: Sequence[float | NDArray[np.float64]],
+    variances: Sequence[float | NDArray[np.float64]] | None = None,
+) -> dict[str, float | int | NDArray[np.float64]]:
     """Combine estimates from analyses using plausible values.
 
     Uses Rubin's combining rules for multiple imputation:
@@ -320,50 +321,94 @@ def combine_plausible_values(
 
     Parameters
     ----------
-    estimates : list
-        Estimates from each plausible value (e.g., regression coefficients)
-    variances : list, optional
-        Variance estimates for each PV analysis.
-        If None, only combines point estimates.
+    estimates : sequence
+        Estimates from each plausible value (e.g., regression coefficients).
+        At least two same-shaped, finite estimates are required.
+    variances : sequence, optional
+        Nonnegative variance estimates for each plausible-value analysis. Each
+        value must match the corresponding estimate shape. If omitted, only
+        point estimates and between-imputation variance are returned.
 
     Returns
     -------
     dict
-        Dictionary with:
-        - 'estimate': Combined estimate
-        - 'variance': Total variance (if variances provided)
-        - 'se': Standard error (if variances provided)
-        - 'between_var': Between-imputation variance
-        - 'within_var': Within-imputation variance (if provided)
+        Dictionary with ``estimate``, ``between_var``, and ``n_imputations``.
+        When variances are provided, also includes ``within_var``, ``variance``,
+        ``se``, and element-wise ``df``. Scalar inputs produce scalar results;
+        array inputs preserve their common estimate shape.
     """
     m = len(estimates)
-    estimates = np.array(estimates)
+    if m < 2:
+        raise ValueError("at least two plausible-value estimates are required")
+    try:
+        estimate_values = np.asarray(estimates, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("estimates must be numeric and have the same shape") from exc
+    if estimate_values.shape[0] != m:
+        raise ValueError("estimates must have the same shape")
+    if not np.all(np.isfinite(estimate_values)):
+        raise ValueError("estimates must contain only finite values")
 
-    combined = np.mean(estimates, axis=0)
+    combined = np.mean(estimate_values, axis=0)
+    between_var = np.var(estimate_values, axis=0, ddof=1)
+    scalar_results = combined.ndim == 0
 
-    between_var = np.var(estimates, axis=0, ddof=1)
-
-    result = {
-        "estimate": combined,
-        "between_var": between_var,
+    result: dict[str, float | int | NDArray[np.float64]] = {
+        "estimate": float(combined) if scalar_results else combined,
+        "between_var": float(between_var) if scalar_results else between_var,
         "n_imputations": m,
     }
 
     if variances is not None:
-        variances = np.array(variances)
+        if len(variances) != m:
+            raise ValueError("variances must match the number of estimates")
+        try:
+            variance_values = np.asarray(variances, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "variances must be numeric and match the estimate shape"
+            ) from exc
+        if variance_values.shape != estimate_values.shape:
+            raise ValueError("variances must match the estimate shape")
+        if not np.all(np.isfinite(variance_values)):
+            raise ValueError("variances must contain only finite values")
+        if np.any(variance_values < 0.0):
+            raise ValueError("variances must be nonnegative")
 
-        within_var = np.mean(variances, axis=0)
+        within_var = np.mean(variance_values, axis=0)
+        extra_variance = (1.0 + 1.0 / m) * between_var
+        total_var = within_var + extra_variance
+        standard_error = np.sqrt(total_var)
+        relative_within = np.divide(
+            within_var,
+            extra_variance,
+            out=np.zeros_like(within_var),
+            where=extra_variance > 0.0,
+        )
+        df = np.where(
+            extra_variance > 0.0,
+            (m - 1) * (1.0 + relative_within) ** 2,
+            np.inf,
+        )
 
-        total_var = within_var + (1 + 1 / m) * between_var
-
-        result["within_var"] = within_var
-        result["variance"] = total_var
-        result["se"] = np.sqrt(total_var)
-
-        if np.all(within_var > 0):
-            r = (1 + 1 / m) * between_var / within_var
-            df = (m - 1) * (1 + 1 / r) ** 2
-            result["df"] = df
+        if scalar_results:
+            result.update(
+                {
+                    "within_var": float(within_var),
+                    "variance": float(total_var),
+                    "se": float(standard_error),
+                    "df": float(df),
+                }
+            )
+        else:
+            result.update(
+                {
+                    "within_var": within_var,
+                    "variance": total_var,
+                    "se": standard_error,
+                    "df": df,
+                }
+            )
 
     return result
 
@@ -372,11 +417,12 @@ def plausible_value_regression(
     pvs: NDArray[np.float64],
     y: NDArray[np.float64],
     X: NDArray[np.float64] | None = None,
-) -> dict[str, float | NDArray]:
+    weights: NDArray[np.float64] | None = None,
+) -> dict[str, float | int | NDArray[np.float64]]:
     """Perform regression using plausible values as predictor.
 
-    Runs regression with each set of plausible values and combines
-    results using Rubin's rules.
+    Runs ordinary or weighted least squares with each set of plausible values
+    and combines coefficient uncertainty using Rubin's rules.
 
     Parameters
     ----------
@@ -386,63 +432,171 @@ def plausible_value_regression(
         Outcome variable (n_persons,)
     X : NDArray, optional
         Additional covariates (n_persons, n_covariates)
+    weights : NDArray, optional
+        Positive case weights with one value per person. Multiplying every
+        weight by the same constant does not change the result.
 
     Returns
     -------
     dict
         Combined regression results:
-        - 'coefficients': Combined regression coefficients
-        - 'se': Standard errors
-        - 'pvalues': P-values
+
+        - ``coefficients``: intercept, plausible-value factor coefficients,
+          then covariate coefficients
+        - ``se``: standard errors
+        - ``pvalues``: two-sided p-values
+        - ``df``: inference degrees of freedom per coefficient
+        - ``n_observations``: number of people
+        - ``n_plausible``: number of plausible values
     """
     from scipy import stats as sp_stats
 
-    n_persons, n_factors, n_plausible = pvs.shape
+    try:
+        values = np.asarray(pvs, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pvs must contain numeric plausible values") from exc
+    if values.ndim != 3:
+        raise ValueError("pvs must have shape (n_persons, n_factors, n_plausible)")
+    n_persons, n_factors, n_plausible = values.shape
+    if n_persons < 1 or n_factors < 1 or n_plausible < 1:
+        raise ValueError("pvs dimensions must all be positive")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("pvs must contain only finite plausible values")
 
-    coef_list = []
-    var_list = []
+    try:
+        outcome = np.asarray(y, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("y must contain numeric outcomes") from exc
+    if outcome.ndim != 1 or outcome.shape[0] != n_persons:
+        raise ValueError("y must contain one outcome per person")
+    if not np.all(np.isfinite(outcome)):
+        raise ValueError("y must contain only finite outcomes")
 
-    for p in range(n_plausible):
-        theta_p = pvs[:, :, p]
+    if X is None:
+        covariates = np.empty((n_persons, 0), dtype=np.float64)
+    else:
+        try:
+            covariates = np.asarray(X, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("X must contain numeric covariates") from exc
+        if covariates.ndim == 1:
+            covariates = covariates.reshape(-1, 1)
+        if covariates.ndim != 2 or covariates.shape[0] != n_persons:
+            raise ValueError("X must contain one row per person")
+        if not np.all(np.isfinite(covariates)):
+            raise ValueError("X must contain only finite covariates")
 
-        if X is not None:
-            design = np.column_stack([np.ones(n_persons), theta_p, X])
+    if weights is None:
+        case_weights = None
+        sqrt_weights = None
+    else:
+        try:
+            case_weights = np.asarray(weights, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("weights must contain numeric values") from exc
+        if case_weights.ndim != 1 or case_weights.shape[0] != n_persons:
+            raise ValueError("weights must contain one value per person")
+        if not np.all(np.isfinite(case_weights)) or np.any(case_weights <= 0.0):
+            raise ValueError("weights must contain only positive finite values")
+        sqrt_weights = np.sqrt(case_weights)
+
+    n_predictors = 1 + n_factors + covariates.shape[1]
+    residual_df = n_persons - n_predictors
+    if residual_df < 1:
+        raise ValueError(
+            "regression requires more people than intercept, factor, and "
+            "covariate coefficients"
+        )
+
+    design = np.empty((n_persons, n_predictors), dtype=np.float64)
+    design[:, 0] = 1.0
+    design[:, 1 + n_factors :] = covariates
+    coefficients = np.empty((n_plausible, n_predictors), dtype=np.float64)
+    coefficient_variances = np.empty_like(coefficients)
+    identity = np.eye(n_predictors)
+
+    for draw in range(n_plausible):
+        design[:, 1 : 1 + n_factors] = values[:, :, draw]
+        if sqrt_weights is None:
+            fit_design = design
+            fit_outcome = outcome
         else:
-            design = np.column_stack([np.ones(n_persons), theta_p])
+            fit_design = design * sqrt_weights[:, None]
+            fit_outcome = outcome * sqrt_weights
 
         try:
-            coef, residuals, _, _ = np.linalg.lstsq(design, y, rcond=None)
+            coefficient, _, rank, _ = np.linalg.lstsq(
+                fit_design,
+                fit_outcome,
+                rcond=None,
+            )
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(f"regression failed for plausible value {draw}") from exc
+        if rank < n_predictors:
+            raise ValueError(
+                f"regression design is rank deficient for plausible value {draw}"
+            )
 
-            if len(residuals) > 0:
-                mse = residuals[0] / (n_persons - design.shape[1])
-            else:
-                mse = np.var(y - design @ coef)
-
-            var_coef = mse * np.linalg.inv(design.T @ design).diagonal()
-
-            coef_list.append(coef)
-            var_list.append(var_coef)
-        except np.linalg.LinAlgError:
-            continue
-
-    if len(coef_list) < 2:
-        return {"coefficients": np.nan, "se": np.nan, "pvalues": np.nan}
-
-    combined = combine_plausible_values(coef_list, var_list)
-
-    if "se" in combined and "df" in combined:
-        t_stats = combined["estimate"] / combined["se"]
-        pvalues = 2 * (1 - sp_stats.t.cdf(np.abs(t_stats), combined["df"]))
-    else:
-        t_stats = combined["estimate"] / combined.get(
-            "se", np.sqrt(combined["between_var"])
+        residual = outcome - design @ coefficient
+        if case_weights is None:
+            residual_sum_squares = float(residual @ residual)
+        else:
+            residual_sum_squares = float(np.dot(case_weights, residual**2))
+        mean_squared_error = residual_sum_squares / residual_df
+        gram = fit_design.T @ fit_design
+        try:
+            inverse_gram = np.linalg.solve(gram, identity)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                f"regression covariance failed for plausible value {draw}"
+            ) from exc
+        coefficients[draw] = coefficient
+        coefficient_variances[draw] = mean_squared_error * np.maximum(
+            np.diag(inverse_gram),
+            0.0,
         )
-        pvalues = 2 * (1 - sp_stats.norm.cdf(np.abs(t_stats)))
+
+    estimate = np.mean(coefficients, axis=0)
+    within_variance = np.mean(coefficient_variances, axis=0)
+    if n_plausible == 1:
+        total_variance = within_variance
+        inference_df = np.full(n_predictors, float(residual_df))
+    else:
+        between_variance = np.var(coefficients, axis=0, ddof=1)
+        inflated_between = (1.0 + 1.0 / n_plausible) * between_variance
+        total_variance = within_variance + inflated_between
+        relative_increase = np.divide(
+            inflated_between,
+            within_variance,
+            out=np.full(n_predictors, np.inf),
+            where=within_variance > 0.0,
+        )
+        inverse_relative = np.divide(
+            1.0,
+            relative_increase,
+            out=np.zeros(n_predictors),
+            where=relative_increase > 0.0,
+        )
+        inference_df = (n_plausible - 1) * (1.0 + inverse_relative) ** 2
+        inference_df[relative_increase == 0.0] = np.inf
+        inference_df[total_variance == 0.0] = np.inf
+
+    standard_error = np.sqrt(total_variance)
+    absolute_t = np.divide(
+        np.abs(estimate),
+        standard_error,
+        out=np.full(n_predictors, np.inf),
+        where=standard_error > 0.0,
+    )
+    absolute_t[(standard_error == 0.0) & (estimate == 0.0)] = 0.0
+    pvalues = 2.0 * sp_stats.t.sf(absolute_t, inference_df)
 
     return {
-        "coefficients": combined["estimate"],
-        "se": combined.get("se", np.sqrt(combined["between_var"])),
+        "coefficients": estimate,
+        "se": standard_error,
         "pvalues": pvalues,
+        "df": inference_df,
+        "n_observations": n_persons,
         "n_plausible": n_plausible,
     }
 
