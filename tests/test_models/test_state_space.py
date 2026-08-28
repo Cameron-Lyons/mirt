@@ -7,8 +7,10 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.models.state_space import (
+    StateSpaceBatchForecastResult,
     StateSpaceBatchPredictiveResult,
     StateSpaceBatchStepResult,
+    StateSpaceForecastResult,
     StateSpaceIRT,
     StateSpacePredictiveResult,
     StateSpaceStepResult,
@@ -23,11 +25,15 @@ def test_dynamic_module_reexports_state_space_model():
 
 def test_models_module_exports_state_space_results():
     from mirt.models import (
+        StateSpaceBatchForecastResult as PublicBatchForecastResult,
+    )
+    from mirt.models import (
         StateSpaceBatchPredictiveResult as PublicBatchPredictiveResult,
     )
     from mirt.models import (
         StateSpaceBatchStepResult as PublicBatchStepResult,
     )
+    from mirt.models import StateSpaceForecastResult as PublicForecastResult
     from mirt.models import StateSpacePredictiveResult as PublicPredictiveResult
     from mirt.models import StateSpaceStepResult as PublicStepResult
 
@@ -35,6 +41,8 @@ def test_models_module_exports_state_space_results():
     assert PublicBatchStepResult is StateSpaceBatchStepResult
     assert PublicPredictiveResult is StateSpacePredictiveResult
     assert PublicBatchPredictiveResult is StateSpaceBatchPredictiveResult
+    assert PublicForecastResult is StateSpaceForecastResult
+    assert PublicBatchForecastResult is StateSpaceBatchForecastResult
 
 
 class TestStateSpaceIRT:
@@ -1316,6 +1324,113 @@ class TestStateSpaceIRT:
         assert_allclose(forecast_states[1], expected_states[1])
         assert_allclose(forecast_probabilities, expected_probabilities)
 
+    def test_forecast_summaries_match_separate_history_and_state_operations(self):
+        model = StateSpaceIRT(
+            n_items=6,
+            n_timepoints=5,
+            base_model="3PL",
+            transition_matrix=np.array([[0.9]]),
+            process_noise=np.array([[0.07]]),
+            discrimination=np.linspace(0.6, 1.7, 6),
+            difficulty=np.linspace(-1.1, 1.2, 6),
+            guessing=np.linspace(0.1, 0.25, 6),
+        )
+        responses = np.random.default_rng(56).integers(0, 2, size=(7, 5, 6))
+        responses[np.random.default_rng(57).random(responses.shape) < 0.2] = -1
+        expected_states = model.forecast_batch(responses, 4)
+        expected_probabilities = model.forecast_response_probabilities_batch(
+            responses,
+            4,
+            n_quadpts=31,
+        )
+
+        result = model.forecast_summary_batch(responses, 4, n_quadpts=31)
+
+        assert isinstance(result, StateSpaceBatchForecastResult)
+        assert result.n_persons == len(responses)
+        assert result.n_steps == 4
+        assert_allclose(result.state_means, expected_states[0])
+        assert_allclose(result.state_variances, expected_states[1])
+        assert_allclose(result.response_probabilities, expected_probabilities)
+        assert_allclose(
+            result.state_standard_deviations,
+            np.sqrt(expected_states[1]),
+        )
+        scalar = model.forecast_summary(responses[0], 4, n_quadpts=31)
+        assert isinstance(scalar, StateSpaceForecastResult)
+        assert scalar.n_steps == 4
+        assert_allclose(scalar.state_means, result.state_means[0])
+        assert_allclose(scalar.state_variances, result.state_variances[0])
+        assert_allclose(
+            scalar.response_probabilities,
+            result.response_probabilities[0],
+        )
+
+        filtered_means, filtered_variances = model.extended_kalman_filter_batch(
+            responses
+        )
+        state_result = model.forecast_summary_from_state_batch(
+            filtered_means[:, -1],
+            filtered_variances[:, -1],
+            4,
+            n_quadpts=31,
+        )
+        scalar_state_result = model.forecast_summary_from_state(
+            filtered_means[0, -1],
+            filtered_variances[0, -1],
+            4,
+            n_quadpts=31,
+        )
+        assert_allclose(state_result.state_means, result.state_means)
+        assert_allclose(state_result.state_variances, result.state_variances)
+        assert_allclose(
+            state_result.response_probabilities,
+            result.response_probabilities,
+        )
+        assert_allclose(scalar_state_result.state_means, scalar.state_means)
+        assert_allclose(scalar_state_result.state_variances, scalar.state_variances)
+        assert_allclose(
+            scalar_state_result.response_probabilities,
+            scalar.response_probabilities,
+        )
+        with pytest.raises(FrozenInstanceError):
+            scalar.state_means = np.zeros(4)
+
+    def test_forecast_summary_state_intervals_match_gaussian_definition(self):
+        means = np.array([-1.0, 0.25, 1.5])
+        variances = np.array([0.0, 0.25, 1.0])
+        probabilities = np.full((3, 2), 0.5)
+        result = StateSpaceForecastResult(means, variances, probabilities)
+        batch_result = StateSpaceBatchForecastResult(
+            means[None, :],
+            variances[None, :],
+            probabilities[None, :, :],
+        )
+        critical_value = 1.959963984540054
+        expected_radius = critical_value * np.sqrt(variances)
+
+        lower, upper = result.state_interval()
+        batch_lower, batch_upper = batch_result.state_interval()
+
+        assert_allclose(lower, means - expected_radius)
+        assert_allclose(upper, means + expected_radius)
+        assert_allclose(batch_lower[0], lower)
+        assert_allclose(batch_upper[0], upper)
+
+    @pytest.mark.parametrize(
+        "confidence",
+        [0.0, 1.0, -0.1, 1.1, True, np.nan, "0.95", None],
+    )
+    def test_forecast_summary_state_intervals_validate_confidence(self, confidence):
+        result = StateSpaceForecastResult(
+            np.zeros(2),
+            np.ones(2),
+            np.full((2, 3), 0.5),
+        )
+
+        with pytest.raises(ValueError, match="confidence"):
+            result.state_interval(confidence)
+
     @pytest.mark.parametrize("base_model", ["2PL", "3PL"])
     def test_response_forecast_integrates_symmetric_state_distribution(
         self,
@@ -1481,6 +1596,60 @@ class TestStateSpaceIRT:
             model.forecast_from_state_batch(np.zeros((2, 1)), np.ones(2), 2)
         with pytest.raises(ValueError, match="state_variances"):
             model.forecast_from_state_batch(np.zeros(2), np.array([1.0, -0.1]), 2)
+
+    @pytest.mark.parametrize("n_steps", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("forecast_summary", (np.zeros((2, 3), dtype=np.int32),)),
+            (
+                "forecast_summary_batch",
+                (np.zeros((2, 2, 3), dtype=np.int32),),
+            ),
+            ("forecast_summary_from_state", (0.0, 1.0)),
+            (
+                "forecast_summary_from_state_batch",
+                (np.zeros(2), np.ones(2)),
+            ),
+        ],
+    )
+    def test_forecast_summaries_require_positive_step_count(
+        self,
+        n_steps,
+        method_name,
+        args,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+
+        with pytest.raises(ValueError, match="n_steps"):
+            getattr(model, method_name)(*args, n_steps)
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, True, 1.5])
+    @pytest.mark.parametrize(
+        ("method_name", "args"),
+        [
+            ("forecast_summary", (np.zeros((2, 3), dtype=np.int32),)),
+            (
+                "forecast_summary_batch",
+                (np.zeros((2, 2, 3), dtype=np.int32),),
+            ),
+            ("forecast_summary_from_state", (0.0, 1.0)),
+            (
+                "forecast_summary_from_state_batch",
+                (np.zeros(2), np.ones(2)),
+            ),
+        ],
+    )
+    def test_forecast_summaries_require_positive_quadrature_count(
+        self,
+        n_quadpts,
+        method_name,
+        args,
+    ):
+        model = StateSpaceIRT(n_items=3, n_timepoints=2)
+
+        with pytest.raises(ValueError, match="n_quadpts"):
+            getattr(model, method_name)(*args, 2, n_quadpts=n_quadpts)
 
     def test_predictive_diagnostics_match_individual_history_operations(self):
         model = StateSpaceIRT(
