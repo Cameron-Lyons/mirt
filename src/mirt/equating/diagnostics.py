@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -53,6 +55,7 @@ def bootstrap_linking_se(
     n_theta: int = 61,
     seed: int | np.random.Generator | None = None,
     refit: RefitCallback | None = None,
+    n_jobs: int = 1,
 ) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64]]:
     """Compute bootstrap standard errors for linking constants.
 
@@ -81,6 +84,10 @@ def bootstrap_linking_se(
     refit : callable or None
         ``refit(model, sampled_responses) -> fitted_model``. Required when
         response matrices are supplied.
+    n_jobs : int
+        Positive number of worker threads for curve-based or response-refit
+        replicates. Closed-form anchor bootstraps are already vectorized.
+        Default 1.
 
     Returns
     -------
@@ -89,6 +96,7 @@ def bootstrap_linking_se(
     """
     _validate_method(method)
     _validate_bootstrap_count(n_bootstrap)
+    n_jobs = _validate_job_count(n_jobs)
     anchors_old, anchors_new = _validate_anchor_pairs(
         model_old, model_new, anchors_old, anchors_new
     )
@@ -134,40 +142,60 @@ def bootstrap_linking_se(
     A_samples = np.empty(n_bootstrap, dtype=np.float64)
     B_samples = np.empty(n_bootstrap, dtype=np.float64)
 
-    for replicate in range(n_bootstrap):
-        if response_matrices is not None:
-            assert refit is not None
-            old_responses, new_responses = response_matrices
-            old_rows = rng.integers(0, old_responses.shape[0], old_responses.shape[0])
-            new_rows = rng.integers(0, new_responses.shape[0], new_responses.shape[0])
-            fitted_old = refit(model_old.copy(), old_responses[old_rows].copy())
-            fitted_new = refit(model_new.copy(), new_responses[new_rows].copy())
-            _validate_anchor_pairs(fitted_old, fitted_new, anchors_old, anchors_new)
-            replicate_old = _extract_link_parameters(
-                fitted_old, anchors_old, "refitted old"
-            )
-            replicate_new = _extract_link_parameters(
-                fitted_new, anchors_new, "refitted new"
-            )
-        else:
-            sampled = rng.integers(0, n_anchors, n_anchors)
-            replicate_old = tuple(values[sampled] for values in parameters_old)
-            replicate_new = tuple(values[sampled] for values in parameters_new)
+    def draw_sample() -> NDArray[np.intp] | tuple[NDArray[np.intp], NDArray[np.intp]]:
+        if response_matrices is None:
+            return rng.integers(0, n_anchors, n_anchors)
+        old_responses, new_responses = response_matrices
+        return (
+            rng.integers(0, old_responses.shape[0], old_responses.shape[0]),
+            rng.integers(0, new_responses.shape[0], new_responses.shape[0]),
+        )
 
-        try:
-            A, B = _estimate_constants(
-                replicate_old,
-                replicate_new,
-                method,
-                theta_grid,
-                weights,
+    def run_replicate(
+        replicate: int,
+        sample: NDArray[np.intp] | tuple[NDArray[np.intp], NDArray[np.intp]],
+    ) -> tuple[float, float]:
+        return _linking_bootstrap_replicate(
+            replicate,
+            sample,
+            model_old,
+            model_new,
+            response_matrices,
+            anchors_old,
+            anchors_new,
+            parameters_old,
+            parameters_new,
+            method,
+            theta_grid,
+            weights,
+            refit,
+        )
+
+    if n_jobs == 1:
+        for replicate in range(n_bootstrap):
+            A_samples[replicate], B_samples[replicate] = run_replicate(
+                replicate, draw_sample()
             )
-        except (ValueError, RuntimeError, ArithmeticError) as exc:
-            raise RuntimeError(
-                f"Bootstrap replicate {replicate + 1} failed: {exc}"
-            ) from exc
-        A_samples[replicate] = A
-        B_samples[replicate] = B
+    else:
+        # Keep only a small multiple of the worker count in flight. Response
+        # bootstrap indices can be large, so eagerly submitting every replicate
+        # would replace compute savings with an avoidable memory spike.
+        max_workers = min(n_jobs, n_bootstrap)
+        pending: deque[tuple[int, Future[tuple[float, float]]]] = deque()
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for replicate in range(n_bootstrap):
+                pending.append(
+                    (
+                        replicate,
+                        executor.submit(run_replicate, replicate, draw_sample()),
+                    )
+                )
+                if len(pending) >= 2 * max_workers:
+                    index, future = pending.popleft()
+                    A_samples[index], B_samples[index] = future.result()
+            while pending:
+                index, future = pending.popleft()
+                A_samples[index], B_samples[index] = future.result()
 
     return (
         float(np.std(A_samples, ddof=1)),
@@ -175,6 +203,55 @@ def bootstrap_linking_se(
         A_samples,
         B_samples,
     )
+
+
+def _linking_bootstrap_replicate(
+    replicate: int,
+    sample: NDArray[np.intp] | tuple[NDArray[np.intp], NDArray[np.intp]],
+    model_old: BaseItemModel,
+    model_new: BaseItemModel,
+    response_matrices: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
+    anchors_old: list[int],
+    anchors_new: list[int],
+    parameters_old: tuple[NDArray[np.float64], ...],
+    parameters_new: tuple[NDArray[np.float64], ...],
+    method: str,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    refit: RefitCallback | None,
+) -> tuple[float, float]:
+    """Evaluate one pre-sampled linking replicate."""
+    if response_matrices is not None:
+        assert refit is not None
+        assert isinstance(sample, tuple)
+        old_responses, new_responses = response_matrices
+        old_rows, new_rows = sample
+        fitted_old = refit(model_old.copy(), old_responses[old_rows].copy())
+        fitted_new = refit(model_new.copy(), new_responses[new_rows].copy())
+        _validate_anchor_pairs(fitted_old, fitted_new, anchors_old, anchors_new)
+        replicate_old = _extract_link_parameters(
+            fitted_old, anchors_old, "refitted old"
+        )
+        replicate_new = _extract_link_parameters(
+            fitted_new, anchors_new, "refitted new"
+        )
+    else:
+        assert isinstance(sample, np.ndarray)
+        replicate_old = tuple(values[sample] for values in parameters_old)
+        replicate_new = tuple(values[sample] for values in parameters_new)
+
+    try:
+        return _estimate_constants(
+            replicate_old,
+            replicate_new,
+            method,
+            theta_grid,
+            weights,
+        )
+    except (ValueError, RuntimeError, ArithmeticError) as exc:
+        raise RuntimeError(
+            f"Bootstrap replicate {replicate + 1} failed: {exc}"
+        ) from exc
 
 
 def delta_method_se(
@@ -548,6 +625,17 @@ def _validate_bootstrap_count(n_bootstrap: int) -> None:
         raise ValueError("n_bootstrap must be an integer")
     if n_bootstrap < 2:
         raise ValueError("n_bootstrap must be at least 2")
+
+
+def _validate_job_count(n_jobs: int) -> int:
+    """Normalize a positive worker count without accepting booleans."""
+    if isinstance(n_jobs, (bool, np.bool_)) or not isinstance(
+        n_jobs, (int, np.integer)
+    ):
+        raise ValueError("n_jobs must be a positive integer")
+    if n_jobs < 1:
+        raise ValueError("n_jobs must be a positive integer")
+    return int(n_jobs)
 
 
 def _validate_bootstrap_responses(
