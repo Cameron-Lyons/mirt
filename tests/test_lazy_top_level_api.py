@@ -50,6 +50,46 @@ def test_plain_import_defers_heavy_dependencies_and_subpackages() -> None:
     assert not any(loaded.values())
 
 
+def test_optional_plotting_exports_are_stable_without_package_probe() -> None:
+    result = _run_probe(
+        """
+        import importlib.util
+        import json
+        import sys
+
+        original_find_spec = importlib.util.find_spec
+
+        def guarded_find_spec(name, *args, **kwargs):
+            if name == "matplotlib":
+                raise AssertionError("optional plotting package was probed")
+            return original_find_spec(name, *args, **kwargs)
+
+        importlib.util.find_spec = guarded_find_spec
+
+        import mirt
+
+        listed = "plot_icc" in mirt.__all__
+        deferred_before_access = "plot_icc" not in mirt.__dict__
+        plotter = mirt.plot_icc
+        print(json.dumps({
+            "listed": listed,
+            "deferred_before_access": deferred_before_access,
+            "callable": callable(plotter),
+            "cached": mirt.__dict__["plot_icc"] is plotter,
+            "matplotlib_loaded": "matplotlib" in sys.modules,
+        }))
+        """
+    )
+
+    assert result == {
+        "listed": True,
+        "deferred_before_access": True,
+        "callable": True,
+        "cached": True,
+        "matplotlib_loaded": False,
+    }
+
+
 def test_lazy_symbol_resolution_is_cached_and_preserves_identity() -> None:
     result = _run_probe(
         """

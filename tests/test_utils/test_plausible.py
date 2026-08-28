@@ -373,7 +373,9 @@ class TestCombinePlausibleValues:
         result = combine_plausible_values(estimates)
 
         assert "estimate" in result
+        assert isinstance(result["estimate"], float)
         assert result["estimate"] == pytest.approx(1.0, abs=0.05)
+        assert result["n_imputations"] == 5
 
     def test_combine_with_variances(self):
         """Test combining with within-imputation variances."""
@@ -386,6 +388,7 @@ class TestCombinePlausibleValues:
         assert "se" in result
         assert "within_var" in result
         assert "between_var" in result
+        assert "df" in result
 
     def test_rubin_variance_formula(self):
         """Test Rubin's variance formula."""
@@ -400,6 +403,76 @@ class TestCombinePlausibleValues:
         expected_total = within + (1 + 1 / m) * between
 
         assert result["variance"] == pytest.approx(expected_total, rel=0.01)
+
+    def test_vector_estimates_preserve_shape(self):
+        """Vector inputs return one combined result per component."""
+        estimates = (
+            np.array([1.0, 4.0]),
+            np.array([2.0, 5.0]),
+            np.array([3.0, 6.0]),
+        )
+
+        result = combine_plausible_values(estimates)
+
+        np.testing.assert_allclose(result["estimate"], [2.0, 5.0])
+        np.testing.assert_allclose(result["between_var"], [1.0, 1.0])
+
+    def test_degrees_of_freedom_are_computed_per_component(self):
+        """Zero within variance in one component does not suppress all df."""
+        estimates = [
+            np.array([1.0, 1.0, 1.0]),
+            np.array([2.0, 2.0, 1.0]),
+            np.array([3.0, 3.0, 1.0]),
+        ]
+        variances = [
+            np.array([1.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+            np.array([1.0, 0.0, 0.0]),
+        ]
+
+        with np.errstate(all="raise"):
+            result = combine_plausible_values(estimates, variances)
+
+        assert result["df"][0] > 2.0
+        assert result["df"][1] == pytest.approx(2.0)
+        assert np.isinf(result["df"][2])
+        assert result["se"][2] == 0.0
+
+    @pytest.mark.parametrize("estimates", [[], [1.0]])
+    def test_requires_multiple_estimates(self, estimates):
+        """Combining requires enough estimates for between variance."""
+        with pytest.raises(ValueError, match="at least two"):
+            combine_plausible_values(estimates)
+
+    @pytest.mark.parametrize(
+        ("estimates", "message"),
+        [
+            ([np.ones(2), np.ones(3)], "same shape"),
+            ([1.0, "invalid"], "numeric"),
+            ([1.0, np.nan], "finite"),
+            ([1.0, np.inf], "finite"),
+        ],
+    )
+    def test_validates_estimates(self, estimates, message):
+        """Estimate errors have an explicit public contract."""
+        with pytest.raises(ValueError, match=message):
+            combine_plausible_values(estimates)
+
+    @pytest.mark.parametrize(
+        ("variances", "message"),
+        [
+            ([1.0], "number"),
+            ([np.ones(2), np.ones(2)], "shape"),
+            ([1.0, "invalid"], "numeric"),
+            ([1.0, np.nan], "finite"),
+            ([1.0, np.inf], "finite"),
+            ([1.0, -1.0], "nonnegative"),
+        ],
+    )
+    def test_validates_variances(self, variances, message):
+        """Variance errors have an explicit public contract."""
+        with pytest.raises(ValueError, match=message):
+            combine_plausible_values([1.0, 2.0], variances)
 
 
 class TestPlausibleValueRegression:

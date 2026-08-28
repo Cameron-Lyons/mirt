@@ -8,6 +8,7 @@ properly account for measurement error in secondary analyses.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -309,9 +310,9 @@ def _generate_pv_mcmc(
 
 
 def combine_plausible_values(
-    estimates: list[float | NDArray],
-    variances: list[float | NDArray] | None = None,
-) -> dict[str, float | NDArray]:
+    estimates: Sequence[float | NDArray[np.float64]],
+    variances: Sequence[float | NDArray[np.float64]] | None = None,
+) -> dict[str, float | int | NDArray[np.float64]]:
     """Combine estimates from analyses using plausible values.
 
     Uses Rubin's combining rules for multiple imputation:
@@ -320,50 +321,94 @@ def combine_plausible_values(
 
     Parameters
     ----------
-    estimates : list
-        Estimates from each plausible value (e.g., regression coefficients)
-    variances : list, optional
-        Variance estimates for each PV analysis.
-        If None, only combines point estimates.
+    estimates : sequence
+        Estimates from each plausible value (e.g., regression coefficients).
+        At least two same-shaped, finite estimates are required.
+    variances : sequence, optional
+        Nonnegative variance estimates for each plausible-value analysis. Each
+        value must match the corresponding estimate shape. If omitted, only
+        point estimates and between-imputation variance are returned.
 
     Returns
     -------
     dict
-        Dictionary with:
-        - 'estimate': Combined estimate
-        - 'variance': Total variance (if variances provided)
-        - 'se': Standard error (if variances provided)
-        - 'between_var': Between-imputation variance
-        - 'within_var': Within-imputation variance (if provided)
+        Dictionary with ``estimate``, ``between_var``, and ``n_imputations``.
+        When variances are provided, also includes ``within_var``, ``variance``,
+        ``se``, and element-wise ``df``. Scalar inputs produce scalar results;
+        array inputs preserve their common estimate shape.
     """
     m = len(estimates)
-    estimates = np.array(estimates)
+    if m < 2:
+        raise ValueError("at least two plausible-value estimates are required")
+    try:
+        estimate_values = np.asarray(estimates, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("estimates must be numeric and have the same shape") from exc
+    if estimate_values.shape[0] != m:
+        raise ValueError("estimates must have the same shape")
+    if not np.all(np.isfinite(estimate_values)):
+        raise ValueError("estimates must contain only finite values")
 
-    combined = np.mean(estimates, axis=0)
+    combined = np.mean(estimate_values, axis=0)
+    between_var = np.var(estimate_values, axis=0, ddof=1)
+    scalar_results = combined.ndim == 0
 
-    between_var = np.var(estimates, axis=0, ddof=1)
-
-    result = {
-        "estimate": combined,
-        "between_var": between_var,
+    result: dict[str, float | int | NDArray[np.float64]] = {
+        "estimate": float(combined) if scalar_results else combined,
+        "between_var": float(between_var) if scalar_results else between_var,
         "n_imputations": m,
     }
 
     if variances is not None:
-        variances = np.array(variances)
+        if len(variances) != m:
+            raise ValueError("variances must match the number of estimates")
+        try:
+            variance_values = np.asarray(variances, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "variances must be numeric and match the estimate shape"
+            ) from exc
+        if variance_values.shape != estimate_values.shape:
+            raise ValueError("variances must match the estimate shape")
+        if not np.all(np.isfinite(variance_values)):
+            raise ValueError("variances must contain only finite values")
+        if np.any(variance_values < 0.0):
+            raise ValueError("variances must be nonnegative")
 
-        within_var = np.mean(variances, axis=0)
+        within_var = np.mean(variance_values, axis=0)
+        extra_variance = (1.0 + 1.0 / m) * between_var
+        total_var = within_var + extra_variance
+        standard_error = np.sqrt(total_var)
+        relative_within = np.divide(
+            within_var,
+            extra_variance,
+            out=np.zeros_like(within_var),
+            where=extra_variance > 0.0,
+        )
+        df = np.where(
+            extra_variance > 0.0,
+            (m - 1) * (1.0 + relative_within) ** 2,
+            np.inf,
+        )
 
-        total_var = within_var + (1 + 1 / m) * between_var
-
-        result["within_var"] = within_var
-        result["variance"] = total_var
-        result["se"] = np.sqrt(total_var)
-
-        if np.all(within_var > 0):
-            r = (1 + 1 / m) * between_var / within_var
-            df = (m - 1) * (1 + 1 / r) ** 2
-            result["df"] = df
+        if scalar_results:
+            result.update(
+                {
+                    "within_var": float(within_var),
+                    "variance": float(total_var),
+                    "se": float(standard_error),
+                    "df": float(df),
+                }
+            )
+        else:
+            result.update(
+                {
+                    "within_var": within_var,
+                    "variance": total_var,
+                    "se": standard_error,
+                    "df": df,
+                }
+            )
 
     return result
 
