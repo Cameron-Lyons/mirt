@@ -156,6 +156,56 @@ class BKTBatchStepResult:
         return int(self.updated_mastery.size)
 
 
+@dataclass(frozen=True, slots=True)
+class BKTForecastResult:
+    """Future mastery and response probabilities for one learner.
+
+    Both arrays have shape ``(n_steps, n_skills)``. The first row describes
+    the next opportunity represented by the supplied mastery priors.
+    """
+
+    mastery_probabilities: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+
+    @property
+    def n_steps(self) -> int:
+        """Number of forecast opportunities per skill."""
+        return int(self.mastery_probabilities.shape[0])
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.mastery_probabilities.shape[1])
+
+
+@dataclass(frozen=True, slots=True)
+class BKTBatchForecastResult:
+    """Vectorized future mastery and response probabilities.
+
+    Both arrays have shape ``(n_persons, n_steps, n_skills)``. The first
+    forecast row describes the next opportunity represented by each supplied
+    mastery prior.
+    """
+
+    mastery_probabilities: NDArray[np.float64]
+    response_probabilities: NDArray[np.float64]
+
+    @property
+    def n_persons(self) -> int:
+        """Number of learners represented by the result."""
+        return int(self.mastery_probabilities.shape[0])
+
+    @property
+    def n_steps(self) -> int:
+        """Number of forecast opportunities per skill."""
+        return int(self.mastery_probabilities.shape[1])
+
+    @property
+    def n_skills(self) -> int:
+        """Number of modeled skills."""
+        return int(self.mastery_probabilities.shape[2])
+
+
 @dataclass
 class BKTModel:
     """Bayesian Knowledge Tracing model.
@@ -483,6 +533,144 @@ class BKTModel:
             skill_values,
             mastery_values,
         )
+
+    @staticmethod
+    def _validated_forecast_steps(n_steps: int) -> int:
+        """Return a validated positive forecast horizon."""
+        if (
+            isinstance(n_steps, (bool, np.bool_))
+            or not isinstance(n_steps, (int, np.integer))
+            or n_steps < 1
+        ):
+            raise ValueError("n_steps must be a positive integer")
+        return int(n_steps)
+
+    def _validated_mastery_priors(
+        self,
+        prior_mastery: NDArray[np.float64],
+        *,
+        batch: bool,
+    ) -> NDArray[np.float64]:
+        """Return validated next-opportunity mastery priors."""
+        raw_mastery = np.asarray(prior_mastery)
+        if batch:
+            expected_shape = "(n_persons, n_skills)"
+            shape_is_valid = (
+                raw_mastery.ndim == 2
+                and raw_mastery.shape[0] > 0
+                and raw_mastery.shape[1] == self.n_skills
+            )
+        else:
+            expected_shape = "(n_skills,)"
+            shape_is_valid = raw_mastery.shape == (self.n_skills,)
+        if not shape_is_valid:
+            raise ValueError(f"prior_mastery must have shape {expected_shape}")
+        if (
+            np.issubdtype(raw_mastery.dtype, np.bool_)
+            or np.issubdtype(raw_mastery.dtype, np.complexfloating)
+            or not np.issubdtype(raw_mastery.dtype, np.number)
+        ):
+            raise ValueError("prior_mastery must contain values in [0, 1]")
+        mastery_values = raw_mastery.astype(np.float64, copy=True)
+        if not np.all(np.isfinite(mastery_values)) or np.any(
+            (mastery_values < 0.0) | (mastery_values > 1.0)
+        ):
+            raise ValueError("prior_mastery must contain values in [0, 1]")
+        return mastery_values
+
+    def _forecast_from_priors_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        n_steps: int,
+    ) -> BKTBatchForecastResult:
+        """Forecast validated next-opportunity priors without Python loops."""
+        transition_rate = self.p_learn + self.p_forget
+        equilibrium = np.divide(
+            self.p_learn,
+            transition_rate,
+            out=np.zeros_like(self.p_learn),
+            where=transition_rate > 0.0,
+        )
+        transition_powers = np.power(
+            (1.0 - transition_rate)[None, None, :],
+            np.arange(n_steps, dtype=np.int64)[None, :, None],
+        )
+        mastery_probabilities = (
+            equilibrium[None, None, :]
+            + (prior_mastery[:, None, :] - equilibrium[None, None, :])
+            * transition_powers
+        )
+        np.clip(mastery_probabilities, 0.0, 1.0, out=mastery_probabilities)
+        response_probabilities = (
+            mastery_probabilities * (1.0 - self.p_slip[None, None, :])
+            + (1.0 - mastery_probabilities) * self.p_guess[None, None, :]
+        )
+        return BKTBatchForecastResult(
+            mastery_probabilities=mastery_probabilities,
+            response_probabilities=response_probabilities,
+        )
+
+    def forecast_from_priors(
+        self,
+        prior_mastery: NDArray[np.float64],
+        n_steps: int,
+    ) -> BKTForecastResult:
+        """Forecast every skill from one learner's next-opportunity priors.
+
+        Forecasts are unconditional on unknown future responses. Each step is
+        one additional opportunity for every modeled skill.
+
+        Parameters
+        ----------
+        prior_mastery : NDArray
+            Next-opportunity mastery probabilities with shape ``(n_skills,)``.
+        n_steps : int
+            Number of future opportunities to forecast for every skill.
+
+        Returns
+        -------
+        BKTForecastResult
+            Mastery and success probabilities with shape
+            ``(n_steps, n_skills)``.
+        """
+        n_steps = self._validated_forecast_steps(n_steps)
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=False,
+        )
+        result = self._forecast_from_priors_batch(mastery_values[None, :], n_steps)
+        return BKTForecastResult(
+            mastery_probabilities=result.mastery_probabilities[0].copy(),
+            response_probabilities=result.response_probabilities[0].copy(),
+        )
+
+    def forecast_from_priors_batch(
+        self,
+        prior_mastery: NDArray[np.float64],
+        n_steps: int,
+    ) -> BKTBatchForecastResult:
+        """Forecast every skill for multiple learners from retained priors.
+
+        Parameters
+        ----------
+        prior_mastery : NDArray
+            Next-opportunity mastery probabilities with shape
+            ``(n_persons, n_skills)``.
+        n_steps : int
+            Number of future opportunities to forecast for every skill.
+
+        Returns
+        -------
+        BKTBatchForecastResult
+            Mastery and success probabilities with shape
+            ``(n_persons, n_steps, n_skills)``.
+        """
+        n_steps = self._validated_forecast_steps(n_steps)
+        mastery_values = self._validated_mastery_priors(
+            prior_mastery,
+            batch=True,
+        )
+        return self._forecast_from_priors_batch(mastery_values, n_steps)
 
     def _can_use_native_inference(self) -> bool:
         """Return whether compiled kernels preserve this model's semantics."""
@@ -970,6 +1158,55 @@ class BKTModel:
         gamma, _ = self.forward_backward(responses, skill_assignments)
         return float(gamma[-1, 1])
 
+    def _latest_mastery_batch(
+        self,
+        learned_probabilities: NDArray[np.float64],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Extract each skill's last posterior from validated inference output."""
+        n_persons, n_trials = learned_probabilities.shape
+        mastery = np.broadcast_to(self.p_init, (n_persons, self.n_skills)).copy()
+
+        if skill_assignments.ndim == 1:
+            for skill_idx, trial_indices in enumerate(
+                self._skill_trials(skill_assignments)
+            ):
+                if len(trial_indices) > 0:
+                    mastery[:, skill_idx] = learned_probabilities[:, trial_indices[-1]]
+            return mastery
+
+        for skill_idx in range(self.n_skills):
+            matches = skill_assignments == skill_idx
+            observed = np.any(matches, axis=1)
+            if not np.any(observed):
+                continue
+            rows = np.flatnonzero(observed)
+            last_trials = n_trials - 1 - np.argmax(matches[:, ::-1], axis=1)
+            mastery[rows, skill_idx] = learned_probabilities[
+                rows,
+                last_trials[rows],
+            ]
+        return mastery
+
+    def _next_mastery_priors_from_latest(
+        self,
+        latest_mastery: NDArray[np.float64],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Advance observed skills to their next-opportunity priors."""
+        transitioned = (
+            latest_mastery * (1.0 - self.p_forget)
+            + (1.0 - latest_mastery) * self.p_learn
+        )
+        if skill_assignments.ndim == 1:
+            observed = np.zeros(self.n_skills, dtype=bool)
+            observed[skill_assignments] = True
+        else:
+            observed = np.zeros_like(latest_mastery, dtype=bool)
+            rows = np.arange(skill_assignments.shape[0])[:, None]
+            observed[rows, skill_assignments] = True
+        return np.where(observed, transitioned, latest_mastery)
+
     def predict_mastery_by_skill(
         self,
         responses: NDArray[np.int_],
@@ -984,14 +1221,11 @@ class BKTModel:
         responses, skill_assignments = self._validate_sequence(
             responses, skill_assignments
         )
-        gamma, _ = self.forward_backward(responses, skill_assignments)
-        mastery = self.p_init.copy()
-        for skill_idx, trial_indices in enumerate(
-            self._skill_trials(skill_assignments)
-        ):
-            if len(trial_indices) > 0:
-                mastery[skill_idx] = gamma[trial_indices[-1], 1]
-        return mastery
+        gamma, _ = self._forward_backward_batch_validated(
+            responses[None, :],
+            skill_assignments,
+        )
+        return self._latest_mastery_batch(gamma[..., 1], skill_assignments)[0]
 
     def predict_mastery_batch(
         self,
@@ -1007,27 +1241,145 @@ class BKTModel:
             responses, skill_assignments
         )
         gamma, _ = self._forward_backward_batch_validated(responses, skill_assignments)
-        mastery = np.broadcast_to(
-            self.p_init, (responses.shape[0], self.n_skills)
-        ).copy()
+        return self._latest_mastery_batch(gamma[..., 1], skill_assignments)
 
-        if skill_assignments.ndim == 1:
-            for skill_idx, trial_indices in enumerate(
-                self._skill_trials(skill_assignments)
-            ):
-                if len(trial_indices) > 0:
-                    mastery[:, skill_idx] = gamma[:, trial_indices[-1], 1]
-            return mastery
+    def next_mastery_priors(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Return every skill's prior for its next opportunity.
 
-        for person_idx, person_skills in enumerate(skill_assignments):
-            for skill_idx, trial_indices in enumerate(
-                self._skill_trials(person_skills)
-            ):
-                if len(trial_indices) > 0:
-                    mastery[person_idx, skill_idx] = gamma[
-                        person_idx, trial_indices[-1], 1
-                    ]
-        return mastery
+        Skills absent from the history retain their initial mastery
+        probabilities. Observed skills advance once through their configured
+        learning and forgetting transition after their final opportunity.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response sequence with shape ``(n_trials,)``. Use ``-1``
+            for a missing response.
+        skill_assignments : NDArray
+            Skill index for every historical trial.
+
+        Returns
+        -------
+        NDArray
+            Next-opportunity priors with shape ``(n_skills,)``.
+        """
+        responses, skill_assignments = self._validate_sequence(
+            responses,
+            skill_assignments,
+        )
+        gamma, _ = self._forward_backward_batch_validated(
+            responses[None, :],
+            skill_assignments,
+        )
+        latest_mastery = self._latest_mastery_batch(
+            gamma[..., 1],
+            skill_assignments,
+        )[0]
+        return self._next_mastery_priors_from_latest(
+            latest_mastery,
+            skill_assignments,
+        )
+
+    def next_mastery_priors_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Return next-opportunity skill priors for multiple learners.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_trials)``.
+        skill_assignments : NDArray
+            Shared trial-to-skill vector or a matrix matching ``responses``.
+
+        Returns
+        -------
+        NDArray
+            Next-opportunity priors with shape
+            ``(n_persons, n_skills)``.
+        """
+        responses, skill_assignments = self._validate_batch(
+            responses,
+            skill_assignments,
+        )
+        gamma, _ = self._forward_backward_batch_validated(
+            responses,
+            skill_assignments,
+        )
+        latest_mastery = self._latest_mastery_batch(
+            gamma[..., 1],
+            skill_assignments,
+        )
+        return self._next_mastery_priors_from_latest(
+            latest_mastery,
+            skill_assignments,
+        )
+
+    def forecast(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        n_steps: int,
+    ) -> BKTForecastResult:
+        """Forecast future skill opportunities after one response history.
+
+        The first forecast step is each skill's next opportunity after its
+        final historical trial. Skills absent from the history start at their
+        configured initial mastery probability.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response sequence with shape ``(n_trials,)``.
+        skill_assignments : NDArray
+            Skill index for every historical trial.
+        n_steps : int
+            Number of future opportunities to forecast for every skill.
+
+        Returns
+        -------
+        BKTForecastResult
+            Mastery and success probabilities with shape
+            ``(n_steps, n_skills)``.
+        """
+        return self.forecast_from_priors(
+            self.next_mastery_priors(responses, skill_assignments),
+            n_steps,
+        )
+
+    def forecast_batch(
+        self,
+        responses: NDArray[np.int_],
+        skill_assignments: NDArray[np.int_],
+        n_steps: int,
+    ) -> BKTBatchForecastResult:
+        """Forecast future skill opportunities after multiple histories.
+
+        Parameters
+        ----------
+        responses : NDArray
+            Integer response matrix with shape ``(n_persons, n_trials)``.
+        skill_assignments : NDArray
+            Shared trial-to-skill vector or a matrix matching ``responses``.
+        n_steps : int
+            Number of future opportunities to forecast for every skill.
+
+        Returns
+        -------
+        BKTBatchForecastResult
+            Mastery and success probabilities with shape
+            ``(n_persons, n_steps, n_skills)``.
+        """
+        return self.forecast_from_priors_batch(
+            self.next_mastery_priors_batch(responses, skill_assignments),
+            n_steps,
+        )
 
     def simulate(
         self,

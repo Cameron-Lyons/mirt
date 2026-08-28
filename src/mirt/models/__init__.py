@@ -37,7 +37,9 @@ from mirt.models.dichotomous import (
     TwoParameterLogistic,
 )
 from mirt.models.dynamic import (
+    BKTBatchForecastResult,
     BKTBatchStepResult,
+    BKTForecastResult,
     BKTModel,
     BKTResult,
     BKTStepResult,
@@ -198,6 +200,8 @@ __all__ = [
     "BKTResult",
     "BKTStepResult",
     "BKTBatchStepResult",
+    "BKTForecastResult",
+    "BKTBatchForecastResult",
     "LongitudinalIRTModel",
     "LongitudinalResult",
     "StateSpaceIRT",

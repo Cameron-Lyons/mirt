@@ -57,6 +57,35 @@ shared scalars or one value per learner. Missing responses have zero log score
 and ``numpy.nan`` residuals while still applying the configured learning and
 forgetting transition.
 
+Mastery forecasts
+-----------------
+
+Project mastery and success probabilities directly from the retained
+next-opportunity priors:
+
+.. code-block:: python
+
+   future = model.forecast_from_priors(mastery_priors, n_steps=6)
+   future_mastery = future.mastery_probabilities
+   future_success = future.response_probabilities
+   print(future_mastery.shape)  # (6, 3)
+
+When retained priors are unavailable, forecast from a response history in one
+call:
+
+.. code-block:: python
+
+   future = model.forecast(responses, skills, n_steps=6)
+   next_priors = model.next_mastery_priors(responses, skills)
+
+``forecast_from_priors_batch`` accepts an
+``(n_persons, n_skills)`` prior matrix, while ``forecast_batch`` accepts shared
+or person-specific skill layouts. Each forecast step represents one future
+opportunity for every modeled skill. Forecasts are unconditional on unknown
+future responses and use a closed-form transition, so their runtime does not
+include a Python loop over the horizon. Skills absent from a response history
+begin at their configured initial mastery probability.
+
 Batch inference
 ---------------
 
