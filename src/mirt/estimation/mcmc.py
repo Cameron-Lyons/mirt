@@ -17,6 +17,7 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtEstimationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -506,8 +507,8 @@ class GibbsSampler(BaseEstimator):
             ess = self._compute_ess(chain_arrays)
             ll_mean = float(np.mean(ll_chain))
 
-            dic = self._compute_dic_from_chains(chain_arrays, model, responses)
-            waic = self._compute_waic_from_chains(chain_arrays, model, responses)
+            dic = self._compute_dic(chain_arrays, model, responses)
+            waic = self._compute_waic(chain_arrays, model, responses)
 
             return MCMCResult(
                 model=model,
@@ -761,78 +762,89 @@ class GibbsSampler(BaseEstimator):
 
         return float(deviance_mean + pd)
 
-    def _compute_dic_from_chains(
-        self,
-        chains: dict[str, NDArray],
-        model: BaseItemModel,
-        responses: NDArray[np.int_],
-    ) -> float:
-        """Compute DIC from Rust chains."""
-        ll_mean = np.mean(chains["log_likelihood"])
-        deviance_mean = -2 * ll_mean
-
-        theta_chain = chains["theta"]
-        theta_mean = np.mean(theta_chain, axis=0)
-        if theta_mean.ndim == 2:
-            theta_mean = theta_mean
-
-        ll_at_mean = np.sum(model.log_likelihood(responses, theta_mean))
-        deviance_at_mean = -2 * ll_at_mean
-
-        pd = deviance_mean - deviance_at_mean
-
-        return float(deviance_mean + pd)
-
     def _compute_waic(
         self,
         chains: dict[str, NDArray],
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> float:
-        """Compute Watanabe-Akaike Information Criterion."""
-        n_samples = len(chains["log_likelihood"])
+        """Compute stable pointwise WAIC from paired posterior draws."""
+        theta_chain = np.asarray(chains["theta"], dtype=np.float64)
+        if theta_chain.ndim != 3 or theta_chain.shape[0] == 0:
+            raise MirtEstimationError(
+                "theta chain must have shape (n_samples, n_persons, n_factors)"
+            )
 
-        lppd = 0
-        pwaic = 0
-
-        for i in range(responses.shape[0]):
-            person_ll = []
-            for s in range(n_samples):
-                theta_s = chains["theta"][s][i : i + 1]
-                resp_i = responses[i : i + 1]
-                ll_s = model.log_likelihood(resp_i, theta_s)[0]
-                person_ll.append(ll_s)
-
-            person_ll = np.array(person_ll)
-            lppd += np.log(np.mean(np.exp(person_ll)))
-            pwaic += np.var(person_ll)
-
-        return float(-2 * (lppd - pwaic))
-
-    def _compute_waic_from_chains(
-        self,
-        chains: dict[str, NDArray],
-        model: BaseItemModel,
-        responses: NDArray[np.int_],
-    ) -> float:
-        """Compute WAIC from Rust chains."""
-        theta_chain = chains["theta"]
-        n_samples = theta_chain.shape[0]
+        n_samples, n_chain_persons, n_chain_factors = theta_chain.shape
         n_persons = responses.shape[0]
+        if n_chain_persons != n_persons or n_chain_factors != model.n_factors:
+            raise MirtEstimationError(
+                "theta chain dimensions must match the fitted data and model",
+                expected=(n_persons, model.n_factors),
+                actual=(n_chain_persons, n_chain_factors),
+            )
+        if not np.all(np.isfinite(theta_chain)):
+            raise MirtEstimationError("theta chain must contain only finite values")
 
-        lppd = 0.0
-        pwaic = 0.0
+        parameter_chains: dict[str, NDArray[np.float64]] = {}
+        for name, parameter in model.parameters.items():
+            if name not in chains:
+                raise MirtEstimationError(
+                    "posterior parameter chain is missing",
+                    parameter=name,
+                )
+            values = np.asarray(chains[name], dtype=np.float64)
+            expected_shape = (n_samples, *parameter.shape)
+            if values.shape != expected_shape:
+                raise MirtEstimationError(
+                    "posterior parameter chain has an unexpected shape",
+                    parameter=name,
+                    expected=expected_shape,
+                    actual=values.shape,
+                )
+            if not np.all(np.isfinite(values)):
+                raise MirtEstimationError(
+                    "posterior parameter chain must contain only finite values",
+                    parameter=name,
+                )
+            parameter_chains[name] = values
 
-        for i in range(n_persons):
-            person_ll = []
-            for s in range(n_samples):
-                theta_s = theta_chain[s, i : i + 1, :]
-                resp_i = responses[i : i + 1]
-                ll_s = model.log_likelihood(resp_i, theta_s)[0]
-                person_ll.append(ll_s)
+        evaluation_model = model.copy()
+        evaluation_model._is_fitted = True
+        log_sum_exp = np.full(n_persons, -np.inf, dtype=np.float64)
+        running_mean = np.zeros(n_persons, dtype=np.float64)
+        running_m2 = np.zeros(n_persons, dtype=np.float64)
 
-            person_ll = np.array(person_ll)
-            lppd += np.log(np.mean(np.exp(person_ll)))
-            pwaic += np.var(person_ll)
+        for sample_index in range(n_samples):
+            for name, values in parameter_chains.items():
+                evaluation_model._parameters[name] = values[sample_index]
 
-        return float(-2 * (lppd - pwaic))
+            pointwise = np.asarray(
+                evaluation_model.log_likelihood(
+                    responses,
+                    theta_chain[sample_index],
+                ),
+                dtype=np.float64,
+            )
+            if pointwise.shape != (n_persons,) or not np.all(np.isfinite(pointwise)):
+                raise MirtEstimationError(
+                    "model returned invalid pointwise posterior log-likelihoods",
+                    iteration=sample_index,
+                    expected=(n_persons,),
+                    actual=pointwise.shape,
+                )
+
+            count = sample_index + 1
+            delta = pointwise - running_mean
+            running_mean += delta / count
+            running_m2 += delta * (pointwise - running_mean)
+            log_sum_exp = np.logaddexp(log_sum_exp, pointwise)
+
+        log_pointwise_predictive_density = np.sum(
+            log_sum_exp - np.log(float(n_samples))
+        )
+        effective_parameters = np.sum(running_m2 / n_samples)
+        waic = -2.0 * (log_pointwise_predictive_density - effective_parameters)
+        if not np.isfinite(waic):
+            raise MirtEstimationError("WAIC is non-finite")
+        return float(waic)
