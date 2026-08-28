@@ -23,6 +23,109 @@ _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 _GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
 
 
+@dataclass(frozen=True)
+class _GrowthCovariance:
+    """Low-rank representation of a marginal growth covariance matrix."""
+
+    residual_variance: float
+    log_determinant: float
+    orthonormal_basis: NDArray[np.float64] | None = None
+    covariance_factor: NDArray[np.float64] | None = None
+
+    @classmethod
+    def from_time_values(
+        cls,
+        time_values: NDArray[np.float64],
+        intercept_variance: float,
+        slope_variance: float,
+        residual_variance: float,
+    ) -> _GrowthCovariance:
+        """Factor the covariance without constructing its dense matrix."""
+        random_effect_columns = []
+        if intercept_variance > 0.0:
+            random_effect_columns.append(
+                np.full(time_values.size, np.sqrt(intercept_variance))
+            )
+        if slope_variance > 0.0:
+            random_effect_columns.append(time_values * np.sqrt(slope_variance))
+
+        if not random_effect_columns:
+            return cls(
+                residual_variance=residual_variance,
+                log_determinant=time_values.size * np.log(residual_variance),
+            )
+
+        random_effect_basis = np.column_stack(random_effect_columns)
+        orthonormal_basis, triangular_basis = np.linalg.qr(
+            random_effect_basis,
+            mode="reduced",
+        )
+        basis_covariance = (
+            residual_variance * np.eye(orthonormal_basis.shape[1])
+            + triangular_basis @ triangular_basis.T
+        )
+        covariance_factor = np.linalg.cholesky(basis_covariance)
+        log_determinant = (time_values.size - orthonormal_basis.shape[1]) * np.log(
+            residual_variance
+        ) + 2.0 * np.sum(np.log(np.diag(covariance_factor)))
+        return cls(
+            residual_variance=residual_variance,
+            log_determinant=float(log_determinant),
+            orthonormal_basis=orthonormal_basis,
+            covariance_factor=covariance_factor,
+        )
+
+    def solve(self, values: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Apply the inverse covariance to one or more column vectors."""
+        if self.orthonormal_basis is None or self.covariance_factor is None:
+            return values / self.residual_variance
+
+        basis_coordinates = self.orthonormal_basis.T @ values
+        orthogonal_values = (
+            values - self.orthonormal_basis @ basis_coordinates
+        ) / self.residual_variance
+        solved_coordinates = np.linalg.solve(
+            self.covariance_factor.T,
+            np.linalg.solve(self.covariance_factor, basis_coordinates),
+        )
+        return orthogonal_values + self.orthonormal_basis @ solved_coordinates
+
+    def quadratic_forms(
+        self,
+        residuals: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate row-wise covariance-weighted squared residuals."""
+        if self.orthonormal_basis is None or self.covariance_factor is None:
+            return np.einsum("ij,ij->i", residuals, residuals) / (
+                self.residual_variance
+            )
+
+        basis_coordinates = residuals @ self.orthonormal_basis
+        orthogonal_residuals = residuals - basis_coordinates @ self.orthonormal_basis.T
+        whitened_coordinates = np.linalg.solve(
+            self.covariance_factor,
+            basis_coordinates.T,
+        )
+        return np.einsum(
+            "ij,ij->i",
+            orthogonal_residuals,
+            orthogonal_residuals,
+        ) / self.residual_variance + np.einsum(
+            "ij,ij->j",
+            whitened_coordinates,
+            whitened_coordinates,
+        )
+
+
+@dataclass(frozen=True)
+class _GrowthObservationPattern:
+    """Rows sharing observed columns and one covariance factorization."""
+
+    rows: NDArray[np.int_]
+    columns: NDArray[np.int_]
+    covariance: _GrowthCovariance
+
+
 @dataclass
 class BKTModel:
     """Bayesian Knowledge Tracing model.
@@ -2087,7 +2190,9 @@ class GrowthMixtureModel:
         Parameters
         ----------
         observations : NDArray
-            Observed trajectories (n_persons, n_timepoints).
+            Observed trajectories (n_persons, n_timepoints). Use ``NaN`` for
+            missing occasions; every person must have at least one observed
+            value.
         time_values : NDArray
             Time points.
 
@@ -2213,6 +2318,7 @@ class GrowthMixtureModel:
         NDArray[np.float64],
         NDArray[np.float64],
         tuple[float, float, float],
+        NDArray[np.bool_] | None,
     ]:
         """Validate growth-mixture inputs and build class trajectories."""
         try:
@@ -2227,8 +2333,20 @@ class GrowthMixtureModel:
             or observation_values.shape[1] < 1
         ):
             raise ValueError("observations must be a non-empty two-dimensional array")
-        if not np.all(np.isfinite(observation_values)):
-            raise ValueError("observations must contain only finite values")
+        finite = np.isfinite(observation_values)
+        observation_mask = None
+        if not np.all(finite):
+            missing = np.isnan(observation_values)
+            if np.any(~finite & ~missing):
+                raise ValueError(
+                    "observations must contain finite values or NaN for missing "
+                    "occasions"
+                )
+            observation_mask = finite
+            if np.any(~np.any(observation_mask, axis=1)):
+                raise ValueError(
+                    "each trajectory must contain at least one observation"
+                )
 
         times = self._validated_time_values(
             time_values,
@@ -2240,7 +2358,106 @@ class GrowthMixtureModel:
             raise ValueError(
                 "residual_variance must be positive for likelihood evaluation"
             )
-        return observation_values, times, trajectories, variances
+        return observation_values, times, trajectories, variances, observation_mask
+
+    @staticmethod
+    def _prepare_observation_patterns(
+        observations: NDArray[np.float64],
+        times: NDArray[np.float64],
+        variances: tuple[float, float, float],
+        observation_mask: NDArray[np.bool_] | None,
+    ) -> list[_GrowthObservationPattern]:
+        """Group rows by observed occasions and factor each covariance once."""
+        if observation_mask is None:
+            unique_patterns = np.ones((1, observations.shape[1]), dtype=np.bool_)
+            row_groups = [np.arange(observations.shape[0], dtype=np.int_)]
+        else:
+            unique_patterns, inverse, counts = np.unique(
+                observation_mask,
+                axis=0,
+                return_inverse=True,
+                return_counts=True,
+            )
+            grouped_rows = np.argsort(inverse, kind="stable")
+            row_groups = np.split(grouped_rows, np.cumsum(counts)[:-1])
+
+        intercept_variance, slope_variance, residual_variance = variances
+        patterns = []
+        for pattern, rows in zip(unique_patterns, row_groups):
+            columns = np.flatnonzero(pattern)
+            covariance = _GrowthCovariance.from_time_values(
+                times[columns],
+                intercept_variance,
+                slope_variance,
+                residual_variance,
+            )
+            patterns.append(
+                _GrowthObservationPattern(
+                    rows=rows,
+                    columns=columns,
+                    covariance=covariance,
+                )
+            )
+        return patterns
+
+    def _class_log_likelihood_from_patterns(
+        self,
+        observations: NDArray[np.float64],
+        trajectories: NDArray[np.float64],
+        patterns: list[_GrowthObservationPattern],
+    ) -> NDArray[np.float64]:
+        """Evaluate validated trajectories using prepared observation patterns."""
+        if len(patterns) == 1 and patterns[0].columns.size == observations.shape[1]:
+            return self._complete_class_log_likelihood(
+                observations,
+                trajectories,
+                patterns[0].covariance,
+            )
+
+        log_likelihoods = np.empty(
+            (observations.shape[0], self.n_classes),
+            dtype=np.float64,
+        )
+        for pattern in patterns:
+            values = observations[np.ix_(pattern.rows, pattern.columns)]
+            class_trajectories = trajectories[:, pattern.columns]
+            log_likelihoods[pattern.rows] = self._complete_class_log_likelihood(
+                values,
+                class_trajectories,
+                pattern.covariance,
+            )
+        return log_likelihoods
+
+    def _complete_class_log_likelihood(
+        self,
+        observations: NDArray[np.float64],
+        trajectories: NDArray[np.float64],
+        covariance: _GrowthCovariance,
+    ) -> NDArray[np.float64]:
+        """Evaluate one fully observed trajectory matrix."""
+        if covariance.orthonormal_basis is None:
+            quadratic_forms = (
+                cdist(
+                    observations,
+                    trajectories,
+                    metric="sqeuclidean",
+                )
+                / covariance.residual_variance
+            )
+        else:
+            quadratic_forms = np.empty(
+                (observations.shape[0], self.n_classes),
+                dtype=np.float64,
+            )
+            for class_index, trajectory in enumerate(trajectories):
+                quadratic_forms[:, class_index] = covariance.quadratic_forms(
+                    observations - trajectory
+                )
+
+        normalization = (
+            observations.shape[1] * np.log(2.0 * np.pi) + covariance.log_determinant
+        )
+        return -0.5 * (quadratic_forms + normalization)
 
     def class_log_likelihood(
         self,
@@ -2253,6 +2470,8 @@ class GrowthMixtureModel:
         ----------
         observations : NDArray
             Observed trajectories with shape ``(n_persons, n_timepoints)``.
+            Use ``NaN`` for missing occasions; every person must have at least
+            one observed value.
             A one-dimensional trajectory is accepted as one person.
         time_values : NDArray
             One finite value per trajectory column.
@@ -2269,67 +2488,23 @@ class GrowthMixtureModel:
         It is evaluated through its low-rank random-effect basis without
         constructing a dense time-by-time covariance matrix.
         """
-        values, times, trajectories, variances = self._validated_trajectory_data(
-            observations,
-            time_values,
+        values, times, trajectories, variances, observation_mask = (
+            self._validated_trajectory_data(
+                observations,
+                time_values,
+            )
         )
-        intercept_variance, slope_variance, residual_variance = variances
-        n_timepoints = times.size
-
-        random_effect_columns = []
-        if intercept_variance > 0.0:
-            random_effect_columns.append(
-                np.full(n_timepoints, np.sqrt(intercept_variance))
-            )
-        if slope_variance > 0.0:
-            random_effect_columns.append(times * np.sqrt(slope_variance))
-
-        if not random_effect_columns:
-            quadratic_forms = (
-                cdist(values, trajectories, metric="sqeuclidean") / residual_variance
-            )
-            log_determinant = n_timepoints * np.log(residual_variance)
-        else:
-            random_effect_basis = np.column_stack(random_effect_columns)
-            orthonormal_basis, triangular_basis = np.linalg.qr(
-                random_effect_basis,
-                mode="reduced",
-            )
-            basis_covariance = (
-                residual_variance * np.eye(orthonormal_basis.shape[1])
-                + triangular_basis @ triangular_basis.T
-            )
-            covariance_factor = np.linalg.cholesky(basis_covariance)
-            log_determinant = (n_timepoints - orthonormal_basis.shape[1]) * np.log(
-                residual_variance
-            ) + 2.0 * np.sum(np.log(np.diag(covariance_factor)))
-
-            quadratic_forms = np.empty(
-                (values.shape[0], self.n_classes),
-                dtype=np.float64,
-            )
-            for class_index, trajectory in enumerate(trajectories):
-                residuals = values - trajectory
-                basis_coordinates = residuals @ orthonormal_basis
-                orthogonal_residuals = (
-                    residuals - basis_coordinates @ orthonormal_basis.T
-                )
-                whitened_coordinates = np.linalg.solve(
-                    covariance_factor,
-                    basis_coordinates.T,
-                )
-                quadratic_forms[:, class_index] = np.einsum(
-                    "ij,ij->i",
-                    orthogonal_residuals,
-                    orthogonal_residuals,
-                ) / residual_variance + np.einsum(
-                    "ij,ij->j",
-                    whitened_coordinates,
-                    whitened_coordinates,
-                )
-
-        normalization = n_timepoints * np.log(2.0 * np.pi) + log_determinant
-        return -0.5 * (quadratic_forms + normalization)
+        patterns = self._prepare_observation_patterns(
+            values,
+            times,
+            variances,
+            observation_mask,
+        )
+        return self._class_log_likelihood_from_patterns(
+            values,
+            trajectories,
+            patterns,
+        )
 
     def _posterior_from_log_likelihoods(
         self,
@@ -2356,7 +2531,8 @@ class GrowthMixtureModel:
         Parameters
         ----------
         observations : NDArray
-            Observed trajectories (n_persons, n_timepoints).
+            Observed trajectories (n_persons, n_timepoints). Use ``NaN`` for
+            missing occasions.
         time_values : NDArray
             Time points.
 
@@ -2379,7 +2555,8 @@ class GrowthMixtureModel:
         Parameters
         ----------
         observations : NDArray
-            Observed trajectories (n_persons, n_timepoints).
+            Observed trajectories (n_persons, n_timepoints). Use ``NaN`` for
+            missing occasions.
         time_values : NDArray
             Time points.
 
@@ -2483,7 +2660,9 @@ class GrowthMixtureModel:
         Parameters
         ----------
         observations : NDArray
-            Observed trajectories (n_persons, n_timepoints).
+            Observed trajectories (n_persons, n_timepoints). Use ``NaN`` for
+            missing occasions; every person must have at least one observed
+            value.
         time_values : NDArray
             Time points.
         max_iter : int
@@ -2496,9 +2675,11 @@ class GrowthMixtureModel:
         dict
             Estimation results.
         """
-        observations, times, _, _ = self._validated_trajectory_data(
-            observations,
-            time_values,
+        observations, times, _, variances, observation_mask = (
+            self._validated_trajectory_data(
+                observations,
+                time_values,
+            )
         )
         if (
             isinstance(max_iter, bool)
@@ -2520,12 +2701,68 @@ class GrowthMixtureModel:
         elif self.growth_type == "piecewise":
             hinge = np.maximum(times - self._resolved_changepoint(times), 0.0)
             design = np.column_stack([design, hinge])
-        if np.linalg.matrix_rank(design) < design.shape[1]:
-            raise ValueError("time_values must provide a full-rank growth design")
+        observed_times = (
+            np.ones(observations.shape[1], dtype=np.bool_)
+            if observation_mask is None
+            else np.any(observation_mask, axis=0)
+        )
+        if np.linalg.matrix_rank(design[observed_times]) < design.shape[1]:
+            raise ValueError(
+                "observed time_values must provide a full-rank growth design"
+            )
+
+        self.class_proportions = self._validated_class_proportions().copy()
+        self.class_intercepts = np.asarray(
+            self.class_intercepts,
+            dtype=np.float64,
+        ).copy()
+        self.class_slopes = np.asarray(
+            self.class_slopes,
+            dtype=np.float64,
+        ).copy()
+        if self.growth_type == "quadratic":
+            self.class_quadratics = np.asarray(
+                self.class_quadratics,
+                dtype=np.float64,
+            ).copy()
+        elif self.growth_type == "piecewise":
+            self.class_post_slopes = np.asarray(
+                self.class_post_slopes,
+                dtype=np.float64,
+            ).copy()
+
+        patterns = self._prepare_observation_patterns(
+            observations,
+            times,
+            variances,
+            observation_mask,
+        )
+        complete_data = (
+            len(patterns) == 1 and patterns[0].columns.size == observations.shape[1]
+        )
+        pattern_updates = (
+            []
+            if complete_data
+            else [
+                (
+                    pattern,
+                    design[pattern.columns],
+                    design[pattern.columns].T
+                    @ pattern.covariance.solve(design[pattern.columns]),
+                )
+                for pattern in patterns
+            ]
+        )
 
         converged = False
         for iteration in range(max_iter):
-            posteriors = self.posterior_probabilities(observations, times)
+            trajectories = self._validated_class_trajectories(times)
+            log_likelihoods = self._class_log_likelihood_from_patterns(
+                observations,
+                trajectories,
+                patterns,
+            )
+            posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
 
             prev_proportions = self.class_proportions.copy()
             prev_intercepts = self.class_intercepts.copy()
@@ -2540,12 +2777,53 @@ class GrowthMixtureModel:
             class_mass = np.sum(posteriors, axis=0)
             active = class_mass >= PROB_EPSILON
             safe_mass = np.where(active, class_mass, 1.0)
-            weighted_means = (posteriors.T @ observations) / safe_mass[:, None]
-            coefficients = np.linalg.lstsq(
-                design,
-                weighted_means.T,
-                rcond=None,
-            )[0].T
+            if complete_data:
+                weighted_means = (posteriors.T @ observations) / safe_mass[:, None]
+                coefficients = np.linalg.lstsq(
+                    design,
+                    weighted_means.T,
+                    rcond=None,
+                )[0].T
+            else:
+                normal_matrices = np.zeros(
+                    (self.n_classes, design.shape[1], design.shape[1]),
+                    dtype=np.float64,
+                )
+                right_hand_sides = np.zeros(
+                    (self.n_classes, design.shape[1]),
+                    dtype=np.float64,
+                )
+                for pattern, pattern_design, precision_gram in pattern_updates:
+                    pattern_posteriors = posteriors[pattern.rows]
+                    pattern_mass = np.sum(pattern_posteriors, axis=0)
+                    weighted_observations = (
+                        pattern_posteriors.T
+                        @ observations[np.ix_(pattern.rows, pattern.columns)]
+                    )
+                    precision_weighted_observations = pattern.covariance.solve(
+                        weighted_observations.T
+                    ).T
+                    normal_matrices += pattern_mass[:, None, None] * precision_gram
+                    right_hand_sides += precision_weighted_observations @ pattern_design
+
+                coefficients = np.column_stack(
+                    [self.class_intercepts, self.class_slopes]
+                )
+                if self.growth_type == "quadratic":
+                    coefficients = np.column_stack(
+                        [coefficients, self.class_quadratics]
+                    )
+                elif self.growth_type == "piecewise":
+                    coefficients = np.column_stack(
+                        [
+                            coefficients,
+                            self.class_post_slopes - self.class_slopes,
+                        ]
+                    )
+                coefficients[active] = np.linalg.solve(
+                    normal_matrices[active],
+                    right_hand_sides[active, :, None],
+                )[:, :, 0]
             self.class_intercepts[active] = coefficients[active, 0]
             self.class_slopes[active] = coefficients[active, 1]
             if self.growth_type == "quadratic":
@@ -2574,7 +2852,12 @@ class GrowthMixtureModel:
                 converged = True
                 break
 
-        final_log_likelihoods = self.class_log_likelihood(observations, times)
+        final_trajectories = self._validated_class_trajectories(times)
+        final_log_likelihoods = self._class_log_likelihood_from_patterns(
+            observations,
+            final_trajectories,
+            patterns,
+        )
         final_posteriors, log_normalizer = self._posterior_from_log_likelihoods(
             final_log_likelihoods
         )
@@ -2626,6 +2909,8 @@ class GrowthMixtureModel:
         ----------
         observations : NDArray
             Observed trajectories with shape ``(n_persons, n_timepoints)``.
+            Use ``NaN`` for missing occasions; every person must have at least
+            one observed value.
         time_values : NDArray
             One time value per observation column.
         max_iter : int
@@ -2675,7 +2960,7 @@ class GrowthMixtureModel:
         Parameters
         ----------
         observations : NDArray
-            Observed trajectories.
+            Observed trajectories. Use ``NaN`` for missing occasions.
         time_values : NDArray
             Time points.
 

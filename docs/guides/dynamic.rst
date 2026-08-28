@@ -95,6 +95,28 @@ convergence diagnostics:
 ``fit_em`` remains available when a mapping is preferred. ``fit`` uses the same
 estimation path and packages its final state into ``GrowthMixtureResult``.
 
+Incomplete trajectories
+-----------------------
+
+Use ``numpy.nan`` when a person missed a measurement occasion. Likelihoods,
+posterior probabilities, classification, entropy, and fitting marginalize over
+the missing occasions for each person:
+
+.. code-block:: python
+
+   incomplete = trajectories.copy()
+   incomplete[::3, 1] = np.nan
+   incomplete[1::4, 4] = np.nan
+
+   result = mixture.fit(incomplete, time_values)
+   probabilities = mixture.posterior_probabilities(incomplete, time_values)
+
+Every trajectory must retain at least one observed value. Entirely unobserved
+time columns are allowed when the remaining occasions still identify the chosen
+growth curve. Infinite values remain invalid. Rows with identical observation
+patterns share covariance work, while complete inputs continue through the
+optimized complete-data path.
+
 For continuous two-segment trajectories, use piecewise growth with a shared
 changepoint and class-specific slopes on each side:
 
