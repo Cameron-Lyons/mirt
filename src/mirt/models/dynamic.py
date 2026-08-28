@@ -7,6 +7,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._backend_config import should_use_rust
+from mirt._categorical import sample_categorical_rows
 from mirt._core import sigmoid
 from mirt.backends.rust.dynamic import (
     bkt_backward,
@@ -15,6 +16,8 @@ from mirt.backends.rust.dynamic import (
     bkt_viterbi,
 )
 from mirt.constants import PROB_EPSILON
+
+_LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 
 
 @dataclass
@@ -844,6 +847,12 @@ class LongitudinalIRTModel:
         IRT model for item responses ("2PL" or "GRM")
     growth_model : str
         Growth model type ("linear", "quadratic")
+    n_categories : int, optional
+        Number of response categories for a GRM. Inferred from ``thresholds``
+        when provided, otherwise defaults to 4.
+    thresholds : NDArray, optional
+        Ordered GRM thresholds with shape
+        ``(n_items, n_categories - 1)``.
     """
 
     n_items: int
@@ -858,21 +867,146 @@ class LongitudinalIRTModel:
     growth_mean: NDArray[np.float64] | None = None
     growth_cov: NDArray[np.float64] | None = None
     residual_variance: float = 0.1
+    n_categories: int | None = None
+    thresholds: NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.n_items, bool)
+            or not isinstance(self.n_items, (int, np.integer))
+            or self.n_items < 1
+        ):
+            raise ValueError("n_items must be a positive integer")
+        if (
+            isinstance(self.n_timepoints, bool)
+            or not isinstance(self.n_timepoints, (int, np.integer))
+            or self.n_timepoints < 1
+        ):
+            raise ValueError("n_timepoints must be a positive integer")
+        self.n_items = int(self.n_items)
+        self.n_timepoints = int(self.n_timepoints)
+        if self.base_model not in ("2PL", "GRM"):
+            raise ValueError("base_model must be '2PL' or 'GRM'")
+        if self.growth_model not in ("linear", "quadratic"):
+            raise ValueError("growth_model must be 'linear' or 'quadratic'")
+
         if self.item_names is None:
             self.item_names = [f"Item_{i}" for i in range(self.n_items)]
+        else:
+            self.item_names = list(self.item_names)
+            if len(self.item_names) != self.n_items:
+                raise ValueError("item_names length must match n_items")
+            if any(not isinstance(name, str) or not name for name in self.item_names):
+                raise ValueError("item_names must contain non-empty strings")
+            if len(set(self.item_names)) != self.n_items:
+                raise ValueError("item_names must be unique")
 
         if self.discrimination is None:
             self.discrimination = np.ones(self.n_items)
+        else:
+            self.discrimination = np.asarray(
+                self.discrimination,
+                dtype=np.float64,
+            ).copy()
+        if self.discrimination.shape != (self.n_items,) or not np.all(
+            np.isfinite(self.discrimination)
+        ):
+            raise ValueError(f"discrimination must have shape ({self.n_items},)")
+        if np.any(self.discrimination <= 0.0):
+            raise ValueError("discrimination values must be positive")
+
         if self.difficulty is None:
             self.difficulty = np.zeros(self.n_items)
+        else:
+            self.difficulty = np.asarray(self.difficulty, dtype=np.float64).copy()
+        if self.difficulty.shape != (self.n_items,) or not np.all(
+            np.isfinite(self.difficulty)
+        ):
+            raise ValueError(f"difficulty must have shape ({self.n_items},)")
+
+        if self.base_model == "GRM":
+            if self.thresholds is None:
+                if self.n_categories is None:
+                    self.n_categories = 4
+                self._validate_category_count()
+                default_thresholds = (
+                    np.zeros(1)
+                    if self.n_categories == 2
+                    else np.linspace(-1.0, 1.0, self.n_categories - 1)
+                )
+                self.thresholds = np.broadcast_to(
+                    default_thresholds,
+                    (self.n_items, self.n_categories - 1),
+                ).copy()
+            else:
+                self.thresholds = np.asarray(
+                    self.thresholds,
+                    dtype=np.float64,
+                ).copy()
+                if (
+                    self.thresholds.ndim != 2
+                    or self.thresholds.shape[0] != self.n_items
+                ):
+                    raise ValueError(
+                        "thresholds must have shape (n_items, n_categories - 1)"
+                    )
+                inferred_categories = self.thresholds.shape[1] + 1
+                if (
+                    self.n_categories is not None
+                    and self.n_categories != inferred_categories
+                ):
+                    raise ValueError("n_categories does not match thresholds")
+                self.n_categories = inferred_categories
+                self._validate_category_count()
+            if not np.all(np.isfinite(self.thresholds)):
+                raise ValueError("thresholds must contain only finite values")
+            if np.any(np.diff(self.thresholds, axis=1) <= 0.0):
+                raise ValueError("thresholds must be strictly increasing within items")
+        else:
+            if self.thresholds is not None:
+                raise ValueError("thresholds are only supported for base_model='GRM'")
+            if self.n_categories not in (None, 2):
+                raise ValueError("2PL models require exactly 2 response categories")
+            self.n_categories = 2
 
         n_growth = 2 if self.growth_model == "linear" else 3
         if self.growth_mean is None:
             self.growth_mean = np.zeros(n_growth)
+        else:
+            self.growth_mean = np.asarray(self.growth_mean, dtype=np.float64).copy()
+        if self.growth_mean.shape != (n_growth,) or not np.all(
+            np.isfinite(self.growth_mean)
+        ):
+            raise ValueError(f"growth_mean must have shape ({n_growth},)")
+
         if self.growth_cov is None:
             self.growth_cov = np.eye(n_growth)
+        else:
+            self.growth_cov = np.asarray(self.growth_cov, dtype=np.float64).copy()
+        if self.growth_cov.shape != (n_growth, n_growth) or not np.all(
+            np.isfinite(self.growth_cov)
+        ):
+            raise ValueError(f"growth_cov must have shape ({n_growth}, {n_growth})")
+        if not np.allclose(self.growth_cov, self.growth_cov.T, rtol=0.0, atol=1e-12):
+            raise ValueError("growth_cov must be symmetric")
+        if np.min(np.linalg.eigvalsh(self.growth_cov)) < -1e-12:
+            raise ValueError("growth_cov must be positive semidefinite")
+
+        if isinstance(self.residual_variance, bool):
+            raise ValueError("residual_variance must be finite and non-negative")
+        self.residual_variance = float(self.residual_variance)
+        if not np.isfinite(self.residual_variance) or self.residual_variance < 0.0:
+            raise ValueError("residual_variance must be finite and non-negative")
+
+    def _validate_category_count(self) -> None:
+        """Validate and normalize the configured GRM category count."""
+        if (
+            isinstance(self.n_categories, bool)
+            or not isinstance(self.n_categories, (int, np.integer))
+            or self.n_categories < 2
+        ):
+            raise ValueError("n_categories must be an integer of at least 2")
+        self.n_categories = int(self.n_categories)
 
     @property
     def n_growth_factors(self) -> int:
@@ -901,21 +1035,33 @@ class LongitudinalIRTModel:
         NDArray
             Ability trajectory (n_persons, n_timepoints)
         """
-        n_persons = growth_factors.shape[0]
+        growth_values = np.asarray(growth_factors, dtype=np.float64)
+        if growth_values.ndim != 2 or growth_values.shape[1] != self.n_growth_factors:
+            raise ValueError(
+                f"growth_factors must have shape (n_persons, {self.n_growth_factors})"
+            )
+        if not np.all(np.isfinite(growth_values)):
+            raise ValueError("growth_factors must contain only finite values")
 
         if time_values is None:
-            time_values = np.arange(self.n_timepoints, dtype=np.float64)
+            times = np.arange(self.n_timepoints, dtype=np.float64)
+        else:
+            times = np.asarray(time_values, dtype=np.float64)
+        if times.shape != (self.n_timepoints,) or not np.all(np.isfinite(times)):
+            raise ValueError(f"time_values must have shape ({self.n_timepoints},)")
 
-        theta = np.zeros((n_persons, self.n_timepoints))
-
-        for i in range(n_persons):
-            theta[i] = growth_factors[i, 0] + growth_factors[i, 1] * time_values
-
-            if self.growth_model == "quadratic" and growth_factors.shape[1] > 2:
-                theta[i] += growth_factors[i, 2] * time_values**2
+        basis = [np.ones(self.n_timepoints), times]
+        if self.growth_model == "quadratic":
+            basis.append(times**2)
+        theta = growth_values @ np.stack(basis)
 
         if residuals is not None:
-            theta += residuals
+            residual_values = np.asarray(residuals, dtype=np.float64)
+            if residual_values.shape != theta.shape or not np.all(
+                np.isfinite(residual_values)
+            ):
+                raise ValueError(f"residuals must have shape {theta.shape}")
+            theta += residual_values
 
         return theta
 
@@ -936,20 +1082,66 @@ class LongitudinalIRTModel:
         Returns
         -------
         NDArray
-            P(X=1|θ)
+            For a 2PL, ``P(X=1|theta)`` with shape ``(n_persons,)`` for one
+            item or ``(n_persons, n_items)`` for all items. For a GRM,
+            category probabilities with a final ``n_categories`` axis.
         """
-        theta = np.atleast_1d(theta)
+        theta_values = np.asarray(theta, dtype=np.float64)
+        if theta_values.ndim == 0:
+            theta_values = theta_values.reshape(1)
+        if theta_values.ndim != 1:
+            raise ValueError("theta must be a scalar or one-dimensional array")
+        if not np.all(np.isfinite(theta_values)):
+            raise ValueError("theta must contain only finite values")
 
         if item_idx is not None:
+            if (
+                isinstance(item_idx, bool)
+                or not isinstance(item_idx, (int, np.integer))
+                or not 0 <= item_idx < self.n_items
+            ):
+                raise ValueError(f"item_idx must be between 0 and {self.n_items - 1}")
+            item_idx = int(item_idx)
             a = self.discrimination[item_idx]
-            b = self.difficulty[item_idx]
-            z = a * (theta - b)
-            return sigmoid(z)
+            if self.base_model == "2PL":
+                b = self.difficulty[item_idx]
+                return np.asarray(sigmoid(a * (theta_values - b)))
 
-        probs = np.zeros((len(theta), self.n_items))
-        for j in range(self.n_items):
-            probs[:, j] = self.probability(theta, j)
-        return probs
+            cumulative = np.asarray(
+                sigmoid(a * (theta_values[:, None] - self.thresholds[item_idx])),
+                dtype=np.float64,
+            )
+            return self._graded_category_probabilities(cumulative)
+
+        if self.base_model == "2PL":
+            logits = self.discrimination[None, :] * (
+                theta_values[:, None] - self.difficulty[None, :]
+            )
+            return np.asarray(sigmoid(logits))
+
+        cumulative = np.asarray(
+            sigmoid(
+                self.discrimination[None, :, None]
+                * (theta_values[:, None, None] - self.thresholds[None, :, :])
+            ),
+            dtype=np.float64,
+        )
+        return self._graded_category_probabilities(cumulative)
+
+    @staticmethod
+    def _graded_category_probabilities(
+        cumulative: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Convert GRM cumulative curves into adjacent category probabilities."""
+        boundaries = np.concatenate(
+            (
+                np.ones((*cumulative.shape[:-1], 1)),
+                cumulative,
+                np.zeros((*cumulative.shape[:-1], 1)),
+            ),
+            axis=-1,
+        )
+        return boundaries[..., :-1] - boundaries[..., 1:]
 
     def simulate(
         self,
@@ -976,6 +1168,13 @@ class LongitudinalIRTModel:
             - theta_trajectories: (n_persons, n_timepoints)
             - growth_factors: (n_persons, n_growth_factors)
         """
+        if (
+            isinstance(n_persons, bool)
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        n_persons = int(n_persons)
         rng = np.random.default_rng(seed)
 
         growth_factors = rng.multivariate_normal(
@@ -988,13 +1187,37 @@ class LongitudinalIRTModel:
 
         theta = self.compute_theta(growth_factors, time_values, residuals)
 
-        responses = np.zeros(
-            (n_persons, self.n_timepoints, self.n_items), dtype=np.int32
+        flat_theta = theta.reshape(-1)
+        flat_responses = np.empty((flat_theta.size, self.n_items), dtype=np.int32)
+        category_factor = int(self.n_categories) if self.base_model == "GRM" else 1
+        probability_values_per_row = self.n_items * category_factor
+        rows_per_chunk = max(
+            1,
+            _LONGITUDINAL_MAX_PROBABILITY_VALUES // probability_values_per_row,
         )
-        for i in range(n_persons):
-            for t in range(self.n_timepoints):
-                probs = self.probability(theta[i, t])
-                responses[i, t] = (rng.random(self.n_items) < probs).astype(np.int32)
+
+        for start in range(0, flat_theta.size, rows_per_chunk):
+            stop = min(start + rows_per_chunk, flat_theta.size)
+            probabilities = self.probability(flat_theta[start:stop])
+            if self.base_model == "2PL":
+                flat_responses[start:stop] = (
+                    rng.random(probabilities.shape) < probabilities
+                )
+            else:
+                category_probabilities = probabilities.reshape(
+                    -1,
+                    int(self.n_categories),
+                )
+                flat_responses[start:stop] = sample_categorical_rows(
+                    category_probabilities,
+                    rng,
+                ).reshape(stop - start, self.n_items)
+
+        responses = flat_responses.reshape(
+            n_persons,
+            self.n_timepoints,
+            self.n_items,
+        )
 
         return responses, theta, growth_factors
 
@@ -1011,6 +1234,8 @@ class LongitudinalIRTModel:
         lines.append(f"Growth Model:       {self.growth_model}")
         lines.append(f"Number of Items:    {self.n_items}")
         lines.append(f"Number of Times:    {self.n_timepoints}")
+        if self.base_model == "GRM":
+            lines.append(f"Response Categories: {self.n_categories}")
         lines.append(f"Residual Variance:  {self.residual_variance:.4f}")
         lines.append("-" * width)
 
