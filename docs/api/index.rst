@@ -102,6 +102,8 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   diagnostics.compute_itemfit
+   diagnostics.compute_s_x2
    diagnostics.compute_ld_statistics
    diagnostics.compute_ld_chi2
    diagnostics.flag_ld_pairs

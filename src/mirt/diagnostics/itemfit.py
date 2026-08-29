@@ -6,6 +6,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
+from mirt.diagnostics.multiple_testing import (
+    PValueAdjustment,
+    _validate_p_value_adjustment,
+    adjust_p_values,
+)
 from mirt.utils.numeric import compute_expected_variance, compute_fit_stats
 
 if TYPE_CHECKING:
@@ -21,12 +26,16 @@ def compute_itemfit(
     statistics: list[str] | None = None,
     theta: NDArray[np.float64] | None = None,
     n_groups: int = 10,
+    p_adjust: PValueAdjustment = "none",
 ) -> dict[str, NDArray[np.float64]]:
     """Compute requested item-fit statistics.
 
     S-X2 results include the statistic, degrees of freedom, and p-value under
-    the keys ``"S_X2"``, ``"df"``, and ``"p_value"``.
+    the keys ``"S_X2"``, ``"df"``, and ``"p_value"``. When ``p_adjust`` is
+    not ``"none"``, ``"p_value_adjusted"`` contains multiplicity-adjusted
+    p-values across items.
     """
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     if statistics is None:
         statistics = ["infit", "outfit"]
 
@@ -59,16 +68,25 @@ def compute_itemfit(
             result["infit"] = infit
 
     if "S_X2" in statistics:
-        result.update(
-            _compute_s_x2_from_expected(
-                model,
-                responses,
-                expected,
-                n_groups=n_groups,
-            )
+        s_x2_result = _compute_s_x2_from_expected(
+            model,
+            responses,
+            expected,
+            n_groups=n_groups,
         )
+        _include_adjusted_p_values(s_x2_result, p_adjust)
+        result.update(s_x2_result)
 
     return result
+
+
+def _include_adjusted_p_values(
+    result: dict[str, NDArray[np.float64]],
+    p_adjust: PValueAdjustment,
+) -> None:
+    """Add adjusted S-X2 p-values only when explicitly requested."""
+    if p_adjust != "none":
+        result["p_value_adjusted"] = adjust_p_values(result["p_value"], p_adjust)
 
 
 def _validate_n_groups(n_groups: int) -> int:
@@ -216,8 +234,16 @@ def compute_s_x2(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_groups: int = 10,
+    p_adjust: PValueAdjustment = "none",
 ) -> dict[str, NDArray[np.float64]]:
-    """Compute grouped Orlando-Thissen S-X2 item-fit statistics."""
+    """Compute grouped Orlando-Thissen S-X2 item-fit statistics.
+
+    Set ``p_adjust`` to ``"bonferroni"``, ``"holm"``, or ``"fdr_bh"`` to
+    include multiplicity-adjusted p-values across items under the
+    ``"p_value_adjusted"`` key. The default preserves the original result
+    shape.
+    """
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     n_groups = _validate_n_groups(n_groups)
     responses = np.asarray(responses)
     _, n_items = responses.shape
@@ -233,9 +259,11 @@ def compute_s_x2(
         theta_array = theta_array.reshape(-1, 1)
 
     expected, _ = compute_expected_variance(model, theta_array, n_items)
-    return _compute_s_x2_from_expected(
+    result = _compute_s_x2_from_expected(
         model,
         responses,
         expected,
         n_groups=n_groups,
     )
+    _include_adjusted_p_values(result, p_adjust)
+    return result
