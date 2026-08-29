@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from scipy import stats
 
 if TYPE_CHECKING:
     from mirt.multigroup.model import MultigroupModel
@@ -282,6 +281,8 @@ def invariance_lrt(
     ValueError
         If the models are not nested (constrained should have higher -2LL).
     """
+    from scipy import stats
+
     ll_free = float(free.log_likelihood)
     ll_constrained = float(constrained.log_likelihood)
     if not np.isfinite(ll_free) or not np.isfinite(ll_constrained):
