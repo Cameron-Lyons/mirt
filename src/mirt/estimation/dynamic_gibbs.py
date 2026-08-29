@@ -974,20 +974,20 @@ class LongitudinalGibbsSampler:
 
         precision_prior = np.linalg.inv(model.growth_cov)
         precision_lik = X.T @ X / model.residual_variance
+        precision_post = precision_prior + precision_lik
+        cov_post = np.linalg.inv(precision_post)
 
-        growth_factors = np.zeros((n_persons, n_growth))
+        mean_lik = theta_trajectories @ X / model.residual_variance
+        mean_prior = precision_prior @ model.growth_mean
+        mean_post = (mean_lik + mean_prior) @ cov_post.T
 
-        for i in range(n_persons):
-            precision_post = precision_prior + precision_lik
-            cov_post = np.linalg.inv(precision_post)
-
-            mean_lik = X.T @ theta_trajectories[i] / model.residual_variance
-            mean_prior = precision_prior @ model.growth_mean
-            mean_post = cov_post @ (mean_prior + mean_lik)
-
-            growth_factors[i] = rng.multivariate_normal(mean_post, cov_post)
-
-        return growth_factors
+        centered_draws = rng.multivariate_normal(
+            np.zeros(n_growth),
+            cov_post,
+            size=n_persons,
+        )
+        centered_draws += mean_post
+        return np.asarray(centered_draws, dtype=np.float64)
 
     def _sample_item_params(
         self,
