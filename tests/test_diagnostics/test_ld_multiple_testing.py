@@ -35,14 +35,17 @@ def test_compute_ld_statistics_stores_raw_and_adjusted_pair_probabilities(monkey
     q3 = np.zeros((3, 3))
     monkeypatch.setattr(
         ld_module,
-        "_compute_residuals",
-        lambda model, responses, theta: np.zeros_like(responses, dtype=np.float64),
+        "_compute_residuals_and_positive_probabilities",
+        lambda model, responses, theta: (
+            np.zeros_like(responses, dtype=np.float64),
+            np.full_like(responses, 0.5, dtype=np.float64),
+        ),
     )
     monkeypatch.setattr(ld_module, "_compute_q3", lambda residuals, responses: q3)
     monkeypatch.setattr(
         ld_module,
         "_compute_ld_chi2_g2",
-        lambda model, responses, theta, n_quadpts: (chi2, chi2.copy()),
+        lambda model, responses, theta, n_quadpts, **kwargs: (chi2, chi2.copy()),
     )
 
     result = compute_ld_statistics(
