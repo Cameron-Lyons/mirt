@@ -7,7 +7,7 @@ from numpy.testing import assert_allclose
 from mirt import fscores
 from mirt.models import GradedResponseModel, TwoParameterLogistic
 from mirt.scoring._common import build_quadrature, validate_scoring_responses
-from mirt.scoring.eap import EAPScorer
+from mirt.scoring.eap import EAPScorer, _eap_response_patterns
 from mirt.utils.numeric import logsumexp_axis1
 
 
@@ -172,7 +172,7 @@ class TestEAPScorerScoring:
             np.array([[-1, 0], [-999, 0]]),
         )
 
-        assert_allclose(received[0], [[-1, 0], [-1, 0]])
+        assert_allclose(received[0], [[-1, 0]])
         assert_allclose(result.theta[0], result.theta[1])
         assert_allclose(result.standard_error[0], result.standard_error[1])
 
@@ -265,7 +265,15 @@ class TestEAPScorerScoring:
         """The default splits work once its estimated temporary size is large."""
         model = TwoParameterLogistic(n_items=3)
         model._is_fitted = True
-        responses = np.resize(np.array([0, 1, 1]), (5, 3))
+        responses = np.array(
+            [
+                [0, 0, 0],
+                [0, 0, 1],
+                [0, 1, 0],
+                [0, 1, 1],
+                [1, 0, 0],
+            ]
+        )
         original = model.log_likelihood_batch
         call_sizes = []
 
@@ -279,6 +287,54 @@ class TestEAPScorerScoring:
         EAPScorer(n_quadpts=9).score(model, responses)
 
         assert call_sizes == [1, 1, 1, 1, 1]
+
+    def test_duplicate_patterns_share_one_likelihood_evaluation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Repeated rows reuse posterior moments and retain respondent order."""
+        model = TwoParameterLogistic(n_items=4)
+        model._is_fitted = True
+        first = np.array([0, 1, 0, 1])
+        second = np.array([1, 0, 1, 0])
+        responses = np.vstack([first, second, first, first, second])
+        original = model.log_likelihood_batch
+        call_sizes = []
+
+        def capture(response_batch, theta):
+            call_sizes.append(len(response_batch))
+            return original(response_batch, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", capture)
+
+        result = EAPScorer(n_quadpts=9).score(model, responses)
+
+        assert sum(call_sizes) == 2
+        assert_allclose(result.theta[[0, 2, 3]], result.theta[0])
+        assert_allclose(result.standard_error[[0, 2, 3]], result.standard_error[0])
+        assert_allclose(result.theta[[1, 4]], result.theta[1])
+
+    def test_near_unique_large_input_skips_full_pattern_sort(self):
+        """Adaptive compression preserves the fast vectorized path."""
+        row_ids = np.arange(2_048, dtype=np.int_)[:, None]
+        bit_positions = np.arange(12, dtype=np.int_)[None, :]
+        responses = (row_ids >> bit_positions) & 1
+
+        patterns, inverse = _eap_response_patterns(responses)
+
+        assert np.shares_memory(patterns, responses)
+        np.testing.assert_array_equal(inverse, np.arange(responses.shape[0]))
+
+    def test_repetition_heavy_large_input_uses_sampled_compression(self):
+        """A bounded sample triggers full compression when reuse is substantial."""
+        row_ids = np.arange(16, dtype=np.int_)[:, None]
+        bit_positions = np.arange(12, dtype=np.int_)[None, :]
+        source_patterns = (row_ids >> bit_positions) & 1
+        responses = source_patterns[np.arange(4_096) % source_patterns.shape[0]]
+
+        patterns, inverse = _eap_response_patterns(responses)
+
+        assert patterns.shape == (16, 12)
+        np.testing.assert_array_equal(patterns[inverse], responses)
 
     def test_fscores_forwards_eap_batch_size(self, monkeypatch):
         """The public scoring entry point exposes respondent batching."""
@@ -325,7 +381,7 @@ class TestEAPScorerScoring:
             difficulty=np.array([-0.5, 0.2, 0.8]),
         )
         model._is_fitted = True
-        responses = np.array([[1, 0, 1], [0, 1, -7], [1, 1, 0]])
+        responses = np.array([[1, 0, 1], [0, 1, -7], [1, 1, 0], [1, 0, 1]])
         prior_mean = np.array([100_000.0, -100_000.0])
         prior_cov = np.array([[1.5, 0.2], [0.2, 0.8]])
         scorer = EAPScorer(
