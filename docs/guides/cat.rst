@@ -130,4 +130,36 @@ limits, required and excluded items, enemy pairs, and a cost budget.
    print(assembly.selected_items)
    print(assembly.summary())
 
+Parallel forms
+~~~~~~~~~~~~~~
+
+Use :func:`~mirt.cat.parallel_assembly.assemble_parallel_forms` to assemble
+multiple forms simultaneously. The default max-min objective balances weighted
+information across forms and assigns each non-anchor item to at most one form.
+Common required items act as shared anchors; item reuse and pairwise overlap can
+be relaxed explicitly when the pool is too small for disjoint forms.
+
+.. code-block:: python
+
+   from mirt.cat import assemble_parallel_forms
+
+   parallel = assemble_parallel_forms(
+       fit.model,
+       n_forms=3,
+       form_size=10,
+       theta=np.linspace(-2.0, 2.0, 21),
+       blueprint=blueprint,
+       required_items={0, 10},
+       max_item_usage=2,
+       max_pairwise_overlap=4,
+   )
+   for form in parallel.forms:
+       print(form.selected_items)
+   print(parallel.overlap_matrix)
+
+``target_information`` accepts a scalar, one common curve, or a
+form-by-ability matrix for form-specific targets. Content, enemy-pair, and cost
+constraints are applied independently to every form, while reuse and overlap
+limits are enforced jointly across the full set.
+
 See ``examples/fit_score_itemfit_cat.py`` for a complete script.
