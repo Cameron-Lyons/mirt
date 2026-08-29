@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mirt.cat.results import CATResult, CATState, MCATResult, MCATState
+from mirt.exceptions import MirtValidationError
 
 
 class TestCATState:
@@ -139,6 +140,88 @@ class TestCATResult:
         assert "theta" in repr_str.lower()
         assert "5" in repr_str
 
+    def test_dict_round_trip(self, sample_result):
+        """Portable dictionaries reconstruct the full administration."""
+        payload = sample_result.to_dict()
+
+        restored = CATResult.from_dict(payload)
+
+        assert restored.to_dict() == payload
+        assert isinstance(restored.responses, np.ndarray)
+        payload["items_administered"][0] = 99
+        assert restored.items_administered[0] == 0
+
+    def test_json_round_trip(self, sample_result):
+        """JSON text and bytes reconstruct the full administration."""
+        text = sample_result.to_json(indent=2)
+
+        restored_from_text = CATResult.from_json(text)
+        restored_from_bytes = CATResult.from_json(text.encode())
+
+        assert restored_from_text.to_dict() == sample_result.to_dict()
+        assert restored_from_bytes.to_dict() == sample_result.to_dict()
+
+    def test_from_dict_rejects_unknown_and_missing_fields(self, sample_result):
+        """Malformed mappings do not silently lose result data."""
+        unknown = sample_result.to_dict()
+        unknown["stopping_reazon"] = unknown["stopping_reason"]
+        with pytest.raises(MirtValidationError, match="unknown fields"):
+            CATResult.from_dict(unknown)
+
+        missing = sample_result.to_dict()
+        del missing["responses"]
+        with pytest.raises(MirtValidationError, match="missing required fields"):
+            CATResult.from_dict(missing)
+
+    def test_from_json_rejects_invalid_values(self):
+        """Invalid JSON inputs use the package validation exception."""
+        with pytest.raises(MirtValidationError, match="valid JSON object"):
+            CATResult.from_json("{not valid")
+        with pytest.raises(MirtValidationError, match="string or bytes"):
+            CATResult.from_json(123)  # type: ignore[arg-type]
+
+    def test_constructor_normalizes_and_copies_arrays(self):
+        """Caller-owned arrays cannot mutate a constructed result."""
+        responses = np.array([1, 0])
+        theta_history = np.array([0.1, 0.2])
+        result = CATResult(
+            theta=np.float64(0.2),
+            standard_error=np.float64(0.4),
+            items_administered=[2, 4],
+            responses=responses,
+            n_items_administered=np.int64(2),
+            stopping_reason="  complete  ",
+            theta_history=theta_history,
+        )
+
+        responses[0] = 0
+        theta_history[0] = 99.0
+        assert result.responses.tolist() == [1, 0]
+        assert result.theta_history == [0.1, 0.2]
+        assert result.stopping_reason == "complete"
+
+    @pytest.mark.parametrize(
+        ("changes", "match"),
+        [
+            ({"responses": np.array([1])}, "one value per administered item"),
+            ({"n_items_administered": 4}, "must match"),
+            ({"standard_error": -0.1}, "cannot be negative"),
+            ({"theta_history": [0.1] * 6}, "cannot be longer"),
+        ],
+    )
+    def test_constructor_rejects_inconsistent_results(
+        self,
+        sample_result,
+        changes,
+        match,
+    ):
+        """Counts, uncertainty, and histories must describe one administration."""
+        values = sample_result.to_dict()
+        values.update(changes)
+
+        with pytest.raises(MirtValidationError, match=match):
+            CATResult.from_dict(values)
+
 
 class TestMCATState:
     """Tests for MCATState dataclass."""
@@ -255,6 +338,63 @@ class TestMCATResult:
 
         assert "MCATResult" in repr_str
         assert "theta" in repr_str.lower()
+
+    def test_dict_round_trip(self, sample_mcat_result):
+        """Portable dictionaries preserve multidimensional histories."""
+        payload = sample_mcat_result.to_dict()
+
+        restored = MCATResult.from_dict(payload)
+
+        assert restored.to_dict() == payload
+        assert all(isinstance(value, np.ndarray) for value in restored.theta_history)
+        payload["covariance"][0][0] = 99.0
+        assert restored.covariance[0, 0] == pytest.approx(0.16)
+
+    def test_json_round_trip(self, sample_mcat_result):
+        """JSON preserves multidimensional estimates and covariance histories."""
+        restored = MCATResult.from_json(sample_mcat_result.to_json(indent=2))
+
+        assert restored.to_dict() == sample_mcat_result.to_dict()
+        np.testing.assert_array_equal(restored.theta, sample_mcat_result.theta)
+        np.testing.assert_array_equal(
+            restored.covariance_history[1],
+            sample_mcat_result.covariance_history[1],
+        )
+
+    def test_from_dict_validates_factor_metadata(self, sample_mcat_result):
+        """Derived dimensional metadata must agree with the arrays."""
+        payload = sample_mcat_result.to_dict()
+        payload["n_factors"] = 3
+
+        with pytest.raises(MirtValidationError, match="n_factors does not match"):
+            MCATResult.from_dict(payload)
+
+    @pytest.mark.parametrize(
+        ("changes", "match"),
+        [
+            ({"theta": []}, "at least one factor"),
+            ({"covariance": [[1.0]]}, "one row and column per factor"),
+            (
+                {"covariance": [[1.0, 0.4], [0.1, 1.0]]},
+                "must be symmetric",
+            ),
+            ({"standard_error": [0.4]}, "one value per factor"),
+            ({"standard_error": [0.4, -0.1]}, "negative values"),
+            ({"theta_history": [[0.1]]}, "final result shape"),
+        ],
+    )
+    def test_constructor_rejects_inconsistent_dimensions(
+        self,
+        sample_mcat_result,
+        changes,
+        match,
+    ):
+        """Every multidimensional array must follow the final factor shape."""
+        values = sample_mcat_result.to_dict()
+        values.update(changes)
+
+        with pytest.raises(MirtValidationError, match=match):
+            MCATResult.from_dict(values)
 
 
 class TestCATResultToDataFrame:

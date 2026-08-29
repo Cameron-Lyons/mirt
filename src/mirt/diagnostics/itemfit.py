@@ -12,6 +12,9 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+_SX2_TARGET_CHUNK_ELEMENTS = 1_000_000
+
+
 def compute_itemfit(
     model: BaseItemModel,
     responses: NDArray[np.int_] | None = None,
@@ -111,41 +114,29 @@ def _compute_s_x2_from_expected(
     else:
         score_scales = np.ones(n_items, dtype=np.float64)
 
-    observed_scaled = responses / score_scales
-    expected_scaled = expected / score_scales
-    s_x2 = np.zeros(n_items, dtype=np.float64)
-    degrees = np.zeros(n_items, dtype=np.int64)
-
-    for item_idx in range(n_items):
-        item_valid = valid_mask[:, item_idx]
-        item_groups = group_indices[item_valid]
-        counts = np.bincount(item_groups, minlength=n_groups)
-        eligible = counts >= 5
-        if not np.any(eligible):
-            continue
-
-        observed_sums = np.bincount(
-            item_groups,
-            weights=observed_scaled[item_valid, item_idx],
-            minlength=n_groups,
-        )
-        expected_sums = np.bincount(
-            item_groups,
-            weights=expected_scaled[item_valid, item_idx],
-            minlength=n_groups,
-        )
-        observed_means = observed_sums[eligible] / counts[eligible]
-        expected_means = np.clip(
-            expected_sums[eligible] / counts[eligible],
-            PROB_CLIP_MIN,
-            PROB_CLIP_MAX,
-        )
-        s_x2[item_idx] = np.sum(
-            counts[eligible]
-            * (observed_means - expected_means) ** 2
-            / (expected_means * (1.0 - expected_means))
-        )
-        degrees[item_idx] = np.count_nonzero(eligible)
+    counts, observed_sums, expected_sums = _grouped_item_sums(
+        responses,
+        expected,
+        valid_mask,
+        group_indices,
+        score_scales,
+        n_groups,
+    )
+    eligible = counts >= 5
+    safe_counts = np.where(eligible, counts, 1.0)
+    observed_means = observed_sums / safe_counts
+    expected_means = np.clip(
+        expected_sums / safe_counts,
+        PROB_CLIP_MIN,
+        PROB_CLIP_MAX,
+    )
+    components = (
+        counts
+        * (observed_means - expected_means) ** 2
+        / (expected_means * (1.0 - expected_means))
+    )
+    s_x2 = np.sum(np.where(eligible, components, 0.0), axis=0)
+    degrees = np.count_nonzero(eligible, axis=0)
 
     df = np.maximum(degrees - 1, 1).astype(np.float64)
     return {
@@ -153,6 +144,71 @@ def _compute_s_x2_from_expected(
         "df": df,
         "p_value": special.chdtrc(df, s_x2),
     }
+
+
+def _grouped_item_sums(
+    responses: NDArray[np.int_],
+    expected: NDArray[np.float64],
+    valid_mask: NDArray[np.bool_],
+    group_indices: NDArray[np.int_],
+    score_scales: NDArray[np.float64],
+    n_groups: int,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Reduce all S-X2 score-group and item combinations in bounded chunks."""
+    n_persons, n_items = responses.shape
+    n_bins = n_groups * n_items
+    counts = np.zeros(n_bins, dtype=np.float64)
+    observed_sums = np.zeros(n_bins, dtype=np.float64)
+    expected_sums = np.zeros(n_bins, dtype=np.float64)
+    item_offsets = np.arange(n_items, dtype=np.intp)
+    rows_per_chunk = max(
+        1,
+        min(
+            n_persons,
+            _SX2_TARGET_CHUNK_ELEMENTS // max(n_items, 1),
+        ),
+    )
+
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        group_item_codes = (
+            group_indices[start:stop, None] * n_items + item_offsets
+        ).ravel()
+        block_valid = valid_mask[start:stop]
+        counts += np.bincount(
+            group_item_codes,
+            weights=block_valid.ravel(),
+            minlength=n_bins,
+        )
+        observed_sums += np.bincount(
+            group_item_codes,
+            weights=np.where(
+                block_valid,
+                responses[start:stop] / score_scales,
+                0.0,
+            ).ravel(),
+            minlength=n_bins,
+        )
+        expected_sums += np.bincount(
+            group_item_codes,
+            weights=np.where(
+                block_valid,
+                expected[start:stop] / score_scales,
+                0.0,
+            ).ravel(),
+            minlength=n_bins,
+        )
+
+    shape = (n_groups, n_items)
+    return (
+        counts.reshape(shape),
+        observed_sums.reshape(shape),
+        expected_sums.reshape(shape),
+    )
 
 
 def compute_s_x2(

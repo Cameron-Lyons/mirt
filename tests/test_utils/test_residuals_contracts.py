@@ -273,9 +273,21 @@ def test_polytomous_residuals_use_score_moments_and_category_likelihoods(
     assert score_result.ld_matrix.shape == (model.n_items, model.n_items)
 
 
-def test_polytomous_ld_matches_generalized_scalar_reference() -> None:
+def test_polytomous_ld_matches_generalized_scalar_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(residuals_module, "_LD_CATEGORY_CHUNK_ELEMENTS", 30)
+
+    def unexpected_pairwise(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("category blocks should handle wider item sets")
+
+    monkeypatch.setattr(
+        residuals_module,
+        "_pairwise_polytomous_ld_x2",
+        unexpected_pairwise,
+    )
     theta = np.linspace(-3.0, 3.0, 109)[:, None]
-    model = GradedResponseModel(5, n_categories=[3, 5, 4, 3, 6])
+    model = GradedResponseModel(8, n_categories=[3, 5, 4, 3, 6, 4, 5, 3])
     responses = _polytomous_responses(model, theta, seed=1007)
     responses[::9, 0] = -1
     responses[::11, 1] = np.nan
@@ -291,6 +303,41 @@ def test_polytomous_ld_matches_generalized_scalar_reference() -> None:
 
     assert_allclose(actual[0], expected[0], rtol=2e-13, atol=2e-13)
     assert_allclose(actual[1], expected[1], rtol=2e-13, atol=2e-13)
+
+
+def test_polytomous_ld_small_high_category_case_matches_scalar_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pairwise_calls = 0
+    original_pairwise = residuals_module._pairwise_polytomous_ld_x2
+
+    def tracked_pairwise(*args: Any, **kwargs: Any) -> Any:
+        nonlocal pairwise_calls
+        pairwise_calls += 1
+        return original_pairwise(*args, **kwargs)
+
+    monkeypatch.setattr(
+        residuals_module,
+        "_pairwise_polytomous_ld_x2",
+        tracked_pairwise,
+    )
+    theta = np.linspace(-2.0, 2.0, 47)[:, None]
+    model = GradedResponseModel(3, n_categories=[8, 7, 6])
+    responses = _polytomous_responses(model, theta, seed=1013)
+    responses[::7, 0] = -1
+    responses[::8, 1] = np.nan
+    probabilities = model.probability(theta)
+
+    actual = LD_X2(model, responses, theta)
+    expected = _scalar_polytomous_ld(
+        responses,
+        probabilities,
+        model.n_categories,
+    )
+
+    assert_allclose(actual[0], expected[0], rtol=2e-13, atol=2e-13)
+    assert_allclose(actual[1], expected[1], rtol=2e-13, atol=2e-13)
+    assert pairwise_calls == 1
 
 
 def test_native_and_vectorized_binary_paths_agree() -> None:

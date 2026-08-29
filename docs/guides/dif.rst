@@ -20,6 +20,29 @@ Methods
 * ``lord`` — Lord's chi-square
 * ``raju`` — Raju area measures
 
+Multiple-testing control
+------------------------
+
+Item-wide DIF analyses can control family-wise error or false discoveries
+without an optional statistics package. The raw and adjusted p-values are both
+returned, and ETS classifications use the adjusted values.
+
+.. code-block:: python
+
+   result = mirt.dif(
+       data,
+       groups,
+       model="2PL",
+       method="wald",
+       p_adjust="holm",
+   )
+   print(result[["p_value", "p_value_adjusted", "classification"]])
+
+Available methods are ``"none"``, ``"bonferroni"``, ``"holm"``, and
+``"fdr_bh"``. For custom diagnostic arrays, use
+:func:`mirt.diagnostics.adjust_p_values`; its ``axis`` argument adjusts many
+families independently while preserving missing values.
+
 Test-level impact
 -----------------
 

@@ -2,14 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt.exceptions import MirtValidationError
 from mirt.results._common import normal_critical_value
+
+
+def _portable_person_id(value: Any) -> Any:
+    """Convert NumPy scalar identifiers to standard Python scalars."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 @dataclass
@@ -139,8 +147,109 @@ class ScoreResult:
             "n_factors": self.n_factors,
             "theta": self.theta.tolist(),
             "standard_error": self.standard_error.tolist(),
-            "person_ids": None if self.person_ids is None else list(self.person_ids),
+            "person_ids": None
+            if self.person_ids is None
+            else [_portable_person_id(value) for value in self.person_ids],
         }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> Self:
+        """Reconstruct scores from :meth:`to_dict` output.
+
+        Derived shape metadata is optional, but when supplied it must agree
+        with the reconstructed arrays. Unknown fields are rejected so that
+        misspelled input does not silently disappear.
+        """
+        if not isinstance(payload, Mapping):
+            raise MirtValidationError(
+                "score payload must be a mapping",
+                parameter="payload",
+                value=type(payload).__name__,
+                expected="mapping",
+            )
+
+        allowed = {
+            "method",
+            "n_persons",
+            "n_factors",
+            "theta",
+            "standard_error",
+            "person_ids",
+        }
+        unknown = set(payload) - allowed
+        if unknown:
+            names = ", ".join(sorted(str(name) for name in unknown))
+            raise MirtValidationError(
+                f"score payload contains unknown fields: {names}",
+                parameter="payload",
+                value=names,
+                expected="fields produced by ScoreResult.to_dict()",
+            )
+
+        required = {"method", "theta", "standard_error"}
+        missing = required - set(payload)
+        if missing:
+            names = ", ".join(sorted(missing))
+            raise MirtValidationError(
+                f"score payload is missing required fields: {names}",
+                parameter="payload",
+                value=names,
+                expected="method, theta, and standard_error",
+            )
+
+        result = cls(
+            theta=payload["theta"],
+            standard_error=payload["standard_error"],
+            method=payload["method"],
+            person_ids=payload.get("person_ids"),
+        )
+        for name, actual in (
+            ("n_persons", result.n_persons),
+            ("n_factors", result.n_factors),
+        ):
+            if name not in payload:
+                continue
+            value = payload[name]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, np.integer))
+                or int(value) != actual
+            ):
+                raise MirtValidationError(
+                    f"{name} does not match the reconstructed score shape",
+                    parameter=name,
+                    value=value,
+                    expected=str(actual),
+                )
+        return result
+
+    def to_json(self, *, indent: int | None = None) -> str:
+        """Serialize scores to JSON without a dataframe dependency."""
+        import json
+
+        return json.dumps(self.to_dict(), indent=indent)
+
+    @classmethod
+    def from_json(cls, value: str | bytes | bytearray) -> Self:
+        """Reconstruct scores from :meth:`to_json` output."""
+        import json
+
+        if not isinstance(value, (str, bytes, bytearray)):
+            raise MirtValidationError(
+                "score JSON must be a string or bytes",
+                parameter="value",
+                value=type(value).__name__,
+                expected="str, bytes, or bytearray",
+            )
+        try:
+            payload = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise MirtValidationError(
+                "score JSON must contain a valid JSON object",
+                parameter="value",
+                expected="JSON object produced by ScoreResult.to_json()",
+            ) from error
+        return cls.from_dict(payload)
 
     def summary(self) -> str:
         """Format factor-wise score and uncertainty summaries."""
