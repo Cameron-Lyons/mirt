@@ -346,6 +346,31 @@ class TestGibbsSampler:
 class TestMCMCResult:
     """Tests for MCMCResult class."""
 
+    @staticmethod
+    def _synthetic_result() -> MCMCResult:
+        """Build a deterministic result for posterior-statistic tests."""
+        model = TwoParameterLogistic(n_items=2)
+        chains = {
+            "discrimination": np.array(
+                [[0.8, 1.2], [1.0, 1.4], [1.2, 1.6], [1.4, 1.8]]
+            ),
+            "difficulty": np.array([[-1.0, 0.0], [-0.5, 0.5], [0.0, 1.0], [0.5, 1.5]]),
+            "theta": np.arange(24, dtype=float).reshape(4, 3, 2),
+            "log_likelihood": np.array([-12.0, -11.0, -10.0, -9.0]),
+        }
+        return MCMCResult(
+            model=model,
+            chains=chains,
+            log_likelihood=-10.5,
+            dic=25.0,
+            waic=24.0,
+            rhat={"discrimination": 1.01, "difficulty": 1.02},
+            ess={"discrimination": 75.0, "difficulty": 64.5},
+            n_iterations=100,
+            burnin=20,
+            thin=2,
+        )
+
     def test_summary(self, dichotomous_responses):
         """Test posterior summary."""
         model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
@@ -382,6 +407,89 @@ class TestMCMCResult:
         summary = result.summary()
 
         assert "Log-likelihood" in summary or "LL" in summary
+
+    def test_summary_contains_effective_sample_sizes(self):
+        """Test that text summaries expose both convergence diagnostics."""
+        summary = self._synthetic_result().summary()
+
+        assert "Effective sample size:" in summary
+        assert "discrimination: 75.0" in summary
+        assert "difficulty: 64.5" in summary
+
+    def test_posterior_summary_preserves_parameter_shapes(self):
+        """Posterior summaries reduce only the leading draw dimension."""
+        result = self._synthetic_result()
+
+        summary = result.posterior_summary(
+            credible_level=0.8,
+            parameters=["discrimination", "theta"],
+        )
+
+        assert set(summary) == {"discrimination", "theta"}
+        for name in summary:
+            chain = result.chains[name]
+            expected = np.quantile(chain, [0.1, 0.5, 0.9], axis=0)
+            np.testing.assert_allclose(summary[name]["mean"], np.mean(chain, axis=0))
+            np.testing.assert_allclose(summary[name]["std"], np.std(chain, axis=0))
+            np.testing.assert_allclose(summary[name]["ci_lower"], expected[0])
+            np.testing.assert_allclose(summary[name]["median"], expected[1])
+            np.testing.assert_allclose(summary[name]["ci_upper"], expected[2])
+        assert np.shape(summary["theta"]["mean"]) == (3, 2)
+
+    def test_posterior_summary_defaults_to_every_stored_chain(self):
+        """The default summary includes scalar and multidimensional chains."""
+        result = self._synthetic_result()
+
+        summary = result.posterior_summary()
+
+        assert set(summary) == set(result.chains)
+        assert summary["log_likelihood"]["mean"] == pytest.approx(-10.5)
+        assert np.shape(summary["log_likelihood"]["ci_lower"]) == ()
+
+    def test_credible_intervals_accept_single_chain_name(self):
+        """A single chain can be selected without wrapping its name."""
+        result = self._synthetic_result()
+
+        intervals = result.credible_intervals(
+            credible_level=0.5,
+            parameters="difficulty",
+        )
+
+        assert set(intervals) == {"difficulty"}
+        expected = np.quantile(result.chains["difficulty"], [0.25, 0.75], axis=0)
+        np.testing.assert_allclose(intervals["difficulty"][0], expected[0])
+        np.testing.assert_allclose(intervals["difficulty"][1], expected[1])
+
+    @pytest.mark.parametrize(
+        "credible_level",
+        [0.0, 1.0, -0.1, np.nan, np.inf, True, "0.95"],
+    )
+    def test_posterior_summary_rejects_invalid_credible_levels(self, credible_level):
+        """Credible levels must be finite probabilities inside the unit interval."""
+        result = self._synthetic_result()
+
+        with pytest.raises(ValueError, match="credible_level"):
+            result.posterior_summary(credible_level=credible_level)
+
+    def test_posterior_summary_rejects_unknown_or_invalid_chains(self):
+        """Selection errors and malformed draws fail with clear messages."""
+        result = self._synthetic_result()
+        with pytest.raises(ValueError, match="unknown posterior chain: guessing"):
+            result.posterior_summary(parameters="guessing")
+        with pytest.raises(ValueError, match="parameters must be a chain name"):
+            result.posterior_summary(parameters=42)
+
+        result.chains["difficulty"] = np.full((4, 2), np.nan)
+        with pytest.raises(ValueError, match="must contain only finite values"):
+            result.posterior_summary(parameters="difficulty")
+
+    def test_posterior_summary_rejects_misaligned_draw_counts(self):
+        """Joint summaries require chains based on the same posterior draws."""
+        result = self._synthetic_result()
+        result.chains["difficulty"] = result.chains["difficulty"][:-1]
+
+        with pytest.raises(ValueError, match="equal draw counts"):
+            result.posterior_summary(parameters=["discrimination", "difficulty"])
 
     def test_convergence_diagnostics(self, dichotomous_responses):
         """Test convergence diagnostics."""

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import mirt.diagnostics.residuals as residuals_module
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.residuals import (
     ResidualAnalysisResult,
@@ -280,6 +281,16 @@ class TestAnalyzeResiduals:
             )
             assert_allclose(getattr(result, attribute), expected, equal_nan=True)
 
+    def test_all_missing_items_have_warning_free_empty_summaries(self):
+        model = FixedProbabilityModel([np.array([0.2, 0.8]), np.array([0.7, 0.3])])
+
+        result = analyze_residuals(model, np.full((2, 2), -1), np.zeros(2))
+
+        for statistics in result.item_residuals.values():
+            assert np.isnan(statistics["mean"])
+            assert np.isnan(statistics["sd"])
+            assert statistics["max_abs_z"] == 0.0
+
 
 class TestComputeOutfitInfit:
     """Tests for compute_outfit_infit function."""
@@ -363,6 +374,131 @@ class TestComputeOutfitInfit:
             np.nansum(z_sq * variance, axis=1)
             / (np.nansum(variance, axis=1) + PROB_EPSILON),
         )
+
+    def test_reports_valid_observation_counts_on_request(self):
+        probabilities = [
+            np.array([0.2, 0.4, 0.6, 0.8]),
+            np.array([0.7, 0.5, 0.3, 0.1]),
+        ]
+        responses = np.array([[0, 1], [0, -1], [1, 0], [1, 0]])
+
+        result = compute_outfit_infit(
+            FixedProbabilityModel(probabilities),
+            responses,
+            np.zeros(4),
+            include_counts=True,
+        )
+
+        np.testing.assert_array_equal(result["item_n"], [4, 3])
+        np.testing.assert_array_equal(result["person_n"], [2, 1, 2, 2])
+
+    def test_default_result_retains_four_statistic_keys(self):
+        model = FixedProbabilityModel([np.array([0.2, 0.8])])
+
+        result = compute_outfit_infit(model, np.array([[0], [1]]), np.zeros(2))
+
+        assert set(result) == {
+            "item_outfit",
+            "item_infit",
+            "person_outfit",
+            "person_infit",
+        }
+
+    def test_all_missing_summaries_are_nan_without_warnings(self):
+        probabilities = [np.array([0.2, 0.8]), np.array([0.7, 0.3])]
+        responses = np.full((2, 2), -1)
+
+        result = compute_outfit_infit(
+            FixedProbabilityModel(probabilities),
+            responses,
+            np.zeros(2),
+            include_counts=True,
+        )
+
+        np.testing.assert_array_equal(result["item_n"], [0, 0])
+        np.testing.assert_array_equal(result["person_n"], [0, 0])
+        for name in ("item_outfit", "item_infit", "person_outfit", "person_infit"):
+            assert np.all(np.isnan(result[name]))
+
+    def test_summary_path_does_not_materialize_residual_matrices(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        def fail_if_called(*args, **kwargs):
+            raise AssertionError("residual matrix path should not be used")
+
+        monkeypatch.setattr(
+            residuals_module,
+            "_compute_residual_arrays",
+            fail_if_called,
+        )
+        model = FixedProbabilityModel([np.array([0.2, 0.8]), np.array([0.7, 0.3])])
+
+        result = compute_outfit_infit(
+            model,
+            np.array([[0, 1], [1, 0]]),
+            np.zeros(2),
+        )
+
+        assert model.probability_calls == 2
+        assert np.all(np.isfinite(result["item_outfit"]))
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"include_counts": "yes"}, "include_counts must be boolean"),
+            ({"responses": np.array([0, 1])}, "two-dimensional matrix"),
+        ],
+    )
+    def test_validates_summary_options(self, kwargs, message):
+        model = FixedProbabilityModel([np.array([0.2, 0.8])])
+        responses = kwargs.pop("responses", np.array([[0], [1]]))
+
+        with pytest.raises(ValueError, match=message):
+            compute_outfit_infit(model, responses, np.zeros(2), **kwargs)
+
+
+def test_fit_statistics_chunking_matches_direct_aggregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(20260830)
+    residuals = rng.normal(size=(17, 13))
+    variances = rng.uniform(0.05, 0.25, size=residuals.shape)
+    missing = rng.random(residuals.shape) < 0.2
+    residuals[missing] = np.nan
+    variances[missing] = np.nan
+    residuals[:, -1] = np.nan
+    variances[:, -1] = np.nan
+    monkeypatch.setattr(residuals_module, "_FIT_STATISTICS_CHUNK_ELEMENTS", 34)
+
+    actual = residuals_module._fit_statistics(residuals, variances)
+
+    valid = np.isfinite(residuals)
+    squared = np.where(valid, np.square(residuals), 0.0)
+    weighted = np.where(valid, squared * variances, 0.0)
+    item_n = np.sum(valid, axis=0)
+    person_n = np.sum(valid, axis=1)
+    item_variance = np.sum(variances, axis=0, where=valid, initial=0.0)
+    person_variance = np.sum(variances, axis=1, where=valid, initial=0.0)
+    references = {
+        "item_outfit": np.divide(
+            np.sum(squared, axis=0),
+            item_n,
+            out=np.full(residuals.shape[1], np.nan),
+            where=item_n > 0,
+        ),
+        "item_infit": np.divide(
+            np.sum(weighted, axis=0),
+            item_variance + PROB_EPSILON,
+            out=np.full(residuals.shape[1], np.nan),
+            where=item_n > 0,
+        ),
+        "person_outfit": np.sum(squared, axis=1) / person_n,
+        "person_infit": np.sum(weighted, axis=1) / (person_variance + PROB_EPSILON),
+    }
+    np.testing.assert_array_equal(actual["item_n"], item_n)
+    np.testing.assert_array_equal(actual["person_n"], person_n)
+    for name, expected in references.items():
+        assert_allclose(actual[name], expected, equal_nan=True)
 
 
 class TestIdentifyMisfittingPatterns:

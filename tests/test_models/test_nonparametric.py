@@ -483,6 +483,7 @@ class TestKernelSmoothingModel:
         assert returned is model
         assert model.is_fitted
         np.testing.assert_array_equal(model.calibration_counts, [3, 2])
+        np.testing.assert_array_equal(model.calibration_weight_sums, [3.0, 2.0])
 
     def test_probability_shape_bounds_and_item_consistency(self):
         model = self._fitted_model()
@@ -524,6 +525,97 @@ class TestKernelSmoothingModel:
         expected = responses.T @ weights / np.sum(weights, axis=0)
         np.testing.assert_allclose(model.irf_values, expected)
 
+    def test_weighted_missing_calibration_matches_gaussian_kernel_reference(self):
+        theta = np.array([-1.5, -0.5, 0.0, 0.75, 1.5])
+        responses = np.array(
+            [
+                [0, 1, -1],
+                [0, -1, 0],
+                [1, 1, 1],
+                [-1, 0, 1],
+                [1, 1, 0],
+            ]
+        )
+        sample_weight = np.array([0.5, 2.0, 0.0, 1.5, 3.0])
+        grid = np.array([-1.0, 0.0, 1.0])
+        bandwidth = 0.7
+        model = KernelSmoothingModel(
+            n_items=3,
+            bandwidth=bandwidth,
+            theta_grid=grid,
+        )
+
+        model.calibrate(responses, theta, sample_weight=sample_weight)
+
+        kernel = np.exp(-0.5 * ((theta[:, None] - grid[None, :]) / bandwidth) ** 2)
+        weighted_kernel = sample_weight[:, None] * kernel
+        observed = responses >= 0
+        response_values = np.where(observed, responses, 0.0)
+        expected = (response_values.T @ weighted_kernel) / (
+            observed.astype(float).T @ weighted_kernel
+        )
+        np.testing.assert_allclose(model.irf_values, expected)
+        np.testing.assert_array_equal(model.calibration_counts, [4, 4, 4])
+        np.testing.assert_array_equal(
+            model.calibration_weight_sums,
+            [5.5, 5.0, 6.5],
+        )
+
+    def test_weighted_calibration_is_scale_invariant(self):
+        theta = np.array([-1.0, -0.25, 0.5, 1.5])
+        responses = np.array([[0, 1], [1, -1], [0, 1], [1, 0]])
+        sample_weight = np.array([0.25, 2.0, 1.5, 4.0])
+
+        first = KernelSmoothingModel(n_items=2).calibrate(
+            responses,
+            theta,
+            sample_weight=sample_weight,
+        )
+        second = KernelSmoothingModel(n_items=2).calibrate(
+            responses,
+            theta,
+            sample_weight=sample_weight * 1e200,
+        )
+
+        np.testing.assert_allclose(first.irf_values, second.irf_values)
+        np.testing.assert_allclose(
+            second.calibration_weight_sums,
+            first.calibration_weight_sums * 1e200,
+        )
+
+    def test_integer_weights_match_duplicated_persons(self):
+        theta = np.array([-1.0, -0.25, 0.5, 1.5])
+        responses = np.array([[0, 1], [1, -1], [0, 1], [1, 0]])
+        frequency = np.array([1, 3, 2, 4])
+
+        weighted = KernelSmoothingModel(n_items=2).calibrate(
+            responses,
+            theta,
+            sample_weight=frequency,
+        )
+        duplicated = KernelSmoothingModel(n_items=2).calibrate(
+            np.repeat(responses, frequency, axis=0),
+            np.repeat(theta, frequency),
+        )
+
+        np.testing.assert_allclose(weighted.irf_values, duplicated.irf_values)
+        np.testing.assert_array_equal(weighted.calibration_weight_sums, [10.0, 7.0])
+
+    def test_weighted_kernel_combines_distance_and_weight_in_log_space(self):
+        model = KernelSmoothingModel(
+            n_items=1,
+            bandwidth=1.0,
+            theta_grid=np.array([0.0, 10.0, 20.0]),
+        )
+
+        model.calibrate(
+            np.array([[0], [1]]),
+            np.array([0.0, 20.0]),
+            sample_weight=np.array([1e-300, 1.0]),
+        )
+
+        np.testing.assert_allclose(model.irf_values, 1.0, atol=1e-12)
+
     def test_probability_clamps_outside_grid(self):
         model = self._fitted_model()
 
@@ -555,6 +647,20 @@ class TestKernelSmoothingModel:
 
         np.testing.assert_allclose(model.irf_values[0], [0.0, 0.5, 1.0], atol=1e-300)
 
+    def test_item_fallback_remains_stable_with_extreme_missing_patterns(self):
+        model = KernelSmoothingModel(
+            n_items=2,
+            bandwidth=1e-300,
+            theta_grid=np.array([-1e308, 0.0, 1e308]),
+        )
+        responses = np.array([[0, -1], [-1, 1]])
+
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
+            model.calibrate(responses, np.array([-1e308, 1e308]))
+
+        np.testing.assert_array_equal(model.irf_values[0], 0.0)
+        np.testing.assert_array_equal(model.irf_values[1], 1.0)
+
     def test_single_observation_per_item_produces_constant_curves(self):
         model = KernelSmoothingModel(n_items=2, bandwidth=0.25)
         responses = np.array([[1, 0]])
@@ -578,12 +684,17 @@ class TestKernelSmoothingModel:
         model = self._fitted_model()
         before_irf = model.irf_values
         before_counts = model.calibration_counts
+        before_weight_sums = model.calibration_weight_sums
 
         with pytest.raises(ValueError):
             model.calibrate(np.array([[0, 2]]), np.array([0.0]))
 
         np.testing.assert_array_equal(model.irf_values, before_irf)
         np.testing.assert_array_equal(model.calibration_counts, before_counts)
+        np.testing.assert_array_equal(
+            model.calibration_weight_sums,
+            before_weight_sums,
+        )
         assert model.is_fitted
 
     def test_information_is_finite_nonnegative_and_item_consistent(self):
@@ -639,10 +750,16 @@ class TestKernelSmoothingModel:
         model = self._fitted_model()
 
         copied = model.copy()
+        np.testing.assert_array_equal(
+            copied.calibration_weight_sums,
+            model.calibration_weight_sums,
+        )
         copied.calibrate(np.ones((2, 2), dtype=int), np.array([-1.0, 1.0]))
 
         assert copied.bandwidth == model.bandwidth
         np.testing.assert_array_equal(copied.theta_grid, model.theta_grid)
+        np.testing.assert_array_equal(copied.calibration_weight_sums, [2.0, 2.0])
+        np.testing.assert_array_equal(model.calibration_weight_sums, [5.0, 4.0])
         assert copied.is_fitted
         assert not np.array_equal(copied.irf_values, model.irf_values)
         np.testing.assert_allclose(
@@ -655,13 +772,16 @@ class TestKernelSmoothingModel:
         grid = model.theta_grid
         irf = model.irf_values
         counts = model.calibration_counts
+        weight_sums = model.calibration_weight_sums
         grid[:] = 99
         irf[:] = 99
         counts[:] = 99
+        weight_sums[:] = 99
 
         assert np.all(model.theta_grid != 99)
         assert np.all(model.irf_values != 99)
         assert np.all(model.calibration_counts != 99)
+        assert np.all(model.calibration_weight_sums != 99)
 
     @pytest.mark.parametrize("bandwidth", [0.0, -1.0, np.nan, np.inf])
     def test_rejects_invalid_bandwidth(self, bandwidth):
@@ -707,6 +827,40 @@ class TestKernelSmoothingModel:
 
         with pytest.raises(ValueError, match=r"\[1\]"):
             model.calibrate(responses, np.array([-1.0, 1.0]))
+
+    @pytest.mark.parametrize(
+        "sample_weight",
+        [
+            np.array([1.0]),
+            np.ones((2, 1)),
+            np.array([1.0, np.nan]),
+            np.array([1.0, np.inf]),
+            np.array([1.0, -0.1]),
+            np.zeros(2),
+            np.full(2, np.finfo(np.float64).max),
+        ],
+    )
+    def test_calibration_rejects_invalid_sample_weights(self, sample_weight):
+        model = KernelSmoothingModel(n_items=2)
+        responses = np.array([[0, 1], [1, 0]])
+
+        with pytest.raises(ValueError, match="sample_weight|positive calibration"):
+            model.calibrate(
+                responses,
+                np.array([-1.0, 1.0]),
+                sample_weight=sample_weight,
+            )
+
+    def test_calibration_requires_positive_weight_for_each_item(self):
+        model = KernelSmoothingModel(n_items=2)
+        responses = np.array([[0, -1], [1, 1]])
+
+        with pytest.raises(ValueError, match=r"positive calibration weight: \[1\]"):
+            model.calibrate(
+                responses,
+                np.array([-1.0, 1.0]),
+                sample_weight=np.array([1.0, 0.0]),
+            )
 
     @pytest.mark.parametrize("item_idx", [-1, 2, 1.5, True])
     def test_rejects_invalid_item_index(self, item_idx):

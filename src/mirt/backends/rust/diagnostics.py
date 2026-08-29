@@ -36,14 +36,13 @@ def _prepare_binary_diagnostic_inputs(
     response_values = np.asarray(responses)
     if response_values.dtype.kind not in "biuf":
         raise ValueError("responses must contain numeric values")
-    response_float = np.asarray(response_values, dtype=np.float64)
     theta_values = np.asarray(theta, dtype=np.float64)
     discrimination_values = np.asarray(discrimination, dtype=np.float64)
     difficulty_values = np.asarray(difficulty, dtype=np.float64)
 
-    if response_float.ndim != 2 or not all(response_float.shape):
+    if response_values.ndim != 2 or not all(response_values.shape):
         raise ValueError("responses must be a non-empty two-dimensional matrix")
-    n_persons, n_items = response_float.shape
+    n_persons, n_items = response_values.shape
     if theta_values.shape == (n_persons, 1):
         theta_values = theta_values[:, 0]
     if theta_values.shape != (n_persons,):
@@ -53,10 +52,10 @@ def _prepare_binary_diagnostic_inputs(
     if difficulty_values.shape != (n_items,):
         raise ValueError(f"difficulty must have shape ({n_items},)")
 
-    if np.any(np.isinf(response_float)):
+    if np.any(np.isinf(response_values)):
         raise ValueError("responses must contain finite values or NaN for missing")
-    observed = np.isfinite(response_float) & (response_float >= 0.0)
-    if np.any(observed & (response_float != 0.0) & (response_float != 1.0)):
+    observed = np.isfinite(response_values) & (response_values >= 0.0)
+    if np.any(observed & (response_values != 0.0) & (response_values != 1.0)):
         raise ValueError("observed responses must contain only 0 or 1")
     if not np.all(np.isfinite(theta_values)):
         raise ValueError("theta must contain only finite values")
@@ -65,8 +64,13 @@ def _prepare_binary_diagnostic_inputs(
     if not np.all(np.isfinite(difficulty_values)):
         raise ValueError("difficulty must contain only finite values")
 
-    normalized_responses = np.where(observed, response_float, -1.0)
-    responses_i32 = _ensure_i32(normalized_responses)
+    responses_i32 = np.full(response_values.shape, -1, dtype=np.int32)
+    np.copyto(
+        responses_i32,
+        response_values,
+        where=observed,
+        casting="unsafe",
+    )
     theta_f64 = _ensure_f64(theta_values)
     discrimination_f64 = _ensure_f64(discrimination_values)
     difficulty_f64 = _ensure_f64(difficulty_values)
@@ -774,31 +778,87 @@ def compute_fit_statistics(
             difficulty,
         )
 
-    probabilities = np.asarray(
-        sigmoid(discrimination[None, :] * (theta[:, None] - difficulty[None, :])),
-        dtype=np.float64,
-    )
-    np.clip(
-        probabilities,
-        PROB_EPSILON,
-        1.0 - PROB_EPSILON,
-        out=probabilities,
-    )
-    valid = responses >= 0
-    variance_values = probabilities * (1.0 - probabilities)
-    raw_residuals = responses - probabilities
-    z_sq = np.where(
-        valid,
-        raw_residuals**2 / (variance_values + PROB_EPSILON),
-        np.nan,
-    )
-    variance = np.where(valid, variance_values, np.nan)
+    n_persons, n_items = responses.shape
+    item_square_sum = np.zeros(n_items)
+    item_weighted_sum = np.zeros(n_items)
+    item_variance_sum = np.zeros(n_items)
+    item_n = np.zeros(n_items, dtype=np.intp)
+    person_square_sum = np.zeros(n_persons)
+    person_weighted_sum = np.zeros(n_persons)
+    person_variance_sum = np.zeros(n_persons)
+    person_n = np.zeros(n_persons, dtype=np.intp)
+    chunk_size = _entry_chunk_size(n_persons, n_items)
 
-    item_outfit = np.nanmean(z_sq, axis=0)
-    item_infit = np.nansum(z_sq * variance, axis=0) / np.nansum(variance, axis=0)
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        response_chunk = responses[start:stop]
+        probabilities = np.asarray(
+            sigmoid(
+                discrimination[None, :]
+                * (theta[start:stop, None] - difficulty[None, :])
+            ),
+            dtype=np.float64,
+        )
+        np.clip(
+            probabilities,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+            out=probabilities,
+        )
+        valid = response_chunk >= 0
+        variance = probabilities * (1.0 - probabilities)
+        np.subtract(response_chunk, probabilities, out=probabilities)
+        np.square(probabilities, out=probabilities)
+        denominator = variance + PROB_EPSILON
+        np.divide(probabilities, denominator, out=probabilities)
+        del denominator
+        probabilities *= valid
 
-    person_outfit = np.nanmean(z_sq, axis=1)
-    person_infit = np.nansum(z_sq * variance, axis=1) / np.nansum(variance, axis=1)
+        item_square_sum += np.sum(probabilities, axis=0)
+        item_n += np.sum(valid, axis=0, dtype=np.intp)
+        person_square_sum[start:stop] = np.sum(probabilities, axis=1)
+        person_n[start:stop] = np.sum(valid, axis=1, dtype=np.intp)
+        item_variance_sum += np.sum(
+            variance,
+            axis=0,
+            where=valid,
+            initial=0.0,
+        )
+        person_variance_sum[start:stop] = np.sum(
+            variance,
+            axis=1,
+            where=valid,
+            initial=0.0,
+        )
+
+        np.multiply(probabilities, variance, out=probabilities)
+        item_weighted_sum += np.sum(probabilities, axis=0)
+        person_weighted_sum[start:stop] = np.sum(probabilities, axis=1)
+
+    item_outfit = np.divide(
+        item_square_sum,
+        item_n,
+        out=np.full(n_items, np.nan),
+        where=item_n > 0,
+    )
+    item_infit = np.divide(
+        item_weighted_sum,
+        item_variance_sum,
+        out=np.full(n_items, np.nan),
+        where=item_n > 0,
+    )
+    person_outfit = np.divide(
+        person_square_sum,
+        person_n,
+        out=np.full(n_persons, np.nan),
+        where=person_n > 0,
+    )
+    person_infit = np.divide(
+        person_weighted_sum,
+        person_variance_sum,
+        out=np.full(n_persons, np.nan),
+        where=person_n > 0,
+    )
 
     return item_outfit, item_infit, person_outfit, person_infit
 

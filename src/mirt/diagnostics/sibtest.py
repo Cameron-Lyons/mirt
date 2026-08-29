@@ -14,9 +14,13 @@ from scipy import stats
 
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import split_groups
+from mirt.diagnostics.multiple_testing import (
+    PValueAdjustment,
+    _validate_p_value_adjustment,
+    adjust_p_values,
+)
 
 SIBTESTMethod: TypeAlias = Literal["original", "crossing"]
-PValueAdjustment: TypeAlias = Literal["bonferroni", "holm", "fdr_bh", "none"]
 SIBTESTResult: TypeAlias = dict[
     str, NDArray[np.float64] | NDArray[np.bool_] | float | int | str
 ]
@@ -311,34 +315,8 @@ def _effect_size(
 def _adjust_p_values(
     p_values: NDArray[np.float64], method: PValueAdjustment
 ) -> NDArray[np.float64]:
-    """Adjust a family of p-values without an additional dependency."""
-    adjusted = np.full_like(p_values, np.nan)
-    finite = np.flatnonzero(np.isfinite(p_values))
-    if finite.size == 0:
-        return adjusted
-
-    values = p_values[finite]
-    family_size = finite.size
-    if method == "none":
-        corrected = values
-    elif method == "bonferroni":
-        corrected = values * family_size
-    else:
-        order = np.argsort(values)
-        ordered = values[order]
-        if method == "holm":
-            ordered_adjusted = np.maximum.accumulate(
-                ordered * (family_size - np.arange(ordered.size))
-            )
-        else:
-            ranks = np.arange(1, ordered.size + 1)
-            ordered_adjusted = np.minimum.accumulate(
-                (ordered * family_size / ranks)[::-1]
-            )[::-1]
-        corrected = np.empty_like(values)
-        corrected[order] = ordered_adjusted
-    adjusted[finite] = np.clip(corrected, 0.0, 1.0)
-    return adjusted
+    """Compatibility wrapper for the shared adjustment utility."""
+    return adjust_p_values(p_values, method)
 
 
 def sibtest_items(
@@ -394,13 +372,7 @@ def sibtest_items(
         raise ValueError("alpha must be finite and between 0 and 1") from exc
     if not np.isfinite(alpha) or not 0.0 < alpha < 1.0:
         raise ValueError("alpha must be finite and between 0 and 1")
-    if not isinstance(p_adjust, str) or p_adjust not in {
-        "bonferroni",
-        "holm",
-        "fdr_bh",
-        "none",
-    }:
-        raise ValueError("p_adjust must be 'bonferroni', 'holm', 'fdr_bh', or 'none'")
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
 
     response_data = _validate_response_data(data)
     group_labels = _validate_groups(groups, response_data.shape[0])
@@ -455,7 +427,7 @@ def sibtest_items(
             zs[item_index] = z
             p_values[item_index] = 2.0 * stats.norm.sf(abs(z))
 
-    adjusted = _adjust_p_values(p_values, p_adjust)
+    adjusted = adjust_p_values(p_values, p_adjust)
     flagged = adjusted < alpha
     n_finite_tests = int(np.count_nonzero(np.isfinite(p_values)))
     corrected_alpha = (

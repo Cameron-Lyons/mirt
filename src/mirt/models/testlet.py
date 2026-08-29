@@ -18,6 +18,8 @@ from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
 
+_PAIRWISE_CORRELATION_TARGET_ELEMENTS = 2_000_000
+
 
 def _validate_item_index(n_items: int, item_idx: int) -> int:
     if (
@@ -131,6 +133,57 @@ def _validate_binary_responses(
     codes = np.zeros(values.shape, dtype=np.intp)
     codes[observed] = observed_values.astype(np.intp)
     return codes, observed
+
+
+def _pairwise_complete_correlations(
+    residuals: NDArray[np.float64],
+    observed: NDArray[np.bool_],
+) -> tuple[NDArray[np.float64], NDArray[np.intp]]:
+    """Compute pairwise-complete correlations with bounded row chunks."""
+    residual_values = np.asarray(residuals, dtype=np.float64)
+    observed_values = np.asarray(observed, dtype=np.bool_)
+    if residual_values.ndim != 2 or observed_values.shape != residual_values.shape:
+        raise ValueError(
+            "residuals and observed must have the same two-dimensional shape"
+        )
+
+    n_persons, n_items = residual_values.shape
+    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
+    pair_sums = np.zeros_like(pair_counts)
+    pair_square_sums = np.zeros_like(pair_counts)
+    pair_cross_products = np.zeros_like(pair_counts)
+    chunk_size = max(
+        1,
+        _PAIRWISE_CORRELATION_TARGET_ELEMENTS // max(1, n_items),
+    )
+
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        valid = observed_values[start:stop] & np.isfinite(residual_values[start:stop])
+        valid_float = valid.astype(np.float64)
+        values = np.where(valid, residual_values[start:stop], 0.0)
+        squares = values * values
+        pair_counts += valid_float.T @ valid_float
+        pair_sums += values.T @ valid_float
+        pair_square_sums += squares.T @ valid_float
+        pair_cross_products += values.T @ values
+
+    safe_counts = np.maximum(pair_counts, 1.0)
+    covariance = pair_cross_products - pair_sums * pair_sums.T / safe_counts
+    variance_rows = pair_square_sums - pair_sums * pair_sums / safe_counts
+    np.maximum(variance_rows, 0.0, out=variance_rows)
+    denominator = np.sqrt(variance_rows * variance_rows.T)
+
+    correlations = np.full((n_items, n_items), np.nan, dtype=np.float64)
+    eligible = (pair_counts >= 2.0) & (denominator > 0.0)
+    np.divide(
+        covariance,
+        denominator,
+        out=correlations,
+        where=eligible,
+    )
+    np.clip(correlations, -1.0, 1.0, out=correlations)
+    return correlations, pair_counts.astype(np.intp)
 
 
 class TestletModel(DichotomousItemModel):
@@ -1069,46 +1122,25 @@ class RandomTestletEffectsModel(TestletModel):
         a = self._parameters["discrimination"]
         b = self._parameters["difficulty"]
 
+        expected = sigmoid(theta_values[:, None] * a[None, :] - b[None, :])
+        residuals = np.where(observed, response_codes - expected, np.nan)
         estimated_vars = np.zeros(self._n_testlets)
 
-        for t_idx in self._unique_testlets:
+        for position, t_idx in enumerate(self._unique_testlets):
             items = self.get_testlet_items(t_idx)
             n_items_t = len(items)
 
             if n_items_t < 2:
-                pos = np.where(self._unique_testlets == t_idx)[0][0]
-                estimated_vars[pos] = 0.0
                 continue
 
-            residuals = np.full(
-                (len(theta_values), n_items_t), np.nan, dtype=np.float64
+            correlations, _ = _pairwise_complete_correlations(
+                residuals[:, items],
+                observed[:, items],
             )
-            for i, j in enumerate(items):
-                z = a[j] * theta_values - b[j]
-                expected = sigmoid(z)
-                residuals[observed[:, j], i] = (
-                    response_codes[observed[:, j], j] - expected[observed[:, j]]
-                )
-
-            correlations: list[float] = []
-            for first in range(n_items_t):
-                for second in range(first + 1, n_items_t):
-                    pair_observed = np.isfinite(residuals[:, first]) & np.isfinite(
-                        residuals[:, second]
-                    )
-                    if np.count_nonzero(pair_observed) < 2:
-                        continue
-                    first_residual = residuals[pair_observed, first]
-                    second_residual = residuals[pair_observed, second]
-                    if np.std(first_residual) == 0.0 or np.std(second_residual) == 0.0:
-                        continue
-                    correlations.append(
-                        float(np.corrcoef(first_residual, second_residual)[0, 1])
-                    )
-            mean_corr = float(np.mean(correlations)) if correlations else 0.0
-
-            pos = np.where(self._unique_testlets == t_idx)[0][0]
-            estimated_vars[pos] = max(0.0, mean_corr)
+            values = correlations[np.triu_indices(n_items_t, k=1)]
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size:
+                estimated_vars[position] = max(0.0, float(np.mean(finite_values)))
 
         return estimated_vars
 
@@ -1135,7 +1167,10 @@ def compute_testlet_q3(
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
     testlet_membership: NDArray[np.int_],
-) -> dict[str, NDArray[np.float64] | float]:
+) -> dict[
+    str,
+    NDArray[np.float64] | NDArray[np.intp] | float | int,
+]:
     """Compute Q3 statistic for testlet local dependence.
 
     The Q3 statistic measures residual correlations between items
@@ -1158,7 +1193,9 @@ def compute_testlet_q3(
     Returns
     -------
     dict
-        Contains 'q3_matrix', 'within_testlet', 'between_testlet'.
+        Contains the Q3 matrix, pairwise-complete sample sizes, within- and
+        between-testlet summaries, and the number of usable pairs behind each
+        summary.
     """
     response_values = np.asarray(responses)
     if response_values.ndim != 2:
@@ -1201,37 +1238,28 @@ def compute_testlet_q3(
         - difficulty_values[None, :]
     )
     residuals = np.where(observed, response_codes - expected, np.nan)
-    q3_matrix = np.full((n_items, n_items), np.nan, dtype=np.float64)
-    for first in range(n_items):
-        for second in range(first, n_items):
-            pair_observed = observed[:, first] & observed[:, second]
-            if np.count_nonzero(pair_observed) < 2:
-                continue
-            first_residual = residuals[pair_observed, first]
-            second_residual = residuals[pair_observed, second]
-            if np.std(first_residual) == 0.0 or np.std(second_residual) == 0.0:
-                continue
-            correlation = np.corrcoef(first_residual, second_residual)[0, 1]
-            q3_matrix[first, second] = correlation
-            q3_matrix[second, first] = correlation
+    q3_matrix, pair_counts = _pairwise_complete_correlations(residuals, observed)
 
-    within_q3: list[float] = []
-    between_q3: list[float] = []
-
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            q3_val = q3_matrix[i, j]
-            if not np.isfinite(q3_val):
-                continue
-            if membership[i] >= 0 and membership[i] == membership[j]:
-                within_q3.append(float(q3_val))
-            else:
-                between_q3.append(float(q3_val))
+    rows, columns = np.triu_indices(n_items, k=1)
+    q3_values = q3_matrix[rows, columns]
+    finite = np.isfinite(q3_values)
+    within = (membership[rows] >= 0) & (membership[rows] == membership[columns])
+    within_q3 = q3_values[finite & within]
+    between_q3 = q3_values[finite & ~within]
 
     return {
         "q3_matrix": q3_matrix,
-        "within_testlet_mean": np.mean(within_q3) if within_q3 else np.nan,
-        "between_testlet_mean": np.mean(between_q3) if between_q3 else np.nan,
-        "within_testlet_max": np.max(within_q3) if within_q3 else np.nan,
-        "between_testlet_max": np.max(between_q3) if between_q3 else np.nan,
+        "pair_counts": pair_counts,
+        "within_testlet_mean": (
+            float(np.mean(within_q3)) if within_q3.size else np.nan
+        ),
+        "between_testlet_mean": (
+            float(np.mean(between_q3)) if between_q3.size else np.nan
+        ),
+        "within_testlet_max": (float(np.max(within_q3)) if within_q3.size else np.nan),
+        "between_testlet_max": (
+            float(np.max(between_q3)) if between_q3.size else np.nan
+        ),
+        "n_within_pairs": int(within_q3.size),
+        "n_between_pairs": int(between_q3.size),
     }

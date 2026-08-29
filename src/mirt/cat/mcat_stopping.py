@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from numbers import Real
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
+from numpy.typing import ArrayLike, NDArray
 
 if TYPE_CHECKING:
     from mirt.cat.results import MCATState
@@ -252,6 +254,126 @@ class ThetaChangeMCATStop(MCATStoppingRule):
         )
 
 
+class CompositeClassificationStop(MCATStoppingRule):
+    """Stop after confidently classifying a weighted ability composite.
+
+    The composite estimate is ``weights @ theta`` and its standard error is
+    ``sqrt(weights @ covariance @ weights)``. Using the full covariance matrix
+    accounts for correlations between latent dimensions.
+
+    Parameters
+    ----------
+    weights : array-like
+        Finite, nonzero factor weights defining the composite and decision
+        boundary. The number of weights must match the state dimensions.
+    cut_score : float
+        Finite cut score on the weighted composite scale.
+    confidence : float, default=0.95
+        Required one-sided confidence, strictly between 0.5 and 1.
+    """
+
+    def __init__(
+        self,
+        weights: ArrayLike,
+        cut_score: float,
+        confidence: float = 0.95,
+    ) -> None:
+        raw_weights = np.asarray(weights)
+        if raw_weights.dtype.kind not in {"i", "u", "f"}:
+            raise ValueError("weights must be a one-dimensional array of finite values")
+        values = np.asarray(weights, dtype=np.float64)
+        if values.ndim != 1 or values.size == 0 or not np.all(np.isfinite(values)):
+            raise ValueError("weights must be a one-dimensional array of finite values")
+        if not np.any(values != 0.0):
+            raise ValueError("weights must contain at least one nonzero value")
+        if isinstance(cut_score, bool) or not isinstance(cut_score, Real):
+            raise ValueError("cut_score must be finite")
+        cut_value = float(cut_score)
+        if not np.isfinite(cut_value):
+            raise ValueError("cut_score must be finite")
+        if isinstance(confidence, bool) or not isinstance(confidence, Real):
+            raise ValueError("confidence must be strictly between 0.5 and 1")
+        confidence_value = float(confidence)
+        if not np.isfinite(confidence_value) or not 0.5 < confidence_value < 1.0:
+            raise ValueError("confidence must be strictly between 0.5 and 1")
+
+        from scipy.special import ndtri
+
+        self._weights: NDArray[np.float64] = values.copy()
+        self.cut_score: float = cut_value
+        self.confidence: float = confidence_value
+        self._critical_z: float = float(ndtri(confidence_value))
+        self._triggered: bool = False
+        self._classification: Literal["above", "below"] | None = None
+
+    @property
+    def weights(self) -> NDArray[np.float64]:
+        """Return a defensive copy of the composite factor weights."""
+        return self._weights.copy()
+
+    @property
+    def classification(self) -> Literal["above", "below"] | None:
+        """Return the reached classification, or ``None`` before a decision."""
+        return self._classification
+
+    def should_stop(self, state: MCATState) -> bool:
+        theta = np.asarray(state.theta, dtype=np.float64)
+        covariance = np.asarray(state.covariance, dtype=np.float64)
+        n_factors = self._weights.size
+        if theta.shape != (n_factors,):
+            raise ValueError(
+                f"state.theta must have shape ({n_factors},) to match weights"
+            )
+        if covariance.shape != (n_factors, n_factors):
+            raise ValueError(
+                "state.covariance must have shape "
+                f"({n_factors}, {n_factors}) to match weights"
+            )
+        if not np.all(np.isfinite(theta)):
+            raise ValueError("state.theta must contain only finite values")
+        if not np.all(np.isfinite(covariance)):
+            raise ValueError("state.covariance must contain only finite values")
+        if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-12):
+            raise ValueError("state.covariance must be symmetric")
+
+        composite = float(self._weights @ theta)
+        variance = float(self._weights @ covariance @ self._weights)
+        scale = max(
+            1.0,
+            float(np.max(np.abs(covariance))) * float(self._weights @ self._weights),
+        )
+        tolerance = 16.0 * np.finfo(np.float64).eps * n_factors * scale
+        if variance < -tolerance:
+            raise ValueError(
+                "state.covariance must have non-negative projected variance"
+            )
+
+        standard_error = float(np.sqrt(max(variance, 0.0)))
+        distance = abs(composite - self.cut_score)
+        confident = (
+            distance > 0.0
+            if standard_error == 0.0
+            else distance >= self._critical_z * standard_error
+        )
+        if confident:
+            self._triggered = True
+            self._classification = "above" if composite > self.cut_score else "below"
+            return True
+        return False
+
+    def get_reason(self) -> str:
+        direction = self._classification or "undetermined"
+        return (
+            f"Composite classification confidence reached ({self.confidence:.0%} "
+            f"confident, {direction} cut score {self.cut_score})"
+        )
+
+    def reset(self) -> None:
+        """Clear classification details from the prior session."""
+        self._triggered = False
+        self._classification = None
+
+
 class CombinedMCATStop(MCATStoppingRule):
     """Combine multiple MCAT stopping rules with logical operators.
 
@@ -324,7 +446,7 @@ def create_mcat_stopping_rule(
     ----------
     method : str
         Stopping rule name. One of: "trace", "determinant", "max_se",
-        "avg_se", "max_items", "theta_change", "combined".
+        "avg_se", "max_items", "theta_change", "classification", "combined".
     **kwargs
         Additional keyword arguments passed to the rule constructor.
 
@@ -345,6 +467,7 @@ def create_mcat_stopping_rule(
         "avg_se": AvgSEStop,
         "max_items": MaxItemsMCATStop,
         "theta_change": ThetaChangeMCATStop,
+        "classification": CompositeClassificationStop,
         "combined": CombinedMCATStop,
     }
 

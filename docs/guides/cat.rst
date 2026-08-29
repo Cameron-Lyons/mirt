@@ -24,6 +24,29 @@ Quick start
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
 
+Portable results
+----------------
+
+``CATResult`` and ``MCATResult`` can be stored or sent without a dataframe
+package. Their dictionary exports contain only JSON-compatible Python values,
+including the complete response, estimate, uncertainty, covariance, and item
+information histories:
+
+.. code-block:: python
+
+   from mirt.cat import CATResult
+
+   payload = result.to_dict()
+   json_text = result.to_json(indent=2)
+
+   restored = CATResult.from_json(json_text)
+   assert restored.to_dict() == payload
+
+The reconstruction methods validate required and unknown fields, administered
+item and response counts, history lengths, and multidimensional array shapes.
+Result objects also copy caller-owned arrays when they are created, so later
+changes to the original arrays do not alter the stored administration.
+
 Item selection
 --------------
 
@@ -46,6 +69,31 @@ Stopping rules
 * ``"SE"`` — stop when standard error falls below ``se_threshold``
 * ``"max_items"`` / ``MaxItemsStop`` — fixed test length
 * Combined rules via ``max_items`` plus an SE rule on ``CATEngine``
+
+For multidimensional classification, project the ability vector and its full
+covariance onto a policy-relevant composite:
+
+.. code-block:: python
+
+   from mirt.cat import CompositeClassificationStop, MCATEngine
+
+   classification = CompositeClassificationStop(
+       weights=[0.7, 0.3],
+       cut_score=0.0,
+       confidence=0.95,
+   )
+   engine = MCATEngine(
+       fit.model,
+       stopping_rule=classification,
+       min_items=8,
+       max_items=30,
+   )
+
+The rule evaluates ``weights @ theta`` with standard error
+``sqrt(weights @ covariance @ weights)``. It therefore incorporates factor
+correlations and stops only after a one-sided decision is sufficiently
+confident. Use :func:`~mirt.cat.mcat_stopping.create_mcat_stopping_rule` with
+``"classification"`` to construct the same rule from configuration.
 
 Content balancing and exposure
 ------------------------------

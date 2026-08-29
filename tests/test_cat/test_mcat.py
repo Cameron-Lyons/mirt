@@ -11,6 +11,7 @@ from mirt.cat import (
     AvgSEStop,
     BayesianMCAT,
     CombinedMCATStop,
+    CompositeClassificationStop,
     COptimality,
     CovarianceDeterminantStop,
     CovarianceTraceStop,
@@ -362,6 +363,109 @@ class TestMCATStoppingRules:
         state4 = MCATState(theta=theta4, covariance=cov, standard_error=se, n_items=4)
         assert rule.should_stop(state4)
 
+    def test_composite_classification_uses_full_covariance(self):
+        rule = CompositeClassificationStop(
+            weights=[1.0, -1.0],
+            cut_score=0.0,
+            confidence=0.95,
+        )
+        covariance = np.array([[0.04, 0.03], [0.03, 0.09]])
+        state = MCATState(
+            theta=np.array([0.4, -0.1]),
+            covariance=covariance,
+            standard_error=np.sqrt(np.diag(covariance)),
+        )
+
+        projected_se = np.sqrt(0.04 + 0.09 - 2.0 * 0.03)
+
+        assert 0.5 >= 1.6448536269514722 * projected_se
+        assert rule.should_stop(state)
+        assert rule.classification == "above"
+        assert "above" in rule.get_reason()
+
+    def test_composite_classification_waits_when_decision_is_uncertain(self):
+        rule = CompositeClassificationStop([0.5, 0.5], cut_score=0.0)
+        state = MCATState(
+            theta=np.array([0.2, 0.0]),
+            covariance=np.array([[0.16, 0.08], [0.08, 0.16]]),
+            standard_error=np.full(2, 0.4),
+        )
+
+        assert not rule.should_stop(state)
+        assert rule.classification is None
+
+    def test_composite_classification_handles_exact_and_zero_variance(self):
+        rule = CompositeClassificationStop([0.25, 0.75], cut_score=1.0)
+        covariance = np.zeros((2, 2))
+        exact = MCATState(
+            theta=np.array([1.0, 1.0]),
+            covariance=covariance,
+            standard_error=np.zeros(2),
+        )
+        below = MCATState(
+            theta=np.array([0.0, 1.0]),
+            covariance=covariance,
+            standard_error=np.zeros(2),
+        )
+
+        assert not rule.should_stop(exact)
+        assert rule.should_stop(below)
+        assert rule.classification == "below"
+
+        exposed = rule.weights
+        exposed[:] = 99.0
+        np.testing.assert_array_equal(rule.weights, [0.25, 0.75])
+        rule.reset()
+        assert rule.classification is None
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"weights": 1.0, "cut_score": 0.0}, "one-dimensional"),
+            ({"weights": [], "cut_score": 0.0}, "one-dimensional"),
+            ({"weights": [0.0, 0.0], "cut_score": 0.0}, "nonzero"),
+            ({"weights": [1.0, np.nan], "cut_score": 0.0}, "finite"),
+            ({"weights": [1.0, 0.0], "cut_score": np.inf}, "cut_score"),
+            ({"weights": [1.0, 0.0], "cut_score": True}, "cut_score"),
+            (
+                {"weights": [1.0, 0.0], "cut_score": 0.0, "confidence": 0.5},
+                "confidence",
+            ),
+        ],
+    )
+    def test_composite_classification_validates_configuration(
+        self,
+        kwargs: dict[str, object],
+        message: str,
+    ):
+        with pytest.raises(ValueError, match=message):
+            CompositeClassificationStop(**kwargs)
+
+    @pytest.mark.parametrize(
+        ("theta", "covariance", "message"),
+        [
+            (np.zeros(3), np.eye(3), "theta"),
+            (np.zeros(2), np.eye(3), "covariance"),
+            (np.zeros(2), np.array([[1.0, 0.2], [0.1, 1.0]]), "symmetric"),
+            (np.zeros(2), np.array([[0.1, 0.0], [0.0, -1.0]]), "non-negative"),
+        ],
+    )
+    def test_composite_classification_validates_state(
+        self,
+        theta: np.ndarray,
+        covariance: np.ndarray,
+        message: str,
+    ):
+        rule = CompositeClassificationStop([1.0, 1.0], cut_score=0.0)
+        state = MCATState(
+            theta=theta,
+            covariance=covariance,
+            standard_error=np.sqrt(np.clip(np.diag(covariance), 0.0, None)),
+        )
+
+        with pytest.raises(ValueError, match=message):
+            rule.should_stop(state)
+
     def test_combined_mcat_stop(self):
         rule = CombinedMCATStop(
             rules=[
@@ -391,6 +495,11 @@ class TestMCATStoppingRules:
         rule = create_mcat_stopping_rule("max_items", max_items=15)
         assert isinstance(rule, MaxItemsMCATStop)
 
+        rule = create_mcat_stopping_rule(
+            "classification", weights=[0.7, 0.3], cut_score=0.0
+        )
+        assert isinstance(rule, CompositeClassificationStop)
+
         with pytest.raises(ValueError):
             create_mcat_stopping_rule("invalid")
 
@@ -409,6 +518,24 @@ class TestMCATEngine:
         assert engine.n_factors == 2
         assert engine.model.n_items == 20
         assert not engine._is_complete
+
+    def test_engine_accepts_composite_classification_stop(self, fitted_mirt_model):
+        rule = CompositeClassificationStop(
+            weights=[0.7, 0.3],
+            cut_score=-100.0,
+        )
+        engine = MCATEngine(
+            fitted_mirt_model,
+            stopping_rule=rule,
+            max_items=10,
+            seed=42,
+        )
+
+        result = engine.run_simulation(np.array([0.0, 0.0]))
+
+        assert result.n_items_administered == 1
+        assert "Composite classification" in result.stopping_reason
+        assert rule.classification == "above"
 
     def test_engine_init_unfitted_model(self):
         model = MultidimensionalModel(n_items=10, n_factors=2)

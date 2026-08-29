@@ -47,16 +47,28 @@ class TestDIF:
             method="likelihood_ratio",
             n_quadpts=11,
             max_iter=30,
+            p_adjust="holm",
         )
 
         assert "statistic" in result
         assert "p_value" in result
+        assert "p_value_adjusted" in result
         assert "effect_size" in result
         assert "classification" in result
+        assert "adjustment" in result
 
         assert len(result["statistic"]) == n_items
         assert len(result["p_value"]) == n_items
         assert np.all(result["p_value"] >= 0) and np.all(result["p_value"] <= 1)
+        assert np.all(result["p_value_adjusted"] >= result["p_value"])
+        assert np.all(result["adjustment"] == "holm")
+        expected_classes = np.where(
+            (result["p_value_adjusted"] > 0.05)
+            | (np.abs(result["effect_size"]) < 0.426),
+            "A",
+            np.where(np.abs(result["effect_size"]) < 0.638, "B", "C"),
+        )
+        np.testing.assert_array_equal(result["classification"], expected_classes)
 
     def test_dif_wald_method(self, rng):
         """Test DIF analysis with Wald method."""
@@ -193,6 +205,63 @@ class TestDIF:
             | (dif_results["classification"] == "C")
         )
 
+    def test_flag_dif_applies_multiple_testing_adjustment(self):
+        dif_results = {
+            "p_value": np.array([0.01, 0.02, 0.04, 0.20]),
+            "effect_size": np.full(4, 0.8),
+            "classification": np.full(4, "C"),
+        }
+
+        unadjusted = flag_dif_items(dif_results)
+        adjusted = flag_dif_items(dif_results, p_adjust="bonferroni")
+
+        np.testing.assert_array_equal(unadjusted, [True, True, True, False])
+        np.testing.assert_array_equal(adjusted, [True, False, False, False])
+
+    def test_flag_dif_classifies_signed_effects_by_magnitude(self):
+        dif_results = {
+            "p_value": np.array([0.001, 0.001]),
+            "effect_size": np.array([-0.8, -0.5]),
+            "classification": np.array(["C", "B"]),
+        }
+
+        np.testing.assert_array_equal(
+            flag_dif_items(dif_results, classification="B"),
+            [True, True],
+        )
+        np.testing.assert_array_equal(
+            flag_dif_items(dif_results, classification="C"),
+            [True, False],
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"alpha": 0.0}, "alpha"),
+            ({"alpha": "invalid"}, "alpha"),
+            ({"min_effect_size": -0.1}, "min_effect_size"),
+            ({"classification": "A"}, "classification"),
+            ({"p_adjust": "unknown"}, "p_adjust"),
+        ],
+    )
+    def test_flag_dif_validates_options(self, kwargs, message):
+        dif_results = {
+            "p_value": np.array([0.01, 0.20]),
+            "effect_size": np.array([0.8, 0.2]),
+            "classification": np.array(["C", "A"]),
+        }
+
+        with pytest.raises(ValueError, match=message):
+            flag_dif_items(dif_results, **kwargs)
+
+    def test_compute_dif_rejects_adjustment_before_fitting(self):
+        with pytest.raises(ValueError, match="p_adjust"):
+            compute_dif(
+                np.zeros((1, 1), dtype=int),
+                np.zeros(1, dtype=int),
+                p_adjust="unknown",  # type: ignore[arg-type]
+            )
+
     def test_requires_two_groups(self, rng):
         """Test that DIF requires exactly 2 groups."""
         n_persons = 100
@@ -325,7 +394,18 @@ class TestDIFIntegration:
         groups = np.array([0] * n_per_group + [1] * n_per_group)
 
         result = mirt.dif(
-            data, groups, model="2PL", method="wald", n_quadpts=11, max_iter=30
+            data,
+            groups,
+            model="2PL",
+            method="wald",
+            n_quadpts=11,
+            max_iter=30,
+            p_adjust="fdr_bh",
         )
 
         assert hasattr(result, "columns") or hasattr(result, "schema")
+        columns = (
+            result.columns if hasattr(result, "columns") else result.schema.names()
+        )
+        assert "p_value_adjusted" in columns
+        assert "adjustment" in columns

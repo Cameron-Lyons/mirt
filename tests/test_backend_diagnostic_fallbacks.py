@@ -217,7 +217,7 @@ def test_numpy_fallbacks_match_scalar_references(
         assert_allclose(actual, expected, rtol=1e-13, atol=1e-13, equal_nan=True)
 
 
-def test_pairwise_fallbacks_match_references_across_small_chunks(
+def test_chunked_fallbacks_match_references_across_small_chunks(
     binary_data: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -249,6 +249,33 @@ def test_pairwise_fallbacks_match_references_across_small_chunks(
         atol=1e-12,
         equal_nan=True,
     )
+    for actual, expected in zip(
+        diagnostics.compute_fit_statistics(
+            responses,
+            theta,
+            discrimination,
+            difficulty,
+        ),
+        _reference_fit_statistics(responses, theta, discrimination, difficulty),
+        strict=True,
+    ):
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-12, equal_nan=True)
+
+
+def test_fit_statistics_all_missing_outputs_are_nan_without_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(diagnostics, "rust_enabled", lambda: False)
+
+    result = diagnostics.compute_fit_statistics(
+        np.full((5, 3), -1),
+        np.linspace(-1.0, 1.0, 5),
+        np.ones(3),
+        np.zeros(3),
+    )
+
+    for statistic in result:
+        assert np.all(np.isnan(statistic))
 
 
 def test_missing_encodings_and_column_theta_are_normalized(

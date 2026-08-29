@@ -19,7 +19,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Mixture IRT**: Latent class IRT models
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
-- **Nonparametric**: Monotonic spline IRFs
+- **Nonparametric**: Monotonic spline and weighted kernel-smoothed IRFs
 - **Network Psychometrics**: Ising and sparse Gaussian graphical models
 
 ### Estimation Methods
@@ -127,6 +127,12 @@ nrm_data = mirt.simdata(
     model="NRM", n_persons=500, n_items=10, n_categories=4,
     n_factors=2, **nrm_params
 )
+
+zi_params = mirt.generate_item_parameters(n_items=20, model="ZI-2PL", seed=42)
+zi_data, structural_zeros = mirt.simdata(
+    model="ZI-2PL", n_persons=500, n_items=20,
+    return_structural_zeros=True, **zi_params, seed=43
+)
 ```
 
 ### Fitting Models
@@ -140,6 +146,21 @@ result_grm = mirt.fit_mirt(likert_data, model="GRM", n_categories=5)
 result_gpcm = mirt.fit_mirt(likert_data, model="GPCM", n_categories=5)
 
 result_mirt = mirt.fit_mirt(responses, model="2PL", n_factors=2)
+```
+
+### Weighted Nonparametric Calibration
+
+```python
+from mirt.models import KernelSmoothingModel
+
+theta = np.linspace(-3, 3, 500)
+kernel_data = mirt.simdata(model="2PL", theta=theta, n_items=20, seed=7)
+person_weight = np.linspace(0.5, 1.5, theta.size)
+
+kernel_model = KernelSmoothingModel(n_items=kernel_data.shape[1]).calibrate(
+    kernel_data, theta, sample_weight=person_weight
+)
+smoothed_curves = kernel_model.probability(np.linspace(-3, 3, 121))
 ```
 
 ### Person Scoring
@@ -450,6 +471,8 @@ plot_person_item_map(result.model, scores.theta)
 | `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
+| `itemstats()` | Item distributions, modes, entropy, and effective category counts |
+| `missing_patterns()` | Frequency-ranked missing-response pattern analysis |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
 | `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
 | `calc_null()` | Independence and pooled-intercept baseline fit statistics |
@@ -466,7 +489,7 @@ plot_person_item_map(result.model, scores.theta)
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
 | `posterior_summary()` | Summarize sampled parameter uncertainty |
-| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
+| `sample_expected_scores()` | Propagate parameter uncertainty to test, subtest, or item scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
 | `predict_mixed()` | Response probabilities from abilities or person covariates |
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
