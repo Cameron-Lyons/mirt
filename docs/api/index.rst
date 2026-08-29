@@ -205,6 +205,8 @@ Utils
    simdata
    validate_responses
    itemstats
+   missing_patterns
+   MissingPatternResult
    traditional
    generate_plausible_values
    combine_plausible_values

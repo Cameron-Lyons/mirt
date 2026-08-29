@@ -103,6 +103,8 @@ BASE_EXPORTS = [
     "parametric_bootstrap",
     "impute_responses",
     "analyze_missing",
+    "missing_patterns",
+    "MissingPatternResult",
     "listwise_deletion",
     "generate_plausible_values",
     "combine_plausible_values",
@@ -504,10 +506,12 @@ TOP_LEVEL_IMPORT_GROUPS = {
     ),
     "mirt.utils.imputation": (
         "MIResult",
+        "MissingPatternResult",
         "analyze_missing",
         "averageMI",
         "impute_responses",
         "listwise_deletion",
+        "missing_patterns",
     ),
     "mirt.utils.information": (
         "areainfo",
