@@ -143,6 +143,7 @@ Cross-validation
    KFold
    StratifiedKFold
    GroupKFold
+   StratifiedGroupKFold
    LeaveOneOut
 
 CAT
