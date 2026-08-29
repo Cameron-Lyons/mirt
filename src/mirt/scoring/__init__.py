@@ -18,6 +18,7 @@ _LAZY_IMPORTS = {
     "MAPScorer": ("mirt.scoring.map", "MAPScorer"),
     "MLScorer": ("mirt.scoring.ml", "MLScorer"),
     "WLEScorer": ("mirt.scoring.wle", "WLEScorer"),
+    "ability_posterior": ("mirt.scoring.eap", "ability_posterior"),
     "eapsum": ("mirt.scoring.eapsum", "eapsum"),
     "sum_score_to_theta": ("mirt.scoring.eapsum", "sum_score_to_theta"),
 }
@@ -160,6 +161,7 @@ def fscores(
 
 __all__ = [
     "fscores",
+    "ability_posterior",
     "EAPScorer",
     "EAPSumScorer",
     "MAPScorer",

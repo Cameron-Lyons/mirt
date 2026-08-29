@@ -11,7 +11,6 @@ Core Functions
    :nosignatures:
 
    fit_mirt
-   fscores
    itemfit
    personfit
    dif
@@ -132,6 +131,7 @@ Scoring
    :nosignatures:
 
    fscores
+   ability_posterior
 
 Cross-validation
 ----------------
@@ -241,4 +241,5 @@ Results
 
    FitResult
    ScoreResult
+   AbilityPosteriorResult
    ResponseTimeResult

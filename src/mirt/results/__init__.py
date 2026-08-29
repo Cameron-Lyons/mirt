@@ -6,6 +6,10 @@ import importlib
 from typing import Any
 
 _LAZY_IMPORTS = {
+    "AbilityPosteriorResult": (
+        "mirt.results.ability_posterior",
+        "AbilityPosteriorResult",
+    ),
     "FitResult": ("mirt.results.fit_result", "FitResult"),
     "ScoreResult": ("mirt.results.score_result", "ScoreResult"),
 }

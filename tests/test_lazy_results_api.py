@@ -7,7 +7,7 @@ import subprocess
 import sys
 import textwrap
 
-EXPECTED_EXPORTS = ("FitResult", "ScoreResult")
+EXPECTED_EXPORTS = ("AbilityPosteriorResult", "FitResult", "ScoreResult")
 
 
 def _run_probe(source: str) -> dict[str, object]:
