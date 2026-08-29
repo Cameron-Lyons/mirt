@@ -111,6 +111,8 @@ _LAZY_IMPORTS = {
     "ContentArea": "mirt.cat.content",
     "WeightedContent": "mirt.cat.content",
     "create_content_constraint": "mirt.cat.content",
+    "FormAssemblyResult": "mirt.cat.assembly",
+    "assemble_form": "mirt.cat.assembly",
 }
 
 __all__ = list(_LAZY_IMPORTS)
