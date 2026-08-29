@@ -631,6 +631,33 @@ class TestPlausibleValueRegression:
         for key in ("coefficients", "se", "pvalues", "df"):
             np.testing.assert_allclose(one_dimensional[key], column_matrix[key])
 
+    def test_regression_batch_size_does_not_change_results(self):
+        """Draw batches retain coefficients and combined inference."""
+        rng = np.random.default_rng(610)
+        latent = rng.normal(size=(120, 3))
+        pvs = latent[:, :, None] + rng.normal(scale=0.25, size=(120, 3, 11))
+        covariates = rng.normal(size=(120, 2))
+        outcome = latent @ np.array([1.3, -0.4, 0.8]) + rng.normal(size=120)
+        weights = rng.uniform(0.2, 2.5, size=120)
+        expected = plausible_value_regression(
+            pvs,
+            outcome,
+            covariates,
+            weights,
+            batch_size=1,
+        )
+
+        for batch_size in (2, 5, 100):
+            actual = plausible_value_regression(
+                pvs,
+                outcome,
+                covariates,
+                weights,
+                batch_size=batch_size,
+            )
+            for key in ("coefficients", "se", "pvalues", "df"):
+                np.testing.assert_allclose(actual[key], expected[key], rtol=1e-12)
+
     @pytest.mark.parametrize(
         ("pvs", "message"),
         [
@@ -686,13 +713,40 @@ class TestPlausibleValueRegression:
         with pytest.raises(ValueError, match="rank deficient"):
             plausible_value_regression(pvs, rng.normal(size=12), X=np.ones(12))
 
+    def test_reports_rank_deficient_draw_index(self):
+        """A deficient member of a draw batch retains its global index."""
+        rng = np.random.default_rng(712)
+        covariate = rng.normal(size=30)
+        pvs = rng.normal(size=(30, 1, 4))
+        pvs[:, 0, 2] = covariate
+
+        with pytest.raises(ValueError, match="plausible value 2"):
+            plausible_value_regression(
+                pvs,
+                rng.normal(size=30),
+                X=covariate,
+                batch_size=4,
+            )
+
+    @pytest.mark.parametrize("batch_size", [0, -1, 1.5, True, "2"])
+    def test_rejects_invalid_regression_batch_size(self, batch_size):
+        """Regression batching accepts only positive integer sizes."""
+        rng = np.random.default_rng(810)
+
+        with pytest.raises(ValueError, match="batch_size"):
+            plausible_value_regression(
+                rng.normal(size=(12, 1, 3)),
+                rng.normal(size=12),
+                batch_size=batch_size,
+            )
+
     def test_reports_linear_algebra_failure(self, monkeypatch):
         """Numerical failures identify the affected plausible value."""
 
-        def fail_lstsq(*args, **kwargs):
+        def fail_qr(*args, **kwargs):
             raise np.linalg.LinAlgError("did not converge")
 
-        monkeypatch.setattr(np.linalg, "lstsq", fail_lstsq)
+        monkeypatch.setattr(np.linalg, "qr", fail_qr)
 
         with pytest.raises(ValueError, match="plausible value 0"):
             plausible_value_regression(

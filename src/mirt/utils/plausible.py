@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
+_PV_REGRESSION_TARGET_ELEMENTS = 500_000
+
 
 def generate_plausible_values(
     model: BaseItemModel | FitResult,
@@ -418,6 +420,8 @@ def plausible_value_regression(
     y: NDArray[np.float64],
     X: NDArray[np.float64] | None = None,
     weights: NDArray[np.float64] | None = None,
+    *,
+    batch_size: int | None = None,
 ) -> dict[str, float | int | NDArray[np.float64]]:
     """Perform regression using plausible values as predictor.
 
@@ -435,6 +439,9 @@ def plausible_value_regression(
     weights : NDArray, optional
         Positive case weights with one value per person. Multiplying every
         weight by the same constant does not change the result.
+    batch_size : int, optional
+        Maximum plausible-value draws processed together. The default bounds
+        temporary draw-by-person arrays automatically.
 
     Returns
     -------
@@ -487,8 +494,7 @@ def plausible_value_regression(
             raise ValueError("X must contain only finite covariates")
 
     if weights is None:
-        case_weights = None
-        sqrt_weights = None
+        case_weights = np.ones(n_persons, dtype=np.float64)
     else:
         try:
             case_weights = np.asarray(weights, dtype=np.float64)
@@ -498,7 +504,12 @@ def plausible_value_regression(
             raise ValueError("weights must contain one value per person")
         if not np.all(np.isfinite(case_weights)) or np.any(case_weights <= 0.0):
             raise ValueError("weights must contain only positive finite values")
-        sqrt_weights = np.sqrt(case_weights)
+    if batch_size is not None and (
+        isinstance(batch_size, (bool, np.bool_))
+        or not isinstance(batch_size, (int, np.integer))
+        or batch_size < 1
+    ):
+        raise ValueError("batch_size must be a positive integer or None")
 
     n_predictors = 1 + n_factors + covariates.shape[1]
     residual_df = n_persons - n_predictors
@@ -508,53 +519,71 @@ def plausible_value_regression(
             "covariate coefficients"
         )
 
-    design = np.empty((n_persons, n_predictors), dtype=np.float64)
-    design[:, 0] = 1.0
-    design[:, 1 + n_factors :] = covariates
+    sqrt_weights = np.sqrt(case_weights)
+    fixed_design = np.empty(
+        (n_persons, 1 + covariates.shape[1]),
+        dtype=np.float64,
+    )
+    fixed_design[:, 0] = 1.0
+    fixed_design[:, 1:] = covariates
+    fixed_design *= sqrt_weights[:, None]
+    weighted_outcome = outcome * sqrt_weights
+    try:
+        fixed_q, fixed_r = np.linalg.qr(fixed_design, mode="reduced")
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("regression failed for plausible value 0") from exc
+    fixed_outcome = fixed_q.T @ weighted_outcome
+    outcome_residual = weighted_outcome - fixed_q @ fixed_outcome
+
     coefficients = np.empty((n_plausible, n_predictors), dtype=np.float64)
     coefficient_variances = np.empty_like(coefficients)
-    identity = np.eye(n_predictors)
-
-    for draw in range(n_plausible):
-        design[:, 1 : 1 + n_factors] = values[:, :, draw]
-        if sqrt_weights is None:
-            fit_design = design
-            fit_outcome = outcome
-        else:
-            fit_design = design * sqrt_weights[:, None]
-            fit_outcome = outcome * sqrt_weights
-
-        try:
-            coefficient, _, rank, _ = np.linalg.lstsq(
-                fit_design,
-                fit_outcome,
-                rcond=None,
-            )
-        except np.linalg.LinAlgError as exc:
-            raise ValueError(f"regression failed for plausible value {draw}") from exc
-        if rank < n_predictors:
-            raise ValueError(
-                f"regression design is rank deficient for plausible value {draw}"
-            )
-
-        residual = outcome - design @ coefficient
-        if case_weights is None:
-            residual_sum_squares = float(residual @ residual)
-        else:
-            residual_sum_squares = float(np.dot(case_weights, residual**2))
-        mean_squared_error = residual_sum_squares / residual_df
-        gram = fit_design.T @ fit_design
-        try:
-            inverse_gram = np.linalg.solve(gram, identity)
-        except np.linalg.LinAlgError as exc:
-            raise ValueError(
-                f"regression covariance failed for plausible value {draw}"
-            ) from exc
-        coefficients[draw] = coefficient
-        coefficient_variances[draw] = mean_squared_error * np.maximum(
-            np.diag(inverse_gram),
-            0.0,
+    resolved_batch_size = (
+        max(
+            1,
+            _PV_REGRESSION_TARGET_ELEMENTS // (n_persons * n_factors),
         )
+        if batch_size is None
+        else int(batch_size)
+    )
+    for start in range(0, n_plausible, resolved_batch_size):
+        stop = min(start + resolved_batch_size, n_plausible)
+        try:
+            batch_coefficients, batch_variances = _fit_pv_regression_batch(
+                values[:, :, start:stop],
+                sqrt_weights,
+                fixed_q,
+                fixed_r,
+                fixed_outcome,
+                outcome_residual,
+                residual_df,
+                start,
+            )
+        except np.linalg.LinAlgError as exc:
+            if stop - start == 1:
+                raise ValueError(
+                    f"regression failed for plausible value {start}"
+                ) from exc
+            for draw in range(start, stop):
+                try:
+                    draw_coefficients, draw_variances = _fit_pv_regression_batch(
+                        values[:, :, draw : draw + 1],
+                        sqrt_weights,
+                        fixed_q,
+                        fixed_r,
+                        fixed_outcome,
+                        outcome_residual,
+                        residual_df,
+                        draw,
+                    )
+                except np.linalg.LinAlgError as draw_exc:
+                    raise ValueError(
+                        f"regression failed for plausible value {draw}"
+                    ) from draw_exc
+                coefficients[draw] = draw_coefficients[0]
+                coefficient_variances[draw] = draw_variances[0]
+            continue
+        coefficients[start:stop] = batch_coefficients
+        coefficient_variances[start:stop] = batch_variances
 
     estimate = np.mean(coefficients, axis=0)
     within_variance = np.mean(coefficient_variances, axis=0)
@@ -599,6 +628,117 @@ def plausible_value_regression(
         "n_observations": n_persons,
         "n_plausible": n_plausible,
     }
+
+
+def _fit_pv_regression_batch(
+    values: NDArray[np.float64],
+    sqrt_weights: NDArray[np.float64],
+    fixed_q: NDArray[np.float64],
+    fixed_r: NDArray[np.float64],
+    fixed_outcome: NDArray[np.float64],
+    outcome_residual: NDArray[np.float64],
+    residual_df: int,
+    draw_start: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Fit a bounded draw batch after projecting out fixed predictors."""
+    n_persons, n_factors, n_draws = values.shape
+    n_fixed = fixed_r.shape[0]
+    n_predictors = n_fixed + n_factors
+
+    variable_design = np.moveaxis(values, 2, 0) * sqrt_weights[None, :, None]
+    fixed_variable = np.einsum(
+        "nk,dnf->dkf",
+        fixed_q,
+        variable_design,
+        optimize=True,
+    )
+    variable_residual = variable_design - np.einsum(
+        "nk,dkf->dnf",
+        fixed_q,
+        fixed_variable,
+        optimize=True,
+    )
+    variable_q, variable_r = np.linalg.qr(variable_residual, mode="reduced")
+    variable_outcome = np.einsum(
+        "dnf,n->df",
+        variable_q,
+        outcome_residual,
+        optimize=True,
+    )
+
+    triangular = np.zeros(
+        (n_draws, n_predictors, n_predictors),
+        dtype=np.float64,
+    )
+    triangular[:, :n_fixed, :n_fixed] = fixed_r
+    triangular[:, :n_fixed, n_fixed:] = fixed_variable
+    triangular[:, n_fixed:, n_fixed:] = variable_r
+    singular_values = np.linalg.svd(triangular, compute_uv=False)
+    cutoff = (
+        np.finfo(np.float64).eps * max(n_persons, n_predictors) * singular_values[:, :1]
+    )
+    ranks = np.sum(singular_values > cutoff, axis=1)
+    deficient = np.flatnonzero(ranks < n_predictors)
+    if deficient.size:
+        draw = draw_start + int(deficient[0])
+        raise ValueError(
+            f"regression design is rank deficient for plausible value {draw}"
+        )
+
+    variable_coefficients = np.linalg.solve(
+        variable_r,
+        variable_outcome[..., None],
+    )[..., 0]
+    fixed_rhs = fixed_outcome[None, :] - np.einsum(
+        "dkf,df->dk",
+        fixed_variable,
+        variable_coefficients,
+        optimize=True,
+    )
+    fixed_coefficients = np.linalg.solve(
+        np.broadcast_to(fixed_r, (n_draws, n_fixed, n_fixed)),
+        fixed_rhs[..., None],
+    )[..., 0]
+    coefficients = np.concatenate(
+        (
+            fixed_coefficients[:, :1],
+            variable_coefficients,
+            fixed_coefficients[:, 1:],
+        ),
+        axis=1,
+    )
+
+    inverse_triangular = np.linalg.solve(
+        triangular,
+        np.broadcast_to(np.eye(n_predictors), triangular.shape),
+    )
+    inverse_gram_diagonal = np.sum(inverse_triangular**2, axis=2)
+    inverse_gram_diagonal = np.concatenate(
+        (
+            inverse_gram_diagonal[:, :1],
+            inverse_gram_diagonal[:, n_fixed:],
+            inverse_gram_diagonal[:, 1:n_fixed],
+        ),
+        axis=1,
+    )
+    residual = outcome_residual[None, :] - np.einsum(
+        "dnf,df->dn",
+        variable_q,
+        variable_outcome,
+        optimize=True,
+    )
+    residual_sum_squares = np.einsum(
+        "dn,dn->d",
+        residual,
+        residual,
+        optimize=True,
+    )
+    coefficient_variances = (
+        residual_sum_squares[:, None]
+        / residual_df
+        * np.maximum(inverse_gram_diagonal, 0.0)
+    )
+    return coefficients, coefficient_variances
 
 
 def plausible_value_statistics(

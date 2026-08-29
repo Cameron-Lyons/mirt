@@ -67,6 +67,33 @@ Omitting ``parameters`` summarizes every stored chain, including ``theta`` and
 ``log_likelihood``. Selected chains must contain finite values and share a common
 number of posterior draws.
 
+Plausible-value regression
+--------------------------
+
+Plausible values propagate ability uncertainty into secondary analyses. Generate
+them from a fitted item model, then combine a regression across all retained draws:
+
+.. code-block:: python
+
+   plausible_values = mirt.generate_plausible_values(
+       fitted_model,
+       responses,
+       n_plausible=20,
+       seed=42,
+   )
+   analysis = mirt.plausible_value_regression(
+       plausible_values,
+       outcome,
+       X=covariates,
+       weights=case_weights,
+   )
+
+``coefficients``, ``se``, ``pvalues``, and ``df`` contain the combined regression
+inference. The calculation projects the invariant intercept and covariates once,
+then processes plausible-value draws in memory-bounded batches. Pass
+``batch_size`` to set an explicit number of draws per batch; the default chooses a
+bound from the number of people and factors.
+
 Diagnostics
 -----------
 
