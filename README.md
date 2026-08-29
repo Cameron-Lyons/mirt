@@ -45,7 +45,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **GRDIF**: Generalized Residual DIF for multiple groups with robust scaling (MAD/IQR)
 - **DTF/DRF**: Differential test/response functioning
 - **SIBTEST**: Simultaneous item bias test
-- **Local dependence**: Q3, chi-square residuals
+- **Local dependence**: Q3, chi-square residuals, and pairwise multiplicity control
 
 ### Additional Features
 - Custom dichotomous, ordinal, multidimensional, and latent group models
@@ -185,6 +185,15 @@ aberrant = person_fit[person_fit["Zh"] < -2]
 
 fit_indices = mirt.compute_fit_indices(result.model, responses)
 print(fit_indices)
+
+from mirt.diagnostics import compute_ld_statistics
+
+ld = compute_ld_statistics(
+    result.model,
+    responses,
+    p_adjust="fdr_bh",
+)
+print(ld.chi2_adjusted_p_value_matrix)
 
 results = [result_1pl, result_2pl, result_3pl]
 comparison = mirt.compare_models(results)

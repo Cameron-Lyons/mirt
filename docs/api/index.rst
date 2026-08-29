@@ -103,6 +103,9 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   diagnostics.compute_ld_statistics
+   diagnostics.compute_ld_chi2
+   diagnostics.flag_ld_pairs
    diagnostics.adjust_p_values
    diagnostics.psis_loo
    diagnostics.waic
