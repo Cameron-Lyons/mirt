@@ -8,9 +8,9 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from mirt._categorical import sample_categorical_rows
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
+    _entry_chunk_size,
     mirt_rs,
     rust_enabled,
 )
@@ -130,6 +130,20 @@ def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
     return weights / np.sum(weights, axis=1, keepdims=True)
 
 
+def _sample_category_probabilities(
+    probabilities: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> NDArray[np.int_]:
+    """Sample a person-by-item probability cube in stable item-major order."""
+    np.cumsum(probabilities, axis=2, out=probabilities)
+    probabilities[:, :, -1] = 1.0
+    uniforms = rng.random((probabilities.shape[1], probabilities.shape[0])).T
+    return np.count_nonzero(
+        uniforms[:, :, None] >= probabilities,
+        axis=2,
+    ).astype(np.int_)
+
+
 def simulate_grm(
     theta: ArrayLike,
     discrimination: ArrayLike,
@@ -159,31 +173,43 @@ def simulate_grm(
     n_items = len(discrimination_array)
     n_categories = thresholds_array.shape[1] + 1
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
+    chunk_size = _entry_chunk_size(
+        n_items,
+        n_persons * n_categories,
+    )
 
-    for i in range(n_items):
-        cum_probs = np.ones((n_persons, n_categories))
-        for k in range(n_categories - 1):
-            with np.errstate(over="ignore", invalid="ignore"):
-                z = discrimination_array[i] * (
-                    theta_array[:, 0] - thresholds_array[i, k]
-                )
-            z = np.nan_to_num(z, nan=0.0, posinf=np.inf, neginf=-np.inf)
-            cum_probs[:, k + 1] = sigmoid(z)
-
-        cat_probs = -np.diff(
-            np.column_stack([cum_probs, np.zeros((n_persons, 1))]), axis=1
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        with np.errstate(over="ignore", invalid="ignore"):
+            z = discrimination_array[None, start:stop, None] * (
+                theta_array[:, None, :] - thresholds_array[None, start:stop, :]
+            )
+        z = np.nan_to_num(z, nan=0.0, posinf=np.inf, neginf=-np.inf)
+        cumulative_probabilities = np.empty(
+            (n_persons, stop - start, n_categories),
+            dtype=np.float64,
         )
-        cat_probs = np.maximum(cat_probs, 0)
-        totals = cat_probs.sum(axis=1, keepdims=True)
-        cat_probs = np.divide(
-            cat_probs,
+        cumulative_probabilities[:, :, 0] = 1.0
+        cumulative_probabilities[:, :, 1:] = sigmoid(z)
+
+        category_probabilities = np.empty_like(cumulative_probabilities)
+        category_probabilities[:, :, :-1] = (
+            cumulative_probabilities[:, :, :-1] - cumulative_probabilities[:, :, 1:]
+        )
+        category_probabilities[:, :, -1] = cumulative_probabilities[:, :, -1]
+        np.maximum(category_probabilities, 0.0, out=category_probabilities)
+        totals = category_probabilities.sum(axis=2, keepdims=True)
+        np.divide(
+            category_probabilities,
             totals,
-            out=np.zeros_like(cat_probs),
+            out=category_probabilities,
             where=totals > 0,
         )
-
-        responses[:, i] = sample_categorical_rows(cat_probs, rng)
+        responses[:, start:stop] = _sample_category_probabilities(
+            category_probabilities,
+            rng,
+        )
 
     return responses
 
@@ -217,26 +243,38 @@ def simulate_gpcm(
     n_items = len(discrimination_array)
     n_categories = thresholds_array.shape[1] + 1
 
-    responses = np.zeros((n_persons, n_items), dtype=np.int_)
+    responses = np.empty((n_persons, n_items), dtype=np.int_)
+    chunk_size = _entry_chunk_size(
+        n_items,
+        n_persons * n_categories,
+    )
+    increment_limit = _MAX_STABLE_LOGIT / n_categories
 
-    for i in range(n_items):
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
         with np.errstate(over="ignore", invalid="ignore"):
-            increments = discrimination_array[i] * (
-                theta_array[:, :1] - thresholds_array[i][None, :]
+            increments = discrimination_array[None, start:stop, None] * (
+                theta_array[:, None, :] - thresholds_array[None, start:stop, :]
             )
-        increment_limit = _MAX_STABLE_LOGIT / n_categories
         increments = np.nan_to_num(
             increments,
             nan=0.0,
             posinf=increment_limit,
             neginf=-increment_limit,
         )
-        increments = np.clip(increments, -increment_limit, increment_limit)
-        logits = np.zeros((n_persons, n_categories), dtype=np.float64)
-        logits[:, 1:] = np.cumsum(increments, axis=1)
-        cat_probs = _stable_softmax(logits)
-
-        responses[:, i] = sample_categorical_rows(cat_probs, rng)
+        np.clip(increments, -increment_limit, increment_limit, out=increments)
+        logits = np.zeros(
+            (n_persons, stop - start, n_categories),
+            dtype=np.float64,
+        )
+        logits[:, :, 1:] = np.cumsum(increments, axis=2)
+        category_probabilities = _stable_softmax(
+            logits.reshape(-1, n_categories)
+        ).reshape(n_persons, stop - start, n_categories)
+        responses[:, start:stop] = _sample_category_probabilities(
+            category_probabilities,
+            rng,
+        )
 
     return responses
 
