@@ -199,12 +199,22 @@ def compute_ld_statistics(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    residuals = _compute_residuals(model, responses, theta)
+    residuals, positive_probabilities = _compute_residuals_and_positive_probabilities(
+        model,
+        responses,
+        theta,
+    )
 
     q3_matrix = _compute_q3(residuals, responses)
     adj_residual_corr = _adjust_q3(q3_matrix)
 
-    ld_chi2_matrix, g2_matrix = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
+    ld_chi2_matrix, g2_matrix = _compute_ld_chi2_g2(
+        model,
+        responses,
+        theta,
+        n_quadpts,
+        positive_probabilities=positive_probabilities,
+    )
 
     rows, columns = np.triu_indices(n_items, k=1)
     q3_values = q3_matrix[rows, columns]
@@ -426,6 +436,50 @@ def _compute_residuals(
     return residuals
 
 
+def _compute_residuals_and_positive_probabilities(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Compute residuals and positive-response probabilities in one pass."""
+    from mirt.diagnostics.residuals import (
+        _all_item_expected_value_variance,
+        _item_expected_value_variance,
+    )
+
+    n_persons, n_items = responses.shape
+    batched = _all_item_expected_value_variance(model, theta, n_items)
+    if batched is not None:
+        probabilities, expected, variance = batched
+        valid = responses >= 0
+        residuals = np.where(
+            valid,
+            (responses - expected) / np.sqrt(variance + PROB_EPSILON),
+            np.nan,
+        )
+        positive = (
+            1.0 - probabilities[:, :, 0] if probabilities.ndim == 3 else probabilities
+        )
+        return residuals, np.asarray(positive, dtype=np.float64)
+
+    residuals = np.full((n_persons, n_items), np.nan)
+    positive = np.empty((n_persons, n_items), dtype=np.float64)
+    for item_idx in range(n_items):
+        probabilities, expected, variance = _item_expected_value_variance(
+            model,
+            theta,
+            item_idx,
+        )
+        positive[:, item_idx] = (
+            1.0 - probabilities[:, 0] if probabilities.ndim == 2 else probabilities
+        )
+        valid = responses[:, item_idx] >= 0
+        residuals[valid, item_idx] = (
+            responses[valid, item_idx] - expected[valid]
+        ) / np.sqrt(variance[valid] + PROB_EPSILON)
+    return residuals, positive
+
+
 def _compute_q3(
     residuals: NDArray[np.float64],
     responses: NDArray[np.int_],
@@ -477,6 +531,8 @@ def _compute_ld_chi2_g2(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
     n_quadpts: int,
+    *,
+    positive_probabilities: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute LD χ² and G² statistics for item pairs.
 
@@ -486,12 +542,15 @@ def _compute_ld_chi2_g2(
     del n_quadpts  # Retained for compatibility with the public call path.
     n_persons, n_items = responses.shape
 
-    positive_probabilities = np.empty((n_persons, n_items), dtype=np.float64)
-    for item_idx in range(n_items):
-        probabilities = np.asarray(model.probability(theta, item_idx))
-        if probabilities.ndim == 2:
-            probabilities = 1.0 - probabilities[:, 0]
-        positive_probabilities[:, item_idx] = probabilities
+    if positive_probabilities is None:
+        positive_probabilities = np.empty((n_persons, n_items), dtype=np.float64)
+        for item_idx in range(n_items):
+            probabilities = np.asarray(model.probability(theta, item_idx))
+            if probabilities.ndim == 2:
+                probabilities = 1.0 - probabilities[:, 0]
+            positive_probabilities[:, item_idx] = probabilities
+    elif positive_probabilities.shape != (n_persons, n_items):
+        raise ValueError("positive_probabilities must match the response matrix shape")
 
     valid = responses >= 0
     valid_float = valid.astype(np.float64)

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import mirt.diagnostics.residuals as residuals_module
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.ld import (
     LDResult,
@@ -24,6 +25,8 @@ class _CountingPolytomousModel:
 
     def __init__(self, n_items: int) -> None:
         self.n_items = n_items
+        self.n_categories = [2] * n_items
+        self.max_categories = 2
         self.item_names = [f"Item_{index}" for index in range(n_items)]
         self.probability_calls = 0
 
@@ -34,8 +37,21 @@ class _CountingPolytomousModel:
         logits = slope * (theta_values - difficulty)
         return 1.0 / (1.0 + np.exp(-logits))
 
-    def probability(self, theta, item_idx):
+    def probability(self, theta, item_idx=None):
         self.probability_calls += 1
+        if item_idx is None:
+            return np.stack(
+                [
+                    np.column_stack(
+                        (
+                            1.0 - self.positive_probability(theta, index),
+                            self.positive_probability(theta, index),
+                        )
+                    )
+                    for index in range(self.n_items)
+                ],
+                axis=1,
+            )
         positive = self.positive_probability(theta, item_idx)
         return np.column_stack((1.0 - positive, positive))
 
@@ -230,7 +246,7 @@ class TestVectorizedLDCalculations:
         )
         assert_allclose(actual_g2, expected_g2, rtol=1e-12, atol=1e-12, equal_nan=True)
 
-    def test_full_analysis_reuses_residual_correlations(self):
+    def test_full_analysis_reuses_one_bounded_probability_pass(self, monkeypatch):
         rng = np.random.default_rng(271828)
         n_persons, n_items = 40, 5
         theta = rng.normal(size=(n_persons, 1))
@@ -241,9 +257,30 @@ class TestVectorizedLDCalculations:
         responses = (rng.random(probabilities.shape) < probabilities).astype(int)
         responses[rng.random(responses.shape) < 0.1] = -1
 
+        monkeypatch.setattr(
+            residuals_module,
+            "_RESIDUAL_MAX_PROBABILITY_VALUES",
+            0,
+        )
+        expected = compute_ld_statistics(model, responses, theta=theta)
+        assert model.probability_calls == n_items
+
+        model.probability_calls = 0
+        monkeypatch.setattr(
+            residuals_module,
+            "_RESIDUAL_MAX_PROBABILITY_VALUES",
+            responses.size * model.max_categories,
+        )
         result = compute_ld_statistics(model, responses, theta=theta)
 
-        assert model.probability_calls == 2 * n_items
+        assert model.probability_calls == 1
+        assert_allclose(result.q3_matrix, expected.q3_matrix, equal_nan=True)
+        assert_allclose(
+            result.ld_chi2_matrix,
+            expected.ld_chi2_matrix,
+            equal_nan=True,
+        )
+        assert_allclose(result.g2_matrix, expected.g2_matrix, equal_nan=True)
         assert_allclose(
             result.adj_residual_corr,
             result.q3_matrix + 1.0 / (n_items - 1),
