@@ -125,6 +125,49 @@ def test_person_level_facet_assignments_broadcast_across_items() -> None:
     )
 
 
+def test_binary_simulation_is_reproducible_across_chunks() -> None:
+    model = _binary()
+
+    unchunked = model.simulate(
+        THETA,
+        ASSIGNMENTS,
+        seed=20260829,
+        chunk_size=N_PERSONS,
+    )
+    chunked = model.simulate(
+        THETA,
+        ASSIGNMENTS,
+        seed=20260829,
+        chunk_size=3,
+    )
+    automatic = model.simulate(THETA, ASSIGNMENTS, seed=20260829)
+
+    assert unchunked.shape == (N_PERSONS, N_ITEMS)
+    assert unchunked.dtype == np.int32
+    assert set(np.unique(unchunked)).issubset({0, 1})
+    np.testing.assert_array_equal(chunked, unchunked)
+    np.testing.assert_array_equal(automatic, unchunked)
+
+
+def test_binary_simulation_matches_response_probabilities() -> None:
+    model = _binary()
+    theta = np.full(50_000, 0.35)
+    assignments = {"rater": 1, "task": 0}
+
+    responses = model.simulate(
+        theta,
+        assignments,
+        seed=819,
+        chunk_size=997,
+    )
+
+    assert_allclose(
+        responses.mean(axis=0),
+        model.probability(theta[0], facet_indices=assignments)[0],
+        atol=0.008,
+    )
+
+
 @pytest.mark.parametrize("factory", [_rating_scale, _partial_credit])
 def test_polytomous_batch_matches_item_calls_and_normalizes(
     factory: Callable[[], PolytomousMFRM],
@@ -155,6 +198,54 @@ def test_polytomous_batch_matches_item_calls_and_normalizes(
                 ),
                 probabilities[:, item_idx, category],
             )
+
+
+@pytest.mark.parametrize("factory", [_rating_scale, _partial_credit])
+def test_polytomous_simulation_is_reproducible_across_chunks(
+    factory: Callable[[], PolytomousMFRM],
+) -> None:
+    model = factory()
+
+    unchunked = model.simulate(
+        THETA,
+        ASSIGNMENTS,
+        seed=771,
+        chunk_size=N_PERSONS,
+    )
+    chunked = model.simulate(THETA, ASSIGNMENTS, seed=771, chunk_size=2)
+    automatic = model.simulate(THETA, ASSIGNMENTS, seed=771)
+
+    assert unchunked.shape == (N_PERSONS, N_ITEMS)
+    assert unchunked.dtype == np.int32
+    assert np.all((unchunked >= 0) & (unchunked < model.n_categories))
+    np.testing.assert_array_equal(chunked, unchunked)
+    np.testing.assert_array_equal(automatic, unchunked)
+
+
+def test_polytomous_simulation_matches_category_probabilities() -> None:
+    model = _partial_credit()
+    theta = np.full(50_000, -0.2)
+    assignments = {"rater": 2, "task": 1}
+
+    responses = model.simulate(
+        theta,
+        assignments,
+        seed=177,
+        chunk_size=983,
+    )
+    frequencies = np.stack(
+        [
+            np.bincount(responses[:, item_idx], minlength=model.n_categories)
+            / len(responses)
+            for item_idx in range(model.n_items)
+        ]
+    )
+
+    assert_allclose(
+        frequencies,
+        model.probability(theta[0], facet_indices=assignments)[0],
+        atol=0.008,
+    )
 
 
 @pytest.mark.parametrize("factory", [_rating_scale, _partial_credit])
@@ -355,6 +446,31 @@ def test_facet_assignments_are_complete_integer_and_in_range() -> None:
         model.probability(
             THETA,
             facet_indices={"rater": np.zeros(3, dtype=int), "task": 0},
+        )
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_simulation_rejects_invalid_chunk_sizes(chunk_size: object) -> None:
+    with pytest.raises(ValueError, match="chunk_size"):
+        _binary().simulate(
+            THETA,
+            ASSIGNMENTS,
+            chunk_size=chunk_size,  # type: ignore[arg-type]
+        )
+
+
+def test_simulation_validates_full_facet_assignment_shape_before_chunking() -> None:
+    invalid_assignments = {
+        "rater": np.zeros(3, dtype=int),
+        "task": 0,
+    }
+
+    with pytest.raises(ValueError, match="indices must have shape"):
+        _binary().simulate(
+            THETA,
+            invalid_assignments,
+            seed=4,
+            chunk_size=3,
         )
 
 
