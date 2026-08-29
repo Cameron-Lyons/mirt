@@ -251,24 +251,23 @@ class EAPSumScorer:
 
         log_prior = np.log(quad_weights + 1e-300)
 
+        log_posterior = log_p_score_given_theta + log_prior[None, :]
+        log_norm = logsumexp(log_posterior, axis=1, keepdims=True)
+        posterior = np.exp(log_posterior - log_norm)
+
+        theta_points = quad_points[:, 0]
+        theta_values = posterior @ theta_points
+        deviations = theta_points[None, :] - theta_values[:, None]
+        se_values = np.sqrt(np.sum(posterior * deviations**2, axis=1))
+
         lookup = {"max_score": max_score}
-        theta_values = np.empty(max_score + 1, dtype=np.float64)
-        se_values = np.empty(max_score + 1, dtype=np.float64)
-
-        for s in range(max_score + 1):
-            log_posterior = log_p_score_given_theta[s, :] + log_prior
-            log_norm = logsumexp(log_posterior)
-            posterior = np.exp(log_posterior - log_norm)
-
-            theta_s = np.dot(posterior, quad_points[:, 0])
-
-            deviation = quad_points[:, 0] - theta_s
-            variance = np.sum(posterior * (deviation**2))
-            se_s = np.sqrt(variance)
-
-            lookup[s] = {"theta": float(theta_s), "se": float(se_s)}
-            theta_values[s] = theta_s
-            se_values[s] = se_s
+        for score, (theta_value, se_value) in enumerate(
+            zip(theta_values, se_values, strict=True)
+        ):
+            lookup[score] = {
+                "theta": float(theta_value),
+                "se": float(se_value),
+            }
 
         self._lookup_tables[item_indices] = lookup
         self._lookup_values[item_indices] = (theta_values, se_values)
@@ -373,45 +372,38 @@ class EAPSumScorer:
                     return result
 
         n_quad = len(quad_points)
-
-        log_dist = np.full((max_score + 1, n_quad), -np.inf)
-        log_dist[0, :] = 0.0
+        log_dist = np.zeros((1, n_quad), dtype=np.float64)
 
         for item_idx in item_indices:
             probs = model.probability(quad_points, item_idx)
 
             if probs.ndim == 1:
-                p1 = probs
-                p0 = 1 - p1
-
-                new_log_dist = np.full_like(log_dist, -np.inf)
-
-                for s in range(max_score + 1):
-                    log_stay = log_dist[s, :] + np.log(p0 + 1e-300)
-
-                    if s > 0:
-                        log_up = log_dist[s - 1, :] + np.log(p1 + 1e-300)
-                        new_log_dist[s, :] = np.logaddexp(log_stay, log_up)
-                    else:
-                        new_log_dist[s, :] = log_stay
-
-                log_dist = new_log_dist
-
+                log_probs = np.column_stack(
+                    (np.log(1.0 - probs + 1e-300), np.log(probs + 1e-300))
+                )
             else:
-                n_cats = probs.shape[1]
                 log_probs = np.log(probs + 1e-300)
 
-                new_log_dist = np.full_like(log_dist, -np.inf)
+            previous_scores = log_dist.shape[0]
+            n_categories = log_probs.shape[1]
+            new_log_dist = np.full(
+                (previous_scores + n_categories - 1, n_quad),
+                -np.inf,
+                dtype=np.float64,
+            )
+            for category in range(n_categories):
+                target = new_log_dist[category : category + previous_scores]
+                np.logaddexp(
+                    target,
+                    log_dist + log_probs[:, category],
+                    out=target,
+                )
+            log_dist = new_log_dist
 
-                for s in range(max_score + 1):
-                    for c in range(n_cats):
-                        if s >= c and s - c <= max_score:
-                            contribution = log_dist[s - c, :] + log_probs[:, c]
-                            new_log_dist[s, :] = np.logaddexp(
-                                new_log_dist[s, :], contribution
-                            )
-
-                log_dist = new_log_dist
+        if log_dist.shape[0] != max_score + 1:
+            raise RuntimeError(
+                "sum-score distribution size does not match the model structure"
+            )
 
         return log_dist
 
