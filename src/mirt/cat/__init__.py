@@ -113,6 +113,8 @@ _LAZY_IMPORTS = {
     "create_content_constraint": "mirt.cat.content",
     "FormAssemblyResult": "mirt.cat.assembly",
     "assemble_form": "mirt.cat.assembly",
+    "ParallelFormAssemblyResult": "mirt.cat.parallel_assembly",
+    "assemble_parallel_forms": "mirt.cat.parallel_assembly",
 }
 
 __all__ = list(_LAZY_IMPORTS)

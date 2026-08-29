@@ -7,11 +7,43 @@ import pytest
 
 from mirt.models import GradedResponseModel, TwoParameterLogistic
 from mirt.scoring import fscores
+from mirt.scoring._common import unique_response_patterns
 from mirt.scoring.map import MAPScorer
 from mirt.scoring.ml import MLScorer
 from mirt.scoring.wle import WLEScorer
 
 OptimizerScorer = MLScorer | MAPScorer | WLEScorer
+
+
+def test_response_pattern_compression_reconstructs_noncontiguous_input() -> None:
+    base = np.array(
+        [
+            [0, 1, -1, 2, 3, 4],
+            [1, 0, 2, -1, 4, 3],
+            [0, 1, -1, 2, 3, 4],
+            [2, 2, 1, 0, -1, 1],
+        ],
+        dtype=np.int_,
+    )
+    responses = base[:, ::2]
+
+    patterns, inverse = unique_response_patterns(responses)
+
+    assert patterns.shape == (3, 3)
+    assert inverse.dtype == np.intp
+    np.testing.assert_array_equal(patterns[inverse], responses)
+
+
+def test_response_pattern_keys_preserve_large_category_codes() -> None:
+    responses = np.array(
+        [[0, 40_000], [0, -40_000], [0, 40_000]],
+        dtype=np.int_,
+    )
+
+    patterns, inverse = unique_response_patterns(responses)
+
+    assert patterns.shape == (2, 2)
+    np.testing.assert_array_equal(patterns[inverse], responses)
 
 
 @pytest.mark.parametrize(
