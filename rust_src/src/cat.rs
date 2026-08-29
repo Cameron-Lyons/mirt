@@ -1,7 +1,7 @@
 //! Computerized Adaptive Testing (CAT) functions.
 
-use numpy::ndarray::Array1;
-use numpy::{PyArray1, PyReadonlyArray1, ToPyArray};
+use numpy::ndarray::{Array1, Array2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
@@ -29,13 +29,16 @@ struct StoppingRule {
     min_items: usize,
 }
 
-/// Result type for batch CAT simulations: (theta_est, se_est, n_items, true_theta)
+/// Result type for batch CAT simulations, including padded administration paths.
 type CATBatchResult<'py> = (
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<i32>>,
     Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<i32>>,
+    Bound<'py, PyArray2<i32>>,
 );
+type CATSimulationRecord = (f64, f64, usize, f64, Vec<i32>, Vec<i32>);
 
 /// Result type for conditional MSE: (eval_thetas, bias, mse, avg_items)
 type CATMseResult<'py> = (
@@ -264,19 +267,21 @@ pub fn cat_simulate_batch<'py>(
     let weights = quad_weights.as_array().to_vec();
 
     let n_thetas = thetas.len();
-    let n_total = n_thetas * n_replications as usize;
+    let n_reps = usize::try_from(n_replications).unwrap_or(0);
+    let n_total = n_thetas * n_reps;
+    let path_width = usize::try_from(max_items).unwrap_or(0).min(disc.len());
 
     let stopping = StoppingRule {
         se_threshold,
-        max_items: max_items as usize,
-        min_items: min_items as usize,
+        max_items: path_width,
+        min_items: usize::try_from(min_items).unwrap_or(0).min(path_width),
     };
 
     let tasks: Vec<(usize, usize)> = (0..n_thetas)
-        .flat_map(|t| (0..n_replications as usize).map(move |r| (t, r)))
+        .flat_map(|t| (0..n_reps).map(move |r| (t, r)))
         .collect();
 
-    let results: Vec<(f64, f64, usize, f64)> = tasks
+    let results: Vec<CATSimulationRecord> = tasks
         .par_iter()
         .map(|(theta_idx, rep)| {
             let task_seed = seed
@@ -294,10 +299,17 @@ pub fn cat_simulate_batch<'py>(
             };
 
             let true_theta = thetas[*theta_idx];
-            let (est_theta, est_se, n_items, _, _) =
+            let (est_theta, est_se, n_items, administered, responses) =
                 cat_simulate_single(true_theta, &items, &quad, &stopping, &mut rng);
 
-            (est_theta, est_se, n_items, true_theta)
+            (
+                est_theta,
+                est_se,
+                n_items,
+                true_theta,
+                administered,
+                responses,
+            )
         })
         .collect();
 
@@ -305,12 +317,18 @@ pub fn cat_simulate_batch<'py>(
     let mut se_est = Array1::zeros(n_total);
     let mut n_items = Array1::zeros(n_total);
     let mut true_theta_out = Array1::zeros(n_total);
+    let mut administered_out = Array2::from_elem((n_total, path_width), -1);
+    let mut responses_out = Array2::from_elem((n_total, path_width), -1);
 
-    for (i, (t, s, n, tt)) in results.into_iter().enumerate() {
+    for (i, (t, s, n, tt, administered, responses)) in results.into_iter().enumerate() {
         theta_est[i] = t;
         se_est[i] = s;
         n_items[i] = n as i32;
         true_theta_out[i] = tt;
+        for (step, (&item, &response)) in administered.iter().zip(responses.iter()).enumerate() {
+            administered_out[[i, step]] = item;
+            responses_out[[i, step]] = response;
+        }
     }
 
     (
@@ -318,6 +336,8 @@ pub fn cat_simulate_batch<'py>(
         se_est.to_pyarray(py),
         n_items.to_pyarray(py),
         true_theta_out.to_pyarray(py),
+        administered_out.to_pyarray(py),
+        responses_out.to_pyarray(py),
     )
 }
 

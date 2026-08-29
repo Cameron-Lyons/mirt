@@ -312,7 +312,7 @@ def test_simulation_dispatches_normalized_inputs(
     monkeypatch, function_name, theta_name
 ):
     captured = {}
-    sentinel = (np.array([1.0]),) * 4
+    sentinel = (np.array([1.0]),) * (6 if function_name == "cat_simulate_batch" else 4)
 
     def fake_simulation(*args):
         captured["args"] = args
@@ -325,15 +325,74 @@ def test_simulation_dispatches_normalized_inputs(
 
     result = getattr(cat_module, function_name)(**_simulation_inputs(theta_name))
 
-    assert result is sentinel
+    if function_name == "cat_simulate_batch":
+        assert result == sentinel[:4]
+    else:
+        assert result is sentinel
     for vector in captured["args"][:5]:
         assert vector.dtype == np.float64
         assert vector.flags.c_contiguous
     assert captured["args"][5:] == (0.3, 4, 2, 3, 91)
 
 
+def test_full_batch_simulation_retains_native_paths(monkeypatch):
+    sentinel = (
+        np.array([0.1]),
+        np.array([0.2]),
+        np.array([2], dtype=np.int32),
+        np.array([0.0]),
+        np.array([[3, 1, -1]], dtype=np.int32),
+        np.array([[1, 0, -1]], dtype=np.int32),
+    )
+    monkeypatch.setattr(cat_module, "rust_enabled", lambda: True)
+    monkeypatch.setattr(
+        cat_module,
+        "mirt_rs",
+        SimpleNamespace(cat_simulate_batch=lambda *args: sentinel),
+    )
+
+    result = cat_module.cat_simulate_batch_full(**_simulation_inputs())
+
+    assert result is sentinel
+
+
+def test_full_batch_simulation_rejects_invalid_native_payload(monkeypatch):
+    monkeypatch.setattr(cat_module, "rust_enabled", lambda: True)
+    monkeypatch.setattr(
+        cat_module,
+        "mirt_rs",
+        SimpleNamespace(cat_simulate_batch=lambda *args: (np.array([1.0]),) * 4),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid payload"):
+        cat_module.cat_simulate_batch_full(**_simulation_inputs())
+
+
+def test_installed_full_batch_paths_align_with_counts(monkeypatch):
+    if not cat_module.mirt_rs:
+        pytest.skip("native backend is not installed")
+    monkeypatch.setattr(cat_module, "rust_enabled", lambda: True)
+
+    result = cat_module.cat_simulate_batch_full(**_simulation_inputs())
+
+    assert result is not None
+    theta, standard_error, counts, true_theta, items, responses = result
+    assert (
+        theta.shape == standard_error.shape == counts.shape == true_theta.shape == (9,)
+    )
+    assert items.shape == responses.shape == (9, 4)
+    for row, count_value in enumerate(counts):
+        count = int(count_value)
+        assert 2 <= count <= 4
+        assert len(set(items[row, :count].tolist())) == count
+        assert np.isin(responses[row, :count], [0, 1]).all()
+        assert np.all(items[row, count:] == -1)
+        assert np.all(responses[row, count:] == -1)
+
+
 def test_optional_simulation_returns_none_without_native_backend(monkeypatch):
     monkeypatch.setattr(cat_module, "rust_enabled", lambda: False)
 
     assert cat_module.cat_simulate_batch(**_simulation_inputs()) is None
+    assert cat_module.cat_simulate_batch_full(**_simulation_inputs()) is None
     assert cat_module.cat_conditional_mse(**_simulation_inputs("eval_thetas")) is None

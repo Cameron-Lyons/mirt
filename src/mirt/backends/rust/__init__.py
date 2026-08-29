@@ -74,6 +74,7 @@ _MODULE_EXPORTS = {
         "cat_select_max_info",
         "cat_eap_update",
         "cat_simulate_batch",
+        "cat_simulate_batch_full",
         "cat_conditional_mse",
     ),
     "eapsum": (

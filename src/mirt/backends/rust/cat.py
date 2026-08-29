@@ -1,6 +1,7 @@
 """Rust backend: cat.
 
-Fallback mode: mixed. cat_compute_item_info / cat_select_max_info / cat_eap_update are numpy; cat_simulate_batch / cat_conditional_mse are optional.
+Fallback mode: mixed. Item information, selection, and EAP updates have NumPy
+fallbacks; batch simulation and conditional MSE helpers are optional.
 """
 
 from __future__ import annotations
@@ -17,6 +18,21 @@ from mirt.backends.rust._helpers import (
 )
 
 FALLBACK_MODE = "mixed"
+
+CATBatchSummary = tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.int32],
+    NDArray[np.float64],
+]
+CATBatchDetails = tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.int32],
+    NDArray[np.float64],
+    NDArray[np.int32],
+    NDArray[np.int32],
+]
 
 
 def _numeric_vector(values: NDArray[np.float64], name: str) -> NDArray[np.float64]:
@@ -339,12 +355,7 @@ def cat_simulate_batch(
     min_items: int,
     n_replications: int,
     seed: int | None = None,
-) -> (
-    tuple[
-        NDArray[np.float64], NDArray[np.float64], NDArray[np.int32], NDArray[np.float64]
-    ]
-    | None
-):
+) -> CATBatchSummary | None:
     """Run batch CAT simulations in parallel using Rust.
 
     Parameters
@@ -376,6 +387,42 @@ def cat_simulate_batch(
         (theta_estimates, se_estimates, n_items, true_thetas_expanded).
         Returns None if Rust backend not available.
     """
+    result = cat_simulate_batch_full(
+        true_thetas,
+        discrimination,
+        difficulty,
+        quad_points,
+        quad_weights,
+        se_threshold,
+        max_items,
+        min_items,
+        n_replications,
+        seed,
+    )
+    if result is None:
+        return None
+    return result[:4]
+
+
+def cat_simulate_batch_full(
+    true_thetas: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    quad_weights: NDArray[np.float64],
+    se_threshold: float,
+    max_items: int,
+    min_items: int,
+    n_replications: int,
+    seed: int | None = None,
+) -> CATBatchDetails | None:
+    """Run native batch simulations and retain item and response paths.
+
+    The final two arrays have one row per simulation and up to ``max_items``
+    columns, capped by the item-bank size. They use ``-1`` only for padding
+    beyond each simulation's reported item count.
+    Returns ``None`` when the native backend is unavailable or disabled.
+    """
     (
         true_thetas,
         discrimination,
@@ -401,21 +448,23 @@ def cat_simulate_batch(
         seed,
     )
 
-    if rust_enabled():
-        return mirt_rs.cat_simulate_batch(
-            true_thetas,
-            discrimination,
-            difficulty,
-            quad_points,
-            quad_weights,
-            se_threshold,
-            max_items,
-            min_items,
-            n_replications,
-            seed,
-        )
-
-    return None
+    if not rust_enabled():
+        return None
+    result = mirt_rs.cat_simulate_batch(
+        true_thetas,
+        discrimination,
+        difficulty,
+        quad_points,
+        quad_weights,
+        se_threshold,
+        max_items,
+        min_items,
+        n_replications,
+        seed,
+    )
+    if not isinstance(result, tuple) or len(result) != 6:
+        raise RuntimeError("native CAT batch simulation returned an invalid payload")
+    return result
 
 
 def cat_conditional_mse(
