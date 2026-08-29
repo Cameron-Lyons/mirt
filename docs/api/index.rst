@@ -39,6 +39,9 @@ Models
    BifactorModel
    MixtureIRT
    TestletModel
+   models.MultilevelIRTModel
+   models.ThreeLevelIRTModel
+   models.CrossedRandomEffectsModel
    ResponseTimeModel
    DINA
    DINO

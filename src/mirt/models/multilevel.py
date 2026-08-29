@@ -16,6 +16,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.numeric import logsumexp_axis1, standard_normal_quadrature
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -143,6 +144,99 @@ def _validate_theta(
     if not np.all(np.isfinite(values)):
         raise ValueError("theta must contain only finite values")
     return values
+
+
+def _validate_responses(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    expected_persons: int,
+) -> NDArray[np.int32]:
+    """Return a validated response matrix with negative missing codes normalized."""
+    try:
+        raw = np.asarray(responses)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("responses must contain numeric response codes") from exc
+    if raw.ndim != 2:
+        raise ValueError("responses must be two-dimensional")
+    expected_shape = (expected_persons, model.n_items)
+    if raw.shape != expected_shape:
+        raise ValueError(f"responses shape {raw.shape} != {expected_shape}")
+    if raw.dtype.kind not in "biuf":
+        raise ValueError("responses must contain numeric response codes")
+
+    values = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(values)):
+        raise ValueError("responses must contain only finite values")
+    observed = values >= 0.0
+    if np.any(observed & (values != np.floor(values))):
+        raise ValueError("observed responses must contain integer response codes")
+
+    if model.is_polytomous:
+        category_counts = np.asarray(model.n_categories, dtype=np.float64)
+        if np.any(observed & (values >= category_counts[None, :])):
+            raise ValueError("observed responses exceed an item's category range")
+    elif np.any(observed & (values > 1.0)):
+        raise ValueError(
+            "dichotomous responses must contain only 0, 1, or missing values"
+        )
+
+    return np.where(observed, values, -1.0).astype(np.int32, copy=False)
+
+
+def _marginal_response_log_likelihoods(
+    model: BaseItemModel,
+    responses: NDArray[np.int32],
+    prior_means: NDArray[np.float64],
+    prior_variance: float,
+    n_quadpts: int,
+    chunk_size: int | None,
+) -> NDArray[np.float64]:
+    """Integrate person response patterns over grouped normal priors."""
+    if model.n_factors != 1:
+        raise ValueError("marginal likelihood requires a unidimensional base model")
+    if (
+        isinstance(n_quadpts, (bool, np.bool_))
+        or not isinstance(n_quadpts, (int, np.integer))
+        or n_quadpts < 1
+    ):
+        raise ValueError("n_quadpts must be a positive integer")
+
+    means = np.asarray(prior_means, dtype=np.float64)
+    if means.shape != (responses.shape[0],) or not np.all(np.isfinite(means)):
+        raise ValueError("prior means must be finite with one value per person")
+    variance = _finite_variance(prior_variance, "prior", positive=True)
+    nodes, weights = standard_normal_quadrature(int(n_quadpts))
+    log_weights = np.log(weights)
+    rows_per_chunk = _validate_chunk_size(
+        chunk_size,
+        responses.shape[0],
+        int(n_quadpts) + model.n_items,
+    )
+
+    unique_means, mean_positions = np.unique(means, return_inverse=True)
+    marginal = np.empty(responses.shape[0], dtype=np.float64)
+    prior_scale = np.sqrt(variance)
+
+    for mean_position, mean in enumerate(unique_means):
+        person_indices = np.flatnonzero(mean_positions == mean_position)
+        theta = (mean + prior_scale * nodes).reshape(-1, 1)
+        for start in range(0, person_indices.size, rows_per_chunk):
+            indices = person_indices[start : start + rows_per_chunk]
+            conditional = np.asarray(
+                model.log_likelihood_batch(responses[indices], theta),
+                dtype=np.float64,
+            )
+            expected_shape = (indices.size, int(n_quadpts))
+            if conditional.shape != expected_shape:
+                raise ValueError(
+                    "base model returned log-likelihood shape "
+                    f"{conditional.shape}, expected {expected_shape}"
+                )
+            if not np.all(np.isfinite(conditional)):
+                raise ValueError("base model returned non-finite log likelihoods")
+            marginal[indices] = logsumexp_axis1(conditional + log_weights[None, :])
+
+    return marginal
 
 
 def _validate_chunk_size(
@@ -408,6 +502,52 @@ class MultilevelIRTModel:
         """Compute the response log-likelihood given person abilities."""
         return float(np.sum(self._base_model.log_likelihood(responses, theta)))
 
+    def marginal_log_likelihoods(
+        self,
+        responses: NDArray[np.int_],
+        n_quadpts: int = 21,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return person response-pattern log likelihoods under group priors.
+
+        Person ability is integrated over a normal distribution centered on
+        the person's current group mean with variance :attr:`within_variance`.
+        Respondents sharing a mean are evaluated together, and ``chunk_size``
+        can place a tighter bound on working memory.
+        """
+        response_values = _validate_responses(
+            self._base_model,
+            responses,
+            self._n_persons,
+        )
+        return _marginal_response_log_likelihoods(
+            self._base_model,
+            response_values,
+            self.person_prior_mean(),
+            self._within_variance,
+            n_quadpts,
+            chunk_size,
+        )
+
+    def marginal_log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        n_quadpts: int = 21,
+        *,
+        chunk_size: int | None = None,
+    ) -> float:
+        """Return the total response log likelihood under the group priors."""
+        return float(
+            np.sum(
+                self.marginal_log_likelihoods(
+                    responses,
+                    n_quadpts,
+                    chunk_size=chunk_size,
+                )
+            )
+        )
+
     def sample_abilities(self, seed: int | None = None) -> NDArray[np.float64]:
         """Draw person traits conditional on the current group means.
 
@@ -648,6 +788,51 @@ class ThreeLevelIRTModel:
     ) -> float:
         """Compute the response log-likelihood given person abilities."""
         return float(np.sum(self._base_model.log_likelihood(responses, theta)))
+
+    def marginal_log_likelihoods(
+        self,
+        responses: NDArray[np.int_],
+        n_quadpts: int = 21,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return person response-pattern log likelihoods under level priors.
+
+        Person ability is integrated around the sum of the current level-2
+        and level-3 effects with variance given by the within component.
+        Respondents with an equal combined mean share each quadrature pass.
+        """
+        response_values = _validate_responses(
+            self._base_model,
+            responses,
+            self._n_persons,
+        )
+        return _marginal_response_log_likelihoods(
+            self._base_model,
+            response_values,
+            self.person_prior_mean(),
+            self._within_variance,
+            n_quadpts,
+            chunk_size,
+        )
+
+    def marginal_log_likelihood(
+        self,
+        responses: NDArray[np.int_],
+        n_quadpts: int = 21,
+        *,
+        chunk_size: int | None = None,
+    ) -> float:
+        """Return the total response log likelihood under the level priors."""
+        return float(
+            np.sum(
+                self.marginal_log_likelihoods(
+                    responses,
+                    n_quadpts,
+                    chunk_size=chunk_size,
+                )
+            )
+        )
 
     def sample_abilities(self, seed: int | None = None) -> NDArray[np.float64]:
         """Draw person traits conditional on the current level effects."""
