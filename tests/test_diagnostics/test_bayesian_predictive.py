@@ -148,6 +148,26 @@ def test_native_style_unidimensional_theta_chain_is_supported() -> None:
     assert_allclose(actual, expected)
 
 
+def test_pointwise_likelihood_broadcasts_fixed_parameters_and_theta() -> None:
+    model, responses, chains = _dichotomous_case()
+    n_samples = 3
+    fixed_theta = chains["theta"][0]
+    fixed = {
+        "log_likelihood": np.zeros(n_samples),
+        "theta": fixed_theta,
+    }
+    sampled = {
+        "discrimination": np.tile(model.discrimination, (n_samples, 1)),
+        "difficulty": np.tile(model.difficulty, (n_samples, 1)),
+        "theta": np.tile(fixed_theta, (n_samples, 1, 1)),
+    }
+
+    expected = compute_pointwise_log_lik(model, responses, sampled, by="observed")
+    actual = compute_pointwise_log_lik(model, responses, fixed, by="observed")
+
+    assert_allclose(actual, expected)
+
+
 def test_boolean_dichotomous_responses_are_supported() -> None:
     model, responses, chains = _dichotomous_case()
     complete = np.maximum(responses, 0)
