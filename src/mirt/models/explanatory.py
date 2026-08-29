@@ -9,9 +9,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
-from mirt.utils.numeric import logsumexp_axis1, standard_normal_quadrature
+from mirt.utils.numeric import standard_normal_quadrature
 
 
 def _positive_integer(value: int, name: str) -> int:
@@ -872,45 +871,31 @@ class ExplanatoryIRT(DichotomousItemModel):
             )
         if raw_responses.dtype.kind not in "biuf":
             raise ValueError("responses must contain numeric values")
-        response_values = np.asarray(raw_responses, dtype=np.float64)
-        if not np.all(np.isfinite(response_values)):
+        if not np.all(np.isfinite(raw_responses)):
             raise ValueError("responses must contain only finite values")
-        observed = response_values >= 0.0
-        if np.any(observed & (response_values != 0.0) & (response_values != 1.0)):
+        observed = raw_responses >= 0
+        if np.any(observed & (raw_responses != 0) & (raw_responses != 1)):
             raise ValueError("observed responses must contain only 0 and 1")
 
         mean = self._latent_regression.predict_mean(covariates)
-        if response_values.shape[0] != mean.size:
+        if raw_responses.shape[0] != mean.size:
             raise ValueError(
                 "responses and covariates must contain the same number of persons"
             )
-        values = np.where(observed, response_values, 0.0)
-        incorrect = observed.astype(np.float64) - values
         nodes, weights = standard_normal_quadrature(n_quadpts)
-        scale = np.sqrt(self._latent_regression.residual_variance)
-        log_integrand = np.empty((mean.size, n_quadpts), dtype=np.float64)
+        from mirt.backends.rust.explanatory import (
+            compute_explanatory_marginal_log_likelihood,
+        )
 
-        for point, (node, weight) in enumerate(zip(nodes, weights, strict=True)):
-            theta = (mean + scale * node).reshape(-1, 1)
-            probabilities = np.clip(
-                self.probability(theta),
-                PROB_EPSILON,
-                1.0 - PROB_EPSILON,
-            )
-            conditional_log_likelihood = np.einsum(
-                "ij,ij->i",
-                values,
-                np.log(probabilities),
-                optimize=True,
-            ) + np.einsum(
-                "ij,ij->i",
-                incorrect,
-                np.log1p(-probabilities),
-                optimize=True,
-            )
-            log_integrand[:, point] = np.log(weight) + conditional_log_likelihood
-
-        return logsumexp_axis1(log_integrand)
+        return compute_explanatory_marginal_log_likelihood(
+            raw_responses,
+            mean,
+            np.sqrt(self._latent_regression.residual_variance),
+            nodes,
+            weights,
+            self._parameters["discrimination"],
+            self.difficulty,
+        )
 
     def information(
         self,
