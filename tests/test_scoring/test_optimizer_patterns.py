@@ -51,7 +51,6 @@ def test_response_pattern_keys_preserve_large_category_codes() -> None:
     [
         (MLScorer, "_score_unidimensional"),
         (MAPScorer, "_score_unidimensional"),
-        (WLEScorer, "_estimate_person"),
     ],
 )
 def test_optimizer_scorers_reuse_unique_response_patterns(
@@ -85,30 +84,37 @@ def test_optimizer_scorers_reuse_unique_response_patterns(
     np.testing.assert_allclose(result.theta[[1, 4]], result.theta[1])
 
 
-def test_missing_codes_share_one_optimizer_result(
+def test_wle_batched_path_reuses_normalized_response_patterns(
     fitted_2pl_model,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = fitted_2pl_model.model
-    responses = np.zeros((2, model.n_items), dtype=int)
+    first = np.resize(np.array([0, 1]), model.n_items)
+    second = 1 - first
+    responses = np.vstack([first, second, first, first, second])
     responses[0, 0] = -1
-    responses[1, 0] = -999
-    scorer = WLEScorer()
-    original = scorer._estimate_person
-    calls = 0
+    responses[2, 0] = -999
+    responses[3, 0] = -4
+    captured: list[np.ndarray] = []
 
-    def counted(*args: object, **kwargs: object):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
+    def fake_batch(response_patterns: np.ndarray, *args: object, **kwargs: object):
+        captured.append(response_patterns.copy())
+        count = response_patterns.shape[0]
+        return np.arange(count, dtype=float), np.arange(count, dtype=float) + 1.0
 
-    monkeypatch.setattr(scorer, "_estimate_person", counted)
+    monkeypatch.setattr("mirt.backends.rust.scoring.compute_wle_scores", fake_batch)
 
-    result = scorer.score(model, responses)
+    result = WLEScorer().score(model, responses)
 
-    assert calls == 1
-    np.testing.assert_allclose(result.theta[0], result.theta[1])
-    np.testing.assert_allclose(result.standard_error[0], result.standard_error[1])
+    assert len(captured) == 1
+    assert captured[0].shape == (2, model.n_items)
+    assert np.min(captured[0]) == -1
+    assert np.count_nonzero(captured[0][:, 0] == -1) == 1
+    np.testing.assert_allclose(result.theta[[0, 2, 3]], result.theta[0])
+    np.testing.assert_allclose(
+        result.standard_error[[0, 2, 3]], result.standard_error[0]
+    )
+    np.testing.assert_allclose(result.theta[[1, 4]], result.theta[1])
 
 
 @pytest.mark.parametrize("scorer", [MLScorer(), MAPScorer(), WLEScorer()])

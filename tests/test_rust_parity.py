@@ -161,6 +161,35 @@ def test_eap_scores_rust_matches_numpy(restore_backend) -> None:
     np.testing.assert_allclose(rust_se, numpy_se, rtol=1e-9, atol=1e-9)
 
 
+def test_wle_scores_rust_matches_numpy_with_missing_data(restore_backend) -> None:
+    responses, _, disc, diff = _sample_2pl(44)
+    responses[0] = -1
+
+    mirt.set_backend("auto")
+    rust_theta, rust_se = rb.compute_wle_scores(
+        responses,
+        disc,
+        diff,
+        theta_min=-5.0,
+        theta_max=4.5,
+        tol=1e-8,
+        n_jobs=3,
+    )
+    mirt.set_backend("numpy")
+    numpy_theta, numpy_se = rb.compute_wle_scores(
+        responses,
+        disc,
+        diff,
+        theta_min=-5.0,
+        theta_max=4.5,
+        tol=1e-8,
+        n_jobs=3,
+    )
+
+    np.testing.assert_allclose(rust_theta, numpy_theta, rtol=1e-8, atol=5e-8)
+    np.testing.assert_allclose(rust_se, numpy_se, rtol=1e-8, atol=5e-8)
+
+
 def test_q3_and_residuals_rust_match_numpy(restore_backend) -> None:
     rng = np.random.default_rng(99)
     responses = rng.integers(0, 2, size=(50, 10), dtype=np.int32)

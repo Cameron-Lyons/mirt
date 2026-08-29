@@ -31,7 +31,7 @@ _MODULE_EXPORTS = {
         "compute_expected_counts_polytomous",
         "compute_expected_counts_parallel",
     ),
-    "scoring": ("compute_eap_scores",),
+    "scoring": ("compute_eap_scores", "compute_wle_scores"),
     "estimation": (
         "em_fit_2pl",
         "gibbs_sample_2pl",

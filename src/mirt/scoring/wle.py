@@ -33,6 +33,13 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+def _supports_batched_2pl_wle(model: BaseItemModel) -> bool:
+    """Return whether the model has the exact native 2PL WLE contract."""
+    from mirt.models.dichotomous import TwoParameterLogistic
+
+    return type(model) is TwoParameterLogistic and model.n_factors == 1
+
+
 class WLEScorer:
     """Weighted Likelihood Estimation scorer.
 
@@ -119,6 +126,24 @@ class WLEScorer:
         responses = validate_scoring_responses(model, responses)
         patterns, inverse = unique_response_patterns(responses)
         n_factors = model.n_factors
+
+        if _supports_batched_2pl_wle(model):
+            from mirt.backends.rust.scoring import compute_wle_scores
+
+            theta_wle, theta_se = compute_wle_scores(
+                patterns,
+                model.parameters["discrimination"],
+                model.parameters["difficulty"],
+                theta_min=self.bounds[0],
+                theta_max=self.bounds[1],
+                tol=self.tol,
+                n_jobs=resolve_n_jobs(self.n_jobs),
+            )
+            return ScoreResult(
+                theta=theta_wle[inverse],
+                standard_error=theta_se[inverse],
+                method="WLE",
+            )
 
         def score_person(
             index: int,
