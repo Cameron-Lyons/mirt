@@ -93,6 +93,21 @@ scalar cut or an array broadcastable to the score shape, including one cut per f
 for multidimensional scores. Zero standard error produces a deterministic decision
 away from the cut, while infinite or unknown uncertainty does not force a decision.
 
+WLE performance and missing responses
+-------------------------------------
+
+Unidimensional 2PL WLE scoring groups repeated response patterns and evaluates the
+unique patterns through a batched backend. It uses the native implementation when
+available and a vectorized, memory-bounded NumPy implementation otherwise. Pass
+``n_jobs`` to ``fscores`` to control native worker parallelism; ``-1`` uses all
+available CPU cores. Other model families and multidimensional models retain the
+general scorer.
+
+Negative response values are treated as missing. Missing items contribute neither
+log likelihood nor test information, so reported WLE standard errors reflect only
+the items observed for each person. A person with no observed items receives theta
+zero and infinite standard error.
+
 Posterior ability distributions
 -------------------------------
 

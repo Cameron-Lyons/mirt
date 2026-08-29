@@ -20,6 +20,7 @@ EXPECTED_EXPORTS = (
     "compute_expected_counts_polytomous",
     "compute_expected_counts_parallel",
     "compute_eap_scores",
+    "compute_wle_scores",
     "em_fit_2pl",
     "gibbs_sample_2pl",
     "mhrm_fit_2pl",
@@ -129,7 +130,7 @@ def test_plain_backend_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "native_loaded": False,
         "backend_submodules": [],
-        "export_count": 75,
+        "export_count": 76,
         "exports_visible": True,
     }
 
@@ -219,7 +220,7 @@ def test_star_import_resolves_every_public_backend_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 75,
+        "export_count": 76,
         "all_cached": True,
     }
 
