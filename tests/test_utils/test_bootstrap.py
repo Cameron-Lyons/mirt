@@ -12,7 +12,11 @@ from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.dichotomous import FourParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
-from mirt.utils.bootstrap import _elementwise_percentile, _simulate_model_responses
+from mirt.utils.bootstrap import (
+    _elementwise_percentile,
+    _resample_rng_chunks,
+    _simulate_model_responses,
+)
 
 
 def test_elementwise_percentile_matches_independent_numpy_quantiles():
@@ -28,6 +32,27 @@ def test_elementwise_percentile_matches_independent_numpy_quantiles():
         )
 
     np.testing.assert_allclose(actual, expected, atol=3e-15, rtol=0.0)
+
+
+def test_resample_rng_chunks_preserve_the_original_random_stream():
+    expected_rng = np.random.default_rng(42)
+    expected = [expected_rng.integers(0, 17, size=17) for _ in range(13)]
+
+    rng = np.random.default_rng(42)
+    chunks = _resample_rng_chunks(rng, 13, 17, 4)
+    actual = []
+    for state, chunk_size in chunks:
+        chunk_rng = np.random.default_rng()
+        chunk_rng.bit_generator.state = state
+        actual.extend(chunk_rng.integers(0, 17, size=17) for _ in range(chunk_size))
+
+    assert [chunk_size for _, chunk_size in chunks] == [4, 3, 3, 3]
+    for actual_indices, expected_indices in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(actual_indices, expected_indices)
+    np.testing.assert_array_equal(
+        rng.integers(0, 17, size=17),
+        expected_rng.integers(0, 17, size=17),
+    )
 
 
 def test_elementwise_percentile_requires_one_quantile_per_element():

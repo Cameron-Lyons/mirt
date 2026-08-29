@@ -1,7 +1,8 @@
-"""Validated plotting helpers for IRT models and diagnostics.
+"""Validated plotting helpers with call-specific numerical dependencies.
 
-Matplotlib remains optional: importing :mod:`mirt` or this module does not load
-it.  A backend is requested only when a function must create its own axes.
+Importing :mod:`mirt` or this module does not load NumPy, SciPy, or Matplotlib.
+NumPy is requested by the first plotting call, Matplotlib only when a function
+must create its own axes, and SciPy only for a requested density estimate.
 Callers may also supply an existing axes-compatible object.
 """
 
@@ -10,12 +11,12 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
-import numpy as np
-from numpy.typing import NDArray
-
 from mirt.constants import PROB_EPSILON
 
 if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+
     from mirt.models.base import BaseItemModel
 
 
@@ -40,6 +41,8 @@ def _resolve_axes(ax: Any, figsize: tuple[float, float]) -> Any:
 
 
 def _model_size(model: BaseItemModel) -> tuple[int, int]:
+    import numpy as np
+
     n_items = getattr(model, "n_items", None)
     n_factors = getattr(model, "n_factors", 1)
     if (
@@ -63,6 +66,8 @@ def _theta_grid(
     n_points: int,
     factor: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], tuple[float, float]]:
+    import numpy as np
+
     _, n_factors = _model_size(model)
     limits = np.asarray(theta_range, dtype=np.float64)
     if limits.shape != (2,) or not np.all(np.isfinite(limits)):
@@ -88,6 +93,8 @@ def _item_indices(
     model: BaseItemModel,
     item_idx: int | list[int] | None,
 ) -> list[int]:
+    import numpy as np
+
     n_items, _ = _model_size(model)
     if item_idx is None:
         return list(range(n_items))
@@ -128,6 +135,8 @@ def _probability_curves(
     theta: NDArray[np.float64],
     item_idx: int,
 ) -> NDArray[np.float64]:
+    import numpy as np
+
     probabilities = np.asarray(model.probability(theta, item_idx), dtype=np.float64)
     n_points = theta.shape[0]
     if not np.all(np.isfinite(probabilities)):
@@ -158,6 +167,8 @@ def _curve(
     *,
     nonnegative: bool = False,
 ) -> NDArray[np.float64]:
+    import numpy as np
+
     result = np.asarray(values, dtype=np.float64)
     if result.shape != (n_points,):
         raise ValueError(f"{name} must have shape (n_points,)")
@@ -172,6 +183,8 @@ def _full_information(
     model: BaseItemModel,
     theta: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+    import numpy as np
+
     n_items, _ = _model_size(model)
     n_points = theta.shape[0]
     information = np.asarray(model.information(theta), dtype=np.float64)
@@ -213,6 +226,8 @@ def _information_curves(
     indices: list[int],
     include_total: bool,
 ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
+    import numpy as np
+
     n_items, _ = _model_size(model)
     is_polytomous = bool(getattr(model, "is_polytomous", False))
 
@@ -243,6 +258,8 @@ def _expected_score(
     model: BaseItemModel,
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
+    import numpy as np
+
     expected = _curve(
         model.expected_score(theta),
         theta.shape[0],
@@ -256,6 +273,8 @@ def _expected_score(
 
 
 def _maximum_score(model: BaseItemModel) -> float:
+    import numpy as np
+
     n_items, _ = _model_size(model)
     category_counts = getattr(model, "n_categories", None)
     if isinstance(category_counts, Sequence) and not isinstance(
@@ -268,6 +287,8 @@ def _maximum_score(model: BaseItemModel) -> float:
 
 
 def _factor_values(theta: Any, factor: int, name: str) -> NDArray[np.float64]:
+    import numpy as np
+
     values = np.asarray(theta, dtype=np.float64)
     if isinstance(factor, bool) or not isinstance(factor, (int, np.integer)):
         raise ValueError("factor must be an integer")
@@ -295,6 +316,8 @@ def _names(item_names: list[str] | None, n_items: int) -> list[str]:
 
 
 def _mapping_values(mapping: Mapping[str, Any], key: str) -> NDArray[np.float64]:
+    import numpy as np
+
     if key not in mapping:
         raise ValueError(f"results do not contain {key!r}")
     values = np.asarray(mapping[key], dtype=np.float64)
@@ -306,6 +329,8 @@ def _mapping_values(mapping: Mapping[str, Any], key: str) -> NDArray[np.float64]
 
 
 def _ordered_pair(values: tuple[float, float], name: str) -> tuple[float, float]:
+    import numpy as np
+
     pair = np.asarray(values, dtype=np.float64)
     if pair.shape != (2,) or not np.all(np.isfinite(pair)) or pair[0] >= pair[1]:
         raise ValueError(f"{name} must contain two finite increasing values")
@@ -324,6 +349,8 @@ def plot_icc(
     **kwargs: Any,
 ) -> Any:
     """Plot item response curves, including every category for ordinal items."""
+    import numpy as np
+
     if not isinstance(show_legend, (bool, np.bool_)):
         raise ValueError("show_legend must be boolean")
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
@@ -373,6 +400,8 @@ def plot_category_curves(
     **kwargs: Any,
 ) -> Any:
     """Plot all response-category curves for one item."""
+    import numpy as np
+
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     indices = _item_indices(model, item_idx)
     probabilities = _probability_curves(model, theta, indices[0])
@@ -410,6 +439,8 @@ def plot_information(
     **kwargs: Any,
 ) -> Any:
     """Plot test information and optional item-information curves."""
+    import numpy as np
+
     if not isinstance(test_info, (bool, np.bool_)):
         raise ValueError("test_info must be boolean")
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
@@ -456,6 +487,8 @@ def plot_ability_distribution(
     **kwargs: Any,
 ) -> Any:
     """Plot one ability dimension with optional KDE and normal reference."""
+    import numpy as np
+
     if not isinstance(show_density, (bool, np.bool_)):
         raise ValueError("show_density must be boolean")
     if not isinstance(show_normal, (bool, np.bool_)):
@@ -560,6 +593,8 @@ def plot_itemfit(
 
 
 def _item_locations(model: BaseItemModel, factor: int) -> NDArray[np.float64]:
+    import numpy as np
+
     n_items, n_factors = _model_size(model)
     if factor < 0 or factor >= n_factors:
         raise ValueError(f"factor must be in [0, {n_factors})")
@@ -632,6 +667,8 @@ def plot_person_item_map(
     **kwargs: Any,
 ) -> Any:
     """Plot a Wright map for one factor with persons and item locations."""
+    import numpy as np
+
     values = _factor_values(theta, factor, "theta")
     try:
         np.histogram_bin_edges(values, bins=bins)
@@ -675,6 +712,8 @@ def plot_dif(
     **kwargs: Any,
 ) -> Any:
     """Plot absolute DIF effect sizes using ETS A/B/C classifications."""
+    import numpy as np
+
     if not isinstance(dif_results, Mapping):
         raise ValueError("dif_results must be a mapping")
     effect_sizes = _mapping_values(dif_results, effect_size_key)
@@ -727,6 +766,8 @@ def plot_expected_score(
     **kwargs: Any,
 ) -> Any:
     """Plot a test characteristic curve for dichotomous or ordinal models."""
+    import numpy as np
+
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     expected = _expected_score(model, theta)
     maximum = _maximum_score(model)
@@ -752,6 +793,8 @@ def plot_se(
     **kwargs: Any,
 ) -> Any:
     """Plot standard error of measurement from total information."""
+    import numpy as np
+
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     information, _ = _full_information(model, theta)
     standard_error = 1.0 / np.sqrt(np.maximum(information, PROB_EPSILON))

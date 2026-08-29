@@ -12,6 +12,11 @@ from scipy.integrate import trapezoid
 
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import extract_item_se, fit_group_models, split_groups
+from mirt.diagnostics.multiple_testing import (
+    PValueAdjustment,
+    _validate_p_value_adjustment,
+    adjust_p_values,
+)
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
@@ -33,7 +38,8 @@ def compute_dif(
     max_iter: int = 500,
     tol: float = 1e-4,
     focal_group: str | int | None = None,
-) -> dict[str, NDArray[np.float64]]:
+    p_adjust: PValueAdjustment = "none",
+) -> dict[str, Any]:
     """Compute Differential Item Functioning statistics.
 
     DIF analysis tests whether items function differently across groups
@@ -53,14 +59,22 @@ def compute_dif(
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
+        p_adjust: Multiple-testing adjustment across items. Supported values are
+            'none', 'bonferroni', 'holm', and 'fdr_bh'. Default 'none'.
 
     Returns:
         Dictionary with DIF statistics:
             - 'statistic': Test statistic for each item
             - 'p_value': P-value for each item
+            - 'p_value_adjusted': Multiplicity-adjusted P-value for each item
             - 'effect_size': Effect size measure
-            - 'classification': ETS classification (A/B/C)
+            - 'classification': ETS classification using adjusted P-values
+            - 'adjustment': Adjustment method for each row
     """
+    if method not in {"likelihood_ratio", "wald", "lord", "raju"}:
+        raise ValueError(f"Unknown DIF method: {method}")
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+
     data = np.asarray(data)
     groups = np.asarray(groups)
     n_items = data.shape[1]
@@ -77,16 +91,21 @@ def compute_dif(
         tol=tol,
     )
 
+    result: dict[str, Any]
     if method == "likelihood_ratio":
-        return _dif_likelihood_ratio(ref_result, focal_result, n_items)
+        result = _dif_likelihood_ratio(ref_result, focal_result, n_items)
     elif method == "wald":
-        return _dif_wald(ref_result, focal_result, n_items)
+        result = _dif_wald(ref_result, focal_result, n_items)
     elif method == "lord":
-        return _dif_wald(ref_result, focal_result, n_items)
-    elif method == "raju":
-        return _dif_raju(ref_result, focal_result, n_items)
+        result = _dif_wald(ref_result, focal_result, n_items)
     else:
-        raise ValueError(f"Unknown DIF method: {method}")
+        result = _dif_raju(ref_result, focal_result, n_items)
+
+    adjusted = adjust_p_values(result["p_value"], p_adjust)
+    result["p_value_adjusted"] = adjusted
+    result["classification"] = _ets_classify(result["effect_size"], adjusted)
+    result["adjustment"] = np.full(n_items, p_adjust)
+    return result
 
 
 def _dif_likelihood_ratio(
@@ -265,7 +284,7 @@ def _ets_classify(
     classification = np.empty(n_items, dtype="U1")
 
     for i in range(n_items):
-        es = effect_sizes[i]
+        es = abs(effect_sizes[i])
         p = p_values[i]
 
         if p > 0.05 or es < 0.426:
@@ -279,10 +298,11 @@ def _ets_classify(
 
 
 def flag_dif_items(
-    dif_results: dict[str, NDArray[np.float64]],
+    dif_results: dict[str, Any],
     alpha: float = 0.05,
     min_effect_size: float = 0.426,
     classification: str | None = None,
+    p_adjust: PValueAdjustment = "none",
 ) -> NDArray[np.bool_]:
     """Flag items showing significant DIF.
 
@@ -292,20 +312,42 @@ def flag_dif_items(
         min_effect_size: Minimum effect size to flag.
         classification: If specified, flag items with this ETS class or worse.
             'B' flags B and C items, 'C' flags only C items.
+        p_adjust: Multiple-testing adjustment applied before flagging. Supported
+            values are 'none', 'bonferroni', 'holm', and 'fdr_bh'.
 
     Returns:
         Boolean array indicating flagged items.
     """
-    p_values = dif_results["p_value"]
-    effect_sizes = dif_results["effect_size"]
-    classes = dif_results["classification"]
+    if isinstance(alpha, (bool, np.bool_)):
+        raise ValueError("alpha must be finite and in (0, 1)")
+    try:
+        alpha = float(alpha)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("alpha must be finite and in (0, 1)") from exc
+    if not 0.0 < alpha < 1.0:
+        raise ValueError("alpha must be finite and in (0, 1)")
+    if isinstance(min_effect_size, (bool, np.bool_)):
+        raise ValueError("min_effect_size must be finite and nonnegative")
+    try:
+        min_effect_size = float(min_effect_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_effect_size must be finite and nonnegative") from exc
+    if not np.isfinite(min_effect_size) or min_effect_size < 0.0:
+        raise ValueError("min_effect_size must be finite and nonnegative")
+    if classification not in {None, "B", "C"}:
+        raise ValueError("classification must be 'B', 'C', or None")
+
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_values = adjust_p_values(dif_results["p_value"], p_adjust)
+    effect_sizes = np.asarray(dif_results["effect_size"], dtype=np.float64)
+    classes = _ets_classify(effect_sizes, p_values)
 
     flags = (p_values <= alpha) & (np.abs(effect_sizes) >= min_effect_size)
 
     if classification is not None:
         if classification == "B":
             flags &= (classes == "B") | (classes == "C")
-        elif classification == "C":
+        else:
             flags &= classes == "C"
 
     return flags

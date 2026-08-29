@@ -15,7 +15,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.constants import PROB_EPSILON
+from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 
 _torch: ModuleType | None = None
 _torch_import_error: ImportError | None = None
@@ -451,6 +451,14 @@ def compute_expected_counts_gpu(
     return to_numpy(r_k), to_numpy(n_k)
 
 
+def _torch_jj_lambda(torch: ModuleType, xi: Any) -> Any:
+    """Evaluate the Jaakkola--Jordan coefficient without zero divisions."""
+    xi_abs = torch.abs(xi)
+    safe_xi = torch.clamp(xi_abs, min=1e-6)
+    values = torch.tanh(safe_xi / 2.0) / (4.0 * safe_xi)
+    return torch.where(xi_abs < 1e-6, torch.full_like(xi_abs, 0.125), values)
+
+
 def gvem_e_step_gpu(
     responses: NDArray[np.int_],
     slopes: NDArray[np.float64],
@@ -502,49 +510,31 @@ def gvem_e_step_gpu(
     sigma_t = torch.from_numpy(sigma.astype(np.float64)).to(device)
     xi_t = torch.from_numpy(xi.astype(np.float64)).to(device)
 
-    n_persons, n_items = responses.shape
-
     valid_mask = resp >= 0
 
     for _ in range(n_inner_iter):
-        xi_abs = torch.abs(xi_t)
-        lam = torch.where(
-            xi_abs < 1e-6,
-            torch.full_like(xi_abs, 0.125),
-            torch.tanh(xi_abs / 2) / (4 * xi_abs),
+        lam = _torch_jj_lambda(torch, xi_t)
+        weights = torch.where(valid_mask, 2.0 * lam, 0.0)
+        precision = prior_inv.unsqueeze(0) + torch.einsum(
+            "ij,jf,jg->ifg",
+            weights,
+            a,
+            a,
         )
+        sigma_t = torch.linalg.inv(precision)
 
-        for i in range(n_persons):
-            valid_items = valid_mask[i]
-            if not valid_items.any():
-                continue
+        coefficients = torch.where(
+            valid_mask,
+            resp - 0.5 - 2.0 * lam * d.unsqueeze(0),
+            0.0,
+        )
+        natural_mean = coefficients @ a
+        mu_t = torch.einsum("ifg,ig->if", sigma_t, natural_mean)
 
-            a_valid = a[valid_items]
-            d_valid = d[valid_items]
-            y_valid = resp[i, valid_items]
-            lam_valid = lam[i, valid_items]
-
-            ata_weighted = torch.einsum("j,jk,jl->kl", 2 * lam_valid, a_valid, a_valid)
-            sigma_inv = prior_inv + ata_weighted
-
-            sigma_t[i] = torch.linalg.inv(sigma_inv)
-
-            mu_contrib = torch.einsum(
-                "j,jk->k", (y_valid - 0.5) + 2 * lam_valid * d_valid, a_valid
-            )
-            mu_t[i] = sigma_t[i] @ mu_contrib
-
-        for i in range(n_persons):
-            for j in range(n_items):
-                if valid_mask[i, j]:
-                    a_j = a[j]
-                    d_j = d[j]
-                    mu_i = mu_t[i]
-                    sigma_i = sigma_t[i]
-
-                    eta = torch.dot(a_j, mu_i) + d_j
-                    var_term = torch.einsum("k,kl,l->", a_j, sigma_i, a_j)
-                    xi_t[i, j] = torch.sqrt(eta**2 + var_term)
+        eta_mean = mu_t @ a.T + d
+        eta_variance = torch.einsum("jf,ifg,jg->ij", a, sigma_t, a)
+        updated_xi = torch.sqrt(torch.clamp(eta_variance + eta_mean**2, min=0.0))
+        xi_t = torch.where(valid_mask, updated_xi, xi_t)
 
     return to_numpy(mu_t), to_numpy(sigma_t), to_numpy(xi_t)
 
@@ -599,7 +589,6 @@ def gvem_compute_elbo_gpu(
     sigma_t = torch.from_numpy(sigma.astype(np.float64)).to(device)
     xi_t = torch.from_numpy(xi.astype(np.float64)).to(device)
 
-    n_persons, n_items = responses.shape
     n_factors = slopes.shape[1]
 
     valid_mask = resp >= 0
@@ -607,46 +596,25 @@ def gvem_compute_elbo_gpu(
     prior_cov_inv = torch.linalg.inv(prior_cov_t)
     prior_log_det = torch.linalg.slogdet(prior_cov_t)[1]
 
-    elbo = torch.tensor(0.0, device=device, dtype=torch.float64)
-
-    xi_abs = torch.abs(xi_t)
-    lam = torch.where(
-        xi_abs < 1e-6,
-        torch.full_like(xi_abs, 0.125),
-        torch.tanh(xi_abs / 2) / (4 * xi_abs),
+    lam = _torch_jj_lambda(torch, xi_t)
+    eta_mean = mu_t @ a.T + d
+    eta_variance = torch.einsum("jf,ifg,jg->ij", a, sigma_t, a)
+    eta_second = eta_variance + eta_mean**2
+    likelihood_terms = (
+        -torch.logaddexp(torch.zeros_like(xi_t), -xi_t)
+        + (resp - 0.5) * eta_mean
+        - 0.5 * xi_t
+        - lam * (eta_second - xi_t**2)
     )
+    expected_log_likelihood = likelihood_terms[valid_mask].sum()
 
-    for i in range(n_persons):
-        diff = mu_t[i] - prior_mu
-        kl_mean = 0.5 * torch.einsum("k,kl,l->", diff, prior_cov_inv, diff)
-        kl_cov = 0.5 * (
-            torch.trace(prior_cov_inv @ sigma_t[i])
-            - n_factors
-            + prior_log_det
-            - torch.linalg.slogdet(sigma_t[i])[1]
-        )
-        elbo -= kl_mean + kl_cov
+    diff = mu_t - prior_mu
+    kl_mean = 0.5 * torch.einsum("if,fg,ig->i", diff, prior_cov_inv, diff)
+    kl_trace = 0.5 * torch.einsum("fg,igf->i", prior_cov_inv, sigma_t)
+    log_det_q = torch.linalg.slogdet(sigma_t)[1]
+    kl = kl_mean + kl_trace + 0.5 * (prior_log_det - log_det_q) - 0.5 * n_factors
 
-        for j in range(n_items):
-            if valid_mask[i, j]:
-                a_j = a[j]
-                d_j = d[j]
-                y_ij = resp[i, j]
-                xi_ij = xi_t[i, j]
-                lam_ij = lam[i, j]
-
-                eta = torch.dot(a_j, mu_t[i]) + d_j
-                var_term = torch.einsum("k,kl,l->", a_j, sigma_t[i], a_j)
-
-                ll_contrib = (
-                    (y_ij - 0.5) * eta
-                    - 0.5 * xi_ij
-                    + torch.log(torch.sigmoid(xi_ij))
-                    - lam_ij * (eta**2 + var_term - xi_ij**2)
-                )
-                elbo += ll_contrib
-
-    return float(elbo.item())
+    return float((expected_log_likelihood - kl.sum()).item())
 
 
 def gvem_m_step_gpu(
@@ -691,59 +659,50 @@ def gvem_m_step_gpu(
     sigma_t = torch.from_numpy(sigma.astype(np.float64)).to(device)
     xi_t = torch.from_numpy(xi.astype(np.float64)).to(device)
 
-    n_persons, n_items = responses.shape
     n_factors = mu.shape[1]
 
     valid_mask = resp >= 0
 
-    xi_abs = torch.abs(xi_t)
-    lam = torch.where(
-        xi_abs < 1e-6,
-        torch.full_like(xi_abs, 0.125),
-        torch.tanh(xi_abs / 2) / (4 * xi_abs),
+    lam = _torch_jj_lambda(torch, xi_t)
+    weights = torch.where(valid_mask, 2.0 * lam, 0.0)
+    second_moments = sigma_t + torch.einsum("if,ig->ifg", mu_t, mu_t)
+    slope_system = torch.einsum("ij,ifg->jfg", weights, second_moments)
+    slope_system += REGULARIZATION_EPSILON * torch.eye(
+        n_factors,
+        device=device,
+        dtype=torch.float64,
+    ).unsqueeze(0)
+
+    current_d = torch.as_tensor(
+        current_intercepts,
+        device=device,
+        dtype=torch.float64,
     )
+    slope_coefficients = torch.where(
+        valid_mask,
+        resp - 0.5 - weights * current_d.unsqueeze(0),
+        0.0,
+    )
+    slope_rhs = torch.einsum("ij,if->jf", slope_coefficients, mu_t)
+    new_slopes = torch.linalg.solve(slope_system, slope_rhs.unsqueeze(2)).squeeze(2)
 
-    new_slopes = torch.zeros((n_items, n_factors), device=device, dtype=torch.float64)
-    new_intercepts = torch.zeros(n_items, device=device, dtype=torch.float64)
+    linear_terms = mu_t @ new_slopes.T
+    intercept_numerator = torch.where(
+        valid_mask,
+        resp - 0.5 - weights * linear_terms,
+        0.0,
+    ).sum(dim=0)
+    intercept_denominator = weights.sum(dim=0)
+    new_intercepts = torch.where(
+        intercept_denominator > PROB_EPSILON,
+        intercept_numerator / torch.clamp(intercept_denominator, min=PROB_EPSILON),
+        0.0,
+    ).clamp(-10.0, 10.0)
 
-    for j in range(n_items):
-        valid_persons = valid_mask[:, j]
-        n_valid = valid_persons.sum()
-
-        if n_valid == 0:
-            new_slopes[j] = torch.from_numpy(current_slopes[j]).to(device)
-            new_intercepts[j] = current_intercepts[j]
-            continue
-
-        mu_valid = mu_t[valid_persons]
-        sigma_valid = sigma_t[valid_persons]
-        lam_valid = lam[valid_persons, j]
-        y_valid = resp[valid_persons, j]
-
-        X = torch.zeros((n_valid, n_factors + 1), device=device, dtype=torch.float64)
-        X[:, :n_factors] = mu_valid
-        X[:, n_factors] = 1.0
-
-        W = 2 * lam_valid
-        y_tilde = y_valid - 0.5
-
-        XtWX = torch.einsum("ik,i,il->kl", X, W, X)
-
-        for i_idx, i in enumerate(torch.where(valid_persons)[0]):
-            outer = sigma_valid[i_idx, :, :]
-            XtWX[:n_factors, :n_factors] += 2 * lam_valid[i_idx] * outer
-
-        XtWX += 1e-6 * torch.eye(n_factors + 1, device=device, dtype=torch.float64)
-
-        Xty = X.T @ y_tilde
-
-        try:
-            params = torch.linalg.solve(XtWX, Xty)
-            new_slopes[j] = params[:n_factors]
-            new_intercepts[j] = params[n_factors]
-        except RuntimeError:
-            new_slopes[j] = torch.from_numpy(current_slopes[j]).to(device)
-            new_intercepts[j] = current_intercepts[j]
+    valid_items = valid_mask.any(dim=0)
+    current_a = torch.as_tensor(current_slopes, device=device, dtype=torch.float64)
+    new_slopes = torch.where(valid_items[:, None], new_slopes, current_a)
+    new_intercepts = torch.where(valid_items, new_intercepts, current_d)
 
     return to_numpy(new_slopes), to_numpy(new_intercepts)
 

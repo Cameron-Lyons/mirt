@@ -341,6 +341,24 @@ class FitResult:
             }
         return result
 
+    def to_json(
+        self,
+        *,
+        include_parameters: bool = True,
+        include_standard_errors: bool = True,
+        indent: int | None = None,
+    ) -> str:
+        """Serialize the portable fit representation to JSON."""
+        import json
+
+        return json.dumps(
+            self.to_dict(
+                include_parameters=include_parameters,
+                include_standard_errors=include_standard_errors,
+            ),
+            indent=indent,
+        )
+
     def __repr__(self) -> str:
         return (
             f"FitResult(model={self.model.model_name}, "

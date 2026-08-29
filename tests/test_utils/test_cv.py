@@ -14,6 +14,7 @@ from mirt.utils.cv import (
     KFold,
     LeaveOneOut,
     LogLikelihoodScorer,
+    StratifiedGroupKFold,
     StratifiedKFold,
     cross_validate,
 )
@@ -266,6 +267,133 @@ class TestGroupKFold:
         import mirt
 
         assert mirt.GroupKFold is GroupKFold
+
+
+class TestStratifiedGroupKFold:
+    @staticmethod
+    def _clustered_score_problem():
+        group_scores = np.tile([0, 4, 2], 3)
+        group_size = 8
+        groups = np.repeat(np.arange(group_scores.size), group_size)
+        responses = np.zeros((groups.size, 4), dtype=int)
+        for group, score in enumerate(group_scores):
+            rows = groups == group
+            responses[rows, :score] = 1
+        return responses, groups
+
+    def test_keeps_groups_together_and_covers_every_row(self):
+        responses, groups = self._clustered_score_problem()
+        splitter = StratifiedGroupKFold(groups, n_splits=3, n_bins=3)
+
+        folds = list(splitter.split(responses))
+
+        _assert_valid_splits(splitter, responses, expected_n_splits=3)
+        assert [test.size for _, test in folds] == [24, 24, 24]
+        for train_indices, test_indices in folds:
+            assert not set(groups[train_indices]) & set(groups[test_indices])
+
+    def test_improves_score_balance_over_size_only_grouping(self):
+        responses, groups = self._clustered_score_problem()
+        sum_scores = responses.sum(axis=1)
+
+        grouped = GroupKFold(groups, n_splits=3)
+        stratified = StratifiedGroupKFold(groups, n_splits=3, n_bins=3)
+        grouped_means = [
+            np.mean(sum_scores[test]) for _, test in grouped.split(responses)
+        ]
+        stratified_means = [
+            np.mean(sum_scores[test]) for _, test in stratified.split(responses)
+        ]
+
+        assert np.std(stratified_means) < np.std(grouped_means)
+        np.testing.assert_allclose(stratified_means, np.mean(sum_scores))
+
+    def test_shuffling_is_reproducible(self):
+        rng = np.random.default_rng(20260828)
+        group_sizes = rng.integers(2, 9, size=40)
+        groups = np.repeat(np.arange(group_sizes.size), group_sizes)
+        responses = rng.integers(0, 2, size=(groups.size, 8))
+        first = list(
+            StratifiedGroupKFold(
+                groups,
+                n_splits=5,
+                n_bins=4,
+                shuffle=True,
+                random_state=42,
+            ).split(responses)
+        )
+        second = list(
+            StratifiedGroupKFold(
+                groups,
+                n_splits=5,
+                n_bins=4,
+                shuffle=True,
+                random_state=42,
+            ).split(responses)
+        )
+
+        for (_, first_test), (_, second_test) in zip(first, second):
+            np.testing.assert_array_equal(first_test, second_test)
+
+    def test_missing_scores_match_negative_missing_codes(self):
+        responses, groups = self._clustered_score_problem()
+        with_nan = responses.astype(float)
+        with_nan[::7, 0] = np.nan
+        with_negative = with_nan.copy()
+        with_negative[np.isnan(with_negative)] = -1.0
+        splitter = StratifiedGroupKFold(groups, n_splits=3, n_bins=3)
+
+        nan_folds = list(splitter.split(with_nan))
+        negative_folds = list(splitter.split(with_negative))
+
+        for (_, nan_test), (_, negative_test) in zip(nan_folds, negative_folds):
+            np.testing.assert_array_equal(nan_test, negative_test)
+
+    def test_sparse_quantile_bins_are_compacted(self):
+        counts = np.array([1, 11, 22, 28, 36, 54, 42, 25, 13, 9, 3, 1])
+        sum_scores = np.repeat(np.arange(1, 13), counts)
+        responses = np.zeros((sum_scores.size, 12), dtype=int)
+        for row, score in enumerate(sum_scores):
+            responses[row, :score] = 1
+        groups = np.arange(len(responses))
+
+        with np.errstate(divide="raise", invalid="raise"):
+            folds = list(
+                StratifiedGroupKFold(groups, n_splits=5, n_bins=5).split(responses)
+            )
+
+        assert len(folds) == 5
+        assert all(test.size > 0 for _, test in folds)
+
+    @pytest.mark.parametrize("n_bins", [0, -1, True, 2.5])
+    def test_rejects_invalid_bin_count(self, n_bins):
+        with pytest.raises(ValueError, match="n_bins"):
+            StratifiedGroupKFold(np.arange(4), n_splits=2, n_bins=n_bins)
+
+    def test_reuses_group_and_score_validation(self):
+        with pytest.raises(ValueError, match="same number of rows"):
+            list(
+                StratifiedGroupKFold(np.arange(3), n_splits=2).split(
+                    np.zeros((4, 2), dtype=int)
+                )
+            )
+        with pytest.raises(ValueError, match="numeric"):
+            list(
+                StratifiedGroupKFold(np.arange(4), n_splits=2).split(
+                    np.array([["a"], ["b"], ["c"], ["d"]], dtype=object)
+                )
+            )
+
+    def test_is_exported_from_public_namespaces(self):
+        import mirt
+        import mirt.utils as utils
+
+        assert mirt.StratifiedGroupKFold is StratifiedGroupKFold
+        assert utils.StratifiedGroupKFold is StratifiedGroupKFold
+        assert (
+            "StratifiedGroupKFold"
+            in __import__("mirt.utils.cv", fromlist=["__all__"]).__all__
+        )
 
 
 class TestLeaveOneOut:

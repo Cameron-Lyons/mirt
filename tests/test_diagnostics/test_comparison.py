@@ -63,6 +63,32 @@ def _result(model):
     return SimpleNamespace(model=model)
 
 
+def _comparison_result(
+    name: str,
+    *,
+    log_likelihood: float,
+    n_parameters: int,
+    n_observations: int,
+):
+    model = SimpleNamespace(
+        model_name=name,
+        n_parameters=n_parameters,
+        parameters={},
+    )
+    return SimpleNamespace(
+        model=model,
+        log_likelihood=log_likelihood,
+        n_observations=n_observations,
+    )
+
+
+def _column_values(table, name: str) -> np.ndarray:
+    column = table[name]
+    if hasattr(column, "to_numpy"):
+        column = column.to_numpy()
+    return np.asarray(column)
+
+
 class TestAnovaIRT:
     """Tests for likelihood ratio test / anova."""
 
@@ -125,6 +151,114 @@ class TestCompareModels:
 
         assert "AIC" in criteria
         assert "BIC" in criteria
+
+    @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
+    def test_compare_supports_all_case_insensitive_criteria(self):
+        results = [
+            _comparison_result(
+                "compact",
+                log_likelihood=-100.0,
+                n_parameters=5,
+                n_observations=200,
+            ),
+            _comparison_result(
+                "flexible",
+                log_likelihood=-96.0,
+                n_parameters=9,
+                n_observations=200,
+            ),
+        ]
+
+        criteria = ("aic", "bic", "sabic", "aicc", "caic")
+        comparison = compare_models(results, criteria=criteria)
+        expected: dict[str, list[float]] = {
+            criterion: [] for criterion in ("AIC", "BIC", "SABIC", "AICc", "CAIC")
+        }
+        for result in results:
+            likelihood = result.log_likelihood
+            parameters = result.model.n_parameters
+            observations = result.n_observations
+            aic = -2.0 * likelihood + 2.0 * parameters
+            expected["AIC"].append(aic)
+            expected["BIC"].append(
+                -2.0 * likelihood + parameters * np.log(observations)
+            )
+            expected["SABIC"].append(
+                -2.0 * likelihood + parameters * np.log((observations + 2.0) / 24.0)
+            )
+            expected["AICc"].append(
+                aic
+                + (2.0 * parameters * (parameters + 1.0))
+                / (observations - parameters - 1.0)
+            )
+            expected["CAIC"].append(
+                -2.0 * likelihood + parameters * (np.log(observations) + 1.0)
+            )
+
+        for criterion, expected_values in expected.items():
+            values = np.asarray(expected_values)
+            deltas = values - values.min()
+            weights = np.exp(-0.5 * deltas)
+            weights /= weights.sum()
+            np.testing.assert_allclose(_column_values(comparison, criterion), values)
+            np.testing.assert_allclose(
+                _column_values(comparison, f"d{criterion}"), deltas
+            )
+            np.testing.assert_allclose(
+                _column_values(comparison, f"w{criterion}"), weights
+            )
+
+    @pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
+    def test_compare_marks_undefined_aicc_weights(self):
+        results = [
+            _comparison_result(
+                name,
+                log_likelihood=-10.0,
+                n_parameters=10,
+                n_observations=10,
+            )
+            for name in ("first", "second")
+        ]
+
+        comparison = compare_models(results, criteria=["AICc"])
+
+        assert np.all(np.isinf(_column_values(comparison, "AICc")))
+        assert np.all(np.isnan(_column_values(comparison, "dAICc")))
+        assert np.all(np.isnan(_column_values(comparison, "wAICc")))
+
+    @pytest.mark.parametrize(
+        ("criteria", "message"),
+        [
+            ([], "at least one"),
+            ("AIC", "sequence"),
+            (["AIC", "aic"], "duplicate"),
+            (["DIC"], "Unknown criterion"),
+            ([1], "criterion names"),
+        ],
+    )
+    def test_compare_rejects_invalid_criteria(self, criteria, message):
+        result = _comparison_result(
+            "model",
+            log_likelihood=-10.0,
+            n_parameters=2,
+            n_observations=20,
+        )
+
+        with pytest.raises(ValueError, match=message):
+            compare_models([result], criteria=criteria)
+
+    def test_compare_rejects_empty_or_nonfinite_results(self):
+        with pytest.raises(ValueError, match="at least one"):
+            compare_models([])
+
+        result = _comparison_result(
+            "model",
+            log_likelihood=np.nan,
+            n_parameters=2,
+            n_observations=20,
+        )
+        with pytest.raises(ValueError, match="finite log likelihoods"):
+            compare_models([result])
 
 
 class TestVuongTest:

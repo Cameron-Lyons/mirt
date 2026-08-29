@@ -22,6 +22,7 @@ References:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral, Real
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -524,25 +525,49 @@ def flag_ld_pairs(
     -------
     list of tuple
         List of (item_i, item_j) pairs flagged for LD
+
+    Raises
+    ------
+    TypeError
+        If ``method`` or an active threshold has the wrong type.
+    ValueError
+        If ``method`` is unsupported or an active threshold is out of range.
     """
-    pairs = set()
+    if not isinstance(method, str):
+        raise TypeError("method must be a string")
+    if method not in {"q3", "chi2", "both"}:
+        raise ValueError("method must be 'q3', 'chi2', or 'both'")
+
+    if method in {"q3", "both"}:
+        q3_threshold = _validate_finite_pair_scalar(
+            q3_threshold,
+            name="q3_threshold",
+            lower=0.0,
+            lower_inclusive=True,
+        )
+    if method in {"chi2", "both"}:
+        chi2_alpha = _validate_finite_pair_scalar(
+            chi2_alpha,
+            name="chi2_alpha",
+            lower=0.0,
+            upper=1.0,
+        )
+
+    rows, columns = np.triu_indices_from(ld_result.q3_matrix, k=1)
+    selected = np.zeros(rows.size, dtype=bool)
 
     if method in ("q3", "both"):
-        for i, j, _ in ld_result.q3_flagged:
-            if np.abs(ld_result.q3_matrix[i, j]) > q3_threshold:
-                pairs.add((min(i, j), max(i, j)))
+        q3_values = ld_result.q3_matrix[rows, columns]
+        selected |= np.abs(q3_values) > q3_threshold
 
     if method in ("chi2", "both"):
-        n_items = ld_result.ld_chi2_matrix.shape[0]
-        for i in range(n_items):
-            for j in range(i + 1, n_items):
-                chi2 = ld_result.ld_chi2_matrix[i, j]
-                if not np.isnan(chi2):
-                    p_value = 1 - stats.chi2.cdf(chi2, df=1)
-                    if p_value < chi2_alpha:
-                        pairs.add((i, j))
+        chi2_values = ld_result.ld_chi2_matrix[rows, columns]
+        critical_value = stats.chi2.isf(chi2_alpha, df=1)
+        selected |= chi2_values > critical_value
 
-    return sorted(pairs)
+    return [
+        (int(i), int(j)) for i, j in zip(rows[selected], columns[selected], strict=True)
+    ]
 
 
 def ld_summary_table(
@@ -562,54 +587,105 @@ def ld_summary_table(
     -------
     str
         Formatted table
+
+    Raises
+    ------
+    TypeError
+        If ``top_n`` is not an integer.
+    ValueError
+        If ``top_n`` is negative.
     """
+    if isinstance(top_n, (bool, np.bool_)) or not isinstance(top_n, Integral):
+        raise TypeError("top_n must be an integer")
+    if top_n < 0:
+        raise ValueError("top_n must be nonnegative")
+
     n_items = ld_result.q3_matrix.shape[0]
-
-    pairs_data = []
-    for i in range(n_items):
-        for j in range(i + 1, n_items):
-            q3 = ld_result.q3_matrix[i, j]
-            chi2 = ld_result.ld_chi2_matrix[i, j]
-            adj_r = ld_result.adj_residual_corr[i, j]
-
-            if not np.isnan(chi2):
-                p_val = 1 - stats.chi2.cdf(chi2, df=1)
-            else:
-                p_val = np.nan
-
-            pairs_data.append(
-                {
-                    "i": i,
-                    "j": j,
-                    "q3": q3,
-                    "adj_r": adj_r,
-                    "chi2": chi2,
-                    "p": p_val,
-                }
-            )
-
-    pairs_data.sort(key=lambda x: -abs(x["q3"]))
+    rows, columns = np.triu_indices(n_items, k=1)
+    q3_values = ld_result.q3_matrix[rows, columns]
+    selected = _top_absolute_pair_indices(q3_values, min(int(top_n), rows.size))
+    rows = rows[selected]
+    columns = columns[selected]
+    q3_values = q3_values[selected]
+    chi2_values = ld_result.ld_chi2_matrix[rows, columns]
+    adjusted_values = ld_result.adj_residual_corr[rows, columns]
+    p_values = np.full(chi2_values.shape, np.nan)
+    valid = ~np.isnan(chi2_values)
+    p_values[valid] = stats.chi2.sf(chi2_values[valid], df=1)
 
     lines = [
         f"{'Item i':<8} {'Item j':<8} {'Q3':>8} {'Adj r':>8} {'LD χ²':>10} {'p-value':>10}",
         "-" * 62,
     ]
 
-    for data in pairs_data[:top_n]:
+    for i, j, q3, adj_r, chi2, p_value in zip(
+        rows,
+        columns,
+        q3_values,
+        adjusted_values,
+        chi2_values,
+        p_values,
+        strict=True,
+    ):
         if ld_result.item_names:
-            item_i = ld_result.item_names[data["i"]][:7]
-            item_j = ld_result.item_names[data["j"]][:7]
+            item_i = ld_result.item_names[i][:7]
+            item_j = ld_result.item_names[j][:7]
         else:
-            item_i = str(data["i"] + 1)
-            item_j = str(data["j"] + 1)
+            item_i = str(i + 1)
+            item_j = str(j + 1)
 
-        q3_str = f"{data['q3']:.4f}"
-        adj_str = f"{data['adj_r']:.4f}"
-        chi2_str = f"{data['chi2']:.2f}" if not np.isnan(data["chi2"]) else "NA"
-        p_str = f"{data['p']:.4f}" if not np.isnan(data["p"]) else "NA"
+        q3_str = f"{q3:.4f}"
+        adj_str = f"{adj_r:.4f}"
+        chi2_str = f"{chi2:.2f}" if not np.isnan(chi2) else "NA"
+        p_str = f"{p_value:.4f}" if not np.isnan(p_value) else "NA"
 
         lines.append(
             f"{item_i:<8} {item_j:<8} {q3_str:>8} {adj_str:>8} {chi2_str:>10} {p_str:>10}"
         )
 
     return "\n".join(lines)
+
+
+def _validate_finite_pair_scalar(
+    value: float,
+    *,
+    name: str,
+    lower: float,
+    upper: float | None = None,
+    lower_inclusive: bool = False,
+) -> float:
+    """Validate a finite scalar used to select locally dependent pairs."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number")
+
+    validated = float(value)
+    lower_valid = validated >= lower if lower_inclusive else validated > lower
+    upper_valid = upper is None or validated < upper
+    if not np.isfinite(validated) or not lower_valid or not upper_valid:
+        if upper is None:
+            bound = f"at least {lower}" if lower_inclusive else f"greater than {lower}"
+        else:
+            bound = f"strictly between {lower} and {upper}"
+        raise ValueError(f"{name} must be finite and {bound}")
+    return validated
+
+
+def _top_absolute_pair_indices(
+    values: NDArray[np.float64],
+    count: int,
+) -> NDArray[np.intp]:
+    """Select the largest absolute values with stable row-major tie handling."""
+    if count == 0:
+        return np.empty(0, dtype=np.intp)
+
+    magnitudes = np.abs(values)
+    magnitudes = np.where(np.isnan(magnitudes), -np.inf, magnitudes)
+    if count == values.size:
+        return np.argsort(-magnitudes, kind="stable")
+
+    cutoff = np.partition(magnitudes, -count)[-count]
+    greater = np.flatnonzero(magnitudes > cutoff)
+    tied = np.flatnonzero(magnitudes == cutoff)[: count - greater.size]
+    selected = np.concatenate((greater, tied))
+    order = np.argsort(-magnitudes[selected], kind="stable")
+    return selected[order]

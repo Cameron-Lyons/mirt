@@ -15,6 +15,11 @@ from mirt._rust_backend import RUST_AVAILABLE
 from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
 
 _ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
+_RESPONSE_VALIDATION_CHUNK_ELEMENTS = 1_000_000
+_ITEM_STATS_MOMENT_CHUNK_ELEMENTS = 1_000_000
+_ITEM_STATS_FREQUENCY_CHUNK_ELEMENTS = 8_000_000
+_ITEM_STATS_MAX_VECTORIZED_CATEGORIES = 16
+_ITEM_STATS_MAX_FREQUENCY_ENTRIES = 5_000_000
 
 
 def _clean_response_matrix(
@@ -35,13 +40,19 @@ def _clean_response_matrix(
     values = np.asarray(raw, dtype=np.float64)
     finite = np.isfinite(values)
     missing = np.isnan(values) | ((values < 0.0) & finite) | (values == missing_code)
-    observed = values[~missing]
-    if not np.all(np.isfinite(observed)):
-        raise ValueError("observed responses must contain only finite values")
-    if np.any(observed != np.floor(observed)):
-        raise ValueError("observed responses must be integer-valued")
-    if binary and np.any((observed != 0.0) & (observed != 1.0)):
-        raise ValueError("responses must contain only 0, 1, or missing values")
+    del finite
+
+    flat_values = values.ravel()
+    flat_missing = missing.ravel()
+    for start in range(0, flat_values.size, _RESPONSE_VALIDATION_CHUNK_ELEMENTS):
+        stop = min(start + _RESPONSE_VALIDATION_CHUNK_ELEMENTS, flat_values.size)
+        observed = flat_values[start:stop][~flat_missing[start:stop]]
+        if not np.all(np.isfinite(observed)):
+            raise ValueError("observed responses must contain only finite values")
+        if np.any(observed != np.floor(observed)):
+            raise ValueError("observed responses must be integer-valued")
+        if binary and np.any((observed != 0.0) & (observed != 1.0)):
+            raise ValueError("responses must contain only 0, 1, or missing values")
 
     return np.where(missing, np.nan, values), missing
 
@@ -424,6 +435,9 @@ class ItemStats:
         Proportion missing per item, in the interval [0, 1].
     frequencies : list[dict[int, int]]
         Response frequency tables per item.
+
+    Derived properties also provide the observed category count, modal
+    response, Shannon entropy, and effective category count for each item.
     """
 
     n: NDArray[np.intp]
@@ -436,6 +450,129 @@ class ItemStats:
     n_missing: NDArray[np.intp]
     pct_missing: NDArray[np.float64]
     frequencies: list[dict[int, int]]
+
+    @property
+    def n_categories(self) -> NDArray[np.intp]:
+        """Number of distinct observed response categories per item."""
+        return np.fromiter(
+            (len(frequency) for frequency in self.frequencies),
+            dtype=np.intp,
+            count=len(self.frequencies),
+        )
+
+    @property
+    def mode(self) -> NDArray[np.float64]:
+        """Modal response per item, using the smaller category to break ties."""
+        modes = np.full(len(self.frequencies), np.nan)
+        for index, frequency in enumerate(self.frequencies):
+            if frequency:
+                modes[index] = min(
+                    frequency,
+                    key=lambda category: (-frequency[category], category),
+                )
+        return modes
+
+    @property
+    def entropy(self) -> NDArray[np.float64]:
+        """Shannon response entropy in natural-log units for each item."""
+        entropy = np.full(len(self.frequencies), np.nan)
+        for index, frequency in enumerate(self.frequencies):
+            if not frequency:
+                continue
+            counts = np.fromiter(frequency.values(), dtype=np.float64)
+            probabilities = counts / np.sum(counts)
+            entropy[index] = -float(np.sum(probabilities * np.log(probabilities)))
+        return entropy
+
+    @property
+    def effective_categories(self) -> NDArray[np.float64]:
+        """Entropy-equivalent number of equally likely response categories."""
+        return np.exp(self.entropy)
+
+
+def _item_shape_moments(
+    responses: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+    means: NDArray[np.float64],
+    counts: NDArray[np.intp],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Compute central moments in bounded item chunks."""
+    n_persons, n_items = responses.shape
+    chunk_size = min(
+        n_items,
+        max(1, _ITEM_STATS_MOMENT_CHUNK_ELEMENTS // n_persons),
+    )
+    second = np.zeros(n_items)
+    third = np.zeros(n_items)
+    fourth = np.zeros(n_items)
+
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        block_valid = valid[:, start:stop]
+        centered = np.zeros((n_persons, stop - start), dtype=np.float64)
+        np.subtract(
+            responses[:, start:stop],
+            means[None, start:stop],
+            out=centered,
+            where=block_valid,
+        )
+        squared = centered * centered
+        second[start:stop] = np.sum(squared, axis=0)
+        third[start:stop] = np.sum(squared * centered, axis=0)
+        fourth[start:stop] = np.sum(squared * squared, axis=0)
+
+    denominator = counts.astype(np.float64)
+    for moment in (second, third, fourth):
+        np.divide(moment, denominator, out=moment, where=counts > 0)
+    return second, third, fourth
+
+
+def _item_frequency_tables(
+    responses: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+) -> list[dict[int, int]]:
+    """Count compact category codes across item chunks, with a sparse fallback."""
+    n_persons, n_items = responses.shape
+    maximum = int(np.max(responses, where=valid, initial=-1.0))
+    n_categories = maximum + 1
+    vectorized = (
+        0 < n_categories <= _ITEM_STATS_MAX_VECTORIZED_CATEGORIES
+        and n_categories * n_items <= _ITEM_STATS_MAX_FREQUENCY_ENTRIES
+    )
+    if not vectorized:
+        frequencies: list[dict[int, int]] = []
+        for item_index in range(n_items):
+            observed = responses[valid[:, item_index], item_index].astype(np.int_)
+            categories, counts = np.unique(observed, return_counts=True)
+            frequencies.append(
+                {
+                    int(category): int(count)
+                    for category, count in zip(categories, counts, strict=True)
+                }
+            )
+        return frequencies
+
+    chunk_size = min(
+        n_items,
+        max(1, _ITEM_STATS_FREQUENCY_CHUNK_ELEMENTS // n_persons),
+    )
+    frequency_counts = np.empty((n_categories, n_items), dtype=np.intp)
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        block = responses[:, start:stop]
+        for category in range(n_categories):
+            frequency_counts[category, start:stop] = np.count_nonzero(
+                block == category,
+                axis=0,
+            )
+
+    return [
+        {
+            int(category): int(frequency_counts[category, item_index])
+            for category in np.flatnonzero(frequency_counts[:, item_index])
+        }
+        for item_index in range(n_items)
+    ]
 
 
 def itemstats(
@@ -471,6 +608,8 @@ def itemstats(
         - skewness, kurtosis: Distribution shape
         - n_missing, pct_missing: Missing count and proportion
         - frequencies: Response distribution tables
+        - mode, n_categories: Modal response and observed category count
+        - entropy, effective_categories: Response diversity measures
 
     Examples
     --------
@@ -498,41 +637,34 @@ def itemstats(
     n = np.sum(valid, axis=0, dtype=np.intp)
     n_missing = np.sum(missing_mask, axis=0, dtype=np.intp)
     pct_missing = n_missing / n_persons
+    del missing_mask
 
     mean = np.divide(
-        np.nansum(responses, axis=0),
+        np.sum(responses, axis=0, where=valid, initial=0.0),
         n,
         out=np.full(n_items, np.nan),
         where=n > 0,
     )
-    variances = np.asarray(_sample_variance(responses, axis=0))
-    sd = np.sqrt(variances)
-    sd[n == 0] = np.nan
-
-    min_val = np.min(np.where(valid, responses, np.inf), axis=0)
-    max_val = np.max(np.where(valid, responses, -np.inf), axis=0)
+    min_val = np.min(responses, axis=0, where=valid, initial=np.inf)
+    max_val = np.max(responses, axis=0, where=valid, initial=-np.inf)
     min_val[n == 0] = np.nan
     max_val[n == 0] = np.nan
 
-    centered = np.where(valid, responses - mean, 0.0)
-    second_moment = np.divide(
-        np.sum(centered**2, axis=0),
+    second_moment, third_moment, fourth_moment = _item_shape_moments(
+        responses,
+        valid,
+        mean,
         n,
-        out=np.zeros(n_items),
-        where=n > 0,
     )
-    third_moment = np.divide(
-        np.sum(centered**3, axis=0),
-        n,
+    variances = np.divide(
+        second_moment * n,
+        n - 1,
         out=np.zeros(n_items),
-        where=n > 0,
+        where=n > 1,
     )
-    fourth_moment = np.divide(
-        np.sum(centered**4, axis=0),
-        n,
-        out=np.zeros(n_items),
-        where=n > 0,
-    )
+    sd = np.sqrt(variances)
+    sd[n == 0] = np.nan
+
     shaped = (n > 2) & (second_moment > 0.0)
     skewness = np.zeros(n_items)
     kurtosis = np.zeros(n_items)
@@ -553,13 +685,7 @@ def itemstats(
         ):
             statistic[affected] = np.nan
 
-    frequencies: list[dict[int, int]] = []
-
-    for j in range(n_items):
-        valid_responses = responses[valid[:, j], j].astype(int)
-        unique, counts = np.unique(valid_responses, return_counts=True)
-        freq_dict = {int(k): int(v) for k, v in zip(unique, counts)}
-        frequencies.append(freq_dict)
+    frequencies = _item_frequency_tables(responses, valid)
 
     return ItemStats(
         n=n,
@@ -600,12 +726,17 @@ def itemstats_to_dataframe(
     elif len(item_names) != n_items:
         raise ValueError(f"item_names has length {len(item_names)}, expected {n_items}")
 
+    entropy = stats.entropy
     data = {
         "n": stats.n,
         "mean": stats.mean,
         "sd": stats.sd,
         "min": stats.min,
         "max": stats.max,
+        "mode": stats.mode,
+        "n_categories": stats.n_categories,
+        "entropy": entropy,
+        "effective_categories": np.exp(entropy),
         "skewness": stats.skewness,
         "kurtosis": stats.kurtosis,
         "n_missing": stats.n_missing,

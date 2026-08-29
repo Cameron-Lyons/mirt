@@ -40,6 +40,37 @@ differentiation. An optional ``gradient_function`` can return a mapping from
 each parameter name to its probability derivative; otherwise parameter
 gradients are also computed numerically.
 
+All-item batch callbacks
+------------------------
+
+Models with many items can avoid one Python callback per item by supplying a
+``batch_icc_function``. It receives theta plus complete ``(n_items,)``
+parameter arrays. Dichotomous callbacks return ``(n_theta, n_items)``;
+polytomous callbacks return ``(n_theta, n_items, n_categories)``.
+
+.. code-block:: python
+
+   def logistic_batch(theta, slope, location):
+       linear = slope[None, :] * (theta[:, None] - location[None, :])
+       return 1 / (1 + np.exp(-linear))
+
+   fast_spec = create_item_type(
+       "BatchedLogistic",
+       logistic,
+       par_bounds={"slope": (0.05, 5), "location": (-5, 5)},
+       par_defaults={"slope": 1, "location": 0},
+       batch_icc_function=logistic_batch,
+   )
+   fast_model = CustomItemModel(1_000, fast_spec)
+   probabilities = fast_model.probability(theta)  # one batch callback
+
+The per-item callback remains the source for requests with ``item_idx``. When
+no analytical information callback is defined, all-item numerical information
+automatically reuses ``batch_icc_function``. An optional
+``batch_info_function`` can instead return information directly with shape
+``(n_theta, n_items)``. Parameter arrays passed to batch callbacks are copies,
+so callback-side mutation cannot alter the model.
+
 Polytomous items
 ----------------
 

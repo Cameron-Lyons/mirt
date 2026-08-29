@@ -8,6 +8,8 @@ This module provides methods for comparing fitted IRT models:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from math import log
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -16,6 +18,9 @@ from scipy import special, stats
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
+
+
+_COMPARISON_CRITERIA = ("AIC", "BIC", "SABIC", "AICc", "CAIC")
 
 
 def _parameter_count(result: FitResult) -> int:
@@ -28,6 +33,82 @@ def _parameter_count(result: FitResult) -> int:
     if model_count is not None:
         return int(model_count)
     return sum(np.asarray(values).size for values in result.model.parameters.values())
+
+
+def _normalize_comparison_criteria(
+    criteria: Sequence[str] | None,
+) -> tuple[str, ...]:
+    """Validate requested criteria and normalize case to public column names."""
+    if criteria is None:
+        return ("AIC", "BIC")
+    if isinstance(criteria, (str, bytes)):
+        raise ValueError("criteria must be a non-empty sequence of criterion names")
+
+    requested = list(criteria)
+    if not requested:
+        raise ValueError("criteria must contain at least one criterion")
+
+    canonical = {name.upper(): name for name in _COMPARISON_CRITERIA}
+    normalized: list[str] = []
+    for criterion in requested:
+        if not isinstance(criterion, str):
+            raise ValueError("criteria must contain only criterion names")
+        name = canonical.get(criterion.upper())
+        if name is None:
+            choices = ", ".join(_COMPARISON_CRITERIA)
+            raise ValueError(f"Unknown criterion: {criterion}; choose from {choices}")
+        normalized.append(name)
+
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("criteria must not contain duplicate criterion names")
+    return tuple(normalized)
+
+
+def _information_criteria_arrays(
+    log_likelihoods: NDArray[np.float64],
+    n_parameters: NDArray[np.int64],
+    n_observations: NDArray[np.int64],
+) -> dict[str, NDArray[np.float64]]:
+    """Compute every supported criterion in one vectorized pass."""
+    observations = np.maximum(n_observations, 1).astype(np.float64, copy=False)
+    parameters = n_parameters.astype(np.float64, copy=False)
+    deviance = -2.0 * log_likelihoods
+    aic = deviance + 2.0 * parameters
+    bic = deviance + parameters * np.log(observations)
+    sabic = deviance + parameters * np.log((observations + 2.0) / 24.0)
+    caic = deviance + parameters * (np.log(observations) + 1.0)
+
+    denominator = observations - parameters - 1.0
+    aicc = np.full_like(aic, np.inf)
+    usable = denominator > 0.0
+    aicc[usable] = (
+        aic[usable]
+        + (2.0 * parameters[usable] * (parameters[usable] + 1.0)) / denominator[usable]
+    )
+    return {
+        "AIC": aic,
+        "BIC": bic,
+        "SABIC": sabic,
+        "AICc": aicc,
+        "CAIC": caic,
+        "-2LogLik": deviance,
+    }
+
+
+def _criterion_deltas_and_weights(
+    values: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return stable relative differences and weights for one criterion."""
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        undefined = np.full(values.shape, np.nan, dtype=np.float64)
+        return undefined, undefined.copy()
+
+    minimum = np.min(values[finite])
+    deltas = values - minimum
+    relative_likelihoods = np.exp(-0.5 * deltas)
+    weights = relative_likelihoods / np.sum(relative_likelihoods)
+    return deltas, weights
 
 
 def anova_irt(
@@ -112,7 +193,7 @@ def anova_irt(
 
 def compare_models(
     results: list[FitResult],
-    criteria: list[str] | None = None,
+    criteria: Sequence[str] | None = None,
 ) -> Any:
     """Compare multiple IRT models using information criteria.
 
@@ -127,6 +208,8 @@ def compare_models(
         - 'AIC': Akaike Information Criterion
         - 'BIC': Bayesian Information Criterion
         - 'SABIC': Sample-size Adjusted BIC
+        - 'AICc': Small-sample corrected AIC
+        - 'CAIC': Consistent Akaike Information Criterion
         Default: ['AIC', 'BIC']
 
     Returns
@@ -136,53 +219,52 @@ def compare_models(
     """
     from mirt.utils.dataframe import create_dataframe
 
-    if criteria is None:
-        criteria = ["AIC", "BIC"]
+    if not results:
+        raise ValueError("results must contain at least one fitted model")
+    criteria = _normalize_comparison_criteria(criteria)
 
     n_models = len(results)
-    model_names = []
-    log_likelihoods = []
-    n_params_list = []
-    n_obs_list = []
-
-    for i, result in enumerate(results):
-        model_names.append(f"Model {i + 1}: {result.model.model_name}")
-        log_likelihoods.append(result.log_likelihood)
-        n_params = _parameter_count(result)
-        n_params_list.append(n_params)
-        n_obs_list.append(result.n_observations)
+    model_names = [
+        f"Model {index + 1}: {result.model.model_name}"
+        for index, result in enumerate(results)
+    ]
+    log_likelihoods = np.fromiter(
+        (result.log_likelihood for result in results),
+        dtype=np.float64,
+        count=n_models,
+    )
+    if not np.all(np.isfinite(log_likelihoods)):
+        raise ValueError("results must contain finite log likelihoods")
+    n_params = np.fromiter(
+        (_parameter_count(result) for result in results),
+        dtype=np.int64,
+        count=n_models,
+    )
+    if np.any(n_params < 0):
+        raise ValueError("results must contain non-negative parameter counts")
+    n_observations = np.fromiter(
+        (result.n_observations for result in results),
+        dtype=np.int64,
+        count=n_models,
+    )
+    criterion_values = _information_criteria_arrays(
+        log_likelihoods,
+        n_params,
+        n_observations,
+    )
 
     data: dict[str, Any] = {
         "Model": model_names,
         "LogLik": log_likelihoods,
-        "npar": n_params_list,
+        "npar": n_params,
     }
 
     for criterion in criteria:
-        values = []
-        for i in range(n_models):
-            ll = log_likelihoods[i]
-            k = n_params_list[i]
-            n = n_obs_list[i] if n_obs_list[i] > 0 else 1
-
-            if criterion == "AIC":
-                values.append(-2 * ll + 2 * k)
-            elif criterion == "BIC":
-                values.append(-2 * ll + k * np.log(n))
-            elif criterion == "SABIC":
-                values.append(-2 * ll + k * np.log((n + 2) / 24))
-            else:
-                raise ValueError(f"Unknown criterion: {criterion}")
-
+        values = criterion_values[criterion]
         data[criterion] = values
-
-        min_val = min(values)
-        data[f"d{criterion}"] = [v - min_val for v in values]
-
-        deltas = np.array(data[f"d{criterion}"])
-        weights = np.exp(-0.5 * deltas)
-        weights = weights / weights.sum()
-        data[f"w{criterion}"] = weights.tolist()
+        deltas, weights = _criterion_deltas_and_weights(values)
+        data[f"d{criterion}"] = deltas
+        data[f"w{criterion}"] = weights
 
     return create_dataframe(data)
 
@@ -412,33 +494,23 @@ def information_criteria(
     dict
         Dictionary with AIC, BIC, SABIC, AICc, CAIC
     """
-    ll = result.log_likelihood
+    ll = float(result.log_likelihood)
     k = _parameter_count(result)
     n = n_obs if n_obs is not None else result.n_observations
-
-    if n <= 0:
-        n = 1
-
-    aic = -2 * ll + 2 * k
-
-    bic = -2 * ll + k * np.log(n)
-
-    sabic = -2 * ll + k * np.log((n + 2) / 24)
-
-    if n - k - 1 > 0:
-        aicc = aic + (2 * k * (k + 1)) / (n - k - 1)
-    else:
-        aicc = np.inf
-
-    caic = -2 * ll + k * (np.log(n) + 1)
+    observations = max(int(n), 1)
+    deviance = -2.0 * ll
+    aic = deviance + 2.0 * k
+    denominator = observations - k - 1
 
     return {
-        "AIC": float(aic),
-        "BIC": float(bic),
-        "SABIC": float(sabic),
-        "AICc": float(aicc),
-        "CAIC": float(caic),
-        "-2LogLik": float(-2 * ll),
+        "AIC": aic,
+        "BIC": deviance + k * log(observations),
+        "SABIC": deviance + k * log((observations + 2.0) / 24.0),
+        "AICc": (
+            aic + (2.0 * k * (k + 1.0)) / denominator if denominator > 0 else np.inf
+        ),
+        "CAIC": deviance + k * (log(observations) + 1.0),
+        "-2LogLik": deviance,
         "npar": k,
     }
 

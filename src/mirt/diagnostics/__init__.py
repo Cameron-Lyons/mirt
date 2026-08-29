@@ -9,6 +9,7 @@ __all__ = [
     "compute_pairwise_rdif",
     "grdif_effect_size",
     "flag_dif_items",
+    "adjust_p_values",
     "compute_ld_statistics",
     "compute_q3",
     "compute_ld_chi2",
@@ -39,6 +40,10 @@ _LAZY_IMPORTS = {
     "compute_pairwise_rdif": ("mirt.diagnostics.dif", "compute_pairwise_rdif"),
     "grdif_effect_size": ("mirt.diagnostics.dif", "grdif_effect_size"),
     "flag_dif_items": ("mirt.diagnostics.dif", "flag_dif_items"),
+    "adjust_p_values": (
+        "mirt.diagnostics.multiple_testing",
+        "adjust_p_values",
+    ),
     "compute_ld_statistics": ("mirt.diagnostics.ld", "compute_ld_statistics"),
     "compute_q3": ("mirt.diagnostics.ld", "compute_q3"),
     "compute_ld_chi2": ("mirt.diagnostics.ld", "compute_ld_chi2"),

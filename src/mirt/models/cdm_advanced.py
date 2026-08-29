@@ -8,6 +8,7 @@ This module provides:
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Literal, Self
 
@@ -41,6 +42,20 @@ _DEFAULT_REDUCED_MODELS: tuple[ReducedModelType, ...] = (
     "RRUM",
     "saturated",
 )
+_MAX_GDINA_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+
+
+def _gdina_item_chunks(
+    item_indices: NDArray[np.intp],
+    entries_per_item: int,
+) -> Iterator[NDArray[np.intp]]:
+    """Split G-DINA items into bounded vectorized probability chunks."""
+    chunk_size = max(
+        1,
+        _MAX_GDINA_PROBABILITY_CHUNK_ENTRIES // max(1, entries_per_item),
+    )
+    for start in range(0, item_indices.size, chunk_size):
+        yield item_indices[start : start + chunk_size]
 
 
 @dataclass
@@ -403,7 +418,16 @@ class GDINA(BaseCDM):
         self, alpha: NDArray[np.int_], item_idx: int
     ) -> NDArray[np.int_]:
         """Map attribute patterns to latent group indices for an item."""
-        alpha = self._ensure_alpha_2d(alpha)
+        alpha_values = self._ensure_alpha_2d(alpha)
+        index = self._validate_item_index(item_idx)
+        return self._latent_group_idx_from_alpha(alpha_values, index)
+
+    def _latent_group_idx_from_alpha(
+        self,
+        alpha: NDArray[np.int_],
+        item_idx: int,
+    ) -> NDArray[np.int_]:
+        """Map already-validated patterns to one item's latent groups."""
         q_j = self._q_matrix[item_idx]
         required_attrs = np.where(q_j == 1)[0]
 
@@ -417,7 +441,7 @@ class GDINA(BaseCDM):
         self, alpha: NDArray[np.int_], item_idx: int
     ) -> NDArray[np.float64]:
         """Compute probability for saturated model."""
-        group_idx = self._latent_group_idx(alpha, item_idx)
+        group_idx = self._latent_group_idx_from_alpha(alpha, item_idx)
         delta = self._delta_params[item_idx]
         return delta[group_idx]
 
@@ -466,7 +490,7 @@ class GDINA(BaseCDM):
         for i, attr in enumerate(required_attrs):
             logit += delta[i + 1] * alpha[:, attr]
 
-        return 1 / (1 + np.exp(-logit))
+        return np.asarray(sigmoid(logit), dtype=np.float64)
 
     def _compute_prob_rrum(
         self, alpha: NDArray[np.int_], item_idx: int
@@ -482,6 +506,156 @@ class GDINA(BaseCDM):
             prob *= penalty ** (1 - alpha[:, attr])
 
         return np.clip(prob, 0, 1)
+
+    def _item_probability_from_alpha(
+        self,
+        alpha: NDArray[np.int_],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Evaluate one item from an already-validated mastery matrix."""
+        model_type = self._reduced_models[item_idx]
+        if model_type == "saturated":
+            return self._compute_prob_saturated(alpha, item_idx)
+        if model_type == "DINA":
+            return self._compute_prob_dina(alpha, item_idx)
+        if model_type == "DINO":
+            return self._compute_prob_dino(alpha, item_idx)
+        if model_type == "ACDM":
+            return self._compute_prob_acdm(alpha, item_idx)
+        if model_type == "LLM":
+            return self._compute_prob_llm(alpha, item_idx)
+        if model_type == "RRUM":
+            return self._compute_prob_rrum(alpha, item_idx)
+        return self._compute_prob_saturated(alpha, item_idx)
+
+    def _coefficient_matrix(
+        self,
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        """Map family-specific main effects onto their required attributes."""
+        coefficients = np.zeros(
+            (item_indices.size, self.n_attributes),
+            dtype=np.float64,
+        )
+        for row, item_idx in enumerate(item_indices):
+            required = np.flatnonzero(self._q_matrix[item_idx])
+            delta = self._delta_params[item_idx]
+            for effect_idx, attribute in enumerate(required):
+                coefficients[row, attribute] = delta[effect_idx + 1]
+        return coefficients
+
+    def _group_reduced_probabilities(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.intp],
+        model_type: ReducedModelType,
+    ) -> NDArray[np.float64]:
+        """Evaluate one reduced family across a bounded item chunk."""
+        q_matrix = self._q_matrix[item_indices]
+        intercepts = np.fromiter(
+            (self._delta_params[item_idx][0] for item_idx in item_indices),
+            dtype=np.float64,
+            count=item_indices.size,
+        )
+
+        if model_type in ("DINA", "DINO"):
+            mastery_counts = alpha @ q_matrix.T
+            if model_type == "DINA":
+                eta = mastery_counts == np.sum(q_matrix, axis=1)
+            else:
+                eta = mastery_counts > 0
+            mastered = np.fromiter(
+                (self._delta_params[item_idx][1] for item_idx in item_indices),
+                dtype=np.float64,
+                count=item_indices.size,
+            )
+            return intercepts + (mastered - intercepts) * eta
+
+        coefficients = self._coefficient_matrix(item_indices)
+        if model_type == "ACDM":
+            return np.clip(intercepts + alpha @ coefficients.T, 0.0, 1.0)
+        if model_type == "LLM":
+            return np.asarray(
+                sigmoid(intercepts + alpha @ coefficients.T),
+                dtype=np.float64,
+            )
+
+        penalties = np.ones_like(coefficients)
+        required = q_matrix == 1
+        penalties[required] = coefficients[required]
+        probability = intercepts * np.prod(
+            np.where(
+                alpha[:, None, :] == 1,
+                1.0,
+                penalties[None, :, :],
+            ),
+            axis=2,
+        )
+        return np.clip(probability, 0.0, 1.0)
+
+    def _saturated_probabilities(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        """Evaluate saturated items while sharing equal Q-matrix mappings."""
+        result = np.empty((alpha.shape[0], item_indices.size), dtype=np.float64)
+        q_patterns, group_codes = np.unique(
+            self._q_matrix[item_indices],
+            axis=0,
+            return_inverse=True,
+        )
+        for group_code, q_pattern in enumerate(q_patterns):
+            positions = np.flatnonzero(group_codes == group_code)
+            required = np.flatnonzero(q_pattern)
+            group_indices = np.zeros(alpha.shape[0], dtype=np.int_)
+            for effect_idx, attribute in enumerate(required):
+                group_indices += alpha[:, attribute] * (2**effect_idx)
+
+            entries_per_item = max(alpha.shape[0], 2 ** len(required))
+            for chunk_positions in _gdina_item_chunks(
+                positions,
+                entries_per_item,
+            ):
+                chunk_items = item_indices[chunk_positions]
+                deltas = np.stack(
+                    [self._delta_params[item_idx] for item_idx in chunk_items]
+                )
+                result[:, chunk_positions] = deltas[:, group_indices].T
+        return result
+
+    def _all_probabilities(
+        self,
+        alpha: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate every G-DINA family without repeating input validation."""
+        result = np.empty((alpha.shape[0], self.n_items), dtype=np.float64)
+        model_types = np.asarray(self._reduced_models, dtype=object)
+        for model_type in _DEFAULT_REDUCED_MODELS:
+            item_indices = np.flatnonzero(model_types == model_type)
+            if item_indices.size == 0:
+                continue
+            if model_type == "saturated":
+                result[:, item_indices] = self._saturated_probabilities(
+                    alpha,
+                    item_indices,
+                )
+                continue
+
+            if model_type == "RRUM":
+                entries_per_item = max(1, alpha.shape[0]) * self.n_attributes
+            else:
+                entries_per_item = max(alpha.shape[0], self.n_attributes)
+            for chunk in _gdina_item_chunks(
+                item_indices,
+                entries_per_item,
+            ):
+                result[:, chunk] = self._group_reduced_probabilities(
+                    alpha,
+                    chunk,
+                    model_type,
+                )
+        return result
 
     def probability(
         self,
@@ -502,32 +676,14 @@ class GDINA(BaseCDM):
         NDArray
             Probabilities (n_patterns,) or (n_patterns, n_items)
         """
-        alpha = self._ensure_alpha_2d(alpha)
-        n_patterns = alpha.shape[0]
+        alpha_values = self._ensure_alpha_2d(alpha)
 
         if item_idx is not None:
-            model_type = self._reduced_models[item_idx]
-
-            if model_type == "saturated":
-                return self._compute_prob_saturated(alpha, item_idx)
-            elif model_type == "DINA":
-                return self._compute_prob_dina(alpha, item_idx)
-            elif model_type == "DINO":
-                return self._compute_prob_dino(alpha, item_idx)
-            elif model_type == "ACDM":
-                return self._compute_prob_acdm(alpha, item_idx)
-            elif model_type == "LLM":
-                return self._compute_prob_llm(alpha, item_idx)
-            elif model_type == "RRUM":
-                return self._compute_prob_rrum(alpha, item_idx)
-            else:
-                return self._compute_prob_saturated(alpha, item_idx)
-
-        probs = np.zeros((n_patterns, self.n_items))
-        for j in range(self.n_items):
-            probs[:, j] = self.probability(alpha, j)
-
-        return probs
+            index = self._validate_item_index(item_idx)
+            return self._item_probability_from_alpha(alpha_values, index)
+        if self.n_items == 1:
+            return self._item_probability_from_alpha(alpha_values, 0)[:, None]
+        return self._all_probabilities(alpha_values)
 
     def eta(
         self,

@@ -44,19 +44,33 @@ Generate DIF report:
 
 from __future__ import annotations
 
-from pathlib import Path
+import importlib
 from typing import TYPE_CHECKING, Any, Literal
 
-from mirt.reports.dif_analysis import DIFAnalysisReport
-from mirt.reports.full_diagnostic import FullDiagnosticReport
-from mirt.reports.item_analysis import ItemAnalysisReport
-from mirt.reports.model_fit import ModelFitReport
-
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
     from numpy.typing import NDArray
 
     from mirt.results.fit_result import FitResult
+
+
+_LAZY_IMPORTS = {
+    "ItemAnalysisReport": ("mirt.reports.item_analysis", "ItemAnalysisReport"),
+    "ModelFitReport": ("mirt.reports.model_fit", "ModelFitReport"),
+    "DIFAnalysisReport": ("mirt.reports.dif_analysis", "DIFAnalysisReport"),
+    "FullDiagnosticReport": (
+        "mirt.reports.full_diagnostic",
+        "FullDiagnosticReport",
+    ),
+}
+
+_REPORT_BUILDERS = {
+    "item_analysis": _LAZY_IMPORTS["ItemAnalysisReport"],
+    "model_fit": _LAZY_IMPORTS["ModelFitReport"],
+    "full_diagnostic": _LAZY_IMPORTS["FullDiagnosticReport"],
+}
 
 __all__ = [
     "ItemAnalysisReport",
@@ -116,18 +130,14 @@ def generate_report(
     >>> generate_report(result, data, report_type="full_diagnostic",
     ...                 output_path="report.html")
     """
-    builders = {
-        "item_analysis": ItemAnalysisReport,
-        "model_fit": ModelFitReport,
-        "full_diagnostic": FullDiagnosticReport,
-    }
-
-    if report_type not in builders:
+    if report_type not in _REPORT_BUILDERS:
         raise ValueError(
-            f"Unknown report type: {report_type}. Available: {list(builders.keys())}"
+            f"Unknown report type: {report_type}. Available: {list(_REPORT_BUILDERS)}"
         )
 
-    builder_cls = builders[report_type]
+    module_name, class_name = _REPORT_BUILDERS[report_type]
+    module = importlib.import_module(module_name)
+    builder_cls = getattr(module, class_name)
 
     if report_type in ("item_analysis", "full_diagnostic"):
         report = builder_cls(fit_result, responses, theta=theta, **kwargs)
@@ -139,3 +149,17 @@ def generate_report(
         report._write_html(output_path, html)
 
     return html
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_IMPORTS:
+        module_name, symbol_name = _LAZY_IMPORTS[name]
+        module = importlib.import_module(module_name)
+        value = getattr(module, symbol_name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'mirt.reports' has no attribute '{name}'")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
