@@ -140,6 +140,7 @@ of only its first two moments:
    )
 
    lower, upper = posterior.credible_intervals(level=0.95)
+   hdi_lower, hdi_upper = posterior.highest_density_intervals(level=0.95)
    median = posterior.quantile(0.5)
    probability_above = posterior.classification_probabilities(cut_score=0.0)
    decisions = posterior.classify(cut_score=0.0, confidence=0.95)
@@ -149,9 +150,15 @@ of only its first two moments:
 ``points`` contains the shared quadrature grid and each row of ``weights`` is a
 normalized respondent distribution over that grid. ``log_marginal_likelihood``
 contains the integrated response-pattern likelihood under the chosen prior.
-``mean``, ``median``, ``standard_error``, ``quantile()``, and ``map_estimate`` support
-unidimensional and multidimensional models; credible intervals and threshold
-probabilities are computed from each factor's exact marginal grid distribution rather
-than a normal approximation. Likelihood evaluation is memory-bounded through
-``batch_size``, while the returned weight matrix necessarily contains
-``n_persons * n_points`` values.
+``mean``, ``median``, ``standard_error``, ``quantile()``, and ``map_estimate``
+support unidimensional and multidimensional models. ``credible_intervals`` returns
+equal-tail bounds, while ``highest_density_intervals`` returns the shortest
+contiguous marginal interval containing the requested mass. The latter is often
+narrower for skewed posteriors and combines duplicate factor coordinates before
+searching. Both intervals and threshold probabilities use each factor's exact grid
+distribution rather than a normal approximation.
+
+Likelihood evaluation is memory-bounded through the scorer's ``batch_size``. The
+highest-density search also batches respondents automatically; pass its own
+``batch_size`` when a fixed temporary-memory ceiling is required. The returned
+weight matrix necessarily contains ``n_persons * n_points`` values.
