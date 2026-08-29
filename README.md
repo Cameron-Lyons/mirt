@@ -497,6 +497,7 @@ plot_person_item_map(result.model, scores.theta)
 | `expected_score()` | Expected score at theta |
 | `gen_difficulty()` | Generalized difficulty index |
 | `theta_for_score()` | Find theta for target score |
+| `information_intervals()` | Find item or test ability ranges meeting an information target |
 
 ## Comparison with R mirt
 
