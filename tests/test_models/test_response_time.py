@@ -245,6 +245,75 @@ def test_timing_information_and_expected_response_time():
     )
 
 
+def test_response_time_cdf_matches_lognormal_formula():
+    from scipy.special import ndtr
+
+    model = _configured_model()
+    tau = np.array([-0.4, 0.2, 0.8])
+    deadlines = np.array([[1.5, 2.0], [2.5, 3.5], [4.0, 5.0]])
+    standardized = model.time_discrimination[None, :] * (
+        np.log(deadlines) - (model.time_intensity[None, :] - tau[:, None])
+    )
+    expected = ndtr(standardized)
+
+    np.testing.assert_allclose(model.response_time_cdf(deadlines, tau), expected)
+    np.testing.assert_allclose(
+        model.response_time_cdf(deadlines[:, 1], tau, 1),
+        expected[:, 1],
+    )
+
+    common_deadline = model.response_time_cdf(3.0, tau)
+    expected_common = ndtr(
+        model.time_discrimination[None, :]
+        * (np.log(3.0) - (model.time_intensity[None, :] - tau[:, None]))
+    )
+    np.testing.assert_allclose(common_deadline, expected_common)
+
+
+def test_response_time_quantiles_round_trip_through_cdf():
+    model = _configured_model()
+    tau = np.array([-0.6, 0.1, 0.9])
+    quantiles = np.array([0.1, 0.5, 0.9])
+
+    response_times = model.response_time_quantile(quantiles, tau)
+    recovered = model.response_time_cdf(response_times, tau)
+
+    assert response_times.shape == (3, 2)
+    np.testing.assert_allclose(
+        recovered,
+        np.broadcast_to(quantiles[:, None], recovered.shape),
+        atol=1e-14,
+    )
+    np.testing.assert_allclose(
+        model.response_time_quantile(0.5, tau, 1),
+        np.exp(model.time_intensity[1] - tau),
+    )
+
+
+@pytest.mark.parametrize("response_time", [0.0, -1.0, np.inf, np.nan])
+def test_response_time_cdf_rejects_invalid_deadlines(response_time):
+    with pytest.raises(MirtValidationError, match="response_time"):
+        _configured_model().response_time_cdf(response_time, 0.0)
+
+
+@pytest.mark.parametrize("quantile", [0.0, 1.0, -0.1, 1.1, np.inf, np.nan])
+def test_response_time_quantile_rejects_invalid_probabilities(quantile):
+    with pytest.raises(MirtValidationError, match="quantile"):
+        _configured_model().response_time_quantile(quantile, 0.0)
+
+
+def test_response_time_predictions_validate_input_shapes():
+    model = _configured_model()
+    tau = np.zeros(2)
+
+    with pytest.raises(MirtValidationError, match="response_time"):
+        model.response_time_cdf(np.ones(3), tau)
+    with pytest.raises(MirtValidationError, match="quantile"):
+        model.response_time_quantile(np.ones((2, 1)) * 0.5, tau)
+    with pytest.raises(IndexError, match="Item index"):
+        model.response_time_cdf(1.0, tau, item_idx=2)
+
+
 def test_joint_log_likelihood_matches_manual_sum():
     model = _configured_model("3PL")
     responses = np.array([[1, 0], [0, 1]])
