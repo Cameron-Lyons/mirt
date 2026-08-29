@@ -172,6 +172,13 @@ ml = mirt.fscores(result, responses, method="ML")
 
 print(eap.theta)
 print(eap.standard_error)
+
+# Convert latent scores to a T-score scale while propagating uncertainty.
+t_scores = eap.linear_transform(multiplier=10, offset=50)
+percentile_ranks = t_scores.normal_percentile_ranks(
+    reference_mean=50,
+    reference_sd=10,
+)
 ```
 
 ### Diagnostics
