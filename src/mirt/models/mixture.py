@@ -20,6 +20,18 @@ _LOG_DISCRIMINATION_BOUNDS = (float(np.log(0.01)), float(np.log(10.0)))
 _DIFFICULTY_BOUNDS = (-8.0, 8.0)
 _GUESSING_BOUNDS = (0.0, 0.5)
 _MIXTURE_MAX_SIMULATION_VALUES = 1_000_000
+_MIXTURE_MAX_LIKELIHOOD_VALUES = 1_000_000
+
+
+def _validate_chunk_size(value: int | None, name: str) -> int | None:
+    """Validate an optional positive chunk control."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise ValueError(f"{name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
 
 
 class MixtureIRT(BaseItemModel):
@@ -428,10 +440,57 @@ class MixtureIRT(BaseItemModel):
         incorrect = observed.astype(np.float64) - correct
         return correct, incorrect
 
+    def _class_log_curves(
+        self,
+        theta: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return class-specific log probabilities for both responses."""
+        curves, _ = self._class_curves(theta)
+        np.clip(
+            curves,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+            out=curves,
+        )
+        log_incorrect = np.log1p(-curves)
+        np.log(curves, out=curves)
+        return curves, log_incorrect
+
+    def _paired_class_log_joint_chunk(
+        self,
+        responses: NDArray[np.int_],
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate one aligned chunk after input validation."""
+        correct, incorrect = self._response_components(responses)
+        log_correct, log_incorrect = self._class_log_curves(theta)
+        class_log_likelihood = np.einsum(
+            "pj,pkj->pk", correct, log_correct, optimize=True
+        )
+        class_log_likelihood += np.einsum(
+            "pj,pkj->pk", incorrect, log_incorrect, optimize=True
+        )
+        return class_log_likelihood + self._log_class_proportions()[None, :]
+
+    def _automatic_paired_chunk_size(self, n_output: int) -> int:
+        working_values_per_person = max(
+            1,
+            2 * self._n_classes * self.n_items + 2 * self.n_items,
+        )
+        return max(
+            1,
+            min(
+                n_output,
+                _MIXTURE_MAX_LIKELIHOOD_VALUES // working_values_per_person,
+            ),
+        )
+
     def _paired_class_log_joint(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
         values = self._validate_responses(responses)
         theta_values = self._ensure_theta_2d(theta)
@@ -444,22 +503,29 @@ class MixtureIRT(BaseItemModel):
                 n_theta=n_theta,
             )
         n_output = max(n_responses, n_theta)
-        correct, incorrect = self._response_components(values)
-        if n_responses == 1 and n_output > 1:
-            correct = np.broadcast_to(correct, (n_output, self.n_items))
-            incorrect = np.broadcast_to(incorrect, (n_output, self.n_items))
+        resolved_chunk_size = _validate_chunk_size(chunk_size, "chunk_size")
+        if resolved_chunk_size is None:
+            resolved_chunk_size = self._automatic_paired_chunk_size(n_output)
 
-        curves, _ = self._class_curves(theta_values)
-        if n_theta == 1 and n_output > 1:
-            curves = np.broadcast_to(curves, (n_output, self._n_classes, self.n_items))
-        curves = np.clip(curves, PROB_EPSILON, 1.0 - PROB_EPSILON)
-        class_log_likelihood = np.einsum(
-            "pj,pkj->pk", correct, np.log(curves), optimize=True
-        )
-        class_log_likelihood += np.einsum(
-            "pj,pkj->pk", incorrect, np.log1p(-curves), optimize=True
-        )
-        return class_log_likelihood + self._log_class_proportions()[None, :]
+        result = np.empty((n_output, self._n_classes), dtype=np.float64)
+        for start in range(0, n_output, resolved_chunk_size):
+            stop = min(start + resolved_chunk_size, n_output)
+            if n_responses == 1:
+                response_chunk = np.broadcast_to(
+                    values,
+                    (stop - start, self.n_items),
+                )
+            else:
+                response_chunk = values[start:stop]
+            if n_theta == 1:
+                theta_chunk = np.broadcast_to(theta_values, (stop - start, 1))
+            else:
+                theta_chunk = theta_values[start:stop]
+            result[start:stop] = self._paired_class_log_joint_chunk(
+                response_chunk,
+                theta_chunk,
+            )
+        return result
 
     def _log_class_proportions(self) -> NDArray[np.float64]:
         proportions = self._parameters["class_proportions"]
@@ -471,48 +537,171 @@ class MixtureIRT(BaseItemModel):
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute response-pattern likelihoods with one shared class per row."""
-        return logsumexp(self._paired_class_log_joint(responses, theta), axis=1)
+        """Compute response-pattern likelihoods with one shared class per row.
+
+        Parameters
+        ----------
+        responses : ndarray
+            Binary response matrix. Negative values are treated as missing.
+        theta : ndarray
+            Aligned ability values, or one value to broadcast to every row.
+        chunk_size : int, optional
+            Maximum aligned rows evaluated at once. By default, the chunk is
+            selected automatically from the item and class counts.
+        """
+        return logsumexp(
+            self._paired_class_log_joint(
+                responses,
+                theta,
+                chunk_size=chunk_size,
+            ),
+            axis=1,
+        )
+
+    def _automatic_grid_chunk_sizes(
+        self,
+        n_patterns: int,
+        n_theta: int,
+        pattern_chunk_size: int | None,
+        theta_chunk_size: int | None,
+    ) -> tuple[int, int]:
+        if theta_chunk_size is None:
+            curve_values_per_theta = max(1, 2 * self._n_classes * self.n_items)
+            theta_chunk_size = max(
+                1,
+                min(
+                    n_theta,
+                    _MIXTURE_MAX_LIKELIHOOD_VALUES // curve_values_per_theta,
+                ),
+            )
+        if pattern_chunk_size is None:
+            working_values_per_pattern = max(
+                1,
+                2 * self.n_items,
+                2 * self._n_classes * theta_chunk_size,
+            )
+            pattern_chunk_size = max(
+                1,
+                min(
+                    n_patterns,
+                    _MIXTURE_MAX_LIKELIHOOD_VALUES // working_values_per_pattern,
+                ),
+            )
+        return pattern_chunk_size, theta_chunk_size
+
+    def _grid_log_likelihood_chunk(
+        self,
+        responses: NDArray[np.int_],
+        log_correct: NDArray[np.float64],
+        log_incorrect: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate one response-pattern by ability block."""
+        correct, incorrect = self._response_components(responses)
+        class_log_likelihood = np.einsum(
+            "pj,qkj->pkq", correct, log_correct, optimize=True
+        )
+        class_log_likelihood += np.einsum(
+            "pj,qkj->pkq", incorrect, log_incorrect, optimize=True
+        )
+        class_log_likelihood += self._log_class_proportions()[None, :, None]
+        return logsumexp(class_log_likelihood, axis=1)
 
     def log_likelihood_batch(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        pattern_chunk_size: int | None = None,
+        theta_chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Evaluate every response pattern at every supplied ability point."""
+        """Evaluate every response pattern at every supplied ability point.
+
+        ``pattern_chunk_size`` and ``theta_chunk_size`` bound the two working
+        dimensions independently. Omitted limits are selected automatically.
+        """
         values = self._validate_responses(responses)
         theta_values = self._ensure_theta_2d(theta)
-        correct, incorrect = self._response_components(values)
-        curves, _ = self._class_curves(theta_values)
-        curves = np.clip(curves, PROB_EPSILON, 1.0 - PROB_EPSILON)
-        class_log_likelihood = np.einsum(
-            "pj,qkj->pkq", correct, np.log(curves), optimize=True
+        pattern_chunk_size = _validate_chunk_size(
+            pattern_chunk_size,
+            "pattern_chunk_size",
         )
-        class_log_likelihood += np.einsum(
-            "pj,qkj->pkq", incorrect, np.log1p(-curves), optimize=True
+        theta_chunk_size = _validate_chunk_size(
+            theta_chunk_size,
+            "theta_chunk_size",
         )
-        class_log_joint = (
-            class_log_likelihood + self._log_class_proportions()[None, :, None]
+        pattern_chunk_size, theta_chunk_size = self._automatic_grid_chunk_sizes(
+            values.shape[0],
+            theta_values.shape[0],
+            pattern_chunk_size,
+            theta_chunk_size,
         )
-        return logsumexp(class_log_joint, axis=1)
+
+        result = np.empty(
+            (values.shape[0], theta_values.shape[0]),
+            dtype=np.float64,
+        )
+        for theta_start in range(0, theta_values.shape[0], theta_chunk_size):
+            theta_stop = min(theta_start + theta_chunk_size, theta_values.shape[0])
+            log_correct, log_incorrect = self._class_log_curves(
+                theta_values[theta_start:theta_stop]
+            )
+            for pattern_start in range(0, values.shape[0], pattern_chunk_size):
+                pattern_stop = min(
+                    pattern_start + pattern_chunk_size,
+                    values.shape[0],
+                )
+                result[
+                    pattern_start:pattern_stop,
+                    theta_start:theta_stop,
+                ] = self._grid_log_likelihood_chunk(
+                    values[pattern_start:pattern_stop],
+                    log_correct,
+                    log_incorrect,
+                )
+        return result
 
     def class_posterior(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute posterior class probabilities conditional on ability."""
-        log_joint = self._paired_class_log_joint(responses, theta)
+        """Compute posterior class probabilities conditional on ability.
+
+        ``chunk_size`` bounds the aligned rows evaluated at once. An automatic
+        memory-bounded limit is used when it is omitted.
+        """
+        log_joint = self._paired_class_log_joint(
+            responses,
+            theta,
+            chunk_size=chunk_size,
+        )
         return np.exp(log_joint - logsumexp(log_joint, axis=1, keepdims=True))
 
     def classify_persons(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.int_]:
-        """Assign each response pattern to its maximum-posterior class."""
-        return np.argmax(self.class_posterior(responses, theta), axis=1)
+        """Assign each response pattern to its maximum-posterior class.
+
+        Classification uses the class log joint directly because posterior
+        normalization cannot change its maximum.
+        """
+        return np.argmax(
+            self._paired_class_log_joint(
+                responses,
+                theta,
+                chunk_size=chunk_size,
+            ),
+            axis=1,
+        )
 
     def information(
         self,
