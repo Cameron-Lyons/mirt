@@ -537,6 +537,76 @@ def test_itemstats_reports_missing_proportions_and_valid_counts() -> None:
     assert result.frequencies == [{0: 1, 1: 2, 2: 1}, {0: 1, 1: 2}, {}]
 
 
+def test_itemstats_exposes_distribution_descriptors() -> None:
+    responses = np.array(
+        [
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, -1.0],
+            [1.0, 2.0, -1.0],
+            [1.0, 2.0, -1.0],
+        ]
+    )
+
+    result = itemstats(responses)
+
+    np.testing.assert_array_equal(result.n_categories, [2, 3, 0])
+    np.testing.assert_allclose(result.mode[:2], [0.0, 2.0])
+    assert np.isnan(result.mode[2])
+    expected_entropy = np.array(
+        [
+            np.log(2.0),
+            -(0.25 * np.log(0.25) * 2 + 0.5 * np.log(0.5)),
+        ]
+    )
+    np.testing.assert_allclose(result.entropy[:2], expected_entropy)
+    np.testing.assert_allclose(
+        result.effective_categories[:2],
+        np.exp(expected_entropy),
+    )
+    assert np.isnan(result.entropy[2])
+    assert np.isnan(result.effective_categories[2])
+
+
+def test_itemstats_chunked_moments_match_direct_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(20260829)
+    responses = rng.integers(0, 6, size=(31, 13)).astype(np.float64)
+    responses[rng.random(responses.shape) < 0.2] = np.nan
+    monkeypatch.setattr(classical, "_ITEM_STATS_MOMENT_CHUNK_ELEMENTS", 62)
+
+    result = itemstats(responses)
+
+    for item_index in range(responses.shape[1]):
+        observed = responses[np.isfinite(responses[:, item_index]), item_index]
+        centered = observed - np.mean(observed)
+        second = np.mean(centered**2)
+        expected_skewness = np.mean(centered**3) / second**1.5
+        expected_kurtosis = np.mean(centered**4) / second**2 - 3.0
+        assert result.skewness[item_index] == pytest.approx(expected_skewness)
+        assert result.kurtosis[item_index] == pytest.approx(expected_kurtosis)
+
+
+def test_itemstats_sparse_large_codes_use_exact_frequency_fallback() -> None:
+    responses = np.array([[0, 1000], [1000, 7], [1000, 1000], [-1, 7]])
+
+    result = itemstats(responses)
+
+    assert result.frequencies == [{0: 1, 1000: 2}, {7: 2, 1000: 2}]
+
+
+def test_itemstats_dataframe_includes_distribution_descriptors() -> None:
+    table = itemstats_to_dataframe(itemstats([[0, 1], [1, 1], [1, 2]]))
+    columns = table.columns if hasattr(table, "columns") else table.schema.names()
+
+    assert {
+        "mode",
+        "n_categories",
+        "entropy",
+        "effective_categories",
+    }.issubset(columns)
+
+
 def test_itemstats_matches_population_shape_statistics() -> None:
     responses = np.array([[0.0], [1.0], [1.0], [2.0]])
 
@@ -595,3 +665,12 @@ def test_itemstats_dataframe_validates_item_names() -> None:
 def test_itemstats_validates_responses(responses: object, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         itemstats(responses)  # type: ignore[arg-type]
+
+
+def test_response_validation_checks_later_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(classical, "_RESPONSE_VALIDATION_CHUNK_ELEMENTS", 2)
+
+    with pytest.raises(ValueError, match="integer-valued"):
+        itemstats([[0.0, 1.0], [2.0, 1.5]])
