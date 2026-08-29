@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -9,6 +10,36 @@ from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
+
+
+def create_paired_resample_chunks(
+    *,
+    rng: np.random.Generator,
+    n_replicates: int,
+    n_jobs: int,
+    first_size: int,
+    second_size: int,
+) -> list[tuple[dict[str, Any], int]]:
+    """Capture compact RNG chunks for paired stratified resampling.
+
+    Advancing the calling generator before work starts preserves its public
+    state and makes seeded samples independent of worker scheduling without
+    materializing every replicate's row indices.
+    """
+    if n_replicates < 0:
+        raise ValueError("n_replicates must be nonnegative")
+    if n_replicates == 0:
+        return []
+    chunk_count = min(n_jobs, n_replicates)
+    quotient, remainder = divmod(n_replicates, chunk_count)
+    chunks: list[tuple[dict[str, Any], int]] = []
+    for chunk_index in range(chunk_count):
+        chunk_size = quotient + (chunk_index < remainder)
+        chunks.append((deepcopy(rng.bit_generator.state), chunk_size))
+        for _ in range(chunk_size):
+            rng.integers(0, first_size, size=first_size)
+            rng.integers(0, second_size, size=second_size)
+    return chunks
 
 
 def split_groups(
@@ -107,6 +138,7 @@ def fit_group_models(
     """
     from mirt import fit_mirt
 
+    fit_kwargs.setdefault("compute_standard_errors", False)
     ref_result = fit_mirt(ref_data, model=model, verbose=False, **fit_kwargs)
     focal_result = fit_mirt(focal_data, model=model, verbose=False, **fit_kwargs)
 

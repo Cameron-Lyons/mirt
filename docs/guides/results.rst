@@ -32,6 +32,22 @@ Confidence intervals are also available directly:
 
    lower, upper = result.confidence_intervals(alpha=0.10)["difficulty"]
 
+When a workflow only consumes fitted parameters, skip repeated inferential work
+explicitly:
+
+.. code-block:: python
+
+   parameter_only = mirt.fit_mirt(
+       responses,
+       model="2PL",
+       compute_standard_errors=False,
+   )
+
+This is useful for resampling and repeated diagnostic fits. The returned
+``FitResult`` retains parameters, convergence metadata, and fit indices, while
+its standard-error mapping is empty and inferential summaries report ``NaN``.
+Diagnostic group refits use this mode by default.
+
 ``summary()`` supports one-, two-, and higher-dimensional parameter arrays. The legacy
 ``coef()`` and ``coef_with_se()`` methods remain available for item-aligned one- and
 two-dimensional parameters through the configured pandas or polars backend.

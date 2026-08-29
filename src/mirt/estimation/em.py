@@ -47,6 +47,7 @@ class EMEstimator(BaseEstimator):
         n_jobs: int = 1,
         use_gpu: bool | Literal["auto"] = "auto",
         use_rust: bool = True,
+        compute_standard_errors: bool = True,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -66,6 +67,14 @@ class EMEstimator(BaseEstimator):
         self.n_jobs = n_jobs
         self.use_gpu = use_gpu
         self.use_rust = use_rust
+        if not isinstance(compute_standard_errors, (bool, np.bool_)):
+            raise MirtValidationError(
+                "compute_standard_errors must be a boolean",
+                parameter="compute_standard_errors",
+                value=compute_standard_errors,
+                expected="bool",
+            )
+        self.compute_standard_errors = bool(compute_standard_errors)
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
@@ -174,8 +183,10 @@ class EMEstimator(BaseEstimator):
 
         model._is_fitted = True
 
-        standard_errors = self._compute_standard_errors(
-            model, responses, posterior_weights
+        standard_errors = (
+            self._compute_standard_errors(model, responses, posterior_weights)
+            if self.compute_standard_errors
+            else {}
         )
 
         n_params = model.n_parameters + self._latent_density.n_parameters

@@ -207,6 +207,10 @@ class TestComputeDTF:
             ({"n_bootstrap": -1}, "n_bootstrap"),
             ({"n_bootstrap": 2.5}, "n_bootstrap"),
             ({"n_bootstrap": False}, "n_bootstrap"),
+            ({"n_jobs": 0}, "n_jobs"),
+            ({"n_jobs": -2}, "n_jobs"),
+            ({"n_jobs": 2.5}, "n_jobs"),
+            ({"n_jobs": True}, "n_jobs"),
             ({"confidence_level": 0.0}, "confidence_level"),
             ({"confidence_level": 1.0}, "confidence_level"),
             ({"confidence_level": np.nan}, "confidence_level"),
@@ -399,6 +403,34 @@ class TestBootstrap:
         assert first["n_bootstrap_failed"] == 0
         assert np.isfinite(first["DTF_SE"])
         assert 0.0 <= first["p_value"] <= 1.0
+
+    def test_parallel_bootstrap_matches_serial_results(self, monkeypatch):
+        self.install_data_driven_fit(monkeypatch)
+
+        def run_inline(function, tasks, n_jobs):
+            assert len(tasks) == min(n_jobs, 24)
+            return [function(task) for task in tasks]
+
+        monkeypatch.setattr("mirt.diagnostics.dtf._run_bootstrap_tasks", run_inline)
+        data, groups = base_data()
+        options = {
+            "n_bootstrap": 24,
+            "random_state": 2718,
+            "n_quadpts": 9,
+            "confidence_level": 0.9,
+        }
+
+        serial = compute_dtf(data, groups, n_jobs=1, **options)
+        parallel = compute_dtf(data, groups, n_jobs=3, **options)
+
+        for key in ("DTF", "DTF_SE", "p_value"):
+            assert parallel[key] == pytest.approx(serial[key])
+        np.testing.assert_allclose(
+            parallel["confidence_interval"], serial["confidence_interval"]
+        )
+        assert parallel["n_bootstrap_successful"] == 24
+        assert parallel["n_bootstrap_failed"] == 0
+        assert parallel["n_jobs"] == 3
 
     def test_failures_are_counted(self, monkeypatch):
         call_count = 0

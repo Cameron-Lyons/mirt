@@ -62,12 +62,17 @@ appropriate.
        weighting="normal",
        n_bootstrap=200,
        random_state=42,
+       n_jobs=4,
    )
    print(dtf["DTF"], dtf["confidence_interval"])
 
 Set ``n_bootstrap=0`` when only the descriptive score curves and effect size
 are needed. The result reports successful and failed bootstrap replicate
-counts so uncertainty estimates can be audited.
+counts so uncertainty estimates can be audited. For larger studies,
+``n_jobs`` runs independent bootstrap refits in worker processes while
+preserving seeded results; the serial default is ``n_jobs=1``, and ``-1``
+uses all available CPU cores. The same option is available on
+:func:`mirt.reliability_invariance`.
 
 Related utilities
 -----------------

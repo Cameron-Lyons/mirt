@@ -371,6 +371,55 @@ def test_reliability_invariance_is_reproducible_and_reports_bootstrap_counts(
     assert all(option["max_iter"] == 7 for option in fit_options)
 
 
+def test_reliability_parallel_bootstrap_matches_serial_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_fit(
+        ref_data: np.ndarray,
+        focal_data: np.ndarray,
+        **kwargs: Any,
+    ) -> tuple[Any, Any]:
+        ref_information = 3.0 + float(np.mean(ref_data))
+        focal_information = 3.0 + float(np.mean(focal_data))
+        return _fit_result(_ConstantInformationModel(ref_information)), _fit_result(
+            _ConstantInformationModel(focal_information)
+        )
+
+    monkeypatch.setattr("mirt.diagnostics.drf.fit_group_models", fake_fit)
+
+    def run_inline(function: Any, tasks: list[Any], n_jobs: int) -> list[Any]:
+        assert len(tasks) == min(n_jobs, 24)
+        return [function(task) for task in tasks]
+
+    monkeypatch.setattr("mirt.diagnostics.drf._run_bootstrap_tasks", run_inline)
+    data = np.arange(48, dtype=np.int64).reshape(12, 4) % 3
+    groups = np.array([0] * 6 + [1] * 6)
+    options = {
+        "n_bootstrap": 24,
+        "seed": 314,
+        "theta_range": (-2.0, 2.0),
+        "n_points": 9,
+        "confidence_level": 0.9,
+    }
+
+    serial = reliability_invariance(data, groups, n_jobs=1, **options)
+    parallel = reliability_invariance(data, groups, n_jobs=4, **options)
+
+    for key in (
+        "reliability_ref",
+        "reliability_focal",
+        "reliability_diff",
+        "reliability_diff_se",
+        "z",
+        "p_value",
+    ):
+        assert parallel[key] == pytest.approx(serial[key])
+    assert_allclose(parallel["reliability_diff_ci"], serial["reliability_diff_ci"])
+    assert parallel["n_bootstrap_successful"] == 24
+    assert parallel["n_bootstrap_failed"] == 0
+    assert parallel["n_jobs"] == 4
+
+
 def test_reliability_invariance_counts_failed_bootstrap_fits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -458,6 +507,10 @@ def test_reliability_invariance_can_skip_bootstrap(
     [
         ({"n_bootstrap": -1}, "n_bootstrap"),
         ({"n_bootstrap": True}, "n_bootstrap"),
+        ({"n_jobs": 0}, "n_jobs"),
+        ({"n_jobs": -2}, "n_jobs"),
+        ({"n_jobs": 1.5}, "n_jobs"),
+        ({"n_jobs": False}, "n_jobs"),
         ({"confidence_level": 0.0}, "confidence_level"),
         ({"confidence_level": np.nan}, "confidence_level"),
     ],
