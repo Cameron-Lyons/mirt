@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 
@@ -350,12 +350,51 @@ def _sigmoid_inplace(values: NDArray[np.float64]) -> NDArray[np.float64]:
     return values
 
 
+def _score_item_selection(
+    *,
+    n_items: int,
+    item_idx: int | None,
+    item_indices: ArrayLike | None,
+) -> slice | NDArray[np.intp]:
+    """Validate singular or subtest item selection for sampled scores."""
+    if item_idx is not None and item_indices is not None:
+        raise ValueError("item_idx and item_indices are mutually exclusive")
+
+    if item_idx is not None:
+        if (
+            isinstance(item_idx, bool)
+            or not isinstance(item_idx, (int, np.integer))
+            or item_idx < 0
+            or item_idx >= n_items
+        ):
+            raise IndexError(f"item_idx must be an integer in [0, {n_items})")
+        index = int(item_idx)
+        return slice(index, index + 1)
+
+    if item_indices is None:
+        return slice(None)
+
+    raw_indices = np.asarray(item_indices)
+    if raw_indices.ndim != 1 or raw_indices.size == 0:
+        raise ValueError("item_indices must be a non-empty one-dimensional sequence")
+    if raw_indices.dtype.kind not in "iu":
+        raise ValueError("item_indices must contain integers")
+
+    indices = raw_indices.astype(np.intp, copy=False)
+    if np.any(indices < 0) or np.any(indices >= n_items):
+        raise IndexError(f"item_indices must contain values in [0, {n_items})")
+    if np.unique(indices).size != indices.size:
+        raise ValueError("item_indices must not contain duplicates")
+    return indices
+
+
 def sample_expected_scores(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
     samples: ParameterSamples,
     *,
     item_idx: int | None = None,
+    item_indices: ArrayLike | None = None,
     chunk_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Compute expected scores using parameter samples.
@@ -373,6 +412,10 @@ def sample_expected_scores(
     item_idx : int, optional
         Zero-based item index. When provided, uncertainty is propagated for
         only that item instead of allocating logits for the full item bank.
+    item_indices : array-like, optional
+        Unique zero-based item indices defining a subtest. The returned values
+        are expected totals across only these items. Mutually exclusive with
+        ``item_idx``.
     chunk_size : int, optional
         Number of parameter samples to evaluate per vectorized chunk. By
         default, a memory-aware chunk size is selected automatically.
@@ -381,8 +424,9 @@ def sample_expected_scores(
     -------
     NDArray[np.float64]
         Expected scores for each sample. Shape: ``(n_samples, n_persons)``.
-        With ``item_idx``, each value is that item's expected score; otherwise
-        it is the expected total score across all items.
+        With ``item_idx``, each value is that item's expected score. With
+        ``item_indices``, each value is the selected subtest's expected total;
+        otherwise it is the expected total across all items.
     """
     if model.model_name not in {"1PL", "2PL", "3PL", "4PL", "5PL"}:
         raise ValueError("sample_expected_scores requires a logistic item model")
@@ -411,15 +455,11 @@ def sample_expected_scores(
         raise ValueError(
             "sample discrimination dimensions must match the model's items and factors"
         )
-    if item_idx is not None:
-        if (
-            isinstance(item_idx, bool)
-            or not isinstance(item_idx, (int, np.integer))
-            or item_idx < 0
-            or item_idx >= n_items
-        ):
-            raise IndexError(f"item_idx must be an integer in [0, {n_items})")
-        item_idx = int(item_idx)
+    item_selection = _score_item_selection(
+        n_items=n_items,
+        item_idx=item_idx,
+        item_indices=item_indices,
+    )
 
     all_item_shape = (n_samples, n_items)
 
@@ -454,25 +494,28 @@ def sample_expected_scores(
     if asymmetry is not None and np.any(asymmetry <= 0.0):
         raise ValueError("samples.asymmetry must be positive")
 
-    lower = guessing if guessing is not None else np.zeros(all_item_shape)
+    if guessing is not None:
+        if upper is not None and np.any(guessing > upper):
+            raise ValueError("sample lower asymptotes cannot exceed upper asymptotes")
+        if slipping is not None and np.any(guessing + slipping > 1.0):
+            raise ValueError("sample lower asymptotes cannot exceed upper asymptotes")
+
+    disc = disc[:, item_selection, :]
+    diff = diff[:, item_selection]
+    guessing = None if guessing is None else guessing[:, item_selection]
+    upper = None if upper is None else upper[:, item_selection]
+    slipping = None if slipping is None else slipping[:, item_selection]
+    asymmetry = None if asymmetry is None else asymmetry[:, item_selection]
+    n_scored_items = disc.shape[1]
+    selected_shape = (n_samples, n_scored_items)
+
+    lower = guessing if guessing is not None else np.zeros(selected_shape)
     if upper is not None:
         effective_upper = upper
     elif slipping is not None:
         effective_upper = 1.0 - slipping
     else:
-        effective_upper = np.ones(all_item_shape)
-    if np.any(lower > effective_upper):
-        raise ValueError("sample lower asymptotes cannot exceed upper asymptotes")
-
-    if item_idx is not None:
-        item_selection = slice(item_idx, item_idx + 1)
-        disc = disc[:, item_selection, :]
-        diff = diff[:, item_selection]
-        lower = lower[:, item_selection]
-        effective_upper = effective_upper[:, item_selection]
-        if asymmetry is not None:
-            asymmetry = asymmetry[:, item_selection]
-    n_scored_items = disc.shape[1]
+        effective_upper = np.ones(selected_shape)
 
     n_persons = theta.shape[0]
     expected = np.empty((n_samples, n_persons), dtype=np.float64)
