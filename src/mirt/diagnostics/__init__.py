@@ -4,6 +4,7 @@ from typing import Any
 __all__ = [
     "compute_itemfit",
     "compute_personfit",
+    "compute_personfit_significance",
     "compute_dif",
     "compute_grdif",
     "compute_pairwise_rdif",
@@ -35,6 +36,10 @@ __all__ = [
 _LAZY_IMPORTS = {
     "compute_itemfit": ("mirt.diagnostics.itemfit", "compute_itemfit"),
     "compute_personfit": ("mirt.diagnostics.personfit", "compute_personfit"),
+    "compute_personfit_significance": (
+        "mirt.diagnostics.personfit",
+        "compute_personfit_significance",
+    ),
     "compute_dif": ("mirt.diagnostics.dif", "compute_dif"),
     "compute_grdif": ("mirt.diagnostics.dif", "compute_grdif"),
     "compute_pairwise_rdif": ("mirt.diagnostics.dif", "compute_pairwise_rdif"),

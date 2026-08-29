@@ -120,7 +120,10 @@ Evaluate model fit with various diagnostics:
 
    item_stats = mirt.itemfit(result, responses, statistics=["infit", "outfit"])
    person_stats = mirt.personfit(
-       result, responses, statistics=["infit", "outfit", "Zh"]
+       result,
+       responses,
+       statistics=["infit", "outfit", "Zh"],
+       p_adjust="holm",
    )
    print(item_stats.head())
    print(person_stats.head())

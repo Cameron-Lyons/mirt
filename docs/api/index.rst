@@ -104,6 +104,7 @@ Diagnostics
    compute_drf
    sibtest
    diagnostics.adjust_p_values
+   diagnostics.compute_personfit_significance
    diagnostics.psis_loo
    diagnostics.waic
 
