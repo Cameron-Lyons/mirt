@@ -24,6 +24,20 @@ parameters used by supported logistic models.
    difficulty_lower = summary["difficulty"]["ci_lower"]
    difficulty_upper = summary["difficulty"]["ci_upper"]
 
+Equal-tail intervals remain the default. For skewed or multimodal parameter
+draws, request the narrowest empirical interval containing the target mass:
+
+.. code-block:: python
+
+   density_summary = mirt.posterior_summary(
+       samples,
+       credible_level=0.95,
+       interval_method="highest_density",
+   )
+
+   difficulty_hdi_lower = density_summary["difficulty"]["ci_lower"]
+   difficulty_hdi_upper = density_summary["difficulty"]["ci_upper"]
+
 Pass a full parameter covariance matrix through ``vcov`` when one is available.
 Without it, the sampler uses a documented diagonal approximation.
 

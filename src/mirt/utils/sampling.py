@@ -5,7 +5,7 @@ posterior distribution for uncertainty quantification.
 """
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -280,10 +280,61 @@ def _validated_parameter_samples(
     )
 
 
+def _equal_tailed_sample_summary(
+    values: NDArray[np.float64],
+    lower_percentile: float,
+    upper_percentile: float,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Return median and equal-tail bounds from one quantile pass."""
+    quantiles = np.percentile(
+        values,
+        [lower_percentile, 50.0, upper_percentile],
+        axis=0,
+    )
+    return quantiles[1], quantiles[0], quantiles[2]
+
+
+def _highest_density_sample_summary(
+    values: NDArray[np.float64],
+    credible_level: float,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Return median and shortest empirical intervals from one sort."""
+    ordered = np.sort(values, axis=0)
+    n_draws = ordered.shape[0]
+    midpoint = n_draws // 2
+    if n_draws % 2:
+        median = ordered[midpoint].copy()
+    else:
+        median = (ordered[midpoint - 1] + ordered[midpoint]) * 0.5
+
+    window_size = min(n_draws, max(1, int(np.ceil(credible_level * n_draws))))
+    if window_size == n_draws:
+        return median, ordered[0].copy(), ordered[-1].copy()
+
+    widths = ordered[window_size - 1 :] - ordered[: n_draws - window_size + 1]
+    starts = np.argmin(widths, axis=0).astype(np.intp, copy=False)
+    lower = np.take_along_axis(ordered, starts[None, ...], axis=0)[0]
+    upper = np.take_along_axis(
+        ordered,
+        (starts + window_size - 1)[None, ...],
+        axis=0,
+    )[0]
+    return median, lower, upper
+
+
 def posterior_summary(
     samples: ParameterSamples,
     credible_level: float = 0.95,
-) -> dict[str, dict]:
+    interval_method: Literal["equal_tailed", "highest_density"] = "equal_tailed",
+) -> dict[str, dict[str, NDArray[np.float64]]]:
     """Compute posterior summary statistics from samples.
 
     Parameters
@@ -292,6 +343,10 @@ def posterior_summary(
         Parameter samples from draw_parameters().
     credible_level : float
         Level for credible intervals. Default 0.95.
+    interval_method : {"equal_tailed", "highest_density"}
+        Interval construction. Equal-tail intervals use marginal percentiles;
+        highest-density intervals use the narrowest empirical window containing
+        at least ``credible_level`` of the draws. Default "equal_tailed".
 
     Returns
     -------
@@ -307,6 +362,11 @@ def posterior_summary(
     """
     if not np.isfinite(credible_level) or not 0.0 < credible_level < 1.0:
         raise ValueError("credible_level must be between 0 and 1")
+    if not isinstance(interval_method, str) or interval_method not in {
+        "equal_tailed",
+        "highest_density",
+    }:
+        raise ValueError("interval_method must be 'equal_tailed' or 'highest_density'")
 
     alpha = 1 - credible_level
     lower_q = alpha / 2 * 100
@@ -328,17 +388,29 @@ def posterior_summary(
         )
     )
 
-    return {
-        name: {
+    summaries: dict[str, dict[str, NDArray[np.float64]]] = {}
+    for name, values in parameter_arrays.items():
+        if values is None:
+            continue
+        if interval_method == "equal_tailed":
+            median, lower, upper = _equal_tailed_sample_summary(
+                values,
+                lower_q,
+                upper_q,
+            )
+        else:
+            median, lower, upper = _highest_density_sample_summary(
+                values,
+                credible_level,
+            )
+        summaries[name] = {
             "mean": np.mean(values, axis=0),
             "std": np.std(values, axis=0),
-            "median": np.median(values, axis=0),
-            "ci_lower": np.percentile(values, lower_q, axis=0),
-            "ci_upper": np.percentile(values, upper_q, axis=0),
+            "median": median,
+            "ci_lower": lower,
+            "ci_upper": upper,
         }
-        for name, values in parameter_arrays.items()
-        if values is not None
-    }
+    return summaries
 
 
 def _sigmoid_inplace(values: NDArray[np.float64]) -> NDArray[np.float64]:
