@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
+    _entry_chunk_size,
     mirt_rs,
     rust_enabled,
 )
@@ -155,6 +156,39 @@ def _binary_log_likelihood_grid(
     return correct @ np.log(probabilities).T + incorrect @ np.log1p(-probabilities).T
 
 
+def _sample_posterior_grid(
+    cumulative_posterior: NDArray[np.float64],
+    quad_points: NDArray[np.float64],
+    n_plausible: int,
+    jitter_sd: float,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Draw every posterior-grid sample with bounded inverse-CDF chunks."""
+    n_persons, n_quad = cumulative_posterior.shape
+    plausible_values = np.empty((n_persons, n_plausible), dtype=np.float64)
+    flat_values = plausible_values.ravel()
+    n_samples = flat_values.size
+    chunk_size = _entry_chunk_size(
+        n_samples,
+        n_quad,
+    )
+
+    for start in range(0, n_samples, chunk_size):
+        stop = min(start + chunk_size, n_samples)
+        person_indices = np.arange(start, stop, dtype=np.intp) // n_plausible
+        uniforms = rng.random(stop - start)
+        indices = np.count_nonzero(
+            uniforms[:, None] >= cumulative_posterior[person_indices],
+            axis=1,
+        )
+        draws = quad_points[indices]
+        if jitter_sd > 0.0:
+            draws += rng.normal(0.0, jitter_sd, size=stop - start)
+        flat_values[start:stop] = draws
+
+    return plausible_values
+
+
 def _binary_log_posterior(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
@@ -238,24 +272,24 @@ def generate_plausible_values_posterior(
         )
 
     rng = np.random.default_rng(seed)
-    n_persons = responses.shape[0]
-    n_quad = len(quad_points)
-
-    pvs = np.empty((n_persons, n_plausible), dtype=np.float64)
     log_weights = np.log(quad_weights + 1e-300)
-    log_likes = _binary_log_likelihood_grid(
+    posterior = _binary_log_likelihood_grid(
         responses, quad_points, discrimination, difficulty
     )
-    log_posterior = log_likes + log_weights[None, :]
-    log_posterior -= np.max(log_posterior, axis=1, keepdims=True)
-    posterior = np.exp(log_posterior)
+    posterior += log_weights[None, :]
+    posterior -= np.max(posterior, axis=1, keepdims=True)
+    np.exp(posterior, out=posterior)
     posterior /= np.sum(posterior, axis=1, keepdims=True)
-    for i in range(n_persons):
-        for draw in range(n_plausible):
-            idx = rng.choice(n_quad, p=posterior[i])
-            pvs[i, draw] = quad_points[idx] + rng.normal(0.0, jitter_sd)
+    np.cumsum(posterior, axis=1, out=posterior)
+    posterior[:, -1] = 1.0
 
-    return pvs
+    return _sample_posterior_grid(
+        posterior,
+        quad_points,
+        n_plausible,
+        jitter_sd,
+        rng,
+    )
 
 
 def generate_plausible_values_mcmc(
