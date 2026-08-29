@@ -863,6 +863,7 @@ class BKTModel:
             Integer response matrix with shape ``(n_persons, n_trials)``.
         skill_assignments : NDArray
             Shared trial-to-skill vector or a matrix matching ``responses``.
+            Repeated matrix rows are grouped for batch inference.
 
         Returns
         -------
@@ -1884,15 +1885,39 @@ class BKTModel:
 
         gamma = np.empty((*responses.shape, 2), dtype=np.float64)
         log_likelihoods = np.empty(responses.shape[0], dtype=np.float64)
-        for person_idx, person_responses in enumerate(responses):
-            person_skills = (
-                skill_assignments
-                if skill_assignments.ndim == 1
-                else skill_assignments[person_idx]
+        layout_rows: dict[bytes, list[int]] = {}
+        for row, layout in enumerate(skill_assignments):
+            layout_rows.setdefault(layout.tobytes(), []).append(row)
+
+        native_available = self._can_use_native_inference()
+        if not native_available and len(layout_rows) == responses.shape[0]:
+            for row, layout in enumerate(skill_assignments):
+                gamma[row], log_likelihoods[row] = self._forward_backward_python(
+                    responses[row], layout
+                )
+            return gamma, log_likelihoods
+
+        for row_group in layout_rows.values():
+            rows = np.asarray(row_group, dtype=np.intp)
+            layout = skill_assignments[row_group[0]]
+            layout_responses = responses[rows]
+            result = (
+                self._native_forward_backward_batch(layout_responses, layout)
+                if native_available
+                else None
             )
-            gamma[person_idx], log_likelihoods[person_idx] = (
-                self._forward_backward_python(person_responses, person_skills)
-            )
+            if result is None:
+                if rows.size == 1:
+                    row = int(rows[0])
+                    gamma[row], log_likelihoods[row] = self._forward_backward_python(
+                        responses[row], layout
+                    )
+                    continue
+                result = self._forward_backward_batch_shared_python(
+                    layout_responses,
+                    layout,
+                )
+            gamma[rows], log_likelihoods[rows] = result
         return gamma, log_likelihoods
 
     def viterbi(

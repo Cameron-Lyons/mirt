@@ -189,6 +189,151 @@ def test_batch_api_supports_person_specific_skill_layouts() -> None:
         )
 
 
+def test_person_specific_batches_group_repeated_layouts_for_native_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses, shared_skills = _batch()
+    responses = np.vstack((responses, responses, responses[:1]))
+    rolled_skills = np.roll(shared_skills, 1)
+    skill_assignments = np.vstack(
+        (
+            shared_skills,
+            rolled_skills,
+            shared_skills,
+            rolled_skills,
+            shared_skills,
+            np.roll(shared_skills, 2),
+            shared_skills,
+        )
+    )
+    model = _model()
+    calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def fake_native(
+        response_values: np.ndarray,
+        skill_values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        calls.append((response_values.copy(), skill_values.copy()))
+        learned = np.full(response_values.shape, 0.6)
+        gamma = np.stack((1.0 - learned, learned), axis=2)
+        return gamma, np.full(response_values.shape[0], -3.0)
+
+    monkeypatch.setattr(model, "_can_use_native_inference", lambda: True)
+    monkeypatch.setattr(model, "_native_forward_backward_batch", fake_native)
+    monkeypatch.setattr(
+        model,
+        "_forward_backward_python",
+        lambda *args, **kwargs: pytest.fail("layouts must use batch dispatch"),
+    )
+
+    gamma, log_likelihoods = model.forward_backward_batch(
+        responses,
+        skill_assignments,
+    )
+
+    assert sorted(len(response_values) for response_values, _ in calls) == [1, 2, 4]
+    assert {tuple(skill_values) for _, skill_values in calls} == {
+        tuple(shared_skills),
+        tuple(rolled_skills),
+        tuple(np.roll(shared_skills, 2)),
+    }
+    assert_allclose(gamma[..., 1], 0.6)
+    assert_allclose(log_likelihoods, -3.0)
+
+
+def test_repeated_layout_numpy_fallback_avoids_per_person_smoothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses, shared_skills = _batch()
+    responses = np.vstack((responses, responses))
+    skill_assignments = np.vstack(
+        (
+            shared_skills,
+            np.roll(shared_skills, 1),
+            shared_skills,
+            np.roll(shared_skills, 1),
+            shared_skills,
+            np.roll(shared_skills, 1),
+        )
+    )
+    expected_model = _model(use_rust=False)
+    expected = [
+        expected_model._forward_backward_python(person_responses, person_skills)
+        for person_responses, person_skills in zip(
+            responses,
+            skill_assignments,
+            strict=True,
+        )
+    ]
+    model = _model(use_rust=False)
+    batch_sizes: list[int] = []
+    original = model._forward_backward_batch_shared_python
+
+    def record_batch(
+        response_values: np.ndarray,
+        skill_values: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        batch_sizes.append(len(response_values))
+        return original(response_values, skill_values)
+
+    monkeypatch.setattr(model, "_forward_backward_batch_shared_python", record_batch)
+    monkeypatch.setattr(
+        model,
+        "_forward_backward_python",
+        lambda *args, **kwargs: pytest.fail("repeated layouts must stay batched"),
+    )
+
+    gamma, log_likelihoods = model.forward_backward_batch(
+        responses,
+        skill_assignments,
+    )
+
+    assert sorted(batch_sizes) == [3, 3]
+    for person_idx, (expected_gamma, expected_ll) in enumerate(expected):
+        assert_allclose(gamma[person_idx], expected_gamma)
+        assert log_likelihoods[person_idx] == pytest.approx(expected_ll)
+
+
+def test_unique_layout_numpy_fallback_retains_individual_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses, shared_skills = _batch()
+    skill_assignments = np.vstack(
+        (
+            shared_skills,
+            np.roll(shared_skills, 1),
+            np.roll(shared_skills, 2),
+        )
+    )
+    model = _model(use_rust=False)
+    calls = 0
+    original = model._forward_backward_python
+
+    def record_individual(
+        response_values: np.ndarray,
+        skill_values: np.ndarray,
+    ) -> tuple[np.ndarray, float]:
+        nonlocal calls
+        calls += 1
+        return original(response_values, skill_values)
+
+    monkeypatch.setattr(model, "_forward_backward_python", record_individual)
+    monkeypatch.setattr(
+        model,
+        "_forward_backward_batch_shared_python",
+        lambda *args, **kwargs: pytest.fail("singleton layouts must avoid batching"),
+    )
+
+    gamma, log_likelihoods = model.forward_backward_batch(
+        responses,
+        skill_assignments,
+    )
+
+    assert calls == len(responses)
+    assert gamma.shape == (*responses.shape, 2)
+    assert np.all(np.isfinite(log_likelihoods))
+
+
 def test_single_and_batch_methods_dispatch_to_native_kernels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
