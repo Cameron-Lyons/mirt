@@ -1,3 +1,5 @@
+from collections.abc import Iterator
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -10,13 +12,54 @@ from mirt._rust_backend import (
 from mirt.constants import PROB_EPSILON
 from mirt.models.base import PolytomousItemModel
 
+_MAX_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+
+
+def _category_count_chunks(
+    category_counts: list[int],
+    n_persons: int,
+) -> Iterator[tuple[int, NDArray[np.intp]]]:
+    """Group equal-width items into memory-bounded probability chunks."""
+    counts = np.asarray(category_counts, dtype=np.intp)
+    for n_categories in np.unique(counts):
+        item_indices = np.flatnonzero(counts == n_categories)
+        chunk_size = max(
+            1,
+            _MAX_PROBABILITY_CHUNK_ENTRIES // max(1, n_persons * int(n_categories)),
+        )
+        for start in range(0, item_indices.size, chunk_size):
+            yield (
+                int(n_categories),
+                item_indices[start : start + chunk_size],
+            )
+
 
 def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Compute row-wise softmax without overflowing exponentials."""
-    weights = logits - np.max(logits, axis=1, keepdims=True)
+    """Compute category-last softmax without overflowing exponentials."""
+    weights = logits - np.max(logits, axis=-1, keepdims=True)
     np.exp(weights, out=weights)
-    weights /= weights.sum(axis=1, keepdims=True)
+    weights /= weights.sum(axis=-1, keepdims=True)
     return weights
+
+
+def _graded_probabilities(logits: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Convert cumulative logits to category-last graded probabilities."""
+    cumulative = sigmoid(logits)
+    probabilities = np.empty((*logits.shape[:-1], logits.shape[-1] + 1))
+    probabilities[..., 0] = 1.0 - cumulative[..., 0]
+    probabilities[..., 1:-1] = cumulative[..., :-1] - cumulative[..., 1:]
+    probabilities[..., -1] = cumulative[..., -1]
+    return probabilities
+
+
+def _partial_credit_probabilities(
+    increments: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Convert adjacent-category increments to stable probabilities."""
+    logits = np.empty((*increments.shape[:-1], increments.shape[-1] + 1))
+    logits[..., 0] = 0.0
+    np.cumsum(increments, axis=-1, out=logits[..., 1:])
+    return _stable_softmax(logits)
 
 
 def _graded_information(
@@ -136,7 +179,6 @@ class GradedResponseModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute all GRM category probabilities in one vectorized pass."""
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
         n_cat = self._n_categories[item_idx]
         a_item = self._parameters["discrimination"][item_idx]
         thresholds = self._parameters["thresholds"][item_idx, : n_cat - 1]
@@ -146,11 +188,48 @@ class GradedResponseModel(PolytomousItemModel):
         else:
             logits = np.dot(theta, a_item)[:, None] - np.sum(a_item) * thresholds
 
-        cumulative = sigmoid(logits)
-        probabilities = np.empty((n_persons, n_cat), dtype=np.float64)
-        probabilities[:, 0] = 1.0 - cumulative[:, 0]
-        probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
-        probabilities[:, -1] = cumulative[:, -1]
+        return _graded_probabilities(logits)
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute all-item GRM probabilities in bounded item chunks."""
+        theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            return self._category_probabilities(theta, item_idx)
+        if self.n_items == 1:
+            return self._category_probabilities(theta, 0)[:, None, :]
+        n_persons = theta.shape[0]
+        probabilities = np.zeros(
+            (n_persons, self.n_items, max(self._n_categories)),
+            dtype=np.float64,
+        )
+        discrimination = self._parameters["discrimination"]
+        thresholds = self._parameters["thresholds"]
+
+        for n_categories, item_indices in _category_count_chunks(
+            self._n_categories, n_persons
+        ):
+            active_thresholds = thresholds[item_indices, : n_categories - 1]
+            active_discrimination = discrimination[item_indices]
+            if self.n_factors == 1:
+                logits = active_discrimination[None, :, None] * (
+                    theta[:, 0, None, None] - active_thresholds[None, :, :]
+                )
+            else:
+                projected_theta = theta @ active_discrimination.T
+                threshold_scale = np.sum(active_discrimination, axis=1)
+                logits = (
+                    projected_theta[:, :, None]
+                    - (threshold_scale[:, None] * active_thresholds)[None, :, :]
+                )
+
+            probabilities[:, item_indices, :n_categories] = _graded_probabilities(
+                logits
+            )
+
         return probabilities
 
     def _item_information(
@@ -253,7 +332,6 @@ class GeneralizedPartialCredit(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute all GPCM category probabilities in one stable pass."""
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
         n_cat = self._n_categories[item_idx]
 
         a = self._parameters["discrimination"]
@@ -268,10 +346,49 @@ class GeneralizedPartialCredit(PolytomousItemModel):
             projected_theta = np.dot(theta, a_item)
             increments = scale * (projected_theta[:, None] - steps[None, :])
 
-        logits = np.empty((n_persons, n_cat), dtype=np.float64)
-        logits[:, 0] = 0.0
-        np.cumsum(increments, axis=1, out=logits[:, 1:])
-        return _stable_softmax(logits)
+        return _partial_credit_probabilities(increments)
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute all-item GPCM probabilities in bounded item chunks."""
+        theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            return self._category_probabilities(theta, item_idx)
+        if self.n_items == 1:
+            return self._category_probabilities(theta, 0)[:, None, :]
+
+        n_persons = theta.shape[0]
+        probabilities = np.zeros(
+            (n_persons, self.n_items, max(self._n_categories)),
+            dtype=np.float64,
+        )
+        discrimination = self._parameters["discrimination"]
+        steps = self._parameters["steps"]
+
+        for n_categories, item_indices in _category_count_chunks(
+            self._n_categories, n_persons
+        ):
+            active_steps = steps[item_indices, : n_categories - 1]
+            active_discrimination = discrimination[item_indices]
+            if self.n_factors == 1:
+                increments = active_discrimination[None, :, None] * (
+                    theta[:, 0, None, None] - active_steps[None, :, :]
+                )
+            else:
+                scale = np.linalg.norm(active_discrimination, axis=1)
+                projected_theta = theta @ active_discrimination.T
+                increments = scale[None, :, None] * (
+                    projected_theta[:, :, None] - active_steps[None, :, :]
+                )
+
+            probabilities[:, item_indices, :n_categories] = (
+                _partial_credit_probabilities(increments)
+            )
+
+        return probabilities
 
     def _item_information(
         self,
@@ -485,17 +602,42 @@ class RatingScaleModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute all RSM category probabilities in one stable pass."""
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
-        n_cat = self._n_cats
 
         b_j = self._parameters["difficulty"][item_idx]
         tau = self._parameters["thresholds"]
         increments = theta.ravel()[:, None] - b_j - tau[None, :]
 
-        logits = np.empty((n_persons, n_cat), dtype=np.float64)
-        logits[:, 0] = 0.0
-        np.cumsum(increments, axis=1, out=logits[:, 1:])
-        return _stable_softmax(logits)
+        return _partial_credit_probabilities(increments)
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute all-item RSM probabilities in bounded item chunks."""
+        theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            return self._category_probabilities(theta, item_idx)
+        if self.n_items == 1:
+            return self._category_probabilities(theta, 0)[:, None, :]
+
+        n_persons = theta.shape[0]
+        probabilities = np.empty(
+            (n_persons, self.n_items, self._n_cats),
+            dtype=np.float64,
+        )
+        difficulty = self._parameters["difficulty"]
+        thresholds = self._parameters["thresholds"]
+        for _, item_indices in _category_count_chunks(self._n_categories, n_persons):
+            increments = (
+                theta[:, 0, None, None]
+                - difficulty[item_indices][None, :, None]
+                - thresholds[None, None, :]
+            )
+            probabilities[:, item_indices, :] = _partial_credit_probabilities(
+                increments
+            )
+        return probabilities
 
     def _item_information(
         self,
@@ -664,18 +806,40 @@ class GradedRatingScaleModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute all GRSM category probabilities in one vectorized pass."""
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
-        n_cat = self._n_cats
         a = self._parameters["discrimination"][0]
         b_j = self._parameters["difficulty"][item_idx]
         thresholds = self._parameters["thresholds"]
 
         logits = a * (theta.ravel()[:, None] - b_j - thresholds[None, :])
-        cumulative = sigmoid(logits)
-        probabilities = np.empty((n_persons, n_cat), dtype=np.float64)
-        probabilities[:, 0] = 1.0 - cumulative[:, 0]
-        probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
-        probabilities[:, -1] = cumulative[:, -1]
+        return _graded_probabilities(logits)
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute all-item GRSM probabilities in bounded item chunks."""
+        theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            return self._category_probabilities(theta, item_idx)
+        if self.n_items == 1:
+            return self._category_probabilities(theta, 0)[:, None, :]
+
+        n_persons = theta.shape[0]
+        probabilities = np.empty(
+            (n_persons, self.n_items, self._n_cats),
+            dtype=np.float64,
+        )
+        discrimination = self._parameters["discrimination"][0]
+        difficulty = self._parameters["difficulty"]
+        thresholds = self._parameters["thresholds"]
+        for _, item_indices in _category_count_chunks(self._n_categories, n_persons):
+            logits = discrimination * (
+                theta[:, 0, None, None]
+                - difficulty[item_indices][None, :, None]
+                - thresholds[None, None, :]
+            )
+            probabilities[:, item_indices, :] = _graded_probabilities(logits)
         return probabilities
 
     def _item_information(
@@ -805,6 +969,57 @@ class NominalResponseModel(PolytomousItemModel):
             logits = np.dot(theta, a[item_idx, :n_cat].T) + c[item_idx, None, :n_cat]
 
         return _stable_softmax(logits)
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute all-item NRM probabilities in bounded item chunks."""
+        theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            return self._category_probabilities(theta, item_idx)
+        if self.n_items == 1:
+            return self._category_probabilities(theta, 0)[:, None, :]
+        if self.n_items < 8:
+            return super().probability(theta)
+
+        n_persons = theta.shape[0]
+        probabilities = np.zeros(
+            (n_persons, self.n_items, max(self._n_categories)),
+            dtype=np.float64,
+        )
+        slopes = self._parameters["slopes"]
+        intercepts = self._parameters["intercepts"]
+
+        for n_categories, item_indices in _category_count_chunks(
+            self._n_categories, n_persons
+        ):
+            if item_indices.size < 4:
+                for item_index in item_indices:
+                    probabilities[:, item_index, :n_categories] = (
+                        self._category_probabilities(theta, int(item_index))
+                    )
+                continue
+
+            active_slopes = slopes[item_indices, :n_categories]
+            active_intercepts = intercepts[item_indices, :n_categories]
+            if self.n_factors == 1:
+                logits = (
+                    theta[:, 0, None, None] * active_slopes[None, :, :]
+                    + active_intercepts[None, :, :]
+                )
+            else:
+                logits = np.einsum(
+                    "pf,icf->pic",
+                    theta,
+                    active_slopes,
+                    optimize=True,
+                )
+                logits += active_intercepts[None, :, :]
+            probabilities[:, item_indices, :n_categories] = _stable_softmax(logits)
+
+        return probabilities
 
     def _item_information(
         self,
