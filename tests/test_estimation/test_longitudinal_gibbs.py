@@ -158,6 +158,37 @@ def _reference_sample_items(
             model.difficulty[j] = b_proposed
 
 
+def _reference_sample_growth_factors(
+    theta_trajectories: np.ndarray,
+    model: LongitudinalIRTModel,
+    time_values: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Evaluate the original person-wise posterior sampler."""
+    n_persons = theta_trajectories.shape[0]
+    n_growth = model.n_growth_factors
+    design = np.ones((time_values.size, n_growth))
+    design[:, 1] = time_values
+    if model.growth_model == "quadratic":
+        design[:, 2] = time_values**2
+
+    precision_prior = np.linalg.inv(model.growth_cov)
+    precision_likelihood = design.T @ design / model.residual_variance
+    growth_factors = np.empty((n_persons, n_growth))
+    for person in range(n_persons):
+        covariance = np.linalg.inv(precision_prior + precision_likelihood)
+        likelihood_mean = (
+            design.T @ theta_trajectories[person] / model.residual_variance
+        )
+        prior_mean = precision_prior @ model.growth_mean
+        posterior_mean = covariance @ (prior_mean + likelihood_mean)
+        growth_factors[person] = rng.multivariate_normal(
+            posterior_mean,
+            covariance,
+        )
+    return growth_factors
+
+
 @pytest.fixture
 def longitudinal_data() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     responses = np.array(
@@ -266,6 +297,56 @@ def test_vectorized_item_sampler_preserves_seeded_draws(
 
     assert_array_equal(actual_model.discrimination, expected_model.discrimination)
     assert_array_equal(actual_model.difficulty, expected_model.difficulty)
+
+
+@pytest.mark.parametrize("growth_model", ["linear", "quadratic"])
+def test_batched_growth_factor_sampler_matches_personwise_reference(
+    growth_model: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(84)
+    n_persons = 37
+    time_values = np.array([-0.5, 0.2, 1.7, 3.1])
+    n_growth = 2 if growth_model == "linear" else 3
+    covariance_root = rng.normal(size=(n_growth, n_growth))
+    model = LongitudinalIRTModel(
+        n_items=4,
+        n_timepoints=time_values.size,
+        growth_model=growth_model,
+        growth_mean=rng.normal(size=n_growth),
+        growth_cov=covariance_root @ covariance_root.T + 0.5 * np.eye(n_growth),
+        residual_variance=0.35,
+    )
+    theta = rng.normal(size=(n_persons, time_values.size))
+    expected_rng = np.random.default_rng(91)
+    actual_rng = np.random.default_rng(91)
+    expected = _reference_sample_growth_factors(
+        theta,
+        model,
+        time_values,
+        expected_rng,
+    )
+    sampler = LongitudinalGibbsSampler(n_iter=2, burnin=1)
+
+    inverse_calls = 0
+    original_inverse = np.linalg.inv
+
+    def counting_inverse(values: np.ndarray) -> np.ndarray:
+        nonlocal inverse_calls
+        inverse_calls += 1
+        return original_inverse(values)
+
+    monkeypatch.setattr(dynamic_gibbs.np.linalg, "inv", counting_inverse)
+    actual = sampler._sample_growth_factors(
+        theta,
+        model,
+        time_values,
+        actual_rng,
+    )
+
+    assert inverse_calls == 2
+    assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+    assert actual_rng.random() == expected_rng.random()
 
 
 @pytest.mark.parametrize(
