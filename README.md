@@ -19,7 +19,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Mixture IRT**: Latent class IRT models
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
-- **Nonparametric**: Monotonic spline IRFs
+- **Nonparametric**: Monotonic spline and weighted kernel-smoothed IRFs
 - **Network Psychometrics**: Ising and sparse Gaussian graphical models
 
 ### Estimation Methods
@@ -140,6 +140,21 @@ result_grm = mirt.fit_mirt(likert_data, model="GRM", n_categories=5)
 result_gpcm = mirt.fit_mirt(likert_data, model="GPCM", n_categories=5)
 
 result_mirt = mirt.fit_mirt(responses, model="2PL", n_factors=2)
+```
+
+### Weighted Nonparametric Calibration
+
+```python
+from mirt.models import KernelSmoothingModel
+
+theta = np.linspace(-3, 3, 500)
+kernel_data = mirt.simdata(model="2PL", theta=theta, n_items=20, seed=7)
+person_weight = np.linspace(0.5, 1.5, theta.size)
+
+kernel_model = KernelSmoothingModel(n_items=kernel_data.shape[1]).calibrate(
+    kernel_data, theta, sample_weight=person_weight
+)
+smoothed_curves = kernel_model.probability(np.linspace(-3, 3, 121))
 ```
 
 ### Person Scoring
