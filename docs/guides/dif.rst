@@ -73,7 +73,8 @@ Related utilities
 -----------------
 
 * :func:`mirt.sibtest` — SIBTEST
-* :func:`mirt.compute_grdif` — multi-group GRDIF with robust scaling
+* :func:`mirt.compute_grdif` — multi-group GRDIF with robust scaling and
+  itemwise multiplicity control
 * :func:`mirt.compute_dtf` / :func:`mirt.compute_drf` — test/response functioning
 
 See ``examples/dif_analysis.py``.
