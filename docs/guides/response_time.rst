@@ -38,6 +38,29 @@ Create a model with one set of accuracy and timing parameters per item:
 Negative or ``NaN`` responses are treated as missing.  A ``NaN`` log response
 time is missing independently of its accuracy response.
 
+Posterior likelihood batches
+----------------------------
+
+Use ``joint_log_likelihood_samples`` to evaluate paired retained ability and
+speed draws without a Python loop. The result preserves the sample-by-person
+layout needed by WAIC, DIC, or other posterior summaries:
+
+.. code-block:: python
+
+   # Both arrays have shape (n_samples, n_persons).
+   pointwise_log_likelihood = model.joint_log_likelihood_samples(
+       responses,
+       log_response_times,
+       theta_samples,
+       speed_samples,
+   )
+
+The compiled path parallelizes the complete sample-person grid. The NumPy
+fallback selects memory-bounded sample batches automatically; set
+``sample_chunk_size`` explicitly when a tighter memory ceiling is required.
+The Gibbs estimator uses this path automatically for its DIC and WAIC
+calculations.
+
 Timing predictions
 ------------------
 

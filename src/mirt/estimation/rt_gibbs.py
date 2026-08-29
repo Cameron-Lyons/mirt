@@ -974,6 +974,25 @@ class ResponseTimeGibbsSampler:
     ) -> NDArray[np.float64]:
         """Evaluate every retained person-level log likelihood once."""
         n_samples = theta_samples.shape[0]
+        batched_likelihood = getattr(model, "joint_log_likelihood_samples", None)
+        if callable(batched_likelihood):
+            log_likes = np.asarray(
+                batched_likelihood(
+                    responses,
+                    log_rt,
+                    theta_samples,
+                    tau_samples,
+                ),
+                dtype=np.float64,
+            )
+            expected_shape = (n_samples, responses.shape[0])
+            if log_likes.shape != expected_shape:
+                raise ValueError(
+                    "joint_log_likelihood_samples must return shape "
+                    f"{expected_shape}, got {log_likes.shape}"
+                )
+            return log_likes
+
         log_likes = np.empty((n_samples, responses.shape[0]), dtype=np.float64)
         for sample_idx in range(n_samples):
             log_likes[sample_idx] = model.joint_log_likelihood(
