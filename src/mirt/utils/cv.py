@@ -18,9 +18,11 @@ from numpy.typing import NDArray
 
 if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
+    from mirt.results.score_result import ScoreResult
 
 
 ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+AbilityMethod = Literal["EAP", "MAP", "ML", "WLE", "EAPsum"]
 
 
 def _validate_split_responses(
@@ -584,6 +586,28 @@ class Scorer(ABC):
         """Name of the scorer for results dictionary."""
         ...
 
+    @property
+    def ability_method(self) -> AbilityMethod | None:
+        """Ability estimation method that can be shared within a fold."""
+        return None
+
+    def score_from_ability_result(
+        self,
+        result: FitResult,
+        train_responses: NDArray[np.int_],
+        test_responses: NDArray[np.int_],
+        ability_result: ScoreResult,
+        test_indices: NDArray[np.intp] | None = None,
+    ) -> float:
+        """Compute a metric from a reusable ability estimate.
+
+        Scorers that declare an ``ability_method`` must override this method.
+        Existing custom scorers can continue to implement only ``__call__``.
+        """
+        raise NotImplementedError(
+            "scorers with an ability_method must implement score_from_ability_result"
+        )
+
     @abstractmethod
     def __call__(
         self,
@@ -625,6 +649,10 @@ class LogLikelihoodScorer(Scorer):
     def name(self) -> str:
         return "log_likelihood"
 
+    @property
+    def ability_method(self) -> Literal["EAP"]:
+        return "EAP"
+
     def __call__(
         self,
         result: FitResult,
@@ -635,9 +663,30 @@ class LogLikelihoodScorer(Scorer):
         """Compute log-likelihood on test data."""
         from mirt.scoring import fscores
 
-        _ = train_responses
-        scores = fscores(result.model, test_responses, method="EAP")
-        theta = scores.theta
+        ability_result = fscores(
+            result.model,
+            test_responses,
+            method=self.ability_method,
+        )
+        return self.score_from_ability_result(
+            result,
+            train_responses,
+            test_responses,
+            ability_result,
+            test_indices,
+        )
+
+    def score_from_ability_result(
+        self,
+        result: FitResult,
+        train_responses: NDArray[np.int_],
+        test_responses: NDArray[np.int_],
+        ability_result: ScoreResult,
+        test_indices: NDArray[np.intp] | None = None,
+    ) -> float:
+        """Compute held-out log-likelihood from estimated abilities."""
+        _ = train_responses, test_indices
+        theta = ability_result.theta
         if theta.ndim == 1:
             theta = theta.reshape(-1, 1)
 
@@ -664,6 +713,10 @@ class AbilityRMSEScorer(Scorer):
     def name(self) -> str:
         return "ability_rmse"
 
+    @property
+    def ability_method(self) -> Literal["EAP"]:
+        return "EAP"
+
     def __call__(
         self,
         result: FitResult,
@@ -674,9 +727,30 @@ class AbilityRMSEScorer(Scorer):
         """Compute RMSE between estimated and true abilities."""
         from mirt.scoring import fscores
 
-        _ = train_responses
-        scores = fscores(result.model, test_responses, method="EAP")
-        estimated = scores.theta.ravel()
+        ability_result = fscores(
+            result.model,
+            test_responses,
+            method=self.ability_method,
+        )
+        return self.score_from_ability_result(
+            result,
+            train_responses,
+            test_responses,
+            ability_result,
+            test_indices,
+        )
+
+    def score_from_ability_result(
+        self,
+        result: FitResult,
+        train_responses: NDArray[np.int_],
+        test_responses: NDArray[np.int_],
+        ability_result: ScoreResult,
+        test_indices: NDArray[np.intp] | None = None,
+    ) -> float:
+        """Compute ability RMSE from an existing ability estimate."""
+        _ = result, train_responses, test_responses
+        estimated = ability_result.theta.ravel()
 
         if test_indices is not None:
             true = self.true_theta[test_indices]
@@ -771,6 +845,40 @@ def _fit_cv_fold(task: _CVFoldTask) -> tuple[int, FitResult]:
         verbose=False,
     )
     return task.fold_idx, result
+
+
+def _evaluate_scorers(
+    scorers: list[Scorer],
+    result: FitResult,
+    train_responses: NDArray[np.int_],
+    test_responses: NDArray[np.int_],
+    test_indices: NDArray[np.intp],
+) -> dict[str, float]:
+    """Evaluate scorers while sharing ability estimates within one fold."""
+    from mirt.scoring import fscores
+
+    ability_results: dict[AbilityMethod, ScoreResult] = {}
+    fold_scores: dict[str, float] = {}
+    for scorer in scorers:
+        method = scorer.ability_method
+        if method is None:
+            value = scorer(result, train_responses, test_responses, test_indices)
+        else:
+            if method not in ability_results:
+                ability_results[method] = fscores(
+                    result.model,
+                    test_responses,
+                    method=method,
+                )
+            value = scorer.score_from_ability_result(
+                result,
+                train_responses,
+                test_responses,
+                ability_results[method],
+                test_indices,
+            )
+        fold_scores[scorer.name] = value
+    return fold_scores
 
 
 def _validated_splits(
@@ -1006,9 +1114,14 @@ def cross_validate(
             if return_models:
                 fold_results.append(result)
 
-            for scorer in scorers:
-                score = scorer(result, train_data, test_data, test_idx)
-                scores[scorer.name].append(score)
+            for name, score in _evaluate_scorers(
+                scorers,
+                result,
+                train_data,
+                test_data,
+                test_idx,
+            ).items():
+                scores[name].append(score)
     else:
         for task, (train_idx, test_idx) in zip(tasks, splits, strict=True):
             if verbose:
@@ -1022,9 +1135,14 @@ def cross_validate(
             if return_models:
                 fold_results.append(result)
 
-            for scorer in scorers:
-                score = scorer(result, train_data, test_data, test_idx)
-                scores[scorer.name].append(score)
+            for name, score in _evaluate_scorers(
+                scorers,
+                result,
+                train_data,
+                test_data,
+                test_idx,
+            ).items():
+                scores[name].append(score)
 
     mean_scores = {k: float(np.mean(v)) for k, v in scores.items()}
     std_scores = {
