@@ -20,6 +20,7 @@ powered by a Rust backend for computational efficiency.
    guides/plotting
    guides/multigroup
    guides/equating
+   guides/bayesian
    guides/results
    guides/reports
    guides/custom_models
