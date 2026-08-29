@@ -131,13 +131,22 @@ def _stable_gaussian_weights(
     samples: NDArray[np.float64],
     grid: NDArray[np.float64],
     bandwidth: float,
+    sample_weight: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Return Gaussian weights relative to the nearest sample per grid point."""
+    """Return stable Gaussian and person weights relative to each grid maximum."""
     sample_matrix = samples[:, None]
     grid_matrix = grid[None, :]
+    log_sample_weight = np.zeros(samples.size, dtype=np.float64)
+    if sample_weight is not None:
+        log_sample_weight.fill(-np.inf)
+        np.log(
+            sample_weight,
+            out=log_sample_weight,
+            where=sample_weight > 0.0,
+        )
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         scaled_distance = (sample_matrix - grid_matrix) / bandwidth
-        log_weights = -0.5 * scaled_distance**2
+        log_weights = -0.5 * scaled_distance**2 + log_sample_weight[:, None]
     column_maximum = np.max(log_weights, axis=0)
     if np.all(np.isfinite(column_maximum)):
         return np.exp(log_weights - column_maximum)
@@ -173,7 +182,9 @@ def _stable_gaussian_weights(
     log_penalty = log_squared_gap - np.log(2.0) - 2.0 * np.log(bandwidth)
     max_log_penalty = np.log(-np.log(np.nextafter(0.0, 1.0)))
     penalty = np.exp(np.minimum(log_penalty, max_log_penalty))
-    return np.exp(-penalty)
+    log_weights = -penalty + log_sample_weight[:, None]
+    column_maximum = np.max(log_weights, axis=0)
+    return np.exp(log_weights - column_maximum)
 
 
 def _fisher_information(
@@ -644,7 +655,8 @@ class KernelSmoothingModel(DichotomousItemModel):
 
     Calibration uses a numerically stable Nadaraya-Watson estimator on a
     configurable ability grid. Missing responses may be represented by any
-    negative integer code.
+    negative integer code, and person weights support frequency, survey, or
+    inverse-probability weighted calibration.
     """
 
     model_name = "KernelSmoothing"
@@ -665,6 +677,7 @@ class KernelSmoothingModel(DichotomousItemModel):
         self._theta_grid = np.empty(0, dtype=np.float64)
         self._irf_values = np.empty((0, 0), dtype=np.float64)
         self._calibration_counts = np.empty(0, dtype=np.intp)
+        self._calibration_weight_sums = np.empty(0, dtype=np.float64)
         super().__init__(n_items, n_factors=1, item_names=item_names)
 
     @staticmethod
@@ -686,6 +699,7 @@ class KernelSmoothingModel(DichotomousItemModel):
         self._theta_grid = self._configured_theta_grid.copy()
         self._irf_values = np.full((self.n_items, self._theta_grid.size), 0.5)
         self._calibration_counts = np.zeros(self.n_items, dtype=np.intp)
+        self._calibration_weight_sums = np.zeros(self.n_items, dtype=np.float64)
 
     @property
     def theta_grid(self) -> NDArray[np.float64]:
@@ -702,12 +716,36 @@ class KernelSmoothingModel(DichotomousItemModel):
         """Number of observed responses used for each item."""
         return self._calibration_counts.copy()
 
+    @property
+    def calibration_weight_sums(self) -> NDArray[np.float64]:
+        """Sum of person weights contributing to each item calibration."""
+        return self._calibration_weight_sums.copy()
+
     def calibrate(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        sample_weight: NDArray[np.float64] | None = None,
     ) -> Self:
-        """Calibrate item response functions with stable Gaussian kernels."""
+        """Calibrate item response functions with stable Gaussian kernels.
+
+        Parameters
+        ----------
+        responses : ndarray of shape (n_persons, n_items)
+            Dichotomous responses. Any negative value denotes a missing response.
+        theta : ndarray of shape (n_persons,) or (n_persons, 1)
+            Finite person ability values.
+        sample_weight : ndarray of shape (n_persons,), optional
+            Nonnegative finite person weights. Multiplying every weight by the
+            same positive constant leaves the fitted curves unchanged. Every
+            item must retain positive total weight after excluding its missing
+            responses.
+
+        Returns
+        -------
+        KernelSmoothingModel
+            This fitted model.
+        """
         responses_array = np.asarray(responses)
         if responses_array.ndim != 2:
             raise ValueError("responses must be a 2D array")
@@ -744,37 +782,84 @@ class KernelSmoothingModel(DichotomousItemModel):
         if not np.all(np.isfinite(theta_array)):
             raise ValueError("theta must contain only finite values")
 
+        if sample_weight is None:
+            sample_weight_array = np.ones(theta_array.size, dtype=np.float64)
+        else:
+            sample_weight_array = np.asarray(sample_weight, dtype=np.float64)
+            if sample_weight_array.shape != (theta_array.size,):
+                raise ValueError(f"sample_weight must have shape ({theta_array.size},)")
+            if not np.all(np.isfinite(sample_weight_array)):
+                raise ValueError("sample_weight must contain only finite values")
+            if np.any(sample_weight_array < 0.0):
+                raise ValueError("sample_weight must be nonnegative")
+
         counts = np.sum(valid, axis=0).astype(np.intp, copy=False)
         if np.any(counts == 0):
             missing_items = np.flatnonzero(counts == 0).tolist()
             raise ValueError(f"items without observed responses: {missing_items}")
-
-        if np.all(valid):
-            weights = _stable_gaussian_weights(
-                theta_array, self._theta_grid, self.bandwidth
+        all_observed = bool(np.all(valid))
+        valid_values: NDArray[np.float64] | None = None
+        with np.errstate(over="ignore", invalid="ignore"):
+            if all_observed:
+                calibration_weight_sums = np.full(
+                    self.n_items,
+                    np.sum(sample_weight_array),
+                )
+            else:
+                valid_values = valid.astype(np.float64)
+                calibration_weight_sums = valid_values.T @ sample_weight_array
+        if not np.all(np.isfinite(calibration_weight_sums)):
+            raise ValueError("sample_weight totals must be finite; rescale the weights")
+        if np.any(calibration_weight_sums <= 0.0):
+            missing_items = np.flatnonzero(calibration_weight_sums <= 0.0).tolist()
+            raise ValueError(
+                f"items without positive calibration weight: {missing_items}"
             )
+
+        kernel_weights = _stable_gaussian_weights(
+            theta_array,
+            self._theta_grid,
+            self.bandwidth,
+            sample_weight_array,
+        )
+        response_values = np.where(valid, responses_array, 0.0)
+        if all_observed:
             new_irf_values = (
-                responses_array.astype(np.float64, copy=False).T
-                @ weights
-                / np.sum(weights, axis=0)
+                response_values.T @ kernel_weights / np.sum(kernel_weights, axis=0)
             )
         else:
-            new_irf_values = np.empty_like(self._irf_values)
-            for item_idx in range(self.n_items):
-                item_valid = valid[:, item_idx]
-                item_theta = theta_array[item_valid]
-                item_responses = responses_array[item_valid, item_idx].astype(
-                    np.float64, copy=False
+            assert valid_values is not None
+            denominator = valid_values.T @ kernel_weights
+            new_irf_values = np.divide(
+                response_values.T @ kernel_weights,
+                denominator,
+                out=np.zeros_like(denominator),
+                where=denominator > 0.0,
+            )
+            fallback_items = np.flatnonzero(
+                np.any(
+                    (denominator <= np.finfo(np.float64).tiny)
+                    | ~np.isfinite(denominator),
+                    axis=1,
                 )
-                weights = _stable_gaussian_weights(
-                    item_theta, self._theta_grid, self.bandwidth
+            )
+            for item_idx in fallback_items:
+                item_valid = valid[:, item_idx] & (sample_weight_array > 0.0)
+                item_kernel_weights = _stable_gaussian_weights(
+                    theta_array[item_valid],
+                    self._theta_grid,
+                    self.bandwidth,
+                    sample_weight_array[item_valid],
                 )
                 new_irf_values[item_idx] = (
-                    item_responses @ weights / np.sum(weights, axis=0)
+                    response_values[item_valid, item_idx]
+                    @ item_kernel_weights
+                    / np.sum(item_kernel_weights, axis=0)
                 )
 
         self._irf_values = np.clip(new_irf_values, 0.0, 1.0)
         self._calibration_counts = counts
+        self._calibration_weight_sums = calibration_weight_sums
         self._is_fitted = True
         return self
 
@@ -856,5 +941,6 @@ class KernelSmoothingModel(DichotomousItemModel):
         )
         new_model._irf_values = self._irf_values.copy()
         new_model._calibration_counts = self._calibration_counts.copy()
+        new_model._calibration_weight_sums = self._calibration_weight_sums.copy()
         new_model._is_fitted = self._is_fitted
         return new_model
