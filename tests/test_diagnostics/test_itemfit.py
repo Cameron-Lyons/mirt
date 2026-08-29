@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import mirt.diagnostics.itemfit as itemfit_module
 from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 from mirt.diagnostics.itemfit import compute_itemfit, compute_s_x2
 
@@ -265,8 +266,9 @@ class TestComputeSX2:
 
         assert "S_X2" in result
 
-    def test_s_x2_matches_grouped_dichotomous_reference(self):
-        """Test exact grouped aggregation with missing responses."""
+    def test_s_x2_matches_grouped_dichotomous_reference(self, monkeypatch):
+        """Test chunked grouped aggregation with missing responses."""
+        monkeypatch.setattr(itemfit_module, "_SX2_TARGET_CHUNK_ELEMENTS", 3)
         responses = np.tile(
             np.array([[0, 0], [0, 1], [1, 0], [1, 1]]),
             (5, 1),
@@ -297,8 +299,9 @@ class TestComputeSX2:
         assert_allclose(result["df"], expected_df)
         assert model.probability_calls == 1
 
-    def test_s_x2_normalizes_polytomous_observed_scores(self):
-        """Test observed and expected category scores use the same scale."""
+    def test_s_x2_normalizes_polytomous_observed_scores(self, monkeypatch):
+        """Test chunked observed and expected scores use the same scale."""
+        monkeypatch.setattr(itemfit_module, "_SX2_TARGET_CHUNK_ELEMENTS", 3)
         responses = np.tile(
             np.array([[0, 0], [0, 1], [1, 1], [1, 2], [2, 2]]),
             (4, 1),
