@@ -14,6 +14,7 @@ powered by a Rust backend for computational efficiency.
    guides/dynamic
    guides/response_time
    guides/explanatory
+   guides/multilevel
    guides/irtree
    guides/information
    guides/dif
@@ -65,6 +66,7 @@ Features
 * **Results**: Validated inference, confidence intervals, and portable exports
 * **Computerized Adaptive Testing**: CAT algorithms and simulations
 * **Custom Models**: Validated dichotomous, polytomous, multidimensional, and group callbacks
+* **Multilevel Models**: Integrated two- and three-level response-pattern likelihoods
 * **High Performance**: Rust-powered backend for fast computation
 
 Indices and tables
