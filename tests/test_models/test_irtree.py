@@ -184,6 +184,64 @@ def test_expected_score_matches_probability_weighted_categories() -> None:
     np.testing.assert_allclose(model.expected_score(theta, item_idx=1), expected[:, 1])
 
 
+def test_simulate_is_reproducible_across_chunk_sizes() -> None:
+    model = IRTreeModel(n_items=3, tree_spec="bockenholt")
+    theta = np.linspace(-1.5, 1.5, 57)[:, None] * np.array([[1.0, -0.5, 0.25]])
+
+    unchunked = model.simulate(theta, seed=20260829, chunk_size=len(theta))
+    chunked = model.simulate(theta, seed=20260829, chunk_size=7)
+    automatic = model.simulate(theta, seed=20260829)
+
+    assert unchunked.shape == (57, 3)
+    assert unchunked.dtype == np.int32
+    np.testing.assert_array_equal(chunked, unchunked)
+    np.testing.assert_array_equal(automatic, unchunked)
+    assert np.all((unchunked >= 0) & (unchunked < model.n_categories))
+
+
+def test_simulate_matches_category_probabilities() -> None:
+    model = IRTreeModel(n_items=2, tree_spec="extreme_midpoint")
+    model.set_parameters(
+        discrimination=np.array([[0.8, 1.2, 1.4, 0.7], [1.1, 0.9, 1.3, 1.6]]),
+        difficulty=np.array([[0.2, -0.3, 0.5, 0.1], [-0.2, 0.4, 0.0, -0.6]]),
+    )
+    theta = np.repeat(np.array([[0.1, -0.2, 0.3]]), 50_000, axis=0)
+
+    responses = model.simulate(theta, seed=981, chunk_size=911)
+    frequencies = np.stack(
+        [
+            np.bincount(responses[:, item_idx], minlength=model.n_categories)
+            / len(responses)
+            for item_idx in range(model.n_items)
+        ]
+    )
+
+    np.testing.assert_allclose(
+        frequencies,
+        model.probability(theta[0], item_idx=None)[0],
+        atol=0.008,
+    )
+
+
+def test_simulate_accepts_single_person_theta() -> None:
+    model = IRTreeModel(n_items=4, tree_spec="direction_intensity")
+
+    responses = model.simulate(np.array([0.1, -0.4]), seed=73)
+
+    assert responses.shape == (1, 4)
+
+
+@pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+def test_simulate_rejects_invalid_chunk_size(chunk_size: object) -> None:
+    model = IRTreeModel(n_items=1, tree_spec="bockenholt")
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        model.simulate(
+            np.zeros((2, model.n_traits)),
+            chunk_size=chunk_size,  # type: ignore[arg-type]
+        )
+
+
 def test_information_matches_category_score_definition() -> None:
     model = IRTreeModel(n_items=1, tree_spec="extreme_midpoint")
     model.set_parameters(

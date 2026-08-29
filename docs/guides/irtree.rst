@@ -77,6 +77,28 @@ must be integer category codes between zero and ``n_categories - 1``. Invalid
 fractional or out-of-range values raise a data-validation error instead of
 being silently converted.
 
+Simulating responses
+--------------------
+
+Use :meth:`mirt.IRTreeModel.simulate` to draw ordinal responses conditional
+on person trait values. The method evaluates every item and category in
+vectorized batches, selects a memory-bounded batch size automatically, and
+returns a person-by-item matrix of integer category codes:
+
+.. code-block:: python
+
+   rng = np.random.default_rng(42)
+   theta = rng.multivariate_normal(
+       result.trait_means,
+       result.trait_covariance,
+       size=10_000,
+   )
+   replicated_responses = result.model.simulate(theta, seed=42)
+
+Pass ``chunk_size`` to cap the number of persons evaluated at once. A fixed
+``seed`` yields the same responses regardless of the chosen chunk size, so
+memory tuning does not change a reproducible simulation.
+
 Fixing the trait distribution
 -----------------------------
 
