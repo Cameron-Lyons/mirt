@@ -158,6 +158,17 @@ Cross-validation
    StratifiedGroupKFold
    LeaveOneOut
 
+Regularization selection
+------------------------
+
+.. autosummary::
+   :toctree: generated
+   :nosignatures:
+
+   cv_select_lambda
+   information_criteria_path
+   RegularizationCVResult
+
 CAT
 ---
 

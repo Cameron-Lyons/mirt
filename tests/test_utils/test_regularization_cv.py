@@ -136,6 +136,27 @@ class TestHeldOutLikelihood:
 
 
 class TestCrossValidatedSelection:
+    def test_parallel_folds_match_serial_results(self, concordant_responses):
+        common = {
+            "responses": concordant_responses,
+            "lambda_values": [0.3, 0.1],
+            "n_folds": 3,
+            "n_quadpts": 3,
+            "max_iter": 3,
+            "tol": 1e-3,
+            "seed": 42,
+        }
+
+        serial = cv_select_lambda(**common, n_jobs=1)
+        parallel = cv_select_lambda(**common, n_jobs=2)
+
+        assert parallel.lambda_values == serial.lambda_values
+        assert parallel.best_lambda == serial.best_lambda
+        np.testing.assert_allclose(parallel.fold_scores, serial.fold_scores)
+        np.testing.assert_allclose(parallel.mean_scores, serial.mean_scores)
+        np.testing.assert_allclose(parallel.std_scores, serial.std_scores)
+        np.testing.assert_allclose(parallel.mean_nonzero, serial.mean_nonzero)
+
     def test_selects_loading_structure_from_held_out_data(
         self, concordant_responses, monkeypatch
     ):
@@ -283,6 +304,10 @@ class TestCrossValidatedSelection:
             ({"n_folds": 25}, MirtValidationError),
             ({"criterion": "aic"}, MirtValidationError),
             ({"one_se_rule": 1}, MirtValidationError),
+            ({"n_jobs": 0}, MirtValidationError),
+            ({"n_jobs": -2}, MirtValidationError),
+            ({"n_jobs": True}, MirtValidationError),
+            ({"n_jobs": 1.5}, MirtValidationError),
             ({"lambda_values": []}, MirtValidationError),
             ({"lambda_values": [0.1, np.nan]}, MirtValidationError),
             ({"n_lambda": 0}, MirtValidationError),

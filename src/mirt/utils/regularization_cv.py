@@ -85,6 +85,63 @@ class RegularizationCVResult:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class _RegularizationFoldTask:
+    """Serializable inputs for evaluating one regularization fold."""
+
+    fold_index: int
+    responses: NDArray[np.int_]
+    fold_indices: NDArray[np.int_]
+    lambda_values: tuple[float, ...]
+    penalty: Penalty
+    alpha: float
+    n_factors: int
+    criterion: CVCriterion
+    n_quadpts: int
+    max_iter: int
+    tol: float
+
+
+def _evaluate_regularization_fold(
+    task: _RegularizationFoldTask,
+) -> tuple[int, list[float], list[float]]:
+    """Fit and score every penalty value for one independent fold."""
+    train_data = task.responses[task.fold_indices != task.fold_index]
+    test_data = task.responses[task.fold_indices == task.fold_index]
+    estimator_options = {
+        "penalty": task.penalty,
+        "alpha": task.alpha,
+        "n_factors": task.n_factors,
+        "n_quadpts": task.n_quadpts,
+        "max_iter": task.max_iter,
+        "tol": task.tol,
+        "verbose": False,
+    }
+    scores: list[float] = []
+    nonzero: list[float] = []
+    for lambda_value in task.lambda_values:
+        estimator = RegularizedMIRTEstimator(**estimator_options)
+        try:
+            result = estimator.fit(train_data, lambda_val=lambda_value)
+            score = _score_regularized_result(
+                result,
+                test_data,
+                criterion=task.criterion,
+                n_quadpts=task.n_quadpts,
+            )
+        except (
+            ValueError,
+            RuntimeError,
+            ArithmeticError,
+            FloatingPointError,
+            np.linalg.LinAlgError,
+        ):
+            score = np.nan
+        scores.append(float(score))
+        nonzero.append(float(result.n_nonzero) if np.isfinite(score) else np.nan)
+    return task.fold_index, scores, nonzero
+
+
 def cv_select_lambda(
     responses: NDArray[np.int_],
     penalty: Penalty = "lasso",
@@ -100,13 +157,15 @@ def cv_select_lambda(
     tol: float = 1e-3,
     verbose: bool = False,
     seed: int | None = None,
+    n_jobs: int = 1,
 ) -> RegularizationCVResult:
     """Select regularization strength with person-level cross-validation.
 
     Held-out scores integrate over the latent trait distribution rather than
     evaluating every person at a zero trait vector. All stored scores use a
     higher-is-better orientation; BIC and EBIC are negated and normalized by
-    the held-out fold size.
+    the held-out fold size. Independent folds can run in separate processes
+    with ``n_jobs``; use ``-1`` for all available CPUs.
     """
     responses = _validate_regularization_inputs(
         responses,
@@ -132,6 +191,20 @@ def cv_select_lambda(
             value=n_folds,
             expected=f"<= {responses.shape[0]}",
         )
+    if isinstance(n_jobs, (bool, np.bool_)) or not isinstance(
+        n_jobs, (int, np.integer)
+    ):
+        raise MirtValidationError(
+            "n_jobs must be an integer",
+            parameter="n_jobs",
+            value=n_jobs,
+        )
+    if n_jobs == 0 or n_jobs < -1:
+        raise MirtValidationError(
+            "n_jobs must be -1 or a positive integer",
+            parameter="n_jobs",
+            value=n_jobs,
+        )
 
     estimator_options = {
         "penalty": penalty,
@@ -156,44 +229,56 @@ def cv_select_lambda(
     for fold, indices in enumerate(np.array_split(shuffled, n_folds)):
         fold_indices[indices] = fold
 
-    fold_scores: list[list[float]] = []
+    tasks = [
+        _RegularizationFoldTask(
+            fold_index=fold,
+            responses=responses,
+            fold_indices=fold_indices,
+            lambda_values=tuple(lambda_values),
+            penalty=penalty,
+            alpha=float(alpha),
+            n_factors=n_factors,
+            criterion=criterion,
+            n_quadpts=n_quadpts,
+            max_iter=max_iter,
+            tol=float(tol),
+        )
+        for fold in range(n_folds)
+    ]
+
+    resolved_jobs = int(n_jobs)
+    if resolved_jobs == -1:
+        import os
+
+        resolved_jobs = os.cpu_count() or 1
+
+    if resolved_jobs > 1 and n_folds > 1:
+        from concurrent.futures import ProcessPoolExecutor
+
+        with ProcessPoolExecutor(max_workers=min(resolved_jobs, n_folds)) as executor:
+            fold_results = list(executor.map(_evaluate_regularization_fold, tasks))
+    else:
+        fold_results = []
+        for task in tasks:
+            if verbose:
+                print(f"Fold {task.fold_index + 1}/{n_folds}")
+            fold_results.append(_evaluate_regularization_fold(task))
+
+    fold_results.sort(key=lambda values: values[0])
+    score_matrix = np.full((len(lambda_values), n_folds), np.nan, dtype=np.float64)
+    nonzero_matrix = np.full_like(score_matrix, np.nan)
+    for fold_index, fold_score, fold_nonzero in fold_results:
+        score_matrix[:, fold_index] = fold_score
+        nonzero_matrix[:, fold_index] = fold_nonzero
+        if verbose and resolved_jobs > 1:
+            print(f"Fold {fold_index + 1}/{n_folds} completed")
+
+    fold_scores = score_matrix.tolist()
     mean_scores: list[float] = []
     std_scores: list[float] = []
     mean_nonzero: list[float] = []
-
-    for lambda_index, lambda_value in enumerate(lambda_values):
-        if verbose:
-            print(f"Lambda {lambda_index + 1}/{len(lambda_values)}: {lambda_value:.6f}")
-
-        scores_for_lambda: list[float] = []
-        nonzero_for_lambda: list[float] = []
-        for fold in range(n_folds):
-            train_data = responses[fold_indices != fold]
-            test_data = responses[fold_indices == fold]
-            estimator = RegularizedMIRTEstimator(**estimator_options)
-
-            try:
-                result = estimator.fit(train_data, lambda_val=lambda_value)
-                score = _score_regularized_result(
-                    result,
-                    test_data,
-                    criterion=criterion,
-                    n_quadpts=n_quadpts,
-                )
-            except (
-                ValueError,
-                RuntimeError,
-                ArithmeticError,
-                FloatingPointError,
-                np.linalg.LinAlgError,
-            ):
-                score = np.nan
-            scores_for_lambda.append(float(score))
-            if np.isfinite(score):
-                nonzero_for_lambda.append(float(result.n_nonzero))
-
-        fold_scores.append(scores_for_lambda)
-        finite_scores = np.asarray(scores_for_lambda, dtype=np.float64)
+    for lambda_index in range(len(lambda_values)):
+        finite_scores = score_matrix[lambda_index]
         finite_scores = finite_scores[np.isfinite(finite_scores)]
         if finite_scores.size == 0:
             mean_scores.append(np.nan)
@@ -204,7 +289,9 @@ def cv_select_lambda(
             std_scores.append(
                 float(finite_scores.std(ddof=1)) if finite_scores.size > 1 else 0.0
             )
-            mean_nonzero.append(float(np.mean(nonzero_for_lambda)))
+            finite_nonzero = nonzero_matrix[lambda_index]
+            finite_nonzero = finite_nonzero[np.isfinite(finite_nonzero)]
+            mean_nonzero.append(float(np.mean(finite_nonzero)))
 
     finite_means = np.isfinite(mean_scores)
     if not np.any(finite_means):
