@@ -72,6 +72,68 @@ class BaseItemModel(ABC):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]: ...
 
+    def _prepare_probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.intp]]:
+        """Validate aligned respondent abilities and item indices."""
+        theta_2d = self._ensure_theta_2d(theta)
+        indices = np.asarray(item_indices)
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise MirtValidationError(
+                "item_indices must be a one-dimensional integer array",
+                parameter="item_indices",
+                value=indices,
+                expected="one-dimensional integer array",
+            )
+        if indices.shape[0] != theta_2d.shape[0]:
+            raise MirtValidationError(
+                "item_indices must contain one entry per theta row",
+                parameter="item_indices",
+                value=indices.shape,
+                expected=f"({theta_2d.shape[0]},)",
+            )
+        if np.any((indices < 0) | (indices >= self.n_items)):
+            raise MirtValidationError(
+                "item_indices entries must identify valid model items",
+                parameter="item_indices",
+                value=indices,
+                expected=f"values in [0, {self.n_items})",
+            )
+        return theta_2d, indices.astype(np.intp, copy=False)
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs without a Cartesian product.
+
+        Each row of ``theta`` is evaluated only for the item at the matching
+        position in ``item_indices``. Dichotomous models return one probability
+        per pair. Polytomous models return a category matrix padded with zeros
+        to the model's maximum category count.
+        """
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        if self.is_polytomous:
+            category_counts = self._n_categories
+            result = np.zeros((indices.size, max(category_counts)), dtype=np.float64)
+            for item_idx in np.unique(indices):
+                selected = indices == item_idx
+                n_categories = category_counts[int(item_idx)]
+                result[selected, :n_categories] = self.probability(
+                    theta_2d[selected],
+                    int(item_idx),
+                )
+            return result
+
+        result = np.empty(indices.size, dtype=np.float64)
+        for item_idx in np.unique(indices):
+            selected = indices == item_idx
+            result[selected] = self.probability(theta_2d[selected], int(item_idx))
+        return result
+
     @abstractmethod
     def log_likelihood(
         self,

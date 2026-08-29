@@ -7,6 +7,7 @@ import pytest
 
 import mirt
 import mirt.scoring as scoring_module
+import mirt.utils.imputation as imputation_module
 from mirt import analyze_missing, averageMI, impute_responses, listwise_deletion
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.utils.imputation import (
@@ -211,13 +212,16 @@ class TestImputeResponses:
 
         np.testing.assert_array_equal(responses, original)
 
-    def test_multiple_imputation_scores_once(self, monkeypatch):
+    def test_multiple_imputation_reuses_fit_and_batches_each_copy(self, monkeypatch):
         responses = np.array([[-1, 0], [1, -1], [0, 1]])
-        calls = {"fit": 0, "score": 0}
+        calls = {"fit": 0, "score": 0, "probability": 0}
 
         class FakeModel:
-            def probability(self, theta, item):
-                return np.tile(np.array([0.25, 0.75]), (len(theta), 1))
+            is_polytomous = False
+
+            def probability_pairs(self, theta, item_indices):
+                calls["probability"] += 1
+                return np.full(len(theta), 0.5)
 
         fake_model = FakeModel()
 
@@ -242,9 +246,133 @@ class TestImputeResponses:
             seed=42,
         )
 
-        assert calls == {"fit": 1, "score": 1}
+        assert calls == {"fit": 1, "score": 1, "probability": 4}
         assert len(imputations) == 4
         assert all(np.all(imputation >= 0) for imputation in imputations)
+
+    def test_multiple_imputation_supports_models_without_paired_api(self, monkeypatch):
+        responses = np.zeros((20, 12), dtype=int)
+        responses[0, 1] = -1
+        responses[1, 9] = -1
+        calls: list[int | None] = []
+
+        class FakeModel:
+            is_polytomous = False
+
+            def probability(self, theta, item=None):
+                calls.append(item)
+                if item is None:
+                    return np.full((len(theta), responses.shape[1]), 0.5)
+                return np.full(len(theta), 0.5)
+
+        monkeypatch.setattr(
+            mirt,
+            "fit_mirt",
+            lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
+        )
+        monkeypatch.setattr(
+            scoring_module,
+            "fscores",
+            lambda *args, **kwargs: SimpleNamespace(
+                theta=np.zeros(len(responses)),
+                standard_error=np.full(len(responses), 0.1),
+            ),
+        )
+
+        imputations = impute_responses(
+            responses,
+            method="multiple",
+            n_imputations=3,
+            seed=42,
+        )
+
+        assert calls == [1, 9] * 3
+        assert all(np.all(imputation >= 0) for imputation in imputations)
+
+    def test_paired_model_batches_respect_probability_memory_limit(self, monkeypatch):
+        responses = np.zeros((10, 4), dtype=int)
+        rows, columns = np.indices(responses.shape)
+        responses[(rows + columns) % 2 == 0] = -1
+        batch_sizes: list[int] = []
+
+        class FakeModel:
+            is_polytomous = False
+
+            def probability_pairs(self, theta, item_indices):
+                batch_sizes.append(len(theta))
+                return np.full(len(theta), 0.5)
+
+        monkeypatch.setattr(imputation_module, "_MODEL_DRAW_TARGET_ELEMENTS", 8)
+        monkeypatch.setattr(
+            mirt,
+            "fit_mirt",
+            lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
+        )
+        monkeypatch.setattr(
+            scoring_module,
+            "fscores",
+            lambda *args, **kwargs: SimpleNamespace(
+                theta=np.zeros(len(responses)),
+                standard_error=np.full(len(responses), 0.1),
+            ),
+        )
+
+        impute_responses(
+            responses,
+            method="multiple",
+            n_imputations=2,
+            seed=42,
+        )
+
+        assert batch_sizes == [4] * 10
+
+    def test_dense_polytomous_imputation_batches_all_items(self, monkeypatch):
+        responses = np.array(
+            [
+                [-1, 0, -1],
+                [1, -1, 2],
+                [-1, 2, 0],
+                [2, -1, -1],
+            ]
+        )
+        calls = 0
+
+        class FakeModel:
+            is_polytomous = True
+            n_categories = [3, 3, 3]
+
+            def probability_pairs(self, theta, item_indices):
+                nonlocal calls
+                calls += 1
+                probabilities = np.zeros((len(theta), 3))
+                probabilities[:, 2] = 1.0
+                return probabilities
+
+        monkeypatch.setattr(
+            mirt,
+            "fit_mirt",
+            lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
+        )
+        monkeypatch.setattr(
+            scoring_module,
+            "fscores",
+            lambda *args, **kwargs: SimpleNamespace(
+                theta=np.zeros(len(responses)),
+                standard_error=np.full(len(responses), 0.1),
+            ),
+        )
+
+        imputations = impute_responses(
+            responses,
+            method="multiple",
+            model="GRM",
+            n_imputations=3,
+            seed=42,
+        )
+
+        assert calls == 3
+        for imputed in imputations:
+            np.testing.assert_array_equal(imputed[responses == -1], 2)
 
     def test_multiple_imputation_falls_back_when_scoring_fails(self, monkeypatch):
         responses = np.array([[-1, 0], [1, -1], [0, 1]])

@@ -232,6 +232,40 @@ class GradedResponseModel(PolytomousItemModel):
 
         return probabilities
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item GRM category probabilities."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        category_counts = np.asarray(self._n_categories, dtype=np.intp)[indices]
+        result = np.zeros((indices.size, max(self._n_categories)), dtype=np.float64)
+        discrimination = self._parameters["discrimination"][indices]
+        thresholds = self._parameters["thresholds"][indices]
+
+        for n_categories in np.unique(category_counts):
+            selected = category_counts == n_categories
+            active_thresholds = thresholds[selected, : n_categories - 1]
+            active_discrimination = discrimination[selected]
+            if self.n_factors == 1:
+                logits = active_discrimination[:, None] * (
+                    theta_2d[selected, 0, None] - active_thresholds
+                )
+            else:
+                projected = np.einsum(
+                    "ij,ij->i",
+                    theta_2d[selected],
+                    active_discrimination,
+                )
+                threshold_scale = np.sum(active_discrimination, axis=1)
+                logits = (
+                    projected[:, None] - threshold_scale[:, None] * active_thresholds
+                )
+            result[selected, :n_categories] = _graded_probabilities(logits)
+
+        return result
+
     def _item_information(
         self,
         theta: NDArray[np.float64],
@@ -389,6 +423,38 @@ class GeneralizedPartialCredit(PolytomousItemModel):
             )
 
         return probabilities
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item GPCM category probabilities."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        category_counts = np.asarray(self._n_categories, dtype=np.intp)[indices]
+        result = np.zeros((indices.size, max(self._n_categories)), dtype=np.float64)
+        discrimination = self._parameters["discrimination"][indices]
+        steps = self._parameters["steps"][indices]
+
+        for n_categories in np.unique(category_counts):
+            selected = category_counts == n_categories
+            active_steps = steps[selected, : n_categories - 1]
+            active_discrimination = discrimination[selected]
+            if self.n_factors == 1:
+                increments = active_discrimination[:, None] * (
+                    theta_2d[selected, 0, None] - active_steps
+                )
+            else:
+                scale = np.linalg.norm(active_discrimination, axis=1)
+                projected = np.einsum(
+                    "ij,ij->i",
+                    theta_2d[selected],
+                    active_discrimination,
+                )
+                increments = scale[:, None] * (projected[:, None] - active_steps)
+            result[selected, :n_categories] = _partial_credit_probabilities(increments)
+
+        return result
 
     def _item_information(
         self,
