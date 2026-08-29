@@ -9,7 +9,7 @@ This module provides nonparametric bootstrap procedures for:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -45,8 +45,10 @@ class _StatisticFitTask:
     warm_start: bool
     max_iter: int
     responses: NDArray[np.int_]
-    sample_indices: list[NDArray[np.int64]]
     statistic: Literal["parameters", "theta"] | Callable[..., Any]
+    sample_indices: list[NDArray[np.int64]] | None = None
+    resample_rng_state: dict[str, Any] | None = None
+    n_resamples: int = 0
 
 
 @dataclass(slots=True)
@@ -137,6 +139,78 @@ def _chunk_values(values: list[_TaskInput], n_chunks: int) -> list[list[_TaskInp
     return chunks
 
 
+def _chunk_sizes(n_values: int, n_chunks: int) -> list[int]:
+    """Return balanced sizes for contiguous chunks without materializing values."""
+    chunk_count = min(n_chunks, n_values)
+    quotient, remainder = divmod(n_values, chunk_count)
+    return [quotient + (chunk_index < remainder) for chunk_index in range(chunk_count)]
+
+
+def _resample_rng_chunks(
+    rng: np.random.Generator,
+    n_resamples: int,
+    n_persons: int,
+    n_chunks: int,
+) -> list[tuple[dict[str, Any], int]]:
+    """Capture compact worker states while preserving the seeded random stream."""
+    chunks: list[tuple[dict[str, Any], int]] = []
+    for chunk_size in _chunk_sizes(n_resamples, n_chunks):
+        chunks.append((deepcopy(rng.bit_generator.state), chunk_size))
+        for _ in range(chunk_size):
+            rng.integers(0, n_persons, size=n_persons)
+    return chunks
+
+
+def _iter_sample_indices(task: _StatisticFitTask) -> Iterator[NDArray[np.int64]]:
+    """Yield explicit or generated sample indices for one worker task."""
+    if task.sample_indices is not None:
+        yield from task.sample_indices
+        return
+
+    if task.resample_rng_state is None:
+        raise RuntimeError("A bootstrap task requires indices or random state")
+    rng = np.random.default_rng()
+    rng.bit_generator.state = task.resample_rng_state
+    n_persons = task.responses.shape[0]
+    for _ in range(task.n_resamples):
+        yield np.asarray(
+            rng.integers(0, n_persons, size=n_persons),
+            dtype=np.int64,
+        )
+
+
+def _resample_fit_tasks(
+    model: BaseItemModel,
+    original_params: dict[str, NDArray[np.float64]],
+    warm_start: bool,
+    max_iter: int,
+    responses: NDArray[np.int_],
+    statistic: Literal["parameters", "theta"] | Callable[..., Any],
+    rng: np.random.Generator,
+    n_resamples: int,
+    n_jobs: int,
+) -> list[_StatisticFitTask]:
+    """Build constant-size worker tasks for nonparametric resampling."""
+    return [
+        _StatisticFitTask(
+            model=model,
+            original_params=original_params,
+            warm_start=warm_start,
+            max_iter=max_iter,
+            responses=responses,
+            statistic=statistic,
+            resample_rng_state=rng_state,
+            n_resamples=chunk_size,
+        )
+        for rng_state, chunk_size in _resample_rng_chunks(
+            rng,
+            n_resamples,
+            responses.shape[0],
+            n_jobs,
+        )
+    ]
+
+
 def _validate_statistic(statistic: str | Callable[..., Any]) -> None:
     if isinstance(statistic, str):
         if statistic not in _STATISTICS:
@@ -218,7 +292,7 @@ def _fit_statistic_task(
     from mirt.estimation.em import EMEstimator
 
     task_results: list[tuple[dict[str, NDArray[np.float64]] | None, str | None]] = []
-    for indices in task.sample_indices:
+    for indices in _iter_sample_indices(task):
         fit_responses = task.responses[indices]
         boot_model = _prepare_bootstrap_model(
             task.model,
@@ -544,7 +618,6 @@ def bootstrap_se(
     n_jobs = _validate_n_jobs(n_jobs)
 
     responses = validate_responses(responses, n_items=model.n_items)
-    n_persons = responses.shape[0]
     if statistic == "parameters":
         native_samples = _native_2pl_bootstrap_samples(
             model, responses, n_bootstrap, seed, warm_start
@@ -562,21 +635,17 @@ def bootstrap_se(
     max_iter = 100 if warm_start else 200
     original_params = {k: v.copy() for k, v in model.parameters.items()}
 
-    sample_indices = [
-        rng.integers(0, n_persons, size=n_persons) for _ in range(n_bootstrap)
-    ]
-    replicate_tasks = [
-        _StatisticFitTask(
-            model=model,
-            original_params=original_params,
-            warm_start=warm_start,
-            max_iter=max_iter,
-            responses=responses,
-            sample_indices=index_chunk,
-            statistic=statistic,
-        )
-        for index_chunk in _chunk_values(sample_indices, n_jobs)
-    ]
+    replicate_tasks = _resample_fit_tasks(
+        model,
+        original_params,
+        warm_start,
+        max_iter,
+        responses,
+        statistic,
+        rng,
+        n_bootstrap,
+        n_jobs,
+    )
     chunk_results = _run_bootstrap_tasks(
         _fit_statistic_task,
         replicate_tasks,
@@ -717,21 +786,17 @@ def bootstrap_ci(
             ):
                 boot_estimates[name].extend(samples)
     else:
-        sample_indices = [
-            rng.integers(0, n_persons, size=n_persons) for _ in range(n_bootstrap)
-        ]
-        replicate_tasks = [
-            _StatisticFitTask(
-                model=original_model,
-                original_params=original_params,
-                warm_start=warm_start,
-                max_iter=max_iter,
-                responses=responses,
-                sample_indices=index_chunk,
-                statistic=statistic,
-            )
-            for index_chunk in _chunk_values(sample_indices, n_jobs)
-        ]
+        replicate_tasks = _resample_fit_tasks(
+            original_model,
+            original_params,
+            warm_start,
+            max_iter,
+            responses,
+            statistic,
+            rng,
+            n_bootstrap,
+            n_jobs,
+        )
         chunk_results = _run_bootstrap_tasks(
             _fit_statistic_task,
             replicate_tasks,
@@ -776,8 +841,8 @@ def bootstrap_ci(
                 warm_start=warm_start,
                 max_iter=max_iter,
                 responses=responses,
-                sample_indices=index_chunk,
                 statistic=statistic,
+                sample_indices=index_chunk,
             )
             for index_chunk in _chunk_values(jackknife_sample_indices, n_jobs)
         ]
