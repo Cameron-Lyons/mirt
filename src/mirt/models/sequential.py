@@ -440,6 +440,36 @@ class _SequentialProcessModel(_OrdinalLogitModel):
         )
         return _safe_sigmoid(logits)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        if indices.size == 0:
+            return np.zeros((0, self.max_categories), dtype=np.float64)
+
+        theta_1d = self._prepare_theta(theta_2d)
+        category_counts = np.asarray(self._n_categories, dtype=np.intp)[indices]
+        logits = self.discrimination[indices, None] * (
+            theta_1d[:, None] - self.thresholds[indices]
+        )
+        steps = _safe_sigmoid(logits)
+        reach = np.concatenate(
+            [np.ones((indices.size, 1)), np.cumprod(steps, axis=1)],
+            axis=1,
+        )
+        failure = np.concatenate(
+            [1.0 - steps, np.ones((indices.size, 1))],
+            axis=1,
+        )
+        categories = np.arange(self.max_categories)[None, :]
+        active = categories < category_counts[:, None]
+        last_category = categories == category_counts[:, None] - 1
+        failure = np.where(last_category, 1.0, failure)
+        return reach * failure * active
+
     def step_probability(
         self,
         theta: NDArray[np.float64],
@@ -548,6 +578,32 @@ class AdjacentCategoryModel(_OrdinalLogitModel):
     """Ordinal model for neighboring-category log odds."""
 
     model_name = "AdjacentCategory"
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        if indices.size == 0:
+            return np.zeros((0, self.max_categories), dtype=np.float64)
+
+        theta_1d = self._prepare_theta(theta_2d)
+        category_counts = np.asarray(self._n_categories, dtype=np.intp)[indices]
+        increments = self.discrimination[indices, None] * (
+            theta_1d[:, None] - self.thresholds[indices]
+        )
+        logits = np.concatenate(
+            [np.zeros((indices.size, 1)), np.cumsum(increments, axis=1)],
+            axis=1,
+        )
+        categories = np.arange(self.max_categories)[None, :]
+        active = categories < category_counts[:, None]
+        logits = np.where(active, logits, -np.inf)
+        logits -= np.max(logits, axis=1, keepdims=True)
+        weights = np.where(active, np.exp(logits), 0.0)
+        return weights / np.sum(weights, axis=1, keepdims=True)
 
     def _item_probabilities(
         self,
