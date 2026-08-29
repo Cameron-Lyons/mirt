@@ -7,6 +7,7 @@ from mirt._core import sigmoid
 
 SimulationModel = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 _MAX_STABLE_LOGIT = np.finfo(np.float64).max
+_MAX_POLYTOMOUS_CHUNK_ENTRIES = 1_000_000
 
 
 def simdata(
@@ -380,19 +381,60 @@ def _stable_softmax(logits: NDArray[np.float64]) -> NDArray[np.float64]:
             -_MAX_STABLE_LOGIT,
             _MAX_STABLE_LOGIT,
         )
-        shifted = finite_logits - finite_logits.max(axis=1, keepdims=True)
+        shifted = finite_logits - finite_logits.max(axis=-1, keepdims=True)
         weights = np.exp(np.clip(shifted, -745.0, 0.0))
-    return weights / weights.sum(axis=1, keepdims=True)
+    return weights / weights.sum(axis=-1, keepdims=True)
 
 
-def _sample_categories(
+def _polytomous_item_chunk_size(
+    n_persons: int,
+    n_items: int,
+    n_categories: int,
+) -> int:
+    """Select an item chunk that bounds person-item-category temporaries."""
+    entries_per_item = n_persons * n_categories
+    return max(
+        1,
+        min(
+            n_items,
+            _MAX_POLYTOMOUS_CHUNK_ENTRIES // max(1, entries_per_item),
+        ),
+    )
+
+
+def _polytomous_threshold_predictors(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    thresholds: NDArray[np.float64],
+    start: int,
+    stop: int,
+) -> NDArray[np.float64]:
+    """Evaluate threshold predictors for one bounded item chunk."""
+    if discrimination.ndim == 1:
+        return discrimination[None, start:stop, None] * (
+            theta[:, 0, None, None] - thresholds[None, start:stop, :]
+        )
+    item_discrimination = discrimination[start:stop]
+    return (
+        np.dot(theta, item_discrimination.T)[:, :, None]
+        - np.sum(item_discrimination, axis=1)[None, :, None]
+        * thresholds[None, start:stop, :]
+    )
+
+
+def _sample_item_categories(
     probabilities: NDArray[np.float64],
     rng: np.random.Generator,
 ) -> NDArray[np.int_]:
-    """Draw one category per row without a Python loop over respondents."""
-    cumulative = np.cumsum(probabilities[:, :-1], axis=1)
-    uniforms = rng.random(probabilities.shape[0])
-    return np.sum(uniforms[:, None] >= cumulative, axis=1, dtype=np.int_)
+    """Draw person-item categories while retaining item-major seed order."""
+    cumulative = probabilities[:, :, :-1]
+    np.cumsum(cumulative, axis=2, out=cumulative)
+    uniforms = rng.random((probabilities.shape[1], probabilities.shape[0])).T
+    return np.sum(
+        uniforms[:, :, None] >= cumulative,
+        axis=2,
+        dtype=np.int_,
+    )
 
 
 def _should_use_rust() -> bool:
@@ -508,9 +550,14 @@ def _simulate_grm(
     n_factors = theta.shape[1]
 
     if thresholds is None:
-        thresholds = np.zeros((n_items, n_categories - 1))
-        for i in range(n_items):
-            thresholds[i] = difficulty[i] + np.linspace(-1.5, 1.5, n_categories - 1)
+        thresholds = (
+            difficulty[:, None]
+            + np.linspace(
+                -1.5,
+                1.5,
+                n_categories - 1,
+            )[None, :]
+        )
     thresholds = _prepare_parameter(
         "thresholds",
         thresholds,
@@ -538,25 +585,40 @@ def _simulate_grm(
         )
 
     responses = np.empty((n_persons, n_items), dtype=np.int_)
+    chunk_size = _polytomous_item_chunk_size(
+        n_persons,
+        n_items,
+        n_categories,
+    )
 
-    for i in range(n_items):
-        if n_factors == 1:
-            logits = a[i] * (theta[:, :1] - thresholds[i][None, :])
-        else:
-            logits = (
-                np.dot(theta, a[i])[:, None] - np.sum(a[i]) * thresholds[i][None, :]
-            )
-
-        cumulative = np.column_stack(
-            [
-                np.ones(n_persons),
-                sigmoid(logits),
-                np.zeros(n_persons),
-            ]
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        logits = _polytomous_threshold_predictors(
+            theta,
+            a,
+            thresholds,
+            start,
+            stop,
         )
-        probabilities = np.maximum(cumulative[:, :-1] - cumulative[:, 1:], 0.0)
-        probabilities /= probabilities.sum(axis=1, keepdims=True)
-        responses[:, i] = _sample_categories(probabilities, rng)
+
+        cumulative = sigmoid(logits)
+        probabilities = np.empty(
+            (n_persons, stop - start, n_categories),
+            dtype=np.float64,
+        )
+        probabilities[:, :, 0] = 1.0 - cumulative[:, :, 0]
+        probabilities[:, :, -1] = cumulative[:, :, -1]
+        if n_categories > 2:
+            probabilities[:, :, 1:-1] = cumulative[:, :, :-1] - cumulative[:, :, 1:]
+        np.maximum(probabilities, 0.0, out=probabilities)
+        totals = probabilities.sum(axis=2, keepdims=True)
+        np.divide(
+            probabilities,
+            totals,
+            out=probabilities,
+            where=totals > 0,
+        )
+        responses[:, start:stop] = _sample_item_categories(probabilities, rng)
 
     return responses
 
@@ -602,31 +664,43 @@ def _simulate_gpcm(
         )
 
     responses = np.empty((n_persons, n_items), dtype=np.int_)
+    chunk_size = _polytomous_item_chunk_size(
+        n_persons,
+        n_items,
+        n_categories,
+    )
+    increment_limit = _MAX_STABLE_LOGIT / n_categories
 
-    for i in range(n_items):
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
         with np.errstate(over="ignore", invalid="ignore"):
-            if n_factors == 1:
-                increments = a[i] * (theta[:, :1] - thresholds[i][None, :])
-            else:
-                increments = (
-                    np.dot(theta, a[i])[:, None] - np.sum(a[i]) * thresholds[i][None, :]
-                )
-        increments = np.nan_to_num(
+            increments = _polytomous_threshold_predictors(
+                theta,
+                a,
+                thresholds,
+                start,
+                stop,
+            )
+        np.nan_to_num(
             increments,
+            copy=False,
             nan=0.0,
             posinf=_MAX_STABLE_LOGIT,
             neginf=-_MAX_STABLE_LOGIT,
         )
-        increment_limit = _MAX_STABLE_LOGIT / n_categories
-        increments = np.clip(
+        np.clip(
             increments,
             -increment_limit,
             increment_limit,
+            out=increments,
         )
-        logits = np.zeros((n_persons, n_categories), dtype=np.float64)
-        logits[:, 1:] = np.cumsum(increments, axis=1)
+        logits = np.zeros(
+            (n_persons, stop - start, n_categories),
+            dtype=np.float64,
+        )
+        logits[:, :, 1:] = np.cumsum(increments, axis=2)
         probabilities = _stable_softmax(logits)
-        responses[:, i] = _sample_categories(probabilities, rng)
+        responses[:, start:stop] = _sample_item_categories(probabilities, rng)
 
     return responses
 
@@ -642,15 +716,32 @@ def _simulate_nrm(
     n_items, n_categories = intercepts.shape
     n_factors = theta.shape[1]
     responses = np.empty((n_persons, n_items), dtype=np.int_)
+    chunk_size = _polytomous_item_chunk_size(
+        n_persons,
+        n_items,
+        n_categories,
+    )
 
-    for i in range(n_items):
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
         with np.errstate(over="ignore", invalid="ignore"):
             if n_factors == 1:
-                logits = theta[:, :1] * slopes[i][None, :] + intercepts[i]
+                logits = (
+                    theta[:, 0, None, None] * slopes[None, start:stop, :]
+                    + intercepts[None, start:stop, :]
+                )
             else:
-                logits = np.dot(theta, slopes[i].T) + intercepts[i]
+                logits = (
+                    np.einsum(
+                        "pf,icf->pic",
+                        theta,
+                        slopes[start:stop],
+                        optimize=True,
+                    )
+                    + intercepts[None, start:stop, :]
+                )
         probabilities = _stable_softmax(logits)
-        responses[:, i] = _sample_categories(probabilities, rng)
+        responses[:, start:stop] = _sample_item_categories(probabilities, rng)
 
     return responses
 
