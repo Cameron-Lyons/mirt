@@ -80,6 +80,22 @@ After fitting a model, you can score new respondents:
    score_result = mirt.fscores(result, new_responses, method="MAP")
    print(score_result.theta)
 
+EAP scoring automatically evaluates large respondent sets in memory-bounded
+batches. Use ``batch_size`` when a deployment needs an explicit upper bound on
+the number of respondents evaluated at once:
+
+.. code-block:: python
+
+   score_result = mirt.fscores(
+       result,
+       new_responses,
+       method="EAP",
+       batch_size=5_000,
+   )
+
+Smaller batches reduce peak working memory; larger batches can improve throughput
+on systems with ample memory. The estimates and standard errors are unchanged.
+
 Model Fit
 ---------
 
