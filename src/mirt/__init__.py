@@ -492,6 +492,7 @@ def dif(
     max_iter: int = 500,
     tol: float = 1e-4,
     focal_group: str | int | None = None,
+    p_adjust: Literal["none", "bonferroni", "holm", "fdr_bh"] = "none",
 ) -> Any:
     """Compute Differential Item Functioning (DIF) statistics.
 
@@ -512,13 +513,16 @@ def dif(
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
+        p_adjust: Multiple-testing adjustment across items. Default 'none'.
 
     Returns:
         DataFrame with DIF statistics for each item:
             - statistic: Test statistic
             - p_value: P-value
+            - p_value_adjusted: Multiplicity-adjusted P-value
             - effect_size: Effect size measure
-            - classification: ETS classification (A/B/C)
+            - classification: ETS classification using adjusted P-values
+            - adjustment: Multiple-testing method
     """
     from mirt.diagnostics.dif import compute_dif
     from mirt.utils.dataframe import create_dataframe
@@ -533,6 +537,7 @@ def dif(
         max_iter=max_iter,
         tol=tol,
         focal_group=focal_group,
+        p_adjust=p_adjust,
     )
 
     return create_dataframe(dif_results, index_name="item")
