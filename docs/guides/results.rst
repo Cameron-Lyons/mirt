@@ -92,3 +92,35 @@ requested confidence; otherwise it returns ``"uncertain"``. Both methods accept 
 scalar cut or an array broadcastable to the score shape, including one cut per factor
 for multidimensional scores. Zero standard error produces a deterministic decision
 away from the cut, while infinite or unknown uncertainty does not force a decision.
+
+Posterior ability distributions
+-------------------------------
+
+Use ``ability_posterior`` when inference needs the complete EAP distribution instead
+of only its first two moments:
+
+.. code-block:: python
+
+   posterior = mirt.ability_posterior(
+       result,
+       responses,
+       n_quadpts=49,
+       person_ids=person_ids,
+   )
+
+   lower, upper = posterior.credible_intervals(level=0.95)
+   median = posterior.quantile(0.5)
+   probability_above = posterior.classification_probabilities(cut_score=0.0)
+   decisions = posterior.classify(cut_score=0.0, confidence=0.95)
+   map_values = posterior.map_estimate
+   scores = posterior.to_score_result()
+
+``points`` contains the shared quadrature grid and each row of ``weights`` is a
+normalized respondent distribution over that grid. ``log_marginal_likelihood``
+contains the integrated response-pattern likelihood under the chosen prior.
+``mean``, ``median``, ``standard_error``, ``quantile()``, and ``map_estimate`` support
+unidimensional and multidimensional models; credible intervals and threshold
+probabilities are computed from each factor's exact marginal grid distribution rather
+than a normal approximation. Likelihood evaluation is memory-bounded through
+``batch_size``, while the returned weight matrix necessarily contains
+``n_persons * n_points`` values.
