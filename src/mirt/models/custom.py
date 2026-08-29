@@ -133,7 +133,8 @@ class ItemTypeSpec:
 
     The probability callback receives theta followed by the named item
     parameters.  It returns ``(n_theta,)`` for dichotomous items or
-    ``(n_theta, n_categories)`` for polytomous items.
+    ``(n_theta, n_categories)`` for polytomous items. Optional batch callbacks
+    receive full item-parameter arrays and return all items together.
     """
 
     name: str
@@ -144,6 +145,8 @@ class ItemTypeSpec:
     par_defaults: dict[str, float] = field(default_factory=dict)
     n_categories: int = 2
     gradient_function: Callable[..., dict[str, FloatArray]] | None = None
+    batch_icc_function: Callable[..., FloatArray] | None = None
+    batch_info_function: Callable[..., FloatArray] | None = None
 
     def __post_init__(self) -> None:
         self.name = _validate_name(self.name)
@@ -158,6 +161,20 @@ class ItemTypeSpec:
         if self.gradient_function is not None and not callable(self.gradient_function):
             raise MirtValidationError(
                 "gradient_function must be callable", parameter="gradient_function"
+            )
+        if self.batch_icc_function is not None and not callable(
+            self.batch_icc_function
+        ):
+            raise MirtValidationError(
+                "batch_icc_function must be callable",
+                parameter="batch_icc_function",
+            )
+        if self.batch_info_function is not None and not callable(
+            self.batch_info_function
+        ):
+            raise MirtValidationError(
+                "batch_info_function must be callable",
+                parameter="batch_info_function",
             )
         if (
             isinstance(self.n_categories, bool)
@@ -185,11 +202,17 @@ def create_item_type(
     par_defaults: dict[str, float] | None = None,
     n_categories: int = 2,
     gradient_function: Callable[..., dict[str, FloatArray]] | None = None,
+    batch_icc_function: Callable[..., FloatArray] | None = None,
+    batch_info_function: Callable[..., FloatArray] | None = None,
 ) -> ItemTypeSpec:
     """Create a custom item specification.
 
-    Parameter names are inferred from every callback argument after theta when
-    ``par_names`` is omitted.
+    Parameter names are inferred from every per-item probability callback
+    argument after theta when ``par_names`` is omitted. Batch callbacks receive
+    theta followed by one full ``(n_items,)`` array per named parameter. A
+    dichotomous batch probability callback returns ``(n_theta, n_items)``; a
+    polytomous callback returns ``(n_theta, n_items, n_categories)``. A batch
+    information callback returns ``(n_theta, n_items)``.
     """
 
     if par_names is None:
@@ -203,6 +226,8 @@ def create_item_type(
         par_defaults={} if par_defaults is None else par_defaults,
         n_categories=n_categories,
         gradient_function=gradient_function,
+        batch_icc_function=batch_icc_function,
+        batch_info_function=batch_info_function,
     )
 
 
@@ -304,10 +329,64 @@ class CustomItemModel(BaseItemModel):
             )
         return probabilities
 
+    def _batch_parameters(self) -> dict[str, FloatArray]:
+        """Return protected full item-parameter arrays for a batch callback."""
+        return {name: values.copy() for name, values in self._parameters.items()}
+
+    def _validate_batch_probability_output(
+        self,
+        values: Any,
+        n_theta: int,
+    ) -> FloatArray:
+        """Validate probabilities returned for every theta-item combination."""
+        probabilities = np.asarray(values, dtype=np.float64)
+        if self.is_polytomous:
+            expected = (n_theta, self.n_items, self.n_categories)
+        else:
+            if probabilities.shape == (n_theta, self.n_items, 1):
+                probabilities = probabilities[:, :, 0]
+            if self.n_items == 1 and probabilities.shape == (n_theta,):
+                probabilities = probabilities.reshape(n_theta, 1)
+            expected = (n_theta, self.n_items)
+
+        if probabilities.shape != expected:
+            raise MirtValidationError(
+                f"batch_icc_function returned shape {probabilities.shape}, "
+                f"expected {expected}",
+                parameter="batch_icc_function",
+            )
+        if not np.all(np.isfinite(probabilities)) or np.any(
+            (probabilities < 0.0) | (probabilities > 1.0)
+        ):
+            raise MirtValidationError(
+                "batch_icc_function must return finite probabilities in [0, 1]",
+                parameter="batch_icc_function",
+            )
+        if self.is_polytomous and not np.allclose(
+            probabilities.sum(axis=2), 1.0, rtol=1e-7, atol=1e-9
+        ):
+            raise MirtValidationError(
+                "Category rows returned by batch_icc_function must sum to 1",
+                parameter="batch_icc_function",
+            )
+        return probabilities
+
     def _item_probability(self, theta: FloatArray, item_idx: int) -> FloatArray:
         params = self.get_item_parameters(item_idx)
         result = self.item_type.icc_function(self._callback_theta(theta), **params)
         return self._validate_probability_output(result, theta.shape[0])
+
+    def _all_item_probabilities(self, theta: FloatArray) -> FloatArray:
+        """Evaluate all items through the batch callback or compatible fallback."""
+        callback = self.item_type.batch_icc_function
+        if callback is None:
+            item_probabilities = [
+                self._item_probability(theta, item) for item in range(self.n_items)
+            ]
+            return np.stack(item_probabilities, axis=1)
+
+        result = callback(self._callback_theta(theta), **self._batch_parameters())
+        return self._validate_batch_probability_output(result, theta.shape[0])
 
     def probability(self, theta: FloatArray, item_idx: int | None = None) -> FloatArray:
         """Compute success probabilities or full category traces."""
@@ -315,10 +394,7 @@ class CustomItemModel(BaseItemModel):
         theta_2d = self._validated_theta(theta)
         if item_idx is not None:
             return self._item_probability(theta_2d, self._validated_item(item_idx))
-        item_probabilities = [
-            self._item_probability(theta_2d, item) for item in range(self.n_items)
-        ]
-        return np.stack(item_probabilities, axis=1)
+        return self._all_item_probabilities(theta_2d)
 
     def icc(self, theta: FloatArray, item_idx: int) -> FloatArray:
         """Alias for a single item's probability trace."""
@@ -364,6 +440,29 @@ class CustomItemModel(BaseItemModel):
             )
         return information
 
+    def _validate_batch_information_output(
+        self,
+        values: Any,
+        n_theta: int,
+    ) -> FloatArray:
+        """Validate scalar information returned for every theta and item."""
+        information = np.asarray(values, dtype=np.float64)
+        if self.n_items == 1 and information.shape == (n_theta,):
+            information = information.reshape(n_theta, 1)
+        expected = (n_theta, self.n_items)
+        if information.shape != expected:
+            raise MirtValidationError(
+                f"batch_info_function returned shape {information.shape}, "
+                f"expected {expected}",
+                parameter="batch_info_function",
+            )
+        if not np.all(np.isfinite(information)) or np.any(information < 0.0):
+            raise MirtValidationError(
+                "batch_info_function must return finite, non-negative values",
+                parameter="batch_info_function",
+            )
+        return information
+
     def information(self, theta: FloatArray, item_idx: int | None = None) -> FloatArray:
         """Compute scalar item information at each theta point.
 
@@ -373,6 +472,21 @@ class CustomItemModel(BaseItemModel):
 
         theta_2d = self._validated_theta(theta)
         if item_idx is None:
+            batch_callback = self.item_type.batch_info_function
+            if batch_callback is not None:
+                result = batch_callback(
+                    self._callback_theta(theta_2d),
+                    **self._batch_parameters(),
+                )
+                return self._validate_batch_information_output(
+                    result,
+                    theta_2d.shape[0],
+                )
+            if (
+                self.item_type.batch_icc_function is not None
+                and self.item_type.info_function is None
+            ):
+                return self._numerical_information_all(theta_2d)
             return np.column_stack(
                 [self.information(theta_2d, item) for item in range(self.n_items)]
             )
@@ -383,6 +497,31 @@ class CustomItemModel(BaseItemModel):
             self._callback_theta(theta_2d), **self.get_item_parameters(item_idx)
         )
         return self._validate_information_output(result, theta_2d.shape[0])
+
+    def _numerical_information_all(self, theta: FloatArray) -> FloatArray:
+        """Compute numerical information for every item through batch callbacks."""
+        h = 1e-5
+        probability = self._all_item_probabilities(theta)
+        information = np.zeros(
+            (theta.shape[0], self.n_items),
+            dtype=np.float64,
+        )
+        for factor in range(self.n_factors):
+            theta_plus = theta.copy()
+            theta_minus = theta.copy()
+            theta_plus[:, factor] += h
+            theta_minus[:, factor] -= h
+            derivative = (
+                self._all_item_probabilities(theta_plus)
+                - self._all_item_probabilities(theta_minus)
+            ) / (2.0 * h)
+            if self.is_polytomous:
+                denominator = np.clip(probability, PROB_EPSILON, None)
+                information += np.sum(derivative**2 / denominator, axis=2)
+            else:
+                clipped = np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON)
+                information += derivative**2 / (clipped * (1.0 - clipped))
+        return information
 
     def _numerical_information(self, theta: FloatArray, item_idx: int) -> FloatArray:
         h = 1e-5
