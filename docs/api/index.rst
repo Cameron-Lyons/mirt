@@ -114,6 +114,8 @@ Diagnostics
    diagnostics.compute_personfit_significance
    diagnostics.psis_loo
    diagnostics.waic
+   diagnostics.posterior_predictive_check
+   diagnostics.posterior_predictive_checks
 
 Plotting
 --------
