@@ -37,21 +37,26 @@ def _theta_matrix(
 def _item_information_matrix(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
+    item_indices: list[int] | None = None,
 ) -> NDArray[np.float64]:
-    """Return item-level information regardless of model-family convention."""
+    """Return selected item information across model-family conventions."""
+    indices = range(model.n_items) if item_indices is None else item_indices
+    if item_indices is not None and len(item_indices) == 0:
+        return np.empty((theta.shape[0], 0), dtype=np.float64)
+
     if getattr(model, "is_polytomous", False):
         return np.column_stack(
-            [model.information(theta, item_idx=idx) for idx in range(model.n_items)]
+            [model.information(theta, item_idx=idx) for idx in indices]
         )
 
     information = np.asarray(model.information(theta), dtype=np.float64)
     expected_shape = (theta.shape[0], model.n_items)
     if information.shape == expected_shape:
-        return information
+        return information if item_indices is None else information[:, item_indices]
 
     if information.shape == (theta.shape[0],):
         return np.column_stack(
-            [model.information(theta, item_idx=idx) for idx in range(model.n_items)]
+            [model.information(theta, item_idx=idx) for idx in indices]
         )
 
     raise ValueError(
@@ -140,16 +145,15 @@ def iteminfo(
             model.information(theta_arr, item_idx=item_idx), dtype=np.float64
         )
 
-    all_info = _item_information_matrix(model, theta_arr)
-    return all_info[:, item_idx]
+    return _item_information_matrix(model, theta_arr, item_idx)
 
 
 def areainfo(
     model: "BaseItemModel",
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 100,
-    item_idx: int | None = None,
-) -> float:
+    item_idx: int | list[int] | None = None,
+) -> float | NDArray[np.float64]:
     """Compute area under the information curve.
 
     Integrates the information function over a range of theta values
@@ -163,14 +167,16 @@ def areainfo(
         Range of theta values for integration. Default (-4, 4).
     n_points : int
         Number of quadrature points. Default 100.
-    item_idx : int or None
-        If provided, compute area for specific item.
-        If None, compute area for test information.
+    item_idx : int, list of int, or None
+        If provided, compute area for the selected item or items. If None,
+        compute area for test information. A list preserves selection order.
 
     Returns
     -------
-    float
-        Area under the information curve.
+    float or NDArray[np.float64]
+        Area under the information curve. A list of item indices returns one
+        area per selected item; scalar and test-information queries return a
+        float.
 
     Examples
     --------
@@ -178,6 +184,7 @@ def areainfo(
     >>> print(f"Total test information area: {area:.2f}")
     >>> item_area = areainfo(result.model, item_idx=0)
     >>> print(f"Item 0 information area: {item_area:.2f}")
+    >>> selected_areas = areainfo(result.model, item_idx=[2, 0])
     """
     theta = np.linspace(theta_range[0], theta_range[1], n_points)
 
@@ -186,7 +193,10 @@ def areainfo(
     else:
         info = testinfo(model, theta)
 
-    return float(np.trapezoid(info, theta))
+    area = np.trapezoid(info, theta, axis=0)
+    if isinstance(item_idx, list):
+        return np.asarray(area, dtype=np.float64)
+    return float(area)
 
 
 def _information_interval_chunk_size(
