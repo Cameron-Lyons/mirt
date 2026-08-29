@@ -7,6 +7,7 @@ that ideal point.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from numbers import Integral
 from typing import Self
 
@@ -19,6 +20,24 @@ from mirt.models.base import DichotomousItemModel, PolytomousItemModel
 
 _SATURATED_LOGIT = 750.0
 _LOG_MAX_FLOAT = float(np.log(np.finfo(np.float64).max))
+_MAX_GGUM_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+
+
+def _ggum_category_chunks(
+    category_counts: list[int],
+    n_persons: int,
+) -> Iterator[tuple[int, NDArray[np.intp]]]:
+    """Group equal-width GGUM items into bounded probability chunks."""
+    counts = np.asarray(category_counts, dtype=np.intp)
+    for n_categories in np.unique(counts):
+        item_indices = np.flatnonzero(counts == n_categories)
+        chunk_size = max(
+            1,
+            _MAX_GGUM_PROBABILITY_CHUNK_ENTRIES
+            // max(1, n_persons * int(n_categories)),
+        )
+        for start in range(0, item_indices.size, chunk_size):
+            yield int(n_categories), item_indices[start : start + chunk_size]
 
 
 def _saturate_logit(values: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -373,6 +392,50 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         )
         return probabilities, derivative
 
+    def _group_probabilities(
+        self,
+        theta_values: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+        n_categories: int,
+    ) -> NDArray[np.float64] | None:
+        """Return vectorized probabilities, or defer numerically extreme chunks."""
+        c = n_categories - 1
+        m = 2 * c + 1
+        categories = np.arange(n_categories, dtype=np.intp)
+        complements = m - categories
+        thresholds = self._parameters["thresholds"][item_indices, :m]
+        discrimination = self._parameters["discrimination"][item_indices]
+        location = self._parameters["location"][item_indices]
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            cumulative = np.concatenate(
+                (
+                    np.zeros((item_indices.size, 1), dtype=np.float64),
+                    np.cumsum(thresholds, axis=1),
+                ),
+                axis=1,
+            )
+            distance = theta_values[:, None] - location[None, :]
+            scaled_distance = distance * discrimination[None, :]
+            scaled_cumulative = cumulative * discrimination[:, None]
+            first = (
+                scaled_distance[:, :, None] * categories[None, None, :]
+                - scaled_cumulative[:, categories][None, :, :]
+            )
+            second = (
+                scaled_distance[:, :, None] * complements[None, None, :]
+                - scaled_cumulative[:, complements][None, :, :]
+            )
+
+        if not np.all(np.isfinite(first)) or not np.all(np.isfinite(second)):
+            return None
+
+        np.logaddexp(first, second, out=first)
+        first -= np.max(first, axis=2, keepdims=True)
+        np.exp(first, out=first)
+        first /= np.sum(first, axis=2, keepdims=True)
+        return first
+
     def probability(
         self,
         theta: NDArray[np.float64],
@@ -387,17 +450,37 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
                 item,
                 include_derivatives=False,
             )[0]
+        if self.n_items == 1:
+            return self._item_components(
+                values,
+                0,
+                include_derivatives=False,
+            )[0][:, None, :]
 
         probabilities = np.zeros(
             (len(values), self.n_items, max(self._n_categories)), dtype=np.float64
         )
-        for item in range(self.n_items):
-            item_probabilities, _ = self._item_components(
-                values,
-                item,
-                include_derivatives=False,
-            )
-            probabilities[:, item, : self._n_categories[item]] = item_probabilities
+        for n_categories, item_indices in _ggum_category_chunks(
+            self._n_categories, len(values)
+        ):
+            chunk_probabilities = None
+            if item_indices.size >= 4:
+                chunk_probabilities = self._group_probabilities(
+                    values,
+                    item_indices,
+                    n_categories,
+                )
+            if chunk_probabilities is not None:
+                probabilities[:, item_indices, :n_categories] = chunk_probabilities
+                continue
+
+            for item in item_indices:
+                item_probabilities, _ = self._item_components(
+                    values,
+                    int(item),
+                    include_derivatives=False,
+                )
+                probabilities[:, item, :n_categories] = item_probabilities
         return probabilities
 
     def category_probability(
