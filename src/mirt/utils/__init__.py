@@ -46,6 +46,7 @@ _LAZY_IMPORTS = {
     "gen_difficulty": "mirt.utils.information",
     "theta_for_score": "mirt.utils.information",
     "information_intervals": "mirt.utils.information",
+    "conditional_rxx": "mirt.utils.reliability",
     "marginal_rxx": "mirt.utils.reliability",
     "empirical_rxx": "mirt.utils.reliability",
     "sem": "mirt.utils.reliability",

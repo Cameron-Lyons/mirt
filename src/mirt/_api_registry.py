@@ -135,6 +135,7 @@ BASE_EXPORTS = [
     "gen_difficulty",
     "theta_for_score",
     "information_intervals",
+    "conditional_rxx",
     "marginal_rxx",
     "empirical_rxx",
     "sem",
@@ -551,7 +552,12 @@ TOP_LEVEL_IMPORT_GROUPS = {
         "randef",
         "shrinkage_estimates",
     ),
-    "mirt.utils.reliability": ("empirical_rxx", "marginal_rxx", "sem"),
+    "mirt.utils.reliability": (
+        "conditional_rxx",
+        "empirical_rxx",
+        "marginal_rxx",
+        "sem",
+    ),
     "mirt.utils.regularization_cv": (
         "RegularizationCVResult",
         "cv_select_lambda",

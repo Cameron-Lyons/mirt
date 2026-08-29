@@ -216,6 +216,7 @@ Utils
 
    simdata
    validate_responses
+   conditional_rxx
    itemstats
    missing_patterns
    MissingPatternResult
