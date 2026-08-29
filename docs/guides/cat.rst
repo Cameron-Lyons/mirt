@@ -24,6 +24,29 @@ Quick start
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
 
+Portable results
+----------------
+
+``CATResult`` and ``MCATResult`` can be stored or sent without a dataframe
+package. Their dictionary exports contain only JSON-compatible Python values,
+including the complete response, estimate, uncertainty, covariance, and item
+information histories:
+
+.. code-block:: python
+
+   from mirt.cat import CATResult
+
+   payload = result.to_dict()
+   json_text = result.to_json(indent=2)
+
+   restored = CATResult.from_json(json_text)
+   assert restored.to_dict() == payload
+
+The reconstruction methods validate required and unknown fields, administered
+item and response counts, history lengths, and multidimensional array shapes.
+Result objects also copy caller-owned arrays when they are created, so later
+changes to the original arrays do not alter the stored administration.
+
 Item selection
 --------------
 
