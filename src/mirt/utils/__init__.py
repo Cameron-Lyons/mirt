@@ -26,6 +26,7 @@ _LAZY_IMPORTS = {
     "Splitter": "mirt.utils.cv",
     "GroupKFold": "mirt.utils.cv",
     "KFold": "mirt.utils.cv",
+    "StratifiedGroupKFold": "mirt.utils.cv",
     "StratifiedKFold": "mirt.utils.cv",
     "LeaveOneOut": "mirt.utils.cv",
     "Scorer": "mirt.utils.cv",

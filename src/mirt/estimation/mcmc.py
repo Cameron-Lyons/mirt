@@ -9,7 +9,9 @@ Uses fast Rust backend when available for 2PL models.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
+from numbers import Real
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -24,6 +26,10 @@ if TYPE_CHECKING:
 
 from mirt.estimation.base import BaseEstimator
 from mirt.results.fit_result import FitResult
+
+PosteriorValue = NDArray[np.float64] | np.float64
+PosteriorSummary = dict[str, dict[str, PosteriorValue]]
+CredibleIntervals = dict[str, tuple[PosteriorValue, PosteriorValue]]
 
 
 def _is_2pl_unidimensional(model: BaseItemModel) -> bool:
@@ -68,6 +74,130 @@ class MCMCResult:
     burnin: int
     thin: int
 
+    @staticmethod
+    def _validate_credible_level(credible_level: float) -> float:
+        """Return a finite credible level strictly between zero and one."""
+        if (
+            isinstance(credible_level, bool)
+            or not isinstance(credible_level, Real)
+            or not np.isfinite(credible_level)
+            or not 0.0 < credible_level < 1.0
+        ):
+            raise ValueError("credible_level must be between 0 and 1")
+        return float(credible_level)
+
+    def _selected_chains(
+        self,
+        parameters: str | Sequence[str] | None,
+    ) -> dict[str, NDArray[np.float64]]:
+        """Select and validate posterior chains for result summaries."""
+        if parameters is None:
+            names = tuple(self.chains)
+        elif isinstance(parameters, str):
+            names = (parameters,)
+        else:
+            try:
+                names = tuple(parameters)
+            except TypeError as exc:
+                raise ValueError(
+                    "parameters must be a chain name or sequence of chain names"
+                ) from exc
+            if not all(isinstance(name, str) for name in names):
+                raise ValueError("parameters must contain only chain names")
+
+        unknown = tuple(
+            dict.fromkeys(name for name in names if name not in self.chains)
+        )
+        if unknown:
+            joined = ", ".join(unknown)
+            raise ValueError(f"unknown posterior chain: {joined}")
+
+        selected: dict[str, NDArray[np.float64]] = {}
+        n_draws: int | None = None
+        for name in dict.fromkeys(names):
+            try:
+                chain = np.asarray(self.chains[name], dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"posterior chain '{name}' must contain numeric values"
+                ) from exc
+            if chain.ndim == 0 or chain.size == 0 or chain.shape[0] == 0:
+                raise ValueError(
+                    f"posterior chain '{name}' must contain at least one draw"
+                )
+            if not np.all(np.isfinite(chain)):
+                raise ValueError(
+                    f"posterior chain '{name}' must contain only finite values"
+                )
+            if n_draws is None:
+                n_draws = chain.shape[0]
+            elif chain.shape[0] != n_draws:
+                raise ValueError(
+                    "selected posterior chains must have equal draw counts"
+                )
+            selected[name] = chain
+
+        return selected
+
+    def posterior_summary(
+        self,
+        credible_level: float = 0.95,
+        parameters: str | Sequence[str] | None = None,
+    ) -> PosteriorSummary:
+        """Return posterior moments and equal-tailed credible intervals.
+
+        Statistics are computed over the leading draw dimension. Remaining
+        dimensions are preserved, so item parameters and person abilities can
+        be summarized with the same method.
+
+        Parameters
+        ----------
+        credible_level : float
+            Probability covered by each equal-tailed interval.
+        parameters : str or sequence of str, optional
+            Chain names to summarize. By default, all stored chains are used.
+
+        Returns
+        -------
+        dict
+            Mean, standard deviation, median, and interval bounds for each
+            selected chain.
+        """
+        level = self._validate_credible_level(credible_level)
+        selected = self._selected_chains(parameters)
+        tail = (1.0 - level) / 2.0
+
+        result: PosteriorSummary = {}
+        for name, chain in selected.items():
+            lower, median, upper = np.quantile(
+                chain,
+                (tail, 0.5, 1.0 - tail),
+                axis=0,
+            )
+            result[name] = {
+                "mean": np.mean(chain, axis=0),
+                "std": np.std(chain, axis=0),
+                "median": median,
+                "ci_lower": lower,
+                "ci_upper": upper,
+            }
+        return result
+
+    def credible_intervals(
+        self,
+        credible_level: float = 0.95,
+        parameters: str | Sequence[str] | None = None,
+    ) -> CredibleIntervals:
+        """Return equal-tailed credible intervals for selected chains."""
+        level = self._validate_credible_level(credible_level)
+        selected = self._selected_chains(parameters)
+        tail = (1.0 - level) / 2.0
+        intervals: CredibleIntervals = {}
+        for name, chain in selected.items():
+            lower, upper = np.quantile(chain, (tail, 1.0 - tail), axis=0)
+            intervals[name] = (lower, upper)
+        return intervals
+
     def summary(self) -> str:
         """Generate summary of MCMC results."""
         lines = [
@@ -87,6 +217,11 @@ class MCMCResult:
         for name, rhat in self.rhat.items():
             status = "OK" if rhat < 1.1 else "WARNING"
             lines.append(f"  {name}: {rhat:.4f} ({status})")
+
+        if self.ess:
+            lines.extend(("", "Effective sample size:"))
+            for name, ess in self.ess.items():
+                lines.append(f"  {name}: {ess:.1f}")
 
         return "\n".join(lines)
 

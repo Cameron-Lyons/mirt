@@ -12,6 +12,8 @@ from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
+    _entry_chunk_size,
+    _prepare_binary_response_components,
     mirt_rs,
     rust_enabled,
 )
@@ -81,19 +83,22 @@ def compute_expected_counts(
             _ensure_f64(posterior_weights),
         )
 
-    n_persons = len(responses)
-    n_quad = posterior_weights.shape[1]
-    valid_mask = responses >= 0
+    responses_array = np.asarray(responses)
+    weights = np.asarray(posterior_weights, dtype=np.float64)
+    n_persons = len(responses_array)
+    n_quad = weights.shape[1]
+    r_k = np.zeros(n_quad, dtype=np.float64)
+    n_k = np.zeros(n_quad, dtype=np.float64)
+    chunk_size = _entry_chunk_size(n_persons, 2)
 
-    r_k = np.zeros(n_quad)
-    n_k = np.zeros(n_quad)
-
-    for i in range(n_persons):
-        if valid_mask[i]:
-            n_k += posterior_weights[i]
-            if responses[i] == 1:
-                r_k += posterior_weights[i]
-
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        correct, valid = _prepare_binary_response_components(
+            responses_array[start:stop]
+        )
+        weight_chunk = weights[start:stop]
+        r_k += correct @ weight_chunk
+        n_k += valid @ weight_chunk
     return r_k, n_k
 
 
@@ -111,12 +116,24 @@ def compute_expected_counts_polytomous(
             n_categories,
         )
 
-    n_quad = posterior_weights.shape[1]
-    r_kc = np.zeros((n_quad, n_categories))
+    responses_array = np.asarray(responses)
+    weights = np.asarray(posterior_weights, dtype=np.float64)
+    n_quad = weights.shape[1]
+    r_kc = np.zeros((n_quad, n_categories), dtype=np.float64)
+    valid_rows = np.flatnonzero(
+        (responses_array >= 0) & (responses_array < n_categories)
+    )
+    chunk_size = _entry_chunk_size(
+        len(valid_rows),
+        n_quad + n_categories,
+    )
 
-    for i, resp in enumerate(responses):
-        if 0 <= resp < n_categories:
-            r_kc[:, resp] += posterior_weights[i]
+    for start in range(0, len(valid_rows), chunk_size):
+        rows = valid_rows[start : start + chunk_size]
+        categories = responses_array[rows].astype(np.intp, copy=False)
+        indicators = np.zeros((len(rows), n_categories), dtype=np.float64)
+        indicators[np.arange(len(rows)), categories] = 1.0
+        r_kc += weights[rows].T @ indicators
 
     return r_kc
 
@@ -145,20 +162,22 @@ def compute_expected_counts_parallel(
             posterior_weights.astype(np.float64),
         )
 
-    n_items = responses.shape[1]
-    n_quad = posterior_weights.shape[1]
+    responses_array = np.asarray(responses)
+    weights = np.asarray(posterior_weights, dtype=np.float64)
+    n_persons, n_items = responses_array.shape
+    n_quad = weights.shape[1]
 
-    r_k_all = np.zeros((n_items, n_quad))
-    n_k_all = np.zeros((n_items, n_quad))
+    r_k_all = np.zeros((n_items, n_quad), dtype=np.float64)
+    n_k_all = np.zeros((n_items, n_quad), dtype=np.float64)
+    chunk_size = _entry_chunk_size(n_persons, 2 * n_items)
 
-    for j in range(n_items):
-        item_responses = responses[:, j]
-        valid_mask = item_responses >= 0
-
-        r_k_all[j] = np.sum(
-            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-            axis=0,
+    for start in range(0, n_persons, chunk_size):
+        stop = min(start + chunk_size, n_persons)
+        correct, valid = _prepare_binary_response_components(
+            responses_array[start:stop]
         )
-        n_k_all[j] = np.sum(posterior_weights[valid_mask], axis=0)
+        weight_chunk = weights[start:stop]
+        r_k_all += correct.T @ weight_chunk
+        n_k_all += valid.T @ weight_chunk
 
     return r_k_all, n_k_all

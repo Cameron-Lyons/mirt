@@ -83,6 +83,7 @@ Estimation
    EMEstimator
    MHRMEstimator
    GibbsSampler
+   MCMCResult
    BLEstimator
    ResponseTimeGibbsSampler
    IRTreeEMEstimator
@@ -102,6 +103,7 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   diagnostics.adjust_p_values
    diagnostics.psis_loo
    diagnostics.waic
 
@@ -142,6 +144,7 @@ Cross-validation
    KFold
    StratifiedKFold
    GroupKFold
+   StratifiedGroupKFold
    LeaveOneOut
 
 CAT

@@ -15,6 +15,7 @@ from mirt.constants import PROB_EPSILON
 
 _MIN_LD_PAIR_RESPONSES = 5
 _MIN_EXPECTED_CELL = 0.5
+_LD_CATEGORY_CHUNK_ELEMENTS = 1_000_000
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -585,12 +586,90 @@ def _binary_ld_x2(
 def _polytomous_ld_x2(
     data: _ResidualData,
 ) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.bool_]]:
-    """Compute generalized categorical LD statistics and pairwise degrees."""
+    """Compute generalized categorical LD statistics in respondent chunks."""
+    n_persons, n_items = data.responses.shape
+    ld_x2 = np.zeros((n_items, n_items), dtype=np.float64)
+    category_degrees = data.n_categories.astype(np.int64, copy=False) - 1
+    degrees = np.multiply.outer(category_degrees, category_degrees)
+    np.fill_diagonal(degrees, 1)
+
+    max_categories = int(np.max(data.n_categories))
+    # Compact item-pair tables perform fewer reductions for small instruments
+    # whose response scale is wider than the item set.
+    if n_items <= max_categories:
+        return _pairwise_polytomous_ld_x2(data, degrees)
+
+    observed_float = data.observed.astype(np.float64)
+    pair_counts = observed_float.T @ observed_float
+    eligible = pair_counts >= _MIN_LD_PAIR_RESPONSES
+    np.fill_diagonal(eligible, False)
+    if not np.any(eligible):
+        return ld_x2, degrees, eligible
+
+    category_exists = np.arange(max_categories)[:, None] < data.n_categories[None, :]
+    chunk_size = min(
+        n_persons,
+        max(1, _LD_CATEGORY_CHUNK_ELEMENTS // n_items),
+    )
+
+    for first_category in range(max_categories):
+        first_exists = category_exists[first_category]
+        for second_category in range(first_category, max_categories):
+            valid_cells = (
+                first_exists[:, None] & category_exists[second_category][None, :]
+            )
+            if not np.any(valid_cells & eligible):
+                continue
+
+            observed_cells = np.zeros((n_items, n_items), dtype=np.float64)
+            expected_cells = np.zeros((n_items, n_items), dtype=np.float64)
+            for start in range(0, n_persons, chunk_size):
+                stop = min(start + chunk_size, n_persons)
+                observed = data.observed[start:stop]
+                responses = data.responses[start:stop]
+                first_observed = (observed & (responses == first_category)).astype(
+                    np.float64
+                )
+                first_probability = np.where(
+                    observed,
+                    data.probabilities[start:stop, :, first_category],
+                    0.0,
+                )
+                if first_category == second_category:
+                    second_observed = first_observed
+                    second_probability = first_probability
+                else:
+                    second_observed = (
+                        observed & (responses == second_category)
+                    ).astype(np.float64)
+                    second_probability = np.where(
+                        observed,
+                        data.probabilities[start:stop, :, second_category],
+                        0.0,
+                    )
+
+                observed_cells += first_observed.T @ second_observed
+                expected_cells += first_probability.T @ second_probability
+
+            contribution = (observed_cells - expected_cells) ** 2
+            contribution /= np.maximum(expected_cells, _MIN_EXPECTED_CELL)
+            ld_x2 += np.where(valid_cells, contribution, 0.0)
+            if first_category != second_category:
+                ld_x2 += np.where(valid_cells.T, contribution.T, 0.0)
+
+    ld_x2 = np.where(eligible, (ld_x2 + ld_x2.T) / 2.0, 0.0)
+
+    return ld_x2, degrees, eligible
+
+
+def _pairwise_polytomous_ld_x2(
+    data: _ResidualData,
+    degrees: NDArray[np.int_],
+) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.bool_]]:
+    """Use compact per-pair tables when categories outnumber items."""
     n_items = data.responses.shape[1]
     ld_x2 = np.zeros((n_items, n_items), dtype=np.float64)
-    degrees = np.ones((n_items, n_items), dtype=np.int64)
     eligible = np.zeros((n_items, n_items), dtype=np.bool_)
-
     for first in range(n_items):
         first_categories = int(data.n_categories[first])
         for second in range(first + 1, n_items):
@@ -613,9 +692,7 @@ def _polytomous_ld_x2(
                 (observed_cells - expected_cells) ** 2
                 / np.maximum(expected_cells, _MIN_EXPECTED_CELL)
             )
-            pair_degrees = (first_categories - 1) * (second_categories - 1)
             ld_x2[first, second] = ld_x2[second, first] = statistic
-            degrees[first, second] = degrees[second, first] = pair_degrees
             eligible[first, second] = eligible[second, first] = True
 
     return ld_x2, degrees, eligible

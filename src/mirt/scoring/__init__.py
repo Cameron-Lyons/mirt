@@ -1,20 +1,26 @@
 from __future__ import annotations
 
+import importlib
 from typing import TYPE_CHECKING, Any, Literal
 
-import numpy as np
-from numpy.typing import NDArray
-
-from mirt.results.score_result import ScoreResult
-from mirt.scoring.eap import EAPScorer
-from mirt.scoring.eapsum import EAPSumScorer, eapsum, sum_score_to_theta
-from mirt.scoring.map import MAPScorer
-from mirt.scoring.ml import MLScorer
-from mirt.scoring.wle import WLEScorer
-
 if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import NDArray
+
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+    from mirt.results.score_result import ScoreResult
+
+
+_LAZY_IMPORTS = {
+    "EAPScorer": ("mirt.scoring.eap", "EAPScorer"),
+    "EAPSumScorer": ("mirt.scoring.eapsum", "EAPSumScorer"),
+    "MAPScorer": ("mirt.scoring.map", "MAPScorer"),
+    "MLScorer": ("mirt.scoring.ml", "MLScorer"),
+    "WLEScorer": ("mirt.scoring.wle", "WLEScorer"),
+    "eapsum": ("mirt.scoring.eapsum", "eapsum"),
+    "sum_score_to_theta": ("mirt.scoring.eapsum", "sum_score_to_theta"),
+}
 
 
 def fscores(
@@ -84,6 +90,8 @@ def fscores(
     >>> scores = fscores(result, data, method="EAP")
     >>> print(scores.theta[:5])
     """
+    import numpy as np
+
     from mirt.results.fit_result import FitResult
 
     if isinstance(model_or_result, FitResult):
@@ -103,18 +111,24 @@ def fscores(
         )
 
     if method == "EAP":
+        from mirt.scoring.eap import EAPScorer
+
         scorer = EAPScorer(
             n_quadpts=n_quadpts,
             prior_mean=prior_mean,
             prior_cov=prior_cov,
         )
     elif method == "EAPsum":
+        from mirt.scoring.eapsum import EAPSumScorer
+
         scorer = EAPSumScorer(
             n_quadpts=n_quadpts,
             prior_mean=prior_mean,
             prior_cov=prior_cov,
         )
     elif method == "MAP":
+        from mirt.scoring.map import MAPScorer
+
         scorer = MAPScorer(
             prior_mean=prior_mean,
             prior_cov=prior_cov,
@@ -122,8 +136,12 @@ def fscores(
             n_jobs=n_jobs,
         )
     elif method == "ML":
+        from mirt.scoring.ml import MLScorer
+
         scorer = MLScorer(theta_bounds=bounds, n_jobs=n_jobs)
     elif method == "WLE":
+        from mirt.scoring.wle import WLEScorer
+
         scorer = WLEScorer(bounds=bounds, n_jobs=n_jobs)
     else:
         raise ValueError(f"Unknown scoring method: {method}")
@@ -144,3 +162,17 @@ __all__ = [
     "eapsum",
     "sum_score_to_theta",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_IMPORTS:
+        module_name, symbol_name = _LAZY_IMPORTS[name]
+        module = importlib.import_module(module_name)
+        value = getattr(module, symbol_name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module 'mirt.scoring' has no attribute '{name}'")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
