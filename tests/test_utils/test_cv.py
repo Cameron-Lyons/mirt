@@ -7,6 +7,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.utils.cv import (
+    AbilityRMSEScorer,
     AICScorer,
     BICScorer,
     CVResult,
@@ -14,6 +15,7 @@ from mirt.utils.cv import (
     KFold,
     LeaveOneOut,
     LogLikelihoodScorer,
+    Scorer,
     StratifiedGroupKFold,
     StratifiedKFold,
     cross_validate,
@@ -511,6 +513,10 @@ class TestCrossValidate:
             "model_type": "1PL",
             "responses": responses,
             "splitter": KFold(n_splits=2, shuffle=False),
+            "scorers": [
+                LogLikelihoodScorer(),
+                AbilityRMSEScorer(np.zeros(len(responses))),
+            ],
             "n_quadpts": 11,
             "max_iter": 2,
             "return_models": True,
@@ -526,6 +532,89 @@ class TestCrossValidate:
             parallel.scores["log_likelihood"],
             sequential.scores["log_likelihood"],
         )
+        assert_allclose(
+            parallel.scores["ability_rmse"],
+            sequential.scores["ability_rmse"],
+        )
+
+    def test_shares_ability_estimates_across_scorers(self, monkeypatch):
+        responses = self._small_responses()
+        true_theta = np.linspace(-1.0, 1.0, len(responses))
+        fitted_models = 0
+        scoring_calls = []
+
+        class FakeModel:
+            def __init__(self, fold):
+                self.fold = fold
+
+            def log_likelihood(self, test_responses, theta):
+                return theta[:, 0] - 0.5 * np.sum(test_responses, axis=1)
+
+        class RowCountScorer(Scorer):
+            calls = 0
+
+            @property
+            def name(self):
+                return "test_rows"
+
+            def __call__(
+                self,
+                result,
+                train_responses,
+                test_responses,
+                test_indices=None,
+            ):
+                _ = result, train_responses, test_indices
+                self.calls += 1
+                return float(len(test_responses))
+
+        def fake_fit(*args, **kwargs):
+            nonlocal fitted_models
+            _ = args, kwargs
+            model = FakeModel(fitted_models)
+            fitted_models += 1
+            return SimpleNamespace(model=model)
+
+        def fake_fscores(model, test_responses, method):
+            scoring_calls.append((model.fold, method))
+            theta = np.mean(test_responses, axis=1, keepdims=True)
+            return SimpleNamespace(theta=theta)
+
+        monkeypatch.setattr("mirt.fit_mirt", fake_fit)
+        monkeypatch.setattr("mirt.scoring.fscores", fake_fscores)
+        row_count = RowCountScorer()
+        splitter = KFold(n_splits=3, shuffle=False)
+
+        result = cross_validate(
+            "1PL",
+            responses,
+            splitter=splitter,
+            scorers=[
+                LogLikelihoodScorer(),
+                AbilityRMSEScorer(true_theta),
+                row_count,
+            ],
+        )
+
+        expected_log_likelihood = []
+        expected_rmse = []
+        expected_rows = []
+        for _, test_indices in splitter.split(responses):
+            test_responses = responses[test_indices]
+            estimated = np.mean(test_responses, axis=1)
+            expected_log_likelihood.append(
+                float(np.sum(estimated - 0.5 * np.sum(test_responses, axis=1)))
+            )
+            expected_rmse.append(
+                -float(np.sqrt(np.mean((estimated - true_theta[test_indices]) ** 2)))
+            )
+            expected_rows.append(float(len(test_indices)))
+
+        assert scoring_calls == [(0, "EAP"), (1, "EAP"), (2, "EAP")]
+        assert row_count.calls == 3
+        assert_allclose(result.scores["log_likelihood"], expected_log_likelihood)
+        assert_allclose(result.scores["ability_rmse"], expected_rmse)
+        assert result.scores["test_rows"] == expected_rows
 
     @pytest.mark.parametrize("n_jobs", [0, -2, True, 1.5])
     def test_rejects_invalid_job_counts(self, n_jobs):
