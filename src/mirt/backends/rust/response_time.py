@@ -15,6 +15,7 @@ from mirt.constants import PROB_EPSILON
 
 FALLBACK_MODE = "numpy"
 _LOG_2PI = float(np.log(2.0 * np.pi))
+_SAMPLE_LIKELIHOOD_TARGET_ELEMENTS = 2_000_000
 
 
 def _as_f64(values: NDArray[np.floating]) -> NDArray[np.float64]:
@@ -104,6 +105,95 @@ def rt_joint_log_likelihood(
     timing = np.log(alpha) - 0.5 * _LOG_2PI - 0.5 * (alpha * residual) ** 2
     timing = np.where(observed_timing, timing, 0.0)
     return np.sum(accuracy + timing, axis=1)
+
+
+def rt_joint_log_likelihood_samples(
+    responses: NDArray[np.integer],
+    log_rt: NDArray[np.float64],
+    theta: NDArray[np.float64],
+    tau: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    time_discrimination: NDArray[np.float64],
+    time_intensity: NDArray[np.float64],
+    guessing: NDArray[np.float64] | None = None,
+    *,
+    use_rust: bool = True,
+    sample_chunk_size: int | None = None,
+) -> NDArray[np.float64]:
+    """Compute paired posterior log likelihoods for every sample and person."""
+    if use_rust and rust_enabled():
+        return np.asarray(
+            mirt_rs.rt_joint_log_likelihood_samples(
+                _as_i32(responses),
+                _as_f64(log_rt),
+                _as_f64(theta),
+                _as_f64(tau),
+                _as_f64(discrimination),
+                _as_f64(difficulty),
+                None if guessing is None else _as_f64(guessing),
+                _as_f64(time_discrimination),
+                _as_f64(time_intensity),
+            ),
+            dtype=np.float64,
+        )
+
+    responses = np.asarray(responses)
+    log_rt = np.asarray(log_rt, dtype=np.float64)
+    theta = np.asarray(theta, dtype=np.float64)
+    tau = np.asarray(tau, dtype=np.float64)
+    discrimination = np.asarray(discrimination, dtype=np.float64)
+    difficulty = np.asarray(difficulty, dtype=np.float64)
+    time_discrimination = np.asarray(time_discrimination, dtype=np.float64)
+    time_intensity = np.asarray(time_intensity, dtype=np.float64)
+
+    n_samples, n_persons = theta.shape
+    n_items = responses.shape[1]
+    if sample_chunk_size is None:
+        elements_per_sample = max(1, n_persons * n_items)
+        sample_chunk_size = max(
+            1,
+            _SAMPLE_LIKELIHOOD_TARGET_ELEMENTS // elements_per_sample,
+        )
+
+    observed_accuracy = responses >= 0
+    correct = responses == 1
+    observed_timing = ~np.isnan(log_rt)
+    timing_values = np.where(observed_timing, log_rt, 0.0)
+    alpha = time_discrimination[None, None, :]
+    log_alpha_normalizer = (np.log(time_discrimination) - 0.5 * _LOG_2PI)[None, None, :]
+    result = np.empty((n_samples, n_persons), dtype=np.float64)
+
+    for start in range(0, n_samples, sample_chunk_size):
+        stop = min(start + sample_chunk_size, n_samples)
+        logits = discrimination[None, None, :] * (
+            theta[start:stop, :, None] - difficulty[None, None, :]
+        )
+        probability = np.asarray(sigmoid(logits), dtype=np.float64)
+        if guessing is not None:
+            guessing_values = np.asarray(guessing, dtype=np.float64)[None, None, :]
+            probability *= 1.0 - guessing_values
+            probability += guessing_values
+        np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON, out=probability)
+
+        log_probability = np.log(probability)
+        np.subtract(1.0, probability, out=probability)
+        np.log(probability, out=probability)
+        accuracy = np.where(correct[None, :, :], log_probability, probability)
+        accuracy *= observed_accuracy[None, :, :]
+
+        residual = timing_values[None, :, :] - (
+            time_intensity[None, None, :] - tau[start:stop, :, None]
+        )
+        residual *= alpha
+        np.square(residual, out=residual)
+        residual *= -0.5
+        residual += log_alpha_normalizer
+        residual *= observed_timing[None, :, :]
+        accuracy += residual
+        result[start:stop] = np.sum(accuracy, axis=2)
+
+    return result
 
 
 def rt_accept_person_proposals(

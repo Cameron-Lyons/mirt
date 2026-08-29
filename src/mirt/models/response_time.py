@@ -9,7 +9,10 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt.backends.rust.response_time import rt_joint_log_likelihood
+from mirt.backends.rust.response_time import (
+    rt_joint_log_likelihood,
+    rt_joint_log_likelihood_samples,
+)
 from mirt.exceptions import MirtValidationError
 
 AccuracyModel = Literal["2PL", "3PL"]
@@ -651,19 +654,12 @@ class ResponseTimeModel:
             )
         return np.asarray(np.exp(log_time), dtype=np.float64)
 
-    def joint_log_likelihood(
+    def _validated_joint_observations(
         self,
         responses: NDArray[np.int_] | NDArray[np.float64],
         log_rt: NDArray[np.float64],
-        theta: NDArray[np.float64],
-        tau: NDArray[np.float64],
-    ) -> NDArray[np.float64]:
-        """Compute conditional accuracy-plus-time log likelihood per person.
-
-        Negative or ``NaN`` responses are treated as missing.  ``NaN`` log
-        response times are missing independently, so a timing observation still
-        contributes when its corresponding accuracy response is unavailable.
-        """
+    ) -> tuple[NDArray[np.int32], NDArray[np.float64]]:
+        """Validate shared accuracy and timing observations once."""
         response_values = np.asarray(responses)
         log_rt_values = np.asarray(log_rt, dtype=np.float64)
         if response_values.ndim != 2 or response_values.shape[1:] != (self.n_items,):
@@ -688,10 +684,6 @@ class ResponseTimeModel:
                 expected=str(response_values.shape),
             )
 
-        n_persons = response_values.shape[0]
-        theta_values = self._person_vector(theta, "theta", n_persons)
-        tau_values = self._person_vector(tau, "tau", n_persons)
-
         if np.issubdtype(response_values.dtype, np.integer) or np.issubdtype(
             response_values.dtype, np.bool_
         ):
@@ -699,7 +691,7 @@ class ResponseTimeModel:
             invalid_response = (
                 response_observed & (response_values != 0) & (response_values != 1)
             )
-            response_integers = response_values
+            response_integers = response_values.astype(np.int32, copy=False)
             invalid_values = response_values[invalid_response]
         else:
             try:
@@ -742,7 +734,28 @@ class ResponseTimeModel:
                 value=log_rt_values,
                 expected="finite values or NaN",
             )
+        return response_integers, log_rt_values
 
+    def joint_log_likelihood(
+        self,
+        responses: NDArray[np.int_] | NDArray[np.float64],
+        log_rt: NDArray[np.float64],
+        theta: NDArray[np.float64],
+        tau: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Compute conditional accuracy-plus-time log likelihood per person.
+
+        Negative or ``NaN`` responses are treated as missing.  ``NaN`` log
+        response times are missing independently, so a timing observation still
+        contributes when its corresponding accuracy response is unavailable.
+        """
+        response_integers, log_rt_values = self._validated_joint_observations(
+            responses,
+            log_rt,
+        )
+        n_persons = response_integers.shape[0]
+        theta_values = self._person_vector(theta, "theta", n_persons)
+        tau_values = self._person_vector(tau, "tau", n_persons)
         (
             discrimination,
             difficulty,
@@ -763,6 +776,118 @@ class ResponseTimeModel:
             time_intensity,
             guessing,
             use_rust=self.use_rust,
+        )
+
+    @staticmethod
+    def _posterior_sample_matrix(
+        values: NDArray[np.float64],
+        name: str,
+        n_persons: int,
+    ) -> NDArray[np.float64]:
+        """Validate a sample-by-person latent parameter matrix."""
+        try:
+            matrix = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=values,
+                expected=f"non-empty (n_samples, {n_persons}) array",
+            ) from exc
+        if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] != n_persons:
+            raise MirtValidationError(
+                f"{name} must have shape (n_samples, {n_persons})",
+                parameter=name,
+                value=matrix.shape,
+                expected=f"non-empty (n_samples, {n_persons}) array",
+            )
+        if not np.all(np.isfinite(matrix)):
+            raise MirtValidationError(
+                f"{name} must contain only finite values",
+                parameter=name,
+                value=matrix,
+                expected="finite values",
+            )
+        return matrix
+
+    def joint_log_likelihood_samples(
+        self,
+        responses: NDArray[np.int_] | NDArray[np.float64],
+        log_rt: NDArray[np.float64],
+        theta: NDArray[np.float64],
+        tau: NDArray[np.float64],
+        *,
+        sample_chunk_size: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Compute paired joint log likelihoods for posterior latent samples.
+
+        Parameters
+        ----------
+        responses, log_rt : ndarray of shape (n_persons, n_items)
+            Accuracy and log response-time observations. Missingness follows
+            :meth:`joint_log_likelihood` and is independent across outcomes.
+        theta, tau : ndarray of shape (n_samples, n_persons)
+            Paired posterior ability and speed samples.
+        sample_chunk_size : int, optional
+            Maximum samples per NumPy fallback batch. The default chooses a
+            memory-bounded size automatically. Native evaluation does not need
+            temporary sample-by-person-by-item tensors.
+
+        Returns
+        -------
+        ndarray of shape (n_samples, n_persons)
+            Conditional accuracy-plus-time log likelihood for every paired
+            sample and person.
+        """
+        response_integers, log_rt_values = self._validated_joint_observations(
+            responses,
+            log_rt,
+        )
+        n_persons = response_integers.shape[0]
+        theta_values = self._posterior_sample_matrix(theta, "theta", n_persons)
+        tau_values = self._posterior_sample_matrix(tau, "tau", n_persons)
+        if tau_values.shape != theta_values.shape:
+            raise MirtValidationError(
+                "tau must have the same shape as theta",
+                parameter="tau",
+                value=tau_values.shape,
+                expected=str(theta_values.shape),
+            )
+        if sample_chunk_size is not None:
+            if (
+                isinstance(sample_chunk_size, (bool, np.bool_))
+                or not isinstance(sample_chunk_size, (int, np.integer))
+                or sample_chunk_size < 1
+            ):
+                raise MirtValidationError(
+                    "sample_chunk_size must be a positive integer",
+                    parameter="sample_chunk_size",
+                    value=sample_chunk_size,
+                    expected="positive integer",
+                )
+            sample_chunk_size = int(sample_chunk_size)
+
+        (
+            discrimination,
+            difficulty,
+            guessing,
+            time_intensity,
+            time_discrimination,
+            _,
+            _,
+        ) = self._validated_state()
+        return rt_joint_log_likelihood_samples(
+            response_integers,
+            log_rt_values,
+            theta_values,
+            tau_values,
+            discrimination,
+            difficulty,
+            time_discrimination,
+            time_intensity,
+            guessing,
+            use_rust=self.use_rust,
+            sample_chunk_size=sample_chunk_size,
         )
 
     def simulate(

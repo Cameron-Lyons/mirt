@@ -3,8 +3,8 @@
 //! This module provides functions for joint modeling of response accuracy
 //! and response times using Van der Linden's hierarchical framework.
 
-use numpy::ndarray::{Array1, ArrayView1};
-use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::ndarray::{Array1, Array2, ArrayView1};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
@@ -161,6 +161,57 @@ pub fn rt_joint_log_likelihood_3pl<'py>(
         .collect();
 
     Array1::from(log_likes).to_pyarray(py)
+}
+
+/// Compute paired joint log likelihoods for posterior samples.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn rt_joint_log_likelihood_samples<'py>(
+    py: Python<'py>,
+    responses: PyReadonlyArray2<i32>,
+    log_rt: PyReadonlyArray2<f64>,
+    theta: PyReadonlyArray2<f64>,
+    tau: PyReadonlyArray2<f64>,
+    discrimination: PyReadonlyArray1<f64>,
+    difficulty: PyReadonlyArray1<f64>,
+    guessing: Option<PyReadonlyArray1<f64>>,
+    time_discrimination: PyReadonlyArray1<f64>,
+    time_intensity: PyReadonlyArray1<f64>,
+) -> Bound<'py, PyArray2<f64>> {
+    let responses = responses.as_array();
+    let log_rt = log_rt.as_array();
+    let theta = theta.as_array();
+    let tau = tau.as_array();
+    let disc = discrimination.as_array();
+    let diff = difficulty.as_array();
+    let time_disc = time_discrimination.as_array();
+    let time_int = time_intensity.as_array();
+    let guess = guessing.map(|values| values.as_array().to_vec());
+
+    let n_samples = theta.nrows();
+    let n_persons = responses.nrows();
+    let log_likes: Vec<f64> = (0..n_samples * n_persons)
+        .into_par_iter()
+        .map(|flat_index| {
+            let sample = flat_index / n_persons;
+            let person = flat_index % n_persons;
+            joint_log_likelihood_single(
+                &responses.row(person),
+                &log_rt.row(person),
+                theta[(sample, person)],
+                tau[(sample, person)],
+                &disc,
+                &diff,
+                &time_disc,
+                &time_int,
+                guess.as_deref(),
+            )
+        })
+        .collect();
+
+    Array2::from_shape_vec((n_samples, n_persons), log_likes)
+        .expect("sample likelihood result shape must be valid")
+        .to_pyarray(py)
 }
 
 /// Accept or reject pre-generated joint ability and speed proposals.
@@ -496,6 +547,7 @@ pub fn rt_time_sufficient_stats<'py>(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rt_joint_log_likelihood, m)?)?;
     m.add_function(wrap_pyfunction!(rt_joint_log_likelihood_3pl, m)?)?;
+    m.add_function(wrap_pyfunction!(rt_joint_log_likelihood_samples, m)?)?;
     m.add_function(wrap_pyfunction!(rt_accept_person_proposals, m)?)?;
     m.add_function(wrap_pyfunction!(rt_sample_person_params, m)?)?;
     m.add_function(wrap_pyfunction!(rt_log_mvn_density, m)?)?;
