@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections import Counter
+from dataclasses import dataclass
 from numbers import Integral, Real
+from statistics import NormalDist
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -48,6 +50,61 @@ def _prepare_available_items(available_items: set[int]) -> NDArray[np.int_]:
         raise ValueError("available item indices must be non-negative")
     item_indices.sort()
     return item_indices
+
+
+@dataclass(frozen=True)
+class ExposureReport:
+    """Item-level exposure monitoring summary.
+
+    Attributes
+    ----------
+    item_indices : ndarray
+        Zero-based item indices represented by each array position.
+    selection_counts, opportunity_counts, eligibility_counts : ndarray
+        Recorded item counts.
+    exposure_rates, eligibility_rates : ndarray
+        Selection rates per examinee and eligibility rates per opportunity.
+    confidence_lower, confidence_upper : ndarray
+        Wilson confidence bounds for exposure rates.
+    target_rate : float
+        Configured maximum exposure rate.
+    above_target : ndarray
+        Items whose point exposure estimate exceeds the target.
+    significantly_above_target : ndarray
+        Items whose lower confidence bound exceeds the target.
+    n_examinees : int
+        Number of recorded examinee sessions.
+    """
+
+    item_indices: NDArray[np.int_]
+    selection_counts: NDArray[np.int64]
+    opportunity_counts: NDArray[np.int64]
+    eligibility_counts: NDArray[np.int64]
+    exposure_rates: NDArray[np.float64]
+    eligibility_rates: NDArray[np.float64]
+    confidence_lower: NDArray[np.float64]
+    confidence_upper: NDArray[np.float64]
+    target_rate: float
+    above_target: NDArray[np.bool_]
+    significantly_above_target: NDArray[np.bool_]
+    n_examinees: int
+
+    @property
+    def overexposed_items(self) -> NDArray[np.int_]:
+        """Return item indices whose point estimates exceed the target."""
+        return self.item_indices[self.above_target].copy()
+
+    @property
+    def statistically_overexposed_items(self) -> NDArray[np.int_]:
+        """Return item indices whose confidence intervals exceed the target."""
+        return self.item_indices[self.significantly_above_target].copy()
+
+    @property
+    def max_exposure_rate(self) -> float:
+        """Return the largest item exposure rate, or zero for an empty report."""
+        if self.exposure_rates.size == 0:
+            return 0.0
+        return float(np.max(self.exposure_rates))
 
 
 class ExposureControl(ABC):
@@ -219,6 +276,202 @@ class SympsonHetter(ExposureControl):
 
     def reset(self) -> None:
         self._n_examinees += 1
+
+    def record_sessions(
+        self,
+        selections: ArrayLike,
+        *,
+        missing_value: int = -1,
+        n_items: int | None = None,
+    ) -> None:
+        """Record one or many completed adaptive-test sessions in a batch.
+
+        A one-dimensional input represents one session. A two-dimensional
+        input uses one row per examinee and one column per administered
+        position. Ragged histories can be padded with ``missing_value``.
+        Repeated items within one session are rejected because exposure is an
+        examinee-level proportion.
+
+        Parameters
+        ----------
+        selections : array-like
+            Integer selected-item histories.
+        missing_value : int, default=-1
+            Negative padding value ignored while counting selections.
+        n_items : int, optional
+            Item-pool size used to validate upper index bounds.
+        """
+        if isinstance(missing_value, (bool, np.bool_)) or not isinstance(
+            missing_value, Integral
+        ):
+            raise TypeError("missing_value must be an integer")
+        missing_value = int(missing_value)
+        if missing_value >= 0:
+            raise ValueError("missing_value must be negative")
+
+        if n_items is not None:
+            if (
+                isinstance(n_items, (bool, np.bool_))
+                or not isinstance(n_items, Integral)
+                or n_items < 1
+            ):
+                raise ValueError("n_items must be a positive integer")
+            n_items = int(n_items)
+
+        values = np.asarray(selections)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
+            raise ValueError("selections must contain one or more non-empty sessions")
+        if not np.issubdtype(values.dtype, np.integer) or np.issubdtype(
+            values.dtype, np.bool_
+        ):
+            raise TypeError("selections must contain integers")
+
+        item_values = values.astype(np.int64, copy=False)
+        invalid_negative = (item_values < 0) & (item_values != missing_value)
+        if np.any(invalid_negative):
+            raise ValueError("negative selections must equal missing_value")
+        observed = item_values != missing_value
+        if n_items is not None and np.any(item_values[observed] >= n_items):
+            raise IndexError(f"selected item must be in [0, {n_items})")
+
+        ordered = np.sort(item_values, axis=1)
+        repeated = (ordered[:, 1:] == ordered[:, :-1]) & (
+            ordered[:, 1:] != missing_value
+        )
+        if np.any(repeated):
+            raise ValueError("a session cannot contain repeated selected items")
+
+        selected = item_values[observed]
+        if selected.size:
+            indices, counts = np.unique(selected, return_counts=True)
+            self._selection_counts.update(
+                {
+                    int(item_idx): int(count)
+                    for item_idx, count in zip(indices, counts, strict=True)
+                }
+            )
+        self._n_examinees += item_values.shape[0]
+
+    def exposure_report(
+        self,
+        n_items: int | None = None,
+        *,
+        confidence_level: float = 0.95,
+    ) -> ExposureReport:
+        """Summarize item exposure with uncertainty-aware target flags.
+
+        Wilson score intervals remain well behaved for zero and complete
+        exposure counts. Items are statistically overexposed only when the
+        entire confidence interval lies above ``target_rate``.
+
+        Parameters
+        ----------
+        n_items : int, optional
+            Number of items to include. By default, the report spans every
+            item known from parameters or recorded counts.
+        confidence_level : float, default=0.95
+            Two-sided confidence level strictly between zero and one.
+        """
+        if isinstance(confidence_level, (bool, np.bool_)) or not isinstance(
+            confidence_level, Real
+        ):
+            raise TypeError("confidence_level must be a real number")
+        confidence_level = float(confidence_level)
+        if not np.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
+            raise ValueError("confidence_level must be finite and in (0, 1)")
+        quantile_probability = 0.5 + confidence_level / 2.0
+        if quantile_probability >= 1.0:
+            raise ValueError("confidence_level is too close to 1 for finite precision")
+
+        known_items = (
+            set(self._params)
+            | set(self._selection_counts)
+            | set(self._opportunity_counts)
+            | set(self._eligibility_counts)
+        )
+        if n_items is None:
+            item_indices = np.fromiter(
+                sorted(known_items),
+                dtype=np.int_,
+                count=len(known_items),
+            )
+        else:
+            if (
+                isinstance(n_items, (bool, np.bool_))
+                or not isinstance(n_items, Integral)
+                or n_items < 1
+            ):
+                raise ValueError("n_items must be a positive integer")
+            item_count = int(n_items)
+            if known_items and max(known_items) >= item_count:
+                raise ValueError("n_items does not include every recorded item")
+            item_indices = np.arange(item_count, dtype=np.int_)
+
+        item_count = item_indices.size
+
+        def counter_values(counter: Counter[int]) -> NDArray[np.int64]:
+            return np.fromiter(
+                (counter.get(int(item_idx), 0) for item_idx in item_indices),
+                dtype=np.int64,
+                count=item_count,
+            )
+
+        selection_counts = counter_values(self._selection_counts)
+        opportunity_counts = counter_values(self._opportunity_counts)
+        eligibility_counts = counter_values(self._eligibility_counts)
+
+        if np.any(selection_counts > self._n_examinees):
+            raise ValueError(
+                "selection counts exceed examinee sessions; record each item once per session"
+            )
+
+        exposure_rates = np.zeros(item_count, dtype=np.float64)
+        confidence_lower = np.zeros(item_count, dtype=np.float64)
+        confidence_upper = np.ones(item_count, dtype=np.float64)
+        if self._n_examinees:
+            exposure_rates = selection_counts / self._n_examinees
+            z_value = NormalDist().inv_cdf(quantile_probability)
+            z_squared = z_value**2
+            denominator = 1.0 + z_squared / self._n_examinees
+            center = (
+                exposure_rates + z_squared / (2.0 * self._n_examinees)
+            ) / denominator
+            half_width = (
+                z_value
+                * np.sqrt(
+                    exposure_rates * (1.0 - exposure_rates) / self._n_examinees
+                    + z_squared / (4.0 * self._n_examinees**2)
+                )
+                / denominator
+            )
+            confidence_lower = np.maximum(0.0, center - half_width)
+            confidence_upper = np.minimum(1.0, center + half_width)
+
+        eligibility_rates = np.divide(
+            eligibility_counts,
+            opportunity_counts,
+            out=np.zeros(item_count, dtype=np.float64),
+            where=opportunity_counts > 0,
+        )
+        above_target = exposure_rates > self.target_rate
+        significantly_above_target = confidence_lower > self.target_rate
+
+        return ExposureReport(
+            item_indices=item_indices,
+            selection_counts=selection_counts,
+            opportunity_counts=opportunity_counts,
+            eligibility_counts=eligibility_counts,
+            exposure_rates=exposure_rates,
+            eligibility_rates=eligibility_rates,
+            confidence_lower=confidence_lower,
+            confidence_upper=confidence_upper,
+            target_rate=self.target_rate,
+            above_target=above_target,
+            significantly_above_target=significantly_above_target,
+            n_examinees=self._n_examinees,
+        )
 
     def calibrate(self, n_items: int) -> None:
         """Recalibrate exposure parameters based on observed rates.
