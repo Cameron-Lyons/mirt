@@ -38,7 +38,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **MCAT**: Multidimensional CAT with D-optimality and trace criteria
 
 ### Diagnostics & DIF
-- **Item fit**: Infit, outfit, S-X2
+- **Item fit**: Infit, outfit, S-X2 with multiple-testing control
 - **Person fit**: Zh, lz, infit/outfit
 - **Model fit**: M2, RMSEA, CFI, TLI, SRMSR
 - **DIF analysis**: Likelihood ratio, Wald, Lord, Raju
@@ -177,7 +177,12 @@ print(eap.standard_error)
 ### Diagnostics
 
 ```python
-item_fit = mirt.itemfit(result, responses)
+item_fit = mirt.itemfit(
+    result,
+    responses,
+    statistics=["infit", "outfit", "S_X2"],
+    p_adjust="fdr_bh",
+)
 print(item_fit)
 
 person_fit = mirt.personfit(result, responses)

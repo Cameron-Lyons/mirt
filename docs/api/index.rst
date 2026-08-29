@@ -103,6 +103,8 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   diagnostics.compute_itemfit
+   diagnostics.compute_s_x2
    diagnostics.adjust_p_values
    diagnostics.psis_loo
    diagnostics.waic

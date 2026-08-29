@@ -356,6 +356,7 @@ def itemfit(
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
     n_groups: int = 10,
+    p_adjust: Literal["bonferroni", "holm", "fdr_bh", "none"] = "none",
 ) -> Any:
     """Compute item fit statistics for a fitted IRT model.
 
@@ -382,6 +383,10 @@ def itemfit(
     n_groups : int
         Number of observed-score groups used for S-X2. Must be at least 2.
         Default is 10.
+    p_adjust : {"bonferroni", "holm", "fdr_bh", "none"}, default="none"
+        Multiple-testing adjustment across item-level S-X2 p-values. When an
+        adjustment is requested, the result includes a
+        ``p_value_adjusted`` column while retaining the raw ``p_value``.
 
     Returns
     -------
@@ -409,6 +414,7 @@ def itemfit(
         responses,
         statistics,
         n_groups=n_groups,
+        p_adjust=p_adjust,
     )
 
     return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")

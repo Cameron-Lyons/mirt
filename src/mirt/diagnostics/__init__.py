@@ -3,6 +3,7 @@ from typing import Any
 
 __all__ = [
     "compute_itemfit",
+    "compute_s_x2",
     "compute_personfit",
     "compute_dif",
     "compute_grdif",
@@ -34,6 +35,7 @@ __all__ = [
 
 _LAZY_IMPORTS = {
     "compute_itemfit": ("mirt.diagnostics.itemfit", "compute_itemfit"),
+    "compute_s_x2": ("mirt.diagnostics.itemfit", "compute_s_x2"),
     "compute_personfit": ("mirt.diagnostics.personfit", "compute_personfit"),
     "compute_dif": ("mirt.diagnostics.dif", "compute_dif"),
     "compute_grdif": ("mirt.diagnostics.dif", "compute_grdif"),

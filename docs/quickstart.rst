@@ -115,7 +115,12 @@ Evaluate model fit with various diagnostics:
    responses = dataset["data"]
    result = mirt.fit_mirt(responses, model="2PL")
 
-   item_stats = mirt.itemfit(result, responses, statistics=["infit", "outfit"])
+   item_stats = mirt.itemfit(
+       result,
+       responses,
+       statistics=["infit", "outfit", "S_X2"],
+       p_adjust="fdr_bh",
+   )
    person_stats = mirt.personfit(
        result, responses, statistics=["infit", "outfit", "Zh"]
    )
