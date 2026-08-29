@@ -173,6 +173,51 @@ def _theta_for_sample(
     )
 
 
+def _supports_batched_pointwise_2pl(model: BaseItemModel) -> bool:
+    """Return whether a model has the exact batched 2PL contract."""
+    from mirt.models.dichotomous import TwoParameterLogistic
+
+    return type(model) is TwoParameterLogistic and model.n_factors == 1
+
+
+def _batched_2pl_pointwise_inputs(
+    model: BaseItemModel,
+    chains: dict[str, NDArray[np.float64]],
+    parameter_chains: dict[str, NDArray[np.float64]],
+    *,
+    n_samples: int,
+    n_persons: int,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Materialize fixed or sampled values for the batched 2PL backend."""
+    discrimination = parameter_chains.get("discrimination")
+    if discrimination is None:
+        discrimination = np.broadcast_to(
+            model.parameters["discrimination"],
+            (n_samples, model.n_items),
+        )
+    difficulty = parameter_chains.get("difficulty")
+    if difficulty is None:
+        difficulty = np.broadcast_to(
+            model.parameters["difficulty"],
+            (n_samples, model.n_items),
+        )
+
+    theta = np.empty((n_samples, n_persons), dtype=np.float64)
+    for sample_idx in range(n_samples):
+        theta[sample_idx] = _theta_for_sample(
+            chains,
+            sample_idx=sample_idx,
+            n_samples=n_samples,
+            n_persons=n_persons,
+            n_factors=1,
+        )[:, 0]
+    return discrimination, difficulty, theta
+
+
 def _validate_response_matrix(
     responses: NDArray[np.int_],
     model: BaseItemModel,
@@ -1052,6 +1097,24 @@ def compute_pointwise_log_lik(
         chains,
         n_persons=n_persons,
     )
+
+    if _supports_batched_pointwise_2pl(model):
+        from mirt.backends.rust.diagnostics import compute_pointwise_loglik_2pl
+
+        discrimination, difficulty, theta = _batched_2pl_pointwise_inputs(
+            model,
+            chains,
+            parameter_chains,
+            n_samples=n_samples,
+            n_persons=n_persons,
+        )
+        return compute_pointwise_loglik_2pl(
+            responses,
+            discrimination,
+            difficulty,
+            theta,
+            aggregation=by,
+        )
 
     if by == "person":
         log_lik = np.zeros((n_samples, n_persons), dtype=np.float64)

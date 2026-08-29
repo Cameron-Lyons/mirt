@@ -73,3 +73,29 @@ Diagnostics
 ``rhat`` and ``ess`` contain convergence and effective-sample-size diagnostics for
 item parameters. Both are included in ``summary()``. Values of R-hat close to one
 and larger effective sample sizes indicate more reliable posterior estimates.
+
+Pointwise predictive criteria
+-----------------------------
+
+Use ``compute_pointwise_log_lik`` to prepare posterior log-likelihood matrices for
+WAIC or PSIS-LOO. Choose the aggregation level according to the predictive unit:
+
+.. code-block:: python
+
+   from mirt.diagnostics import compute_pointwise_log_lik, psis_loo, waic
+
+   person_log_lik = compute_pointwise_log_lik(
+       result.model,
+       responses,
+       result.chains,
+       by="person",
+   )
+   print(waic(person_log_lik).summary())
+   print(psis_loo(person_log_lik).summary())
+
+``by="observation"`` retains the flattened person-item layout and assigns zero to
+missing cells. ``by="observed"`` omits missing cells, producing the most compact
+matrix when each observed response is the predictive unit. Exact unidimensional
+2PL models evaluate fixed or sampled item parameters and abilities through a
+batched native implementation when available, with a memory-bounded NumPy fallback.
+Other model families retain the general probability-based implementation.
