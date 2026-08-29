@@ -1,13 +1,116 @@
-from typing import Literal
+from typing import Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 
-SimulationModel = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+SimulationModel = Literal[
+    "1PL",
+    "2PL",
+    "3PL",
+    "4PL",
+    "GRM",
+    "GPCM",
+    "PCM",
+    "NRM",
+    "ZI-2PL",
+    "ZI-3PL",
+    "HURDLE",
+]
+_VALID_SIMULATION_MODELS = frozenset(
+    {
+        "1PL",
+        "2PL",
+        "3PL",
+        "4PL",
+        "GRM",
+        "GPCM",
+        "PCM",
+        "NRM",
+        "ZI-2PL",
+        "ZI-3PL",
+        "HURDLE",
+    }
+)
+_EXCESS_ZERO_MODELS = frozenset({"ZI-2PL", "ZI-3PL", "HURDLE"})
 _MAX_STABLE_LOGIT = np.finfo(np.float64).max
 _MAX_POLYTOMOUS_CHUNK_ENTRIES = 1_000_000
+
+
+@overload
+def simdata(
+    model: SimulationModel = "2PL",
+    n_persons: int = 500,
+    n_items: int = 20,
+    n_categories: int = 2,
+    n_factors: int = 1,
+    theta: NDArray[np.float64] | None = None,
+    discrimination: NDArray[np.float64] | None = None,
+    difficulty: NDArray[np.float64] | None = None,
+    guessing: NDArray[np.float64] | None = None,
+    upper: NDArray[np.float64] | None = None,
+    thresholds: NDArray[np.float64] | None = None,
+    seed: int | None = None,
+    steps: NDArray[np.float64] | None = None,
+    slopes: NDArray[np.float64] | None = None,
+    intercepts: NDArray[np.float64] | None = None,
+    *,
+    zero_inflation: NDArray[np.float64] | None = None,
+    engagement_intercept: NDArray[np.float64] | None = None,
+    engagement_slope: NDArray[np.float64] | None = None,
+    return_structural_zeros: Literal[False] = False,
+) -> NDArray[np.int_]: ...
+
+
+@overload
+def simdata(
+    model: SimulationModel = "2PL",
+    n_persons: int = 500,
+    n_items: int = 20,
+    n_categories: int = 2,
+    n_factors: int = 1,
+    theta: NDArray[np.float64] | None = None,
+    discrimination: NDArray[np.float64] | None = None,
+    difficulty: NDArray[np.float64] | None = None,
+    guessing: NDArray[np.float64] | None = None,
+    upper: NDArray[np.float64] | None = None,
+    thresholds: NDArray[np.float64] | None = None,
+    seed: int | None = None,
+    steps: NDArray[np.float64] | None = None,
+    slopes: NDArray[np.float64] | None = None,
+    intercepts: NDArray[np.float64] | None = None,
+    *,
+    zero_inflation: NDArray[np.float64] | None = None,
+    engagement_intercept: NDArray[np.float64] | None = None,
+    engagement_slope: NDArray[np.float64] | None = None,
+    return_structural_zeros: Literal[True],
+) -> tuple[NDArray[np.int_], NDArray[np.bool_]]: ...
+
+
+@overload
+def simdata(
+    model: SimulationModel = "2PL",
+    n_persons: int = 500,
+    n_items: int = 20,
+    n_categories: int = 2,
+    n_factors: int = 1,
+    theta: NDArray[np.float64] | None = None,
+    discrimination: NDArray[np.float64] | None = None,
+    difficulty: NDArray[np.float64] | None = None,
+    guessing: NDArray[np.float64] | None = None,
+    upper: NDArray[np.float64] | None = None,
+    thresholds: NDArray[np.float64] | None = None,
+    seed: int | None = None,
+    steps: NDArray[np.float64] | None = None,
+    slopes: NDArray[np.float64] | None = None,
+    intercepts: NDArray[np.float64] | None = None,
+    *,
+    zero_inflation: NDArray[np.float64] | None = None,
+    engagement_intercept: NDArray[np.float64] | None = None,
+    engagement_slope: NDArray[np.float64] | None = None,
+    return_structural_zeros: bool,
+) -> NDArray[np.int_] | tuple[NDArray[np.int_], NDArray[np.bool_]]: ...
 
 
 def simdata(
@@ -26,7 +129,12 @@ def simdata(
     steps: NDArray[np.float64] | None = None,
     slopes: NDArray[np.float64] | None = None,
     intercepts: NDArray[np.float64] | None = None,
-) -> NDArray[np.int_]:
+    *,
+    zero_inflation: NDArray[np.float64] | None = None,
+    engagement_intercept: NDArray[np.float64] | None = None,
+    engagement_slope: NDArray[np.float64] | None = None,
+    return_structural_zeros: bool = False,
+) -> NDArray[np.int_] | tuple[NDArray[np.int_], NDArray[np.bool_]]:
     """Simulate item response data from an IRT model.
 
     Generates response data by sampling from the specified IRT model
@@ -34,7 +142,7 @@ def simdata(
 
     Parameters
     ----------
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
+    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM", "ZI-2PL", "ZI-3PL", "HURDLE"}, default="2PL"
         IRT model to simulate from:
 
         - "1PL": One-parameter logistic (equal discrimination)
@@ -45,6 +153,9 @@ def simdata(
         - "GPCM": Generalized Partial Credit Model (polytomous)
         - "PCM": Partial Credit Model (unit discrimination)
         - "NRM": Nominal Response Model (unordered categories)
+        - "ZI-2PL": 2PL model with item-specific structural zeros
+        - "ZI-3PL": 3PL model with item-specific structural zeros
+        - "HURDLE": 2PL model with an ability-dependent engagement hurdle
 
     n_persons : int, default=500
         Number of persons to simulate.
@@ -64,8 +175,8 @@ def simdata(
     difficulty : ndarray, optional
         Item difficulty parameters. If None, sampled from standard normal.
     guessing : ndarray, optional
-        Lower asymptote (guessing) parameters for 3PL/4PL models.
-        If None, defaults to 0.2 for 3PL/4PL, 0 otherwise.
+        Lower asymptote (guessing) parameters for 3PL, 4PL, and ZI-3PL.
+        If None, defaults to 0.2 for those models, 0 otherwise.
     upper : ndarray, optional
         Upper asymptote (slipping) parameters for 4PL model.
         If None, defaults to 1.0.
@@ -82,12 +193,25 @@ def simdata(
         or (n_items, n_categories, n_factors) when multidimensional.
     intercepts : ndarray of shape (n_items, n_categories), optional
         NRM category intercepts.
+    zero_inflation : ndarray of shape (n_items,), optional
+        Item structural-zero probabilities for ZI-2PL and ZI-3PL. Values must
+        be in ``[0, 1)``. If None, defaults to 0.1.
+    engagement_intercept : ndarray of shape (n_items,), optional
+        Engagement intercepts for HURDLE. If None, defaults to 2.0.
+    engagement_slope : ndarray of shape (n_items,), optional
+        Engagement slopes for HURDLE. If None, defaults to 0.5.
+    return_structural_zeros : bool, default=False
+        If True, return a Boolean mask identifying responses generated by the
+        structural-zero process. Only valid for ZI-2PL, ZI-3PL, and HURDLE.
 
     Returns
     -------
-    ndarray of shape (n_persons, n_items)
+    ndarray of shape (n_persons, n_items), or tuple of ndarrays
         Simulated response matrix. For dichotomous models, values are
         0 or 1. For polytomous models, values are 0, 1, ..., n_categories-1.
+        When ``return_structural_zeros=True``, returns ``(responses, mask)``;
+        the Boolean mask has the same shape and is True only for structural
+        zeros.
 
     Examples
     --------
@@ -106,10 +230,14 @@ def simdata(
 
     >>> # Simulate polytomous GRM data
     >>> data = simdata(model="GRM", n_categories=5, n_items=15)
+
+    >>> # Retain the latent structural-zero labels from a ZI-2PL simulation
+    >>> data, structural = simdata(
+    ...     model="ZI-2PL", n_items=10, return_structural_zeros=True, seed=42
+    ... )
     """
     model = model.upper()
-    valid_models = {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}
-    if model not in valid_models:
+    if model not in _VALID_SIMULATION_MODELS:
         raise ValueError(f"Unknown model: {model}")
     if isinstance(n_items, bool) or not isinstance(n_items, (int, np.integer)):
         raise ValueError("n_items must be a positive integer")
@@ -121,6 +249,8 @@ def simdata(
         n_categories, (int, np.integer)
     ):
         raise ValueError("n_categories must be a positive integer")
+    if not isinstance(return_structural_zeros, (bool, np.bool_)):
+        raise ValueError("return_structural_zeros must be a boolean")
     if n_items < 1:
         raise ValueError("n_items must be a positive integer")
     if n_persons < 1:
@@ -129,6 +259,10 @@ def simdata(
         raise ValueError("n_factors must be a positive integer")
     if model in {"GRM", "GPCM", "PCM", "NRM"} and n_categories < 2:
         raise ValueError("n_categories must be at least 2")
+    if return_structural_zeros and model not in _EXCESS_ZERO_MODELS:
+        raise ValueError(
+            "return_structural_zeros is only valid for ZI-2PL, ZI-3PL, and HURDLE"
+        )
 
     rng = np.random.default_rng(seed)
 
@@ -157,6 +291,14 @@ def simdata(
     ):
         raise ValueError("guessing and upper are only valid for 3PL and 4PL")
 
+    if model not in {"ZI-2PL", "ZI-3PL"} and zero_inflation is not None:
+        raise ValueError("zero_inflation is only valid for ZI-2PL and ZI-3PL")
+    if model != "HURDLE" and (
+        engagement_intercept is not None or engagement_slope is not None
+    ):
+        raise ValueError(
+            "engagement_intercept and engagement_slope are only valid for HURDLE"
+        )
     if model == "NRM":
         if discrimination is not None:
             raise ValueError("NRM simulation: use slopes instead of discrimination")
@@ -210,6 +352,37 @@ def simdata(
             n_items=n_items,
             n_factors=n_factors,
         )
+
+    if model in _EXCESS_ZERO_MODELS:
+        if n_factors != 1:
+            raise ValueError(f"{model} simulation only supports unidimensional theta")
+        if np.any(discrimination <= 0.0):
+            raise ValueError(f"{model} discrimination must be strictly positive")
+        if steps is not None or thresholds is not None:
+            raise ValueError(f"{model} does not use thresholds or steps")
+        if upper is not None:
+            raise ValueError("upper is only valid for 4PL")
+        if model != "ZI-3PL" and guessing is not None:
+            raise ValueError("guessing is only valid for 3PL, 4PL, and ZI-3PL")
+        difficulty = _prepare_parameter(
+            "difficulty",
+            difficulty if difficulty is not None else rng.normal(0, 1, size=n_items),
+            (n_items,),
+        )
+        responses, structural_zeros = _simulate_excess_zero(
+            model=model,
+            theta=theta.ravel(),
+            discrimination=discrimination.ravel(),
+            difficulty=difficulty,
+            guessing=guessing,
+            zero_inflation=zero_inflation,
+            engagement_intercept=engagement_intercept,
+            engagement_slope=engagement_slope,
+            rng=rng,
+        )
+        if return_structural_zeros:
+            return responses, structural_zeros
+        return responses
 
     if model == "PCM":
         if n_factors != 1:
@@ -537,6 +710,74 @@ def _simulate_dichotomous(
     return responses
 
 
+def _simulate_excess_zero(
+    model: str,
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    guessing: NDArray[np.float64] | None,
+    zero_inflation: NDArray[np.float64] | None,
+    engagement_intercept: NDArray[np.float64] | None,
+    engagement_slope: NDArray[np.float64] | None,
+    rng: np.random.Generator,
+) -> tuple[NDArray[np.int_], NDArray[np.bool_]]:
+    """Draw excess-zero responses and their latent structural labels."""
+    n_items = len(difficulty)
+    with np.errstate(over="ignore", invalid="ignore"):
+        linear_predictor = discrimination[None, :] * (
+            theta[:, None] - difficulty[None, :]
+        )
+        response_probability = sigmoid(linear_predictor)
+
+    if model in {"ZI-2PL", "ZI-3PL"}:
+        zero_inflation = _prepare_parameter(
+            "zero_inflation",
+            zero_inflation if zero_inflation is not None else np.full(n_items, 0.1),
+            (n_items,),
+        )
+        if np.any((zero_inflation < 0.0) | (zero_inflation >= 1.0)):
+            raise ValueError("zero_inflation values must be in [0, 1)")
+        structural_probability = np.broadcast_to(
+            zero_inflation[None, :], response_probability.shape
+        )
+        if model == "ZI-3PL":
+            guessing = _prepare_parameter(
+                "guessing",
+                guessing if guessing is not None else np.full(n_items, 0.2),
+                (n_items,),
+            )
+            if np.any((guessing < 0.0) | (guessing >= 1.0)):
+                raise ValueError("guessing values must be in [0, 1)")
+            response_probability = (
+                guessing[None, :] + (1.0 - guessing[None, :]) * response_probability
+            )
+    else:
+        engagement_intercept = _prepare_parameter(
+            "engagement_intercept",
+            engagement_intercept
+            if engagement_intercept is not None
+            else np.full(n_items, 2.0),
+            (n_items,),
+        )
+        engagement_slope = _prepare_parameter(
+            "engagement_slope",
+            engagement_slope if engagement_slope is not None else np.full(n_items, 0.5),
+            (n_items,),
+        )
+        with np.errstate(over="ignore", invalid="ignore"):
+            engagement_probability = sigmoid(
+                engagement_intercept[None, :]
+                + engagement_slope[None, :] * theta[:, None]
+            )
+        structural_probability = 1.0 - engagement_probability
+
+    marginal_probability = (1.0 - structural_probability) * response_probability
+    uniforms = rng.random(marginal_probability.shape)
+    structural_zeros = uniforms < structural_probability
+    responses = (uniforms >= 1.0 - marginal_probability).astype(np.int_)
+    return responses, structural_zeros
+
+
 def _simulate_grm(
     theta: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -762,7 +1003,7 @@ def generate_item_parameters(
     ----------
     n_items : int
         Number of items to generate parameters for.
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
+    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM", "ZI-2PL", "ZI-3PL", "HURDLE"}, default="2PL"
         IRT model type determining which parameters to generate.
     n_factors : int, default=1
         Number of latent factors for multidimensional models.
@@ -785,8 +1026,10 @@ def generate_item_parameters(
         - "steps": Category steps for PCM. Shape
           (n_items, n_categories-1).
         - "slopes" and "intercepts": Category parameters for NRM.
-        - "guessing": Lower asymptote (c) for 3PL/4PL. Shape (n_items,).
+        - "guessing": Lower asymptote (c) for 3PL/4PL/ZI-3PL. Shape (n_items,).
         - "upper": Upper asymptote (d) for 4PL. Shape (n_items,).
+        - "zero_inflation": Structural-zero probabilities for ZI models.
+        - "engagement_intercept" and "engagement_slope": HURDLE parameters.
 
     Examples
     --------
@@ -800,8 +1043,7 @@ def generate_item_parameters(
     >>> print(params['guessing'].mean())  # Average guessing parameter
     """
     model = model.upper()
-    valid_models = {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}
-    if model not in valid_models:
+    if model not in _VALID_SIMULATION_MODELS:
         raise ValueError(f"Unknown model: {model}")
     if isinstance(n_items, bool) or not isinstance(n_items, (int, np.integer)):
         raise ValueError("n_items must be a positive integer")
@@ -819,6 +1061,8 @@ def generate_item_parameters(
         raise ValueError("n_categories must be at least 2")
     if model == "PCM" and n_factors != 1:
         raise ValueError("PCM only supports one factor")
+    if model in _EXCESS_ZERO_MODELS and n_factors != 1:
+        raise ValueError(f"{model} only supports one factor")
 
     rng = np.random.default_rng(seed)
 
@@ -859,7 +1103,7 @@ def generate_item_parameters(
     else:
         params["discrimination"] = np.ones(n_items)
 
-    if model in ("1PL", "2PL", "3PL", "4PL"):
+    if model in ("1PL", "2PL", "3PL", "4PL", "ZI-2PL", "ZI-3PL", "HURDLE"):
         params["difficulty"] = rng.normal(0, 1, size=n_items)
     else:
         params["thresholds"] = np.zeros((n_items, n_categories - 1))
@@ -867,10 +1111,17 @@ def generate_item_parameters(
             base = rng.normal(0, 1)
             params["thresholds"][i] = base + np.linspace(-1.5, 1.5, n_categories - 1)
 
-    if model in ("3PL", "4PL"):
+    if model in ("3PL", "4PL", "ZI-3PL"):
         params["guessing"] = rng.uniform(0.1, 0.3, size=n_items)
 
     if model == "4PL":
         params["upper"] = rng.uniform(0.9, 1.0, size=n_items)
+
+    if model in {"ZI-2PL", "ZI-3PL"}:
+        params["zero_inflation"] = rng.uniform(0.05, 0.25, size=n_items)
+
+    if model == "HURDLE":
+        params["engagement_intercept"] = rng.normal(2.0, 0.5, size=n_items)
+        params["engagement_slope"] = rng.lognormal(np.log(0.5), 0.3, size=n_items)
 
     return params
