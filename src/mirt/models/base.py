@@ -7,6 +7,8 @@ from numpy.typing import NDArray
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
 
+_DICHOTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
+
 
 class BaseItemModel(ABC):
     model_name: str = "BaseModel"
@@ -340,6 +342,60 @@ class DichotomousItemModel(BaseItemModel):
         if item_idx is None:
             return np.sum(probs, axis=1)
         return probs
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate binary responses conditional on latent trait values.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Latent trait values with shape ``(n_persons, n_factors)``. A
+            one-dimensional array is also accepted for unidimensional models.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Binary response matrix with shape ``(n_persons, n_items)``.
+
+        Notes
+        -----
+        A fixed seed produces identical responses for every valid chunk size.
+        """
+        theta_values = self._ensure_theta_2d(theta)
+        n_persons = theta_values.shape[0]
+        if chunk_size is None:
+            chunk_size = max(
+                1,
+                min(
+                    n_persons,
+                    _DICHOTOMOUS_MAX_PROBABILITY_VALUES // self.n_items,
+                ),
+            )
+        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+            chunk_size, (int, np.integer)
+        ):
+            raise ValueError("chunk_size must be a positive integer")
+        elif chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        rng = np.random.default_rng(seed)
+        responses = np.empty((n_persons, self.n_items), dtype=np.int32)
+        for start in range(0, n_persons, int(chunk_size)):
+            stop = min(start + int(chunk_size), n_persons)
+            probabilities = self.probability(theta_values[start:stop])
+            responses[start:stop] = rng.random(probabilities.shape) < probabilities
+        return responses
 
 
 class PolytomousItemModel(BaseItemModel):
