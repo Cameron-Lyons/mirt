@@ -645,6 +645,28 @@ uv run pytest tests/test_performance_smoke.py
 uv run python benchmarks/run_benchmarks.py
 ```
 
+The benchmark runner supports warmups, individual suites, structured JSON output,
+and regression-sensitive baseline comparisons without extra dependencies:
+
+```bash
+# Record a reusable baseline for all workloads.
+uv run python benchmarks/run_benchmarks.py \
+  --repeats 5 --warmups 1 --json benchmark-baseline.json
+
+# Run only scoring and fail if its median slows by more than 10%.
+uv run python benchmarks/run_benchmarks.py \
+  --suite scoring --repeats 5 --warmups 1 \
+  --baseline benchmark-baseline.json --max-regression 10 \
+  --json benchmark-current.json
+```
+
+Reports include workload sizes, backend details, runtime versions, every timing
+sample, distribution summaries, and comparison status. Baselines with different
+item counts, person counts, or effective backends are rejected instead of producing
+misleading ratios. A detected regression returns a nonzero process status for CI use.
+The hosted performance job also publishes its structured scoring report as a retained
+build artifact, making individual revisions directly comparable.
+
 ## API Stability (v1.1)
 
 Starting with v1.0, this package follows [semantic versioning](https://semver.org/).

@@ -43,3 +43,26 @@ def test_fit_time_regression_guard() -> None:
 
     assert np.isfinite(result.log_likelihood)
     assert elapsed <= threshold_seconds
+
+
+@pytest.mark.performance
+def test_eap_scoring_time_regression_guard() -> None:
+    threshold_seconds = float(os.getenv("MIRT_SCORE_THRESHOLD_SECONDS", "4.0"))
+    rng = np.random.default_rng(321)
+    n_persons = 2_000
+    n_items = 30
+    responses = rng.integers(0, 2, size=(n_persons, n_items), dtype=np.int_)
+    model = mirt.TwoParameterLogistic(n_items=n_items)
+    model.set_parameters(
+        discrimination=rng.uniform(0.6, 1.8, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+    )
+    model._is_fitted = True
+
+    start = time.perf_counter()
+    scores = mirt.fscores(model, responses, method="EAP", n_quadpts=49)
+    elapsed = time.perf_counter() - start
+
+    assert scores.theta.shape == (n_persons,)
+    assert np.all(np.isfinite(scores.theta))
+    assert elapsed <= threshold_seconds
