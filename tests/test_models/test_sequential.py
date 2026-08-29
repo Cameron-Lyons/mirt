@@ -60,6 +60,34 @@ def test_probability_shapes_ranges_and_padding(configured_model):
     assert configured_model.probability(theta, item_idx=1).shape == (8, 5)
 
 
+def test_probability_pairs_match_itemwise_reference(configured_model, monkeypatch):
+    theta = np.array([-2.0, -1.1, -0.2, 0.4, 1.3, 2.0])
+    item_indices = np.array([0, 1, 1, 0, 1, 0])
+    expected = np.zeros((theta.size, configured_model.max_categories))
+    for row, item_idx in enumerate(item_indices):
+        probabilities = configured_model.probability(theta[row : row + 1], item_idx)
+        expected[row, : probabilities.shape[1]] = probabilities[0]
+
+    def reject_itemwise_fallback(*args, **kwargs):
+        _ = args, kwargs
+        raise AssertionError("paired evaluation must not dispatch by item")
+
+    monkeypatch.setattr(configured_model, "probability", reject_itemwise_fallback)
+    actual = configured_model.probability_pairs(theta, item_indices)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-15)
+    np.testing.assert_allclose(actual.sum(axis=1), 1.0)
+
+
+def test_probability_pairs_support_empty_input(configured_model):
+    probabilities = configured_model.probability_pairs(
+        np.empty((0, 1)),
+        np.empty(0, dtype=np.intp),
+    )
+
+    assert probabilities.shape == (0, configured_model.max_categories)
+
+
 def test_category_probability_and_curves_share_one_likelihood(configured_model):
     theta = np.array([-1.0, 0.0, 1.0])
     probabilities = configured_model.probability(theta, item_idx=1)
