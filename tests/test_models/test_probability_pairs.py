@@ -6,14 +6,20 @@ import numpy as np
 import pytest
 
 from mirt.exceptions import MirtValidationError
-from mirt.models.base import BaseItemModel
+from mirt.models.base import BaseItemModel, PolytomousItemModel
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
-from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
+from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
+    GradedRatingScaleModel,
+    GradedResponseModel,
+    NominalResponseModel,
+    RatingScaleModel,
+)
 
 
 def _configure_dichotomous(model: BaseItemModel) -> BaseItemModel:
@@ -124,6 +130,80 @@ def test_standard_pair_implementations_avoid_item_dispatch(
 
     assert result.shape[0] == len(theta)
     assert np.all(np.isfinite(result))
+
+
+@pytest.mark.parametrize(
+    ("factory", "theta"),
+    [
+        (
+            lambda: RatingScaleModel(4, 5),
+            np.array([[-2.0], [-1.1], [-0.2], [0.4], [1.3], [2.0]]),
+        ),
+        (
+            lambda: GradedRatingScaleModel(4, 5),
+            np.array([[-2.0], [-1.1], [-0.2], [0.4], [1.3], [2.0]]),
+        ),
+        (
+            lambda: NominalResponseModel(4, [2, 5, 3, 4]),
+            np.array([[-2.0], [-1.1], [-0.2], [0.4], [1.3], [2.0]]),
+        ),
+        (
+            lambda: NominalResponseModel(4, [2, 5, 3, 4], n_factors=3),
+            np.array(
+                [
+                    [-1.5, 0.2, 0.8],
+                    [-0.7, 1.0, -0.4],
+                    [0.0, -0.3, 1.2],
+                    [0.6, 0.9, -1.1],
+                    [1.4, -0.8, 0.5],
+                    [2.0, 0.4, -0.6],
+                ]
+            ),
+        ),
+    ],
+)
+def test_rating_and_nominal_pairs_use_vectorized_kernels(
+    factory: Callable[[], PolytomousItemModel],
+    theta: np.ndarray,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = factory()
+    difficulty = np.array([-1.2, -0.3, 0.6, 1.4])
+    thresholds = np.array([-1.3, -0.4, 0.5, 1.2])
+    if isinstance(model, RatingScaleModel):
+        model.set_parameters(difficulty=difficulty, thresholds=thresholds)
+    elif isinstance(model, GradedRatingScaleModel):
+        model.set_parameters(
+            discrimination=1.4,
+            difficulty=difficulty,
+            thresholds=thresholds,
+        )
+    elif isinstance(model, NominalResponseModel):
+        slopes = np.linspace(-1.2, 1.5, model.slopes.size).reshape(model.slopes.shape)
+        intercepts = np.linspace(-0.8, 0.9, model.intercepts.size).reshape(
+            model.intercepts.shape
+        )
+        model.set_parameters(slopes=slopes, intercepts=intercepts)
+
+    item_indices = np.array([3, 0, 2, 1, 3, 2])
+    expected = np.zeros((theta.shape[0], model.max_categories))
+    for row, item_idx in enumerate(item_indices):
+        probabilities = model.probability(theta[row : row + 1], int(item_idx))[0]
+        expected[row, : probabilities.size] = probabilities
+
+    def fail_item_dispatch(*args: object, **kwargs: object) -> None:
+        raise AssertionError("paired evaluation dispatched through probability()")
+
+    monkeypatch.setattr(model, "probability", fail_item_dispatch)
+    actual = model.probability_pairs(theta, item_indices)
+    empty = model.probability_pairs(
+        np.empty((0, model.n_factors)),
+        np.empty(0, dtype=np.intp),
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+    np.testing.assert_allclose(actual.sum(axis=1), 1.0)
+    assert empty.shape == (0, model.max_categories)
 
 
 @pytest.mark.parametrize(

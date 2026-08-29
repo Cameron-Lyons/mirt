@@ -705,6 +705,20 @@ class RatingScaleModel(PolytomousItemModel):
             )
         return probabilities
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item RSM category probabilities."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        increments = (
+            theta_2d[:, 0, None]
+            - self._parameters["difficulty"][indices, None]
+            - self._parameters["thresholds"][None, :]
+        )
+        return _partial_credit_probabilities(increments)
+
     def _item_information(
         self,
         theta: NDArray[np.float64],
@@ -908,6 +922,20 @@ class GradedRatingScaleModel(PolytomousItemModel):
             probabilities[:, item_indices, :] = _graded_probabilities(logits)
         return probabilities
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item GRSM category probabilities."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        logits = self._parameters["discrimination"][0] * (
+            theta_2d[:, 0, None]
+            - self._parameters["difficulty"][indices, None]
+            - self._parameters["thresholds"][None, :]
+        )
+        return _graded_probabilities(logits)
+
     def _item_information(
         self,
         theta: NDArray[np.float64],
@@ -1086,6 +1114,31 @@ class NominalResponseModel(PolytomousItemModel):
             probabilities[:, item_indices, :n_categories] = _stable_softmax(logits)
 
         return probabilities
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item NRM category probabilities."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        slopes = self._parameters["slopes"][indices]
+        intercepts = self._parameters["intercepts"][indices]
+        if self.n_factors == 1:
+            logits = theta_2d[:, 0, None] * slopes + intercepts
+        else:
+            logits = np.einsum(
+                "pf,pcf->pc",
+                theta_2d,
+                slopes,
+                optimize=True,
+            )
+            logits += intercepts
+
+        category_counts = np.asarray(self._n_categories, dtype=np.intp)[indices]
+        categories = np.arange(self.max_categories)[None, :]
+        logits = np.where(categories < category_counts[:, None], logits, -np.inf)
+        return _stable_softmax(logits)
 
     def _item_information(
         self,
