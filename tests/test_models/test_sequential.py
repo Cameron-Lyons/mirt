@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
 from mirt.models.sequential import (
     AdjacentCategoryModel,
@@ -233,6 +234,35 @@ def test_batch_log_likelihood_matches_person_likelihoods(configured_model):
     np.testing.assert_allclose(
         configured_model.log_likelihood_batch(responses, theta_grid), expected
     )
+
+
+@pytest.mark.parametrize("model_class", MODEL_CLASSES)
+def test_batch_log_likelihood_matches_itemwise_reference_with_missing(model_class):
+    rng = np.random.default_rng(20260829)
+    model = model_class(n_items=17, n_categories=[2, 3, 4, 5] * 4 + [2])
+    responses = np.column_stack(
+        [rng.integers(-1, n_categories, size=31) for n_categories in model.n_categories]
+    ).astype(np.float64)
+    responses[0, 0] = np.nan
+    responses[1, :] = np.nan
+    theta = np.linspace(-3.5, 3.5, 23)
+    probabilities = model.probability(theta)
+
+    expected = np.zeros((responses.shape[0], theta.size))
+    for item_idx in range(model.n_items):
+        observed = np.isfinite(responses[:, item_idx]) & (responses[:, item_idx] >= 0)
+        selected = probabilities[:, item_idx, :][
+            :, responses[observed, item_idx].astype(np.intp)
+        ].T
+        expected[observed] += np.log(np.clip(selected, PROB_EPSILON, 1.0))
+
+    np.testing.assert_allclose(
+        model.log_likelihood_batch(responses, theta),
+        expected,
+        rtol=1e-14,
+        atol=1e-12,
+    )
+    np.testing.assert_array_equal(expected[1], 0.0)
 
 
 @pytest.mark.parametrize(

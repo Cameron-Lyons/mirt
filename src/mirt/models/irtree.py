@@ -12,6 +12,8 @@ from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 
+_IRTREE_MAX_PROBABILITY_VALUES = 1_000_000
+
 
 @dataclass
 class TreeNode:
@@ -835,6 +837,67 @@ class IRTreeModel:
         """Compute expected response-category scores."""
         probabilities = self.probability(theta, item_idx)
         return probabilities @ np.arange(self.n_categories, dtype=np.float64)
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate ordinal responses conditional on latent trait values.
+
+        Parameters
+        ----------
+        theta : NDArray
+            Latent trait values (n_persons, n_traits) or (n_traits,).
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        NDArray
+            Integer category codes with shape (n_persons, n_items).
+
+        Notes
+        -----
+        A fixed seed produces identical responses for every valid chunk size.
+        """
+        theta_array = self._validate_theta(theta)
+        n_persons = theta_array.shape[0]
+        if chunk_size is None:
+            probability_values_per_person = self.n_items * self.n_categories
+            chunk_size = max(
+                1,
+                min(
+                    n_persons,
+                    _IRTREE_MAX_PROBABILITY_VALUES // probability_values_per_person,
+                ),
+            )
+        elif isinstance(chunk_size, bool) or not isinstance(
+            chunk_size, (int, np.integer)
+        ):
+            raise ValueError("chunk_size must be a positive integer")
+        elif chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        rng = np.random.default_rng(seed)
+        responses = np.empty((n_persons, self.n_items), dtype=np.int32)
+        for start in range(0, n_persons, int(chunk_size)):
+            stop = min(start + int(chunk_size), n_persons)
+            probabilities = self.probability(theta_array[start:stop])
+            cumulative = np.cumsum(probabilities, axis=-1)
+            cumulative[..., -1] = 1.0
+            uniforms = rng.random(probabilities.shape[:-1])
+            responses[start:stop] = np.sum(
+                uniforms[..., None] > cumulative,
+                axis=-1,
+                dtype=np.int32,
+            )
+        return responses
 
     def information(
         self,

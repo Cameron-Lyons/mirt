@@ -42,7 +42,7 @@ def test_plain_cat_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "scipy_loaded": False,
         "cat_submodules": [],
-        "export_count": 53,
+        "export_count": 54,
         "exports_visible": True,
     }
 
@@ -130,7 +130,7 @@ def test_star_import_resolves_every_public_cat_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 53,
+        "export_count": 54,
         "all_cached": True,
     }
 

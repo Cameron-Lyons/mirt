@@ -69,6 +69,9 @@ Person-score results
    scores = mirt.fscores(result, responses, method="EAP")
    lower, upper = scores.confidence_intervals()
 
+   probability_above = scores.classification_probabilities(cut_score=0.0)
+   decisions = scores.classify(cut_score=0.0, confidence=0.95)
+
    values = scores.to_array(include_se=True)
    payload = scores.to_dict()
    json_text = scores.to_json(indent=2)
@@ -81,3 +84,11 @@ portable exports. ``from_dict()`` and ``from_json()`` validate reconstructed arr
 shapes and any supplied ``n_persons`` or ``n_factors`` metadata. ``to_dataframe()``
 preserves identifiers with either supported dataframe backend. Score and uncertainty
 arrays must have identical shapes, and finite standard errors cannot be negative.
+
+``classification_probabilities()`` uses the score and its standard error to calculate
+the normal-approximation probability that ability exceeds a cut score. ``classify()``
+returns ``"above"`` or ``"below"`` only when that one-sided probability reaches the
+requested confidence; otherwise it returns ``"uncertain"``. Both methods accept a
+scalar cut or an array broadcastable to the score shape, including one cut per factor
+for multidimensional scores. Zero standard error produces a deterministic decision
+away from the cut, while infinite or unknown uncertainty does not force a decision.

@@ -371,6 +371,57 @@ class ResponseTimeModel:
             )
         return vector
 
+    def _timing_grid(
+        self,
+        values: NDArray[np.float64] | float,
+        name: str,
+        n_persons: int,
+        item_idx: int | None,
+    ) -> NDArray[np.float64]:
+        """Broadcast a timing input across the requested persons and items."""
+        try:
+            array = np.asarray(values, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=values,
+                expected="finite scalar or array",
+            ) from exc
+
+        target_shape = (
+            (n_persons,) if item_idx is not None else (n_persons, self.n_items)
+        )
+        if array.ndim == 0:
+            result = np.broadcast_to(array, target_shape)
+        elif array.shape == target_shape:
+            result = array
+        elif item_idx is None and array.shape == (n_persons,):
+            result = np.broadcast_to(array[:, None], target_shape)
+        elif item_idx is None and n_persons == 1 and array.shape == (self.n_items,):
+            result = array[None, :]
+        else:
+            expected = (
+                f"scalar or shape {target_shape}"
+                if item_idx is not None
+                else f"scalar, ({n_persons},), or {target_shape}"
+            )
+            raise MirtValidationError(
+                f"{name} must be {expected}",
+                parameter=name,
+                value=array.shape,
+                expected=expected,
+            )
+
+        if not np.all(np.isfinite(result)):
+            raise MirtValidationError(
+                f"{name} must contain only finite values",
+                parameter=name,
+                value=array,
+                expected="finite values",
+            )
+        return np.asarray(result, dtype=np.float64)
+
     @property
     def ability_speed_corr(self) -> float:
         """Correlation between population ability and speed."""
@@ -507,6 +558,98 @@ class ResponseTimeModel:
             + 0.5 / time_discrimination[None, :] ** 2
         )
         return np.exp(log_mean)
+
+    def response_time_cdf(
+        self,
+        response_time: NDArray[np.float64] | float,
+        tau: NDArray[np.float64] | float,
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return the probability of responding by a time limit.
+
+        A scalar time limit is broadcast across all persons and items. A
+        person-level vector applies one limit across that person's items, and
+        a person-by-item matrix supplies distinct limits for every response.
+        """
+        from scipy.special import ndtr
+
+        *_, time_intensity, time_discrimination, _, _ = self._validated_state()
+        tau_values = self._person_vector(tau, "tau")
+        validated_item_idx = (
+            self._validate_item_idx(item_idx) if item_idx is not None else None
+        )
+        time_values = self._timing_grid(
+            response_time,
+            "response_time",
+            tau_values.size,
+            validated_item_idx,
+        )
+        if np.any(time_values <= 0.0):
+            raise MirtValidationError(
+                "response_time must contain only positive values",
+                parameter="response_time",
+                value=response_time,
+                expected="> 0",
+            )
+
+        if validated_item_idx is not None:
+            log_mean = time_intensity[validated_item_idx] - tau_values
+            standardized = time_discrimination[validated_item_idx] * (
+                np.log(time_values) - log_mean
+            )
+        else:
+            log_mean = time_intensity[None, :] - tau_values[:, None]
+            standardized = time_discrimination[None, :] * (
+                np.log(time_values) - log_mean
+            )
+        return np.asarray(ndtr(standardized), dtype=np.float64)
+
+    def response_time_quantile(
+        self,
+        quantile: NDArray[np.float64] | float,
+        tau: NDArray[np.float64] | float,
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Return response-time quantiles on the original scale.
+
+        Quantiles may be scalar, person-level, or person-by-item and must lie
+        strictly between zero and one.
+        """
+        from scipy.special import ndtri
+
+        *_, time_intensity, time_discrimination, _, _ = self._validated_state()
+        tau_values = self._person_vector(tau, "tau")
+        validated_item_idx = (
+            self._validate_item_idx(item_idx) if item_idx is not None else None
+        )
+        quantile_values = self._timing_grid(
+            quantile,
+            "quantile",
+            tau_values.size,
+            validated_item_idx,
+        )
+        if np.any((quantile_values <= 0.0) | (quantile_values >= 1.0)):
+            raise MirtValidationError(
+                "quantile must contain values strictly between 0 and 1",
+                parameter="quantile",
+                value=quantile,
+                expected="0 < quantile < 1",
+            )
+
+        normal_quantile = ndtri(quantile_values)
+        if validated_item_idx is not None:
+            log_time = (
+                time_intensity[validated_item_idx]
+                - tau_values
+                + normal_quantile / time_discrimination[validated_item_idx]
+            )
+        else:
+            log_time = (
+                time_intensity[None, :]
+                - tau_values[:, None]
+                + normal_quantile / time_discrimination[None, :]
+            )
+        return np.asarray(np.exp(log_time), dtype=np.float64)
 
     def joint_log_likelihood(
         self,

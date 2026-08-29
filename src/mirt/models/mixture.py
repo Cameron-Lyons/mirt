@@ -19,6 +19,7 @@ _BASE_MODELS = frozenset({"1PL", "2PL", "3PL"})
 _LOG_DISCRIMINATION_BOUNDS = (float(np.log(0.01)), float(np.log(10.0)))
 _DIFFICULTY_BOUNDS = (-8.0, 8.0)
 _GUESSING_BOUNDS = (0.0, 0.5)
+_MIXTURE_MAX_SIMULATION_VALUES = 1_000_000
 
 
 class MixtureIRT(BaseItemModel):
@@ -333,6 +334,79 @@ class MixtureIRT(BaseItemModel):
             curves,
             optimize=True,
         )
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> tuple[NDArray[np.int_], NDArray[np.int_]]:
+        """Simulate response patterns with one latent class per person.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Person abilities. A one-dimensional array represents people in
+            this unidimensional model.
+        seed : int, optional
+            Random seed for reproducible class and response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the item count.
+
+        Returns
+        -------
+        tuple
+            ``(responses, true_classes)`` where responses has shape
+            ``(n_persons, n_items)`` and true_classes has shape
+            ``(n_persons,)``.
+
+        Notes
+        -----
+        Each complete response pattern uses one shared class, matching the
+        model likelihood. A fixed seed produces identical results for every
+        valid chunk size.
+        """
+        theta_values = self._ensure_theta_2d(theta).ravel()
+        discrimination, difficulty, guessing = self._stack_class_parameters()
+        n_persons = theta_values.size
+        if chunk_size is None:
+            working_values_per_person = 5 * self.n_items
+            chunk_size = max(
+                1,
+                min(
+                    n_persons,
+                    _MIXTURE_MAX_SIMULATION_VALUES // working_values_per_person,
+                ),
+            )
+        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+            chunk_size, (int, np.integer)
+        ):
+            raise ValueError("chunk_size must be a positive integer")
+        elif chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        rng = np.random.default_rng(seed)
+        true_classes = rng.choice(
+            self._n_classes,
+            size=n_persons,
+            p=self._parameters["class_proportions"],
+        )
+        responses = np.empty((n_persons, self.n_items), dtype=np.int32)
+        for start in range(0, n_persons, int(chunk_size)):
+            stop = min(start + int(chunk_size), n_persons)
+            selected_classes = true_classes[start:stop]
+            selected_discrimination = discrimination[selected_classes]
+            selected_difficulty = difficulty[selected_classes]
+            selected_guessing = guessing[selected_classes]
+            logistic = sigmoid(
+                selected_discrimination
+                * (theta_values[start:stop, None] - selected_difficulty)
+            )
+            probabilities = selected_guessing + (1.0 - selected_guessing) * logistic
+            responses[start:stop] = rng.random(probabilities.shape) < probabilities
+        return responses, true_classes
 
     def _validate_responses(self, responses: NDArray[np.int_]) -> NDArray[np.int_]:
         values = validate_responses(responses, n_items=self.n_items)

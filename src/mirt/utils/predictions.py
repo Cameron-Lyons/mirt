@@ -9,10 +9,13 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 if TYPE_CHECKING:
     from mirt.estimation.mixed import MixedEffectsFitResult
+
+
+_MIXED_PREDICTION_MAX_PROBABILITY_VALUES = 1_000_000
 
 
 @dataclass
@@ -266,6 +269,11 @@ def predict_mixed(
     new_theta: NDArray[np.float64] | None = None,
     new_covariates: NDArray[np.float64] | None = None,
     item_idx: int | None = None,
+    *,
+    integrate_uncertainty: bool = False,
+    standard_errors: ArrayLike | None = None,
+    n_quadpts: int = 21,
+    chunk_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Predict response probabilities from mixed-effects model.
 
@@ -280,6 +288,19 @@ def predict_mixed(
         person intercept and effects before response probabilities are evaluated.
     item_idx : int, optional
         Zero-based item index. Supplying an index avoids evaluating every item.
+    integrate_uncertainty : bool, optional
+        Average probabilities over Gaussian ability uncertainty instead of using
+        plug-in ability estimates. This is available for unidimensional models.
+    standard_errors : array-like, optional
+        Ability standard errors. Scalars are broadcast across people. Stored
+        predictions use ``result.theta_se`` by default; covariate predictions use
+        the square root of ``result.residual_variance``. Explicit abilities require
+        explicit standard errors.
+    n_quadpts : int, optional
+        Number of Gauss-Hermite integration points, at least 2.
+    chunk_size : int, optional
+        Maximum people evaluated per integration chunk. By default, a bounded
+        chunk size is chosen from the requested item and category dimensions.
 
     Returns
     -------
@@ -294,7 +315,29 @@ def predict_mixed(
     >>> # Predict at specific ability levels
     >>> new_theta = np.array([[-1], [0], [1]])
     >>> probs = predict_mixed(result, new_theta)
+    >>> averaged = predict_mixed(result, integrate_uncertainty=True)
     """
+    if not isinstance(integrate_uncertainty, (bool, np.bool_)):
+        raise TypeError("integrate_uncertainty must be a boolean")
+    if standard_errors is not None and not integrate_uncertainty:
+        raise ValueError("standard_errors requires integrate_uncertainty=True")
+    if integrate_uncertainty:
+        if (
+            isinstance(n_quadpts, (bool, np.bool_))
+            or not isinstance(n_quadpts, (int, np.integer))
+            or n_quadpts < 2
+        ):
+            raise ValueError("n_quadpts must be an integer of at least 2")
+        n_quadpts = int(n_quadpts)
+        if chunk_size is not None:
+            if (
+                isinstance(chunk_size, (bool, np.bool_))
+                or not isinstance(chunk_size, (int, np.integer))
+                or chunk_size < 1
+            ):
+                raise ValueError("chunk_size must be a positive integer")
+            chunk_size = int(chunk_size)
+
     model = getattr(result, "model", None)
     if model is None or not callable(getattr(model, "probability", None)):
         raise ValueError("result does not contain a fitted probability model")
@@ -355,7 +398,120 @@ def predict_mixed(
     if not np.all(np.isfinite(theta)):
         raise ValueError("ability values must contain only finite values")
 
+    if integrate_uncertainty:
+        if n_factors != 1:
+            raise ValueError(
+                "uncertainty integration is available only for unidimensional models"
+            )
+        if standard_errors is None:
+            if new_theta is not None:
+                raise ValueError(
+                    "standard_errors are required with explicit ability values"
+                )
+            if new_covariates is not None:
+                try:
+                    residual_variance = float(result.residual_variance)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "result does not contain a valid residual variance"
+                    ) from exc
+                if residual_variance < 0.0 or not np.isfinite(residual_variance):
+                    raise ValueError(
+                        "result residual variance must be finite and non-negative"
+                    )
+                uncertainty_values: ArrayLike = np.sqrt(residual_variance)
+            else:
+                uncertainty_values = getattr(result, "theta_se", None)
+                if uncertainty_values is None:
+                    raise ValueError(
+                        "result does not contain ability standard errors for integration"
+                    )
+        else:
+            uncertainty_values = standard_errors
+
+        uncertainty = np.asarray(uncertainty_values, dtype=np.float64)
+        if uncertainty.ndim == 0:
+            uncertainty = np.full(theta.shape[0], float(uncertainty))
+        elif uncertainty.ndim == 2 and uncertainty.shape[1] == 1:
+            uncertainty = uncertainty[:, 0]
+        if uncertainty.ndim != 1 or uncertainty.shape[0] != theta.shape[0]:
+            raise ValueError(
+                f"standard_errors must be scalar or contain {theta.shape[0]} values"
+            )
+        if not np.all(np.isfinite(uncertainty)) or np.any(uncertainty < 0.0):
+            raise ValueError("standard_errors must be finite and non-negative")
+        return _integrated_mixed_probabilities(
+            model,
+            theta,
+            uncertainty,
+            item_idx,
+            n_quadpts,
+            chunk_size,
+        )
+
     return np.asarray(model.probability(theta, item_idx=item_idx), dtype=np.float64)
+
+
+def _integrated_mixed_probabilities(
+    model: object,
+    theta: NDArray[np.float64],
+    standard_errors: NDArray[np.float64],
+    item_idx: int | None,
+    n_quadpts: int,
+    chunk_size: int | None,
+) -> NDArray[np.float64]:
+    """Average response probabilities over Gaussian ability uncertainty."""
+    probability = getattr(model, "probability")
+    if theta.shape[0] == 0:
+        return np.asarray(probability(theta, item_idx=item_idx), dtype=np.float64)
+
+    nodes, weights = np.polynomial.hermite.hermgauss(n_quadpts)
+    nodes *= np.sqrt(2.0)
+    weights /= np.sqrt(np.pi)
+
+    if chunk_size is None:
+        n_items = 1 if item_idx is not None else int(getattr(model, "n_items", 1))
+        category_factor = 1
+        categories = getattr(model, "n_categories", None)
+        if categories is not None:
+            category_values = np.asarray(categories)
+            category_factor = int(
+                category_values[item_idx]
+                if item_idx is not None
+                else np.max(category_values)
+            )
+        values_per_person = max(1, n_quadpts * n_items * category_factor)
+        chunk_size = max(
+            1,
+            _MIXED_PREDICTION_MAX_PROBABILITY_VALUES // values_per_person,
+        )
+
+    integrated: NDArray[np.float64] | None = None
+    for start in range(0, theta.shape[0], chunk_size):
+        stop = min(start + chunk_size, theta.shape[0])
+        expanded = (
+            theta[start:stop, 0, None]
+            + standard_errors[start:stop, None] * nodes[None, :]
+        )
+        probabilities = np.asarray(
+            probability(expanded.reshape(-1, 1), item_idx=item_idx),
+            dtype=np.float64,
+        )
+        probabilities = probabilities.reshape(
+            stop - start,
+            n_quadpts,
+            *probabilities.shape[1:],
+        )
+        averaged = np.tensordot(probabilities, weights, axes=([1], [0]))
+        if integrated is None:
+            integrated = np.empty(
+                (theta.shape[0], *averaged.shape[1:]),
+                dtype=np.float64,
+            )
+        integrated[start:stop] = averaged
+
+    assert integrated is not None
+    return integrated
 
 
 def conditional_effects(

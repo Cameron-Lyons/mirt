@@ -43,3 +43,31 @@ Pass an item index to avoid allocating the complete item matrix:
    first_item = fit.model.information(theta, item_idx=0)
 
 This path uses the same analytic formula as the all-item calculation.
+
+Find target-precision ranges
+----------------------------
+
+``information_intervals`` finds every ability range where an item or complete
+test meets a chosen Fisher-information target. The result retains disjoint
+regions, which is useful for forms with separated information peaks.
+
+.. code-block:: python
+
+   # Conditional SEM <= 0.5 requires information >= 1 / 0.5**2.
+   coverage = mirt.information_intervals(
+       fit.model,
+       min_information=1 / 0.5**2,
+       theta_range=(-4.0, 4.0),
+   )
+
+   # Restrict the calculation to the first item.
+   item_coverage = mirt.information_intervals(
+       fit.model,
+       min_information=1.0,
+       item_idx=0,
+   )
+
+Each row contains the lower and upper theta boundary for one covered interval.
+An empty ``(0, 2)`` array means the target is not reached within the requested
+range. Increase ``n_points`` when a test may have extremely narrow peaks; the
+detected boundaries are refined after the grid search.

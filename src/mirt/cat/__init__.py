@@ -96,6 +96,7 @@ _LAZY_IMPORTS = {
     "AvgSEStop": "mirt.cat.mcat_stopping",
     "MaxItemsMCATStop": "mirt.cat.mcat_stopping",
     "ThetaChangeMCATStop": "mirt.cat.mcat_stopping",
+    "CompositeClassificationStop": "mirt.cat.mcat_stopping",
     "CombinedMCATStop": "mirt.cat.mcat_stopping",
     "create_mcat_stopping_rule": "mirt.cat.mcat_stopping",
     "ExposureControl": "mirt.cat.exposure",

@@ -2,9 +2,10 @@
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose
+from numpy.testing import assert_allclose, assert_array_equal
 from scipy.special import expit, logsumexp, roots_hermite
 
+import mirt.models.mixture as mixture_module
 from mirt import MixtureIRT, fit_mixture_irt
 from mirt.models.mixture import _item_expected_objective
 
@@ -117,6 +118,107 @@ class TestMixtureIRT:
         )
 
         assert_allclose(separated_mixture.probability(theta), expected)
+
+    def test_simulation_matches_seeded_shared_class_reference(
+        self,
+        separated_mixture,
+        monkeypatch,
+    ):
+        """Seeded chunks preserve one class and its full response pattern."""
+        theta = np.linspace(-2.0, 2.0, 53)
+        reference_rng = np.random.default_rng(20260829)
+        expected_classes = reference_rng.choice(
+            separated_mixture.n_classes,
+            size=len(theta),
+            p=separated_mixture.class_proportions,
+        )
+        expected_responses = np.empty(
+            (len(theta), separated_mixture.n_items),
+            dtype=np.int32,
+        )
+        for person_idx, class_idx in enumerate(expected_classes):
+            probability = separated_mixture.class_probability(
+                theta[person_idx : person_idx + 1],
+                int(class_idx),
+            )[0]
+            expected_responses[person_idx] = (
+                reference_rng.random(separated_mixture.n_items) < probability
+            )
+        monkeypatch.setattr(
+            mixture_module,
+            "_MIXTURE_MAX_SIMULATION_VALUES",
+            4 * 5 * separated_mixture.n_items,
+        )
+
+        unchunked = separated_mixture.simulate(
+            theta,
+            seed=20260829,
+            chunk_size=len(theta),
+        )
+        chunked = separated_mixture.simulate(theta, seed=20260829, chunk_size=7)
+        automatic = separated_mixture.simulate(theta, seed=20260829)
+
+        for responses, true_classes in (unchunked, chunked, automatic):
+            assert responses.dtype == np.int32
+            assert_array_equal(responses, expected_responses)
+            assert_array_equal(true_classes, expected_classes)
+
+    def test_simulation_recovers_class_and_response_probabilities(
+        self,
+        separated_mixture,
+    ):
+        """Large samples recover both class mass and class-conditional curves."""
+        theta = np.full(60_000, 0.2)
+
+        responses, true_classes = separated_mixture.simulate(
+            theta,
+            seed=812,
+            chunk_size=991,
+        )
+        class_frequencies = np.bincount(
+            true_classes,
+            minlength=separated_mixture.n_classes,
+        ) / len(true_classes)
+
+        assert_allclose(
+            class_frequencies,
+            separated_mixture.class_proportions,
+            atol=0.005,
+        )
+        for class_idx in range(separated_mixture.n_classes):
+            expected = separated_mixture.class_probability(
+                theta[:1],
+                class_idx,
+            )[0]
+            assert_allclose(
+                responses[true_classes == class_idx].mean(axis=0),
+                expected,
+                atol=0.012,
+            )
+
+    @pytest.mark.parametrize("base_model", ["1PL", "2PL", "3PL"])
+    def test_simulation_supports_every_component_family(self, base_model):
+        """All supported class-specific item families generate binary data."""
+        model = MixtureIRT(n_items=4, n_classes=3, base_model=base_model)
+
+        responses, true_classes = model.simulate(np.array([0.1]), seed=31)
+
+        assert responses.shape == (1, 4)
+        assert true_classes.shape == (1,)
+        assert set(np.unique(responses)).issubset({0, 1})
+
+    @pytest.mark.parametrize("chunk_size", [0, -1, 1.5, True])
+    def test_simulation_rejects_invalid_chunk_sizes(
+        self,
+        separated_mixture,
+        chunk_size,
+    ):
+        """Reject chunk controls that cannot bound person batches."""
+        with pytest.raises(ValueError, match="chunk_size"):
+            separated_mixture.simulate(
+                np.array([0.0, 1.0]),
+                chunk_size=chunk_size,
+            )
 
     def test_joint_log_likelihood_preserves_shared_class(self):
         """Mix complete response-pattern likelihoods rather than each item."""

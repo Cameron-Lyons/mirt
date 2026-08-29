@@ -16,6 +16,8 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt._core import sigmoid
 
+_MFRM_MAX_PROBABILITY_VALUES = 1_000_000
+
 
 @dataclass
 class MFRMResult:
@@ -294,6 +296,32 @@ class ManyFacetRaschModel:
         facet_indices: Mapping[str, ArrayLike] | None,
     ) -> NDArray[np.float64]:
         """Validate facet assignments and return their combined severity."""
+        prepared = self._prepare_facet_indices(n_persons, facet_indices)
+        target_shape = (n_persons, self._n_items) if item_idx is None else (n_persons,)
+        effect = np.zeros(target_shape, dtype=np.float64)
+
+        for facet in self._facets:
+            indices = prepared[facet.name]
+            if indices.ndim == 0:
+                selected = self._facet_parameters[facet.name][indices]
+            elif item_idx is None and indices.ndim == 1:
+                selected = self._facet_parameters[facet.name][indices, None]
+            elif item_idx is None:
+                selected = self._facet_parameters[facet.name][indices]
+            elif indices.ndim == 1:
+                selected = self._facet_parameters[facet.name][indices]
+            else:
+                selected = self._facet_parameters[facet.name][indices[:, item_idx]]
+            effect += selected
+
+        return effect
+
+    def _prepare_facet_indices(
+        self,
+        n_persons: int,
+        facet_indices: Mapping[str, ArrayLike] | None,
+    ) -> dict[str, NDArray[np.intp]]:
+        """Validate and normalize facet assignments without broadcasting them."""
         provided = set(facet_indices or {})
         expected = set(self.facet_names)
         unknown = sorted(provided - expected)
@@ -303,10 +331,9 @@ class ManyFacetRaschModel:
         if missing:
             raise ValueError(f"Missing facet assignments: {', '.join(missing)}")
 
-        target_shape = (n_persons, self._n_items) if item_idx is None else (n_persons,)
-        effect = np.zeros(target_shape, dtype=np.float64)
+        prepared: dict[str, NDArray[np.intp]] = {}
         if not expected:
-            return effect
+            return prepared
 
         assert facet_indices is not None
         for facet in self._facets:
@@ -316,23 +343,10 @@ class ManyFacetRaschModel:
             ):
                 raise TypeError(f"facet '{facet.name}' indices must be integers")
 
-            if indices.ndim == 0:
-                prepared_indices = indices
-            elif item_idx is None and indices.shape == (n_persons,):
-                prepared_indices = indices[:, None]
-            elif item_idx is None and indices.shape == (
-                n_persons,
-                self._n_items,
-            ):
-                prepared_indices = indices
-            elif item_idx is not None and indices.shape == (n_persons,):
-                prepared_indices = indices
-            elif item_idx is not None and indices.shape == (
-                n_persons,
-                self._n_items,
-            ):
-                prepared_indices = indices[:, item_idx]
-            else:
+            if indices.ndim != 0 and indices.shape not in {
+                (n_persons,),
+                (n_persons, self._n_items),
+            }:
                 expected_shapes = (
                     f"scalar, ({n_persons},), or ({n_persons}, {self._n_items})"
                 )
@@ -341,13 +355,54 @@ class ManyFacetRaschModel:
                     f"got {indices.shape}"
                 )
 
-            if np.any((prepared_indices < 0) | (prepared_indices >= facet.n_levels)):
+            if np.any((indices < 0) | (indices >= facet.n_levels)):
                 raise IndexError(
                     f"facet '{facet.name}' index out of range [0, {facet.n_levels})"
                 )
-            effect += self._facet_parameters[facet.name][prepared_indices]
+            prepared[facet.name] = indices.astype(np.intp, copy=False)
 
-        return effect
+        return prepared
+
+    def _prepare_simulation_inputs(
+        self,
+        theta: ArrayLike,
+        facet_indices: Mapping[str, ArrayLike] | None,
+        chunk_size: int | None,
+        probability_values_per_person: int,
+    ) -> tuple[NDArray[np.float64], dict[str, NDArray[np.intp]], int]:
+        """Validate shared simulation inputs and choose a bounded chunk size."""
+        theta_values = self._prepare_theta(theta)
+        prepared_facets = self._prepare_facet_indices(
+            len(theta_values),
+            facet_indices,
+        )
+        if chunk_size is None:
+            chunk_size = max(
+                1,
+                min(
+                    len(theta_values),
+                    _MFRM_MAX_PROBABILITY_VALUES // probability_values_per_person,
+                ),
+            )
+        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+            chunk_size, (int, np.integer)
+        ):
+            raise ValueError("chunk_size must be a positive integer")
+        elif chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        return theta_values, prepared_facets, int(chunk_size)
+
+    @staticmethod
+    def _facet_chunk(
+        facet_indices: Mapping[str, NDArray[np.intp]],
+        start: int,
+        stop: int,
+    ) -> dict[str, NDArray[np.intp]]:
+        """Slice person-varying facet assignments while retaining scalars."""
+        return {
+            name: indices if indices.ndim == 0 else indices[start:stop]
+            for name, indices in facet_indices.items()
+        }
 
     def log_odds(
         self,
@@ -432,6 +487,55 @@ class ManyFacetRaschModel:
     ) -> NDArray[np.float64]:
         """Return test information summed across all items."""
         return np.sum(self.information(theta, None, facet_indices), axis=1)
+
+    def simulate(
+        self,
+        theta: ArrayLike,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
+        *,
+        seed: int | None = None,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate binary responses conditional on abilities and facets.
+
+        Parameters
+        ----------
+        theta : array-like
+            Person abilities.
+        facet_indices : mapping, optional
+            Assignment for every facet. Each value may be a scalar, a
+            person-level vector, or a person-by-item matrix.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Binary response matrix with shape ``(n_persons, n_items)``.
+
+        Notes
+        -----
+        A fixed seed produces identical responses for every valid chunk size.
+        """
+        theta_values, prepared_facets, rows_per_chunk = self._prepare_simulation_inputs(
+            theta,
+            facet_indices,
+            chunk_size,
+            self._n_items,
+        )
+        rng = np.random.default_rng(seed)
+        responses = np.empty((len(theta_values), self._n_items), dtype=np.int32)
+        for start in range(0, len(theta_values), rows_per_chunk):
+            stop = min(start + rows_per_chunk, len(theta_values))
+            probabilities = self.probability(
+                theta_values[start:stop],
+                facet_indices=self._facet_chunk(prepared_facets, start, stop),
+            )
+            responses[start:stop] = rng.random(probabilities.shape) < probabilities
+        return responses
 
     def copy(self) -> Self:
         new_model = ManyFacetRaschModel(
@@ -678,6 +782,62 @@ class PolytomousMFRM(ManyFacetRaschModel):
             probabilities * (categories - expected) ** 2,
             axis=-1,
         )
+
+    def simulate(
+        self,
+        theta: ArrayLike,
+        facet_indices: Mapping[str, ArrayLike] | None = None,
+        *,
+        seed: int | None = None,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate ordinal responses conditional on abilities and facets.
+
+        Parameters
+        ----------
+        theta : array-like
+            Person abilities.
+        facet_indices : mapping, optional
+            Assignment for every facet. Each value may be a scalar, a
+            person-level vector, or a person-by-item matrix.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Integer category codes with shape ``(n_persons, n_items)``.
+
+        Notes
+        -----
+        A fixed seed produces identical responses for every valid chunk size.
+        """
+        theta_values, prepared_facets, rows_per_chunk = self._prepare_simulation_inputs(
+            theta,
+            facet_indices,
+            chunk_size,
+            self._n_items * self._n_categories,
+        )
+        rng = np.random.default_rng(seed)
+        responses = np.empty((len(theta_values), self._n_items), dtype=np.int32)
+        for start in range(0, len(theta_values), rows_per_chunk):
+            stop = min(start + rows_per_chunk, len(theta_values))
+            probabilities = self.probability(
+                theta_values[start:stop],
+                facet_indices=self._facet_chunk(prepared_facets, start, stop),
+            )
+            cumulative = np.cumsum(probabilities, axis=-1)
+            cumulative[..., -1] = 1.0
+            uniforms = rng.random(probabilities.shape[:-1])
+            responses[start:stop] = np.sum(
+                uniforms[..., None] > cumulative,
+                axis=-1,
+                dtype=np.int32,
+            )
+        return responses
 
     def copy(self) -> Self:
         new_model = PolytomousMFRM(

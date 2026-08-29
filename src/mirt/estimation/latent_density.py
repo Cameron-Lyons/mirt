@@ -807,6 +807,111 @@ class MixtureDensity(LatentDensity):
         points = _as_univariate_points(theta)
         return logsumexp(self._component_log_density(points), axis=1)
 
+    def _component_probabilities(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return normalized component probabilities for validated points."""
+        log_components = self._component_log_density(theta)
+        log_marginal = logsumexp(log_components, axis=1, keepdims=True)
+        return np.exp(log_components - log_marginal)
+
+    def component_probabilities(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return conditional component probabilities at each latent value.
+
+        The result has shape ``(n_points, n_components)`` and each row sums
+        to one. Evaluation remains stable in remote tails and for components
+        with zero prior weight.
+        """
+        points = _as_univariate_points(theta)
+        return self._component_probabilities(points)
+
+    def classify(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.int_]:
+        """Return the most probable component index for each latent value."""
+        return np.argmax(self.component_probabilities(theta), axis=1).astype(
+            np.int_, copy=False
+        )
+
+    def cdf(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Evaluate the cumulative mixture distribution at latent values."""
+        points = _as_univariate_points(theta)
+        standardized = (points[:, None] - self.means[None, :]) / np.sqrt(
+            self.variances[None, :]
+        )
+        return stats.norm.cdf(standardized) @ self.weights
+
+    @property
+    def mean(self) -> float:
+        """Return the analytic mixture mean."""
+        return float(self.weights @ self.means)
+
+    @property
+    def variance(self) -> float:
+        """Return the analytic mixture variance."""
+        second_moment = float(self.weights @ (self.variances + self.means**2))
+        return max(second_moment - self.mean**2, 0.0)
+
+    @property
+    def standard_deviation(self) -> float:
+        """Return the analytic mixture standard deviation."""
+        return float(np.sqrt(self.variance))
+
+    def sample(
+        self,
+        n_samples: int,
+        random_state: int | np.random.Generator | None = None,
+        *,
+        return_components: bool = False,
+    ) -> NDArray[np.float64] | tuple[NDArray[np.float64], NDArray[np.int_]]:
+        """Draw reproducible latent values from the fitted mixture.
+
+        Parameters
+        ----------
+        n_samples : int
+            Number of draws. Zero returns empty arrays.
+        random_state : int, Generator, or None
+            Seed or existing NumPy generator.
+        return_components : bool, default=False
+            Also return the generating component index for each draw.
+        """
+        sample_count = _validate_count(
+            n_samples,
+            name="n_samples",
+            allow_zero=True,
+        )
+        if not isinstance(return_components, (bool, np.bool_)):
+            raise TypeError("return_components must be a boolean")
+        if isinstance(random_state, np.random.Generator):
+            rng = random_state
+        elif random_state is None or (
+            isinstance(random_state, Integral)
+            and not isinstance(random_state, (bool, np.bool_))
+        ):
+            rng = np.random.default_rng(
+                None if random_state is None else int(random_state)
+            )
+        else:
+            raise TypeError("random_state must be an integer, Generator, or None")
+
+        components = rng.choice(
+            self.n_components,
+            size=sample_count,
+            p=self.weights,
+        ).astype(np.int_, copy=False)
+        samples = rng.normal(
+            loc=self.means[components],
+            scale=np.sqrt(self.variances[components]),
+        ).astype(np.float64, copy=False)
+        if return_components:
+            return samples, components
+        return samples
+
     def update(
         self,
         theta_points: NDArray[np.float64],
@@ -816,15 +921,8 @@ class MixtureDensity(LatentDensity):
         theta = _as_univariate_points(theta_points, name="theta_points")
         normalized_weights = _normalize_weights(weights, n_points=len(theta))
 
-        log_components = self._component_log_density(theta)
-        log_responsibilities = log_components - logsumexp(
-            log_components,
-            axis=1,
-            keepdims=True,
-        )
-        weighted_responsibilities = (
-            np.exp(log_responsibilities) * normalized_weights[:, None]
-        )
+        responsibilities = self._component_probabilities(theta)
+        weighted_responsibilities = responsibilities * normalized_weights[:, None]
         component_mass = weighted_responsibilities.sum(axis=0)
         active = component_mass > PROB_EPSILON
 

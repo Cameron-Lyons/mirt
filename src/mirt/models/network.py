@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Self
+from typing import Literal, Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -196,6 +196,7 @@ class IsingModel:
         self._converged = False
         self._objective_history: list[float] = []
         self._log_partition_cache: float | None = None
+        self._exact_cdf_cache: FloatArray | None = None
 
     @property
     def n_nodes(self) -> int:
@@ -243,6 +244,7 @@ class IsingModel:
             )
         self._thresholds = values.copy()
         self._log_partition_cache = None
+        self._exact_cdf_cache = None
         return self
 
     def set_interactions(self, interactions: NDArray[np.float64]) -> Self:
@@ -262,6 +264,7 @@ class IsingModel:
         np.fill_diagonal(values, 0.0)
         self._interactions = values
         self._log_partition_cache = None
+        self._exact_cdf_cache = None
         return self
 
     def _linear_predictors(self, responses: IntArray) -> FloatArray:
@@ -291,6 +294,42 @@ class IsingModel:
         log_terms = values * linear - np.logaddexp(0.0, linear)
         return float(np.sum(log_terms) / values.shape[0])
 
+    def _validate_exact_enumeration(self, max_nodes: int) -> None:
+        """Reject exact enumeration beyond the caller's explicit limit."""
+
+        if self._n_nodes > max_nodes:
+            raise MirtValidationError(
+                f"Exact enumeration requires {2**self._n_nodes:,} states",
+                parameter="max_nodes",
+                value=max_nodes,
+                expected=f">= {self._n_nodes}",
+            )
+
+    def _exact_state_energies(self) -> FloatArray:
+        """Return unnormalized log probabilities for every binary state."""
+
+        state_ids = np.arange(2**self._n_nodes, dtype=np.uint64)[:, None]
+        bit_positions = np.arange(self._n_nodes, dtype=np.uint64)
+        states = ((state_ids >> bit_positions) & 1).astype(np.float64)
+        return states @ self._thresholds + 0.5 * np.einsum(
+            "bi,ij,bj->b", states, self._interactions, states, optimize=True
+        )
+
+    def _exact_state_cdf(self) -> FloatArray:
+        """Return a cached cumulative distribution over binary state IDs."""
+
+        if self._exact_cdf_cache is None:
+            energies = self._exact_state_energies()
+            if self._log_partition_cache is None:
+                self._log_partition_cache = float(np.logaddexp.reduce(energies))
+            probabilities = np.exp(energies - self._log_partition_cache)
+            cumulative = np.cumsum(probabilities, dtype=np.float64)
+            cumulative /= cumulative[-1]
+            cumulative[-1] = 1.0
+            cumulative.setflags(write=False)
+            self._exact_cdf_cache = cumulative
+        return self._exact_cdf_cache
+
     def log_partition_function(self, max_nodes: int = 16) -> float:
         """Compute the exact log partition function for a small network.
 
@@ -300,22 +339,11 @@ class IsingModel:
         """
 
         max_nodes = _validate_count("max_nodes", max_nodes, allow_zero=False)
-        if self._n_nodes > max_nodes:
-            raise MirtValidationError(
-                f"Exact enumeration requires {2**self._n_nodes:,} states",
-                parameter="max_nodes",
-                value=max_nodes,
-                expected=f">= {self._n_nodes}",
-            )
+        self._validate_exact_enumeration(max_nodes)
         if self._log_partition_cache is not None:
             return self._log_partition_cache
 
-        state_ids = np.arange(2**self._n_nodes, dtype=np.uint64)[:, None]
-        bit_positions = np.arange(self._n_nodes, dtype=np.uint64)
-        states = ((state_ids >> bit_positions) & 1).astype(np.float64)
-        energies = states @ self._thresholds + 0.5 * np.einsum(
-            "bi,ij,bj->b", states, self._interactions, states, optimize=True
-        )
+        energies = self._exact_state_energies()
         self._log_partition_cache = float(np.logaddexp.reduce(energies))
         return self._log_partition_cache
 
@@ -349,17 +377,44 @@ class IsingModel:
         n_burnin: int = 1000,
         seed: int | None = None,
         thin: int = 1,
+        *,
+        method: Literal["gibbs", "exact"] = "gibbs",
+        max_nodes: int = 16,
     ) -> IntArray:
-        """Generate Gibbs samples, optionally retaining every ``thin`` sweep."""
+        """Generate binary network samples.
+
+        Gibbs sampling supports burn-in and thinning for networks of any size.
+        Exact sampling draws independent states and is guarded by ``max_nodes``
+        because its setup cost doubles with every node.
+        """
 
         n_samples = _validate_count("n_samples", n_samples, allow_zero=True)
         n_burnin = _validate_count("n_burnin", n_burnin, allow_zero=True)
         thin = _validate_count("thin", thin, allow_zero=False)
+        max_nodes = _validate_count("max_nodes", max_nodes, allow_zero=False)
+        if method not in {"gibbs", "exact"}:
+            raise MirtValidationError(
+                "method must be 'gibbs' or 'exact'",
+                parameter="method",
+                value=method,
+            )
+        if method == "exact":
+            self._validate_exact_enumeration(max_nodes)
+
         samples = np.zeros((n_samples, self._n_nodes), dtype=np.int64)
         if n_samples == 0:
             return samples
 
         rng = np.random.default_rng(seed)
+        if method == "exact":
+            state_ids = np.searchsorted(
+                self._exact_state_cdf(),
+                rng.random(n_samples),
+                side="right",
+            ).astype(np.uint64, copy=False)
+            bit_positions = np.arange(self._n_nodes, dtype=np.uint64)
+            return ((state_ids[:, None] >> bit_positions) & 1).astype(np.int64)
+
         current = rng.binomial(1, 0.5, self._n_nodes).astype(np.int64)
         linear = self._thresholds + self._interactions @ current
         sample_idx = 0
@@ -406,6 +461,9 @@ class IsingModel:
         copied._converged = self._converged
         copied._objective_history = self._objective_history.copy()
         copied._log_partition_cache = self._log_partition_cache
+        if self._exact_cdf_cache is not None:
+            copied._exact_cdf_cache = self._exact_cdf_cache.copy()
+            copied._exact_cdf_cache.setflags(write=False)
         return copied
 
 

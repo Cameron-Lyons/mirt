@@ -192,6 +192,66 @@ def test_ising_sampling_supports_thinning_and_empty_output() -> None:
             action()
 
 
+def test_exact_ising_sampling_matches_joint_distribution() -> None:
+    model = IsingModel(3)
+    model.set_thresholds(np.array([0.5, -0.3, 0.2]))
+    model.set_interactions(
+        np.array([[0.0, 0.8, -0.4], [0.8, 0.0, 0.6], [-0.4, 0.6, 0.0]])
+    )
+    state_ids = np.arange(8)[:, None]
+    states = ((state_ids >> np.arange(3)) & 1).astype(int)
+    expected = model.probability(states)
+
+    draws = model.sample(200_000, method="exact", seed=42)
+    observed_ids = np.sum(draws * (1 << np.arange(3)), axis=1)
+    observed = np.bincount(observed_ids, minlength=8) / len(draws)
+
+    np.testing.assert_allclose(observed, expected, atol=0.003)
+    np.testing.assert_array_equal(
+        draws,
+        model.sample(200_000, method="exact", seed=42),
+    )
+
+
+def test_exact_ising_sampling_reuses_and_invalidates_distribution() -> None:
+    model = IsingModel(4)
+
+    with patch.object(np, "einsum", wraps=np.einsum) as einsum:
+        first = model.sample(20, method="exact", seed=1)
+        second = model.sample(20, method="exact", seed=2)
+        assert einsum.call_count == 1
+
+        model.set_thresholds(np.full(4, 0.25))
+        updated = model.sample(20, method="exact", seed=1)
+        assert einsum.call_count == 2
+
+    assert not np.array_equal(first, second)
+    assert not np.array_equal(first, updated)
+
+
+def test_exact_ising_sampling_validates_method_and_enumeration_limit() -> None:
+    model = IsingModel(4)
+
+    with pytest.raises(MirtValidationError, match="method"):
+        model.sample(1, method="unknown")  # type: ignore[arg-type]
+    with pytest.raises(MirtValidationError, match="Exact enumeration"):
+        model.sample(1, method="exact", max_nodes=3)
+    with pytest.raises(MirtValidationError, match="max_nodes"):
+        model.sample(1, method="exact", max_nodes=0)
+
+
+def test_ising_copy_preserves_exact_distribution_cache() -> None:
+    model = IsingModel(3)
+    expected = model.sample(50, method="exact", seed=8)
+    copied = model.copy()
+
+    with patch.object(np, "einsum", wraps=np.einsum) as einsum:
+        actual = copied.sample(50, method="exact", seed=8)
+
+    np.testing.assert_array_equal(actual, expected)
+    assert einsum.call_count == 0
+
+
 def test_gaussian_conditionals_accept_full_or_reduced_rows() -> None:
     model = GaussianGraphicalModel(3)
     model.set_means(np.array([1.0, 2.0, 3.0]))
