@@ -71,9 +71,19 @@ state enumeration.
 
 Exact enumeration is guarded at 16 nodes by default because its cost doubles
 with each additional node. Set ``max_nodes`` explicitly only when that cost is
-acceptable.
+acceptable. The same enumerated distribution can produce independent samples,
+which avoids burn-in and autocorrelation for small networks.
 
-Gibbs sampling supports burn-in and thinning.
+.. code-block:: python
+
+   independent_draws = small.sample(
+       n_samples=2_000,
+       method="exact",
+       seed=42,
+   )
+
+Gibbs sampling remains the default and supports burn-in and thinning for
+larger networks.
 
 .. code-block:: python
 
