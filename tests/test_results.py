@@ -262,6 +262,76 @@ def test_score_confidence_intervals_for_multiple_factors() -> None:
         result.confidence_intervals(0.0)
 
 
+def test_score_classification_probabilities_match_normal_approximation() -> None:
+    result = ScoreResult(
+        theta=np.array([-1.0, 0.0, 1.0]),
+        standard_error=np.ones(3),
+        method="EAP",
+    )
+
+    probabilities = result.classification_probabilities(cut_score=0.0)
+
+    assert probabilities.shape == result.theta.shape
+    assert np.allclose(probabilities, [0.1586552539, 0.5, 0.8413447461])
+    assert np.array_equal(
+        result.classify(cut_score=0.0, confidence=0.8),
+        ["below", "uncertain", "above"],
+    )
+
+
+def test_score_classification_broadcasts_factor_specific_cuts() -> None:
+    result = ScoreResult(
+        theta=np.array([[-1.0, 2.0], [1.0, 0.0], [0.0, 1.0]]),
+        standard_error=np.zeros((3, 2)),
+        method="ML",
+    )
+
+    probabilities = result.classification_probabilities([0.0, 1.0])
+
+    assert np.array_equal(probabilities, [[0.0, 1.0], [1.0, 0.0], [0.5, 0.5]])
+    assert np.array_equal(
+        result.classify([0.0, 1.0]),
+        [
+            ["below", "above"],
+            ["above", "below"],
+            ["uncertain", "uncertain"],
+        ],
+    )
+
+
+def test_score_classification_handles_unbounded_and_unknown_uncertainty() -> None:
+    result = ScoreResult(
+        theta=np.array([-1.0, 1.0, np.nan, 1.0]),
+        standard_error=np.array([np.inf, np.inf, 0.2, np.nan]),
+        method="MAP",
+    )
+
+    probabilities = result.classification_probabilities()
+
+    assert np.array_equal(probabilities[:2], [0.5, 0.5])
+    assert np.isnan(probabilities[2:]).all()
+    assert np.array_equal(result.classify(), ["uncertain"] * 4)
+
+
+@pytest.mark.parametrize(
+    "cut_score",
+    [True, np.nan, np.inf, "invalid", "0.0", [0.0, 1.0]],
+)
+def test_score_classification_validates_cut_scores(cut_score: Any) -> None:
+    result = ScoreResult(np.zeros(3), np.ones(3), "EAP")
+
+    with pytest.raises(MirtValidationError, match="cut_score"):
+        result.classification_probabilities(cut_score)
+
+
+@pytest.mark.parametrize("confidence", [True, 0.5, 1.0, np.nan, "invalid", "0.95"])
+def test_score_classification_validates_confidence(confidence: Any) -> None:
+    result = ScoreResult(np.zeros(2), np.ones(2), "EAP")
+
+    with pytest.raises(MirtValidationError, match="0.5 < confidence < 1"):
+        result.classify(confidence=confidence)
+
+
 def test_score_dataframe_accepts_numpy_person_ids() -> None:
     result = ScoreResult(
         np.array([0.0, 1.0]),
