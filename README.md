@@ -468,7 +468,7 @@ plot_person_item_map(result.model, scores.theta)
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
 | `posterior_summary()` | Summarize sampled parameter uncertainty |
-| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
+| `sample_expected_scores()` | Propagate parameter uncertainty to test, subtest, or item scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
 | `predict_mixed()` | Response probabilities from abilities or person covariates |
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |

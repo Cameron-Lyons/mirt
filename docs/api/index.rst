@@ -215,6 +215,10 @@ Utils
    combine_plausible_values
    plausible_value_regression
    plausible_value_statistics
+   draw_parameters
+   posterior_summary
+   sample_expected_scores
+   ParameterSamples
 
 Exceptions
 ----------
