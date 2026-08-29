@@ -83,6 +83,7 @@ Estimation
    EMEstimator
    MHRMEstimator
    GibbsSampler
+   MCMCResult
    BLEstimator
    ResponseTimeGibbsSampler
    IRTreeEMEstimator
