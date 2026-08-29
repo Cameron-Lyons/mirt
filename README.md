@@ -127,6 +127,12 @@ nrm_data = mirt.simdata(
     model="NRM", n_persons=500, n_items=10, n_categories=4,
     n_factors=2, **nrm_params
 )
+
+zi_params = mirt.generate_item_parameters(n_items=20, model="ZI-2PL", seed=42)
+zi_data, structural_zeros = mirt.simdata(
+    model="ZI-2PL", n_persons=500, n_items=20,
+    return_structural_zeros=True, **zi_params, seed=43
+)
 ```
 
 ### Fitting Models
