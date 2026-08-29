@@ -54,6 +54,7 @@ EXPECTED_EXPORTS = (
     "cat_select_max_info",
     "cat_eap_update",
     "cat_simulate_batch",
+    "cat_simulate_batch_full",
     "cat_conditional_mse",
     "lord_wingersky_recursion",
     "lord_wingersky_polytomous",
@@ -130,7 +131,7 @@ def test_plain_backend_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "native_loaded": False,
         "backend_submodules": [],
-        "export_count": 76,
+        "export_count": 77,
         "exports_visible": True,
     }
 
@@ -220,7 +221,7 @@ def test_star_import_resolves_every_public_backend_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 76,
+        "export_count": 77,
         "all_cached": True,
     }
 

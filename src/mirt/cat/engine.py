@@ -12,7 +12,7 @@ from mirt._rust_backend import (
     cat_conditional_mse as rust_cat_conditional_mse,
 )
 from mirt._rust_backend import (
-    cat_simulate_batch as rust_cat_simulate_batch,
+    cat_simulate_batch_full as rust_cat_simulate_batch_full,
 )
 from mirt.cat._engine_common import (
     configure_content_constraint,
@@ -26,9 +26,10 @@ from mirt.cat._engine_common import (
     run_simulation_loop,
     score_administered_responses,
 )
-from mirt.cat.content import ContentConstraint
+from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
+    NoExposureControl,
     ProgressiveRestricted,
     Randomesque,
 )
@@ -49,6 +50,31 @@ from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+
+def _validate_batch_controls(
+    true_thetas: NDArray[np.float64] | list[float],
+    n_replications: int,
+    use_rust: bool,
+) -> tuple[NDArray[np.float64], int, bool]:
+    """Validate controls shared by unidimensional batch diagnostics."""
+    try:
+        thetas = np.asarray(true_thetas, dtype=np.float64).ravel()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("true_thetas must contain numeric values") from exc
+    if thetas.size == 0:
+        raise ValueError("true_thetas must be non-empty")
+    if not np.all(np.isfinite(thetas)):
+        raise ValueError("true_thetas must contain only finite values")
+    if (
+        isinstance(n_replications, (bool, np.bool_))
+        or not isinstance(n_replications, (int, np.integer))
+        or n_replications < 1
+    ):
+        raise ValueError("n_replications must be a positive integer")
+    if not isinstance(use_rust, (bool, np.bool_)):
+        raise ValueError("use_rust must be boolean")
+    return np.ascontiguousarray(thetas), int(n_replications), bool(use_rust)
 
 
 class CATEngine:
@@ -449,14 +475,18 @@ class CATEngine:
             Number of replications per theta value. Default is 1.
         use_rust : bool, optional
             Use Rust backend for parallel simulation if available. Default is True.
-            Only works with 2PL models using MFI selection.
+            Available for matching 1PL/2PL, EAP, MFI, and SE-stop configurations.
 
         Returns
         -------
         list[CATResult]
             List of CAT results for all simulations.
         """
-        thetas = np.asarray(true_thetas).ravel()
+        thetas, n_replications, use_rust = _validate_batch_controls(
+            true_thetas,
+            n_replications,
+            use_rust,
+        )
 
         can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
 
@@ -475,6 +505,14 @@ class CATEngine:
         """Check if Rust simulation can be used."""
         if not isinstance(self._selection, MaxFisherInformation):
             return False
+        if self.scoring_method != "EAP" or self.initial_theta != 0.0:
+            return False
+        if not isinstance(self._exposure, NoExposureControl) or not isinstance(
+            self._content, NoContentConstraint
+        ):
+            return False
+        if getattr(self.model, "model_name", None) not in {"1PL", "2PL"}:
+            return False
 
         params = self.model.parameters
         if "discrimination" not in params or "difficulty" not in params:
@@ -487,7 +525,7 @@ class CATEngine:
         if disc.ndim != 1:
             return False
 
-        return True
+        return self._native_stopping_parameters() is not None
 
     def _get_quadrature(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Get quadrature points and weights."""
@@ -496,20 +534,39 @@ class CATEngine:
         quad = GaussHermiteQuadrature(self.n_quadpts, n_dimensions=1)
         return quad.nodes.ravel(), quad.weights.ravel()
 
-    def _get_stopping_parameters(self) -> tuple[float, int, int]:
-        """Get stop-rule parameters used by Rust simulation helpers."""
-        se_threshold = 0.3
+    def _native_stopping_parameters(self) -> tuple[float, int, int] | None:
+        """Translate supported stopping rules into native controls."""
+        if isinstance(self._stopping, CombinedStop):
+            if self._stopping.operator != "or":
+                return None
+            rules = self._stopping.rules
+            min_items = self._stopping.min_items
+        else:
+            rules = [self._stopping]
+            min_items = 1
+
+        se_threshold: float | None = None
         max_items = self.model.n_items
-        min_items = 1
+        for rule in rules:
+            if isinstance(rule, StandardErrorStop):
+                if se_threshold is not None:
+                    return None
+                se_threshold = float(rule.threshold)
+            elif isinstance(rule, MaxItemsStop):
+                max_items = min(max_items, int(rule.max_items))
+            else:
+                return None
 
-        if hasattr(self._stopping, "threshold"):
-            se_threshold = float(self._stopping.threshold)
-        if hasattr(self._stopping, "max_items"):
-            max_items = int(self._stopping.max_items)
-        if hasattr(self._stopping, "min_items"):
-            min_items = int(self._stopping.min_items)
-
+        if se_threshold is None or min_items < 1 or min_items > max_items:
+            return None
         return se_threshold, max_items, min_items
+
+    def _get_stopping_parameters(self) -> tuple[float, int, int]:
+        """Return native stopping controls after eligibility is established."""
+        parameters = self._native_stopping_parameters()
+        if parameters is None:
+            raise RuntimeError("stopping rules are not supported by native simulation")
+        return parameters
 
     def _resolve_seed(self) -> int:
         """Resolve a deterministic seed value for Rust calls."""
@@ -530,7 +587,7 @@ class CATEngine:
         quad_points, quad_weights = self._get_quadrature()
         se_threshold, max_items, min_items = self._get_stopping_parameters()
         seed = self._resolve_seed()
-        result = rust_cat_simulate_batch(
+        result = rust_cat_simulate_batch_full(
             true_thetas,
             disc,
             diff,
@@ -551,20 +608,27 @@ class CATEngine:
                     results.append(res)
             return results
 
-        theta_est, se_est, n_items, _ = result
+        theta_est, se_est, n_items, _, item_paths, response_paths = result
 
         results = []
         for i in range(len(theta_est)):
+            count = int(n_items[i])
+            items = np.asarray(item_paths[i, :count], dtype=np.int_).tolist()
+            responses = np.asarray(response_paths[i, :count], dtype=np.int_)
+            if se_est[i] <= se_threshold and count >= min_items:
+                stopping_reason = f"SE threshold reached (SE <= {se_threshold})"
+            elif count >= max_items:
+                stopping_reason = f"Maximum items reached ({max_items})"
+            else:
+                stopping_reason = "Item bank exhausted"
             results.append(
                 CATResult(
                     theta=float(theta_est[i]),
                     standard_error=float(se_est[i]),
-                    items_administered=[],
-                    responses=np.array([], dtype=np.int_),
-                    n_items_administered=int(n_items[i]),
-                    stopping_reason="SE threshold reached"
-                    if se_est[i] <= se_threshold
-                    else "Max items reached",
+                    items_administered=items,
+                    responses=responses,
+                    n_items_administered=count,
+                    stopping_reason=stopping_reason,
                     theta_history=[],
                     se_history=[],
                     item_info_history=[],
@@ -594,13 +658,18 @@ class CATEngine:
             Number of replications per theta. Default is 100.
         use_rust : bool, optional
             Use Rust backend for parallel computation if available. Default is True.
+            Available for matching 1PL/2PL, EAP, MFI, and SE-stop configurations.
 
         Returns
         -------
         tuple[NDArray, NDArray, NDArray, NDArray]
             Tuple of (thetas, biases, MSEs, avg_items).
         """
-        thetas = np.asarray(true_thetas).ravel()
+        thetas, n_replications, use_rust = _validate_batch_controls(
+            true_thetas,
+            n_replications,
+            use_rust,
+        )
 
         can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
 

@@ -24,6 +24,29 @@ Quick start
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
 
+Batch simulation
+----------------
+
+Use ``run_batch_simulation`` for recovery studies across ability levels and
+replications:
+
+.. code-block:: python
+
+   import numpy as np
+
+   ability_grid = np.linspace(-3.0, 3.0, 25)
+   simulations = engine.run_batch_simulation(
+       ability_grid,
+       n_replications=100,
+   )
+
+The native parallel path is selected automatically for unidimensional 1PL/2PL
+models using EAP scoring, MFI selection, SE stopping with an optional maximum
+length, and no content or exposure constraints. Other configurations retain the
+general Python implementation so their operational semantics are preserved.
+Native results include the exact administered item and response sequences, making
+them fully compatible with ``CATResult`` serialization and downstream audits.
+
 Portable results
 ----------------
 

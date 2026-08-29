@@ -5,8 +5,10 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from mirt.backends.rust import is_rust_available
 from mirt.cat.engine import CATEngine
 from mirt.cat.selection import MaxFisherInformation, RandomSelection
+from mirt.cat.stopping import ThetaChangeStop
 
 
 class TestCATEngineInitialization:
@@ -347,6 +349,102 @@ class TestCATEngineSimulation:
         assert len(results) == 3
         for result in results:
             assert result.n_items_administered <= 5
+
+    def test_native_batch_reconstructs_complete_results(
+        self,
+        fitted_2pl_model,
+        monkeypatch,
+    ):
+        """Native summaries retain exact administered item and response paths."""
+        model = fitted_2pl_model.model
+        cat = CATEngine(
+            model,
+            se_threshold=0.45,
+            min_items=2,
+            max_items=3,
+            seed=42,
+        )
+        payload = (
+            np.array([0.1, 0.2]),
+            np.array([0.5, 0.3]),
+            np.array([3, 2], dtype=np.int32),
+            np.array([-1.0, 1.0]),
+            np.array([[4, 1, 3], [2, 0, -1]], dtype=np.int32),
+            np.array([[1, 0, 1], [0, 1, -1]], dtype=np.int32),
+        )
+        monkeypatch.setattr("mirt.cat.engine.should_use_rust", lambda value: True)
+        monkeypatch.setattr(
+            "mirt.cat.engine.rust_cat_simulate_batch_full",
+            lambda *args: payload,
+        )
+
+        results = cat.run_batch_simulation([-1.0, 1.0], use_rust=True)
+
+        assert cat._get_stopping_parameters() == (0.45, 3, 2)
+        assert [result.items_administered for result in results] == [[4, 1, 3], [2, 0]]
+        assert [result.responses.tolist() for result in results] == [[1, 0, 1], [0, 1]]
+        assert [result.n_items_administered for result in results] == [3, 2]
+        assert results[0].stopping_reason == "Maximum items reached (3)"
+        assert results[1].stopping_reason == "SE threshold reached (SE <= 0.45)"
+
+    def test_native_batch_requires_matching_engine_semantics(self, fitted_2pl_model):
+        """Unsupported selection, scoring, start, and stopping rules use Python."""
+        model = fitted_2pl_model.model
+
+        assert not CATEngine(model, scoring_method="MAP")._can_use_rust_simulation()
+        assert not CATEngine(model, initial_theta=0.5)._can_use_rust_simulation()
+        assert not CATEngine(model, item_selection="random")._can_use_rust_simulation()
+        assert not CATEngine(
+            model,
+            stopping_rule=ThetaChangeStop(),
+        )._can_use_rust_simulation()
+
+    @pytest.mark.parametrize(
+        ("arguments", "message"),
+        [
+            ({"true_thetas": []}, "non-empty"),
+            ({"true_thetas": [np.nan]}, "finite"),
+            ({"true_thetas": ["bad"]}, "numeric"),
+            ({"n_replications": 0}, "positive integer"),
+            ({"n_replications": True}, "positive integer"),
+            ({"use_rust": "yes"}, "boolean"),
+        ],
+    )
+    def test_batch_simulation_validates_controls(
+        self,
+        fitted_2pl_model,
+        arguments,
+        message,
+    ):
+        """Batch controls fail consistently before backend selection."""
+        cat = CATEngine(fitted_2pl_model.model, max_items=3)
+        defaults = {"true_thetas": [0.0], "n_replications": 1, "use_rust": False}
+        defaults.update(arguments)
+
+        with pytest.raises(ValueError, match=message):
+            cat.run_batch_simulation(**defaults)
+
+    def test_installed_native_batch_returns_complete_results(self, fitted_2pl_model):
+        """The installed native extension satisfies portable result invariants."""
+        if not is_rust_available():
+            pytest.skip("native backend is not installed")
+        cat = CATEngine(
+            fitted_2pl_model.model,
+            se_threshold=0.4,
+            min_items=2,
+            max_items=5,
+            seed=71,
+        )
+
+        results = cat.run_batch_simulation([-1.0, 0.0, 1.0], use_rust=True)
+
+        assert len(results) == 3
+        for result in results:
+            assert 2 <= result.n_items_administered <= 5
+            assert len(result.items_administered) == result.n_items_administered
+            assert len(result.responses) == result.n_items_administered
+            assert len(set(result.items_administered)) == result.n_items_administered
+            assert np.isin(result.responses, [0, 1]).all()
 
     @pytest.mark.slow
     def test_batch_simulation_many_examinees(self, fitted_2pl_model):
