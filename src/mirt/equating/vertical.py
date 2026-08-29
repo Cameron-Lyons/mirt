@@ -342,7 +342,7 @@ def vertical_scale_summary(result: VerticalScaleResult) -> str:
     )
 
     labels = list(result.grade_means.keys())
-    for i, (label, growth) in enumerate(zip(labels, result.growth_curve)):
+    for i, (label, growth) in enumerate(zip(labels, result.growth_curve, strict=True)):
         lines.append(f"  {label}: {growth:.3f}")
 
     if result.monotonicity_violations:
@@ -461,7 +461,7 @@ def _validate_vertical_inputs(
                 f"models must contain one model per grade: expected "
                 f"{len(grade_data)}, got {len(models)}"
             )
-        for gd, model in zip(grade_data, models):
+        for gd, model in zip(grade_data, models, strict=True):
             n_response_items = np.asarray(gd.responses).shape[1]
             if model.n_items != n_response_items:
                 raise ValueError(

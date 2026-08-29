@@ -236,7 +236,7 @@ def test_vectorized_simulation_is_reproducible(model: BKTModel) -> None:
     first = model.simulate(100, 8, seed=42)
     second = model.simulate(100, 8, seed=42)
 
-    for first_array, second_array in zip(first, second):
+    for first_array, second_array in zip(first, second, strict=True):
         assert_array_equal(first_array, second_array)
     responses, skills, states = first
     assert responses.shape == states.shape == (100, 24)

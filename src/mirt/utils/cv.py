@@ -1010,7 +1010,7 @@ def cross_validate(
                 score = scorer(result, train_data, test_data, test_idx)
                 scores[scorer.name].append(score)
     else:
-        for task, (train_idx, test_idx) in zip(tasks, splits):
+        for task, (train_idx, test_idx) in zip(tasks, splits, strict=True):
             if verbose:
                 print(f"Fold {task.fold_idx + 1}/{n_folds}")
 

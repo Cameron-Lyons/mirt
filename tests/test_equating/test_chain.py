@@ -218,7 +218,7 @@ class TestAccumulateConstants:
         pairwise_A = [1.2, 0.75, 1.8]
         pairwise_B = [0.4, -0.3, 0.6]
         theta_by_time = [np.array([-1.5, 0.0, 2.0])]
-        for slope, intercept in zip(pairwise_A, pairwise_B):
+        for slope, intercept in zip(pairwise_A, pairwise_B, strict=True):
             theta_by_time.append(slope * theta_by_time[-1] + intercept)
 
         cumulative_A, cumulative_B = accumulate_constants(

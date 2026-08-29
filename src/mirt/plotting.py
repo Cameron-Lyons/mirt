@@ -691,7 +691,9 @@ def plot_person_item_map(
     ax.hist(values, bins=bins, **histogram_kwargs)
     item_ax.scatter(np.full(locations.size, 0.5), locations, **marker_kwargs)
     for location, name in zip(
-        locations, (_item_name(model, index) for index in range(model.n_items))
+        locations,
+        (_item_name(model, index) for index in range(model.n_items)),
+        strict=True,
     ):
         item_ax.annotate(name, (0.55, location), fontsize=8, va="center")
     ax.set_ylabel(r"$\theta$ / Item Location")

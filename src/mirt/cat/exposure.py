@@ -689,6 +689,7 @@ class ProgressiveRestricted(ExposureControl):
         for item_idx, information in zip(
             item_indices[finite],
             candidate_information[finite],
+            strict=True,
         ):
             item = int(item_idx)
             value = float(information)

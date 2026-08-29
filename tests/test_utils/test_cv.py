@@ -70,7 +70,7 @@ class TestKFold:
         kf2 = KFold(n_splits=5, shuffle=True, random_state=42)
         folds1 = list(kf1.split(response_matrix))
         folds2 = list(kf2.split(response_matrix))
-        for (tr1, te1), (tr2, te2) in zip(folds1, folds2):
+        for (tr1, te1), (tr2, te2) in zip(folds1, folds2, strict=True):
             assert_allclose(tr1, tr2)
             assert_allclose(te1, te2)
 
@@ -173,7 +173,9 @@ class TestStratifiedKFold:
         with_nan = list(splitter.split(responses))
         with_negative = list(splitter.split(negative))
 
-        for (_, nan_test), (_, negative_test) in zip(with_nan, with_negative):
+        for (_, nan_test), (_, negative_test) in zip(
+            with_nan, with_negative, strict=True
+        ):
             np.testing.assert_array_equal(nan_test, negative_test)
 
     def test_shuffle_can_be_disabled(self, response_matrix):
@@ -183,7 +185,7 @@ class TestStratifiedKFold:
         second = list(splitter.split(response_matrix))
 
         for (first_train, first_test), (second_train, second_test) in zip(
-            first, second
+            first, second, strict=True
         ):
             np.testing.assert_array_equal(first_train, second_train)
             np.testing.assert_array_equal(first_test, second_test)
@@ -237,7 +239,7 @@ class TestGroupKFold:
             )
         )
 
-        for (_, first_test), (_, second_test) in zip(first, second):
+        for (_, first_test), (_, second_test) in zip(first, second, strict=True):
             np.testing.assert_array_equal(first_test, second_test)
 
     @pytest.mark.parametrize(
@@ -332,7 +334,7 @@ class TestStratifiedGroupKFold:
             ).split(responses)
         )
 
-        for (_, first_test), (_, second_test) in zip(first, second):
+        for (_, first_test), (_, second_test) in zip(first, second, strict=True):
             np.testing.assert_array_equal(first_test, second_test)
 
     def test_missing_scores_match_negative_missing_codes(self):
@@ -346,7 +348,9 @@ class TestStratifiedGroupKFold:
         nan_folds = list(splitter.split(with_nan))
         negative_folds = list(splitter.split(with_negative))
 
-        for (_, nan_test), (_, negative_test) in zip(nan_folds, negative_folds):
+        for (_, nan_test), (_, negative_test) in zip(
+            nan_folds, negative_folds, strict=True
+        ):
             np.testing.assert_array_equal(nan_test, negative_test)
 
     def test_sparse_quantile_bins_are_compacted(self):

@@ -20,7 +20,7 @@ def _binary_reference(
 ) -> tuple[np.ndarray, np.ndarray]:
     r_k = np.zeros(posterior_weights.shape[1])
     n_k = np.zeros(posterior_weights.shape[1])
-    for response, weights in zip(responses, posterior_weights):
+    for response, weights in zip(responses, posterior_weights, strict=True):
         if response < 0:
             continue
         n_k += weights
@@ -35,7 +35,7 @@ def _polytomous_reference(
     n_categories: int,
 ) -> np.ndarray:
     r_kc = np.zeros((posterior_weights.shape[1], n_categories))
-    for response, weights in zip(responses, posterior_weights):
+    for response, weights in zip(responses, posterior_weights, strict=True):
         if 0 <= response < n_categories:
             r_kc[:, response] += weights
     return r_kc

@@ -520,7 +520,7 @@ class MCATResult:
             "",
             "Final theta estimates:",
         ]
-        for i, (t, se) in enumerate(zip(self.theta, self.standard_error)):
+        for i, (t, se) in enumerate(zip(self.theta, self.standard_error, strict=True)):
             lines.append(f"  Dimension {i + 1}: {t:7.4f} (SE: {se:.4f})")
 
         lines.extend(

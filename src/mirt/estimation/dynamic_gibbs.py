@@ -476,7 +476,9 @@ class BKTGibbsSampler:
             states[last_trial] = int(rng.random() < alpha[last_trial, 1])
             transition = model.transition_matrix(skill_idx)
 
-            for trial, next_trial in zip(trial_indices[-2::-1], trial_indices[:0:-1]):
+            for trial, next_trial in zip(
+                trial_indices[-2::-1], trial_indices[:0:-1], strict=True
+            ):
                 p_state = alpha[trial] * transition[:, states[next_trial]]
                 p_state /= p_state.sum() + 1e-300
                 states[trial] = int(rng.random() < p_state[1])

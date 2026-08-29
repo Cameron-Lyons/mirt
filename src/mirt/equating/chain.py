@@ -776,7 +776,9 @@ def chain_linking_summary(result: ChainLinkingResult) -> str:
     lines.append(f"{'Time':>6} {'A':>12} {'B':>12}")
     lines.append("-" * 50)
 
-    for t, (A, B) in enumerate(zip(result.cumulative_A, result.cumulative_B)):
+    for t, (A, B) in enumerate(
+        zip(result.cumulative_A, result.cumulative_B, strict=True)
+    ):
         marker = " *" if t == result.reference_index else ""
         lines.append(f"{t:>6} {A:>12.4f} {B:>12.4f}{marker}")
 
