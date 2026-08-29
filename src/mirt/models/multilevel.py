@@ -8,6 +8,7 @@ This module provides:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Self
 
@@ -18,6 +19,8 @@ from mirt.constants import PROB_EPSILON
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+_MULTILEVEL_MAX_WORKING_VALUES = 1_000_000
 
 
 def _validate_identifiers(values: object, name: str) -> NDArray[np.intp]:
@@ -118,6 +121,132 @@ def _shift_log_odds(
     )
     log_odds = np.log(probabilities) - np.log1p(-probabilities)
     return _expit(log_odds + effects)
+
+
+def _validate_theta(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    expected_persons: int | None = None,
+) -> NDArray[np.float64]:
+    """Return finite latent traits with the shape required by a base model."""
+    values = np.asarray(theta, dtype=np.float64)
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    if values.ndim != 2 or values.shape[1] != model.n_factors:
+        raise ValueError(f"theta must have shape (n_persons, {model.n_factors})")
+    if values.shape[0] == 0:
+        raise ValueError("theta must contain at least one person")
+    if expected_persons is not None and values.shape[0] != expected_persons:
+        raise ValueError(
+            f"theta must contain {expected_persons} persons, got {values.shape[0]}"
+        )
+    if not np.all(np.isfinite(values)):
+        raise ValueError("theta must contain only finite values")
+    return values
+
+
+def _validate_chunk_size(
+    chunk_size: int | None,
+    n_persons: int,
+    values_per_person: int,
+) -> int:
+    """Resolve a positive response-simulation chunk size."""
+    if chunk_size is None:
+        return max(
+            1,
+            min(
+                n_persons,
+                _MULTILEVEL_MAX_WORKING_VALUES // max(1, values_per_person),
+            ),
+        )
+    if isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+        chunk_size, (int, np.integer)
+    ):
+        raise ValueError("chunk_size must be a positive integer")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    return int(chunk_size)
+
+
+def _simulate_responses(
+    model: BaseItemModel,
+    n_persons: int,
+    rng: np.random.Generator,
+    probability_for_rows: Callable[[int, int], NDArray[np.float64]],
+    chunk_size: int | None,
+) -> NDArray[np.int_]:
+    """Draw bounded-memory responses from chunked model probabilities."""
+    if model.is_polytomous:
+        category_counts = np.asarray(model.n_categories, dtype=np.intp)
+        if category_counts.shape != (model.n_items,) or np.any(category_counts < 2):
+            raise ValueError("base model category counts are malformed")
+        max_categories = int(np.max(category_counts))
+        values_per_person = model.n_items * (2 * max_categories + 1)
+    else:
+        max_categories = 0
+        values_per_person = model.n_items * 2
+
+    rows_per_chunk = _validate_chunk_size(
+        chunk_size,
+        n_persons,
+        values_per_person,
+    )
+    responses = np.empty((n_persons, model.n_items), dtype=np.int32)
+    tolerance = 1e-8
+
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        probabilities = np.asarray(
+            probability_for_rows(start, stop),
+            dtype=np.float64,
+        )
+        if not np.all(np.isfinite(probabilities)):
+            raise ValueError("base model probabilities must contain only finite values")
+        if np.any(probabilities < -tolerance) or np.any(
+            probabilities > 1.0 + tolerance
+        ):
+            raise ValueError("base model probabilities must be between 0 and 1")
+        probabilities = np.clip(probabilities, 0.0, 1.0)
+
+        if not model.is_polytomous:
+            expected_shape = (stop - start, model.n_items)
+            if probabilities.shape != expected_shape:
+                raise ValueError(
+                    f"base model probability shape {probabilities.shape} != "
+                    f"{expected_shape}"
+                )
+            responses[start:stop] = rng.random(expected_shape) < probabilities
+            continue
+
+        expected_shape = (stop - start, model.n_items, max_categories)
+        if probabilities.shape != expected_shape:
+            raise ValueError(
+                f"base model probability shape {probabilities.shape} != "
+                f"{expected_shape}"
+            )
+        probability_sums = probabilities.sum(axis=2)
+        if not np.allclose(probability_sums, 1.0, atol=1e-7, rtol=1e-7):
+            raise ValueError("base model category probabilities must sum to 1")
+        cumulative = np.cumsum(probabilities, axis=2)
+        cumulative[:, :, -1] = 1.0
+        uniforms = rng.random((stop - start, model.n_items, 1))
+        responses[start:stop] = np.sum(uniforms >= cumulative, axis=2)
+
+    return responses
+
+
+def _sample_abilities(
+    model: BaseItemModel,
+    means: NDArray[np.float64],
+    variance: float,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Draw unidimensional person traits conditional on current level effects."""
+    if model.n_factors != 1:
+        raise ValueError(
+            "automatic ability simulation requires a unidimensional base model"
+        )
+    return rng.normal(means, np.sqrt(variance)).reshape(-1, 1)
 
 
 @dataclass
@@ -278,6 +407,55 @@ class MultilevelIRTModel:
     ) -> float:
         """Compute the response log-likelihood given person abilities."""
         return float(np.sum(self._base_model.log_likelihood(responses, theta)))
+
+    def sample_abilities(self, seed: int | None = None) -> NDArray[np.float64]:
+        """Draw person traits conditional on the current group means.
+
+        The within-group variance controls individual dispersion. Automatic
+        draws are defined for unidimensional base models; multidimensional
+        traits can instead be supplied directly to :meth:`simulate`.
+        """
+        return _sample_abilities(
+            self._base_model,
+            self.person_prior_mean(),
+            self._within_variance,
+            np.random.default_rng(seed),
+        )
+
+    def simulate(
+        self,
+        seed: int | None = None,
+        *,
+        theta: NDArray[np.float64] | None = None,
+        chunk_size: int | None = None,
+    ) -> tuple[NDArray[np.int_], NDArray[np.float64]]:
+        """Simulate responses and latent traits for the stored persons.
+
+        When ``theta`` is omitted, traits are sampled conditional on the
+        current group means and within-group variance. Supplying ``theta``
+        supports conditional simulation, including multidimensional base
+        models. A fixed seed produces identical responses for every valid
+        chunk size.
+        """
+        rng = np.random.default_rng(seed)
+        theta_values = (
+            _sample_abilities(
+                self._base_model,
+                self.person_prior_mean(),
+                self._within_variance,
+                rng,
+            )
+            if theta is None
+            else _validate_theta(self._base_model, theta, self._n_persons)
+        )
+        responses = _simulate_responses(
+            self._base_model,
+            self._n_persons,
+            rng,
+            lambda start, stop: self._base_model.probability(theta_values[start:stop]),
+            chunk_size,
+        )
+        return responses, theta_values
 
     def copy(self) -> Self:
         new_model = MultilevelIRTModel(
@@ -470,6 +648,48 @@ class ThreeLevelIRTModel:
     ) -> float:
         """Compute the response log-likelihood given person abilities."""
         return float(np.sum(self._base_model.log_likelihood(responses, theta)))
+
+    def sample_abilities(self, seed: int | None = None) -> NDArray[np.float64]:
+        """Draw person traits conditional on the current level effects."""
+        return _sample_abilities(
+            self._base_model,
+            self.person_prior_mean(),
+            self._within_variance,
+            np.random.default_rng(seed),
+        )
+
+    def simulate(
+        self,
+        seed: int | None = None,
+        *,
+        theta: NDArray[np.float64] | None = None,
+        chunk_size: int | None = None,
+    ) -> tuple[NDArray[np.int_], NDArray[np.float64]]:
+        """Simulate responses and traits for the stored three-level hierarchy.
+
+        Automatic traits are conditional on the current level-2 and level-3
+        effects. Explicit traits enable conditional simulation for any base
+        model factor count. A fixed seed is invariant to response chunking.
+        """
+        rng = np.random.default_rng(seed)
+        theta_values = (
+            _sample_abilities(
+                self._base_model,
+                self.person_prior_mean(),
+                self._within_variance,
+                rng,
+            )
+            if theta is None
+            else _validate_theta(self._base_model, theta, self._n_persons)
+        )
+        responses = _simulate_responses(
+            self._base_model,
+            self._n_persons,
+            rng,
+            lambda start, stop: self._base_model.probability(theta_values[start:stop]),
+            chunk_size,
+        )
+        return responses, theta_values
 
     def copy(self) -> Self:
         new_model = ThreeLevelIRTModel(
@@ -707,6 +927,48 @@ class CrossedRandomEffectsModel:
             0.0,
         )
         return float(np.sum(log_likelihood))
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate binary responses with stored person-item rater assignments.
+
+        If no assignments are stored, responses use the base model directly.
+        Otherwise each observation receives its assigned rater's log-odds
+        shift. A fixed seed produces identical output across chunk sizes.
+        """
+        expected_persons = (
+            None
+            if self._rater_assignments is None
+            else self._rater_assignments.shape[0]
+        )
+        theta_values = _validate_theta(
+            self._base_model,
+            theta,
+            expected_persons,
+        )
+
+        def probability_for_rows(start: int, stop: int) -> NDArray[np.float64]:
+            probabilities = np.asarray(
+                self._base_model.probability(theta_values[start:stop]),
+                dtype=np.float64,
+            )
+            if self._rater_assignments is None or not self._include_rater_effects:
+                return probabilities
+            effects = self._rater_effects[self._rater_assignments[start:stop]]
+            return _shift_log_odds(probabilities, effects)
+
+        return _simulate_responses(
+            self._base_model,
+            theta_values.shape[0],
+            np.random.default_rng(seed),
+            probability_for_rows,
+            chunk_size,
+        )
 
     def copy(self) -> Self:
         new_model = CrossedRandomEffectsModel(
