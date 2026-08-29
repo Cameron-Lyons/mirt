@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 _RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
+_FIT_STATISTICS_CHUNK_ELEMENTS = 1_000_000
 
 
 @dataclass
@@ -39,6 +40,65 @@ class _ResidualComputation:
     residuals: dict[str, NDArray[np.float64]]
     expected_values: NDArray[np.float64] | None
     variances: NDArray[np.float64] | None
+
+
+@dataclass
+class _FitAccumulator:
+    """Sums and counts needed to finalize item and person fit statistics."""
+
+    item_square_sum: NDArray[np.float64]
+    item_weighted_sum: NDArray[np.float64]
+    item_variance_sum: NDArray[np.float64]
+    item_n: NDArray[np.intp]
+    person_square_sum: NDArray[np.float64]
+    person_weighted_sum: NDArray[np.float64]
+    person_variance_sum: NDArray[np.float64]
+    person_n: NDArray[np.intp]
+
+    @classmethod
+    def create(cls, n_persons: int, n_items: int) -> _FitAccumulator:
+        """Create a zeroed accumulator for a response matrix shape."""
+        return cls(
+            item_square_sum=np.zeros(n_items),
+            item_weighted_sum=np.zeros(n_items),
+            item_variance_sum=np.zeros(n_items),
+            item_n=np.zeros(n_items, dtype=np.intp),
+            person_square_sum=np.zeros(n_persons),
+            person_weighted_sum=np.zeros(n_persons),
+            person_variance_sum=np.zeros(n_persons),
+            person_n=np.zeros(n_persons, dtype=np.intp),
+        )
+
+    def finish(self) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
+        """Finalize fit means and retain their observation counts."""
+        return {
+            "item_outfit": np.divide(
+                self.item_square_sum,
+                self.item_n,
+                out=np.full(self.item_square_sum.shape, np.nan),
+                where=self.item_n > 0,
+            ),
+            "item_infit": np.divide(
+                self.item_weighted_sum,
+                self.item_variance_sum + PROB_EPSILON,
+                out=np.full(self.item_weighted_sum.shape, np.nan),
+                where=self.item_n > 0,
+            ),
+            "person_outfit": np.divide(
+                self.person_square_sum,
+                self.person_n,
+                out=np.full(self.person_square_sum.shape, np.nan),
+                where=self.person_n > 0,
+            ),
+            "person_infit": np.divide(
+                self.person_weighted_sum,
+                self.person_variance_sum + PROB_EPSILON,
+                out=np.full(self.person_weighted_sum.shape, np.nan),
+                where=self.person_n > 0,
+            ),
+            "item_n": self.item_n,
+            "person_n": self.person_n,
+        }
 
 
 @dataclass
@@ -140,6 +200,38 @@ def _resolve_theta(
     return theta_array
 
 
+def _item_expected_value_variance(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_index: int,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Evaluate one item and return probabilities, means, and variances."""
+    probabilities = np.asarray(model.probability(theta, item_index), dtype=np.float64)
+    n_persons = theta.shape[0]
+    if probabilities.ndim == 2:
+        if probabilities.shape[0] != n_persons or probabilities.shape[1] == 0:
+            raise ValueError(
+                "model probabilities must provide at least one category per person"
+            )
+        categories = np.arange(probabilities.shape[1], dtype=np.float64)
+        expected = probabilities @ categories
+        variance = probabilities @ np.square(categories) - np.square(expected)
+        return probabilities, expected, variance
+
+    if probabilities.ndim == 1 and probabilities.shape[0] == n_persons:
+        expected = probabilities
+        variance = probabilities * (1.0 - probabilities)
+        return probabilities, expected, variance
+
+    raise ValueError(
+        "model probabilities must have shape (n_persons,) or (n_persons, n_categories)"
+    )
+
+
 def _compute_residual_arrays(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -161,15 +253,7 @@ def _compute_residual_arrays(
     variances = np.full((n_persons, n_items), np.nan) if store_variances else None
 
     for j in range(n_items):
-        probs = model.probability(theta, j)
-
-        if probs.ndim == 2:
-            categories = np.arange(probs.shape[1])
-            expected = probs @ categories
-            variance = probs @ (categories**2) - expected**2
-        else:
-            expected = probs
-            variance = probs * (1 - probs)
+        probs, expected, variance = _item_expected_value_variance(model, theta, j)
 
         if expected_values is not None:
             expected_values[:, j] = expected
@@ -271,11 +355,18 @@ def _analyze_residuals(
     for j in range(n_items):
         valid = ~np.isnan(standardized[:, j])
         z_j = standardized[valid, j]
-        item_residuals[j] = {
-            "mean": float(np.mean(z_j)),
-            "sd": float(np.std(z_j)),
-            "max_abs_z": float(np.max(np.abs(z_j))) if len(z_j) > 0 else 0,
-        }
+        if z_j.size:
+            item_residuals[j] = {
+                "mean": float(np.mean(z_j)),
+                "sd": float(np.std(z_j)),
+                "max_abs_z": float(np.max(np.abs(z_j))),
+            }
+        else:
+            item_residuals[j] = {
+                "mean": np.nan,
+                "sd": np.nan,
+                "max_abs_z": 0.0,
+            }
 
     pattern_residuals = {}
     for response_pattern, z_i in zip(responses, standardized, strict=True):
@@ -352,26 +443,92 @@ def analyze_residuals(
 def _fit_statistics(
     standardized_residuals: NDArray[np.float64],
     variances: NDArray[np.float64],
-) -> dict[str, NDArray[np.float64]]:
-    """Aggregate standardized residuals into item and person fit statistics."""
-    z_sq = np.square(standardized_residuals)
-    weighted_z_sq = z_sq * variances
+) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
+    """Aggregate residuals in bounded chunks without full-size temporaries."""
+    if standardized_residuals.shape != variances.shape:
+        raise ValueError("standardized_residuals and variances must have equal shapes")
 
-    return {
-        "item_outfit": np.nanmean(z_sq, axis=0),
-        "item_infit": np.nansum(weighted_z_sq, axis=0)
-        / (np.nansum(variances, axis=0) + PROB_EPSILON),
-        "person_outfit": np.nanmean(z_sq, axis=1),
-        "person_infit": np.nansum(weighted_z_sq, axis=1)
-        / (np.nansum(variances, axis=1) + PROB_EPSILON),
-    }
+    n_persons, n_items = standardized_residuals.shape
+    accumulator = _FitAccumulator.create(n_persons, n_items)
+
+    chunk_size = min(
+        n_items,
+        max(1, _FIT_STATISTICS_CHUNK_ELEMENTS // max(1, n_persons)),
+    )
+    for start in range(0, n_items, chunk_size):
+        stop = min(start + chunk_size, n_items)
+        residual_block = standardized_residuals[:, start:stop]
+        variance_block = variances[:, start:stop]
+        valid = np.isfinite(residual_block)
+        squared = np.zeros_like(residual_block)
+        np.square(residual_block, out=squared, where=valid)
+
+        accumulator.item_square_sum[start:stop] = np.sum(squared, axis=0)
+        accumulator.item_n[start:stop] = np.sum(valid, axis=0, dtype=np.intp)
+        accumulator.person_square_sum += np.sum(squared, axis=1)
+        accumulator.person_n += np.sum(valid, axis=1, dtype=np.intp)
+        accumulator.item_variance_sum[start:stop] = np.sum(
+            variance_block,
+            axis=0,
+            where=valid,
+            initial=0.0,
+        )
+        accumulator.person_variance_sum += np.sum(
+            variance_block,
+            axis=1,
+            where=valid,
+            initial=0.0,
+        )
+
+        np.multiply(squared, variance_block, out=squared, where=valid)
+        accumulator.item_weighted_sum[start:stop] = np.sum(squared, axis=0)
+        accumulator.person_weighted_sum += np.sum(squared, axis=1)
+
+    return accumulator.finish()
+
+
+def _stream_fit_statistics(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
+    """Accumulate fit statistics directly from one item probability pass."""
+    n_persons, n_items = responses.shape
+    accumulator = _FitAccumulator.create(n_persons, n_items)
+
+    for item_index in range(n_items):
+        _, expected, variance = _item_expected_value_variance(
+            model,
+            theta,
+            item_index,
+        )
+        valid = responses[:, item_index] >= 0
+        observed = responses[valid, item_index]
+        valid_variance = variance[valid]
+        raw = observed - expected[valid]
+        squared = np.square(raw) / (valid_variance + PROB_EPSILON)
+        weighted = squared * valid_variance
+
+        count = int(np.count_nonzero(valid))
+        accumulator.item_n[item_index] = count
+        accumulator.item_square_sum[item_index] = np.sum(squared)
+        accumulator.item_weighted_sum[item_index] = np.sum(weighted)
+        accumulator.item_variance_sum[item_index] = np.sum(valid_variance)
+        accumulator.person_n[valid] += 1
+        accumulator.person_square_sum[valid] += squared
+        accumulator.person_weighted_sum[valid] += weighted
+        accumulator.person_variance_sum[valid] += valid_variance
+
+    return accumulator.finish()
 
 
 def compute_outfit_infit(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
-) -> dict[str, NDArray[np.float64]]:
+    *,
+    include_counts: bool = False,
+) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
     """Compute outfit and infit statistics for items and persons.
 
     Outfit: unweighted mean square residual
@@ -385,24 +542,27 @@ def compute_outfit_infit(
         Response matrix
     theta : ndarray, optional
         Ability estimates
+    include_counts : bool, default=False
+        Include valid observation counts as ``item_n`` and ``person_n``.
 
     Returns
     -------
     dict
-        Dictionary with 'item_outfit', 'item_infit', 'person_outfit', 'person_infit'
+        Dictionary with ``item_outfit``, ``item_infit``, ``person_outfit``, and
+        ``person_infit``. When requested, ``item_n`` and ``person_n`` contain
+        the corresponding valid observation counts.
     """
+    if not isinstance(include_counts, (bool, np.bool_)):
+        raise ValueError("include_counts must be boolean")
     responses = np.asarray(responses)
+    if responses.ndim != 2:
+        raise ValueError("responses must be a two-dimensional matrix")
     theta_array = _resolve_theta(model, responses, theta)
-    computation = _compute_residual_arrays(
-        model,
-        responses,
-        theta_array,
-        ("standardized",),
-        store_variances=True,
-    )
-    variances = computation.variances
-    assert variances is not None
-    return _fit_statistics(computation.residuals["standardized"], variances)
+    statistics = _stream_fit_statistics(model, responses, theta_array)
+    if not include_counts:
+        del statistics["item_n"]
+        del statistics["person_n"]
+    return statistics
 
 
 def identify_misfitting_patterns(
