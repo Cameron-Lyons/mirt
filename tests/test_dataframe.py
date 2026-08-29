@@ -186,6 +186,44 @@ def test_personfit_materializes_person_identifiers_for_polars(monkeypatch: Any) 
     assert result["person"].to_list() == [0, 1]
 
 
+def test_personfit_forwards_significance_options(monkeypatch: Any) -> None:
+    from mirt.diagnostics import personfit as personfit_module
+
+    captured: dict[str, Any] = {}
+
+    def fake_compute(*args: Any, **kwargs: Any) -> dict[str, np.ndarray]:
+        captured.update(kwargs)
+        return {
+            "p_value": np.array([0.01, 0.5]),
+            "p_value_adjusted": np.array([0.02, 0.5]),
+            "aberrant": np.array([True, False]),
+        }
+
+    set_dataframe_backend("polars")
+    monkeypatch.setattr(personfit_module, "compute_personfit", fake_compute)
+
+    result = mirt.personfit(
+        SimpleNamespace(model=object()),
+        np.array([[0], [1]]),
+        theta=np.array([0.0, 1.0]),
+        p_adjust="holm",
+        alpha=0.01,
+        alternative="two-sided",
+    )
+
+    assert captured == {
+        "p_adjust": "holm",
+        "alpha": 0.01,
+        "alternative": "two-sided",
+    }
+    assert result.columns == [
+        "person",
+        "p_value",
+        "p_value_adjusted",
+        "aberrant",
+    ]
+
+
 def test_dif_materializes_item_identifiers_for_polars(monkeypatch: Any) -> None:
     from mirt.diagnostics import dif as dif_module
 

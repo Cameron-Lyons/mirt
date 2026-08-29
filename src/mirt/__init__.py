@@ -425,6 +425,10 @@ def personfit(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     statistics: list[str] | None = None,
+    *,
+    p_adjust: Literal["none", "bonferroni", "holm", "fdr_bh"] | None = None,
+    alpha: float = 0.05,
+    alternative: Literal["lower", "two-sided", "upper"] = "lower",
 ) -> Any:
     """Compute person fit statistics to detect aberrant response patterns.
 
@@ -449,11 +453,22 @@ def personfit(
         - "lz": Log-likelihood z-score
 
         Default is ["infit", "outfit", "Zh"].
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, optional
+        Enable person-fit p-values and flags, optionally correcting across
+        respondents. ``None`` keeps the default output unchanged; ``"none"``
+        enables significance output without multiplicity correction.
+    alpha : float, default=0.05
+        Significance threshold for the ``aberrant`` column when ``p_adjust`` is
+        enabled.
+    alternative : {"lower", "two-sided", "upper"}, default="lower"
+        Normal-tail alternative for standardized log-likelihood scores.
 
     Returns
     -------
     DataFrame
         Person fit statistics with persons as rows and statistics as columns.
+        When ``p_adjust`` is supplied, raw and adjusted p-values plus an
+        ``aberrant`` flag are included.
 
     Notes
     -----
@@ -467,9 +482,9 @@ def personfit(
     >>> from mirt import fit_mirt, personfit, simdata
     >>> data = simdata(n_persons=500, n_items=20)
     >>> result = fit_mirt(data)
-    >>> pfit = personfit(result, data)
-    >>> # Flag potentially aberrant responders
-    >>> aberrant = pfit[pfit['Zh'] < -2]
+    >>> pfit = personfit(result, data, p_adjust="holm")
+    >>> # Flag potentially aberrant responders with family-wise control
+    >>> aberrant = pfit[pfit['aberrant']]
     >>> print(f"Flagged {len(aberrant)} aberrant responders")
     """
     from mirt.diagnostics.personfit import compute_personfit
@@ -483,7 +498,15 @@ def personfit(
         score_result = fscores(result, responses, method="EAP")
         theta = score_result.theta
 
-    fit_stats = compute_personfit(result.model, responses, theta, statistics)
+    fit_stats = compute_personfit(
+        result.model,
+        responses,
+        theta,
+        statistics,
+        p_adjust=p_adjust,
+        alpha=alpha,
+        alternative=alternative,
+    )
 
     return create_dataframe(fit_stats, index_name="person")
 

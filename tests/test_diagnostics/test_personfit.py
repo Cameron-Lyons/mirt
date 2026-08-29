@@ -5,9 +5,14 @@ from typing import get_args
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
+from scipy.special import ndtr, ndtri
 
 from mirt.constants import PROB_EPSILON
-from mirt.diagnostics.personfit import compute_personfit, flag_aberrant_persons
+from mirt.diagnostics.personfit import (
+    compute_personfit,
+    compute_personfit_significance,
+    flag_aberrant_persons,
+)
 from mirt.typing import PersonFitStatistic
 
 
@@ -255,6 +260,102 @@ class TestComputePersonfit:
     def test_lz_is_in_public_personfit_statistic_type(self):
         """Test runtime typing matches the documented lz option."""
         assert "lz" in get_args(PersonFitStatistic)
+
+    def test_significance_reuses_hidden_zh_computation(self):
+        """Test significance can accompany a mean-square-only request."""
+        responses = np.tile(np.array([[0, 1], [1, 0]]), (5, 1))
+        probabilities = np.tile(np.array([[0.3, 0.7]]), (len(responses), 1))
+        model = FixedProbabilityModel(probabilities)
+
+        result = compute_personfit(
+            model,
+            responses,
+            np.zeros(len(responses)),
+            statistics=["infit"],
+            p_adjust="holm",
+        )
+
+        assert set(result) == {
+            "infit",
+            "p_value",
+            "p_value_adjusted",
+            "aberrant",
+        }
+        assert model.probability_calls == 1
+        assert result["aberrant"].dtype == bool
+
+
+class TestPersonfitSignificance:
+    """Tests for calibrated person-fit decisions."""
+
+    @pytest.mark.parametrize(
+        ("alternative", "expected"),
+        [
+            ("lower", ndtr(np.array([-2.0, 0.0, 2.0]))),
+            ("upper", ndtr(np.array([2.0, 0.0, -2.0]))),
+            ("two-sided", 2.0 * ndtr(np.array([-2.0, 0.0, -2.0]))),
+        ],
+    )
+    def test_tail_alternatives(self, alternative, expected):
+        """Test one- and two-sided normal probabilities."""
+        result = compute_personfit_significance(
+            np.array([-2.0, 0.0, 2.0]),
+            alternative=alternative,
+        )
+
+        assert_allclose(result["p_value"], expected)
+        assert_allclose(result["p_value_adjusted"], expected)
+
+    def test_holm_adjustment_excludes_missing_scores(self):
+        """Test undefined scores do not increase the correction family."""
+        raw = np.array([0.01, 0.03, 0.04, np.nan])
+
+        result = compute_personfit_significance(
+            ndtri(raw),
+            alpha=0.05,
+            p_adjust="holm",
+        )
+
+        assert_allclose(result["p_value"], raw, equal_nan=True)
+        assert_allclose(
+            result["p_value_adjusted"],
+            np.array([0.03, 0.06, 0.06, np.nan]),
+            equal_nan=True,
+        )
+        np.testing.assert_array_equal(
+            result["aberrant"],
+            np.array([True, False, False, False]),
+        )
+
+    def test_extreme_scores_use_stable_tail_probabilities(self):
+        """Test large finite scores retain meaningful small probabilities."""
+        result = compute_personfit_significance(
+            np.array([-10.0, 10.0]),
+            alternative="two-sided",
+        )
+
+        assert np.all(result["p_value"] > 0.0)
+        assert_allclose(result["p_value"][0], result["p_value"][1])
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"alpha": 0.0}, "alpha"),
+            ({"alpha": True}, "alpha"),
+            ({"alternative": "middle"}, "alternative"),
+            ({"p_adjust": "unknown"}, "p_adjust"),
+        ],
+    )
+    def test_invalid_options_are_rejected(self, kwargs, message):
+        """Test significance options fail with focused messages."""
+        with pytest.raises(ValueError, match=message):
+            compute_personfit_significance(np.array([0.0]), **kwargs)
+
+    @pytest.mark.parametrize("zh", [1.0, [[0.0]], [1.0 + 2.0j]])
+    def test_invalid_scores_are_rejected(self, zh):
+        """Test scores must be a real one-dimensional vector."""
+        with pytest.raises(ValueError, match="zh"):
+            compute_personfit_significance(zh)
 
 
 class TestFlagAberrantPersons:

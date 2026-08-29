@@ -125,7 +125,10 @@ Evaluate model fit with various diagnostics:
        p_adjust="fdr_bh",
    )
    person_stats = mirt.personfit(
-       result, responses, statistics=["infit", "outfit", "Zh"]
+       result,
+       responses,
+       statistics=["infit", "outfit", "Zh"],
+       p_adjust="holm",
    )
    print(item_stats.head())
    print(person_stats.head())

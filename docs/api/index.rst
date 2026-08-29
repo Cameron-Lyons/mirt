@@ -108,6 +108,7 @@ Diagnostics
    diagnostics.compute_ld_chi2
    diagnostics.flag_ld_pairs
    diagnostics.adjust_p_values
+   diagnostics.compute_personfit_significance
    diagnostics.psis_loo
    diagnostics.waic
 
