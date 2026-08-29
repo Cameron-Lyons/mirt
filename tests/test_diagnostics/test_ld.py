@@ -390,6 +390,88 @@ class TestFlagLDPairs:
 
         assert len(strict) <= len(lenient)
 
+    def test_q3_threshold_uses_full_matrix(self):
+        """A lower threshold can identify pairs absent from cached flags."""
+        q3 = np.array(
+            [
+                [0.0, 0.10, -0.03],
+                [0.10, 0.0, -0.08],
+                [-0.03, -0.08, 0.0],
+            ]
+        )
+        chi2 = np.full((3, 3), np.nan)
+        result = LDResult(q3, chi2, chi2.copy(), q3.copy(), [], [])
+
+        assert flag_ld_pairs(result, q3_threshold=0.05, method="q3") == [
+            (0, 1),
+            (1, 2),
+        ]
+
+    def test_chi2_matches_survival_function_with_nonfinite_values(self):
+        """Matrix selection preserves the scalar chi-square definition."""
+        q3 = np.zeros((4, 4))
+        chi2 = np.array(
+            [
+                [np.nan, 0.1, 4.0, np.inf],
+                [0.1, np.nan, 6.0, 2.0],
+                [4.0, 6.0, np.nan, 8.0],
+                [np.inf, 2.0, 8.0, np.nan],
+            ]
+        )
+        result = LDResult(q3, chi2, chi2.copy(), q3.copy(), [], [])
+
+        assert flag_ld_pairs(result, method="chi2") == [
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (2, 3),
+        ]
+
+    @pytest.mark.parametrize("method", ["", "Q3", "unknown"])
+    def test_rejects_unknown_method(self, method):
+        """Pair flagging rejects unsupported selection methods."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(ValueError, match="method"):
+            flag_ld_pairs(result, method=method)
+
+    @pytest.mark.parametrize("method", [None, 1, True])
+    def test_rejects_non_string_method(self, method):
+        """Pair flagging requires a string selection method."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(TypeError, match="method"):
+            flag_ld_pairs(result, method=method)
+
+    @pytest.mark.parametrize("threshold", [-0.1, np.inf, np.nan])
+    def test_rejects_invalid_q3_threshold(self, threshold):
+        """Q3 thresholds must be finite and nonnegative."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(ValueError, match="q3_threshold"):
+            flag_ld_pairs(result, q3_threshold=threshold, method="q3")
+
+    @pytest.mark.parametrize("threshold", [None, "0.2", True])
+    def test_rejects_non_numeric_q3_threshold(self, threshold):
+        """Q3 thresholds reject non-numeric and boolean values."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(TypeError, match="q3_threshold"):
+            flag_ld_pairs(result, q3_threshold=threshold, method="q3")
+
+    @pytest.mark.parametrize("alpha", [0.0, 1.0, np.inf, np.nan])
+    def test_rejects_invalid_chi2_alpha(self, alpha):
+        """Chi-square levels must be finite probabilities."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(ValueError, match="chi2_alpha"):
+            flag_ld_pairs(result, chi2_alpha=alpha, method="chi2")
+
 
 class TestLDSummaryTable:
     """Tests for ld_summary_table function."""
@@ -418,6 +500,60 @@ class TestLDSummaryTable:
             if line.strip() and not line.startswith("-")
         ]
         assert len(lines) <= 7
+
+    def test_summary_table_stably_orders_ties_and_missing_q3(self):
+        """Finite top pairs precede missing values and ties keep matrix order."""
+        q3 = np.array(
+            [
+                [0.0, 0.5, -0.5, np.nan],
+                [0.5, 0.0, 0.2, 0.1],
+                [-0.5, 0.2, 0.0, 0.3],
+                [np.nan, 0.1, 0.3, 0.0],
+            ]
+        )
+        chi2 = np.full((4, 4), np.nan)
+        result = LDResult(
+            q3,
+            chi2,
+            chi2.copy(),
+            q3.copy(),
+            [],
+            [],
+            ["one", "two", "three", "four"],
+        )
+
+        lines = ld_summary_table(result, top_n=3).splitlines()[2:]
+
+        assert [line.split()[:2] for line in lines] == [
+            ["one", "two"],
+            ["one", "three"],
+            ["three", "four"],
+        ]
+
+    def test_summary_table_zero_rows(self):
+        """A zero limit returns only the table heading."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        assert len(ld_summary_table(result, top_n=0).splitlines()) == 2
+
+    @pytest.mark.parametrize("top_n", [-1, -10])
+    def test_summary_table_rejects_negative_limit(self, top_n):
+        """Negative display limits are rejected instead of slicing implicitly."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(ValueError, match="top_n"):
+            ld_summary_table(result, top_n=top_n)
+
+    @pytest.mark.parametrize("top_n", [None, 1.5, True])
+    def test_summary_table_rejects_non_integer_limit(self, top_n):
+        """Display limits reject non-integer and boolean values."""
+        matrix = np.zeros((2, 2))
+        result = LDResult(matrix, matrix, matrix, matrix, [], [])
+
+        with pytest.raises(TypeError, match="top_n"):
+            ld_summary_table(result, top_n=top_n)
 
 
 class TestLDWithLocallyDependentData:
