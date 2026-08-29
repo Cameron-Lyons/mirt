@@ -152,10 +152,29 @@ def validate_scoring_responses(
 def unique_response_patterns(
     responses: NDArray[np.int_],
 ) -> tuple[NDArray[np.int_], NDArray[np.intp]]:
-    """Collapse duplicate response rows for deterministic optimizer reuse."""
+    """Collapse duplicate response rows without sorting every item column."""
     if responses.shape[0] == 0:
         return responses.copy(), np.empty(0, dtype=np.intp)
-    patterns, inverse = np.unique(responses, axis=0, return_inverse=True)
+
+    contiguous = np.ascontiguousarray(responses)
+    minimum = int(np.min(contiguous))
+    maximum = int(np.max(contiguous))
+    if np.iinfo(np.int8).min <= minimum and maximum <= np.iinfo(np.int8).max:
+        key_values = contiguous.astype(np.int8)
+    elif np.iinfo(np.int16).min <= minimum and maximum <= np.iinfo(np.int16).max:
+        key_values = contiguous.astype(np.int16)
+    elif np.iinfo(np.int32).min <= minimum and maximum <= np.iinfo(np.int32).max:
+        key_values = contiguous.astype(np.int32)
+    else:
+        key_values = contiguous
+    row_dtype = np.dtype((np.void, key_values.dtype.itemsize * key_values.shape[1]))
+    row_keys = key_values.view(row_dtype).reshape(-1)
+    _, first_indices, inverse = np.unique(
+        row_keys,
+        return_index=True,
+        return_inverse=True,
+    )
+    patterns = contiguous[first_indices]
     return patterns, inverse.astype(np.intp, copy=False)
 
 
