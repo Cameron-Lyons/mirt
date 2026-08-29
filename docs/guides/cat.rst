@@ -47,6 +47,31 @@ Stopping rules
 * ``"max_items"`` / ``MaxItemsStop`` — fixed test length
 * Combined rules via ``max_items`` plus an SE rule on ``CATEngine``
 
+For multidimensional classification, project the ability vector and its full
+covariance onto a policy-relevant composite:
+
+.. code-block:: python
+
+   from mirt.cat import CompositeClassificationStop, MCATEngine
+
+   classification = CompositeClassificationStop(
+       weights=[0.7, 0.3],
+       cut_score=0.0,
+       confidence=0.95,
+   )
+   engine = MCATEngine(
+       fit.model,
+       stopping_rule=classification,
+       min_items=8,
+       max_items=30,
+   )
+
+The rule evaluates ``weights @ theta`` with standard error
+``sqrt(weights @ covariance @ weights)``. It therefore incorporates factor
+correlations and stops only after a one-sided decision is sufficiently
+confident. Use :func:`~mirt.cat.mcat_stopping.create_mcat_stopping_rule` with
+``"classification"`` to construct the same rule from configuration.
+
 Content balancing and exposure
 ------------------------------
 
