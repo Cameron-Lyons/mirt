@@ -15,7 +15,13 @@ from numpy.typing import NDArray
 from scipy import integrate, stats
 
 from mirt.constants import PROB_EPSILON
-from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
+from mirt.diagnostics._utils import (
+    create_paired_resample_chunks,
+    create_theta_grid,
+    fit_group_models,
+    split_groups,
+)
+from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -43,6 +49,19 @@ class _BootstrapSummary:
     n_failed: int
 
 
+@dataclass(slots=True)
+class _DTFBootstrapTask:
+    ref_data: NDArray[np.int_]
+    focal_data: NDArray[np.int_]
+    model: str
+    method: str
+    theta_grid: NDArray[np.float64]
+    integration_weights: NDArray[np.float64]
+    fit_kwargs: dict[str, Any]
+    rng_state: dict[str, Any]
+    n_replicates: int
+
+
 def compute_dtf(
     data: NDArray[np.int_],
     groups: NDArray[Any],
@@ -56,6 +75,7 @@ def compute_dtf(
     weighting: DTFWeighting = "normal",
     confidence_level: float = 0.95,
     random_state: int | np.random.Generator | None = 42,
+    n_jobs: int = 1,
     **fit_kwargs: Any,
 ) -> dict[str, Any]:
     """Compute Differential Test Functioning statistics.
@@ -96,6 +116,9 @@ def compute_dtf(
         Percentile bootstrap confidence level.
     random_state
         Seed or NumPy random generator used for stratified resampling.
+    n_jobs
+        Number of worker processes for bootstrap refits. Use ``-1`` for all
+        available CPU cores. Default 1.
     **fit_kwargs
         Additional arguments passed to ``fit_mirt``.
 
@@ -121,6 +144,7 @@ def compute_dtf(
         n_bootstrap=n_bootstrap,
         confidence_level=confidence_level,
     )
+    n_jobs = _validate_n_jobs(n_jobs)
 
     ref_data, focal_data, ref_mask, focal_mask, ref_group, selected_focal = (
         split_groups(values, labels, focal_group=focal_group)
@@ -152,6 +176,7 @@ def compute_dtf(
         confidence_level=confidence_level,
         random_state=random_state,
         fit_kwargs=fit_kwargs,
+        n_jobs=n_jobs,
     )
 
     return {
@@ -175,6 +200,7 @@ def compute_dtf(
         "n_bootstrap": n_bootstrap,
         "n_bootstrap_successful": bootstrap.n_successful,
         "n_bootstrap_failed": bootstrap.n_failed,
+        "n_jobs": n_jobs,
     }
 
 
@@ -329,6 +355,7 @@ def _bootstrap_dtf_statistics(
     confidence_level: float,
     random_state: int | np.random.Generator | None,
     fit_kwargs: dict[str, Any],
+    n_jobs: int = 1,
 ) -> _BootstrapSummary:
     if n_bootstrap == 0:
         return _BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
@@ -336,27 +363,36 @@ def _bootstrap_dtf_statistics(
     rng = np.random.default_rng(random_state)
     ref_indices = np.flatnonzero(groups == ref_group)
     focal_indices = np.flatnonzero(groups == focal_group)
-    bootstrap_statistics: list[float] = []
-
-    for _ in range(n_bootstrap):
-        sampled_ref = rng.choice(ref_indices, size=ref_indices.size, replace=True)
-        sampled_focal = rng.choice(focal_indices, size=focal_indices.size, replace=True)
-        try:
-            ref_result, focal_result = fit_group_models(
-                data[sampled_ref], data[sampled_focal], model=model, **fit_kwargs
-            )
-            expected_ref = _compute_expected_score(ref_result.model, theta_grid)
-            expected_focal = _compute_expected_score(focal_result.model, theta_grid)
-            statistic = _aggregate_dtf(
-                expected_ref - expected_focal,
-                theta_grid,
-                method,
-                integration_weights,
-            )
-            if np.isfinite(statistic):
-                bootstrap_statistics.append(statistic)
-        except _BOOTSTRAP_EXCEPTIONS:
-            continue
+    ref_data = data[ref_indices]
+    focal_data = data[focal_indices]
+    n_jobs = _validate_n_jobs(n_jobs)
+    tasks = [
+        _DTFBootstrapTask(
+            ref_data=ref_data,
+            focal_data=focal_data,
+            model=model,
+            method=method,
+            theta_grid=theta_grid,
+            integration_weights=integration_weights,
+            fit_kwargs=fit_kwargs,
+            rng_state=rng_state,
+            n_replicates=chunk_size,
+        )
+        for rng_state, chunk_size in create_paired_resample_chunks(
+            rng=rng,
+            n_replicates=n_bootstrap,
+            n_jobs=n_jobs,
+            first_size=ref_data.shape[0],
+            second_size=focal_data.shape[0],
+        )
+    ]
+    task_results = _run_bootstrap_tasks(_fit_dtf_bootstrap_task, tasks, n_jobs)
+    bootstrap_statistics = [
+        statistic
+        for task_result in task_results
+        for statistic in task_result
+        if np.isfinite(statistic)
+    ]
 
     n_successful = len(bootstrap_statistics)
     n_failed = n_bootstrap - n_successful
@@ -384,6 +420,41 @@ def _bootstrap_dtf_statistics(
     )
 
 
+def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[float]:
+    """Fit one deterministic chunk of DTF bootstrap replicates."""
+    rng = np.random.default_rng()
+    rng.bit_generator.state = task.rng_state
+    statistics: list[float] = []
+    for _ in range(task.n_replicates):
+        sampled_ref = rng.integers(
+            0, task.ref_data.shape[0], size=task.ref_data.shape[0]
+        )
+        sampled_focal = rng.integers(
+            0, task.focal_data.shape[0], size=task.focal_data.shape[0]
+        )
+        try:
+            ref_result, focal_result = fit_group_models(
+                task.ref_data[sampled_ref],
+                task.focal_data[sampled_focal],
+                model=task.model,
+                **task.fit_kwargs,
+            )
+            expected_ref = _compute_expected_score(ref_result.model, task.theta_grid)
+            expected_focal = _compute_expected_score(
+                focal_result.model, task.theta_grid
+            )
+            statistic = _aggregate_dtf(
+                expected_ref - expected_focal,
+                task.theta_grid,
+                task.method,
+                task.integration_weights,
+            )
+        except _BOOTSTRAP_EXCEPTIONS:
+            statistic = np.nan
+        statistics.append(statistic if np.isfinite(statistic) else np.nan)
+    return statistics
+
+
 def _bootstrap_dtf_se(
     data: NDArray[np.int_],
     groups: NDArray[Any],
@@ -398,6 +469,7 @@ def _bootstrap_dtf_se(
     confidence_level: float = 0.95,
     random_state: int | np.random.Generator | None = 42,
     focal_group: Any | None = None,
+    n_jobs: int = 1,
     **fit_kwargs: Any,
 ) -> tuple[float, float]:
     """Return bootstrap standard error and approximate p-value.
@@ -415,6 +487,7 @@ def _bootstrap_dtf_se(
         n_bootstrap=n_bootstrap,
         confidence_level=confidence_level,
     )
+    n_jobs = _validate_n_jobs(n_jobs)
     ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
         values, labels, focal_group=focal_group
     )
@@ -446,6 +519,7 @@ def _bootstrap_dtf_se(
         confidence_level=confidence_level,
         random_state=random_state,
         fit_kwargs=fit_kwargs,
+        n_jobs=n_jobs,
     )
     return summary.standard_error, summary.p_value
 

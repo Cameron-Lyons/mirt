@@ -26,6 +26,7 @@ def fit_mirt(
     verbose: bool = False,
     item_names: list[str] | None = None,
     use_rust: bool = True,
+    compute_standard_errors: bool = True,
 ) -> FitResult:
     """Fit an Item Response Theory model to response data.
 
@@ -73,6 +74,10 @@ def fit_mirt(
         Names for each item. If None, items are named Item_1, Item_2, etc.
     use_rust : bool, default=True
         Use high-performance Rust backend if available.
+    compute_standard_errors : bool, default=True
+        Compute parameter standard errors. Set to ``False`` for parameter-only
+        fits such as bootstrap replicates, where skipping inference reduces
+        repeated work. The result then contains an empty standard-error mapping.
 
     Returns
     -------
@@ -130,6 +135,15 @@ def fit_mirt(
         NominalResponseModel,
         PartialCreditModel,
     )
+
+    if not isinstance(compute_standard_errors, (bool, np.bool_)):
+        raise MirtValidationError(
+            "compute_standard_errors must be a boolean",
+            parameter="compute_standard_errors",
+            value=compute_standard_errors,
+            expected="bool",
+        )
+    compute_standard_errors = bool(compute_standard_errors)
     from mirt.results.fit_result import FitResult
     from mirt.typing import EstimationMethod
     from mirt.utils.data import validate_responses
@@ -200,21 +214,27 @@ def fit_mirt(
         }
         irt_model._is_fitted = True
 
-        quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
-        posterior_weights, _ = e_step_complete(
-            data,
-            quad.nodes.ravel(),
-            quad.weights.ravel(),
-            discrimination,
-            difficulty,
-        )
-        se_a, se_b = compute_item_se_parallel(
-            data,
-            posterior_weights,
-            quad.nodes.ravel(),
-            discrimination,
-            difficulty,
-        )
+        standard_errors: dict[str, NDArray[np.float64]] = {}
+        if compute_standard_errors:
+            quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
+            posterior_weights, _ = e_step_complete(
+                data,
+                quad.nodes.ravel(),
+                quad.weights.ravel(),
+                discrimination,
+                difficulty,
+            )
+            se_a, se_b = compute_item_se_parallel(
+                data,
+                posterior_weights,
+                quad.nodes.ravel(),
+                discrimination,
+                difficulty,
+            )
+            standard_errors = {
+                "discrimination": np.asarray(se_a),
+                "difficulty": np.asarray(se_b),
+            }
 
         n_params = 2 * n_items
         aic = -2 * log_likelihood + 2 * n_params
@@ -225,10 +245,7 @@ def fit_mirt(
             log_likelihood=log_likelihood,
             n_iterations=n_iterations,
             converged=converged,
-            standard_errors={
-                "discrimination": np.asarray(se_a),
-                "difficulty": np.asarray(se_b),
-            },
+            standard_errors=standard_errors,
             aic=aic,
             bic=bic,
             n_observations=n_persons,
@@ -283,15 +300,19 @@ def fit_mirt(
             tol=tol,
             verbose=verbose,
             use_rust=use_rust,
+            compute_standard_errors=compute_standard_errors,
         )
         return estimator.fit(irt_model, data)
 
     if estimation_method == "MHRM":
-        return MHRMEstimator(
+        result = MHRMEstimator(
             n_cycles=max_iter,
             verbose=verbose,
             use_rust=use_rust,
         ).fit(irt_model, data)
+        if not compute_standard_errors:
+            result.standard_errors = {}
+        return result
 
     if estimation_method in ("MCMC", "Gibbs"):
         burnin = min(1000, max(max_iter // 5, 1))
@@ -302,7 +323,10 @@ def fit_mirt(
             verbose=verbose,
             use_rust=use_rust,
         ).fit(irt_model, data)
-        return _mcmc_result_to_fit_result(mcmc, n_persons)
+        result = _mcmc_result_to_fit_result(mcmc, n_persons)
+        if not compute_standard_errors:
+            result.standard_errors = {}
+        return result
 
     raise MirtValidationError(
         f"Unknown estimation method: {estimation}",

@@ -14,7 +14,13 @@ from numpy.typing import NDArray
 from scipy import integrate, stats
 
 from mirt.constants import PROB_EPSILON
-from mirt.diagnostics._utils import create_theta_grid, fit_group_models, split_groups
+from mirt.diagnostics._utils import (
+    create_paired_resample_chunks,
+    create_theta_grid,
+    fit_group_models,
+    split_groups,
+)
+from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -38,6 +44,18 @@ class _ReliabilityBootstrapSummary:
     confidence_interval: tuple[float, float]
     n_successful: int
     n_failed: int
+
+
+@dataclass(slots=True)
+class _ReliabilityBootstrapTask:
+    ref_data: NDArray[np.int_]
+    focal_data: NDArray[np.int_]
+    model: str
+    theta_range: tuple[float, float]
+    n_points: int
+    fit_kwargs: dict[str, Any]
+    rng_state: dict[str, Any]
+    n_replicates: int
 
 
 def compute_drf(
@@ -454,43 +472,48 @@ def _bootstrap_reliability_differences(
     confidence_level: float,
     seed: int | np.random.Generator | None,
     fit_kwargs: dict[str, Any],
+    n_jobs: int = 1,
 ) -> _ReliabilityBootstrapSummary:
     if n_bootstrap == 0:
         return _ReliabilityBootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
 
     rng = np.random.default_rng(seed)
-    differences = np.empty(n_bootstrap, dtype=np.float64)
-    n_successful = 0
-    for _ in range(n_bootstrap):
-        ref_indices = rng.integers(0, len(ref_data), size=len(ref_data))
-        focal_indices = rng.integers(0, len(focal_data), size=len(focal_data))
-        try:
-            ref_result, focal_result = fit_group_models(
-                ref_data[ref_indices],
-                focal_data[focal_indices],
-                model=model,
-                **fit_kwargs,
-            )
-            ref_reliability = _compute_marginal_reliability(
-                ref_result.model, theta_range, n_points=n_points
-            )
-            focal_reliability = _compute_marginal_reliability(
-                focal_result.model, theta_range, n_points=n_points
-            )
-        except _BOOTSTRAP_EXCEPTIONS:
-            continue
-        difference = ref_reliability - focal_reliability
-        if np.isfinite(difference):
-            differences[n_successful] = difference
-            n_successful += 1
+    n_jobs = _validate_n_jobs(n_jobs)
+    tasks = [
+        _ReliabilityBootstrapTask(
+            ref_data=ref_data,
+            focal_data=focal_data,
+            model=model,
+            theta_range=theta_range,
+            n_points=n_points,
+            fit_kwargs=fit_kwargs,
+            rng_state=rng_state,
+            n_replicates=chunk_size,
+        )
+        for rng_state, chunk_size in create_paired_resample_chunks(
+            rng=rng,
+            n_replicates=n_bootstrap,
+            n_jobs=n_jobs,
+            first_size=ref_data.shape[0],
+            second_size=focal_data.shape[0],
+        )
+    ]
+    task_results = _run_bootstrap_tasks(_fit_reliability_bootstrap_task, tasks, n_jobs)
+    differences = [
+        difference
+        for task_result in task_results
+        for difference in task_result
+        if np.isfinite(difference)
+    ]
 
+    n_successful = len(differences)
     n_failed = n_bootstrap - n_successful
     if n_successful < 2:
         return _ReliabilityBootstrapSummary(
             np.nan, np.nan, (np.nan, np.nan), n_successful, n_failed
         )
 
-    estimates = differences[:n_successful]
+    estimates = np.asarray(differences, dtype=np.float64)
     standard_error = float(np.std(estimates, ddof=1))
     if standard_error <= PROB_EPSILON:
         p_value = 1.0 if abs(observed_difference) <= PROB_EPSILON else 0.0
@@ -509,6 +532,41 @@ def _bootstrap_reliability_differences(
     )
 
 
+def _fit_reliability_bootstrap_task(
+    task: _ReliabilityBootstrapTask,
+) -> list[float]:
+    """Fit one deterministic chunk of reliability bootstrap replicates."""
+    rng = np.random.default_rng()
+    rng.bit_generator.state = task.rng_state
+    differences: list[float] = []
+    for _ in range(task.n_replicates):
+        ref_indices = rng.integers(
+            0, task.ref_data.shape[0], size=task.ref_data.shape[0]
+        )
+        focal_indices = rng.integers(
+            0, task.focal_data.shape[0], size=task.focal_data.shape[0]
+        )
+        try:
+            ref_result, focal_result = fit_group_models(
+                task.ref_data[ref_indices],
+                task.focal_data[focal_indices],
+                model=task.model,
+                **task.fit_kwargs,
+            )
+            ref_reliability = _compute_marginal_reliability(
+                ref_result.model, task.theta_range, n_points=task.n_points
+            )
+            focal_reliability = _compute_marginal_reliability(
+                focal_result.model, task.theta_range, n_points=task.n_points
+            )
+        except _BOOTSTRAP_EXCEPTIONS:
+            difference = np.nan
+        else:
+            difference = ref_reliability - focal_reliability
+        differences.append(difference if np.isfinite(difference) else np.nan)
+    return differences
+
+
 def reliability_invariance(
     data: NDArray[np.int_],
     groups: NDArray[Any],
@@ -520,6 +578,7 @@ def reliability_invariance(
     n_points: int = 49,
     focal_group: Any | None = None,
     confidence_level: float = 0.95,
+    n_jobs: int = 1,
     **fit_kwargs: Any,
 ) -> dict[str, Any]:
     """Test whether reliability is invariant across groups.
@@ -547,6 +606,9 @@ def reliability_invariance(
         Label to treat as focal. By default, the second sorted group is focal.
     confidence_level : float
         Percentile bootstrap confidence level.
+    n_jobs : int
+        Number of worker processes for bootstrap refits. Use ``-1`` for all
+        available CPU cores. Default 1.
     **fit_kwargs
         Additional arguments passed to the group model fits.
 
@@ -563,6 +625,7 @@ def reliability_invariance(
         - 'reliability_diff_ci': Percentile bootstrap confidence interval
         - 'n_bootstrap_successful': Number of successful bootstrap fits
         - 'n_bootstrap_failed': Number of failed bootstrap fits
+        - 'n_jobs': Resolved bootstrap worker count
     """
     values, labels, theta_limits = _validate_drf_inputs(
         data=data,
@@ -577,6 +640,7 @@ def reliability_invariance(
         raise ValueError("n_bootstrap must be a nonnegative integer")
     if not np.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
         raise ValueError("confidence_level must be finite and in (0, 1)")
+    n_jobs = _validate_n_jobs(n_jobs)
 
     ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
         values, labels, focal_group=focal_group
@@ -603,6 +667,7 @@ def reliability_invariance(
         confidence_level=confidence_level,
         seed=seed,
         fit_kwargs=fit_kwargs,
+        n_jobs=n_jobs,
     )
     if np.isnan(bootstrap.standard_error):
         z_value = np.nan
@@ -624,4 +689,5 @@ def reliability_invariance(
         "n_bootstrap": n_bootstrap,
         "n_bootstrap_successful": bootstrap.n_successful,
         "n_bootstrap_failed": bootstrap.n_failed,
+        "n_jobs": n_jobs,
     }
