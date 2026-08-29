@@ -19,6 +19,7 @@ from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
 
 _PAIRWISE_CORRELATION_TARGET_ELEMENTS = 2_000_000
+_TESTLET_LIKELIHOOD_TARGET_ELEMENTS = 1_000_000
 
 
 def _validate_item_index(n_items: int, item_idx: int) -> int:
@@ -98,12 +99,107 @@ def _normal_quadrature(
     return nodes, weights
 
 
-def _logsumexp(values: NDArray[np.float64], axis: int) -> NDArray[np.float64]:
+def _marginalize_log_likelihood_inplace(
+    values: NDArray[np.float64],
+    log_weights: NDArray[np.float64],
+    axis: int,
+) -> NDArray[np.float64]:
+    """Marginalize a temporary likelihood array without another full copy."""
+    weight_shape = [1] * values.ndim
+    weight_shape[axis] = len(log_weights)
+    values += log_weights.reshape(weight_shape)
     maximum = np.max(values, axis=axis, keepdims=True)
-    return np.squeeze(
-        maximum + np.log(np.sum(np.exp(values - maximum), axis=axis, keepdims=True)),
-        axis=axis,
+    values -= maximum
+    np.exp(values, out=values)
+    return np.squeeze(maximum, axis=axis) + np.log(np.sum(values, axis=axis))
+
+
+def _log_probability_pair(
+    linear: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return clipped log-probability pairs while reusing one input-sized array."""
+    probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
+    log_complement = np.log1p(-probability)
+    np.log(probability, out=probability)
+    return probability, log_complement
+
+
+def _requested_likelihood_chunk_size(
+    chunk_size: int | None,
+    n_rows: int,
+) -> int:
+    """Validate a requested maximum row count."""
+    if chunk_size is None:
+        return max(1, n_rows)
+    if (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, Integral)
+        or chunk_size < 1
+    ):
+        raise MirtValidationError(
+            "chunk_size must be a positive integer",
+            parameter="chunk_size",
+            value=chunk_size,
+            expected=">= 1",
+        )
+    return max(1, min(n_rows, int(chunk_size)))
+
+
+def _largest_testlet_size(
+    positions: NDArray[np.intp],
+    n_testlets: int,
+) -> int:
+    if n_testlets == 0:
+        return 0
+    assigned = positions[positions >= 0]
+    return int(np.bincount(assigned, minlength=n_testlets).max(initial=0))
+
+
+def _paired_likelihood_chunk_size(
+    positions: NDArray[np.intp],
+    n_testlets: int,
+    n_quadpts: int,
+    n_rows: int,
+    chunk_size: int | None,
+) -> int:
+    """Bound the largest person-by-item-by-quadrature temporary."""
+    requested = _requested_likelihood_chunk_size(chunk_size, n_rows)
+    standalone_items = int(np.count_nonzero(positions < 0))
+    testlet_items = _largest_testlet_size(positions, n_testlets)
+    values_per_row = max(1, standalone_items, testlet_items * n_quadpts)
+    automatic = max(1, _TESTLET_LIKELIHOOD_TARGET_ELEMENTS // values_per_row)
+    return min(requested, automatic)
+
+
+def _batch_likelihood_chunk_sizes(
+    positions: NDArray[np.intp],
+    n_testlets: int,
+    n_quadpts: int,
+    n_patterns: int,
+    n_theta: int,
+    chunk_size: int | None,
+) -> tuple[int, int]:
+    """Bound response-pattern and theta chunks for a marginal grid."""
+    pattern_rows = _requested_likelihood_chunk_size(chunk_size, n_patterns)
+    standalone_items = int(np.count_nonzero(positions < 0))
+    testlet_items = _largest_testlet_size(positions, n_testlets)
+    theta_values = max(1, standalone_items, testlet_items * n_quadpts)
+    theta_rows = max(
+        1,
+        min(
+            max(1, n_theta),
+            _TESTLET_LIKELIHOOD_TARGET_ELEMENTS
+            // max(theta_values, pattern_rows * n_quadpts),
+        ),
     )
+    pattern_rows = min(
+        pattern_rows,
+        max(
+            1,
+            _TESTLET_LIKELIHOOD_TARGET_ELEMENTS // max(1, theta_rows * n_quadpts),
+        ),
+    )
+    return pattern_rows, theta_rows
 
 
 def _validate_binary_responses(
@@ -912,6 +1008,8 @@ class RandomTestletEffectsModel(TestletModel):
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
         """Compute log-likelihood integrating out testlet effects.
 
@@ -921,6 +1019,10 @@ class RandomTestletEffectsModel(TestletModel):
             Response matrix (n_persons, n_items).
         theta : NDArray
             General ability values (n_persons,).
+        chunk_size : int, optional
+            Maximum number of persons evaluated together. Automatic chunks
+            already bound quadrature working memory; use this to set a tighter
+            row limit.
 
         Returns
         -------
@@ -943,7 +1045,10 @@ class RandomTestletEffectsModel(TestletModel):
                 response_persons=len(response_codes),
             )
         return self._paired_marginal_log_likelihood(
-            response_codes, observed, theta_values[:, 0]
+            response_codes,
+            observed,
+            theta_values[:, 0],
+            chunk_size,
         )
 
     def _paired_marginal_log_likelihood(
@@ -951,8 +1056,9 @@ class RandomTestletEffectsModel(TestletModel):
         response_codes: NDArray[np.intp],
         observed: NDArray[np.bool_],
         theta_values: NDArray[np.float64],
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute one marginal likelihood at each person's theta value."""
+        """Compute bounded one-to-one response-pattern likelihoods."""
         nodes, weights = _normal_quadrature(self._n_quadpts)
         log_weights = np.log(weights)
         discrimination = self._parameters["discrimination"]
@@ -960,37 +1066,81 @@ class RandomTestletEffectsModel(TestletModel):
         difficulty = self._parameters["difficulty"]
         variances = self._parameters["testlet_variances"]
         likelihood = np.zeros(len(theta_values), dtype=np.float64)
-
         standalone = self._testlet_positions < 0
-        if np.any(standalone):
-            linear = (
-                theta_values[:, None] * discrimination[None, standalone]
-                - difficulty[None, standalone]
-            )
-            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
-            contributions = response_codes[:, standalone] * np.log(probability) + (
-                1 - response_codes[:, standalone]
-            ) * np.log1p(-probability)
-            likelihood += np.sum(
-                np.where(observed[:, standalone], contributions, 0.0), axis=1
-            )
-
+        testlet_components = []
         for position in range(self._n_testlets):
             items = self._testlet_positions == position
-            scale = np.sqrt(variances[position]) * loading[items]
-            linear = (
-                theta_values[:, None, None] * discrimination[None, items, None]
-                - difficulty[None, items, None]
-                + scale[None, :, None] * nodes[None, None, :]
+            testlet_components.append(
+                (
+                    items,
+                    discrimination[items],
+                    difficulty[items],
+                    np.sqrt(variances[position]) * loading[items],
+                )
             )
-            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
-            contributions = response_codes[:, items, None] * np.log(probability) + (
-                1 - response_codes[:, items, None]
-            ) * np.log1p(-probability)
-            conditional = np.sum(
-                np.where(observed[:, items, None], contributions, 0.0), axis=1
-            )
-            likelihood += _logsumexp(conditional + log_weights[None, :], axis=1)
+        rows_per_chunk = _paired_likelihood_chunk_size(
+            self._testlet_positions,
+            self._n_testlets,
+            self._n_quadpts,
+            len(theta_values),
+            chunk_size,
+        )
+
+        for start in range(0, len(theta_values), rows_per_chunk):
+            stop = min(start + rows_per_chunk, len(theta_values))
+            theta_chunk = theta_values[start:stop]
+            codes_chunk = response_codes[start:stop]
+            observed_chunk = observed[start:stop]
+            chunk_likelihood = likelihood[start:stop]
+
+            if np.any(standalone):
+                linear = (
+                    theta_chunk[:, None] * discrimination[None, standalone]
+                    - difficulty[None, standalone]
+                )
+                log_probability, log_complement = _log_probability_pair(linear)
+                successes = observed_chunk[:, standalone] & (
+                    codes_chunk[:, standalone] == 1
+                )
+                failures = observed_chunk[:, standalone] & (
+                    codes_chunk[:, standalone] == 0
+                )
+                chunk_likelihood += np.sum(
+                    successes * log_probability + failures * log_complement,
+                    axis=1,
+                )
+
+            for (
+                items,
+                item_discrimination,
+                item_difficulty,
+                scale,
+            ) in testlet_components:
+                linear = (
+                    theta_chunk[:, None, None] * item_discrimination[None, :, None]
+                    - item_difficulty[None, :, None]
+                    + scale[None, :, None] * nodes[None, None, :]
+                )
+                log_probability, log_complement = _log_probability_pair(linear)
+                successes = observed_chunk[:, items] & (codes_chunk[:, items] == 1)
+                failures = observed_chunk[:, items] & (codes_chunk[:, items] == 0)
+                conditional = np.einsum(
+                    "pi,piq->pq",
+                    successes,
+                    log_probability,
+                    optimize=True,
+                )
+                conditional += np.einsum(
+                    "pi,piq->pq",
+                    failures,
+                    log_complement,
+                    optimize=True,
+                )
+                chunk_likelihood += _marginalize_log_likelihood_inplace(
+                    conditional,
+                    log_weights,
+                    axis=1,
+                )
         return likelihood
 
     def _marginal_log_likelihood_batch(
@@ -998,8 +1148,9 @@ class RandomTestletEffectsModel(TestletModel):
         response_codes: NDArray[np.intp],
         observed: NDArray[np.bool_],
         theta_values: NDArray[np.float64],
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute every response-pattern by general-ability likelihood."""
+        """Compute a bounded response-pattern by general-ability grid."""
         nodes, weights = _normal_quadrature(self._n_quadpts)
         log_weights = np.log(weights)
         discrimination = self._parameters["discrimination"]
@@ -1011,49 +1162,101 @@ class RandomTestletEffectsModel(TestletModel):
         likelihood = np.zeros(
             (len(response_codes), len(theta_values)), dtype=np.float64
         )
-
         standalone = self._testlet_positions < 0
-        if np.any(standalone):
-            linear = (
-                theta_values[:, None] * discrimination[None, standalone]
-                - difficulty[None, standalone]
-            )
-            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
-            likelihood += successes[:, standalone] @ np.log(probability).T
-            likelihood += failures[:, standalone] @ np.log1p(-probability).T
-
+        testlet_components = []
         for position in range(self._n_testlets):
             items = self._testlet_positions == position
-            scale = np.sqrt(variances[position]) * loading[items]
-            linear = (
-                theta_values[:, None, None] * discrimination[None, items, None]
-                - difficulty[None, items, None]
-                + scale[None, :, None] * nodes[None, None, :]
+            testlet_components.append(
+                (
+                    items,
+                    discrimination[items],
+                    difficulty[items],
+                    np.sqrt(variances[position]) * loading[items],
+                )
             )
-            probability = np.clip(sigmoid(linear), PROB_EPSILON, 1.0 - PROB_EPSILON)
-            conditional = np.einsum(
-                "pi,tiq->ptq",
-                successes[:, items],
-                np.log(probability),
-                optimize=True,
-            )
-            conditional += np.einsum(
-                "pi,tiq->ptq",
-                failures[:, items],
-                np.log1p(-probability),
-                optimize=True,
-            )
-            likelihood += _logsumexp(conditional + log_weights[None, None, :], axis=2)
+        pattern_rows, theta_rows = _batch_likelihood_chunk_sizes(
+            self._testlet_positions,
+            self._n_testlets,
+            self._n_quadpts,
+            len(response_codes),
+            len(theta_values),
+            chunk_size,
+        )
+
+        for theta_start in range(0, len(theta_values), theta_rows):
+            theta_stop = min(theta_start + theta_rows, len(theta_values))
+            theta_chunk = theta_values[theta_start:theta_stop]
+            theta_slice = slice(theta_start, theta_stop)
+
+            if np.any(standalone):
+                linear = (
+                    theta_chunk[:, None] * discrimination[None, standalone]
+                    - difficulty[None, standalone]
+                )
+                log_probability, log_complement = _log_probability_pair(linear)
+                for pattern_start in range(0, len(response_codes), pattern_rows):
+                    pattern_stop = min(
+                        pattern_start + pattern_rows, len(response_codes)
+                    )
+                    pattern_slice = slice(pattern_start, pattern_stop)
+                    likelihood[pattern_slice, theta_slice] += (
+                        successes[pattern_slice, standalone] @ log_probability.T
+                        + failures[pattern_slice, standalone] @ log_complement.T
+                    )
+
+            for (
+                items,
+                item_discrimination,
+                item_difficulty,
+                scale,
+            ) in testlet_components:
+                linear = (
+                    theta_chunk[:, None, None] * item_discrimination[None, :, None]
+                    - item_difficulty[None, :, None]
+                    + scale[None, :, None] * nodes[None, None, :]
+                )
+                log_probability, log_complement = _log_probability_pair(linear)
+                for pattern_start in range(0, len(response_codes), pattern_rows):
+                    pattern_stop = min(
+                        pattern_start + pattern_rows, len(response_codes)
+                    )
+                    pattern_slice = slice(pattern_start, pattern_stop)
+                    conditional = np.einsum(
+                        "pi,tiq->ptq",
+                        successes[pattern_slice, items],
+                        log_probability,
+                        optimize=True,
+                    )
+                    conditional += np.einsum(
+                        "pi,tiq->ptq",
+                        failures[pattern_slice, items],
+                        log_complement,
+                        optimize=True,
+                    )
+                    likelihood[pattern_slice, theta_slice] += (
+                        _marginalize_log_likelihood_inplace(
+                            conditional,
+                            log_weights,
+                            axis=2,
+                        )
+                    )
         return likelihood
 
     def log_likelihood(
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute conditional or random-effect-marginal log likelihood."""
+        """Compute conditional or random-effect-marginal likelihood.
+
+        Marginal evaluation uses automatic bounded chunks. ``chunk_size`` can
+        impose a tighter maximum number of response rows per chunk.
+        """
         response_codes, observed = _validate_binary_responses(responses, self.n_items)
         theta_values = self._prepare_theta(theta)
+        _requested_likelihood_chunk_size(chunk_size, len(response_codes))
         if len(theta_values) != len(response_codes):
             raise MirtDataError(
                 "theta and responses must contain the same number of persons",
@@ -1062,7 +1265,10 @@ class RandomTestletEffectsModel(TestletModel):
             )
         if theta_values.shape[1] == 1:
             return self._paired_marginal_log_likelihood(
-                response_codes, observed, theta_values[:, 0]
+                response_codes,
+                observed,
+                theta_values[:, 0],
+                chunk_size,
             )
         normalized = np.where(observed, response_codes, -1)
         return super().log_likelihood(normalized, theta_values)
@@ -1071,13 +1277,23 @@ class RandomTestletEffectsModel(TestletModel):
         self,
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
+        *,
+        chunk_size: int | None = None,
     ) -> NDArray[np.float64]:
-        """Compute conditional or marginal likelihood over a theta grid."""
+        """Compute a conditional or marginal likelihood grid.
+
+        Marginal grids are chunked across response patterns and theta points.
+        ``chunk_size`` can impose a tighter response-pattern row limit.
+        """
         response_codes, observed = _validate_binary_responses(responses, self.n_items)
         theta_values = self._prepare_theta(theta)
+        _requested_likelihood_chunk_size(chunk_size, len(response_codes))
         if theta_values.shape[1] == 1:
             return self._marginal_log_likelihood_batch(
-                response_codes, observed, theta_values[:, 0]
+                response_codes,
+                observed,
+                theta_values[:, 0],
+                chunk_size,
             )
         normalized = np.where(observed, response_codes, -1)
         return super().log_likelihood_batch(normalized, theta_values)
