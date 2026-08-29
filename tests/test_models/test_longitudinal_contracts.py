@@ -117,7 +117,7 @@ def test_grm_simulation_is_polytomous_and_reproducible() -> None:
     assert np.min(responses) == 0
     assert np.max(responses) == 4
     assert set(np.unique(responses)).issubset(set(range(5)))
-    for left, right in zip(first, second):
+    for left, right in zip(first, second, strict=True):
         assert_array_equal(left, right)
 
 

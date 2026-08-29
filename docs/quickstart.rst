@@ -81,8 +81,10 @@ After fitting a model, you can score new respondents:
    print(score_result.theta)
 
 EAP scoring automatically evaluates large respondent sets in memory-bounded
-batches. Use ``batch_size`` when a deployment needs an explicit upper bound on
-the number of respondents evaluated at once:
+batches. It detects repetition-heavy response matrices and reuses posterior
+calculations when pattern compression is expected to improve throughput. Use
+``batch_size`` when a deployment needs an explicit upper bound on the number of
+response rows evaluated at once:
 
 .. code-block:: python
 
@@ -94,7 +96,8 @@ the number of respondents evaluated at once:
    )
 
 Smaller batches reduce peak working memory; larger batches can improve throughput
-on systems with ample memory. The estimates and standard errors are unchanged.
+on systems with ample memory. Compressed rows are expanded back to their original
+respondent order without changing estimates or standard errors.
 
 Model Fit
 ---------

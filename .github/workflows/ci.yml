@@ -63,10 +63,10 @@ jobs:
           uv run maturin develop --release
 
       - name: Run ruff check
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ benchmarks/
 
       - name: Run ruff format check
-        run: uv run ruff format --check src/ tests/
+        run: uv run ruff format --check src/ tests/ benchmarks/
 
   typecheck:
     runs-on: ubuntu-latest
@@ -218,7 +218,21 @@ jobs:
         env:
           MIRT_IMPORT_THRESHOLD_SECONDS: "2.5"
           MIRT_FIT_THRESHOLD_SECONDS: "12.0"
+          MIRT_SCORE_THRESHOLD_SECONDS: "4.0"
         run: uv run pytest tests/test_performance_smoke.py -v --tb=short
+
+      - name: Record structured scoring benchmark
+        run: |
+          uv run python benchmarks/run_benchmarks.py \
+            --suite scoring --persons 2000 --items 30 \
+            --repeats 3 --warmups 1 --json benchmark-report.json
+
+      - name: Upload benchmark report
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        with:
+          name: benchmark-report-${{ github.sha }}
+          path: benchmark-report.json
+          retention-days: 30
 
   slow-tests:
     name: Slow Test Suite

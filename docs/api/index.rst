@@ -11,7 +11,6 @@ Core Functions
    :nosignatures:
 
    fit_mirt
-   fscores
    itemfit
    personfit
    dif
@@ -105,6 +104,9 @@ Diagnostics
    sibtest
    diagnostics.compute_itemfit
    diagnostics.compute_s_x2
+   diagnostics.compute_ld_statistics
+   diagnostics.compute_ld_chi2
+   diagnostics.flag_ld_pairs
    diagnostics.adjust_p_values
    diagnostics.psis_loo
    diagnostics.waic
@@ -134,6 +136,7 @@ Scoring
    :nosignatures:
 
    fscores
+   ability_posterior
 
 Cross-validation
 ----------------
@@ -243,4 +246,5 @@ Results
 
    FitResult
    ScoreResult
+   AbilityPosteriorResult
    ResponseTimeResult

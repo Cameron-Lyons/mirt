@@ -30,6 +30,11 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt.constants import PROB_EPSILON
+from mirt.diagnostics.multiple_testing import (
+    PValueAdjustment,
+    _validate_p_value_adjustment,
+    adjust_p_values,
+)
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -52,9 +57,16 @@ class LDResult:
     q3_flagged : list of tuple
         List of (item_i, item_j, q3_value) tuples flagged for LD
     chi2_flagged : list of tuple
-        List of (item_i, item_j, chi2_value, p_value) tuples flagged for LD
+        List of (item_i, item_j, chi2_value, selected_p_value) tuples flagged
+        for LD. The final value reflects ``p_adjustment``.
     item_names : list of str or None
         Item names for labeling
+    chi2_p_value_matrix : NDArray or None
+        Raw chi-square p-values for every eligible item pair.
+    chi2_adjusted_p_value_matrix : NDArray or None
+        Multiplicity-adjusted chi-square p-values for every eligible pair.
+    p_adjustment : str
+        Multiple-testing adjustment used for chi-square pair selection.
     """
 
     q3_matrix: NDArray[np.float64]
@@ -64,6 +76,9 @@ class LDResult:
     q3_flagged: list[tuple[int, int, float]]
     chi2_flagged: list[tuple[int, int, float, float]]
     item_names: list[str] | None = None
+    chi2_p_value_matrix: NDArray[np.float64] | None = None
+    chi2_adjusted_p_value_matrix: NDArray[np.float64] | None = None
+    p_adjustment: PValueAdjustment = "none"
 
     def summary(self) -> str:
         """Generate a formatted summary of LD results."""
@@ -97,18 +112,21 @@ class LDResult:
             lines.append("")
 
         chi2_upper = self.ld_chi2_matrix[np.triu_indices_from(self.ld_chi2_matrix, k=1)]
+        p_value_label = (
+            "p" if self.p_adjustment == "none" else f"{self.p_adjustment}-adjusted p"
+        )
         lines.extend(
             [
                 "LD Chi-Square Statistics:",
                 f"  Mean χ²:        {np.nanmean(chi2_upper):.4f}",
                 f"  Max χ²:         {np.nanmax(chi2_upper):.4f}",
-                f"  Pairs p < 0.05: {len(self.chi2_flagged)}",
+                f"  Pairs {p_value_label} < 0.05: {len(self.chi2_flagged)}",
                 "",
             ]
         )
 
         if self.chi2_flagged:
-            lines.append("Flagged item pairs (p < 0.05):")
+            lines.append(f"Flagged item pairs ({p_value_label} < 0.05):")
             for i, j, chi2, p in sorted(self.chi2_flagged, key=lambda x: x[3])[:10]:
                 if self.item_names:
                     lines.append(
@@ -139,6 +157,7 @@ def compute_ld_statistics(
     n_quadpts: int = 21,
     q3_threshold: float = 0.2,
     alpha: float = 0.05,
+    p_adjust: PValueAdjustment = "none",
 ) -> LDResult:
     """Compute local dependence statistics for all item pairs.
 
@@ -156,12 +175,15 @@ def compute_ld_statistics(
         Threshold for flagging Q3 values (default 0.2)
     alpha : float
         Significance level for flagging LD χ² values
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, default="none"
+        Multiple-testing adjustment across eligible item pairs.
 
     Returns
     -------
     LDResult
         Object containing all LD statistics and flagged pairs
     """
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
 
@@ -195,20 +217,31 @@ def compute_ld_statistics(
     ]
 
     chi2_values = ld_chi2_matrix[rows, columns]
-    finite = np.isfinite(chi2_values)
-    p_values = np.full(chi2_values.shape, np.nan)
-    p_values[finite] = stats.chi2.sf(chi2_values[finite], df=1)
-    chi2_mask = finite & (p_values < alpha)
+    p_values, adjusted_p_values = _chi2_pair_p_values(chi2_values, p_adjust)
+    chi2_mask = adjusted_p_values < alpha
     chi2_flagged = [
         (int(i), int(j), float(value), float(p_value))
         for i, j, value, p_value in zip(
             rows[chi2_mask],
             columns[chi2_mask],
             chi2_values[chi2_mask],
-            p_values[chi2_mask],
+            adjusted_p_values[chi2_mask],
             strict=True,
         )
     ]
+
+    chi2_p_value_matrix = _symmetric_pair_matrix(
+        n_items,
+        rows,
+        columns,
+        p_values,
+    )
+    chi2_adjusted_p_value_matrix = _symmetric_pair_matrix(
+        n_items,
+        rows,
+        columns,
+        adjusted_p_values,
+    )
 
     item_names = model.item_names if hasattr(model, "item_names") else None
 
@@ -220,6 +253,9 @@ def compute_ld_statistics(
         q3_flagged=q3_flagged,
         chi2_flagged=chi2_flagged,
         item_names=item_names,
+        chi2_p_value_matrix=chi2_p_value_matrix,
+        chi2_adjusted_p_value_matrix=chi2_adjusted_p_value_matrix,
+        p_adjustment=p_adjust,
     )
 
 
@@ -281,6 +317,7 @@ def compute_ld_chi2(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
+    p_adjust: PValueAdjustment = "none",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute Chen & Thissen's LD χ² statistics.
 
@@ -294,17 +331,20 @@ def compute_ld_chi2(
         Ability estimates
     n_quadpts : int
         Number of quadrature points
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, default="none"
+        Multiple-testing adjustment across eligible item pairs.
 
     Returns
     -------
     chi2_matrix : NDArray
         Matrix of LD χ² statistics
     p_value_matrix : NDArray
-        Matrix of p-values
+        Matrix of raw or adjusted p-values, according to ``p_adjust``.
     """
     from mirt._backend_config import should_use_rust
     from mirt._rust_backend import compute_ld_chi2_matrix as rust_compute_chi2
 
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
 
@@ -336,12 +376,12 @@ def compute_ld_chi2(
     p_value_matrix = np.zeros_like(chi2_matrix)
     rows, columns = np.triu_indices(n_items, k=1)
     values = chi2_matrix[rows, columns]
-    finite = np.isfinite(values)
-    p_values = stats.chi2.sf(values[finite], df=1)
-    finite_rows = rows[finite]
-    finite_columns = columns[finite]
-    p_value_matrix[finite_rows, finite_columns] = p_values
-    p_value_matrix[finite_columns, finite_rows] = p_values
+    _, p_values = _chi2_pair_p_values(values, p_adjust)
+    valid = ~np.isnan(p_values)
+    valid_rows = rows[valid]
+    valid_columns = columns[valid]
+    p_value_matrix[valid_rows, valid_columns] = p_values[valid]
+    p_value_matrix[valid_columns, valid_rows] = p_values[valid]
 
     return chi2_matrix, p_value_matrix
 
@@ -507,6 +547,7 @@ def flag_ld_pairs(
     q3_threshold: float = 0.2,
     chi2_alpha: float = 0.05,
     method: str = "q3",
+    p_adjust: PValueAdjustment | None = None,
 ) -> list[tuple[int, int]]:
     """Get list of item pairs flagged for local dependence.
 
@@ -520,6 +561,9 @@ def flag_ld_pairs(
         Significance level for chi-square test
     method : str
         Method to use: "q3", "chi2", or "both"
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"} or None
+        Multiple-testing adjustment for chi-square selection. If omitted, use
+        the adjustment stored on ``ld_result``.
 
     Returns
     -------
@@ -552,6 +596,9 @@ def flag_ld_pairs(
             lower=0.0,
             upper=1.0,
         )
+        if p_adjust is None:
+            p_adjust = ld_result.p_adjustment
+        p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
 
     rows, columns = np.triu_indices_from(ld_result.q3_matrix, k=1)
     selected = np.zeros(rows.size, dtype=bool)
@@ -562,8 +609,8 @@ def flag_ld_pairs(
 
     if method in ("chi2", "both"):
         chi2_values = ld_result.ld_chi2_matrix[rows, columns]
-        critical_value = stats.chi2.isf(chi2_alpha, df=1)
-        selected |= chi2_values > critical_value
+        _, selected_p_values = _chi2_pair_p_values(chi2_values, p_adjust)
+        selected |= selected_p_values < chi2_alpha
 
     return [
         (int(i), int(j)) for i, j in zip(rows[selected], columns[selected], strict=True)
@@ -603,18 +650,25 @@ def ld_summary_table(
     n_items = ld_result.q3_matrix.shape[0]
     rows, columns = np.triu_indices(n_items, k=1)
     q3_values = ld_result.q3_matrix[rows, columns]
+    chi2_values = ld_result.ld_chi2_matrix[rows, columns]
+    if ld_result.chi2_adjusted_p_value_matrix is None:
+        _, p_values = _chi2_pair_p_values(chi2_values, ld_result.p_adjustment)
+    else:
+        p_values = ld_result.chi2_adjusted_p_value_matrix[rows, columns]
+
     selected = _top_absolute_pair_indices(q3_values, min(int(top_n), rows.size))
     rows = rows[selected]
     columns = columns[selected]
     q3_values = q3_values[selected]
-    chi2_values = ld_result.ld_chi2_matrix[rows, columns]
+    chi2_values = chi2_values[selected]
+    p_values = p_values[selected]
     adjusted_values = ld_result.adj_residual_corr[rows, columns]
-    p_values = np.full(chi2_values.shape, np.nan)
-    valid = ~np.isnan(chi2_values)
-    p_values[valid] = stats.chi2.sf(chi2_values[valid], df=1)
+
+    p_value_heading = "p-value" if ld_result.p_adjustment == "none" else "adj p"
 
     lines = [
-        f"{'Item i':<8} {'Item j':<8} {'Q3':>8} {'Adj r':>8} {'LD χ²':>10} {'p-value':>10}",
+        f"{'Item i':<8} {'Item j':<8} {'Q3':>8} {'Adj r':>8} "
+        f"{'LD χ²':>10} {p_value_heading:>10}",
         "-" * 62,
     ]
 
@@ -644,6 +698,30 @@ def ld_summary_table(
         )
 
     return "\n".join(lines)
+
+
+def _chi2_pair_p_values(
+    chi2_values: NDArray[np.float64],
+    p_adjust: PValueAdjustment,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return raw and adjusted p-values for one upper-triangle family."""
+    raw = np.full(chi2_values.shape, np.nan)
+    valid = ~np.isnan(chi2_values)
+    raw[valid] = stats.chi2.sf(chi2_values[valid], df=1)
+    return raw, adjust_p_values(raw, p_adjust)
+
+
+def _symmetric_pair_matrix(
+    n_items: int,
+    rows: NDArray[np.intp],
+    columns: NDArray[np.intp],
+    values: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Place upper-triangle pair values into a symmetric matrix."""
+    matrix = np.full((n_items, n_items), np.nan)
+    matrix[rows, columns] = values
+    matrix[columns, rows] = values
+    return matrix
 
 
 def _validate_finite_pair_scalar(

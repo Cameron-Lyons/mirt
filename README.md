@@ -35,6 +35,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Stopping rules: SE threshold, max items, classification
 - Exposure control: Sympson-Hetter, randomesque, progressive
 - Content balancing: Blueprint constraints
+- Fixed and parallel form assembly: Exact optimization with content, security, cost, reuse, and overlap constraints
 - **MCAT**: Multidimensional CAT with D-optimality and trace criteria
 
 ### Diagnostics & DIF
@@ -45,7 +46,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **GRDIF**: Generalized Residual DIF for multiple groups with robust scaling (MAD/IQR)
 - **DTF/DRF**: Differential test/response functioning
 - **SIBTEST**: Simultaneous item bias test
-- **Local dependence**: Q3, chi-square residuals
+- **Local dependence**: Q3, chi-square residuals, and pairwise multiplicity control
 
 ### Additional Features
 - Custom dichotomous, ordinal, multidimensional, and latent group models
@@ -172,6 +173,13 @@ ml = mirt.fscores(result, responses, method="ML")
 
 print(eap.theta)
 print(eap.standard_error)
+
+# Convert latent scores to a T-score scale while propagating uncertainty.
+t_scores = eap.linear_transform(multiplier=10, offset=50)
+percentile_ranks = t_scores.normal_percentile_ranks(
+    reference_mean=50,
+    reference_sd=10,
+)
 ```
 
 ### Diagnostics
@@ -190,6 +198,15 @@ aberrant = person_fit[person_fit["Zh"] < -2]
 
 fit_indices = mirt.compute_fit_indices(result.model, responses)
 print(fit_indices)
+
+from mirt.diagnostics import compute_ld_statistics
+
+ld = compute_ld_statistics(
+    result.model,
+    responses,
+    p_adjust="fdr_bh",
+)
+print(ld.chi2_adjusted_p_value_matrix)
 
 results = [result_1pl, result_2pl, result_3pl]
 comparison = mirt.compare_models(results)
@@ -649,6 +666,28 @@ uv run pytest tests/test_performance_smoke.py
 
 uv run python benchmarks/run_benchmarks.py
 ```
+
+The benchmark runner supports warmups, individual suites, structured JSON output,
+and regression-sensitive baseline comparisons without extra dependencies:
+
+```bash
+# Record a reusable baseline for all workloads.
+uv run python benchmarks/run_benchmarks.py \
+  --repeats 5 --warmups 1 --json benchmark-baseline.json
+
+# Run only scoring and fail if its median slows by more than 10%.
+uv run python benchmarks/run_benchmarks.py \
+  --suite scoring --repeats 5 --warmups 1 \
+  --baseline benchmark-baseline.json --max-regression 10 \
+  --json benchmark-current.json
+```
+
+Reports include workload sizes, backend details, runtime versions, every timing
+sample, distribution summaries, and comparison status. Baselines with different
+item counts, person counts, or effective backends are rejected instead of producing
+misleading ratios. A detected regression returns a nonzero process status for CI use.
+The hosted performance job also publishes its structured scoring report as a retained
+build artifact, making individual revisions directly comparable.
 
 ## API Stability (v1.1)
 

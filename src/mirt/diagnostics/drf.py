@@ -385,8 +385,8 @@ def plot_drf(
     """
     try:
         import matplotlib.pyplot as plt
-    except ImportError:
-        raise ImportError("matplotlib required for plotting")
+    except ImportError as exc:
+        raise ImportError("matplotlib required for plotting") from exc
 
     if ax is None:
         _, axes = plt.subplots(1, 2, figsize=(12, 5))

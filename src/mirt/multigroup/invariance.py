@@ -431,4 +431,4 @@ def get_invariance_hierarchy_pairs() -> list[tuple[str, str]]:
     list of tuple
         Pairs of (free_level, constrained_level).
     """
-    return list(zip(INVARIANCE_HIERARCHY, INVARIANCE_HIERARCHY[1:]))
+    return list(zip(INVARIANCE_HIERARCHY, INVARIANCE_HIERARCHY[1:], strict=False))

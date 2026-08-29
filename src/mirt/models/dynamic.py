@@ -1544,7 +1544,9 @@ class BKTModel:
                 alpha[first_trial] /= scaling[first_trial]
 
             transition = self.transition_matrix(skill_idx)
-            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+            for previous_trial, trial in zip(
+                trial_indices[:-1], trial_indices[1:], strict=True
+            ):
                 alpha[trial] = (
                     alpha[previous_trial] @ transition
                 ) * self._emission_pair(int(responses[trial]), skill_idx)
@@ -1678,7 +1680,9 @@ class BKTModel:
             beta[trial_indices[-1]] = 1.0
             transition = self.transition_matrix(skill_idx)
 
-            for trial, next_trial in zip(trial_indices[-2::-1], trial_indices[:0:-1]):
+            for trial, next_trial in zip(
+                trial_indices[-2::-1], trial_indices[:0:-1], strict=True
+            ):
                 emission = self._emission_pair(int(responses[next_trial]), skill_idx)
                 beta[trial] = transition @ (emission * beta[next_trial])
                 if scaling[next_trial] > 0:
@@ -1964,7 +1968,9 @@ class BKTModel:
             )
 
             transition = self.transition_matrix(skill_idx)
-            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+            for previous_trial, trial in zip(
+                trial_indices[:-1], trial_indices[1:], strict=True
+            ):
                 for state in range(2):
                     candidates = delta[previous_trial] + np.log(
                         transition[:, state] + 1e-300
@@ -1977,7 +1983,7 @@ class BKTModel:
 
             path[trial_indices[-1]] = int(np.argmax(delta[trial_indices[-1]]))
             for previous_trial, trial in zip(
-                trial_indices[-2::-1], trial_indices[:0:-1]
+                trial_indices[-2::-1], trial_indices[:0:-1], strict=True
             ):
                 path[previous_trial] = psi[trial, path[trial]]
 
@@ -3206,7 +3212,7 @@ class NonlinearGrowthModel:
 
     def compute_theta(
         self,
-        time_values: NDArray[np.float64],
+        time_values: float | NDArray[np.float64],
         asymptote: float | NDArray[np.float64] | None = None,
         rate: float | NDArray[np.float64] | None = None,
         inflection: float | NDArray[np.float64] | None = None,
@@ -3215,19 +3221,20 @@ class NonlinearGrowthModel:
 
         Parameters
         ----------
-        time_values : NDArray
-            Time points.
+        time_values : float or NDArray
+            One or more finite time points.
         asymptote : float or NDArray, optional
-            Individual asymptote(s).
+            One shared asymptote or one asymptote per person.
         rate : float or NDArray, optional
-            Individual rate(s).
+            One shared rate or one rate per person.
         inflection : float or NDArray, optional
-            Individual inflection point(s).
+            One shared inflection point or one point per person.
 
         Returns
         -------
         NDArray
-            Ability values.
+            Ability values with singleton person or time axes removed, matching
+            the method's existing return-shape contract.
         """
         if asymptote is None:
             asymptote = self.asymptote
@@ -3236,34 +3243,47 @@ class NonlinearGrowthModel:
         if inflection is None:
             inflection = self.inflection
 
-        asymptote = np.atleast_1d(asymptote)
-        rate = np.atleast_1d(rate)
-        inflection = np.atleast_1d(inflection)
+        times = np.asarray(time_values, dtype=np.float64)
+        if times.ndim == 0:
+            times = times.reshape(1)
+        if times.ndim != 1 or times.size == 0:
+            raise ValueError("time_values must be a non-empty scalar or vector")
+        if not np.all(np.isfinite(times)):
+            raise ValueError("time_values must contain only finite values")
 
-        n_persons = max(len(asymptote), len(rate), len(inflection))
-        time_values = np.atleast_1d(time_values)
-        n_times = len(time_values)
+        parameters = []
+        for name, values in (
+            ("asymptote", asymptote),
+            ("rate", rate),
+            ("inflection", inflection),
+        ):
+            parameter = np.asarray(values, dtype=np.float64)
+            if parameter.ndim == 0:
+                parameter = parameter.reshape(1)
+            if parameter.ndim != 1 or parameter.size == 0:
+                raise ValueError(f"{name} must be a non-empty scalar or vector")
+            if not np.all(np.isfinite(parameter)):
+                raise ValueError(f"{name} must contain only finite values")
+            parameters.append(parameter)
 
-        if len(asymptote) == 1:
-            asymptote = np.full(n_persons, asymptote[0])
-        if len(rate) == 1:
-            rate = np.full(n_persons, rate[0])
-        if len(inflection) == 1:
-            inflection = np.full(n_persons, inflection[0])
+        asymptotes, rates, inflections = parameters
+        n_persons = max(value.size for value in parameters)
+        if any(value.size not in (1, n_persons) for value in parameters):
+            raise ValueError("growth parameters have incompatible person counts")
 
-        theta = np.zeros((n_persons, n_times))
+        times = times[None, :]
+        asymptotes = asymptotes[:, None]
+        rates = rates[:, None]
+        inflections = inflections[:, None]
 
-        for i in range(n_persons):
-            if self.growth_type == "exponential":
-                theta[i] = asymptote[i] * (1 - np.exp(-rate[i] * time_values))
-            elif self.growth_type == "logistic":
-                theta[i] = asymptote[i] / (
-                    1 + np.exp(-rate[i] * (time_values - inflection[i]))
-                )
-            elif self.growth_type == "gompertz":
-                theta[i] = asymptote[i] * np.exp(
-                    -np.exp(-rate[i] * (time_values - inflection[i]))
-                )
+        if self.growth_type == "exponential":
+            theta = asymptotes * (1.0 - np.exp(-rates * times))
+        elif self.growth_type == "logistic":
+            theta = asymptotes * sigmoid(rates * (times - inflections))
+        elif self.growth_type == "gompertz":
+            theta = asymptotes * np.exp(-np.exp(-rates * (times - inflections)))
+        else:
+            raise ValueError(f"Unknown growth type: {self.growth_type}")
 
         return theta.squeeze()
 
@@ -3700,7 +3720,7 @@ class GrowthMixtureModel:
 
         intercept_variance, slope_variance, residual_variance = variances
         patterns = []
-        for pattern, rows in zip(unique_patterns, row_groups):
+        for pattern, rows in zip(unique_patterns, row_groups, strict=True):
             columns = np.flatnonzero(pattern)
             covariance = _GrowthCovariance.from_time_values(
                 times[columns],

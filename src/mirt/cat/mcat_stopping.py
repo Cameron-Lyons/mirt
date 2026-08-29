@@ -412,7 +412,7 @@ class CombinedMCATStop(MCATStoppingRule):
         results = [rule.should_stop(state) for rule in self.rules]
 
         if self.operator == "or":
-            for rule, result in zip(self.rules, results):
+            for rule, result in zip(self.rules, results, strict=True):
                 if result:
                     self._triggered_rule = rule
                     return True

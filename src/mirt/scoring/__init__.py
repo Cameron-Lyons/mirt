@@ -18,6 +18,7 @@ _LAZY_IMPORTS = {
     "MAPScorer": ("mirt.scoring.map", "MAPScorer"),
     "MLScorer": ("mirt.scoring.ml", "MLScorer"),
     "WLEScorer": ("mirt.scoring.wle", "WLEScorer"),
+    "ability_posterior": ("mirt.scoring.eap", "ability_posterior"),
     "eapsum": ("mirt.scoring.eapsum", "eapsum"),
     "sum_score_to_theta": ("mirt.scoring.eapsum", "sum_score_to_theta"),
 }
@@ -69,9 +70,10 @@ def fscores(
         Number of response patterns to optimize in parallel for MAP, ML, and
         WLE scoring. ``-1`` uses all available CPU cores.
     batch_size : int, optional
-        Maximum respondents per EAP likelihood batch. The default chooses a
-        memory-bounded size automatically. Set an explicit value to control
-        peak working memory. Other scoring methods ignore this option.
+        Maximum response rows per EAP likelihood batch. Repetition-heavy data
+        are compressed to unique patterns when beneficial and expanded back to
+        respondents. The default chooses a memory-bounded size automatically.
+        Other scoring methods ignore this option.
 
     Returns
     -------
@@ -159,6 +161,7 @@ def fscores(
 
 __all__ = [
     "fscores",
+    "ability_posterior",
     "EAPScorer",
     "EAPSumScorer",
     "MAPScorer",

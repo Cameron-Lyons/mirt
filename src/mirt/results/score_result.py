@@ -1,4 +1,4 @@
-"""Person-score result container and uncertainty helpers."""
+"""Person-score result container, uncertainty, and scale helpers."""
 
 from __future__ import annotations
 
@@ -113,6 +113,59 @@ class ScoreResult:
         margin = z_crit * self.standard_error
         return self.theta - margin, self.theta + margin
 
+    def linear_transform(
+        self,
+        multiplier: ArrayLike = 1.0,
+        offset: ArrayLike = 0.0,
+    ) -> Self:
+        """Return scores on a linearly transformed reporting scale.
+
+        The transformed score is ``multiplier * theta + offset`` and its
+        standard error is ``abs(multiplier) * standard_error``. Parameters may
+        be scalars or one-dimensional arrays with one value per factor, so a
+        multidimensional result can use a different reporting scale for each
+        factor. A T-score scale, for example, uses ``multiplier=10`` and
+        ``offset=50``.
+
+        The returned result retains the scoring method and person identifiers.
+        This result is not modified.
+        """
+        factors = self._factor_parameters(
+            multiplier,
+            name="multiplier",
+            require_nonzero=True,
+        )
+        offsets = self._factor_parameters(offset, name="offset")
+        return type(self)(
+            theta=self.theta * factors + offsets,
+            standard_error=self.standard_error * np.abs(factors),
+            method=self.method,
+            person_ids=self.person_ids,
+        )
+
+    def normal_percentile_ranks(
+        self,
+        reference_mean: ArrayLike = 0.0,
+        reference_sd: ArrayLike = 1.0,
+    ) -> NDArray[np.float64]:
+        """Return percentile ranks against normal reference distributions.
+
+        Reference parameters may be scalars or one-dimensional arrays with one
+        value per factor. The returned values range from 0 to 100 and preserve
+        the score array shape. Unknown scores remain ``NaN``.
+        """
+        means = self._factor_parameters(reference_mean, name="reference_mean")
+        standard_deviations = self._factor_parameters(
+            reference_sd,
+            name="reference_sd",
+            require_positive=True,
+        )
+
+        from scipy import special
+
+        standardized = (self.theta - means) / standard_deviations
+        return np.asarray(100.0 * special.ndtr(standardized), dtype=np.float64)
+
     def classification_probabilities(
         self,
         cut_score: ArrayLike = 0.0,
@@ -195,6 +248,73 @@ class ScoreResult:
                 value=cuts.shape,
                 expected=str(self.theta.shape),
             ) from exc
+
+    def _factor_parameters(
+        self,
+        value: ArrayLike,
+        *,
+        name: str,
+        require_nonzero: bool = False,
+        require_positive: bool = False,
+    ) -> NDArray[np.float64]:
+        """Validate a scalar or one finite value per score factor."""
+        expected = f"a finite scalar or an array with shape ({self.n_factors},)"
+        try:
+            raw = np.asarray(value)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=value,
+                expected=expected,
+            ) from exc
+        if raw.dtype.kind not in {"i", "u", "f"}:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=value,
+                expected=expected,
+            )
+        try:
+            parameters = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"{name} must be numeric",
+                parameter=name,
+                value=value,
+                expected=expected,
+            ) from exc
+        if parameters.ndim == 0:
+            pass
+        elif parameters.shape != (self.n_factors,):
+            raise MirtValidationError(
+                f"{name} must provide one value per factor",
+                parameter=name,
+                value=parameters.shape,
+                expected=expected,
+            )
+        if not np.all(np.isfinite(parameters)):
+            raise MirtValidationError(
+                f"{name} must contain only finite values",
+                parameter=name,
+                value=value,
+                expected=expected,
+            )
+        if require_nonzero and np.any(parameters == 0.0):
+            raise MirtValidationError(
+                f"{name} must contain only nonzero values",
+                parameter=name,
+                value=value,
+                expected="nonzero scale values",
+            )
+        if require_positive and np.any(parameters <= 0.0):
+            raise MirtValidationError(
+                f"{name} must contain only positive values",
+                parameter=name,
+                value=value,
+                expected="> 0",
+            )
+        return parameters
 
     @staticmethod
     def _validate_classification_confidence(confidence: float) -> float:

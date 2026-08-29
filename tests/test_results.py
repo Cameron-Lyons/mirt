@@ -277,6 +277,131 @@ def test_score_confidence_intervals_for_multiple_factors() -> None:
         result.confidence_intervals(0.0)
 
 
+def test_score_linear_transform_propagates_uncertainty_and_metadata() -> None:
+    result = ScoreResult(
+        theta=np.array([-1.0, 0.0, 1.0]),
+        standard_error=np.array([0.2, 0.3, 0.4]),
+        method="EAP",
+        person_ids=["p1", "p2", "p3"],
+    )
+
+    transformed = result.linear_transform(multiplier=10.0, offset=50.0)
+
+    np.testing.assert_allclose(transformed.theta, [40.0, 50.0, 60.0])
+    np.testing.assert_allclose(transformed.standard_error, [2.0, 3.0, 4.0])
+    assert transformed.method == "EAP"
+    assert transformed.person_ids == ["p1", "p2", "p3"]
+    assert transformed is not result
+    np.testing.assert_allclose(result.theta, [-1.0, 0.0, 1.0])
+    np.testing.assert_allclose(result.standard_error, [0.2, 0.3, 0.4])
+
+
+def test_score_linear_transform_supports_factor_specific_and_reversed_scales() -> None:
+    result = ScoreResult(
+        theta=np.array([[-1.0, 2.0], [1.0, -2.0]]),
+        standard_error=np.array([[0.2, 0.4], [0.3, 0.5]]),
+        method="MAP",
+    )
+
+    transformed = result.linear_transform(
+        multiplier=np.array([10.0, -15.0]),
+        offset=np.array([50.0, 100.0]),
+    )
+
+    np.testing.assert_allclose(transformed.theta, [[40.0, 70.0], [60.0, 130.0]])
+    np.testing.assert_allclose(transformed.standard_error, [[2.0, 6.0], [3.0, 7.5]])
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("multiplier", True, "numeric"),
+        ("multiplier", 0.0, "nonzero"),
+        ("multiplier", np.nan, "finite"),
+        ("multiplier", [1.0, [2.0]], "numeric"),
+        ("multiplier", [1.0, 2.0, 3.0], "one value per factor"),
+        ("offset", "50", "numeric"),
+        ("offset", np.inf, "finite"),
+        ("offset", [[0.0, 1.0]], "one value per factor"),
+    ],
+)
+def test_score_linear_transform_validates_scale_parameters(
+    parameter: str,
+    value: Any,
+    message: str,
+) -> None:
+    result = ScoreResult(np.zeros((2, 2)), np.ones((2, 2)), "EAP")
+    kwargs = {"multiplier": 1.0, "offset": 0.0, parameter: value}
+
+    with pytest.raises(MirtValidationError, match=message):
+        result.linear_transform(**kwargs)
+
+
+def test_score_normal_percentile_ranks_match_reference_distribution() -> None:
+    result = ScoreResult(
+        theta=np.array([-1.0, 0.0, 1.0, np.nan]),
+        standard_error=np.ones(4),
+        method="EAP",
+    )
+
+    ranks = result.normal_percentile_ranks()
+
+    np.testing.assert_allclose(
+        ranks[:3],
+        [15.86552539, 50.0, 84.13447461],
+        rtol=0.0,
+        atol=1e-8,
+    )
+    assert np.isnan(ranks[3])
+
+
+def test_score_normal_percentile_ranks_support_factor_specific_references() -> None:
+    result = ScoreResult(
+        theta=np.array([[40.0, 85.0], [50.0, 100.0], [60.0, 115.0]]),
+        standard_error=np.ones((3, 2)),
+        method="ML",
+    )
+
+    ranks = result.normal_percentile_ranks(
+        reference_mean=[50.0, 100.0],
+        reference_sd=[10.0, 15.0],
+    )
+
+    expected = np.array(
+        [
+            [15.86552539, 15.86552539],
+            [50.0, 50.0],
+            [84.13447461, 84.13447461],
+        ]
+    )
+    np.testing.assert_allclose(ranks, expected, rtol=0.0, atol=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("parameter", "value", "message"),
+    [
+        ("reference_mean", True, "numeric"),
+        ("reference_mean", [0.0], "one value per factor"),
+        ("reference_mean", np.nan, "finite"),
+        ("reference_sd", "1", "numeric"),
+        ("reference_sd", 0.0, "positive"),
+        ("reference_sd", -1.0, "positive"),
+        ("reference_sd", np.inf, "finite"),
+        ("reference_sd", [1.0], "one value per factor"),
+    ],
+)
+def test_score_normal_percentile_ranks_validate_references(
+    parameter: str,
+    value: Any,
+    message: str,
+) -> None:
+    result = ScoreResult(np.zeros((2, 2)), np.ones((2, 2)), "EAP")
+    kwargs = {"reference_mean": 0.0, "reference_sd": 1.0, parameter: value}
+
+    with pytest.raises(MirtValidationError, match=message):
+        result.normal_percentile_ranks(**kwargs)
+
+
 def test_score_classification_probabilities_match_normal_approximation() -> None:
     result = ScoreResult(
         theta=np.array([-1.0, 0.0, 1.0]),

@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 _RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
+_RESIDUAL_MAX_PROBABILITY_VALUES = 1_000_000
 _FIT_STATISTICS_CHUNK_ELEMENTS = 1_000_000
 
 
@@ -232,6 +233,118 @@ def _item_expected_value_variance(
     )
 
 
+def _all_item_expected_value_variance(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    n_items: int,
+) -> (
+    tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]
+    | None
+):
+    """Evaluate all item moments when the bounded batch contract is available."""
+    if getattr(model, "n_items", None) != n_items:
+        return None
+
+    n_persons = theta.shape[0]
+    is_polytomous = bool(getattr(model, "is_polytomous", False))
+    n_categories = 1
+    if is_polytomous:
+        n_categories = getattr(model, "max_categories", None)
+        if n_categories is None:
+            category_counts = getattr(model, "n_categories", 1)
+            if np.isscalar(category_counts):
+                n_categories = int(category_counts)
+            else:
+                n_categories = max(category_counts)
+
+    probability_values = n_persons * n_items * int(n_categories)
+    if probability_values > _RESIDUAL_MAX_PROBABILITY_VALUES:
+        return None
+
+    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
+    if is_polytomous:
+        if probabilities.ndim == 2 and n_items == 1:
+            probabilities = probabilities[:, None, :]
+        if (
+            probabilities.ndim != 3
+            or probabilities.shape[:2] != (n_persons, n_items)
+            or probabilities.shape[2] == 0
+        ):
+            return None
+        categories = np.arange(probabilities.shape[2], dtype=np.float64)
+        expected = probabilities @ categories
+        variance = probabilities @ np.square(categories) - np.square(expected)
+        return probabilities, expected, variance
+
+    if probabilities.ndim == 1 and n_items == 1:
+        probabilities = probabilities[:, None]
+    if probabilities.shape != (n_persons, n_items):
+        return None
+    expected = probabilities
+    variance = probabilities * (1.0 - probabilities)
+    return probabilities, expected, variance
+
+
+def _compute_batched_residual_arrays(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    residual_types: tuple[str, ...],
+    *,
+    store_expected: bool,
+    store_variances: bool,
+) -> _ResidualComputation | None:
+    """Compute residual matrices from one bounded all-item probability call."""
+    n_persons, n_items = responses.shape
+    moments = _all_item_expected_value_variance(model, theta, n_items)
+    if moments is None:
+        return None
+
+    probabilities, expected, variance = moments
+    valid = responses >= 0
+    raw = np.where(valid, responses - expected, np.nan)
+    residuals: dict[str, NDArray[np.float64]] = {}
+
+    if "raw" in residual_types:
+        residuals["raw"] = raw.copy()
+    if "standardized" in residual_types:
+        residuals["standardized"] = raw / np.sqrt(variance + PROB_EPSILON)
+    if "pearson" in residual_types:
+        residuals["pearson"] = raw / np.sqrt(expected + PROB_EPSILON)
+    if "deviance" in residual_types:
+        if probabilities.ndim == 3:
+            safe_responses = np.where(valid, responses, 0)
+            observed_probability = np.take_along_axis(
+                probabilities,
+                safe_responses[:, :, None],
+                axis=2,
+            )[:, :, 0]
+        else:
+            observed_probability = np.where(
+                responses == 1,
+                probabilities,
+                1.0 - probabilities,
+            )
+        observed_probability = np.clip(
+            observed_probability,
+            PROB_EPSILON,
+            1.0 - PROB_EPSILON,
+        )
+        residuals["deviance"] = np.where(
+            valid,
+            np.sign(raw) * np.sqrt(-2.0 * np.log(observed_probability)),
+            np.nan,
+        )
+
+    expected_values = expected if store_expected else None
+    variances = np.where(valid, variance, np.nan) if store_variances else None
+    return _ResidualComputation(residuals, expected_values, variances)
+
+
 def _compute_residual_arrays(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -246,6 +359,17 @@ def _compute_residual_arrays(
     if unknown_types:
         unknown = next(kind for kind in residual_types if kind in unknown_types)
         raise ValueError(f"Unknown residual type: {unknown}")
+
+    batched = _compute_batched_residual_arrays(
+        model,
+        responses,
+        theta,
+        residual_types,
+        store_expected=store_expected,
+        store_variances=store_variances,
+    )
+    if batched is not None:
+        return batched
 
     n_persons, n_items = responses.shape
     residuals = {kind: np.full((n_persons, n_items), np.nan) for kind in residual_types}
