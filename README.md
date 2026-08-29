@@ -42,7 +42,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Person fit**: Zh, lz, infit/outfit
 - **Model fit**: M2, RMSEA, CFI, TLI, SRMSR
 - **DIF analysis**: Likelihood ratio, Wald, Lord, Raju
-- **GRDIF**: Generalized Residual DIF for multiple groups with robust scaling (MAD/IQR)
+- **GRDIF**: Multi-group residual DIF with robust scaling and multiplicity control
 - **DTF/DRF**: Differential test/response functioning
 - **SIBTEST**: Simultaneous item bias test
 - **Local dependence**: Q3, chi-square residuals
@@ -208,6 +208,7 @@ grdif_result = compute_grdif(
     responses, groups_multi,
     model="2PL",
     scaling_method="mad",
+    p_adjust="fdr_bh",
 )
 print(f"Flagged items: {np.where(grdif_result['flagged_rs'])[0]}")
 ```

@@ -9,6 +9,7 @@ from mirt.diagnostics.dif import (
     compute_pairwise_rdif,
     grdif_effect_size,
 )
+from mirt.diagnostics.multiple_testing import adjust_p_values
 
 
 @pytest.fixture
@@ -146,6 +147,16 @@ class TestComputeGRDIF:
 
         assert np.sum(result["flagged_rs"][:2]) >= 1
 
+    def test_adjusted_p_values_control_reported_flags(self, two_group_data):
+        data, groups = two_group_data
+
+        result = compute_grdif(data, groups, model="2PL", p_adjust="holm")
+
+        for suffix in ("r", "s", "rs"):
+            expected = adjust_p_values(result[f"p_value_{suffix}"], "holm")
+            assert_allclose(result[f"p_value_{suffix}_adjusted"], expected)
+            assert np.array_equal(result[f"flagged_{suffix}"], expected < 0.05)
+
     def test_purification(self, two_group_data):
         data, groups = two_group_data
 
@@ -219,6 +230,20 @@ class TestPairwiseRDIF:
         assert_allclose(
             grdif_result["grdif_r"], pairwise_result["rdif_r"][0], rtol=0.1, atol=0.1
         )
+
+    def test_pairwise_adjustment_controls_all_comparisons(self, three_group_data):
+        data, groups = three_group_data
+
+        result = compute_pairwise_rdif(
+            data,
+            groups,
+            model="2PL",
+            p_adjust="fdr_bh",
+        )
+
+        expected = adjust_p_values(result["p_values_rs"], "fdr_bh")
+        assert_allclose(result["p_values_rs_adjusted"], expected)
+        assert np.array_equal(result["flagged_rs"], expected < 0.05)
 
 
 class TestGRDIFEffectSize:

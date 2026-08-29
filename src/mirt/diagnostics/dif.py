@@ -602,6 +602,7 @@ def compute_grdif(
     max_iter: int = 500,
     tol: float = 1e-4,
     scaling_method: Literal["mean", "mad", "iqr"] = "mean",
+    p_adjust: PValueAdjustment = "none",
 ) -> dict[str, Any]:
     """Compute Generalized Residual DIF (GRDIF) statistics for multiple groups.
 
@@ -634,6 +635,8 @@ def compute_grdif(
             - 'mean': Standard sample variance (default)
             - 'mad': Median absolute deviation (robust to outliers)
             - 'iqr': Interquartile range (robust to outliers)
+        p_adjust: Multiple-testing adjustment applied separately across items
+            for each of the GRDIF_R, GRDIF_S, and GRDIF_RS test families.
 
     Returns:
         Dictionary with GRDIF results:
@@ -643,6 +646,9 @@ def compute_grdif(
             - 'p_value_r': P-values for GRDIF_R
             - 'p_value_s': P-values for GRDIF_S
             - 'p_value_rs': P-values for GRDIF_RS
+            - 'p_value_r_adjusted': Adjusted P-values for GRDIF_R
+            - 'p_value_s_adjusted': Adjusted P-values for GRDIF_S
+            - 'p_value_rs_adjusted': Adjusted P-values for GRDIF_RS
             - 'flagged_r': Items flagged by GRDIF_R
             - 'flagged_s': Items flagged by GRDIF_S
             - 'flagged_rs': Items flagged by GRDIF_RS
@@ -662,6 +668,7 @@ def compute_grdif(
     """
     from mirt import fit_mirt
 
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,
@@ -721,7 +728,7 @@ def compute_grdif(
                 "grdif_r": p_r,
                 "grdif_s": p_s,
             }[purify_by]
-            flagged = p_values < alpha
+            flagged = adjust_p_values(p_values, p_adjust) < alpha
 
             new_anchors = ~flagged
             n_anchors = int(np.count_nonzero(new_anchors))
@@ -764,6 +771,12 @@ def compute_grdif(
         unique_groups,
         scaling_method,
     )
+    p_r_adjusted, p_s_adjusted, p_rs_adjusted = _adjust_grdif_families(
+        p_r,
+        p_s,
+        p_rs,
+        p_adjust,
+    )
 
     return {
         "grdif_r": grdif_r,
@@ -772,9 +785,13 @@ def compute_grdif(
         "p_value_r": p_r,
         "p_value_s": p_s,
         "p_value_rs": p_rs,
-        "flagged_r": p_r < alpha,
-        "flagged_s": p_s < alpha,
-        "flagged_rs": p_rs < alpha,
+        "p_value_r_adjusted": p_r_adjusted,
+        "p_value_s_adjusted": p_s_adjusted,
+        "p_value_rs_adjusted": p_rs_adjusted,
+        "flagged_r": p_r_adjusted < alpha,
+        "flagged_s": p_s_adjusted < alpha,
+        "flagged_rs": p_rs_adjusted < alpha,
+        "p_adjustment": p_adjust,
         "n_groups": n_groups,
         "group_labels": unique_groups.tolist(),
         "group_sizes": group_sizes,
@@ -784,6 +801,20 @@ def compute_grdif(
         "purification_stop_reason": purification_stop_reason,
         "theta": theta.copy(),
     }
+
+
+def _adjust_grdif_families(
+    p_r: NDArray[np.float64],
+    p_s: NDArray[np.float64],
+    p_rs: NDArray[np.float64],
+    p_adjust: PValueAdjustment,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+    """Adjust the three GRDIF test families independently."""
+    return (
+        adjust_p_values(p_r, p_adjust),
+        adjust_p_values(p_s, p_adjust),
+        adjust_p_values(p_rs, p_adjust),
+    )
 
 
 def _compute_grdif_statistics(
@@ -906,6 +937,7 @@ def compute_pairwise_rdif(
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
+    p_adjust: PValueAdjustment = "none",
 ) -> dict[str, Any]:
     """Compute pairwise RDIF statistics for post-hoc analysis.
 
@@ -923,6 +955,8 @@ def compute_pairwise_rdif(
         n_quadpts: Number of quadrature points.
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
+        p_adjust: Multiple-testing adjustment. For each RDIF statistic, all
+            group-pair and item combinations form one testing family.
 
     Returns:
         Dictionary with pairwise results:
@@ -933,9 +967,13 @@ def compute_pairwise_rdif(
             - 'p_values_r': P-values for RDIF_R
             - 'p_values_s': P-values for RDIF_S
             - 'p_values_rs': P-values for RDIF_RS
+            - 'p_values_r_adjusted': Adjusted P-values for RDIF_R
+            - 'p_values_s_adjusted': Adjusted P-values for RDIF_S
+            - 'p_values_rs_adjusted': Adjusted P-values for RDIF_RS
     """
     from mirt import fit_mirt
 
+    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,
@@ -1000,6 +1038,12 @@ def compute_pairwise_rdif(
     p_r = stats.chi2.sf(rdif_r, df=1)
     p_s = stats.chi2.sf(rdif_s, df=1)
     p_rs = stats.chi2.sf(rdif_rs, df=2)
+    p_r_adjusted, p_s_adjusted, p_rs_adjusted = _adjust_grdif_families(
+        p_r,
+        p_s,
+        p_rs,
+        p_adjust,
+    )
 
     return {
         "pairs": pairs,
@@ -1009,9 +1053,13 @@ def compute_pairwise_rdif(
         "p_values_r": p_r,
         "p_values_s": p_s,
         "p_values_rs": p_rs,
-        "flagged_r": p_r < alpha,
-        "flagged_s": p_s < alpha,
-        "flagged_rs": p_rs < alpha,
+        "p_values_r_adjusted": p_r_adjusted,
+        "p_values_s_adjusted": p_s_adjusted,
+        "p_values_rs_adjusted": p_rs_adjusted,
+        "flagged_r": p_r_adjusted < alpha,
+        "flagged_s": p_s_adjusted < alpha,
+        "flagged_rs": p_rs_adjusted < alpha,
+        "p_adjustment": p_adjust,
     }
 
 
