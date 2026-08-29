@@ -2917,23 +2917,69 @@ class PiecewiseGrowthModel:
     residual_variance: float = 0.1
 
     def __post_init__(self) -> None:
-        if len(self.changepoints) == 0 and self.n_pieces > 1:
-            self.changepoints = np.linspace(1, self.n_pieces - 1, self.n_pieces - 1)
+        if (
+            isinstance(self.n_pieces, (bool, np.bool_))
+            or not isinstance(self.n_pieces, (int, np.integer))
+            or self.n_pieces < 1
+        ):
+            raise ValueError("n_pieces must be a positive integer")
+        self.n_pieces = int(self.n_pieces)
 
-        if len(self.slope_means) == 1 and self.n_pieces > 1:
+        self.changepoints = np.asarray(self.changepoints, dtype=np.float64).copy()
+        self.slope_means = np.asarray(self.slope_means, dtype=np.float64).copy()
+        self.slope_vars = np.asarray(self.slope_vars, dtype=np.float64).copy()
+
+        for name, values in (
+            ("changepoints", self.changepoints),
+            ("slope_means", self.slope_means),
+            ("slope_vars", self.slope_vars),
+        ):
+            if values.ndim != 1:
+                raise ValueError(f"{name} must be one-dimensional")
+
+        if self.changepoints.size == 0 and self.n_pieces > 1:
+            self.changepoints = np.linspace(1.0, self.n_pieces - 1, self.n_pieces - 1)
+
+        if self.slope_means.size == 1 and self.n_pieces > 1:
             self.slope_means = np.full(self.n_pieces, self.slope_means[0])
-        if len(self.slope_vars) == 1 and self.n_pieces > 1:
+        if self.slope_vars.size == 1 and self.n_pieces > 1:
             self.slope_vars = np.full(self.n_pieces, self.slope_vars[0])
 
-        if len(self.changepoints) != self.n_pieces - 1:
+        if self.changepoints.size != self.n_pieces - 1:
             raise ValueError(
-                f"changepoints length ({len(self.changepoints)}) "
+                f"changepoints length ({self.changepoints.size}) "
                 f"must be n_pieces - 1 ({self.n_pieces - 1})"
             )
+        if self.slope_means.size != self.n_pieces:
+            raise ValueError(f"slope_means length must be n_pieces ({self.n_pieces})")
+        if self.slope_vars.size != self.n_pieces:
+            raise ValueError(f"slope_vars length must be n_pieces ({self.n_pieces})")
+        if not np.all(np.isfinite(self.changepoints)):
+            raise ValueError("changepoints must contain only finite values")
+        if np.any(np.diff(self.changepoints) <= 0.0):
+            raise ValueError("changepoints must be strictly increasing")
+        if not np.all(np.isfinite(self.slope_means)):
+            raise ValueError("slope_means must contain only finite values")
+        if not np.all(np.isfinite(self.slope_vars)) or np.any(self.slope_vars < 0.0):
+            raise ValueError("slope_vars must be finite and non-negative")
+
+        for name in ("intercept_mean", "intercept_var", "residual_variance"):
+            value = getattr(self, name)
+            if isinstance(value, (bool, np.bool_)) or np.asarray(value).ndim != 0:
+                raise ValueError(f"{name} must be a finite scalar")
+            try:
+                normalized_value = float(value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{name} must be a finite scalar") from error
+            if not np.isfinite(normalized_value):
+                raise ValueError(f"{name} must be a finite scalar")
+            if name != "intercept_mean" and normalized_value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+            setattr(self, name, normalized_value)
 
     def compute_theta(
         self,
-        time_values: NDArray[np.float64],
+        time_values: float | NDArray[np.float64],
         intercept: float | NDArray[np.float64],
         slopes: NDArray[np.float64],
     ) -> NDArray[np.float64]:
@@ -2941,52 +2987,69 @@ class PiecewiseGrowthModel:
 
         Parameters
         ----------
-        time_values : NDArray
-            Time points (n_timepoints,).
+        time_values : float or NDArray
+            One or more finite time points.
         intercept : float or NDArray
-            Individual intercept(s).
+            One shared intercept or one intercept per person.
         slopes : NDArray
-            Individual slopes (n_pieces,) or (n_persons, n_pieces).
+            Shared slopes (n_pieces,) or person-specific slopes
+            (n_persons, n_pieces).
 
         Returns
         -------
         NDArray
             Ability values (n_timepoints,) or (n_persons, n_timepoints).
         """
-        time_values = np.atleast_1d(time_values)
-        n_times = len(time_values)
+        times = np.asarray(time_values, dtype=np.float64)
+        if times.ndim == 0:
+            times = times.reshape(1)
+        if times.ndim != 1 or times.size == 0:
+            raise ValueError("time_values must be a non-empty scalar or vector")
+        if not np.all(np.isfinite(times)):
+            raise ValueError("time_values must contain only finite values")
 
-        intercept = np.atleast_1d(intercept)
-        slopes = np.atleast_2d(slopes)
-        n_persons = slopes.shape[0]
+        intercepts = np.asarray(intercept, dtype=np.float64)
+        if intercepts.ndim == 0:
+            intercepts = intercepts.reshape(1)
+        if intercepts.ndim != 1 or intercepts.size == 0:
+            raise ValueError("intercept must be a non-empty scalar or vector")
+        if not np.all(np.isfinite(intercepts)):
+            raise ValueError("intercept must contain only finite values")
 
-        theta = np.zeros((n_persons, n_times))
+        slope_values = np.asarray(slopes, dtype=np.float64)
+        if slope_values.ndim == 1:
+            slope_values = slope_values.reshape(1, -1)
+        if (
+            slope_values.ndim != 2
+            or slope_values.shape[0] == 0
+            or slope_values.shape[1] != self.n_pieces
+        ):
+            raise ValueError(
+                f"slopes must have shape ({self.n_pieces},) or "
+                f"(n_persons, {self.n_pieces})"
+            )
+        if not np.all(np.isfinite(slope_values)):
+            raise ValueError("slopes must contain only finite values")
 
-        for i in range(n_persons):
-            for t_idx, t in enumerate(time_values):
-                piece_idx = 0
-                for cp_idx, cp in enumerate(self.changepoints):
-                    if t > cp:
-                        piece_idx = cp_idx + 1
+        n_persons = max(intercepts.size, slope_values.shape[0])
+        if intercepts.size not in (1, n_persons):
+            raise ValueError("intercept and slopes have incompatible person counts")
+        if slope_values.shape[0] not in (1, n_persons):
+            raise ValueError("intercept and slopes have incompatible person counts")
 
-                value = intercept[i] if len(intercept) > 1 else intercept[0]
-                t_remaining = t
+        if self.n_pieces == 1:
+            basis = times[:, None]
+        else:
+            starts = np.concatenate(([0.0], self.changepoints))
+            ends = np.concatenate((self.changepoints, [np.inf]))
+            basis = np.maximum(
+                np.minimum(times[:, None], ends[None, :]) - starts[None, :],
+                0.0,
+            )
+            basis[:, 0] = np.minimum(times, self.changepoints[0])
 
-                for p in range(piece_idx + 1):
-                    if p < self.n_pieces - 1 and p < piece_idx:
-                        segment_length = (
-                            self.changepoints[p]
-                            if p == 0
-                            else self.changepoints[p] - self.changepoints[p - 1]
-                        )
-                        value += slopes[i, p] * segment_length
-                        t_remaining -= segment_length
-                    else:
-                        value += slopes[i, p] * t_remaining
-
-                theta[i, t_idx] = value
-
-        return theta.squeeze()
+        theta = intercepts[:, None] + slope_values @ basis.T
+        return theta[0] if n_persons == 1 else theta
 
     def simulate(
         self,
@@ -3010,6 +3073,14 @@ class PiecewiseGrowthModel:
         tuple
             (theta_trajectories, intercepts, slopes)
         """
+        if (
+            isinstance(n_persons, (bool, np.bool_))
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        n_persons = int(n_persons)
+
         rng = np.random.default_rng(seed)
 
         intercepts = rng.normal(
