@@ -85,3 +85,11 @@ dependence among their item responses is retained:
 
 Negative response values are treated as missing. The returned array contains
 one joint log likelihood per respondent.
+
+The likelihood integral is reduced one quadrature point at a time, so temporary
+memory does not grow with ``n_persons * n_quadpts``. When the compiled backend
+is available, independent respondent patterns are evaluated in parallel and
+only the final vector is materialized. The NumPy fallback uses the same clipped
+probability and missing-response semantics and is selected automatically when
+the compiled backend is unavailable or disabled with
+``mirt.set_backend("numpy")``.
