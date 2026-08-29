@@ -9,7 +9,7 @@ from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.models.polytomous import GeneralizedPartialCredit
 from mirt.utils import information as information_utils
 from mirt.utils.information import areainfo, expected_score, iteminfo
-from mirt.utils.reliability import empirical_rxx, marginal_rxx, sem
+from mirt.utils.reliability import conditional_rxx, empirical_rxx, marginal_rxx, sem
 
 
 @pytest.fixture(params=["dichotomous", "polytomous"])
@@ -80,6 +80,66 @@ def test_marginal_reliability_uses_the_selected_latent_range_variance():
     assert marginal_rxx(model, (-1.0, 1.0), n_points=41) == pytest.approx(expected)
 
 
+def test_conditional_reliability_matches_test_information(model):
+    theta = np.linspace(-2.0, 2.0, 21)
+    latent_variance = 2.5
+    information = information_utils.testinfo(model, theta)
+    expected = information * latent_variance / (1.0 + information * latent_variance)
+
+    actual = conditional_rxx(model, theta, latent_variance=latent_variance)
+
+    assert actual.shape == theta.shape
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_conditional_reliability_evaluates_the_grid_once(monkeypatch):
+    model = TwoParameterLogistic(n_items=5)
+    theta = np.linspace(-4.0, 4.0, 10_001)
+    original_information = model.information
+    calls = []
+
+    def tracked_information(theta_values):
+        calls.append(np.asarray(theta_values).shape)
+        return original_information(theta_values)
+
+    monkeypatch.setattr(model, "information", tracked_information)
+
+    reliability = conditional_rxx(model, theta)
+
+    assert calls == [(theta.size, 1)]
+    assert reliability.shape == theta.shape
+
+
+def test_conditional_reliability_preserves_zero_information(monkeypatch):
+    model = TwoParameterLogistic(n_items=3)
+    theta = np.array([-1.0, 0.0, 1.0])
+    monkeypatch.setattr(
+        model,
+        "information",
+        lambda theta_values: np.zeros((len(theta_values), model.n_items)),
+    )
+
+    np.testing.assert_array_equal(conditional_rxx(model, theta), np.zeros(theta.size))
+
+
+@pytest.mark.parametrize(
+    "latent_variance",
+    [True, 0.0, -1.0, np.nan, np.inf, [1.0]],
+)
+def test_conditional_reliability_rejects_invalid_latent_variance(latent_variance):
+    model = TwoParameterLogistic(n_items=3)
+
+    with pytest.raises(ValueError, match="latent_variance must be"):
+        conditional_rxx(model, 0.0, latent_variance=latent_variance)
+
+
+def test_conditional_reliability_rejects_multidimensional_models():
+    model = TwoParameterLogistic(n_items=3, n_factors=2)
+
+    with pytest.raises(ValueError, match="unidimensional"):
+        conditional_rxx(model, np.zeros((2, 2)))
+
+
 def test_empirical_reliability_supports_polytomous_information():
     model = GeneralizedPartialCredit(n_items=20, n_categories=4)
     theta = np.linspace(-2.0, 2.0, 21)
@@ -107,5 +167,6 @@ def test_reliability_rejects_unsupported_options():
 
 def test_score_utilities_are_available_from_the_top_level_api():
     assert mirt.expected_score is expected_score
+    assert mirt.conditional_rxx is conditional_rxx
     assert callable(mirt.expected_test_score)
     assert callable(mirt.theta_for_score)

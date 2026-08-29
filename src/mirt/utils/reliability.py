@@ -73,6 +73,72 @@ def _test_information(
     return test_information
 
 
+def _conditional_reliability(
+    test_information: NDArray[np.float64],
+    latent_variance: float,
+) -> NDArray[np.float64]:
+    """Convert test information to pointwise reliability."""
+    with np.errstate(over="ignore"):
+        scaled_information = test_information * latent_variance
+    reliability = np.ones_like(scaled_information)
+    finite = np.isfinite(scaled_information)
+    np.divide(
+        scaled_information,
+        1.0 + scaled_information,
+        out=reliability,
+        where=finite,
+    )
+    return np.clip(reliability, 0.0, 1.0)
+
+
+def conditional_rxx(
+    model: "BaseItemModel",
+    theta: ArrayLike,
+    latent_variance: float = 1.0,
+) -> NDArray[np.float64]:
+    """Compute reliability at each supplied ability value.
+
+    Conditional reliability is ``I(theta) * Var(theta) / (1 + I(theta) *
+    Var(theta))``, where ``I(theta)`` is total test information. The result
+    is vectorized over ability values and supports both dichotomous and
+    polytomous unidimensional models.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        A fitted unidimensional IRT model.
+    theta : array-like
+        Ability values at which to compute reliability.
+    latent_variance : float, default=1
+        Positive finite variance of the reference ability distribution.
+
+    Returns
+    -------
+    ndarray
+        One reliability coefficient in the interval [0, 1] for each theta
+        point. Points with zero test information have zero reliability.
+
+    Raises
+    ------
+    ValueError
+        If the model is multidimensional or an argument is invalid.
+    """
+    if model.n_factors != 1:
+        raise ValueError("conditional_rxx supports unidimensional models only")
+    if isinstance(latent_variance, (bool, np.bool_)) or np.ndim(latent_variance) != 0:
+        raise ValueError("latent_variance must be a positive finite scalar")
+    try:
+        variance = float(latent_variance)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("latent_variance must be a positive finite scalar") from exc
+    if not np.isfinite(variance) or variance <= 0.0:
+        raise ValueError("latent_variance must be a positive finite scalar")
+
+    theta_array = _theta_array(model, theta)
+    test_information = _test_information(model, theta_array)
+    return _conditional_reliability(test_information, variance)
+
+
 def _quadrature_weights(
     theta: NDArray[np.float64],
     density: Density,
@@ -161,7 +227,7 @@ def marginal_rxx(
     if theta_variance <= PROB_EPSILON:
         raise ValueError("the weighted theta distribution must have positive variance")
 
-    local_reliability = test_information / (test_information + 1.0 / theta_variance)
+    local_reliability = _conditional_reliability(test_information, theta_variance)
     reliability = float(np.sum(weights * local_reliability))
     return float(np.clip(reliability, 0.0, 1.0))
 

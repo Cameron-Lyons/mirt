@@ -33,6 +33,26 @@ Inspect fitted information
 row-wise sum and can be converted to conditional standard error with
 ``1 / np.sqrt(test_information)`` wherever information is positive.
 
+Inspect conditional reliability
+-------------------------------
+
+``conditional_rxx`` converts total information into a reliability profile
+over the supplied ability values. It uses a standard-normal reference
+variance by default and accepts another positive latent variance when the
+target population is more or less dispersed.
+
+.. code-block:: python
+
+   reliability = mirt.conditional_rxx(fit.model, theta)
+   wider_population = mirt.conditional_rxx(
+       fit.model,
+       theta,
+       latent_variance=1.5,
+   )
+
+The returned array aligns with ``theta``. Reliability is zero wherever test
+information is zero and approaches one as information increases.
+
 Single-item curves
 ------------------
 
