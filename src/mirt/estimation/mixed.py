@@ -105,7 +105,9 @@ class MixedEffectsFitResult:
                 names = tuple(
                     f"Covariate {i + 1}" for i in range(len(self.person_effects))
                 )
-            for i, (est, se) in enumerate(zip(self.person_effects, standard_errors)):
+            for i, (est, se) in enumerate(
+                zip(self.person_effects, standard_errors, strict=True)
+            ):
                 lines.append(f"  {names[i]}: {est:.4f} (SE: {se:.4f})")
             lines.append("")
 
@@ -127,7 +129,9 @@ class MixedEffectsFitResult:
                 names = tuple(
                     f"Covariate {i + 1}" for i in range(len(self.item_effects))
                 )
-            for i, (est, se) in enumerate(zip(self.item_effects, standard_errors)):
+            for i, (est, se) in enumerate(
+                zip(self.item_effects, standard_errors, strict=True)
+            ):
                 lines.append(f"  {names[i]}: {est:.4f} (SE: {se:.4f})")
 
         return "\n".join(lines)

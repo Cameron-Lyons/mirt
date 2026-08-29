@@ -710,7 +710,7 @@ def score_equating_summary(result: ScoreEquatingResult) -> str:
     lines.append(f"{'Old Score':>12} {'New Score':>12} {'Rounded':>12}")
     lines.append("-" * 50)
 
-    for old, new in zip(result.old_scores, result.new_scores):
+    for old, new in zip(result.old_scores, result.new_scores, strict=True):
         rounded = round(new)
         lines.append(f"{old:>12.1f} {new:>12.2f} {rounded:>12d}")
 

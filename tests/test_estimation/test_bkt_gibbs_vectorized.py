@@ -53,7 +53,7 @@ def _reference_beta_shapes(
         skill_trials = np.flatnonzero(skill_assignments == skill_idx)
         for person_idx in range(n_persons):
             for previous_trial, current_trial in zip(
-                skill_trials[:-1], skill_trials[1:]
+                skill_trials[:-1], skill_trials[1:], strict=True
             ):
                 if learning_states[person_idx, previous_trial] == 0:
                     n_transitions += 1
@@ -72,7 +72,7 @@ def _reference_beta_shapes(
         skill_trials = np.flatnonzero(skill_assignments == skill_idx)
         for person_idx in range(n_persons):
             for previous_trial, current_trial in zip(
-                skill_trials[:-1], skill_trials[1:]
+                skill_trials[:-1], skill_trials[1:], strict=True
             ):
                 if learning_states[person_idx, previous_trial] == 1:
                     n_transitions += 1

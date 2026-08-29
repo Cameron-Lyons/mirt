@@ -73,7 +73,7 @@ def three_group_data():
     difficulty_shifts[2][1] = 0.6
 
     data_list = []
-    for g, (theta_g, shift) in enumerate(zip(thetas, difficulty_shifts)):
+    for g, (theta_g, shift) in enumerate(zip(thetas, difficulty_shifts, strict=True)):
         data_g = np.zeros((n_per_group, n_items), dtype=np.int_)
         diff_g = difficulty + shift
         for j in range(n_items):

@@ -1544,7 +1544,9 @@ class BKTModel:
                 alpha[first_trial] /= scaling[first_trial]
 
             transition = self.transition_matrix(skill_idx)
-            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+            for previous_trial, trial in zip(
+                trial_indices[:-1], trial_indices[1:], strict=True
+            ):
                 alpha[trial] = (
                     alpha[previous_trial] @ transition
                 ) * self._emission_pair(int(responses[trial]), skill_idx)
@@ -1678,7 +1680,9 @@ class BKTModel:
             beta[trial_indices[-1]] = 1.0
             transition = self.transition_matrix(skill_idx)
 
-            for trial, next_trial in zip(trial_indices[-2::-1], trial_indices[:0:-1]):
+            for trial, next_trial in zip(
+                trial_indices[-2::-1], trial_indices[:0:-1], strict=True
+            ):
                 emission = self._emission_pair(int(responses[next_trial]), skill_idx)
                 beta[trial] = transition @ (emission * beta[next_trial])
                 if scaling[next_trial] > 0:
@@ -1964,7 +1968,9 @@ class BKTModel:
             )
 
             transition = self.transition_matrix(skill_idx)
-            for previous_trial, trial in zip(trial_indices[:-1], trial_indices[1:]):
+            for previous_trial, trial in zip(
+                trial_indices[:-1], trial_indices[1:], strict=True
+            ):
                 for state in range(2):
                     candidates = delta[previous_trial] + np.log(
                         transition[:, state] + 1e-300
@@ -1977,7 +1983,7 @@ class BKTModel:
 
             path[trial_indices[-1]] = int(np.argmax(delta[trial_indices[-1]]))
             for previous_trial, trial in zip(
-                trial_indices[-2::-1], trial_indices[:0:-1]
+                trial_indices[-2::-1], trial_indices[:0:-1], strict=True
             ):
                 path[previous_trial] = psi[trial, path[trial]]
 
@@ -3700,7 +3706,7 @@ class GrowthMixtureModel:
 
         intercept_variance, slope_variance, residual_variance = variances
         patterns = []
-        for pattern, rows in zip(unique_patterns, row_groups):
+        for pattern, rows in zip(unique_patterns, row_groups, strict=True):
             columns = np.flatnonzero(pattern)
             covariance = _GrowthCovariance.from_time_values(
                 times[columns],

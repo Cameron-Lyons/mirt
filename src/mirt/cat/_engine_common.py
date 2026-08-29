@@ -156,7 +156,9 @@ def record_item_administration(
 def build_administered_response_matrix(engine: Any) -> np.ndarray:
     """Build a sparse response matrix from administered CAT/MCAT items."""
     responses = np.full((1, engine.model.n_items), -1, dtype=np.int_)
-    for item_idx, resp in zip(engine._items_administered, engine._responses):
+    for item_idx, resp in zip(
+        engine._items_administered, engine._responses, strict=True
+    ):
         responses[0, item_idx] = resp
     return responses
 
