@@ -233,6 +233,23 @@ def test_fit_rejects_invalid_lambda_override(lambda_value: float) -> None:
         estimator.fit(responses, lambda_val=lambda_value)
 
 
+def test_large_loading_space_has_finite_ebic() -> None:
+    rng = np.random.default_rng(20260829)
+    responses = rng.integers(0, 2, size=(12, 50), dtype=np.int32)
+    estimator = RegularizedMIRTEstimator(
+        n_factors=2,
+        n_quadpts=2,
+        max_iter=1,
+        cd_max_iter=1,
+    )
+
+    result = estimator.fit(responses, lambda_val=0.1)
+
+    expected_penalty = result.loadings.size * np.log(2.0)
+    assert np.isfinite(result.ebic)
+    assert result.ebic == pytest.approx(result.bic + expected_penalty)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [

@@ -402,9 +402,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
         aic = -2 * current_ll + 2 * n_params
         bic = -2 * current_ll + n_params * np.log(n_persons)
         gamma = 0.5
-        ebic = bic + 2 * gamma * np.log(
-            self._count_possible_models(n_items, self.n_factors)
-        )
+        log_model_space = n_items * self.n_factors * np.log(2.0)
+        ebic = bic + 2 * gamma * log_model_space
 
         return RegularizedMIRTResult(
             model=model,
@@ -705,10 +704,6 @@ class RegularizedMIRTEstimator(BaseEstimator):
         residuals = r_k_all - n_k_all * probabilities[:, None]
         max_gradient = float(np.max(np.abs(residuals @ quad_points), initial=0.0))
         return max_gradient * 1.1
-
-    def _count_possible_models(self, n_items: int, n_factors: int) -> int:
-        """Count possible loading patterns for EBIC."""
-        return 2 ** (n_items * n_factors)
 
     def _fit_unpenalized_warmstart(
         self,

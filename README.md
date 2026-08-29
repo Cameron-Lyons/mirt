@@ -494,6 +494,7 @@ plot_person_item_map(result.model, scores.theta)
 | `plausible_value_statistics()` | Mean, variance, SD, or percentiles for one or all latent factors |
 | `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism and shared per-fold ability estimates |
+| `cv_select_lambda()` | Held-out regularization selection with optional process-parallel fold evaluation |
 | `impute_responses()` | Missing data imputation |
 | `itemstats()` | Item distributions, modes, entropy, and effective category counts |
 | `missing_patterns()` | Frequency-ranked missing-response pattern analysis |
