@@ -31,6 +31,8 @@ PosteriorValue = NDArray[np.float64] | np.float64
 PosteriorSummary = dict[str, dict[str, PosteriorValue]]
 CredibleIntervals = dict[str, tuple[PosteriorValue, PosteriorValue]]
 
+_MHRM_MAX_PROBABILITY_VALUES = 1_000_000
+
 
 def _is_2pl_unidimensional(model: BaseItemModel) -> bool:
     """Check if model is 2PL unidimensional."""
@@ -470,6 +472,56 @@ class MHRMEstimator(BaseEstimator):
         """Robbins-Monro update for item parameters."""
         n_items = model.n_items
 
+        # Probability and residual matrices are both dense, so keep their
+        # temporary allocation bounded and retain an itemwise path above it.
+        probability_values = responses.shape[0] * n_items
+        if not model.is_polytomous and (
+            probability_values <= _MHRM_MAX_PROBABILITY_VALUES
+        ):
+            probabilities = np.asarray(model.probability(theta), dtype=np.float64)
+            if probabilities.shape == responses.shape:
+                probabilities = np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON)
+                valid = responses >= 0
+                counts = np.sum(valid, axis=0)
+                observed = counts > 0
+                residuals = np.where(valid, responses - probabilities, 0.0)
+
+                # ``parameters`` returns defensive copies; estimation must
+                # update the model-owned arrays so the fitted values persist.
+                discrimination = model._parameters.get("discrimination")
+                if discrimination is not None and discrimination.ndim == 1:
+                    gradient_a = np.zeros(n_items, dtype=np.float64)
+                    np.divide(
+                        np.sum(residuals * theta[:, :1], axis=0),
+                        counts,
+                        out=gradient_a,
+                        where=observed,
+                    )
+                    discrimination[observed] = np.clip(
+                        discrimination[observed] + gain * gradient_a[observed],
+                        0.1,
+                        5.0,
+                    )
+
+                difficulty = model._parameters.get("difficulty")
+                if difficulty is not None and difficulty.ndim == 1:
+                    gradient_b = np.zeros(n_items, dtype=np.float64)
+                    np.divide(
+                        -np.sum(residuals, axis=0),
+                        counts,
+                        out=gradient_b,
+                        where=observed,
+                    )
+                    difficulty[observed] = np.clip(
+                        difficulty[observed] + gain * gradient_b[observed],
+                        -6.0,
+                        6.0,
+                    )
+                return
+
+        discrimination = model._parameters.get("discrimination")
+        difficulty = model._parameters.get("difficulty")
+
         for j in range(n_items):
             valid = responses[:, j] >= 0
             if not valid.any():
@@ -483,16 +535,16 @@ class MHRMEstimator(BaseEstimator):
 
             residual = resp_j - prob
 
-            if "discrimination" in model.parameters:
-                a = model.parameters["discrimination"]
-                if a.ndim == 1:
+            if discrimination is not None:
+                if discrimination.ndim == 1:
                     gradient_a = np.mean(residual * theta_j.ravel())
-                    a[j] = np.clip(a[j] + gain * gradient_a, 0.1, 5.0)
+                    discrimination[j] = np.clip(
+                        discrimination[j] + gain * gradient_a, 0.1, 5.0
+                    )
 
-            if "difficulty" in model.parameters:
-                b = model.parameters["difficulty"]
+            if difficulty is not None:
                 gradient_b = -np.mean(residual)
-                b[j] = np.clip(b[j] + gain * gradient_b, -6.0, 6.0)
+                difficulty[j] = np.clip(difficulty[j] + gain * gradient_b, -6.0, 6.0)
 
     def _estimate_theta_map(
         self,
