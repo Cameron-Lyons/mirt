@@ -35,7 +35,7 @@ def test_importing_plotting_defers_optional_dependencies() -> None:
     )
 
     assert result == {
-        "numpy_loaded": True,
+        "numpy_loaded": False,
         "scipy_loaded": False,
         "matplotlib_loaded": False,
     }
@@ -53,6 +53,7 @@ def test_resolving_top_level_plotter_keeps_optional_dependencies_deferred() -> N
         print(json.dumps({
             "callable": callable(plotter),
             "cached": mirt.__dict__["plot_ability_distribution"] is plotter,
+            "numpy_loaded": "numpy" in sys.modules,
             "scipy_loaded": "scipy" in sys.modules,
             "matplotlib_loaded": "matplotlib" in sys.modules,
         }))
@@ -62,6 +63,7 @@ def test_resolving_top_level_plotter_keeps_optional_dependencies_deferred() -> N
     assert result == {
         "callable": True,
         "cached": True,
+        "numpy_loaded": False,
         "scipy_loaded": False,
         "matplotlib_loaded": False,
     }
@@ -118,6 +120,7 @@ def test_scipy_is_loaded_only_for_a_requested_kde() -> None:
         print(json.dumps({
             "normal_labels": normal_axes.labels,
             "kde_labels": kde_axes.labels,
+            "numpy_loaded": "numpy" in sys.modules,
             "scipy_after_normal": scipy_after_normal,
             "scipy_after_kde": "scipy" in sys.modules,
             "matplotlib_loaded": "matplotlib" in sys.modules,
@@ -128,6 +131,7 @@ def test_scipy_is_loaded_only_for_a_requested_kde() -> None:
     assert result == {
         "normal_labels": ["N(0,1)"],
         "kde_labels": ["KDE"],
+        "numpy_loaded": True,
         "scipy_after_normal": False,
         "scipy_after_kde": True,
         "matplotlib_loaded": False,

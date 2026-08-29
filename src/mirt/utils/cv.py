@@ -1,7 +1,7 @@
 """Cross-validation framework for IRT models.
 
 This module provides flexible cross-validation tools:
-- Data splitting strategies (K-Fold, Stratified, Leave-One-Out)
+- Data splitting strategies (K-Fold, stratified, grouped, and leave-one-out)
 - Scoring metrics for model evaluation
 - Main cross_validate function
 """
@@ -42,6 +42,76 @@ def _validate_shuffle(value: bool) -> None:
     """Validate a splitter shuffle flag."""
     if not isinstance(value, (bool, np.bool_)):
         raise ValueError("shuffle must be a boolean")
+
+
+def _score_strata(
+    responses: NDArray[Any],
+    n_bins: int,
+) -> NDArray[np.intp]:
+    """Bin observed person sum scores for stratified splitting."""
+    numeric_scores = np.issubdtype(responses.dtype, np.number) or np.issubdtype(
+        responses.dtype, np.bool_
+    )
+    if not numeric_scores or np.issubdtype(responses.dtype, np.complexfloating):
+        raise ValueError("stratified responses must contain numeric scores")
+    if np.any(np.isinf(responses)):
+        raise ValueError("stratified responses must not contain infinite values")
+
+    observed = np.isfinite(responses) & (responses >= 0)
+    sum_scores = np.sum(np.where(observed, responses, 0.0), axis=1)
+    bins = np.unique(np.percentile(sum_scores, np.linspace(0, 100, n_bins + 1)))
+    if bins.size < 2:
+        bins = np.array([sum_scores.min(), sum_scores.max() + 1.0])
+    strata = np.digitize(sum_scores, bins[:-1]) - 1
+    strata = np.clip(strata, 0, bins.size - 2)
+    _, compact_strata = np.unique(strata, return_inverse=True)
+    return compact_strata.astype(np.intp, copy=False)
+
+
+def _validated_group_memberships(
+    groups: NDArray[Any],
+    n_rows: int,
+    n_splits: int,
+) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
+    """Validate group labels and return row memberships and group sizes."""
+    labels = np.asarray(groups)
+    if labels.ndim != 1:
+        raise ValueError("groups must be one-dimensional")
+    if labels.shape[0] != n_rows:
+        raise ValueError("groups and responses must contain the same number of rows")
+    if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
+        raise ValueError("groups must not contain missing or non-finite labels")
+    if labels.dtype.kind == "O":
+        missing_object_label = any(
+            label is None
+            or (
+                isinstance(
+                    label,
+                    (float, complex, np.floating, np.complexfloating),
+                )
+                and not np.isfinite(label)
+            )
+            for label in labels
+        )
+        if missing_object_label:
+            raise ValueError("groups must not contain missing labels")
+
+    try:
+        _, group_indices, group_sizes = np.unique(
+            labels,
+            return_inverse=True,
+            return_counts=True,
+        )
+    except TypeError as exc:
+        raise ValueError("group labels must be mutually comparable") from exc
+    if n_splits > group_sizes.size:
+        raise ValueError(
+            f"n_splits={n_splits} cannot exceed n_groups={group_sizes.size}"
+        )
+    return (
+        group_indices.astype(np.intp, copy=False),
+        group_sizes.astype(np.intp, copy=False),
+    )
 
 
 @runtime_checkable
@@ -195,25 +265,7 @@ class StratifiedKFold:
                 f"n_splits={self.n_splits} cannot exceed n_persons={n_persons}"
             )
 
-        numeric_scores = np.issubdtype(
-            response_values.dtype, np.number
-        ) or np.issubdtype(response_values.dtype, np.bool_)
-        if not numeric_scores or np.issubdtype(
-            response_values.dtype, np.complexfloating
-        ):
-            raise ValueError("stratified responses must contain numeric scores")
-        if np.any(np.isinf(response_values)):
-            raise ValueError("stratified responses must not contain infinite values")
-        observed = np.isfinite(response_values) & (response_values >= 0)
-        sum_scores = np.sum(np.where(observed, response_values, 0.0), axis=1)
-
-        bins = np.percentile(sum_scores, np.linspace(0, 100, self.n_bins + 1))
-        bins = np.unique(bins)
-        if len(bins) < 2:
-            bins = np.array([sum_scores.min(), sum_scores.max() + 1])
-
-        strata = np.digitize(sum_scores, bins[:-1]) - 1
-        strata = np.clip(strata, 0, len(bins) - 2)
+        strata = _score_strata(response_values, self.n_bins)
 
         rng = np.random.default_rng(self.random_state) if self.shuffle else None
 
@@ -279,41 +331,12 @@ class GroupKFold:
     ) -> Iterator[tuple[NDArray[np.intp], NDArray[np.intp]]]:
         """Yield complementary train and test indices without group leakage."""
         response_values = _validate_split_responses(responses)
-        labels = np.asarray(self.groups)
-        if labels.ndim != 1:
-            raise ValueError("groups must be one-dimensional")
-        if labels.shape[0] != response_values.shape[0]:
-            raise ValueError(
-                "groups and responses must contain the same number of rows"
-            )
-        if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
-            raise ValueError("groups must not contain missing or non-finite labels")
-        if labels.dtype.kind == "O":
-            missing_object_label = any(
-                label is None
-                or (
-                    isinstance(
-                        label,
-                        (float, complex, np.floating, np.complexfloating),
-                    )
-                    and not np.isfinite(label)
-                )
-                for label in labels
-            )
-            if missing_object_label:
-                raise ValueError("groups must not contain missing labels")
-
-        try:
-            unique_groups, group_indices, group_sizes = np.unique(
-                labels, return_inverse=True, return_counts=True
-            )
-        except TypeError as exc:
-            raise ValueError("group labels must be mutually comparable") from exc
-        n_groups = unique_groups.size
-        if self.n_splits > n_groups:
-            raise ValueError(
-                f"n_splits={self.n_splits} cannot exceed n_groups={n_groups}"
-            )
+        group_indices, group_sizes = _validated_group_memberships(
+            self.groups,
+            response_values.shape[0],
+            self.n_splits,
+        )
+        n_groups = group_sizes.size
 
         if self.shuffle:
             rng = np.random.default_rng(self.random_state)
@@ -335,6 +358,166 @@ class GroupKFold:
                 fold = fold_order[np.argmin(fold_sizes[fold_order])]
                 group_folds[group_idx] = fold
                 fold_sizes[fold] += group_sizes[group_idx]
+
+        fold_assignments = group_folds[group_indices]
+        for fold in range(self.n_splits):
+            test_idx = np.flatnonzero(fold_assignments == fold)
+            train_idx = np.flatnonzero(fold_assignments != fold)
+            yield train_idx, test_idx
+
+
+@dataclass
+class StratifiedGroupKFold:
+    """Score-stratified K-fold splitting without group leakage.
+
+    Person sum scores are divided into quantile strata. Complete groups are
+    then assigned greedily to minimize both stratum-distribution imbalance and
+    total fold-size imbalance. This is useful for repeated subjects, sites,
+    classrooms, test forms, and other clustered response data.
+
+    Parameters
+    ----------
+    groups : NDArray
+        One-dimensional group label for every response-matrix row.
+    n_splits : int, default=5
+        Number of folds. Cannot exceed the number of unique groups.
+    n_bins : int, default=5
+        Number of quantile bins used to stratify person sum scores.
+    shuffle : bool, default=False
+        Randomize equally difficult group ordering and fold labels.
+    random_state : int | None, default=None
+        Random seed used when ``shuffle=True``.
+
+    Examples
+    --------
+    >>> groups = np.repeat(np.arange(20), 5)
+    >>> splitter = StratifiedGroupKFold(groups, n_splits=5, n_bins=4)
+    >>> for train_idx, test_idx in splitter.split(responses):
+    ...     assert not set(groups[train_idx]) & set(groups[test_idx])
+    """
+
+    groups: NDArray[Any]
+    n_splits: int = 5
+    n_bins: int = 5
+    shuffle: bool = False
+    random_state: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_split_count(self.n_splits)
+        if isinstance(self.n_bins, bool) or not isinstance(
+            self.n_bins, (int, np.integer)
+        ):
+            raise ValueError("n_bins must be an integer")
+        if self.n_bins < 1:
+            raise ValueError("n_bins must be at least 1")
+        _validate_shuffle(self.shuffle)
+
+    def split(
+        self,
+        responses: NDArray[np.int_],
+    ) -> Iterator[tuple[NDArray[np.intp], NDArray[np.intp]]]:
+        """Yield group-exclusive folds with balanced score distributions."""
+        response_values = _validate_split_responses(responses)
+        group_indices, group_sizes = _validated_group_memberships(
+            self.groups,
+            response_values.shape[0],
+            self.n_splits,
+        )
+        strata = _score_strata(response_values, self.n_bins)
+        n_groups = group_sizes.size
+        n_strata = int(strata.max()) + 1
+
+        group_strata = np.zeros((n_groups, n_strata), dtype=np.intp)
+        np.add.at(group_strata, (group_indices, strata), 1)
+        total_strata = np.sum(group_strata, axis=0, dtype=np.float64)
+
+        if self.shuffle:
+            rng = np.random.default_rng(self.random_state)
+            tie_breakers = rng.random(n_groups)
+            fold_order = rng.permutation(self.n_splits)
+        else:
+            tie_breakers = np.arange(n_groups, dtype=np.float64)
+            fold_order = np.arange(self.n_splits, dtype=np.intp)
+
+        relative_strata = group_strata / total_strata[None, :]
+        difficulty = np.std(relative_strata, axis=1)
+        dominant_stratum = np.argmax(relative_strata, axis=1)
+        group_order = np.lexsort(
+            (tie_breakers, dominant_stratum, -group_sizes, -difficulty)
+        )
+
+        group_folds = np.empty(n_groups, dtype=np.intp)
+        fold_strata = np.zeros((self.n_splits, n_strata), dtype=np.float64)
+        fold_sizes = np.zeros(self.n_splits, dtype=np.float64)
+        fold_group_counts = np.zeros(self.n_splits, dtype=np.intp)
+        equal_group_sizes = bool(np.all(group_sizes == group_sizes[0]))
+        total_size = float(response_values.shape[0])
+
+        for position, group_idx in enumerate(group_order):
+            if position < self.n_splits:
+                best_fold = int(fold_order[position])
+            else:
+                candidate_folds = fold_order
+                if equal_group_sizes:
+                    minimum_groups = np.min(fold_group_counts)
+                    candidate_folds = fold_order[
+                        fold_group_counts[fold_order] == minimum_groups
+                    ]
+
+                normalized_folds = fold_strata / total_strata
+                normalized_group = group_strata[group_idx] / total_strata
+                stratum_mean = (
+                    np.sum(normalized_folds, axis=0) + normalized_group
+                ) / self.n_splits
+                stratum_squares = np.sum(np.square(normalized_folds), axis=0)
+                current_strata = normalized_folds[candidate_folds]
+                candidate_stratum_squares = (
+                    stratum_squares[None, :]
+                    - np.square(current_strata)
+                    + np.square(current_strata + normalized_group)
+                )
+                stratum_variance = (
+                    candidate_stratum_squares / self.n_splits
+                    - np.square(stratum_mean)[None, :]
+                )
+                stratum_imbalance = np.mean(
+                    np.sqrt(np.maximum(stratum_variance, 0.0)),
+                    axis=1,
+                )
+
+                normalized_sizes = fold_sizes / total_size
+                normalized_group_size = group_sizes[group_idx] / total_size
+                size_mean = (
+                    np.sum(normalized_sizes) + normalized_group_size
+                ) / self.n_splits
+                candidate_size_squares = (
+                    np.sum(np.square(normalized_sizes))
+                    - np.square(normalized_sizes[candidate_folds])
+                    + np.square(
+                        normalized_sizes[candidate_folds] + normalized_group_size
+                    )
+                )
+                size_imbalance = np.sqrt(
+                    np.maximum(
+                        candidate_size_squares / self.n_splits - size_mean**2,
+                        0.0,
+                    )
+                )
+                scores = stratum_imbalance + size_imbalance
+                resulting_sizes = fold_sizes[candidate_folds] + group_sizes[group_idx]
+                best_position = np.lexsort(
+                    (
+                        np.arange(candidate_folds.size),
+                        resulting_sizes,
+                        scores,
+                    )
+                )[0]
+                best_fold = int(candidate_folds[best_position])
+
+            group_folds[group_idx] = best_fold
+            fold_strata[best_fold] += group_strata[group_idx]
+            fold_sizes[best_fold] += group_sizes[group_idx]
+            fold_group_counts[best_fold] += 1
 
         fold_assignments = group_folds[group_indices]
         for fold in range(self.n_splits):
@@ -861,6 +1044,8 @@ __all__ = [
     "Splitter",
     "KFold",
     "StratifiedKFold",
+    "GroupKFold",
+    "StratifiedGroupKFold",
     "LeaveOneOut",
     "Scorer",
     "LogLikelihoodScorer",

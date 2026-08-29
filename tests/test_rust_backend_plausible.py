@@ -90,7 +90,9 @@ def test_posterior_sampler_matches_discrete_posterior(numpy_fallback: None) -> N
 
 def test_posterior_sampler_is_reproducible_and_handles_missingness(
     numpy_fallback: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(plausible, "_entry_chunk_size", lambda *_: 1)
     responses = np.array([[1, -1, 0], [-9, -1, -4]], dtype=np.int32)
     points = np.array([-1.0, 0.0, 1.0])
     weights = np.array([0.2, 0.6, 0.2])

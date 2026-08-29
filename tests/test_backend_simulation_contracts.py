@@ -309,3 +309,53 @@ def test_numpy_simulation_remains_seeded(
     second = function(**kwargs, seed=23)
 
     np.testing.assert_array_equal(first, second)
+
+
+@pytest.mark.parametrize(
+    ("function", "expected"),
+    [
+        (
+            simulation.simulate_grm,
+            [
+                [3, 0, 0, 0],
+                [0, 0, 3, 1],
+                [3, 0, 2, 2],
+                [2, 3, 1, 1],
+                [3, 3, 2, 3],
+            ],
+        ),
+        (
+            simulation.simulate_gpcm,
+            [
+                [2, 0, 0, 0],
+                [0, 0, 2, 1],
+                [2, 1, 2, 2],
+                [2, 3, 1, 1],
+                [3, 3, 2, 3],
+            ],
+        ),
+    ],
+)
+def test_polytomous_simulation_preserves_seed_order_across_chunks(
+    numpy_simulation: None,
+    monkeypatch: pytest.MonkeyPatch,
+    function: Any,
+    expected: list[list[int]],
+) -> None:
+    theta = np.array([-2.0, -0.5, 0.0, 0.75, 2.0])
+    discrimination = np.array([0.6, 1.0, 1.4, 2.0])
+    thresholds = np.array(
+        [
+            [-1.5, -0.2, 1.1],
+            [-1.0, 0.0, 1.0],
+            [-0.7, 0.4, 1.8],
+            [-2.0, -0.5, 0.5],
+        ]
+    )
+
+    unchunked = function(theta, discrimination, thresholds, seed=31)
+    monkeypatch.setattr(simulation, "_entry_chunk_size", lambda *_: 1)
+    single_item_chunks = function(theta, discrimination, thresholds, seed=31)
+
+    np.testing.assert_array_equal(unchunked, expected)
+    np.testing.assert_array_equal(single_item_chunks, expected)

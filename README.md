@@ -450,6 +450,8 @@ plot_person_item_map(result.model, scores.theta)
 | `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
+| `itemstats()` | Item distributions, modes, entropy, and effective category counts |
+| `missing_patterns()` | Frequency-ranked missing-response pattern analysis |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
 | `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
 | `calc_null()` | Independence and pooled-intercept baseline fit statistics |
@@ -466,7 +468,7 @@ plot_person_item_map(result.model, scores.theta)
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `draw_parameters()` | Draw samples from posterior distribution |
 | `posterior_summary()` | Summarize sampled parameter uncertainty |
-| `sample_expected_scores()` | Propagate parameter uncertainty to expected scores |
+| `sample_expected_scores()` | Propagate parameter uncertainty to test, subtest, or item scores |
 | `randef()` / `fixef()` | Random/fixed effects from mixed models |
 | `predict_mixed()` | Response probabilities from abilities or person covariates |
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |

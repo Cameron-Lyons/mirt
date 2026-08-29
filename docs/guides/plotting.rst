@@ -8,6 +8,11 @@ with the dedicated extra:
 
    pip install "mirt[plot]"
 
+Importing ``mirt.plotting`` or resolving a top-level plotting helper does not
+load NumPy, SciPy, or Matplotlib. NumPy loads on the first plotting call,
+Matplotlib loads only when an axes must be created, and SciPy loads only when a
+kernel-density overlay is requested.
+
 Item and test curves
 --------------------
 

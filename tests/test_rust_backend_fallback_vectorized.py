@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 import mirt
 import mirt._rust_backend as rb
@@ -362,5 +363,60 @@ def test_gpcm_vectorized_fallback_matches_reference() -> None:
         )
 
         np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_polytomous_fallbacks_skip_fully_missing_item_groups() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(12)
+    try:
+        responses = np.full((4, 2), -1, dtype=np.int32)
+        quad_points = np.array([-1.0, 0.0, 1.0])
+        discrimination = np.array([0.8, 1.2])
+        n_categories = np.array([3, 5], dtype=np.int32)
+        thresholds = np.zeros((2, 4))
+        steps = np.zeros((2, 5))
+
+        grm = rb.compute_log_likelihoods_grm(
+            responses,
+            quad_points,
+            discrimination,
+            thresholds,
+            n_categories,
+        )
+        gpcm = rb.compute_log_likelihoods_gpcm(
+            responses,
+            quad_points,
+            discrimination,
+            steps,
+            n_categories,
+        )
+
+        np.testing.assert_array_equal(grm, np.zeros((4, 3)))
+        np.testing.assert_array_equal(gpcm, np.zeros((4, 3)))
+    finally:
+        _restore(previous, old_chunk)
+
+
+def test_polytomous_fallbacks_reject_out_of_range_categories() -> None:
+    previous, old_chunk = _with_numpy_backend_and_chunk(12)
+    try:
+        responses = np.array([[3]], dtype=np.int32)
+        quad_points = np.array([0.0])
+        discrimination = np.array([1.0])
+        n_categories = np.array([3], dtype=np.int32)
+
+        for function, parameters in (
+            (rb.compute_log_likelihoods_grm, np.zeros((1, 2))),
+            (rb.compute_log_likelihoods_gpcm, np.zeros((1, 3))),
+        ):
+            with pytest.raises(IndexError, match="outside the item category range"):
+                function(
+                    responses,
+                    quad_points,
+                    discrimination,
+                    parameters,
+                    n_categories,
+                )
     finally:
         _restore(previous, old_chunk)

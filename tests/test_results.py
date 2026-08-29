@@ -179,6 +179,21 @@ def test_fit_result_dictionary_is_json_compatible() -> None:
     assert "standard_errors" not in compact
 
 
+def test_fit_result_json_export_respects_compact_options() -> None:
+    payload = json.loads(
+        _fit_result().to_json(
+            include_parameters=False,
+            include_standard_errors=False,
+            indent=2,
+        )
+    )
+
+    assert payload["model"]["name"] == "2PL"
+    assert payload["n_observations"] == 250
+    assert "parameters" not in payload
+    assert "standard_errors" not in payload
+
+
 def test_fit_statistics_preserve_scalar_types() -> None:
     statistics = _fit_result().fit_statistics()
 
@@ -367,6 +382,91 @@ def test_score_array_and_dictionary_are_defensive() -> None:
     assert payload["n_factors"] == 2
     assert payload["person_ids"] == ["p1", "p2"]
     json.dumps(payload)
+
+
+def test_score_dictionary_normalizes_numpy_person_identifiers() -> None:
+    result = ScoreResult(
+        np.array([0.0, 1.0, 2.0, 3.0]),
+        np.full(4, 0.2),
+        "EAP",
+        [np.int64(10), np.float64(2.5), np.bool_(True), np.str_("p4")],
+    )
+
+    payload = result.to_dict()
+    assert payload["person_ids"] == [10, 2.5, True, "p4"]
+    assert [type(value) for value in payload["person_ids"]] == [
+        int,
+        float,
+        bool,
+        str,
+    ]
+    json.dumps(payload)
+
+
+def test_score_dictionary_and_json_round_trip() -> None:
+    original = ScoreResult(
+        theta=np.array([[0.0, 1.0], [0.5, -0.5]]),
+        standard_error=np.full((2, 2), 0.2),
+        method="MAP",
+        person_ids=[np.int64(10), np.str_("p2")],
+    )
+
+    from_dict = ScoreResult.from_dict(original.to_dict())
+    from_json = ScoreResult.from_json(original.to_json(indent=2))
+
+    for restored in (from_dict, from_json):
+        np.testing.assert_array_equal(restored.theta, original.theta)
+        np.testing.assert_array_equal(restored.standard_error, original.standard_error)
+        assert restored.method == "MAP"
+        assert restored.person_ids == [10, "p2"]
+        assert restored.to_dict() == json.loads(restored.to_json())
+
+
+def test_score_dictionary_accepts_minimal_payload() -> None:
+    result = ScoreResult.from_dict(
+        {
+            "method": "EAP",
+            "theta": [0.0, 1.0],
+            "standard_error": [0.2, 0.3],
+        }
+    )
+
+    assert result.n_persons == 2
+    assert result.n_factors == 1
+    assert result.person_ids is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("n_persons", 3), ("n_persons", True), ("n_factors", 2), ("n_factors", 1.0)],
+)
+def test_score_dictionary_validates_derived_metadata(field: str, value: Any) -> None:
+    payload = ScoreResult(np.zeros(2), np.ones(2), "EAP").to_dict()
+    payload[field] = value
+
+    with pytest.raises(MirtValidationError, match="reconstructed score shape"):
+        ScoreResult.from_dict(payload)
+
+
+def test_score_dictionary_rejects_invalid_payload_shape() -> None:
+    with pytest.raises(MirtValidationError, match="must be a mapping"):
+        ScoreResult.from_dict([])
+    with pytest.raises(MirtValidationError, match="missing required fields"):
+        ScoreResult.from_dict({"method": "EAP"})
+
+    payload = ScoreResult(np.zeros(2), np.ones(2), "EAP").to_dict()
+    payload["unexpected"] = True
+    with pytest.raises(MirtValidationError, match="unknown fields: unexpected"):
+        ScoreResult.from_dict(payload)
+
+
+def test_score_json_rejects_invalid_input() -> None:
+    with pytest.raises(MirtValidationError, match="string or bytes"):
+        ScoreResult.from_json(123)
+    with pytest.raises(MirtValidationError, match="valid JSON object"):
+        ScoreResult.from_json("{")
+    with pytest.raises(MirtValidationError, match="must be a mapping"):
+        ScoreResult.from_json("[]")
 
 
 def test_score_summary_handles_multiple_factors_and_empty_results() -> None:

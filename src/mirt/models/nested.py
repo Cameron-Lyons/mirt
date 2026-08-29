@@ -16,6 +16,7 @@ items. *Psychometrika, 49*(4), 501-519.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Self
 
 import numpy as np
@@ -25,6 +26,25 @@ from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import PolytomousItemModel
+
+_MAX_NESTED_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+
+
+def _nested_category_chunks(
+    category_counts: list[int],
+    n_persons: int,
+) -> Iterator[tuple[int, NDArray[np.intp]]]:
+    """Group equal-width nested-logit items into bounded probability chunks."""
+    counts = np.asarray(category_counts, dtype=np.intp)
+    for n_categories in np.unique(counts):
+        item_indices = np.flatnonzero(counts == n_categories)
+        chunk_size = max(
+            1,
+            _MAX_NESTED_PROBABILITY_CHUNK_ENTRIES
+            // max(1, n_persons * int(n_categories)),
+        )
+        for start in range(0, item_indices.size, chunk_size):
+            yield int(n_categories), item_indices[start : start + chunk_size]
 
 
 class TwoPLNestedLogit(PolytomousItemModel):
@@ -385,15 +405,90 @@ class TwoPLNestedLogit(PolytomousItemModel):
         if item_idx is not None:
             probability, _ = self._item_curves_from_theta(theta, item_idx)
             return probability
+        if self.n_items == 1:
+            probability, _ = self._item_curves_from_theta(theta, 0)
+            return probability[:, None, :]
+
+        self._validate_parameter_values(self._parameters)
 
         result = np.zeros(
             (theta.size, self.n_items, self.max_categories),
             dtype=np.float64,
         )
-        for index, n_categories in enumerate(self._n_categories):
-            probability, _ = self._item_curves_from_theta(theta, index)
-            result[:, index, :n_categories] = probability
+        for n_categories, item_indices in _nested_category_chunks(
+            self._n_categories,
+            theta.size,
+        ):
+            chunk_probabilities = None
+            if item_indices.size >= 2:
+                chunk_probabilities = self._group_probabilities(
+                    theta,
+                    item_indices,
+                    n_categories,
+                )
+            if chunk_probabilities is not None:
+                result[:, item_indices, :n_categories] = chunk_probabilities
+                continue
+
+            for index in item_indices:
+                probability, _ = self._item_curves_from_theta(theta, int(index))
+                result[:, index, :n_categories] = probability
         return result
+
+    def _group_probabilities(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+        n_categories: int,
+    ) -> NDArray[np.float64] | None:
+        """Evaluate a moderate item chunk, deferring extreme logits."""
+        discrimination = self._parameters["discrimination"][item_indices]
+        difficulty = self._parameters["difficulty"][item_indices]
+        slopes = self._parameters["distractor_slopes"][item_indices, :n_categories]
+        intercepts = self._parameters["distractor_intercepts"][
+            item_indices, :n_categories
+        ]
+        correct = np.asarray(self._correct, dtype=np.intp)[item_indices]
+        lower = np.fromiter(
+            (self._lower_asymptote(int(index)) for index in item_indices),
+            dtype=np.float64,
+            count=item_indices.size,
+        )
+        upper = np.fromiter(
+            (self._upper_asymptote(int(index)) for index in item_indices),
+            dtype=np.float64,
+            count=item_indices.size,
+        )
+        if (
+            not np.all(np.isfinite(lower))
+            or not np.all(np.isfinite(upper))
+            or np.any(lower < 0.0)
+            or np.any(upper > 1.0)
+            or np.any(lower >= upper)
+        ):
+            raise MirtValidationError(
+                "Stored nested-logit asymptotes are invalid",
+                parameter="parameters",
+            )
+
+        with np.errstate(over="ignore", invalid="ignore"):
+            logistic = sigmoid(
+                discrimination[None, :] * (theta[:, None] - difficulty[None, :])
+            )
+            probability_correct = lower + (upper - lower) * logistic
+            logits = theta[:, None, None] * slopes[None, :, :] + intercepts[None, :, :]
+
+        item_positions = np.arange(item_indices.size)
+        logits[:, item_positions, correct] = 0.0
+        if not np.all(np.isfinite(logits)):
+            return None
+        logits[:, item_positions, correct] = -np.inf
+        logits -= np.max(logits, axis=2, keepdims=True)
+        np.exp(logits, out=logits)
+        logits /= np.sum(logits, axis=2, keepdims=True)
+        logits *= 1.0 - probability_correct[:, :, None]
+        logits[:, item_positions, correct] = probability_correct
+        return logits
 
     def category_response_curves(
         self,

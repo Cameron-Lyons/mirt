@@ -127,6 +127,140 @@ def test_sample_expected_scores_can_target_one_item_without_full_bank_logits(
     assert all(shape[2] == 1 for shape in logit_shapes)
 
 
+def test_sample_expected_scores_can_target_a_subtest():
+    model = TwoParameterLogistic(n_items=5)
+    samples = ParameterSamples(
+        discrimination=np.array(
+            [[1.0, 1.5, 0.5, 0.8, 1.2], [0.75, 1.25, 2.0, 1.1, 0.6]]
+        ),
+        difficulty=np.array(
+            [[0.0, 0.5, -0.5, 1.0, -1.0], [-0.5, 0.25, 1.0, 0.2, -0.8]]
+        ),
+    )
+    theta = np.array([[-2.0], [0.0], [2.0]])
+    selected = np.array([4, 1, 3])
+
+    actual = sample_expected_scores(model, theta, samples, item_indices=selected)
+    expected = sum(
+        sample_expected_scores(model, theta, samples, item_idx=int(index))
+        for index in selected
+    )
+
+    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_allclose(
+        sample_expected_scores(
+            model,
+            theta,
+            samples,
+            item_indices=selected,
+            chunk_size=1,
+        ),
+        expected,
+    )
+
+
+def test_sample_expected_scores_subtest_supports_bounded_models():
+    model = FiveParameterLogistic(n_items=4)
+    samples = ParameterSamples(
+        discrimination=np.array(
+            [
+                [1.0, 0.5, 0.8, 1.3],
+                [0.7, 0.9, 1.1, 0.6],
+            ]
+        ),
+        difficulty=np.array([[0.0, 0.5, -0.5, 1.0], [-0.5, 0.25, 1.0, -0.2]]),
+        guessing=np.array([[0.1, 0.2, 0.05, 0.15], [0.15, 0.05, 0.1, 0.2]]),
+        upper=np.array([[0.9, 0.95, 0.8, 0.85], [0.85, 0.8, 0.9, 0.95]]),
+        asymmetry=np.array([[0.8, 1.2, 1.0, 0.7], [1.5, 0.6, 0.9, 1.1]]),
+    )
+    theta = np.array([[-1.0], [0.0], [1.0]])
+
+    actual = sample_expected_scores(model, theta, samples, item_indices=[0, 2])
+    expected = sample_expected_scores(model, theta, samples, item_idx=0)
+    expected += sample_expected_scores(model, theta, samples, item_idx=2)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_sample_expected_scores_subtest_uses_fixed_asymptotes():
+    model = FourParameterLogistic(n_items=4)
+    model.set_parameters(
+        guessing=np.array([0.1, 0.2, 0.05, 0.15]),
+        upper=np.array([0.9, 0.95, 0.8, 0.85]),
+    )
+    samples = ParameterSamples(
+        discrimination=np.array([[1.0, 0.5, 0.8, 1.3], [0.7, 0.9, 1.1, 0.6]]),
+        difficulty=np.array([[0.0, 0.5, -0.5, 1.0], [-0.5, 0.25, 1.0, -0.2]]),
+    )
+    theta = np.array([[-1.0], [0.0], [1.0]])
+
+    actual = sample_expected_scores(model, theta, samples, item_indices=[3, 0])
+    expected = sample_expected_scores(model, theta, samples, item_idx=3)
+    expected += sample_expected_scores(model, theta, samples, item_idx=0)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_sample_expected_scores_subtest_supports_multidimensional_models():
+    model = TwoParameterLogistic(n_items=4, n_factors=2)
+    samples = ParameterSamples(
+        discrimination=np.array(
+            [
+                [[1.0, 0.5], [0.2, 1.2], [0.8, 0.7], [1.3, 0.1]],
+                [[0.7, 0.9], [1.1, 0.3], [0.4, 1.4], [0.6, 0.8]],
+            ]
+        ),
+        difficulty=np.array([[0.0, 0.5, -0.5, 1.0], [-0.5, 0.25, 1.0, -0.2]]),
+    )
+    theta = np.array([[-1.0, 0.5], [0.0, 0.0], [1.0, -0.5]])
+
+    actual = sample_expected_scores(model, theta, samples, item_indices=[1, 3])
+    expected = sample_expected_scores(model, theta, samples, item_idx=1)
+    expected += sample_expected_scores(model, theta, samples, item_idx=3)
+
+    np.testing.assert_allclose(actual, expected)
+
+
+def test_targeted_scores_do_not_allocate_full_bank_asymptote_arrays(monkeypatch):
+    model = TwoParameterLogistic(n_items=40)
+    samples = ParameterSamples(np.ones((6, 40)), np.zeros((6, 40)))
+    observed_shapes = []
+    original_zeros = sampling_utils.np.zeros
+    original_ones = sampling_utils.np.ones
+
+    def tracked_zeros(shape, *args, **kwargs):
+        observed_shapes.append(tuple(shape))
+        return original_zeros(shape, *args, **kwargs)
+
+    def tracked_ones(shape, *args, **kwargs):
+        observed_shapes.append(tuple(shape))
+        return original_ones(shape, *args, **kwargs)
+
+    monkeypatch.setattr(sampling_utils.np, "zeros", tracked_zeros)
+    monkeypatch.setattr(sampling_utils.np, "ones", tracked_ones)
+
+    sample_expected_scores(
+        model,
+        np.array([-1.0, 0.0, 1.0]),
+        samples,
+        item_idx=2,
+    )
+
+    assert (6, 1) in observed_shapes
+    assert (6, 40) not in observed_shapes
+    observed_shapes.clear()
+
+    sample_expected_scores(
+        model,
+        np.array([-1.0, 0.0, 1.0]),
+        samples,
+        item_indices=[2, 8, 21],
+    )
+
+    assert (6, 3) in observed_shapes
+    assert (6, 40) not in observed_shapes
+
+
 @pytest.mark.parametrize("item_idx", [-1, 3, True, 1.5])
 def test_sample_expected_scores_rejects_invalid_item_indices(item_idx):
     model = TwoParameterLogistic(n_items=3)
@@ -134,6 +268,45 @@ def test_sample_expected_scores_rejects_invalid_item_indices(item_idx):
 
     with pytest.raises(IndexError, match="item_idx"):
         sample_expected_scores(model, np.array([0.0]), samples, item_idx=item_idx)
+
+
+@pytest.mark.parametrize(
+    ("item_indices", "error", "message"),
+    [
+        ([], ValueError, "non-empty"),
+        ([[0, 1]], ValueError, "one-dimensional"),
+        ([0.0, 1.0], ValueError, "integers"),
+        ([True, False], ValueError, "integers"),
+        ([0, 0], ValueError, "duplicates"),
+        ([-1, 0], IndexError, "values"),
+        ([0, 3], IndexError, "values"),
+    ],
+)
+def test_sample_expected_scores_rejects_invalid_subtests(item_indices, error, message):
+    model = TwoParameterLogistic(n_items=3)
+    samples = ParameterSamples(np.ones((2, 3)), np.zeros((2, 3)))
+
+    with pytest.raises(error, match=message):
+        sample_expected_scores(
+            model,
+            np.array([0.0]),
+            samples,
+            item_indices=item_indices,
+        )
+
+
+def test_sample_expected_scores_rejects_conflicting_item_selections():
+    model = TwoParameterLogistic(n_items=3)
+    samples = ParameterSamples(np.ones((2, 3)), np.zeros((2, 3)))
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        sample_expected_scores(
+            model,
+            np.array([0.0]),
+            samples,
+            item_idx=0,
+            item_indices=[1, 2],
+        )
 
 
 def test_sample_expected_scores_is_stable_at_extreme_abilities():
