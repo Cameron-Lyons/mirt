@@ -9,7 +9,7 @@ This module provides:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -865,6 +865,58 @@ def posterior_predictive_check(
     are applied temporarily; the supplied model is restored before return, even
     when a custom statistic raises an exception.
     """
+    return posterior_predictive_checks(
+        mcmc_result,
+        responses,
+        model,
+        {"result": test_statistic},
+        n_rep=n_rep,
+        seed=seed,
+    )["result"]
+
+
+def posterior_predictive_checks(
+    mcmc_result: MCMCResult,
+    responses: NDArray[np.int_],
+    model: BaseItemModel,
+    test_statistics: Mapping[str, Callable[[NDArray[np.int_]], float] | str]
+    | Iterable[str],
+    *,
+    n_rep: int | None = None,
+    seed: int | None = None,
+) -> dict[str, PPCResult]:
+    """Evaluate several posterior predictive statistics in one simulation run.
+
+    Parameters
+    ----------
+    mcmc_result : MCMCResult
+        Result from MCMC estimation containing chains.
+    responses : ndarray of shape (n_persons, n_items)
+        Observed response matrix.
+    model : BaseItemModel
+        IRT model used for simulation.
+    test_statistics : mapping or iterable of str
+        A mapping from result labels to built-in statistic names or callables, or
+        an iterable of built-in names. Available built-ins are ``'item_mean'``,
+        ``'person_score'``, ``'chi_square'``, ``'correlation'``, and
+        ``'odds_ratio'``.
+    n_rep : int, optional
+        Number of replications. Defaults to number of posterior samples.
+    seed : int, optional
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    dict of str to PPCResult
+        One result per requested statistic, preserving input order.
+
+    Notes
+    -----
+    Each posterior replicate is simulated once and shared by every statistic.
+    This produces a directly comparable diagnostic suite while avoiding repeated
+    probability evaluation. Posterior samples are applied temporarily and the
+    supplied model is restored before return, including when a statistic raises.
+    """
     rng = np.random.default_rng(seed)
     responses = _validate_response_matrix(responses, model)
     n_persons, n_items = responses.shape
@@ -872,10 +924,10 @@ def posterior_predictive_check(
     if not np.any(responses >= 0):
         raise ValueError("responses must contain at least one observed value")
 
-    if isinstance(test_statistic, str):
-        test_statistic = _get_builtin_statistic(test_statistic, n_items)
-
-    t_obs = test_statistic(responses)
+    statistics = _resolve_test_statistics(test_statistics, n_items)
+    observed_statistics = {
+        name: float(statistic(responses)) for name, statistic in statistics.items()
+    }
 
     chains = mcmc_result.chains
     n_samples, parameter_chains = _sampled_parameter_chains(
@@ -892,8 +944,9 @@ def posterior_predictive_check(
         raise ValueError("n_rep must be a positive integer")
 
     sample_indices = rng.choice(n_samples, size=n_rep, replace=n_rep > n_samples)
-
-    t_rep = np.zeros(n_rep, dtype=np.float64)
+    replicated_statistics = {
+        name: np.zeros(n_rep, dtype=np.float64) for name in statistics
+    }
     observed = responses >= 0
     parameter_names = set(parameter_chains)
 
@@ -912,25 +965,77 @@ def posterior_predictive_check(
                 theta = rng.standard_normal((n_persons, model.n_factors))
             replicated = _simulate_response_matrix(model, theta, rng)
             replicated = np.where(observed, replicated, -1)
-            t_rep[rep_idx] = test_statistic(replicated)
+            for name, statistic in statistics.items():
+                replicated_statistics[name][rep_idx] = statistic(replicated)
 
-    p_value = np.mean(t_rep >= t_obs)
-
-    summary_stats = {
-        "mean": float(np.mean(t_rep)),
-        "std": float(np.std(t_rep)),
-        "q025": float(np.percentile(t_rep, 2.5)),
-        "q975": float(np.percentile(t_rep, 97.5)),
-        "min": float(np.min(t_rep)),
-        "max": float(np.max(t_rep)),
+    return {
+        name: _make_ppc_result(observed_statistics[name], replicated)
+        for name, replicated in replicated_statistics.items()
     }
 
+
+def _make_ppc_result(
+    observed: float,
+    replicated: NDArray[np.float64],
+) -> PPCResult:
+    """Summarize one observed statistic and its posterior replicates."""
+    summary_stats = {
+        "mean": float(np.mean(replicated)),
+        "std": float(np.std(replicated)),
+        "q025": float(np.percentile(replicated, 2.5)),
+        "q975": float(np.percentile(replicated, 97.5)),
+        "min": float(np.min(replicated)),
+        "max": float(np.max(replicated)),
+    }
     return PPCResult(
-        test_statistic_observed=float(t_obs),
-        test_statistic_replicated=t_rep,
-        p_value=float(p_value),
+        test_statistic_observed=observed,
+        test_statistic_replicated=replicated,
+        p_value=float(np.mean(replicated >= observed)),
         summary_stats=summary_stats,
     )
+
+
+def _resolve_test_statistics(
+    test_statistics: Mapping[str, Callable[[NDArray[np.int_]], float] | str]
+    | Iterable[str],
+    n_items: int,
+) -> dict[str, Callable[[NDArray[np.int_]], float]]:
+    """Validate labels and resolve built-in posterior predictive statistics."""
+    if isinstance(test_statistics, Mapping):
+        entries = list(test_statistics.items())
+    else:
+        if isinstance(test_statistics, (str, bytes)):
+            raise ValueError(
+                "test_statistics must be a mapping or an iterable of names"
+            )
+        try:
+            names = list(test_statistics)
+        except TypeError as exc:
+            raise ValueError(
+                "test_statistics must be a mapping or an iterable of names"
+            ) from exc
+        if any(not isinstance(name, str) for name in names):
+            raise ValueError("iterable test_statistics must contain only names")
+        if len(names) != len(set(names)):
+            raise ValueError("test statistic names must be unique")
+        entries = [(name, name) for name in names]
+
+    if not entries:
+        raise ValueError("test_statistics must contain at least one statistic")
+
+    resolved: dict[str, Callable[[NDArray[np.int_]], float]] = {}
+    for label, specification in entries:
+        if not isinstance(label, str) or not label:
+            raise ValueError("test statistic labels must be non-empty strings")
+        if isinstance(specification, str):
+            resolved[label] = _get_builtin_statistic(specification, n_items)
+        elif callable(specification):
+            resolved[label] = specification
+        else:
+            raise ValueError(
+                "test statistics must be built-in names or callable functions"
+            )
+    return resolved
 
 
 def _get_builtin_statistic(

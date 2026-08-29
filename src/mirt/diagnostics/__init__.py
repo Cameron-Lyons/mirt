@@ -27,6 +27,7 @@ __all__ = [
     "waic",
     "dic",
     "posterior_predictive_check",
+    "posterior_predictive_checks",
     "compute_pointwise_log_lik",
     "compare_models",
     "PSISResult",
@@ -74,6 +75,10 @@ _LAZY_IMPORTS = {
     "posterior_predictive_check": (
         "mirt.diagnostics.bayesian",
         "posterior_predictive_check",
+    ),
+    "posterior_predictive_checks": (
+        "mirt.diagnostics.bayesian",
+        "posterior_predictive_checks",
     ),
     "compute_pointwise_log_lik": (
         "mirt.diagnostics.bayesian",

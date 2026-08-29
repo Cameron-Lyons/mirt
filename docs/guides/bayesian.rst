@@ -99,3 +99,30 @@ matrix when each observed response is the predictive unit. Exact unidimensional
 2PL models evaluate fixed or sampled item parameters and abilities through a
 batched native implementation when available, with a memory-bounded NumPy fallback.
 Other model families retain the general probability-based implementation.
+
+Posterior predictive suites
+---------------------------
+
+Use ``posterior_predictive_checks`` when several aspects of model fit should be
+checked together. Every requested statistic sees the same replicated datasets,
+so comparisons are paired and model probabilities are evaluated only once per
+replication:
+
+.. code-block:: python
+
+   from mirt.diagnostics import posterior_predictive_checks
+
+   checks = posterior_predictive_checks(
+       result,
+       responses,
+       result.model,
+       ["item_mean", "person_score", "correlation"],
+       n_rep=500,
+       seed=42,
+   )
+   for name, check in checks.items():
+       print(name, check.p_value)
+
+A mapping can provide descriptive labels and custom scalar statistics. Values may
+mix built-in names and callables. Use ``posterior_predictive_check`` when only one
+statistic is needed; it returns the same ``PPCResult`` as before.
