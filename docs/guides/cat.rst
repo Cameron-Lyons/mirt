@@ -78,4 +78,31 @@ controllers (Sympson–Hetter, randomesque, progressive) for operational CAT.
 Progressive control randomizes early selections within an information window
 and increasingly favors item information as the configured test limit nears.
 
+Fixed-form assembly
+-------------------
+
+Use :func:`~mirt.cat.assembly.assemble_form` to build a fixed form from a
+calibrated item pool. The mixed-integer optimizer can maximize weighted test
+information or match a target information curve while enforcing content-area
+limits, required and excluded items, enemy pairs, and a cost budget.
+
+.. code-block:: python
+
+   import numpy as np
+   from mirt.cat import ContentArea, ContentBlueprint, assemble_form
+
+   blueprint = ContentBlueprint([
+       ContentArea("Algebra", items=set(range(10)), min_items=4, max_items=6),
+       ContentArea("Geometry", items=set(range(10, 20)), min_items=4, max_items=6),
+   ])
+   assembly = assemble_form(
+       fit.model,
+       form_size=10,
+       theta=np.linspace(-2.0, 2.0, 21),
+       blueprint=blueprint,
+       enemy_pairs={(1, 2), (11, 12)},
+   )
+   print(assembly.selected_items)
+   print(assembly.summary())
+
 See ``examples/fit_score_itemfit_cat.py`` for a complete script.
