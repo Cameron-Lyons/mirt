@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt import fscores
 from mirt.models import GradedResponseModel, TwoParameterLogistic
 from mirt.scoring._common import build_quadrature, validate_scoring_responses
 from mirt.scoring.eap import EAPScorer
@@ -20,6 +21,7 @@ class TestEAPScorerInitialization:
         assert scorer.n_quadpts == 49
         assert scorer.prior_mean is None
         assert scorer.prior_cov is None
+        assert scorer.batch_size is None
 
     def test_custom_n_quadpts(self):
         """Test initialization with custom quadrature points."""
@@ -31,6 +33,12 @@ class TestEAPScorerInitialization:
         """Test that invalid n_quadpts raises error."""
         with pytest.raises(ValueError, match="at least 5"):
             EAPScorer(n_quadpts=3)
+
+    @pytest.mark.parametrize("batch_size", [0, -1, True, 2.5, "10"])
+    def test_rejects_invalid_batch_size(self, batch_size):
+        """Reject non-positive and ambiguous respondent batch sizes."""
+        with pytest.raises(ValueError, match="batch_size"):
+            EAPScorer(batch_size=batch_size)
 
     @pytest.mark.parametrize("n_quadpts", [True, 5.5, "7"])
     def test_rejects_non_integer_n_quadpts(self, n_quadpts):
@@ -71,6 +79,8 @@ class TestEAPScorerInitialization:
 
         assert "EAPScorer" in repr_str
         assert "21" in repr_str
+        assert "batch_size" not in repr_str
+        assert "batch_size=10" in repr(EAPScorer(batch_size=10))
 
 
 class TestEAPScorerScoring:
@@ -165,6 +175,128 @@ class TestEAPScorerScoring:
         assert_allclose(received[0], [[-1, 0], [-1, 0]])
         assert_allclose(result.theta[0], result.theta[1])
         assert_allclose(result.standard_error[0], result.standard_error[1])
+
+    def test_explicit_batches_preserve_scores_and_call_bounds(self, monkeypatch):
+        """Explicit batching bounds likelihood calls without changing results."""
+        model = TwoParameterLogistic(n_items=4)
+        model.set_parameters(
+            discrimination=np.array([0.8, 1.1, 1.4, 1.7]),
+            difficulty=np.array([-1.0, -0.2, 0.4, 1.2]),
+        )
+        model._is_fitted = True
+        responses = np.array(
+            [
+                [0, 0, 1, 1],
+                [1, 0, 1, 0],
+                [1, 1, -9, 0],
+                [0, 1, 0, 1],
+                [1, 1, 1, 1],
+            ]
+        )
+        expected = EAPScorer(n_quadpts=21, batch_size=100).score(model, responses)
+        original = model.log_likelihood_batch
+        call_sizes = []
+
+        def capture(response_batch, theta):
+            call_sizes.append(len(response_batch))
+            return original(response_batch, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", capture)
+        actual = EAPScorer(n_quadpts=21, batch_size=2).score(model, responses)
+
+        assert call_sizes == [2, 2, 1]
+        assert_allclose(actual.theta, expected.theta, rtol=0.0, atol=1e-14)
+        assert_allclose(
+            actual.standard_error,
+            expected.standard_error,
+            rtol=0.0,
+            atol=1e-14,
+        )
+
+    def test_explicit_batches_preserve_polytomous_scores(self):
+        """Respondent batching also preserves category-response likelihoods."""
+        model = GradedResponseModel(n_items=3, n_categories=[3, 4, 3])
+        model._is_fitted = True
+        responses = np.array(
+            [
+                [0, 1, 2],
+                [2, 3, 1],
+                [1, -4, 0],
+                [2, 2, 2],
+                [0, 0, 0],
+            ]
+        )
+
+        expected = EAPScorer(n_quadpts=21, batch_size=100).score(model, responses)
+        actual = EAPScorer(n_quadpts=21, batch_size=2).score(model, responses)
+
+        assert_allclose(actual.theta, expected.theta, rtol=0.0, atol=1e-14)
+        assert_allclose(
+            actual.standard_error,
+            expected.standard_error,
+            rtol=0.0,
+            atol=1e-14,
+        )
+
+    def test_explicit_batches_preserve_multidimensional_scores(self):
+        """Batch boundaries do not alter multidimensional posterior moments."""
+        model = TwoParameterLogistic(n_items=4, n_factors=2)
+        model.set_parameters(
+            discrimination=np.array([[1.2, 0.1], [0.2, 1.3], [0.8, 0.7], [1.0, 0.5]]),
+            difficulty=np.array([-0.8, -0.1, 0.5, 1.0]),
+        )
+        model._is_fitted = True
+        responses = np.array([[0, 1, 1, 0], [1, 0, 1, 1], [1, 1, -1, 0], [0, 0, 0, 1]])
+
+        expected = EAPScorer(n_quadpts=5, batch_size=100).score(model, responses)
+        actual = EAPScorer(n_quadpts=5, batch_size=2).score(model, responses)
+
+        assert_allclose(actual.theta, expected.theta, rtol=0.0, atol=1e-14)
+        assert_allclose(
+            actual.standard_error,
+            expected.standard_error,
+            rtol=0.0,
+            atol=1e-14,
+        )
+
+    def test_automatic_batching_bounds_large_working_sets(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The default splits work once its estimated temporary size is large."""
+        model = TwoParameterLogistic(n_items=3)
+        model._is_fitted = True
+        responses = np.resize(np.array([0, 1, 1]), (5, 3))
+        original = model.log_likelihood_batch
+        call_sizes = []
+
+        def capture(response_batch, theta):
+            call_sizes.append(len(response_batch))
+            return original(response_batch, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", capture)
+        monkeypatch.setattr("mirt.scoring.eap._TARGET_WORKING_BYTES", 1)
+
+        EAPScorer(n_quadpts=9).score(model, responses)
+
+        assert call_sizes == [1, 1, 1, 1, 1]
+
+    def test_fscores_forwards_eap_batch_size(self, monkeypatch):
+        """The public scoring entry point exposes respondent batching."""
+        model = TwoParameterLogistic(n_items=2)
+        model._is_fitted = True
+        responses = np.array([[0, 1], [1, 0], [1, 1]])
+        original = model.log_likelihood_batch
+        call_sizes = []
+
+        def capture(response_batch, theta):
+            call_sizes.append(len(response_batch))
+            return original(response_batch, theta)
+
+        monkeypatch.setattr(model, "log_likelihood_batch", capture)
+
+        fscores(model, responses, method="EAP", n_quadpts=9, batch_size=1)
+
+        assert call_sizes == [1, 1, 1]
 
     def test_reuses_canonical_integer_response_storage(self):
         """Validation does not copy an already normalized native integer matrix."""

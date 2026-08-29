@@ -33,6 +33,7 @@ def fscores(
     person_ids: list[Any] | None = None,
     bounds: tuple[float, float] = (-6.0, 6.0),
     n_jobs: int = 1,
+    batch_size: int | None = None,
 ) -> ScoreResult:
     """Compute ability (theta) estimates for respondents.
 
@@ -66,8 +67,11 @@ def fscores(
         Bounds for theta estimation used by MAP, ML, and WLE.
     n_jobs : int, default=1
         Number of response patterns to optimize in parallel for MAP, ML, and
-        WLE scoring. ``-1`` uses all available CPU cores. EAP methods already
-        evaluate respondents in a single batched operation.
+        WLE scoring. ``-1`` uses all available CPU cores.
+    batch_size : int, optional
+        Maximum respondents per EAP likelihood batch. The default chooses a
+        memory-bounded size automatically. Set an explicit value to control
+        peak working memory. Other scoring methods ignore this option.
 
     Returns
     -------
@@ -117,6 +121,7 @@ def fscores(
             n_quadpts=n_quadpts,
             prior_mean=prior_mean,
             prior_cov=prior_cov,
+            batch_size=batch_size,
         )
     elif method == "EAPsum":
         from mirt.scoring.eapsum import EAPSumScorer
