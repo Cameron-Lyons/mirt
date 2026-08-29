@@ -408,11 +408,12 @@ class _OrdinalLogitModel(PolytomousItemModel):
         probabilities = self.probability(theta)
         log_probabilities = np.log(np.clip(probabilities, PROB_EPSILON, 1.0))
         result = np.zeros((safe_responses.shape[0], probabilities.shape[0]))
-        for item_idx in range(self.n_items):
-            selected = log_probabilities[:, item_idx, :][
-                :, safe_responses[:, item_idx]
-            ].T
-            result += np.where(observed[:, item_idx, None], selected, 0.0)
+        category_mask = np.empty_like(observed)
+        for category in range(self.max_categories):
+            np.equal(safe_responses, category, out=category_mask)
+            np.logical_and(category_mask, observed, out=category_mask)
+            if np.any(category_mask):
+                result += category_mask @ log_probabilities[:, :, category].T
         return result
 
 
