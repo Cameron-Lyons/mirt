@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -18,10 +18,14 @@ from numpy.typing import NDArray
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.utils.data import validate_responses
 
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
+
 LARGE_DF = 1e10
 _PAIRWISE_BLOCK_SIZE = np.iinfo(np.uint8).max
 _MAX_VECTORIZED_CATEGORIES = 32
 _MAX_CATEGORY_FREQUENCY_ENTRIES = 5_000_000
+_MODEL_DRAW_TARGET_ELEMENTS = 2_000_000
 _IMPUTATION_METHODS = ("mean", "median", "mode", "random", "EM", "multiple")
 ImputationMethod = Literal["mean", "median", "mode", "random", "EM", "multiple"]
 
@@ -75,6 +79,98 @@ def _draw_categorical(
     cumulative[:, -1] = 1.0
     draws = (rng.random(probabilities.shape[0])[:, None] > cumulative).sum(axis=1)
     return draws.astype(np.int_, copy=False)
+
+
+def _draw_model_responses(
+    imputed: NDArray[np.int_],
+    missing_mask: NDArray[np.bool_],
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> None:
+    """Draw only missing respondent-item pairs in bounded vectorized blocks."""
+    if not hasattr(model, "probability_pairs"):
+        _draw_model_responses_by_item(imputed, missing_mask, model, theta, rng)
+        return
+
+    category_width = 1
+    if model.is_polytomous:
+        category_width = max(model.n_categories)
+    pairs_per_batch = max(
+        1,
+        _MODEL_DRAW_TARGET_ELEMENTS // max(category_width, 1),
+    )
+    rows_per_index_block = max(
+        1,
+        _MODEL_DRAW_TARGET_ELEMENTS // max(missing_mask.shape[1], 1),
+    )
+
+    for row_start in range(0, missing_mask.shape[0], rows_per_index_block):
+        row_stop = row_start + rows_per_index_block
+        local_rows, item_indices = np.nonzero(missing_mask[row_start:row_stop])
+        missing_rows = local_rows + row_start
+        for pair_start in range(0, missing_rows.size, pairs_per_batch):
+            pair_stop = pair_start + pairs_per_batch
+            row_batch = missing_rows[pair_start:pair_stop]
+            item_batch = item_indices[pair_start:pair_stop]
+            _draw_model_response_pairs(
+                imputed,
+                model,
+                theta,
+                row_batch,
+                item_batch,
+                rng,
+            )
+
+
+def _draw_model_response_pairs(
+    imputed: NDArray[np.int_],
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    row_batch: NDArray[np.intp],
+    item_batch: NDArray[np.intp],
+    rng: np.random.Generator,
+) -> None:
+    """Draw one bounded block of aligned respondent-item responses."""
+    probabilities = np.asarray(
+        model.probability_pairs(theta[row_batch], item_batch),
+        dtype=np.float64,
+    )
+    if model.is_polytomous:
+        if probabilities.ndim != 2 or probabilities.shape[0] != row_batch.size:
+            raise MirtDataError(
+                "paired category probabilities must contain one row per missing response"
+            )
+        imputed[row_batch, item_batch] = _draw_categorical(probabilities, rng)
+    else:
+        if probabilities.shape != (row_batch.size,):
+            raise MirtDataError(
+                "paired probabilities must contain one value per missing response"
+            )
+        imputed[row_batch, item_batch] = (
+            rng.random(probabilities.size) < probabilities
+        ).astype(np.int_)
+
+
+def _draw_model_responses_by_item(
+    imputed: NDArray[np.int_],
+    missing_mask: NDArray[np.bool_],
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    rng: np.random.Generator,
+) -> None:
+    """Evaluate missing responses for models lacking paired probabilities."""
+    for item_idx in np.flatnonzero(np.any(missing_mask, axis=0)):
+        item_missing = missing_mask[:, item_idx]
+        probabilities = model.probability(theta[item_missing], int(item_idx))
+
+        if probabilities.ndim > 1:
+            missing_rows = np.flatnonzero(item_missing)
+            imputed[missing_rows, item_idx] = _draw_categorical(probabilities, rng)
+        else:
+            imputed[item_missing, item_idx] = (
+                rng.random(np.count_nonzero(item_missing)) < probabilities
+            ).astype(np.int_)
 
 
 def impute_responses(
@@ -321,8 +417,6 @@ def _impute_em(
     from mirt.scoring import fscores
 
     imputed = responses.copy()
-    n_items = responses.shape[1]
-
     imputed = _impute_mode(responses, missing_mask)
 
     for _ in range(10):
@@ -341,24 +435,7 @@ def _impute_em(
 
         old_imputed = imputed.copy()
 
-        for j in range(n_items):
-            item_missing = missing_mask[:, j]
-            if not item_missing.any():
-                continue
-
-            theta_missing = theta[item_missing]
-            if theta_missing.ndim == 1:
-                theta_missing = theta_missing.reshape(-1, 1)
-
-            probs = result.model.probability(theta_missing, j)
-
-            if probs.ndim > 1:
-                missing_rows = np.flatnonzero(item_missing)
-                imputed[missing_rows, j] = _draw_categorical(probs, rng)
-            else:
-                imputed[item_missing, j] = (
-                    rng.random(item_missing.sum()) < probs
-                ).astype(np.int_)
+        _draw_model_responses(imputed, missing_mask, result.model, theta, rng)
 
         if np.array_equal(old_imputed[missing_mask], imputed[missing_mask]):
             break
@@ -377,7 +454,7 @@ def _impute_multiple(
     from mirt import fit_mirt
     from mirt.scoring import fscores
 
-    n_persons, n_items = responses.shape
+    n_persons = responses.shape[0]
     imputations: list[NDArray[np.int_]] = []
 
     initial = _impute_mode(responses, missing_mask)
@@ -408,21 +485,13 @@ def _impute_multiple(
         else:
             theta_draw = theta_mean + rng.standard_normal(theta_mean.shape) * theta_se
 
-        for j in range(n_items):
-            item_missing = missing_mask[:, j]
-            if not item_missing.any():
-                continue
-
-            theta_missing = theta_draw[item_missing]
-            probs = result.model.probability(theta_missing, j)
-
-            if probs.ndim > 1:
-                missing_rows = np.flatnonzero(item_missing)
-                imputed[missing_rows, j] = _draw_categorical(probs, rng)
-            else:
-                imputed[item_missing, j] = (
-                    rng.random(item_missing.sum()) < probs
-                ).astype(np.int_)
+        _draw_model_responses(
+            imputed,
+            missing_mask,
+            result.model,
+            theta_draw,
+            rng,
+        )
 
         imputations.append(imputed)
 

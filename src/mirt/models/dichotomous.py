@@ -212,6 +212,22 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
             z = np.dot(theta, a.T) - np.sum(a, axis=1) * b
             return sigmoid(z)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        discrimination = self._parameters["discrimination"][indices]
+        difficulty = self._parameters["difficulty"][indices]
+        if self.n_factors == 1:
+            logits = discrimination * (theta_2d[:, 0] - difficulty)
+        else:
+            logits = np.einsum("ij,ij->i", theta_2d, discrimination)
+            logits -= np.sum(discrimination, axis=1) * difficulty
+        return sigmoid(logits)
+
     def information(
         self,
         theta: NDArray[np.float64],
@@ -344,6 +360,19 @@ class ThreeParameterLogistic(_ParameterizedDichotomousModel):
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         p_star = sigmoid(z)
         return c[None, :] + (1.0 - c[None, :]) * p_star
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        discrimination = self._parameters["discrimination"][indices]
+        difficulty = self._parameters["difficulty"][indices]
+        guessing = self._parameters["guessing"][indices]
+        logistic = sigmoid(discrimination * (theta_2d[:, 0] - difficulty))
+        return guessing + (1.0 - guessing) * logistic
 
     def information(
         self,
