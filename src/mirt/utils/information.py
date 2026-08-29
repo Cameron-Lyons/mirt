@@ -20,6 +20,8 @@ _GENERALIZED_DIFFICULTY_MODELS = frozenset({"1PL", "2PL", "3PL", "4PL", "5PL"})
 _GENERALIZED_DIFFICULTY_GRID_POINTS = 65
 _GENERALIZED_DIFFICULTY_GRID_ELEMENTS = 2_000_000
 _GENERALIZED_DIFFICULTY_THETA_TOLERANCE = 1e-6
+_INFORMATION_INTERVAL_TARGET_ELEMENTS = 2_000_000
+_INFORMATION_INTERVAL_THETA_TOLERANCE = 1e-8
 
 
 def _theta_matrix(
@@ -185,6 +187,191 @@ def areainfo(
         info = testinfo(model, theta)
 
     return float(np.trapezoid(info, theta))
+
+
+def _information_interval_chunk_size(
+    model: "BaseItemModel",
+    item_idx: int | None,
+) -> int:
+    """Bound temporary probability or item-information tensors."""
+    elements_per_theta = model.n_items if item_idx is None else 1
+    if getattr(model, "is_polytomous", False):
+        category_counts = np.asarray(model.n_categories)
+        if category_counts.size:
+            category_count = (
+                int(np.max(category_counts))
+                if item_idx is None
+                else int(category_counts[item_idx])
+            )
+            elements_per_theta *= max(1, category_count)
+    return max(1, _INFORMATION_INTERVAL_TARGET_ELEMENTS // elements_per_theta)
+
+
+def _information_interval_values(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    item_idx: int | None,
+) -> NDArray[np.float64]:
+    """Evaluate one finite non-negative information value per theta point."""
+    values = np.empty(theta.size, dtype=np.float64)
+    chunk_size = _information_interval_chunk_size(model, item_idx)
+    for start in range(0, theta.size, chunk_size):
+        stop = min(start + chunk_size, theta.size)
+        chunk = theta[start:stop]
+        information = (
+            testinfo(model, chunk)
+            if item_idx is None
+            else iteminfo(model, chunk, item_idx)
+        )
+        information = np.asarray(information, dtype=np.float64)
+        if information.shape != chunk.shape:
+            raise ValueError("model information must return one value per theta point")
+        if not np.all(np.isfinite(information)):
+            raise ValueError("model information must contain only finite values")
+        if np.any(information < 0.0):
+            raise ValueError("model information must be non-negative")
+        values[start:stop] = information
+    return values
+
+
+def _information_crossings(
+    model: "BaseItemModel",
+    grid: NDArray[np.float64],
+    covered: NDArray[np.bool_],
+    transitions: NDArray[np.intp],
+    min_information: float,
+    item_idx: int | None,
+) -> NDArray[np.float64]:
+    """Refine threshold crossings simultaneously with bounded bisection."""
+    left = grid[transitions].copy()
+    right = grid[transitions + 1].copy()
+    left_covered = covered[transitions]
+    n_iterations = max(
+        1,
+        int(
+            np.ceil(
+                np.log2(
+                    float(np.max(right - left)) / _INFORMATION_INTERVAL_THETA_TOLERANCE
+                )
+            )
+        ),
+    )
+    for _ in range(n_iterations):
+        midpoint = (left + right) * 0.5
+        midpoint_covered = (
+            _information_interval_values(model, midpoint, item_idx) >= min_information
+        )
+        same_side = midpoint_covered == left_covered
+        left[same_side] = midpoint[same_side]
+        right[~same_side] = midpoint[~same_side]
+    return (left + right) * 0.5
+
+
+def information_intervals(
+    model: "BaseItemModel",
+    min_information: float,
+    theta_range: tuple[float, float] = (-6.0, 6.0),
+    n_points: int = 1201,
+    item_idx: int | None = None,
+) -> NDArray[np.float64]:
+    """Find ability intervals meeting an item or test information target.
+
+    A test can meet the target in multiple disjoint regions, so the result
+    contains one ``[lower, upper]`` row per covered interval. Grid points find
+    every visible region and vectorized bisection refines its boundaries.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        A fitted unidimensional IRT model.
+    min_information : float
+        Strictly positive Fisher-information target. A maximum conditional
+        standard error ``max_sem`` corresponds to ``1 / max_sem**2``.
+    theta_range : tuple of float, default=(-6, 6)
+        Finite lower and upper search bounds.
+    n_points : int, default=1201
+        Grid points used to detect distinct covered regions. Increase this
+        value when very narrow information peaks are possible.
+    item_idx : int or None, default=None
+        Optional item index. By default, use total test information.
+
+    Returns
+    -------
+    NDArray[np.float64]
+        Array with shape ``(n_intervals, 2)``. An empty array indicates that
+        the target is not met within ``theta_range``.
+
+    Examples
+    --------
+    >>> intervals = information_intervals(result.model, min_information=4.0)
+    >>> # Equivalent to finding regions with conditional SEM <= 0.5
+    >>> item_intervals = information_intervals(
+    ...     result.model, min_information=4.0, item_idx=0
+    ... )
+    """
+    if model.n_factors != 1:
+        raise ValueError("information_intervals supports unidimensional models only")
+    try:
+        target_value = np.asarray(min_information, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("min_information must be a finite positive value") from exc
+    if target_value.ndim != 0:
+        raise ValueError("min_information must be a finite positive value")
+    target = float(target_value)
+    if (
+        isinstance(min_information, (bool, np.bool_))
+        or not np.isfinite(target)
+        or target <= 0.0
+    ):
+        raise ValueError("min_information must be a finite positive value")
+
+    try:
+        lower, upper = (float(value) for value in theta_range)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("theta_range must contain exactly two numeric bounds") from exc
+    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+        raise ValueError("theta_range must contain finite bounds with lower < upper")
+    if (
+        isinstance(n_points, (bool, np.bool_))
+        or not isinstance(n_points, (int, np.integer))
+        or n_points < 2
+    ):
+        raise ValueError("n_points must be an integer greater than or equal to 2")
+    if item_idx is not None:
+        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
+            item_idx, (int, np.integer)
+        ):
+            raise ValueError("item_idx must be an integer")
+        item_idx = int(item_idx)
+        if item_idx < 0 or item_idx >= model.n_items:
+            raise IndexError(f"item_idx {item_idx} out of range [0, {model.n_items})")
+
+    grid = np.linspace(lower, upper, int(n_points))
+    information = _information_interval_values(model, grid, item_idx)
+    covered = information >= target
+    transitions = np.flatnonzero(covered[1:] != covered[:-1])
+    crossings = (
+        _information_crossings(
+            model,
+            grid,
+            covered,
+            transitions,
+            target,
+            item_idx,
+        )
+        if transitions.size
+        else np.empty(0, dtype=np.float64)
+    )
+
+    starts = crossings[~covered[transitions]]
+    ends = crossings[covered[transitions]]
+    if covered[0]:
+        starts = np.concatenate((np.array([lower]), starts))
+    if covered[-1]:
+        ends = np.concatenate((ends, np.array([upper])))
+    if starts.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+    return np.column_stack((starts, ends))
 
 
 def probtrace(
