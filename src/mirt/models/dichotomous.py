@@ -162,6 +162,17 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
             raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
         return item_idx
 
+    def _unidimensional_pair_logits(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]:
+        """Gather parameters and evaluate aligned unidimensional logits."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        discrimination = self._parameters["discrimination"][indices]
+        difficulty = self._parameters["difficulty"][indices]
+        return indices, discrimination * (theta_2d[:, 0] - difficulty)
+
 
 class TwoParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "2PL"
@@ -367,11 +378,9 @@ class ThreeParameterLogistic(_ParameterizedDichotomousModel):
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
         """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
-        discrimination = self._parameters["discrimination"][indices]
-        difficulty = self._parameters["difficulty"][indices]
+        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
         guessing = self._parameters["guessing"][indices]
-        logistic = sigmoid(discrimination * (theta_2d[:, 0] - difficulty))
+        logistic = sigmoid(logits)
         return guessing + (1.0 - guessing) * logistic
 
     def information(
@@ -457,6 +466,17 @@ class FourParameterLogistic(_ParameterizedDichotomousModel):
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         p_star = sigmoid(z)
         return c[None, :] + (d[None, :] - c[None, :]) * p_star
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
+        guessing = self._parameters["guessing"][indices]
+        upper = self._parameters["upper"][indices]
+        return guessing + (upper - guessing) * sigmoid(logits)
 
     def information(
         self,
@@ -582,6 +602,16 @@ class UnipolarLogLogistic(_ParameterizedDichotomousModel):
 
         z = a[None, :] * (theta_1d[:, None] - b[None, :])
         logistic = sigmoid(z)
+        return logistic * (1.0 - logistic)
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        _, logits = self._unidimensional_pair_logits(theta, item_indices)
+        logistic = sigmoid(logits)
         return logistic * (1.0 - logistic)
 
     def information(
@@ -713,6 +743,19 @@ class FiveParameterLogistic(_ParameterizedDichotomousModel):
         p_star = np.power(logistic, e[None, :])
         return c[None, :] + (d[None, :] - c[None, :]) * p_star
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
+        guessing = self._parameters["guessing"][indices]
+        upper = self._parameters["upper"][indices]
+        asymmetry = self._parameters["asymmetry"][indices]
+        powered = np.power(sigmoid(logits), asymmetry)
+        return guessing + (upper - guessing) * powered
+
     def information(
         self,
         theta: NDArray[np.float64],
@@ -831,6 +874,15 @@ class ComplementaryLogLog(_ParameterizedDichotomousModel):
         exp_z = _bounded_exponential(z)
         return -np.expm1(-exp_z)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        _, logits = self._unidimensional_pair_logits(theta, item_indices)
+        return -np.expm1(-_bounded_exponential(logits))
+
     def information(
         self,
         theta: NDArray[np.float64],
@@ -914,6 +966,15 @@ class NegativeLogLog(_ParameterizedDichotomousModel):
 
         z = -a[None, :] * (theta_1d[:, None] - b[None, :])
         return np.exp(-_bounded_exponential(z))
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        _, logits = self._unidimensional_pair_logits(theta, item_indices)
+        return np.exp(-_bounded_exponential(-logits))
 
     def information(
         self,

@@ -201,6 +201,57 @@ class TestFourParameterLogistic:
 
 
 @pytest.mark.parametrize(
+    "model",
+    [
+        FourParameterLogistic(4),
+        FiveParameterLogistic(4),
+        UnipolarLogLogistic(4),
+        ComplementaryLogLog(4),
+        NegativeLogLog(4),
+    ],
+)
+def test_extended_probability_pairs_use_vectorized_kernels(
+    model,
+    monkeypatch,
+):
+    parameters = {
+        "discrimination": np.array([0.5, 0.9, 1.4, 2.0]),
+        "difficulty": np.array([-1.3, -0.4, 0.5, 1.2]),
+    }
+    if isinstance(model, (FourParameterLogistic, FiveParameterLogistic)):
+        parameters.update(
+            guessing=np.array([0.05, 0.1, 0.15, 0.2]),
+            upper=np.array([0.82, 0.9, 0.95, 0.98]),
+        )
+    if isinstance(model, FiveParameterLogistic):
+        parameters["asymmetry"] = np.array([0.6, 0.9, 1.3, 1.8])
+    model.set_parameters(**parameters)
+    theta = np.array([[-1000.0], [-1.1], [-0.2], [0.4], [1.3], [1000.0]])
+    item_indices = np.array([3, 0, 2, 1, 3, 2])
+    expected = np.array(
+        [
+            model.probability(theta[row : row + 1], int(item_idx))[0]
+            for row, item_idx in enumerate(item_indices)
+        ]
+    )
+
+    def fail_item_dispatch(*args, **kwargs):
+        _ = args, kwargs
+        raise AssertionError("paired evaluation dispatched through probability()")
+
+    monkeypatch.setattr(model, "probability", fail_item_dispatch)
+    actual = model.probability_pairs(theta, item_indices)
+    empty = model.probability_pairs(
+        np.empty((0, 1)),
+        np.empty(0, dtype=np.intp),
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-15)
+    assert np.all(np.isfinite(actual))
+    assert empty.shape == (0,)
+
+
+@pytest.mark.parametrize(
     ("model", "parameter", "values", "message"),
     [
         (
