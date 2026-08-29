@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -462,6 +462,163 @@ def analyze_missing(
         "n_complete_cases": int((~missing_mask.any(axis=1)).sum()),
         "n_complete_items": int((~missing_mask.any(axis=0)).sum()),
     }
+
+
+@dataclass(frozen=True, slots=True)
+class MissingPatternResult:
+    """Frequency summary of distinct missing-response patterns.
+
+    ``patterns`` contains one Boolean row per distinct pattern, where ``True``
+    denotes a missing response. Rows are ordered by decreasing frequency, with
+    first appearance breaking ties. ``indices`` maps every input row back to
+    its pattern row.
+    """
+
+    patterns: NDArray[np.bool_]
+    frequencies: NDArray[np.int_]
+    indices: NDArray[np.int_]
+    n_persons: int
+    n_items: int
+    n_patterns: int
+
+    @property
+    def proportions(self) -> NDArray[np.float64]:
+        """Proportion of respondents represented by each pattern."""
+        return self.frequencies.astype(np.float64) / self.n_persons
+
+    @property
+    def missing_counts(self) -> NDArray[np.int_]:
+        """Number of missing items in each pattern."""
+        return np.sum(self.patterns, axis=1, dtype=np.int_)
+
+    @property
+    def complete_case_count(self) -> int:
+        """Number of respondents with no missing responses."""
+        complete = ~np.any(self.patterns, axis=1)
+        return int(np.sum(self.frequencies, where=complete, initial=0))
+
+    @property
+    def complete_case_rate(self) -> float:
+        """Proportion of respondents with no missing responses."""
+        return self.complete_case_count / self.n_persons
+
+    @property
+    def compression_ratio(self) -> float:
+        """Ratio of distinct patterns to respondents."""
+        return self.n_patterns / self.n_persons
+
+    def expand(self, pattern_values: NDArray) -> NDArray:
+        """Expand pattern-level values back to respondent order."""
+        values = np.asarray(pattern_values)
+        if values.ndim == 0 or values.shape[0] != self.n_patterns:
+            raise MirtValidationError(
+                "pattern_values must have one leading entry per missing pattern",
+                parameter="pattern_values",
+                value=values.shape,
+                expected=f"first dimension of {self.n_patterns}",
+            )
+        return values[self.indices]
+
+    def to_dataframe(self, item_names: Sequence[str] | None = None) -> Any:
+        """Return a pandas or Polars table when an optional backend is installed."""
+        from mirt.utils.dataframe import create_dataframe
+
+        if item_names is None:
+            names = [f"Item_{index + 1}" for index in range(self.n_items)]
+        else:
+            if isinstance(item_names, (str, bytes)):
+                raise MirtValidationError(
+                    "item_names must be a sequence of unique strings",
+                    parameter="item_names",
+                )
+            names = list(item_names)
+            if len(names) != self.n_items:
+                raise MirtValidationError(
+                    "item_names length must match the number of items",
+                    parameter="item_names",
+                    value=len(names),
+                    expected=str(self.n_items),
+                )
+            if not all(isinstance(name, str) and name for name in names) or len(
+                set(names)
+            ) != len(names):
+                raise MirtValidationError(
+                    "item_names must contain unique non-empty strings",
+                    parameter="item_names",
+                )
+
+        data: dict[str, NDArray] = {
+            f"{name}_missing": self.patterns[:, index]
+            for index, name in enumerate(names)
+        }
+        data["n_missing"] = self.missing_counts
+        data["frequency"] = self.frequencies
+        data["proportion"] = self.proportions
+        return create_dataframe(data, index_name="pattern")
+
+
+def missing_patterns(
+    responses: NDArray[np.int_],
+    missing_code: int = -1,
+) -> MissingPatternResult:
+    """Summarize distinct missing-response patterns efficiently.
+
+    Parameters
+    ----------
+    responses : ndarray of shape (n_persons, n_items)
+        Response matrix. Negative values and ``missing_code`` are treated as
+        missing using the same normalization as :func:`impute_responses`.
+    missing_code : int, default=-1
+        Code used to identify missing responses.
+
+    Returns
+    -------
+    MissingPatternResult
+        Packed-bit pattern summary with frequencies, proportions, and a
+        respondent-to-pattern mapping.
+
+    Notes
+    -----
+    Missingness rows are packed to one bit per item before grouping. This
+    bounds temporary memory for wide item banks without adding a dependency.
+    """
+    normalized = _prepare_response_matrix(responses, missing_code)
+    missing_mask = normalized == missing_code
+    n_persons, n_items = missing_mask.shape
+
+    packed = np.packbits(missing_mask, axis=1, bitorder="little")
+    del missing_mask
+    row_dtype = np.dtype((np.void, packed.shape[1]))
+    packed_rows = np.ascontiguousarray(packed).view(row_dtype).ravel()
+    _, first_indices, inverse, counts = np.unique(
+        packed_rows,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+
+    order = np.lexsort((first_indices, -counts))
+    ordered_first = first_indices[order]
+    patterns = np.unpackbits(
+        packed[ordered_first],
+        axis=1,
+        count=n_items,
+        bitorder="little",
+    ).astype(np.bool_, copy=False)
+    frequencies = counts[order].astype(np.int_, copy=False)
+
+    sorted_to_frequency = np.empty(len(order), dtype=np.int_)
+    sorted_to_frequency[order] = np.arange(len(order), dtype=np.int_)
+    indices = sorted_to_frequency[inverse]
+
+    return MissingPatternResult(
+        patterns=patterns,
+        frequencies=frequencies,
+        indices=indices,
+        n_persons=n_persons,
+        n_items=n_items,
+        n_patterns=len(order),
+    )
 
 
 def listwise_deletion(

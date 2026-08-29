@@ -116,6 +116,8 @@ _LAZY_IMPORTS = {
     "ParameterSamples": "mirt.utils.sampling",
     "posterior_summary": "mirt.utils.sampling",
     "sample_expected_scores": "mirt.utils.sampling",
+    "missing_patterns": "mirt.utils.imputation",
+    "MissingPatternResult": "mirt.utils.imputation",
     "randef": "mirt.utils.predictions",
     "fixef": "mirt.utils.predictions",
     "predict_mixed": "mirt.utils.predictions",

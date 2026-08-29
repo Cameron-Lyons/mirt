@@ -450,6 +450,7 @@ plot_person_item_map(result.model, scores.theta)
 | `plausible_value_regression()` | Validated ordinary or weighted regression with combined uncertainty |
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism |
 | `impute_responses()` | Missing data imputation |
+| `missing_patterns()` | Frequency-ranked missing-response pattern analysis |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
 | `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
 | `calc_null()` | Independence and pooled-intercept baseline fit statistics |
