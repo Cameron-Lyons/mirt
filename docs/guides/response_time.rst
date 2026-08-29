@@ -38,6 +38,24 @@ Create a model with one set of accuracy and timing parameters per item:
 Negative or ``NaN`` responses are treated as missing.  A ``NaN`` log response
 time is missing independently of its accuracy response.
 
+Timing predictions
+------------------
+
+Deadline probabilities and response-time quantiles are evaluated directly on
+the original time scale. A scalar deadline or quantile is broadcast across all
+persons and items, while vectors and matrices support distinct requirements.
+
+.. code-block:: python
+
+   probability_by_30 = model.response_time_cdf(30.0, speed)
+   lower = model.response_time_quantile(0.025, speed)
+   median = model.response_time_quantile(0.5, speed)
+   upper = model.response_time_quantile(0.975, speed)
+
+   assert probability_by_30.shape == (2, 3)
+   assert np.all(lower < median)
+   assert np.all(median < upper)
+
 Simulation and estimation
 -------------------------
 
