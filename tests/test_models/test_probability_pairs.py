@@ -7,12 +7,19 @@ import pytest
 
 from mirt.exceptions import MirtValidationError
 from mirt.models.base import BaseItemModel, PolytomousItemModel
+from mirt.models.bifactor import BifactorModel
+from mirt.models.compensatory import (
+    DisjunctiveModel,
+    NoncompensatoryModel,
+    PartiallyCompensatoryModel,
+)
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
+from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
     GradedRatingScaleModel,
@@ -82,6 +89,105 @@ def test_multidimensional_2pl_pairs_match_item_evaluation() -> None:
     )
 
     np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+
+
+def _multidimensional_pair_models() -> list[BaseItemModel]:
+    mirt = MultidimensionalModel(4, n_factors=3).set_parameters(
+        slopes=np.array(
+            [
+                [0.8, 0.2, -0.1],
+                [0.3, 1.4, 0.5],
+                [1.1, -0.4, 0.7],
+                [0.6, 0.9, 1.2],
+            ]
+        ),
+        intercepts=np.array([-0.7, 0.2, 1.0, -0.1]),
+    )
+    bifactor = BifactorModel(4, specific_factors=[2, 2, 5, 5]).set_parameters(
+        general_loadings=np.array([0.7, 1.1, 0.5, 1.3]),
+        specific_loadings=np.array([0.4, 0.8, 1.2, 0.6]),
+        intercepts=np.array([-0.5, 0.1, 0.8, -0.3]),
+    )
+    discrimination = np.array(
+        [
+            [0.7, 1.1, 1.4],
+            [1.3, 0.8, 1.0],
+            [0.9, 1.6, 0.6],
+            [1.5, 1.2, 0.75],
+        ]
+    )
+    difficulty = np.array(
+        [
+            [-0.8, 0.1, 0.6],
+            [0.3, -0.5, 1.0],
+            [-0.2, 0.7, -0.4],
+            [0.9, -0.1, 0.2],
+        ]
+    )
+    partially_compensatory = PartiallyCompensatoryModel(4, 3).set_parameters(
+        discrimination=discrimination,
+        difficulty=difficulty,
+        compensation=np.array(
+            [
+                [0.4, 0.8, 1.0],
+                [0.7, 0.5, 0.9],
+                [1.0, 0.3, 0.6],
+                [0.2, 0.9, 0.75],
+            ]
+        ),
+    )
+    noncompensatory = NoncompensatoryModel(4, 3).set_parameters(
+        discrimination=discrimination,
+        difficulty=difficulty,
+    )
+    disjunctive = DisjunctiveModel(4, 3).set_parameters(
+        discrimination=discrimination,
+        difficulty=difficulty,
+    )
+    return [
+        mirt,
+        bifactor,
+        partially_compensatory,
+        noncompensatory,
+        disjunctive,
+    ]
+
+
+@pytest.mark.parametrize("model", _multidimensional_pair_models())
+def test_multidimensional_pairs_use_vectorized_kernels(
+    model: BaseItemModel,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    theta = np.array(
+        [
+            [-1.0, 0.5, 0.2],
+            [0.2, -0.4, 0.7],
+            [1.5, 0.8, -0.6],
+            [0.0, 1.2, 0.3],
+            [-0.7, -1.1, 0.9],
+        ]
+    )
+    item_indices = np.array([3, 0, 1, 2, 3])
+    expected = np.array(
+        [
+            model.probability(theta[row : row + 1], int(item_idx))[0]
+            for row, item_idx in enumerate(item_indices)
+        ]
+    )
+
+    def fail_item_dispatch(*args: object, **kwargs: object) -> None:
+        raise AssertionError("paired evaluation dispatched through probability()")
+
+    monkeypatch.setattr(model, "probability", fail_item_dispatch)
+
+    actual = model.probability_pairs(theta, item_indices)
+    empty = model.probability_pairs(
+        np.empty((0, model.n_factors)),
+        np.array([], dtype=np.int_),
+    )
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+    assert empty.shape == (0,)
 
 
 @pytest.mark.parametrize(

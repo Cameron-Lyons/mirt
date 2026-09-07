@@ -111,6 +111,23 @@ class BifactorModel(DichotomousItemModel):
         z = a_g[None, :] * theta_g[:, None] + a_s[None, :] * theta_s + d[None, :]
         return sigmoid(z)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        specific_columns = 1 + self._specific_factor_indices[indices]
+        row_indices = np.arange(indices.size)
+        logits = self._parameters["general_loadings"][indices] * theta_2d[:, 0]
+        logits += (
+            self._parameters["specific_loadings"][indices]
+            * theta_2d[row_indices, specific_columns]
+        )
+        logits += self._parameters["intercepts"][indices]
+        return sigmoid(logits)
+
     def information(
         self,
         theta: NDArray[np.float64],

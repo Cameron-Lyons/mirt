@@ -103,6 +103,26 @@ class _LogicalMultidimensionalModel(DichotomousItemModel):
         theta = self._ensure_theta_2d(theta)
         return self._probability_only(theta, item_idx)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        factor_probability = sigmoid(
+            self._parameters["discrimination"][indices]
+            * (theta_2d - self._parameters["difficulty"][indices])
+        )
+        return self._paired_probability(factor_probability, indices)
+
+    def _paired_probability(
+        self,
+        factor_probability: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        raise NotImplementedError
+
     def information(
         self,
         theta: NDArray[np.float64],
@@ -236,6 +256,19 @@ class PartiallyCompensatoryModel(_LogicalMultidimensionalModel):
             )
         return probability
 
+    def _paired_probability(
+        self,
+        factor_probability: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        return np.prod(
+            np.power(
+                factor_probability,
+                self._parameters["compensation"][item_indices],
+            ),
+            axis=1,
+        )
+
 
 class NoncompensatoryModel(_LogicalMultidimensionalModel):
     """Fully noncompensatory (conjunctive) multidimensional IRT model.
@@ -295,6 +328,13 @@ class NoncompensatoryModel(_LogicalMultidimensionalModel):
                 * (theta[:, None, factor_idx] - difficulty[None, :, factor_idx])
             )
         return probability
+
+    def _paired_probability(
+        self,
+        factor_probability: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        return np.prod(factor_probability, axis=1)
 
 
 class DisjunctiveModel(_LogicalMultidimensionalModel):
@@ -357,3 +397,10 @@ class DisjunctiveModel(_LogicalMultidimensionalModel):
             )
             failure_probability *= 1.0 - factor_probability
         return 1.0 - failure_probability
+
+    def _paired_probability(
+        self,
+        factor_probability: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        return 1.0 - np.prod(1.0 - factor_probability, axis=1)
