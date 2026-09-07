@@ -76,6 +76,18 @@ class MultidimensionalModel(DichotomousItemModel):
         z = np.dot(theta, a.T) + d[None, :]
         return sigmoid(z)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        slopes = self._parameters["slopes"][indices]
+        logits = np.einsum("ij,ij->i", theta_2d, slopes)
+        logits += self._parameters["intercepts"][indices]
+        return sigmoid(logits)
+
     def information(
         self,
         theta: NDArray[np.float64],
