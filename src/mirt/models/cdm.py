@@ -179,6 +179,28 @@ class _NoisyGateCDM(BaseCDM):
             return probabilities
         return probabilities[:, self._validate_item_index(item_idx)]
 
+    def probability_pairs(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned mastery-pattern and item pairs."""
+        alpha_values = self._ensure_alpha_2d(alpha)
+        indices = self._prepare_item_indices(item_indices, alpha_values.shape[0])
+        ideal = self._paired_ideal_responses(alpha_values, indices)
+        return np.where(
+            ideal,
+            1.0 - self._parameters["slip"][indices],
+            self._parameters["guess"][indices],
+        )
+
+    def _paired_ideal_responses(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.bool_]:
+        raise NotImplementedError
+
     def _validate_responses(self, responses: ArrayLike) -> NDArray[np.int_]:
         raw = np.asarray(responses)
         if raw.ndim != 2:
@@ -342,6 +364,13 @@ class DINA(_NoisyGateCDM):
     def _ideal_responses(self, alpha: NDArray[np.int_]) -> NDArray[np.bool_]:
         return np.all(alpha[:, None, :] >= self._q_matrix[None, :, :], axis=2)
 
+    def _paired_ideal_responses(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.bool_]:
+        return np.all(alpha >= self._q_matrix[item_indices], axis=1)
+
 
 class DINO(_NoisyGateCDM):
     """Deterministic Input, Noisy OR gate model."""
@@ -354,6 +383,15 @@ class DINO(_NoisyGateCDM):
             axis=2,
         )
         return required_mastered | ~np.any(self._q_matrix, axis=1)[None, :]
+
+    def _paired_ideal_responses(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.bool_]:
+        q_matrix = self._q_matrix[item_indices]
+        required_mastered = np.any((alpha == 1) & (q_matrix == 1), axis=1)
+        return required_mastered | ~np.any(q_matrix, axis=1)
 
 
 def _validate_fit_configuration(
