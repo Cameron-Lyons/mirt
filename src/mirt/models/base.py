@@ -79,6 +79,15 @@ class BaseItemModel(ABC):
     ) -> tuple[NDArray[np.float64], NDArray[np.intp]]:
         """Validate aligned respondent abilities and item indices."""
         theta_2d = self._ensure_theta_2d(theta)
+        indices = self._prepare_item_indices(item_indices, theta_2d.shape[0])
+        return theta_2d, indices
+
+    def _prepare_item_indices(
+        self,
+        item_indices: NDArray[np.int_],
+        n_rows: int,
+    ) -> NDArray[np.intp]:
+        """Validate item indices aligned with a known number of input rows."""
         indices = np.asarray(item_indices)
         if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
             raise MirtValidationError(
@@ -87,12 +96,12 @@ class BaseItemModel(ABC):
                 value=indices,
                 expected="one-dimensional integer array",
             )
-        if indices.shape[0] != theta_2d.shape[0]:
+        if indices.shape[0] != n_rows:
             raise MirtValidationError(
                 "item_indices must contain one entry per theta row",
                 parameter="item_indices",
                 value=indices.shape,
-                expected=f"({theta_2d.shape[0]},)",
+                expected=f"({n_rows},)",
             )
         if np.any((indices < 0) | (indices >= self.n_items)):
             raise MirtValidationError(
@@ -101,7 +110,7 @@ class BaseItemModel(ABC):
                 value=indices,
                 expected=f"values in [0, {self.n_items})",
             )
-        return theta_2d, indices.astype(np.intp, copy=False)
+        return indices.astype(np.intp, copy=False)
 
     def probability_pairs(
         self,

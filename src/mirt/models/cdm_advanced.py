@@ -685,6 +685,89 @@ class GDINA(BaseCDM):
             return self._item_probability_from_alpha(alpha_values, 0)[:, None]
         return self._all_probabilities(alpha_values)
 
+    def probability_pairs(
+        self,
+        alpha: NDArray[np.int_],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned mastery-pattern and item pairs."""
+        alpha_values = self._ensure_alpha_2d(alpha)
+        indices = self._prepare_item_indices(item_indices, alpha_values.shape[0])
+        if indices.size == 0:
+            return np.empty(0, dtype=np.float64)
+
+        q_matrix = self._q_matrix[indices]
+        delta = self._parameters["delta"][indices]
+        model_codes = self._parameters["reduced_model_code"][indices].astype(
+            np.intp,
+            copy=False,
+        )
+        result = np.empty(indices.size, dtype=np.float64)
+
+        for model_type, model_code in _REDUCED_MODEL_TO_CODE.items():
+            selected = model_codes == model_code
+            if not np.any(selected):
+                continue
+            selected_alpha = alpha_values[selected]
+            selected_q = q_matrix[selected]
+            selected_delta = delta[selected]
+            intercept = selected_delta[:, 0]
+
+            if model_type == "saturated":
+                effect_positions = np.cumsum(selected_q, axis=1) - 1
+                bit_weights = np.zeros_like(selected_q)
+                required = selected_q == 1
+                bit_weights[required] = np.left_shift(
+                    1,
+                    effect_positions[required],
+                )
+                group_indices = np.sum(
+                    selected_alpha * bit_weights,
+                    axis=1,
+                ).astype(np.intp, copy=False)
+                result[selected] = selected_delta[
+                    np.arange(selected_delta.shape[0]),
+                    group_indices,
+                ]
+                continue
+
+            mastery_counts = np.sum(selected_alpha * selected_q, axis=1)
+            if model_type in ("DINA", "DINO"):
+                if model_type == "DINA":
+                    ideal = mastery_counts == np.sum(selected_q, axis=1)
+                else:
+                    ideal = mastery_counts > 0
+                result[selected] = (
+                    intercept + (selected_delta[:, 1] - intercept) * ideal
+                )
+                continue
+
+            effect_positions = np.cumsum(selected_q, axis=1)
+            effects = np.take_along_axis(
+                selected_delta,
+                effect_positions,
+                axis=1,
+            )
+            required_effects = np.where(selected_q == 1, effects, 0.0)
+            if model_type == "ACDM":
+                probability = intercept + np.sum(
+                    selected_alpha * required_effects,
+                    axis=1,
+                )
+            elif model_type == "LLM":
+                probability = sigmoid(
+                    intercept + np.sum(selected_alpha * required_effects, axis=1)
+                )
+            else:
+                penalties = np.where(selected_q == 1, effects, 1.0)
+                probability = intercept * np.prod(
+                    np.where(selected_alpha == 1, 1.0, penalties),
+                    axis=1,
+                )
+            result[selected] = np.clip(probability, 0.0, 1.0)
+
+        return result
+
     def eta(
         self,
         alpha: NDArray[np.int_],
@@ -1352,14 +1435,19 @@ class HigherOrderCDM(BaseCDM):
 
         return self.set_higher_order_params(loadings, thresholds)
 
-    def _validate_theta(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+    def _validate_theta(
+        self,
+        theta: NDArray[np.float64],
+        *,
+        allow_empty: bool = False,
+    ) -> NDArray[np.float64]:
         raw_theta = np.asarray(theta)
         if raw_theta.ndim > 2 or (raw_theta.ndim == 2 and 1 not in raw_theta.shape):
             raise ValueError("theta must be a scalar, vector, or single-column matrix")
         if raw_theta.dtype.kind not in "biuf":
             raise ValueError("theta must contain numeric values")
         values = np.asarray(raw_theta, dtype=np.float64).reshape(-1)
-        if values.size == 0:
+        if values.size == 0 and not allow_empty:
             raise ValueError("theta must contain at least one value")
         if not np.all(np.isfinite(values)):
             raise ValueError("theta must contain only finite values")
@@ -1466,6 +1554,26 @@ class HigherOrderCDM(BaseCDM):
         pattern_probability = self.pattern_probability(theta)
         conditional_probability = self._conditional_response_probability(index)
         return pattern_probability @ conditional_probability
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned higher-order ability and item pairs."""
+        theta_values = self._validate_theta(theta, allow_empty=True)
+        indices = self._prepare_item_indices(item_indices, theta_values.size)
+        if indices.size == 0:
+            return np.empty(0, dtype=np.float64)
+
+        pattern_probability = self.pattern_probability(theta_values)
+        conditional_probability = self._conditional_response_probability()
+        selected_probability = conditional_probability[:, indices].T
+        return np.einsum(
+            "ij,ij->i",
+            pattern_probability,
+            selected_probability,
+        )
 
     def eta(
         self,
