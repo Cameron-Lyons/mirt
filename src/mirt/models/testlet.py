@@ -20,6 +20,7 @@ from mirt.models.base import DichotomousItemModel
 
 _PAIRWISE_CORRELATION_TARGET_ELEMENTS = 2_000_000
 _TESTLET_LIKELIHOOD_TARGET_ELEMENTS = 1_000_000
+_TESTLET_PAIR_TARGET_ELEMENTS = 2_000_000
 
 
 def _validate_item_index(n_items: int, item_idx: int) -> int:
@@ -556,6 +557,70 @@ class TestletModel(DichotomousItemModel):
                 * theta_values[:, self._testlet_positions[in_testlet] + 1]
             )
         return sigmoid(linear)
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs without item dispatch."""
+        theta_values = self._prepare_theta(theta)
+        indices = self._prepare_item_indices(item_indices, theta_values.shape[0])
+        if indices.size == 0:
+            return np.empty(0, dtype=np.float64)
+
+        if theta_values.shape[1] == 1:
+            return self._marginal_probability_pairs(theta_values[:, 0], indices)
+
+        discrimination = self._parameters["discrimination"][indices]
+        loadings = self._parameters["testlet_loadings"][indices]
+        difficulty = self._parameters["difficulty"][indices]
+        positions = self._testlet_positions[indices]
+        linear = discrimination * theta_values[:, 0] - difficulty
+        in_testlet = positions >= 0
+        rows = np.flatnonzero(in_testlet)
+        linear[rows] += (
+            loadings[rows]
+            * theta_values[
+                rows,
+                positions[rows] + 1,
+            ]
+        )
+        return sigmoid(linear)
+
+    def _marginal_probability_pairs(
+        self,
+        theta_general: NDArray[np.float64],
+        item_indices: NDArray[np.intp],
+    ) -> NDArray[np.float64]:
+        """Integrate aligned item effects in bounded quadrature blocks."""
+        nodes, weights = _normal_quadrature(self._n_quadpts)
+        discrimination = self._parameters["discrimination"]
+        loadings = self._parameters["testlet_loadings"]
+        difficulty = self._parameters["difficulty"]
+        variances = self._parameters["testlet_variances"]
+        pair_chunk_size = max(
+            1,
+            _TESTLET_PAIR_TARGET_ELEMENTS // self._n_quadpts,
+        )
+        result = np.empty(item_indices.size, dtype=np.float64)
+
+        for start in range(0, item_indices.size, pair_chunk_size):
+            stop = min(start + pair_chunk_size, item_indices.size)
+            chunk_indices = item_indices[start:stop]
+            positions = self._testlet_positions[chunk_indices]
+            item_variances = np.zeros(chunk_indices.size, dtype=np.float64)
+            in_testlet = positions >= 0
+            item_variances[in_testlet] = variances[positions[in_testlet]]
+            scale = loadings[chunk_indices] * np.sqrt(item_variances)
+            linear = (
+                discrimination[chunk_indices, None] * theta_general[start:stop, None]
+                - difficulty[chunk_indices, None]
+                + scale[:, None] * nodes[None, :]
+            )
+            result[start:stop] = sigmoid(linear) @ weights
+
+        return result
 
     def _marginal_probability(
         self,
