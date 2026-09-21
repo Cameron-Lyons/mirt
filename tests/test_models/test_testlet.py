@@ -145,6 +145,84 @@ class TestTestletConfiguration:
 class TestTestletProbability:
     """Conditional and marginal probability calculations."""
 
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: TestletModel(5, [2, 2, -1, 7, 7], n_quadpts=17),
+            lambda: BifactorTestletModel(5, [2, 2, -1, 7, 7], n_quadpts=17),
+            lambda: RandomTestletEffectsModel(
+                5,
+                [2, 2, -1, 7, 7],
+                n_quadpts=17,
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("general_only", [True, False])
+    def test_probability_pairs_match_itemwise_evaluation_without_dispatch(
+        self,
+        factory: Callable[[], TestletModel],
+        general_only: bool,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = factory().set_parameters(
+            discrimination=np.array([0.8, 1.2, 0.7, 1.5, 0.9]),
+            testlet_loadings=np.array([0.4, -0.6, 0.0, 0.8, 0.3]),
+            difficulty=np.array([-0.7, 0.2, 0.5, -0.1, 1.0]),
+            testlet_variances=np.array([0.6, 1.4]),
+        )
+        theta_general = np.array([-1.2, -0.5, 0.0, 0.4, 0.9, 1.6, 0.2])
+        if general_only:
+            theta = theta_general
+            empty_theta = np.array([])
+        else:
+            theta = np.column_stack(
+                [
+                    theta_general,
+                    np.array([0.3, -0.8, 0.1, 0.5, -0.2, 1.0, -0.4]),
+                    np.array([-0.6, 0.2, 0.7, -0.3, 0.4, 0.8, 0.0]),
+                ]
+            )
+            empty_theta = np.empty((0, model.n_factors))
+        item_indices = np.array([4, 0, 2, 3, 1, 4, 2])
+        expected = np.array(
+            [
+                model.probability(theta[row : row + 1], int(item_idx))[0]
+                for row, item_idx in enumerate(item_indices)
+            ]
+        )
+
+        def fail_item_dispatch(*args: object, **kwargs: object) -> None:
+            raise AssertionError("paired evaluation dispatched through probability()")
+
+        monkeypatch.setattr(model, "probability", fail_item_dispatch)
+
+        actual = model.probability_pairs(theta, item_indices)
+        empty = model.probability_pairs(
+            empty_theta,
+            np.array([], dtype=np.int_),
+        )
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+        assert empty.shape == (0,)
+
+    def test_marginal_probability_pairs_preserve_results_across_chunks(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = TestletModel(5, [2, 2, -1, 7, 7], n_quadpts=7)
+        theta = np.linspace(-2.0, 2.0, 11)
+        item_indices = np.array([4, 0, 2, 3, 1, 4, 2, 0, 3, 1, 4])
+        all_probabilities = model.probability(theta)
+        expected = all_probabilities[np.arange(theta.size), item_indices]
+        monkeypatch.setattr(
+            "mirt.models.testlet._TESTLET_PAIR_TARGET_ELEMENTS",
+            2 * model.n_quadpts,
+        )
+
+        actual = model.probability_pairs(theta, item_indices)
+
+        np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+
     def test_public_general_only_probability_matches_quadrature(self) -> None:
         model = TestletModel(2, [4, 4], n_quadpts=31)
         model.set_parameters(
