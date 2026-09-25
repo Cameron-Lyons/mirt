@@ -118,6 +118,14 @@ correlations and stops only after a one-sided decision is sufficiently
 confident. Use :func:`~mirt.cat.mcat_stopping.create_mcat_stopping_rule` with
 ``"classification"`` to construct the same rule from configuration.
 
+With ``scoring_method="EAP"`` (the default), ``MCATEngine`` retains the full
+posterior covariance after each response, including cross-factor correlations.
+Selection, stopping, state snapshots, and result histories all use this matrix.
+``scoring_method="MAP"`` currently uses a diagonal approximation from marginal
+standard errors. The D-, A-, C-optimality and Bayesian selection strategies share
+the current precision matrix across candidates and batch covariance updates to
+limit temporary memory for large item pools.
+
 Content balancing and exposure
 ------------------------------
 

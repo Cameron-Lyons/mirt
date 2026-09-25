@@ -8,6 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.cat._engine_common import (
+    build_administered_response_matrix,
     configure_content_constraint,
     configure_exposure_control,
     consume_pending_item,
@@ -62,7 +63,8 @@ class MCATEngine:
         Options: "trace", "determinant", "max_se", "avg_se", "max_items",
         "theta_change".
     scoring_method : {"EAP", "MAP"}
-        Method for ability estimation. Default is "EAP".
+        Method for ability estimation. Default is "EAP", which retains the
+        full posterior covariance. MAP uses a diagonal SE approximation.
     initial_theta : NDArray[np.float64] | None
         Initial ability estimates. Default is zeros.
     initial_covariance : NDArray[np.float64] | None
@@ -330,21 +332,26 @@ class MCATEngine:
     def _update_theta(self) -> None:
         """Update ability estimates based on administered items."""
         try:
-            result = score_administered_responses(self)
-            theta = result.theta
-            se = result.standard_error
+            if self.scoring_method == "EAP":
+                from mirt.scoring import ability_posterior
 
-            if theta.ndim == 1:
-                self._current_theta = theta
+                posterior = ability_posterior(
+                    self.model,
+                    build_administered_response_matrix(self),
+                    n_quadpts=self.n_quadpts,
+                )
+                theta = posterior.mean.ravel()
+                centered_points = posterior.points - theta
+                covariance = centered_points.T @ (
+                    posterior.weights[0, :, None] * centered_points
+                )
             else:
-                self._current_theta = theta.ravel()
+                result = score_administered_responses(self)
+                theta = result.theta.ravel()
+                covariance = np.diag(result.standard_error.ravel() ** 2)
 
-            if se.ndim == 1:
-                se_arr = se
-            else:
-                se_arr = se.ravel()
-
-            self._current_covariance = np.diag(se_arr**2)
+            self._current_theta = theta
+            self._current_covariance = covariance
 
         except (
             ValueError,
