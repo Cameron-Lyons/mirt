@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+_SELECTION_WORKING_BYTES = 8 * 1024 * 1024
+
+
 class MCATSelectionStrategy(ABC):
     """Abstract base class for MCAT item selection strategies.
 
@@ -230,16 +233,11 @@ def _select_best_item_by_criterion(
     if not available_items:
         raise ValueError("No available items to select from")
 
-    best_item = -1
-    best_criterion = -np.inf
-
-    for item_idx in available_items:
-        criterion = strategy._compute_criterion(model, theta, covariance, item_idx)
-        if criterion > best_criterion:
-            best_criterion = criterion
-            best_item = item_idx
-
-    return best_item
+    criteria = strategy.get_item_criteria(model, theta, covariance, available_items)
+    if not all(np.isfinite(value) for value in criteria.values()):
+        raise ValueError("Item selection criteria must be finite")
+    # Stable ties make item selection reproducible regardless of set ordering.
+    return max(sorted(criteria), key=criteria.__getitem__)
 
 
 class _CriterionSelectionStrategy(MCATSelectionStrategy):
@@ -266,6 +264,39 @@ class _PosteriorCovarianceCriterion(_CriterionSelectionStrategy):
     @abstractmethod
     def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
         """Map posterior covariance to selection criterion value."""
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        available_items: set[int],
+    ) -> dict[int, float]:
+        """Rank candidates while sharing the current posterior precision.
+
+        All candidates start from the same covariance. Invert it once, then
+        update candidate matrices in bounded batches while retaining native
+        model information and subclass-specific criteria.
+        """
+        if not available_items:
+            return {}
+        items = sorted(available_items)
+        regularization = np.eye(model.n_factors) * 1e-8
+        prior_precision = np.linalg.inv(covariance + regularization)
+        # Bound the candidate x factor x factor working arrays for large pools.
+        batch_size = max(1, _SELECTION_WORKING_BYTES // (32 * model.n_factors**2))
+        criteria = {}
+        for start in range(0, len(items), batch_size):
+            batch = items[start : start + batch_size]
+            information = np.stack(
+                [_compute_item_information_matrix(model, theta, item) for item in batch]
+            )
+            information += prior_precision
+            information += regularization
+            post_covariance = np.linalg.inv(information)
+            for item, post_cov in zip(batch, post_covariance, strict=True):
+                criteria[item] = self._criterion_from_post_cov(post_cov)
+        return criteria
 
     def _compute_criterion(
         self,
