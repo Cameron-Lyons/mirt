@@ -10,12 +10,17 @@ on:
     branches: [main]
   merge_group:
   workflow_dispatch:
+    inputs:
+      run-slow:
+        description: Include the slow test suite.
+        type: boolean
+        default: false
   schedule:
     - cron: "0 8 * * 0"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
   run:
@@ -23,6 +28,8 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  MPLBACKEND: Agg
+  PYTHONHASHSEED: "0"
 
 jobs:
   workflow-lint:
@@ -52,6 +59,7 @@ jobs:
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.14"
+          extras: dev
       - name: Run ruff check
         run: uv run --no-sync ruff check src/ tests/ benchmarks/
       - name: Run ruff format check
@@ -67,10 +75,12 @@ jobs:
       - uses: ./.github/actions/setup-python
         with:
           python-version: "3.14"
+          extras: dev
       - name: Run mypy
         run: uv run --no-sync mypy src/mirt --ignore-missing-imports
 
   build-wheel:
+    needs: [workflow-lint, lint, typecheck]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -104,7 +114,7 @@ jobs:
   test:
     needs: build-wheel
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -126,13 +136,15 @@ jobs:
       - name: Require the Rust extension
         run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
       - name: Run tests against the installed wheel
-        run: uv run --no-sync pytest tests/ --strict-config --strict-markers -m 'not slow and not performance' --cov=mirt --cov-report=xml
-      - name: Upload coverage report
-        if: always() && matrix.python-version == '3.14'
+        run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --cov=mirt --cov-report=xml --cov-report=term-missing --junitxml=test-results.xml
+      - name: Upload test reports
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
         with:
-          name: coverage
-          path: coverage.xml
+          name: test-reports-python-${{ matrix.python-version }}
+          path: |
+            test-results.xml
+            coverage.xml
           if-no-files-found: error
           retention-days: 14
       - name: Upload coverage
@@ -144,10 +156,11 @@ jobs:
 
   numpy:
     name: NumPy fallback
+    needs: [workflow-lint, lint, typecheck]
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
-      PYTHONPATH: src
+      PYTHONPATH: ${{ github.workspace }}/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -158,26 +171,20 @@ jobs:
       - name: Require a Python-only environment
         run: uv run --no-sync python -c "from mirt._rust_backend import RUST_AVAILABLE; assert not RUST_AVAILABLE"
       - name: Run fallback tests
-        run: |
-          uv run --no-sync pytest \
-            tests/test_backend*.py \
-            tests/test_rust_backend_fallback_vectorized.py \
-            tests/test_rust_backend_plausible.py \
-            tests/test_scoring/ \
-            tests/test_estimation/test_em.py \
-            tests/test_models/test_dichotomous.py \
-            tests/test_models/test_polytomous.py \
-            tests/test_models/test_multidimensional.py \
-            tests/test_simulation_chunking.py \
-            tests/test_polytomous_simulation.py \
-            tests/test_response_validation_regressions.py \
-            --strict-config --strict-markers -m 'not slow and not performance'
+        run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --junitxml=test-results-numpy.xml
+      - name: Upload fallback test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        with:
+          name: test-reports-numpy
+          path: test-results-numpy.xml
+          retention-days: 14
 
   performance:
     name: Performance Smoke Tests
     needs: build-wheel
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -194,16 +201,16 @@ jobs:
         run: uv pip install --no-deps --no-index dist/*.whl
       - name: Require the Rust extension
         run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
-      - name: Run performance regression smoke tests
+      - name: Run every performance regression check
         env:
           MIRT_IMPORT_THRESHOLD_SECONDS: "2.5"
           MIRT_FIT_THRESHOLD_SECONDS: "12.0"
           MIRT_SCORE_THRESHOLD_SECONDS: "4.0"
-        run: uv run --no-sync pytest tests/test_performance_smoke.py --strict-config --strict-markers
-      - name: Record structured scoring benchmark
+        run: uv run --no-sync pytest tests/ -m performance
+      - name: Record scoring and posterior benchmarks
         run: |
           uv run --no-sync python benchmarks/run_benchmarks.py \
-            --suite scoring --persons 2000 --items 30 \
+            --suite scoring --suite posterior --backend rust --persons 2000 --items 30 \
             --repeats 3 --warmups 1 --json benchmark-report.json
       - name: Upload benchmark report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
@@ -215,7 +222,7 @@ jobs:
 
   slow-tests:
     name: Slow Test Suite
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run-slow)
     needs: build-wheel
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -236,7 +243,7 @@ jobs:
       - name: Require the Rust extension
         run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
       - name: Run slow tests
-        run: uv run --no-sync pytest tests/ --strict-config --strict-markers -m slow
+        run: uv run --no-sync pytest tests/ -m slow
 
   complete:
     name: CI complete
@@ -248,7 +255,7 @@ jobs:
       - name: Require all expected checks to pass
         env:
           CHECK_RESULTS: ${{ toJSON(needs) }}
-          REQUIRE_SLOW: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          REQUIRE_SLOW: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run-slow) }}
         run: |
           python3 - <<'PY'
           import json

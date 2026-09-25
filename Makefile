@@ -16,7 +16,7 @@ test-slow:
 	uv run pytest -m slow
 
 test-rust:
-	cargo test --locked --all-features
+	cargo test --locked --all-targets --all-features
 
 bench:
 	uv run python benchmarks/run_benchmarks.py
@@ -25,4 +25,4 @@ docs:
 	cd docs && uv run sphinx-build -W --keep-going -b html . _build/html
 
 develop:
-	uv run maturin develop --release
+	uv run maturin develop --release --locked --uv
