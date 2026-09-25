@@ -212,6 +212,9 @@ class EAPScorer:
             raise ValueError("Model must be fitted before scoring")
 
         responses = validate_scoring_responses(model, responses)
+        person_ids = AbilityPosteriorResult._validated_person_ids(
+            person_ids, responses.shape[0]
+        )
         quad_points, quad_weights = build_quadrature(
             n_quadpts=self.n_quadpts,
             n_factors=model.n_factors,
