@@ -9,10 +9,8 @@ Requires Python 3.11+, Rust (stable), and [uv](https://github.com/astral-sh/uv).
 ```bash
 git clone https://github.com/Cameron-Lyons/mirt.git
 cd mirt
-uv venv
-uv pip install -e ".[dev]"
-
-uv run maturin develop --release
+uv sync --locked --no-install-project --extra dev
+uv run --no-sync maturin develop --release --locked
 ```
 
 Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
@@ -20,8 +18,8 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 ## Python checks
 
 ```bash
-uv run ruff format src tests
-uv run ruff check src tests
+uv run --no-sync ruff format src tests benchmarks
+uv run --no-sync ruff check src tests benchmarks
 
 uv run mypy src/mirt --ignore-missing-imports
 
@@ -50,11 +48,40 @@ The extension lives under `rust_src/` with the workspace `Cargo.toml` at the rep
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
 ```
 
 Or: `make test-rust` / `make fmt`.
+
+## CI checks
+
+CI installs dependencies from `uv.lock` and builds one release wheel with
+`Cargo.lock` enforced. The same ABI3 wheel is tested on Python 3.11–3.14 and used
+for performance checks. Native jobs explicitly require the extension to load.
+A separate job runs model, estimation, scoring, simulation, and backend contract
+tests from source without the extension. Lint and type checking do not build
+the project.
+
+The coverage floor is 85%. Installed-wheel paths are mapped back to `src/mirt`
+so coverage artifacts and pull-request annotations refer to repository files.
+
+To reproduce wheel testing in a clean environment:
+
+```bash
+uv sync --locked --no-install-project --extra dev
+uv run --no-sync maturin build --release --locked --out dist
+uv pip install --no-deps --no-index dist/*.whl
+uv run --no-sync pytest --strict-config --strict-markers -m 'not slow and not performance' --cov=mirt
+```
+
+Use `--no-sync` after installing the wheel so the test command keeps that exact
+installation. Python-only checks use `PYTHONPATH=src` without installing the
+wheel or running `maturin develop`. Slow tests run weekly and on manual workflow
+dispatch. `CI complete` fails if a required job fails, is cancelled, or is
+unexpectedly skipped; the existing `Rust checks (Cargo.toml)` check covers
+formatting, Clippy, and Rust tests separately. Workflow syntax is checked by a
+pinned, checksum-verified actionlint release.
 
 ## Documentation
 

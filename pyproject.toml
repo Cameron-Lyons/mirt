@@ -85,8 +85,11 @@ filterwarnings = [
     "error::pytest.PytestDeprecationWarning",
 ]
 
+[tool.coverage.paths]
+mirt = ["src/mirt", "*/site-packages/mirt"]
+
 [tool.coverage.report]
-fail_under = 59
+fail_under = 85
 
 [tool.ruff]
 line-length = 88

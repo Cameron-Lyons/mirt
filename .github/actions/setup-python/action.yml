@@ -1,0 +1,23 @@
+name: Set up locked Python dependencies
+description: Install the selected Python and development dependencies without building the project.
+inputs:
+  python-version:
+    description: Python version used by this job.
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install uv and Python
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      with:
+        version: "0.12.7"
+        python-version: ${{ inputs.python-version }}
+        activate-environment: true
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+        cache-suffix: ${{ inputs.python-version }}
+    - name: Install locked dependencies
+      shell: bash
+      run: uv sync --locked --no-install-project --extra dev
