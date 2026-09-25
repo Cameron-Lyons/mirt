@@ -9,7 +9,7 @@ Requires Python 3.11+, Rust (stable), and [uv](https://github.com/astral-sh/uv).
 ```bash
 git clone https://github.com/Cameron-Lyons/mirt.git
 cd mirt
-uv sync --locked --extra dev --extra plot --no-install-project
+uv sync --locked --no-install-project --extra dev --extra plot
 uv run --no-sync maturin develop --release --locked --uv
 ```
 
@@ -18,8 +18,8 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 ## Python checks
 
 ```bash
-uv run ruff format src tests benchmarks
-uv run ruff check src tests benchmarks
+uv run --no-sync ruff format src tests benchmarks
+uv run --no-sync ruff check src tests benchmarks
 
 uv run mypy src/mirt --ignore-missing-imports
 
@@ -54,6 +54,51 @@ cargo test --locked --all-targets --all-features
 
 Or: `make test-rust` / `make fmt`.
 
+## CI checks
+
+CI installs dependencies from `uv.lock` and builds one release wheel with
+`Cargo.lock` enforced. The same ABI3 wheel is tested on Python 3.11–3.14 and used
+for all performance checks and the slow suite. Native jobs explicitly require
+the extension to load. A separate job runs the full non-slow, non-performance
+suite from source without the extension. Workflow syntax, lint, and type checks
+run before wheel builds and tests; lint and type checking do not build the
+project. Test environments include plotting support.
+
+Every native matrix job enforces a 90% coverage floor. Installed-wheel paths
+are mapped back to `src/mirt` so coverage artifacts and pull-request annotations
+refer to repository files. Pytest rejects unknown configuration options and
+unregistered markers. Use `uv lock` when changing dependencies and commit the
+resulting lockfile. CI uses uv 0.12.7.
+
+To reproduce wheel testing in a clean environment:
+
+```bash
+uv sync --locked --no-install-project --extra dev --extra plot
+uv run --no-sync maturin build --release --locked --out dist
+uv pip install --no-deps --no-index dist/*.whl
+uv run --no-sync pytest -m 'not slow and not performance' --cov=mirt
+```
+
+Use `--no-sync` after installing the wheel so the test command keeps that exact
+installation. To reproduce the NumPy-only job, use a clean checkout with no
+built extension, install dependencies with
+`uv sync --locked --no-install-project --extra dev --extra plot`, then run:
+
+```bash
+PYTHONPATH=src uv run --no-sync pytest -m 'not slow and not performance'
+```
+
+Slow tests run weekly and can also be enabled through the CI workflow's manual
+`run-slow` input. `CI complete` fails if a required job fails, is cancelled, or
+is unexpectedly skipped; it can be selected as a required branch-protection
+check. The existing `Rust checks (Cargo.toml)` check covers formatting, Clippy,
+and Rust tests separately; documentation and security retain separate checks.
+Pull-request updates cancel superseded runs, and jobs have explicit time limits.
+Test reports and scoring/posterior benchmarks are retained as workflow artifacts.
+
+Workflow syntax is checked by a pinned, checksum-verified actionlint release.
+Run `actionlint` to validate workflow changes locally.
+
 ## Documentation
 
 ```bash
@@ -62,33 +107,6 @@ make docs
 ```
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
-
-## Continuous integration
-
-The main CI workflow validates workflow syntax, lint, and types before running
-the Python 3.11–3.14 native test matrix, a separate NumPy-only test environment,
-and all tests marked `performance`. Test environments include plotting support,
-and every native test job enforces a 90% coverage floor. Pytest rejects unknown
-configuration options and unregistered markers.
-Python dependencies come from `uv.lock`; native builds and Rust checks require
-`Cargo.lock` to remain unchanged. Use `uv lock` when changing dependencies and
-commit the resulting lockfile. CI uses uv 0.12.7.
-
-`CI checks` aggregates these jobs and fails on failures, cancellations, or
-unexpected skips. It can be selected as a required branch-protection check;
-Rust, documentation, and security workflows retain their separate checks.
-The slow suite runs weekly and can also be enabled through the CI workflow's
-manual `run-slow` input. Pull-request updates cancel superseded runs, and jobs
-have explicit time limits. Test reports and scoring/posterior benchmarks are
-retained as workflow artifacts.
-
-Run `actionlint` to validate workflow changes locally. To reproduce the
-NumPy-only job, use a clean checkout with no built extension, install dependencies
-with `uv sync --locked --extra dev --extra plot --no-install-project`, then run:
-
-```bash
-PYTHONPATH=src uv run --no-sync pytest -m 'not slow and not performance'
-```
 
 ## Experimental APIs
 

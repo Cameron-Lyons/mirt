@@ -85,6 +85,9 @@ filterwarnings = [
     "error::pytest.PytestDeprecationWarning",
 ]
 
+[tool.coverage.paths]
+mirt = ["src/mirt", "*/site-packages/mirt"]
+
 [tool.coverage.report]
 fail_under = 90
 

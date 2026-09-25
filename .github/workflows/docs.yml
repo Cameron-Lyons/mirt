@@ -26,6 +26,7 @@ jobs:
         with:
           python-version: "3.12"
           extras: "dev docs plot"
+          build-native: "true"
 
       - name: Build documentation without warnings
         run: |

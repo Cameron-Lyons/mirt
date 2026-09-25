@@ -10,7 +10,7 @@ inputs:
     default: "dev plot"
   build-native:
     description: Whether to build and install the Rust extension.
-    default: "true"
+    default: "false"
 
 runs:
   using: composite
@@ -20,8 +20,12 @@ runs:
       with:
         version: "0.12.7"
         python-version: ${{ inputs.python-version }}
+        activate-environment: true
         enable-cache: true
-        cache-dependency-glob: uv.lock
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+        cache-suffix: ${{ inputs.python-version }}
 
     - name: Install locked dependencies
       shell: bash
