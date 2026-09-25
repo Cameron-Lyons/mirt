@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from numbers import Real
 from typing import Any, Self
@@ -13,6 +14,7 @@ from mirt.exceptions import MirtValidationError
 from mirt.results.score_result import ScoreResult
 
 _HDI_TARGET_ELEMENTS = 500_000
+_SUMMARY_WORKING_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -167,6 +169,13 @@ class AbilityPosteriorResult:
             return values.ravel()
         return values
 
+    def _summary_batches(self) -> Iterator[slice]:
+        """Bound temporary grid arrays independently of the respondent count."""
+        # Allow two float arrays per row; a single grid row is the minimum.
+        batch_size = max(1, _SUMMARY_WORKING_BYTES // (16 * self.n_points))
+        for start in range(0, self.n_persons, batch_size):
+            yield slice(start, min(start + batch_size, self.n_persons))
+
     @property
     def mean(self) -> NDArray[np.float64]:
         """Posterior mean ability for every respondent."""
@@ -192,13 +201,14 @@ class AbilityPosteriorResult:
     @property
     def entropy(self) -> NDArray[np.float64]:
         """Shannon entropy of each normalized grid distribution."""
-        with np.errstate(divide="ignore", invalid="ignore"):
-            terms = np.where(
-                self.weights > 0.0,
-                self.weights * np.log(self.weights),
-                0.0,
-            )
-        return -np.sum(terms, axis=1)
+        entropy = np.empty(self.n_persons, dtype=np.float64)
+        for batch in self._summary_batches():
+            weights = self.weights[batch]
+            terms = np.zeros_like(weights)
+            np.log(weights, out=terms, where=weights > 0.0)
+            terms *= weights
+            entropy[batch] = -np.sum(terms, axis=1)
+        return entropy
 
     @staticmethod
     def _validate_probability(value: float, *, parameter: str) -> float:
@@ -216,29 +226,60 @@ class AbilityPosteriorResult:
             )
         return resolved
 
-    def _quantile(self, probability: float) -> NDArray[np.float64]:
-        """Evaluate one marginal weighted quantile per respondent and factor."""
-        quantiles = np.empty((self.n_persons, self.n_factors), dtype=np.float64)
+    def _quantiles(self, probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Reuse each sorted marginal CDF for all requested probabilities."""
+        quantiles = np.empty(
+            (len(probabilities), self.n_persons, self.n_factors), dtype=np.float64
+        )
         for factor in range(self.n_factors):
             order = np.argsort(self.points[:, factor], kind="stable")
-            cumulative = np.cumsum(self.weights[:, order], axis=1)
-            indices = np.sum(cumulative < probability, axis=1)
-            np.minimum(indices, self.n_points - 1, out=indices)
-            quantiles[:, factor] = self.points[order[indices], factor]
-        return self._restore_score_shape(quantiles)
+            sorted_points = self.points[order, factor]
+            for batch in self._summary_batches():
+                cumulative = self.weights[batch][:, order]
+                np.cumsum(cumulative, axis=1, out=cumulative)
+                for index, probability in enumerate(probabilities):
+                    indices = np.sum(cumulative < probability, axis=1)
+                    np.minimum(indices, self.n_points - 1, out=indices)
+                    quantiles[index, batch, factor] = sorted_points[indices]
+        return quantiles[:, :, 0] if self.n_factors == 1 else quantiles
 
-    def quantile(self, probability: float = 0.5) -> NDArray[np.float64]:
-        """Return one marginal posterior quantile per respondent and factor."""
-        resolved = self._validate_probability(
-            probability,
-            parameter="probability",
-        )
-        return self._quantile(resolved)
+    def quantile(self, probability: ArrayLike = 0.5) -> NDArray[np.float64]:
+        """Return marginal posterior quantiles from the discrete grid.
+
+        A scalar probability returns shape ``(n_persons,)`` or
+        ``(n_persons, n_factors)``. A non-empty one-dimensional sequence adds
+        a leading probability axis, retaining the requested order. All
+        probabilities must be strictly between zero and one.
+        """
+        if isinstance(probability, Real):
+            resolved = self._validate_probability(probability, parameter="probability")
+            return self._quantiles(np.array([resolved]))[0]
+        try:
+            raw = np.asarray(probability)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "probability must be a number or a one-dimensional sequence",
+                parameter="probability",
+            ) from exc
+        if (
+            raw.ndim > 1
+            or raw.size == 0
+            or raw.dtype.kind not in "iuf"
+            or not np.all(np.isfinite(raw))
+            or np.any((raw <= 0.0) | (raw >= 1.0))
+        ):
+            raise MirtValidationError(
+                "probability must contain finite numbers strictly between 0 and 1",
+                parameter="probability",
+                expected="a scalar or a non-empty one-dimensional sequence",
+            )
+        quantiles = self._quantiles(np.atleast_1d(raw).astype(np.float64))
+        return quantiles[0] if raw.ndim == 0 else quantiles
 
     @property
     def median(self) -> NDArray[np.float64]:
         """Marginal posterior median for every respondent and factor."""
-        return self._quantile(0.5)
+        return self.quantile(0.5)
 
     def credible_intervals(
         self,
@@ -247,7 +288,8 @@ class AbilityPosteriorResult:
         """Return marginal equal-tail credible intervals from the exact grid."""
         resolved_level = self._validate_probability(level, parameter="level")
         tail = (1.0 - resolved_level) / 2.0
-        return self.quantile(tail), self.quantile(1.0 - tail)
+        quantiles = self._quantiles(np.array([tail, 1.0 - tail]))
+        return quantiles[0], quantiles[1]
 
     @staticmethod
     def _row_searchsorted(
@@ -439,9 +481,45 @@ class AbilityPosteriorResult:
             dtype=np.float64,
         )
         for factor in range(self.n_factors):
-            above = self.points[:, factor][None, :] > cuts_2d[:, factor, None]
-            probabilities[:, factor] = np.sum(self.weights * above, axis=1)
+            for batch in self._summary_batches():
+                above = self.points[None, :, factor] > cuts_2d[batch, factor, None]
+                probabilities[batch, factor] = np.einsum(
+                    "ij,ij->i", self.weights[batch], above
+                )
+        np.clip(probabilities, 0.0, 1.0, out=probabilities)
         return self._restore_score_shape(probabilities)
+
+    def sample(
+        self,
+        n_draws: int = 5,
+        *,
+        seed: int | None = None,
+    ) -> NDArray[np.float64]:
+        """Draw plausible abilities from the stored joint grid distribution.
+
+        Returns shape ``(n_persons, n_factors, n_draws)``, including the factor
+        axis for unidimensional models, as in ``generate_plausible_values``.
+        Each draw selects a whole grid point to preserve dependence between
+        factors. No model evaluation is required. Draws are reproducible for
+        a fixed seed and independent of internal batching.
+        """
+        if (
+            isinstance(n_draws, (bool, np.bool_))
+            or not isinstance(n_draws, (int, np.integer))
+            or n_draws < 1
+        ):
+            raise MirtValidationError(
+                "n_draws must be a positive integer", parameter="n_draws"
+            )
+        rng = np.random.default_rng(seed)
+        draws = np.empty((self.n_persons, self.n_factors, n_draws), dtype=np.float64)
+        for batch in self._summary_batches():
+            cumulative = np.cumsum(self.weights[batch], axis=1)
+            cumulative[:, -1] = 1.0
+            for offset, row in enumerate(cumulative):
+                indices = np.searchsorted(row, rng.random(n_draws), side="right")
+                draws[batch.start + offset] = self.points[indices].T
+        return draws
 
     def classify(
         self,

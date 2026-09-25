@@ -21,7 +21,7 @@ import mirt
 from mirt.cat import CATEngine
 
 SCHEMA_VERSION = 1
-SUITE_ORDER = ("fit", "scoring", "cat")
+SUITE_ORDER = ("fit", "scoring", "posterior", "cat")
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +191,35 @@ def bench_scoring(
     )
 
 
+def bench_posterior(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> BenchResult:
+    """Benchmark summaries of a two-factor posterior without fitting overhead."""
+    rng = np.random.default_rng(45)
+    model = mirt.TwoParameterLogistic(n_items=n_items, n_factors=2)
+    model.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, size=(n_items, 2)),
+        difficulty=rng.normal(size=n_items),
+    )
+    model._is_fitted = True
+    responses = rng.integers(0, 2, size=(n_persons, n_items))
+    posterior = mirt.ability_posterior(model, responses, n_quadpts=21)
+
+    def run() -> None:
+        posterior.quantile([0.025, 0.5, 0.975])
+        posterior.classification_probabilities()
+        _ = posterior.entropy
+        posterior.sample(5, seed=46)
+
+    return BenchResult(
+        "posterior_summaries",
+        _time(run, repeats=repeats, warmups=warmups),
+    )
+
+
 def bench_cat(
     n_items: int,
     repeats: int,
@@ -326,6 +355,8 @@ def run_suites(
         results.append(bench_em_fit(n_persons, n_items, repeats, warmups))
     if "scoring" in suites:
         results.append(bench_scoring(n_persons, n_items, repeats, warmups))
+    if "posterior" in suites:
+        results.append(bench_posterior(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
     return results
@@ -430,7 +461,7 @@ def _validate_baseline_compatibility(
 
     if baseline_config.get("items") != current_config.get("items"):
         raise ValueError("baseline item count does not match the current run")
-    person_workloads = {"em_fit_2pl", "eap_scoring"}
+    person_workloads = {"em_fit_2pl", "eap_scoring", "posterior_summaries"}
     if current_names & person_workloads and baseline_config.get(
         "persons"
     ) != current_config.get("persons"):

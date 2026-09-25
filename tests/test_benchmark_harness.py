@@ -277,13 +277,27 @@ class TestBenchmarkComparisons:
 
 class TestBenchmarkCommand:
     def test_suite_selection_is_deduplicated_and_canonical(self) -> None:
-        assert benchmark.resolve_suites(None) == ("fit", "scoring", "cat")
+        assert benchmark.resolve_suites(None) == ("fit", "scoring", "posterior", "cat")
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
             "fit",
             "scoring",
+            "posterior",
             "cat",
         )
+
+    def test_posterior_suite_runs_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("posterior",), n_persons=10, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == ["posterior_summaries"]
+        assert results[0].median > 0.0
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=10),
+                _report(*results, persons=20),
+                max_regression_percent=20.0,
+            )
 
     @pytest.mark.parametrize("suites", [(), ("unknown",)])
     def test_runner_rejects_invalid_direct_suite_selection(

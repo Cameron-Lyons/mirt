@@ -142,10 +142,12 @@ of only its first two moments:
    lower, upper = posterior.credible_intervals(level=0.95)
    hdi_lower, hdi_upper = posterior.highest_density_intervals(level=0.95)
    median = posterior.quantile(0.5)
+   percentiles = posterior.quantile([0.1, 0.5, 0.9])
    probability_above = posterior.classification_probabilities(cut_score=0.0)
    decisions = posterior.classify(cut_score=0.0, confidence=0.95)
    map_values = posterior.map_estimate
    scores = posterior.to_score_result()
+   plausible_values = posterior.sample(n_draws=10, seed=42)
 
 ``points`` contains the shared quadrature grid and each row of ``weights`` is a
 normalized respondent distribution over that grid. ``log_marginal_likelihood``
@@ -162,3 +164,19 @@ Likelihood evaluation is memory-bounded through the scorer's ``batch_size``. The
 highest-density search also batches respondents automatically; pass its own
 ``batch_size`` when a fixed temporary-memory ceiling is required. The returned
 weight matrix necessarily contains ``n_persons * n_points`` values.
+Quantiles, equal-tail intervals, entropy, classification
+probabilities, and sampling also process respondent batches to limit temporary
+memory use.
+
+Pass a sequence to ``quantile()`` to compute several quantiles using the same
+cumulative distributions. The result has shape ``(n_probabilities, n_persons)``
+for one factor, or ``(n_probabilities, n_persons, n_factors)`` for multiple factors.
+Scalar queries retain the usual score shape. Probabilities must be strictly
+between zero and one, and their requested order is preserved.
+
+``sample()`` draws from the stored joint posterior without reevaluating the model.
+It returns ``(n_persons, n_factors, n_draws)``, matching the layout used by
+``generate_plausible_values``. Each draw selects a complete grid point, preserving
+dependence between factors. A fixed seed gives reproducible draws. These draws
+are conditional on the fitted item parameters and the chosen quadrature grid;
+they do not include uncertainty in item calibration.

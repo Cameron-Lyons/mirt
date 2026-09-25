@@ -182,6 +182,21 @@ percentile_ranks = t_scores.normal_percentile_ranks(
 )
 ```
 
+### Posterior Ability Distributions
+
+```python
+posterior = mirt.ability_posterior(result, responses, batch_size=512)
+lower, upper = posterior.credible_intervals(level=0.95)
+percentiles = posterior.quantile([0.1, 0.5, 0.9])
+probability_above = posterior.classification_probabilities(cut_score=0.0)
+plausible_values = posterior.sample(n_draws=10, seed=42)
+```
+
+Posterior summaries use bounded temporary memory. Multiple quantiles share the
+same cumulative distributions, and sampling reuses the stored joint posterior
+without evaluating the model again. Draws have shape
+`(n_persons, n_factors, n_draws)` and preserve dependence between factors.
+
 ### Diagnostics
 
 ```python
@@ -683,6 +698,10 @@ uv run python benchmarks/run_benchmarks.py \
   --suite scoring --repeats 5 --warmups 1 \
   --baseline benchmark-baseline.json --max-regression 10 \
   --json benchmark-current.json
+
+# Measure quantiles, classification, entropy, and draws from a stored posterior.
+uv run python benchmarks/run_benchmarks.py \
+  --suite posterior --persons 2000 --items 30 --repeats 5 --warmups 1
 ```
 
 Reports include workload sizes, backend details, runtime versions, every timing
