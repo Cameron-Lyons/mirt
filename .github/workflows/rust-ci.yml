@@ -2,13 +2,16 @@ name: Rust CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,42 +19,31 @@ env:
 
 jobs:
   rust:
-    name: Rust checks (${{ matrix.manifest }})
+    name: Rust checks (Cargo.toml)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        manifest:
-          - Cargo.toml
-
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal --component clippy --component rustfmt
-          rustup default stable
-
-      - name: Prepare Cargo manifest path
-        run: |
-          manifest="${{ matrix.manifest }}"
-          dir="$(dirname "$manifest")"
-          base="$(basename "$manifest")"
-          if [ "$base" != "Cargo.toml" ]; then
-            ln -sf "$base" "$dir/Cargo.toml"
-            manifest="$dir/Cargo.toml"
-          fi
-          echo "CARGO_MANIFEST_PATH=$manifest" >> "$GITHUB_ENV"
-
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          components: clippy, rustfmt
+      - name: Cache Rust build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-checks-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-cargo-checks-
       - name: Check formatting
-        run: cargo fmt --all --manifest-path "$CARGO_MANIFEST_PATH" -- --check
-
-      - name: Build with warnings denied
-        run: cargo build --manifest-path "$CARGO_MANIFEST_PATH" --all-targets --all-features
-
+        run: cargo fmt --all -- --check
       - name: Run clippy with warnings denied
-        run: cargo clippy --manifest-path "$CARGO_MANIFEST_PATH" --all-targets --all-features -- -D warnings
-
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run tests
-        run: cargo test --manifest-path "$CARGO_MANIFEST_PATH" --all-features
+        run: cargo test --locked --all-targets --all-features

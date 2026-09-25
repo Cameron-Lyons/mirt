@@ -9,10 +9,8 @@ Requires Python 3.11+, Rust (stable), and [uv](https://github.com/astral-sh/uv).
 ```bash
 git clone https://github.com/Cameron-Lyons/mirt.git
 cd mirt
-uv venv
-uv pip install -e ".[dev]"
-
-uv run maturin develop --release
+uv sync --locked --extra dev --extra plot --no-install-project
+uv run --no-sync maturin develop --release --locked --uv
 ```
 
 Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
@@ -20,8 +18,8 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 ## Python checks
 
 ```bash
-uv run ruff format src tests
-uv run ruff check src tests
+uv run ruff format src tests benchmarks
+uv run ruff check src tests benchmarks
 
 uv run mypy src/mirt --ignore-missing-imports
 
@@ -50,8 +48,8 @@ The extension lives under `rust_src/` with the workspace `Cargo.toml` at the rep
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
 ```
 
 Or: `make test-rust` / `make fmt`.
@@ -64,6 +62,33 @@ make docs
 ```
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
+
+## Continuous integration
+
+The main CI workflow validates workflow syntax, lint, and types before running
+the Python 3.11–3.14 native test matrix, a separate NumPy-only test environment,
+and all tests marked `performance`. Test environments include plotting support,
+and every native test job enforces a 90% coverage floor. Pytest rejects unknown
+configuration options and unregistered markers.
+Python dependencies come from `uv.lock`; native builds and Rust checks require
+`Cargo.lock` to remain unchanged. Use `uv lock` when changing dependencies and
+commit the resulting lockfile. CI uses uv 0.12.7.
+
+`CI checks` aggregates these jobs and fails on failures, cancellations, or
+unexpected skips. It can be selected as a required branch-protection check;
+Rust, documentation, and security workflows retain their separate checks.
+The slow suite runs weekly and can also be enabled through the CI workflow's
+manual `run-slow` input. Pull-request updates cancel superseded runs, and jobs
+have explicit time limits. Test reports and scoring/posterior benchmarks are
+retained as workflow artifacts.
+
+Run `actionlint` to validate workflow changes locally. To reproduce the
+NumPy-only job, use a clean checkout with no built extension, install dependencies
+with `uv sync --locked --extra dev --extra plot --no-install-project`, then run:
+
+```bash
+PYTHONPATH=src uv run --no-sync pytest -m 'not slow and not performance'
+```
 
 ## Experimental APIs
 

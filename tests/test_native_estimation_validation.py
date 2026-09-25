@@ -6,6 +6,7 @@ from typing import Any
 import numpy as np
 import pytest
 
+from mirt._rust_backend import RUST_AVAILABLE
 from mirt.backends.rust.estimation import bootstrap_fit_2pl, em_fit_2pl
 
 
@@ -76,6 +77,13 @@ def test_native_bootstrap_accepts_warm_start_parameters() -> None:
         "initial_discrimination": np.array([1.2, 0.8]),
         "initial_difficulty": np.array([-0.25, 0.25]),
     }
+
+    if not RUST_AVAILABLE:
+        with pytest.raises(
+            RuntimeError, match="Rust backend required for bootstrap_fit_2pl"
+        ):
+            bootstrap_fit_2pl(responses, **kwargs)
+        return
 
     discrimination, difficulty = bootstrap_fit_2pl(responses, **kwargs)
     repeated_discrimination, repeated_difficulty = bootstrap_fit_2pl(

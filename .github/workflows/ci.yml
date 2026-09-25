@@ -10,273 +10,201 @@ on:
     branches: [main]
   schedule:
     - cron: "0 8 * * 0"
+  workflow_dispatch:
+    inputs:
+      run-slow:
+        description: Include the slow test suite.
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MPLBACKEND: Agg
+  PYTHONHASHSEED: "0"
 
 jobs:
-  lint:
+  workflows:
+    name: Workflow lint
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.14"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-        with:
-          components: clippy, rustfmt
-
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-lint-
-
-      - name: Cache UV
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-lint-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-lint-
-
-      - name: Run cargo fmt check
-        run: cargo fmt --check
-
-      - name: Run cargo clippy
-        run: cargo clippy -- -D warnings
-
-      - name: Install dependencies and build
+          persist-credentials: false
+      - name: Validate workflows with actionlint
         run: |
-          uv venv
-          uv pip install maturin
-          uv pip install -e ".[dev]"
-          uv run maturin develop --release
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output "$archive"
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $archive" | sha256sum --check
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -color
 
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          build-native: "false"
+          extras: dev
       - name: Run ruff check
-        run: uv run ruff check src/ tests/ benchmarks/
-
+        run: uv run --no-sync ruff check src/ tests/ benchmarks/
       - name: Run ruff format check
-        run: uv run ruff format --check src/ tests/ benchmarks/
+        run: uv run --no-sync ruff format --check src/ tests/ benchmarks/
 
   typecheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.14"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-typecheck-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-typecheck-
-
-      - name: Cache UV
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-typecheck-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-typecheck-
-
-      - name: Install dependencies and build
-        run: |
-          uv venv
-          uv pip install maturin
-          uv pip install -e ".[dev]"
-          uv run maturin develop --release
-
+          build-native: "false"
+          extras: dev
       - name: Run mypy
-        run: uv run mypy src/mirt --ignore-missing-imports
+        run: uv run --no-sync mypy src/mirt --ignore-missing-imports
 
   test:
+    needs: [workflows, lint, typecheck]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+      - name: Require the native backend
+        run: uv run --no-sync python -c "from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
+      - name: Run tests with coverage
+        run: uv run --no-sync pytest tests/ --cov=src/mirt --cov-report=xml --cov-report=term-missing --junitxml=test-results.xml
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
         with:
+          name: test-reports-python-${{ matrix.python-version }}
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ matrix.python-version }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-${{ matrix.python-version }}-
-            ${{ runner.os }}-cargo-test-
-
-      - name: Cache UV
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-test-${{ matrix.python-version }}-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-test-${{ matrix.python-version }}-
-            ${{ runner.os }}-uv-test-
-
-      - name: Install dependencies and build
-        run: |
-          uv venv
-          uv pip install maturin
-          uv pip install -e ".[dev]"
-          uv run maturin develop --release
-
-      - name: Run tests
-        run: uv run pytest tests/ -v --cov=src/mirt --cov-report=xml
-
+            test-results.xml
+            coverage.xml
+          retention-days: 14
       - name: Upload coverage
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         if: matrix.python-version == '3.14'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: coverage.xml
           fail_ci_if_error: false
 
-  performance:
-    name: Performance Smoke Tests
+  numpy:
+    name: NumPy fallback
+    needs: [workflows, lint, typecheck]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.14"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-performance-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-performance-
-
-      - name: Cache UV
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+          build-native: "false"
+      - name: Require an environment without the native backend
+        run: uv run --no-sync python -c "from mirt._rust_backend import RUST_AVAILABLE; assert not RUST_AVAILABLE"
+      - name: Run fallback tests
+        run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --junitxml=test-results-numpy.xml
+      - name: Upload fallback test report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
         with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-performance-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-performance-
+          name: test-reports-numpy
+          path: test-results-numpy.xml
+          retention-days: 14
 
-      - name: Install dependencies and build
-        run: |
-          uv venv
-          uv pip install maturin
-          uv pip install -e ".[dev]"
-          uv run maturin develop --release
-
-      - name: Run performance regression smoke tests
+  performance:
+    name: Performance Smoke Tests
+    needs: [workflows, lint, typecheck]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+      - name: Require the native backend
+        run: uv run --no-sync python -c "from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
+      - name: Run every performance regression check
         env:
           MIRT_IMPORT_THRESHOLD_SECONDS: "2.5"
           MIRT_FIT_THRESHOLD_SECONDS: "12.0"
           MIRT_SCORE_THRESHOLD_SECONDS: "4.0"
-        run: uv run pytest tests/test_performance_smoke.py -v --tb=short
-
-      - name: Record structured scoring benchmark
+        run: uv run --no-sync pytest tests/ -m performance
+      - name: Record scoring and posterior benchmarks
         run: |
-          uv run python benchmarks/run_benchmarks.py \
-            --suite scoring --persons 2000 --items 30 \
+          uv run --no-sync python benchmarks/run_benchmarks.py \
+            --suite scoring --suite posterior --backend rust --persons 2000 --items 30 \
             --repeats 3 --warmups 1 --json benchmark-report.json
-
       - name: Upload benchmark report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
         with:
           name: benchmark-report-${{ github.sha }}
           path: benchmark-report.json
+          if-no-files-found: error
           retention-days: 30
 
   slow-tests:
     name: Slow Test Suite
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run-slow)
+    needs: [workflows, lint, typecheck]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
-          python-version: "3.14"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-
-      - name: Cache Rust build
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-slow-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-slow-
-
-      - name: Cache UV
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
-        with:
-          path: ~/.cache/uv
-          key: ${{ runner.os }}-uv-slow-${{ hashFiles('**/pyproject.toml') }}
-          restore-keys: |
-            ${{ runner.os }}-uv-slow-
-
-      - name: Install dependencies and build
-        run: |
-          uv venv
-          uv pip install maturin
-          uv pip install -e ".[dev]"
-          uv run maturin develop --release
-
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
       - name: Run slow tests
-        run: uv run pytest tests/ -v -m slow --tb=short
+        run: uv run --no-sync pytest tests/ -m slow
+
+  checks:
+    name: CI checks
+    if: always()
+    needs: [workflows, lint, typecheck, test, numpy, performance, slow-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require successful checks
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          REQUIRE_SLOW: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run-slow) }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+
+          failed = []
+          for name, job in json.loads(os.environ["JOB_RESULTS"]).items():
+              if name == "slow-tests" and os.environ["REQUIRE_SLOW"] != "true":
+                  if job["result"] == "skipped":
+                      continue
+              if job["result"] != "success":
+                  failed.append(f"{name}: {job['result']}")
+          if failed:
+              print("Required checks did not pass: " + ", ".join(failed))
+              sys.exit(1)
+          PY

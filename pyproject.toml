@@ -76,7 +76,7 @@ Repository = "https://github.com/Cameron-Lyons/mirt"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-v --tb=short -m 'not slow'"
+addopts = "-v --tb=short --strict-config --strict-markers -m 'not slow'"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "performance: marks performance regression smoke tests",
@@ -86,7 +86,7 @@ filterwarnings = [
 ]
 
 [tool.coverage.report]
-fail_under = 59
+fail_under = 90
 
 [tool.ruff]
 line-length = 88
