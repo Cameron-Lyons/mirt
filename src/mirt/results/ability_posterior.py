@@ -169,10 +169,12 @@ class AbilityPosteriorResult:
             return values.ravel()
         return values
 
-    def _summary_batches(self) -> Iterator[slice]:
+    def _summary_batches(self, *, extra_bytes_per_row: int = 0) -> Iterator[slice]:
         """Bound temporary grid arrays independently of the respondent count."""
         # Allow two float arrays per row; a single grid row is the minimum.
-        batch_size = max(1, _SUMMARY_WORKING_BYTES // (16 * self.n_points))
+        batch_size = max(
+            1, _SUMMARY_WORKING_BYTES // (16 * self.n_points + extra_bytes_per_row)
+        )
         for start in range(0, self.n_persons, batch_size):
             yield slice(start, min(start + batch_size, self.n_persons))
 
@@ -228,19 +230,22 @@ class AbilityPosteriorResult:
 
     def _quantiles(self, probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
         """Reuse each sorted marginal CDF for all requested probabilities."""
+        from mirt.backends.rust.posterior import row_searchsorted
+
         quantiles = np.empty(
             (len(probabilities), self.n_persons, self.n_factors), dtype=np.float64
         )
         for factor in range(self.n_factors):
             order = np.argsort(self.points[:, factor], kind="stable")
             sorted_points = self.points[order, factor]
-            for batch in self._summary_batches():
-                cumulative = self.weights[batch][:, order]
+            for batch in self._summary_batches(
+                extra_bytes_per_row=16 * probabilities.size
+            ):
+                cumulative = np.take(self.weights[batch], order, axis=1)
                 np.cumsum(cumulative, axis=1, out=cumulative)
-                for index, probability in enumerate(probabilities):
-                    indices = np.sum(cumulative < probability, axis=1)
-                    np.minimum(indices, self.n_points - 1, out=indices)
-                    quantiles[index, batch, factor] = sorted_points[indices]
+                indices = row_searchsorted(cumulative, probabilities)
+                np.minimum(indices, self.n_points - 1, out=indices)
+                quantiles[:, batch, factor] = sorted_points[indices].T
         return quantiles[:, :, 0] if self.n_factors == 1 else quantiles
 
     def quantile(self, probability: ArrayLike = 0.5) -> NDArray[np.float64]:
@@ -291,71 +296,6 @@ class AbilityPosteriorResult:
         quantiles = self._quantiles(np.array([tail, 1.0 - tail]))
         return quantiles[0], quantiles[1]
 
-    @staticmethod
-    def _row_searchsorted(
-        cumulative: NDArray[np.float64],
-        targets: NDArray[np.float64],
-    ) -> NDArray[np.intp]:
-        """Search independent row CDFs without a three-dimensional array."""
-        n_rows, n_boundaries = cumulative.shape
-        row_offsets = (2.0 * np.arange(n_rows, dtype=np.float64))[:, None]
-        shifted_cumulative = (cumulative + row_offsets).ravel()
-        shifted_targets = (targets + row_offsets).ravel()
-        flat_indices = np.searchsorted(
-            shifted_cumulative,
-            shifted_targets,
-            side="left",
-        )
-        row_starts = (np.arange(n_rows, dtype=np.intp) * n_boundaries)[:, None]
-        return flat_indices.reshape(targets.shape) - row_starts
-
-    @classmethod
-    def _shortest_mass_intervals(
-        cls,
-        coordinates: NDArray[np.float64],
-        weights: NDArray[np.float64],
-        level: float,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Return shortest contiguous intervals for one marginal grid."""
-        normalized = weights / np.sum(weights, axis=1, keepdims=True)
-        cumulative = np.empty(
-            (weights.shape[0], coordinates.size + 1),
-            dtype=np.float64,
-        )
-        cumulative[:, 0] = 0.0
-        np.cumsum(normalized, axis=1, out=cumulative[:, 1:])
-        cumulative[:, -1] = 1.0
-
-        targets = cumulative[:, :-1] + level
-        end_boundaries = cls._row_searchsorted(cumulative, targets)
-        valid = (targets <= 1.0) & (end_boundaries <= coordinates.size)
-        safe_end_boundaries = np.clip(end_boundaries, 1, coordinates.size)
-
-        interval_widths = coordinates[safe_end_boundaries - 1] - coordinates[None, :]
-        interval_widths[~valid] = np.inf
-        minimum_width = np.min(interval_widths, axis=1)
-        coordinate_scale = max(1.0, float(np.ptp(coordinates)))
-        width_tolerance = 16.0 * np.finfo(np.float64).eps * coordinate_scale
-        shortest = interval_widths <= minimum_width[:, None] + width_tolerance
-
-        rows = np.arange(weights.shape[0], dtype=np.intp)[:, None]
-        enclosed_mass = cumulative[rows, safe_end_boundaries] - cumulative[:, :-1]
-        candidate_mass = np.where(shortest, enclosed_mass, -np.inf)
-        greatest_mass = np.max(candidate_mass, axis=1)
-        mass_tolerance = 16.0 * np.finfo(np.float64).eps
-        preferred = shortest & (
-            enclosed_mass >= greatest_mass[:, None] - mass_tolerance
-        )
-        best_start = np.argmax(preferred, axis=1)
-        best_end = (
-            safe_end_boundaries[
-                np.arange(weights.shape[0], dtype=np.intp),
-                best_start,
-            ]
-            - 1
-        )
-        return coordinates[best_start], coordinates[best_end]
-
     def highest_density_intervals(
         self,
         level: float = 0.95,
@@ -383,6 +323,8 @@ class AbilityPosteriorResult:
         lower, upper : tuple of ndarray
             Marginal interval bounds with the standard score shape.
         """
+        from mirt.backends.rust.posterior import shortest_mass_intervals
+
         resolved_level = self._validate_probability(level, parameter="level")
         if batch_size is not None and (
             isinstance(batch_size, (bool, np.bool_))
@@ -406,19 +348,19 @@ class AbilityPosteriorResult:
                 return_index=True,
             )
             resolved_batch_size = (
-                max(1, _HDI_TARGET_ELEMENTS // coordinates.size)
+                max(1, _HDI_TARGET_ELEMENTS // self.n_points)
                 if batch_size is None
                 else int(batch_size)
             )
             for start in range(0, self.n_persons, resolved_batch_size):
                 stop = min(start + resolved_batch_size, self.n_persons)
-                sorted_weights = self.weights[start:stop, order]
-                marginal_weights = np.add.reduceat(
-                    sorted_weights,
-                    group_starts,
-                    axis=1,
+                sorted_weights = np.take(self.weights[start:stop], order, axis=1)
+                marginal_weights = (
+                    sorted_weights
+                    if coordinates.size == self.n_points
+                    else np.add.reduceat(sorted_weights, group_starts, axis=1)
                 )
-                factor_lower, factor_upper = self._shortest_mass_intervals(
+                factor_lower, factor_upper = shortest_mass_intervals(
                     coordinates,
                     marginal_weights,
                     resolved_level,
@@ -503,6 +445,8 @@ class AbilityPosteriorResult:
         factors. No model evaluation is required. Draws are reproducible for
         a fixed seed and independent of internal batching.
         """
+        from mirt.backends.rust.posterior import row_searchsorted
+
         if (
             isinstance(n_draws, (bool, np.bool_))
             or not isinstance(n_draws, (int, np.integer))
@@ -513,12 +457,14 @@ class AbilityPosteriorResult:
             )
         rng = np.random.default_rng(seed)
         draws = np.empty((self.n_persons, self.n_factors, n_draws), dtype=np.float64)
-        for batch in self._summary_batches():
+        for batch in self._summary_batches(
+            extra_bytes_per_row=8 * n_draws * (2 + self.n_factors)
+        ):
             cumulative = np.cumsum(self.weights[batch], axis=1)
             cumulative[:, -1] = 1.0
-            for offset, row in enumerate(cumulative):
-                indices = np.searchsorted(row, rng.random(n_draws), side="right")
-                draws[batch.start + offset] = self.points[indices].T
+            uniforms = rng.random((cumulative.shape[0], n_draws))
+            indices = row_searchsorted(cumulative, uniforms, side="right")
+            draws[batch] = self.points[indices].transpose(0, 2, 1)
         return draws
 
     def classify(

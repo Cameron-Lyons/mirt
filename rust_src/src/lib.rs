@@ -38,8 +38,10 @@ pub mod mirt_models;
 pub mod mstep;
 pub mod multigroup;
 pub mod multilevel;
+pub mod patterns;
 pub mod plausible;
 pub mod polytomous;
+pub mod posterior;
 pub mod regularized;
 pub mod response_time;
 pub mod scoring;
@@ -77,6 +79,8 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     dynamic::register(m)?;
     explanatory::register(m)?;
     equating::register(m)?;
+    patterns::register(m)?;
+    posterior::register(m)?;
 
     Ok(())
 }

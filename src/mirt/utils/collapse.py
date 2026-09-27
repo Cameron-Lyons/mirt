@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.backends.rust.patterns import response_pattern_indices
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.utils.data import validate_responses
 
@@ -119,41 +120,24 @@ def _normalize_responses(
         response_array = response_array.copy()
         response_array[np.isnan(response_array)] = missing_code
 
-    validated = validate_responses(
+    return validate_responses(
         response_array,
         allow_missing=True,
         missing_code=int(missing_code),
     )
-    return np.ascontiguousarray(validated)
 
 
 def _collapse_validated(responses: NDArray[np.int_]) -> CollapsedData:
-    """Collapse an already validated, contiguous response matrix."""
-    n_persons, n_items = responses.shape
-
-    row_dtype = np.dtype((np.void, responses.itemsize * n_items))
-    patterns_flat = responses.view(row_dtype).ravel()
-    _unique_patterns, first_indices, inverse, counts = np.unique(
-        patterns_flat,
-        return_index=True,
-        return_inverse=True,
-        return_counts=True,
-    )
-
-    appearance_order = np.argsort(first_indices, kind="stable")
-    first_indices = first_indices[appearance_order]
-    patterns = responses[first_indices].copy()
-    frequencies = counts[appearance_order].astype(np.int_, copy=False)
+    """Collapse an already validated response matrix."""
+    n_persons = responses.shape[0]
+    first_indices, indices, frequencies = response_pattern_indices(responses)
+    patterns = responses[first_indices]
     n_patterns = len(first_indices)
-
-    sorted_to_appearance = np.empty(n_patterns, dtype=np.int_)
-    sorted_to_appearance[appearance_order] = np.arange(n_patterns, dtype=np.int_)
-    indices = sorted_to_appearance[inverse]
 
     return CollapsedData(
         patterns=patterns,
-        frequencies=frequencies,
-        indices=indices,
+        frequencies=frequencies.astype(np.int_, copy=False),
+        indices=indices.astype(np.int_, copy=False),
         n_persons=n_persons,
         n_patterns=n_patterns,
     )

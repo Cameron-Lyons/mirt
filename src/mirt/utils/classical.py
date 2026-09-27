@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt._categorical import item_category_frequencies
 from mirt._classical import _alpha_if_deleted_numpy, _sample_variance
 from mirt._rust_backend import RUST_AVAILABLE
 from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
@@ -17,9 +18,6 @@ from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_delete
 _ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
 _RESPONSE_VALIDATION_CHUNK_ELEMENTS = 1_000_000
 _ITEM_STATS_MOMENT_CHUNK_ELEMENTS = 1_000_000
-_ITEM_STATS_FREQUENCY_CHUNK_ELEMENTS = 8_000_000
-_ITEM_STATS_MAX_VECTORIZED_CATEGORIES = 16
-_ITEM_STATS_MAX_FREQUENCY_ENTRIES = 5_000_000
 
 
 def _clean_response_matrix(
@@ -532,14 +530,9 @@ def _item_frequency_tables(
     valid: NDArray[np.bool_],
 ) -> list[dict[int, int]]:
     """Count compact category codes across item chunks, with a sparse fallback."""
-    n_persons, n_items = responses.shape
-    maximum = int(np.max(responses, where=valid, initial=-1.0))
-    n_categories = maximum + 1
-    vectorized = (
-        0 < n_categories <= _ITEM_STATS_MAX_VECTORIZED_CATEGORIES
-        and n_categories * n_items <= _ITEM_STATS_MAX_FREQUENCY_ENTRIES
-    )
-    if not vectorized:
+    n_items = responses.shape[1]
+    frequency_counts = item_category_frequencies(responses, valid, max_categories=16)
+    if frequency_counts is None:
         frequencies: list[dict[int, int]] = []
         for item_index in range(n_items):
             observed = responses[valid[:, item_index], item_index].astype(np.int_)
@@ -551,20 +544,6 @@ def _item_frequency_tables(
                 }
             )
         return frequencies
-
-    chunk_size = min(
-        n_items,
-        max(1, _ITEM_STATS_FREQUENCY_CHUNK_ELEMENTS // n_persons),
-    )
-    frequency_counts = np.empty((n_categories, n_items), dtype=np.intp)
-    for start in range(0, n_items, chunk_size):
-        stop = min(start + chunk_size, n_items)
-        block = responses[:, start:stop]
-        for category in range(n_categories):
-            frequency_counts[category, start:stop] = np.count_nonzero(
-                block == category,
-                axis=0,
-            )
 
     return [
         {

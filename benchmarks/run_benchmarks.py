@@ -21,7 +21,7 @@ import mirt
 from mirt.cat import CATEngine
 
 SCHEMA_VERSION = 1
-SUITE_ORDER = ("fit", "scoring", "posterior", "cat")
+SUITE_ORDER = ("fit", "scoring", "posterior", "patterns", "data", "cat")
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +196,7 @@ def bench_posterior(
     n_items: int,
     repeats: int,
     warmups: int = 0,
-) -> BenchResult:
+) -> list[BenchResult]:
     """Benchmark summaries of a two-factor posterior without fitting overhead."""
     rng = np.random.default_rng(45)
     model = mirt.TwoParameterLogistic(n_items=n_items, n_factors=2)
@@ -214,10 +214,69 @@ def bench_posterior(
         _ = posterior.entropy
         posterior.sample(5, seed=46)
 
-    return BenchResult(
-        "posterior_summaries",
-        _time(run, repeats=repeats, warmups=warmups),
+    return [
+        BenchResult(
+            "posterior_summaries", _time(run, repeats=repeats, warmups=warmups)
+        ),
+        BenchResult(
+            "posterior_highest_density",
+            _time(
+                posterior.highest_density_intervals, repeats=repeats, warmups=warmups
+            ),
+        ),
+    ]
+
+
+def bench_patterns(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Time public pattern collapsing with repeated and mostly distinct rows."""
+    rng = np.random.default_rng(47)
+    pool = rng.integers(-1, 5, size=(min(256, n_persons), n_items))
+    repeated = pool[rng.integers(0, len(pool), size=n_persons)]
+    distinct = rng.integers(-1, 5, size=(n_persons, n_items))
+    return [
+        BenchResult(
+            name,
+            _time(
+                lambda: mirt.collapse_patterns(responses),
+                repeats=repeats,
+                warmups=warmups,
+            ),
+        )
+        for name, responses in (
+            ("patterns_repeated", repeated),
+            ("patterns_distinct", distinct),
+        )
+    ]
+
+
+def bench_data(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Time missing-data counts, mode imputation, and item summaries."""
+    from mirt.utils.classical import itemstats
+    from mirt.utils.imputation import impute_responses, pairwise_available
+
+    rng = np.random.default_rng(48)
+    responses = rng.integers(0, 5, size=(n_persons, n_items))
+    responses[rng.random(responses.shape) < 0.1] = -1
+    responses[0] = 0  # Keep every item imputable even in small benchmark runs.
+    workloads = (
+        ("pairwise_available", lambda: pairwise_available(responses)),
+        ("mode_imputation", lambda: impute_responses(responses, method="mode")),
+        ("item_statistics", lambda: itemstats(responses)),
     )
+    return [
+        BenchResult(name, _time(run, repeats=repeats, warmups=warmups))
+        for name, run in workloads
+    ]
 
 
 def bench_cat(
@@ -356,7 +415,11 @@ def run_suites(
     if "scoring" in suites:
         results.append(bench_scoring(n_persons, n_items, repeats, warmups))
     if "posterior" in suites:
-        results.append(bench_posterior(n_persons, n_items, repeats, warmups))
+        results.extend(bench_posterior(n_persons, n_items, repeats, warmups))
+    if "patterns" in suites:
+        results.extend(bench_patterns(n_persons, n_items, repeats, warmups))
+    if "data" in suites:
+        results.extend(bench_data(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
     return results
@@ -461,7 +524,17 @@ def _validate_baseline_compatibility(
 
     if baseline_config.get("items") != current_config.get("items"):
         raise ValueError("baseline item count does not match the current run")
-    person_workloads = {"em_fit_2pl", "eap_scoring", "posterior_summaries"}
+    person_workloads = {
+        "em_fit_2pl",
+        "eap_scoring",
+        "posterior_summaries",
+        "posterior_highest_density",
+        "patterns_repeated",
+        "patterns_distinct",
+        "pairwise_available",
+        "mode_imputation",
+        "item_statistics",
+    }
     if current_names & person_workloads and baseline_config.get(
         "persons"
     ) != current_config.get("persons"):

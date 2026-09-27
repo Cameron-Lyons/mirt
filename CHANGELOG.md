@@ -5,6 +5,31 @@ All notable changes to the mirt package will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Accelerated pairwise availability counts with bounded BLAS matrix products
+  and exact integer accumulation.
+- Shared memory-bounded category counting between imputation and item statistics.
+- Added a `data` benchmark suite for counts, imputation, and item statistics.
+- Shared response-pattern grouping between ability scoring and collapse utilities,
+  with Rust hashing over compact integer rows and GIL release during grouping.
+- Reduced copies and sorting work in the NumPy pattern-grouping fallback while
+  preserving first-appearance order and full-width response codes.
+- Added a `patterns` benchmark suite for repeated and mostly distinct responses.
+- Shared exact row-wise CDF searches across posterior quantiles, intervals, and
+  sampling, with Rust acceleration and batched reproducible draws.
+- Moved shortest-interval selection to a linear Rust scan with a reusable grid buffer.
+- Bounded highest-density interval working memory by the full joint grid and
+  removed redundant marginal reductions when all coordinates are unique.
+
+### Fixed
+- Highest-density intervals no longer depend on row position or batch size at
+  adjacent floating-point probability boundaries, or return reversed bounds at
+  very small positive probability levels.
+- Benchmark comparisons reject different person counts for pattern grouping
+  and the new highest-density interval workload.
+
 ## [1.1.0] - 2026-08-18
 
 ### Added

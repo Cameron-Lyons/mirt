@@ -178,6 +178,25 @@ def test_unidimensional_samples_keep_factor_axis():
     assert _posterior(1).sample(seed=1).shape == (2, 1, 5)
 
 
+@pytest.mark.performance
+def test_multidimensional_interval_temporary_memory_uses_full_grid(monkeypatch):
+    points = np.tile(np.array([[-1.0, 0.0], [1.0, 1.0]]), (2048, 1))
+    result = AbilityPosteriorResult(
+        points, np.full((256, len(points)), 1.0 / len(points)), np.zeros(256)
+    )
+    monkeypatch.setattr(posterior_module, "_HDI_TARGET_ELEMENTS", 8192)
+    result.highest_density_intervals()  # Exclude lazy imports from the measurement.
+    tracemalloc.start()
+    try:
+        lower, upper = result.highest_density_intervals()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert_array_equal(lower, np.tile([-1.0, 0.0], (256, 1)))
+    assert_array_equal(upper, np.tile([1.0, 1.0], (256, 1)))
+    assert peak < result.weights.nbytes // 4
+
+
 def test_person_identifiers_are_validated_before_likelihood_evaluation(monkeypatch):
     model = TwoParameterLogistic(n_items=2)
     model._is_fitted = True
