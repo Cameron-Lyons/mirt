@@ -209,6 +209,21 @@ in the number of free parameters, while retained person arrays are bounded.
 Reports include thread environment settings and reject comparisons with different
 settings when the baseline records them.
 
+The `latent-density` suite measures Gaussian parameter updates and log-density
+evaluation in one, three, and eight dimensions. `--persons` sets the number of
+input points; input generation is excluded from timing and traced memory:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite latent-density --persons 100000 --items 20 --repeats 9 --warmups 2 --backend numpy --json /tmp/mirt-latent-density.json
+```
+
+Updates form weighted covariance matrices directly, using scratch storage linear
+in the point count and dimension count instead of one covariance matrix per
+point. Log-density evaluation reuses the owned point buffer for centering and
+reduces quadratic forms without a separate elementwise-product matrix. Both
+preserve caller arrays. The reported `tracemalloc` peaks cover Python/NumPy
+allocations and exclude process RSS and native library workspace.
+
 Fast paths use exact built-in model types; custom and multidimensional scoring
 or polytomous optimization retain their generic implementations. Native M-steps
 use analytic gradients and a projected BFGS optimizer with backtracking, so

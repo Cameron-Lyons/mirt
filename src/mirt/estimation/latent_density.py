@@ -310,9 +310,11 @@ class GaussianDensity(LatentDensity):
 
     def log_density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         points = _as_multivariate_points(theta, n_dimensions=self.n_dimensions)
-        diff = points - self.mean
-        mahal = np.sum(diff @ self._precision * diff, axis=1)
-        return self._log_norm - 0.5 * mahal
+        points -= self.mean
+        mahal = np.einsum("ij,ij->i", points @ self._precision, points)
+        mahal *= -0.5
+        mahal += self._log_norm
+        return mahal
 
     def update(
         self,
@@ -330,15 +332,12 @@ class GaussianDensity(LatentDensity):
             return
 
         if self.estimate_mean:
-            self.mean = np.sum(normalized_weights[:, None] * points, axis=0)
+            self.mean = normalized_weights @ points
 
         if self.estimate_cov:
-            diff = points - self.mean
-            self.cov = np.sum(
-                normalized_weights[:, None, None]
-                * (diff[:, :, None] * diff[:, None, :]),
-                axis=0,
-            )
+            # Validation owns this scratch array; center it without copying inputs.
+            points -= self.mean
+            self.cov = points.T @ (normalized_weights[:, None] * points)
             self.cov = (self.cov + self.cov.T) / 2
             self.cov += REGULARIZATION_EPSILON * np.eye(self.n_dimensions)
 

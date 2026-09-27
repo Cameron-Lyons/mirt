@@ -38,6 +38,7 @@ SUITE_ORDER = (
     "kernels",
     "optimization",
     "information",
+    "latent-density",
 )
 
 
@@ -323,6 +324,45 @@ def bench_optimization(
             ),
         )
     )
+    return results
+
+
+def bench_latent_density(
+    n_persons: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure Gaussian updates/evaluation, using persons as the point count."""
+    from mirt.estimation.latent_density import GaussianDensity
+
+    rng = np.random.default_rng(68)
+    results = []
+    for n_dimensions in (1, 3, 8):
+        points = rng.normal(size=(n_persons, n_dimensions))
+        weights = rng.uniform(size=n_persons)
+        density = GaussianDensity(
+            n_dimensions=n_dimensions, estimate_mean=True, estimate_cov=True
+        )
+
+        def update() -> None:
+            density.update(points, weights)
+
+        times = _time(update, repeats=repeats, warmups=warmups)
+        results.append(
+            BenchResult(
+                f"gaussian_update_{n_dimensions}d", times, _peak_traced_bytes(update)
+            )
+        )
+
+        def evaluate() -> object:
+            return density.log_density(points)
+
+        times = _time(evaluate, repeats=repeats, warmups=warmups)
+        results.append(
+            BenchResult(
+                f"gaussian_log_density_{n_dimensions}d",
+                times,
+                _peak_traced_bytes(evaluate),
+            )
+        )
     return results
 
 
@@ -813,6 +853,8 @@ def run_suites(
         results.extend(bench_optimization(n_persons, n_items, repeats, warmups))
     if "information" in suites:
         results.append(bench_information(n_persons, n_items, repeats, warmups))
+    if "latent-density" in suites:
+        results.extend(bench_latent_density(n_persons, repeats, warmups))
     return results
 
 
@@ -955,6 +997,12 @@ def _validate_baseline_compatibility(
         "map_scoring",
         "ml_scoring",
         "marginal_information",
+        "gaussian_update_1d",
+        "gaussian_update_3d",
+        "gaussian_update_8d",
+        "gaussian_log_density_1d",
+        "gaussian_log_density_3d",
+        "gaussian_log_density_8d",
     }
     person_workloads.update(
         name
