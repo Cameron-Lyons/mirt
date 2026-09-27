@@ -321,6 +321,7 @@ class TestBenchmarkCommand:
             "fit",
             "scoring",
             "posterior",
+            "bayesian",
             "patterns",
             "data",
             "diagnostics",
@@ -337,6 +338,7 @@ class TestBenchmarkCommand:
             "fit",
             "scoring",
             "posterior",
+            "bayesian",
             "patterns",
             "data",
             "diagnostics",
@@ -364,6 +366,25 @@ class TestBenchmarkCommand:
                 benchmark.compare_results(
                     _report(result, persons=20),
                     _report(result, persons=40),
+                    max_regression_percent=20.0,
+                )
+
+    def test_bayesian_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("bayesian",), n_persons=6, n_items=2, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "waic",
+            "psis_normal",
+            "psis_heavy_tail",
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=6),
+                    _report(result, persons=12),
                     max_regression_percent=20.0,
                 )
 

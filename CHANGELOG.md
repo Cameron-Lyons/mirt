@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   use a single matrix product, and column offsets improve numerical stability.
 - Added a `diagnostics` benchmark suite for complete/missing-data Q3 timing and
   traced Python/NumPy memory peaks.
+- Shared bounded WAIC/PSIS predictive-density reductions, reusing exponential
+  buffers and centering variance calculations for large log-likelihood shifts.
+  PSIS partitions its tail cutoff, sorts the selected tail once, and bounds
+  queued thread tasks. Added Bayesian diagnostic timing and memory workloads.
 - Kept EM convergence and final likelihoods in log space to avoid underflow on
   long tests, and reused built-in likelihood buffers for posterior normalization.
 - Batched generic EM expected counts with bounded matrix products and cached
