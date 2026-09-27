@@ -6,8 +6,20 @@ import numpy as np
 import pytest
 from numpy.testing import assert_array_equal
 
+import mirt
+from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.exceptions import MirtValidationError
 from mirt.results.ability_posterior import AbilityPosteriorResult
+
+
+@pytest.fixture(autouse=True, params=["numpy", "rust"])
+def interval_backend(request):
+    if request.param == "rust" and not RUST_AVAILABLE:
+        pytest.skip("Rust extension is unavailable")
+    previous = mirt.get_backend()
+    mirt.set_backend(request.param)
+    yield
+    mirt.set_backend(previous)
 
 
 def _small_result() -> AbilityPosteriorResult:
@@ -129,6 +141,31 @@ def test_batch_size_does_not_change_intervals() -> None:
             batch_size=batch_size,
         )
         assert_array_equal(actual, expected)
+
+
+def test_adjacent_probability_boundary_is_independent_of_row_and_batch() -> None:
+    result = AbilityPosteriorResult(
+        points=np.array([0.0, 1.0, 3.0]),
+        weights=np.tile([0.5, 0.25, 0.25], (1000, 1)),
+        log_marginal_likelihood=np.zeros(1000),
+    )
+    level = np.nextafter(0.5, 1.0)
+    for batch_size in (1, 17, None):
+        lower, upper = result.highest_density_intervals(level, batch_size=batch_size)
+        assert_array_equal(lower, np.zeros(1000))
+        assert_array_equal(upper, np.ones(1000))
+
+
+@pytest.mark.parametrize("level", [1e-20, np.nextafter(0.0, 1.0)])
+def test_tiny_levels_produce_non_reversed_point_intervals(level: float) -> None:
+    result = AbilityPosteriorResult(
+        points=np.array([0.0, 1.0, 3.0]),
+        weights=np.array([[0.5, 0.25, 0.25], [0.0, 0.0, 1.0]]),
+        log_marginal_likelihood=np.zeros(2),
+    )
+    lower, upper = result.highest_density_intervals(level)
+    assert_array_equal(lower, [0.0, 3.0])
+    assert_array_equal(upper, lower)
 
 
 @pytest.mark.parametrize("level", [0.0, 1.0, np.nan, np.inf, True, "0.9"])

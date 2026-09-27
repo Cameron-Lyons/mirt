@@ -471,6 +471,35 @@ class TestListwiseDeletion:
 
 
 class TestPairwiseAvailable:
+    @pytest.mark.parametrize("chunk_elements", [1, 33, 1_000_000])
+    @pytest.mark.parametrize("missing_code", [-1, 99])
+    def test_counts_match_pairwise_reference(
+        self, monkeypatch, chunk_elements, missing_code
+    ):
+        rng = np.random.default_rng(53)
+        responses = rng.integers(-2, 4, size=(701, 12))[:, ::2]
+        responses[:30, 0] = missing_code
+        responses[:, 1] = missing_code
+        responses[:, 2] = 1
+        original = responses.copy()
+        valid = (responses >= 0) & (responses != missing_code)
+        expected = np.array(
+            [
+                [np.count_nonzero(first & second) for second in valid.T]
+                for first in valid.T
+            ]
+        )
+        monkeypatch.setattr(
+            imputation_module, "_PAIRWISE_CHUNK_ELEMENTS", chunk_elements
+        )
+
+        available, joint = pairwise_available(responses, missing_code=missing_code)
+
+        np.testing.assert_array_equal(joint, expected)
+        np.testing.assert_array_equal(available, np.diag(expected))
+        np.testing.assert_array_equal(responses, original)
+        assert available.dtype == joint.dtype == np.dtype(np.int_)
+
     def test_counts_available_responses_and_pairs(self):
         responses = np.array([[1, -1, 0], [0, 1, -1], [-1, 1, 1]])
 

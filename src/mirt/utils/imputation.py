@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import item_category_frequencies
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.utils.data import validate_responses
 
@@ -22,9 +23,7 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 LARGE_DF = 1e10
-_PAIRWISE_BLOCK_SIZE = np.iinfo(np.uint8).max
-_MAX_VECTORIZED_CATEGORIES = 32
-_MAX_CATEGORY_FREQUENCY_ENTRIES = 5_000_000
+_PAIRWISE_CHUNK_ELEMENTS = 1_000_000
 _MODEL_DRAW_TARGET_ELEMENTS = 2_000_000
 _IMPUTATION_METHODS = ("mean", "median", "mode", "random", "EM", "multiple")
 ImputationMethod = Literal["mean", "median", "mode", "random", "EM", "multiple"]
@@ -292,31 +291,6 @@ def _impute_mean(
     return imputed
 
 
-def _item_category_frequencies(
-    responses: NDArray[np.int_],
-    missing_mask: NDArray[np.bool_],
-) -> NDArray[np.intp] | None:
-    """Count item categories together when the bounded table stays compact."""
-    valid = ~missing_mask
-    maximum = int(np.max(responses, where=valid, initial=-1))
-    n_categories = maximum + 1
-    n_items = responses.shape[1]
-    if (
-        n_categories < 1
-        or n_categories > _MAX_VECTORIZED_CATEGORIES
-        or n_categories * n_items > _MAX_CATEGORY_FREQUENCY_ENTRIES
-    ):
-        return None
-
-    frequencies = np.empty((n_categories, n_items), dtype=np.intp)
-    for category in range(n_categories):
-        frequencies[category] = np.count_nonzero(
-            (responses == category) & valid,
-            axis=0,
-        )
-    return frequencies
-
-
 def _fill_missing_items(
     imputed: NDArray[np.int_],
     missing_mask: NDArray[np.bool_],
@@ -341,7 +315,7 @@ def _impute_median(
 ) -> NDArray[np.int_]:
     """Impute with rounded item medians."""
     imputed = responses.copy()
-    frequencies = _item_category_frequencies(responses, missing_mask)
+    frequencies = item_category_frequencies(responses, ~missing_mask)
     if frequencies is None:
         for item in range(responses.shape[1]):
             observed = responses[~missing_mask[:, item], item]
@@ -368,7 +342,7 @@ def _impute_mode(
 ) -> NDArray[np.int_]:
     """Impute with item modes."""
     imputed = responses.copy()
-    frequencies = _item_category_frequencies(responses, missing_mask)
+    frequencies = item_category_frequencies(responses, ~missing_mask)
     if frequencies is None:
         for item in range(responses.shape[1]):
             observed = responses[~missing_mask[:, item], item]
@@ -743,12 +717,12 @@ def pairwise_available(
     n_available = valid.sum(axis=0, dtype=np.int_)
     joint_available = np.zeros((n_items, n_items), dtype=np.int_)
 
-    # A uint8 product is substantially faster than pairwise Python loops. Keep
-    # blocks at 255 rows so each partial count remains within uint8 range, then
-    # accumulate into platform-sized integers without overflow.
-    for start in range(0, len(valid), _PAIRWISE_BLOCK_SIZE):
-        block = valid[start : start + _PAIRWISE_BLOCK_SIZE].astype(np.uint8)
-        joint_available += block.T @ block
+    # Float64 products use optimized BLAS kernels. Counts in each bounded block
+    # are exact; accumulate as integers to keep totals independent of chunking.
+    rows_per_block = max(1, _PAIRWISE_CHUNK_ELEMENTS // n_items)
+    for start in range(0, len(valid), rows_per_block):
+        block = valid[start : start + rows_per_block].astype(np.float64)
+        joint_available += (block.T @ block).astype(np.int_)
 
     return n_available, joint_available
 

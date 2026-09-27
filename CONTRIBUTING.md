@@ -108,6 +108,40 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+To compare response-pattern grouping on repeated and mostly distinct rows:
+
+```bash
+uv run --no-sync python benchmarks/run_benchmarks.py --suite patterns --persons 100000 --items 20 --repeats 7 --backend numpy
+uv run --no-sync python benchmarks/run_benchmarks.py --suite patterns --persons 100000 --items 20 --repeats 7 --backend rust
+```
+
+Scoring and `collapse_patterns` share this grouping implementation. The Rust
+path hashes borrowed integer rows and releases the GIL during grouping; the
+NumPy fallback sorts compact row keys. Both preserve first-appearance order,
+missing-code normalization, and full-width integer response codes.
+
+The `posterior` suite measures posterior summaries and highest-density intervals
+separately. Both use a precomputed two-factor posterior so fitting is excluded:
+
+```bash
+uv run --no-sync python benchmarks/run_benchmarks.py --suite posterior --persons 20000 --items 20 --repeats 7 --backend rust
+```
+
+Use `--backend numpy` to compare the fallback. Posterior sampling uses NumPy's
+seeded random stream on both backends; only the independent CDF searches move to
+Rust, so draws are identical across backends and batching choices.
+
+The `data` suite covers pairwise availability counts, mode imputation, and item
+statistics on five-category responses with 10% missing data:
+
+```bash
+OPENBLAS_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite data --persons 20000 --items 200 --repeats 7 --warmups 2 --backend numpy
+```
+
+Keep BLAS thread settings the same when comparing runs. Pairwise counts use
+bounded floating-point matrix products with exact integer accumulation;
+imputation and item statistics share bounded category counting.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

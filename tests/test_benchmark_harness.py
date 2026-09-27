@@ -263,6 +263,18 @@ class TestBenchmarkComparisons:
                 max_regression_percent=20.0,
             )
 
+    @pytest.mark.parametrize(
+        "name", ["patterns_repeated", "patterns_distinct", "posterior_highest_density"]
+    )
+    def test_new_workloads_reject_mismatched_person_counts(self, name: str) -> None:
+        result = benchmark.BenchResult(name, (1.0,))
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(result, persons=100),
+                _report(result, persons=200),
+                max_regression_percent=20.0,
+            )
+
     @pytest.mark.parametrize("value", [-1.0, float("nan"), True])
     def test_rejects_invalid_direct_regression_limits(self, value: object) -> None:
         report = _report(benchmark.BenchResult("fit", (1.0,)))
@@ -277,20 +289,60 @@ class TestBenchmarkComparisons:
 
 class TestBenchmarkCommand:
     def test_suite_selection_is_deduplicated_and_canonical(self) -> None:
-        assert benchmark.resolve_suites(None) == ("fit", "scoring", "posterior", "cat")
+        assert benchmark.resolve_suites(None) == (
+            "fit",
+            "scoring",
+            "posterior",
+            "patterns",
+            "data",
+            "cat",
+        )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
             "fit",
             "scoring",
             "posterior",
+            "patterns",
+            "data",
             "cat",
         )
+
+    def test_data_suite_runs_and_checks_workload_size(self) -> None:
+        results = benchmark.run_suites(
+            ("data",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "pairwise_available",
+            "mode_imputation",
+            "item_statistics",
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=40),
+                    max_regression_percent=20.0,
+                )
+
+    def test_patterns_suite_runs(self) -> None:
+        results = benchmark.run_suites(
+            ("patterns",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "patterns_repeated",
+            "patterns_distinct",
+        ]
+        assert all(len(result.times) == 2 for result in results)
 
     def test_posterior_suite_runs_and_checks_person_count(self) -> None:
         results = benchmark.run_suites(
             ("posterior",), n_persons=10, n_items=3, repeats=1, warmups=0
         )
-        assert [result.name for result in results] == ["posterior_summaries"]
+        assert [result.name for result in results] == [
+            "posterior_summaries",
+            "posterior_highest_density",
+        ]
         assert results[0].median > 0.0
         with pytest.raises(ValueError, match="person count"):
             benchmark.compare_results(
