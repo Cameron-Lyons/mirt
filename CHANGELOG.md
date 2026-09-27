@@ -37,6 +37,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   default SE step setting to avoid finite-difference cancellation.
 - Added likelihood, optimization, and information benchmark suites, including
   traced information-memory peaks and BLAS/Rayon thread metadata.
+- Replaced per-point Gaussian covariance tensors with weighted matrix products
+  and reused owned point buffers during updates and log-density evaluation.
+  Added a `latent-density` benchmark suite for timing and traced memory.
 - Accelerated pairwise availability counts with bounded BLAS matrix products
   and exact integer accumulation.
 - Shared memory-bounded category counting between imputation and item statistics.

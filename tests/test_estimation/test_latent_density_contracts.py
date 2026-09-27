@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from math import factorial
+import tracemalloc
+from math import factorial, fsum
 from typing import Any
 
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
+from scipy.stats import multivariate_normal
 
+from mirt.constants import REGULARIZATION_EPSILON
 from mirt.estimation.latent_density import (
     CustomDensity,
     DavidianCurve,
@@ -78,6 +81,118 @@ def test_gaussian_update_validates_points_and_weights() -> None:
         density.update(np.zeros((3, 2)), np.zeros(3))
     with pytest.raises(ValueError, match="non-negative"):
         density.update(np.zeros((3, 2)), np.array([1.0, -1.0, 1.0]))
+
+
+@pytest.mark.parametrize("n_dimensions", [1, 3, 8])
+@pytest.mark.parametrize("layout", ["C", "F", "strided", "readonly"])
+@pytest.mark.parametrize(
+    "estimate_mean,estimate_cov",
+    [(False, False), (True, False), (False, True), (True, True)],
+)
+def test_gaussian_updates_match_weighted_moments_without_mutating_inputs(
+    n_dimensions: int, layout: str, estimate_mean: bool, estimate_cov: bool
+) -> None:
+    rng = np.random.default_rng(892)
+    points = rng.normal(size=(31, 2 * n_dimensions))[:, ::2]
+    if layout in ("C", "F"):
+        points = np.array(points, order=layout)
+    elif layout == "readonly":
+        points.flags.writeable = False
+    weights = rng.uniform(size=len(points))
+    weights[::3] = 0.0
+    original_points = points.copy()
+    original_weights = weights.copy()
+    mean = np.linspace(-0.75, 1.25, n_dimensions)
+    covariance = np.eye(n_dimensions) * 2.0 + 0.2
+    density = GaussianDensity(
+        mean=mean,
+        cov=covariance,
+        estimate_mean=estimate_mean,
+        estimate_cov=estimate_cov,
+    )
+
+    mass = weights / fsum(weights)
+    expected_mean = (
+        np.array([fsum(mass * points[:, j]) for j in range(n_dimensions)])
+        if estimate_mean
+        else mean
+    )
+    expected_covariance = covariance.copy()
+    if estimate_cov:
+        centered = points - expected_mean
+        expected_covariance = np.array(
+            [
+                [
+                    fsum(mass * centered[:, i] * centered[:, j])
+                    for j in range(n_dimensions)
+                ]
+                for i in range(n_dimensions)
+            ]
+        )
+        expected_covariance += REGULARIZATION_EPSILON * np.eye(n_dimensions)
+
+    density.update(points, weights)
+
+    assert_allclose(density.mean, expected_mean, atol=1e-14)
+    assert_allclose(density.cov, expected_covariance, atol=1e-14)
+    assert_allclose(
+        density.log_density(points),
+        multivariate_normal.logpdf(points, mean=expected_mean, cov=expected_covariance),
+        rtol=1e-12,
+    )
+    np.testing.assert_array_equal(points, original_points)
+    np.testing.assert_array_equal(weights, original_weights)
+    points.flags.writeable = True
+    points[:] = 0.0
+    weights[:] = 0.0
+    assert_allclose(density.mean, expected_mean, atol=1e-14)
+    assert_allclose(density.cov, expected_covariance, atol=1e-14)
+
+
+@pytest.mark.parametrize("scale", [1e-300, 1.0, 1e308])
+def test_gaussian_updates_regularize_single_positive_weight(scale: float) -> None:
+    points = np.array([[1.0, 2.0], [9.0, 3.0], [2.0, 4.0]])
+    density = GaussianDensity(n_dimensions=2, estimate_mean=True, estimate_cov=True)
+
+    density.update(points, np.array([0.0, scale, 0.0]))
+
+    assert_allclose(density.mean, points[1])
+    assert_allclose(density.cov, REGULARIZATION_EPSILON * np.eye(2))
+    assert np.all(np.isfinite(density.log_density(points)))
+
+
+@pytest.mark.parametrize("scale", [1e-300, 1e308])
+def test_gaussian_update_is_invariant_to_weight_scale(scale: float) -> None:
+    points = np.array([[-2.0, 1.0], [1.0, 3.0], [2.0, -4.0]])
+    weights = np.array([0.5, 0.75, 1.0])
+    reference = GaussianDensity(n_dimensions=2, estimate_mean=True, estimate_cov=True)
+    density = GaussianDensity(n_dimensions=2, estimate_mean=True, estimate_cov=True)
+
+    reference.update(points, weights)
+    density.update(points, scale * weights)
+
+    assert_allclose(density.mean, reference.mean, atol=1e-14)
+    assert_allclose(density.cov, reference.cov, atol=1e-14)
+
+
+@pytest.mark.parametrize("method", ["update", "log_density"])
+def test_gaussian_reductions_avoid_pointwise_covariance_tensors(method: str) -> None:
+    points = np.random.default_rng(31).normal(size=(5000, 24))
+    weights = np.ones(len(points))
+    density = GaussianDensity(n_dimensions=24, estimate_mean=True, estimate_cov=True)
+
+    tracemalloc.start()
+    try:
+        if method == "update":
+            density.update(points, weights)
+        else:
+            density.log_density(points)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+    # Allow scratch matrices and vectors, but no per-point outer-product tensor.
+    assert peak < 3 * points.nbytes
 
 
 @pytest.mark.parametrize("density_type", [EmpiricalHistogram, EmpiricalHistogramWoods])
