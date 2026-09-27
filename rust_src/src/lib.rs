@@ -15,6 +15,9 @@
 
 use pyo3::prelude::*;
 
+mod likelihood_cache;
+mod optimization_scoring;
+mod polytomous_mstep;
 mod special;
 
 pub mod utils;
@@ -61,11 +64,13 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     estimation::register(m)?;
     diagnostics::register(m)?;
     scoring::register(m)?;
+    optimization_scoring::register(m)?;
     bootstrap::register(m)?;
     mirt_models::register(m)?;
     eapsum::register(m)?;
     cat::register(m)?;
     mstep::register(m)?;
+    polytomous_mstep::register(m)?;
     standard_errors::register(m)?;
     calibration::register(m)?;
     polytomous::register(m)?;

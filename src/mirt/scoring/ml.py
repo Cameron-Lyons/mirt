@@ -44,6 +44,22 @@ class MLScorer:
         patterns, inverse = unique_response_patterns(responses)
         n_factors = model.n_factors
 
+        from mirt.backends.rust.optimization_scoring import try_optimized_scores
+
+        native = None
+        if type(self) is MLScorer and "_score_unidimensional" not in vars(self):
+            native = try_optimized_scores(
+                model,
+                patterns,
+                bounds=self.theta_bounds,
+                method="ML",
+                n_jobs=self.n_jobs,
+            )
+        if native is not None:
+            return ScoreResult(
+                theta=native[0][inverse], standard_error=native[1][inverse], method="ML"
+            )
+
         def score_person(
             i: int,
         ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:

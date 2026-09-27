@@ -142,6 +142,28 @@ Keep BLAS thread settings the same when comparing runs. Pairwise counts use
 bounded floating-point matrix products with exact integer accumulation;
 imputation and item statistics share bounded category counting.
 
+To measure native likelihoods, GRM/GPCM/PCM fits, MAP/ML scoring, and repetitive
+EM data, use the `kernels` and `optimization` suites:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite kernels --suite optimization --persons 1000 --items 20 --repeats 5 --warmups 1 --backend rust --json /tmp/mirt-optimization.json
+OPENBLAS_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite information --persons 500 --items 20 --repeats 3 --backend numpy --json /tmp/mirt-information.json
+```
+
+The `information` suite measures the marginal information matrix and records a
+separate `tracemalloc` peak for Python/NumPy allocations. This is not process RSS
+or a measurement of native allocations. Its computational cost remains quadratic
+in the number of free parameters, while retained person arrays are bounded.
+Reports include thread environment settings and reject comparisons with different
+settings when the baseline records them.
+
+Fast paths use exact built-in model types; custom and multidimensional scoring
+or polytomous optimization retain their generic implementations. Native M-steps
+use analytic gradients and a projected BFGS optimizer with backtracking, so
+fixed-iteration fits can differ slightly from SciPy fits. Compare the objective,
+parameter recovery, and convergence as well as speed. Itemwise EM standard errors
+and full marginal-information standard errors retain their separate objectives.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.
