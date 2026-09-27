@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 
 _CHAIN_METADATA = {"log_likelihood", "theta"}
+_LOG_LIKELIHOOD_CHUNK_ELEMENTS = 262_144
 
 
 def _copy_state_value(value: Any) -> Any:
@@ -482,9 +483,49 @@ def _validate_log_likelihood(log_lik: ArrayLike) -> NDArray[np.float64]:
         raise ValueError("log_lik must contain at least two posterior samples")
     if values.shape[1] == 0:
         raise ValueError("log_lik must contain at least one observation")
-    if not np.all(np.isfinite(values)):
-        raise ValueError("log_lik must contain only finite values")
+    for _, block in _log_likelihood_blocks(values):
+        if not np.all(np.isfinite(block)):
+            raise ValueError("log_lik must contain only finite values")
     return values
+
+
+def _log_likelihood_blocks(
+    values: NDArray[np.float64],
+) -> Iterator[tuple[slice, NDArray[np.float64]]]:
+    """Yield observation blocks bounded by the full posterior sample count."""
+    width = max(1, _LOG_LIKELIHOOD_CHUNK_ELEMENTS // values.shape[0])
+    for start in range(0, values.shape[1], width):
+        columns = slice(start, start + width)
+        yield columns, values[:, columns]
+
+
+def _log_predictive_moments(
+    log_lik: NDArray[np.float64], *, include_variance: bool = False
+) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+    """Share bounded predictive-density reductions between WAIC and PSIS."""
+    log_mean = np.empty(log_lik.shape[1])
+    variance = np.empty_like(log_mean) if include_variance else None
+    n_samples = log_lik.shape[0]
+    log_sample_count = np.log(n_samples)
+    for columns, block in _log_likelihood_blocks(log_lik):
+        # Own a compact buffer so reductions stay local and exponential
+        # normalization can reuse storage without mutating the caller's data.
+        draws = np.array(block, dtype=np.float64, order="C", copy=True)
+        maxima = draws.max(axis=0)
+        if variance is not None:
+            # A fixed midrange offset retains small variations around large
+            # log shifts without overflowing for opposite-sign finite extremes.
+            offsets = 0.5 * maxima + 0.5 * draws.min(axis=0)
+            centered = draws - offsets
+            centered -= centered.mean(axis=0)
+            np.square(centered, out=centered)
+            variance[columns] = centered.sum(axis=0) / (n_samples - 1)
+            del centered
+        with np.errstate(over="ignore"):
+            draws -= maxima
+        np.exp(draws, out=draws)
+        log_mean[columns] = maxima + np.log(draws.sum(axis=0)) - log_sample_count
+    return log_mean, variance
 
 
 def _validate_relative_efficiency(
@@ -510,11 +551,10 @@ def _validate_relative_efficiency(
     return values
 
 
-def _fit_generalized_pareto(
-    excesses: NDArray[np.float64],
+def _fit_sorted_generalized_pareto(
+    sorted_excesses: NDArray[np.float64],
 ) -> tuple[float, float]:
-    """Fit a generalized Pareto tail with the Zhang-Stephens estimator."""
-    sorted_excesses = np.sort(np.asarray(excesses, dtype=np.float64))
+    """Fit sorted tail excesses with the Zhang-Stephens estimator."""
     n_tail = sorted_excesses.size
     if n_tail <= 4 or sorted_excesses[0] < 0.0:
         return np.inf, np.nan
@@ -582,8 +622,10 @@ def _pareto_smooth_log_weights(
         np.ceil(min(0.2 * values.size, 3.0 * np.sqrt(values.size / relative_eff)))
     )
     cutoff_index = -tail_size - 1
-    order = np.argsort(values)
-    cutoff = max(values[order[cutoff_index]], np.log(np.finfo(np.float64).tiny))
+    cutoff = max(
+        np.partition(values, cutoff_index)[cutoff_index],
+        np.log(np.finfo(np.float64).tiny),
+    )
     tail_indices = np.flatnonzero(values > cutoff)
 
     if tail_indices.size <= 4:
@@ -592,7 +634,7 @@ def _pareto_smooth_log_weights(
         tail_order = np.argsort(values[tail_indices])
         cutoff_weight = np.exp(cutoff)
         excesses = np.exp(values[tail_indices][tail_order]) - cutoff_weight
-        shape, scale = _fit_generalized_pareto(excesses)
+        shape, scale = _fit_sorted_generalized_pareto(excesses)
         if shape >= 1.0 / 3.0 and np.isfinite(shape):
             probabilities = (
                 np.arange(tail_indices.size, dtype=np.float64) + 0.5
@@ -672,7 +714,7 @@ def psis_loo(
         raise ValueError("k_threshold must be a positive finite number") from exc
     if not np.isfinite(k_threshold) or k_threshold <= 0.0:
         raise ValueError("k_threshold must be a positive finite number")
-    n_samples, n_obs = log_lik.shape
+    n_obs = log_lik.shape[1]
     relative_efficiency = _validate_relative_efficiency(relative_eff, n_obs)
     if (
         isinstance(n_jobs, (bool, np.bool_))
@@ -708,14 +750,19 @@ def psis_loo(
         from concurrent.futures import ThreadPoolExecutor
 
         with ThreadPoolExecutor(max_workers=min(worker_count, n_obs)) as executor:
-            smoothed_results = executor.map(smooth_observation, range(n_obs))
-            for observation, (elpd, k) in enumerate(smoothed_results):
-                pointwise_elpd[observation] = elpd
-                pareto_k[observation] = k
+            # Older Python versions eagerly submit every map input. Bound the
+            # queued futures while keeping several observations ready per worker.
+            batch_size = 4 * min(worker_count, n_obs)
+            for start in range(0, n_obs, batch_size):
+                stop = min(start + batch_size, n_obs)
+                smoothed_results = executor.map(smooth_observation, range(start, stop))
+                for observation, (elpd, k) in enumerate(smoothed_results, start):
+                    pointwise_elpd[observation] = elpd
+                    pareto_k[observation] = k
 
     elpd_loo = np.sum(pointwise_elpd)
 
-    lppd_i = logsumexp(log_lik, axis=0) - np.log(n_samples)
+    lppd_i, _ = _log_predictive_moments(log_lik)
     lppd = np.sum(lppd_i)
     p_loo = lppd - elpd_loo
 
@@ -771,12 +818,12 @@ def waic(log_lik: ArrayLike) -> WAICResult:
     Journal of Machine Learning Research, 11, 3571-3594.
     """
     log_lik = _validate_log_likelihood(log_lik)
-    n_samples, n_obs = log_lik.shape
+    n_obs = log_lik.shape[1]
 
-    lppd_i = logsumexp(log_lik, axis=0) - np.log(n_samples)
+    lppd_i, p_waic_i = _log_predictive_moments(log_lik, include_variance=True)
+    assert p_waic_i is not None
     lppd = np.sum(lppd_i)
 
-    p_waic_i = np.var(log_lik, axis=0, ddof=1)
     p_waic = np.sum(p_waic_i)
 
     elpd_waic = lppd - p_waic

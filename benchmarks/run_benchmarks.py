@@ -27,6 +27,7 @@ SUITE_ORDER = (
     "fit",
     "scoring",
     "posterior",
+    "bayesian",
     "patterns",
     "data",
     "diagnostics",
@@ -436,6 +437,37 @@ def bench_data(
     ]
 
 
+def bench_bayesian(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure information criteria on precomputed posterior likelihoods."""
+    from mirt.diagnostics.bayesian import psis_loo, waic
+
+    rng = np.random.default_rng(7832)
+    log_lik = rng.normal(-2.0, 0.7, size=(1000, n_persons * n_items))
+
+    def run_waic():
+        return waic(log_lik)
+
+    times = _time(run_waic, repeats=repeats, warmups=warmups)
+    results = [BenchResult("waic", times, _peak_traced_bytes(run_waic))]
+    for name, heavy_tail in (("psis_normal", False), ("psis_heavy_tail", True)):
+        log_lik = rng.normal(-2.0, 0.7, size=(4000, n_persons))
+        if heavy_tail:
+            log_lik -= rng.pareto(1.8, size=log_lik.shape)
+        relative_eff = np.linspace(0.2, 1.0, n_persons)
+
+        def run_psis():
+            return psis_loo(log_lik, relative_eff=relative_eff)
+
+        times = _time(run_psis, repeats=repeats, warmups=warmups)
+        results.append(BenchResult(name, times, _peak_traced_bytes(run_psis)))
+    return results
+
+
 def bench_diagnostics(
     n_persons: int,
     n_items: int,
@@ -680,6 +712,8 @@ def run_suites(
         results.append(bench_scoring(n_persons, n_items, repeats, warmups))
     if "posterior" in suites:
         results.extend(bench_posterior(n_persons, n_items, repeats, warmups))
+    if "bayesian" in suites:
+        results.extend(bench_bayesian(n_persons, n_items, repeats, warmups))
     if "patterns" in suites:
         results.extend(bench_patterns(n_persons, n_items, repeats, warmups))
     if "data" in suites:
@@ -812,6 +846,9 @@ def _validate_baseline_compatibility(
         "eap_scoring",
         "posterior_summaries",
         "posterior_highest_density",
+        "waic",
+        "psis_normal",
+        "psis_heavy_tail",
         "patterns_repeated",
         "patterns_distinct",
         "pairwise_available",

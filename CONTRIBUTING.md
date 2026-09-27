@@ -131,6 +131,23 @@ Use `--backend numpy` to compare the fallback. Posterior sampling uses NumPy's
 seeded random stream on both backends; only the independent CDF searches move to
 Rust, so draws are identical across backends and batching choices.
 
+The `bayesian` suite measures WAIC using 1,000 posterior draws over person × item
+observations, and PSIS-LOO using 4,000 draws over person-level observations with
+normal and heavy-tailed log likelihoods. Inputs are precomputed, and PSIS runs
+serially with per-observation relative efficiencies:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite bayesian --persons 1000 --items 20 --repeats 9 --warmups 2 --backend numpy --json /tmp/mirt-bayesian.json
+```
+
+Predictive summaries validate and reduce bounded observation blocks, with at
+least one full posterior column per block. They reuse owned exponential buffers
+and center variance calculations before reduction. PSIS uses a partition for its
+tail cutoff and sorts only the selected tail; parallel calls bound queued work
+by worker count. Reports trace Python/NumPy allocations, excluding input creation
+and native allocations. Input dtype conversion and returned observation arrays
+can still grow with input size.
+
 The `data` suite covers pairwise availability counts, mode imputation, and item
 statistics on five-category responses with 10% missing data:
 

@@ -97,7 +97,7 @@ def test_relative_efficiency_accepts_per_observation_values() -> None:
 
 def test_parallel_psis_matches_serial_results() -> None:
     """Threaded observation smoothing preserves deterministic outputs."""
-    log_likelihood = _reference_log_likelihood()
+    log_likelihood = np.tile(_reference_log_likelihood(), (1, 7))
 
     serial = psis_loo(log_likelihood, n_jobs=1)
     parallel = psis_loo(log_likelihood, n_jobs=3)
