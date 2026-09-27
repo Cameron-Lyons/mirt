@@ -51,6 +51,12 @@ def _report(
 
 
 class TestBenchResult:
+    def test_optional_traced_memory_is_reported(self) -> None:
+        result = benchmark.BenchResult("information", (0.1,), peak_traced_bytes=123)
+        assert result.to_dict()["peak_traced_bytes"] == 123
+        with pytest.raises(ValueError, match="peak traced"):
+            benchmark.BenchResult("information", (0.1,), peak_traced_bytes=-1)
+
     def test_calculates_complete_summary(self) -> None:
         result = benchmark.BenchResult("fit", (1.0, 2.0, 3.0, 4.0))
 
@@ -288,6 +294,19 @@ class TestBenchmarkComparisons:
 
 
 class TestBenchmarkCommand:
+    @pytest.mark.parametrize("suite", ["kernels", "optimization", "information"])
+    def test_new_suites_run_and_enforce_person_count(self, suite: str) -> None:
+        results = benchmark.run_suites(
+            (suite,), n_persons=12, n_items=2, repeats=1, warmups=0
+        )
+        assert results
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12),
+                _report(*results, persons=13),
+                max_regression_percent=20,
+            )
+
     def test_suite_selection_is_deduplicated_and_canonical(self) -> None:
         assert benchmark.resolve_suites(None) == (
             "fit",
@@ -296,6 +315,9 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "cat",
+            "kernels",
+            "optimization",
+            "information",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -305,6 +327,9 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "cat",
+            "kernels",
+            "optimization",
+            "information",
         )
 
     def test_data_suite_runs_and_checks_workload_size(self) -> None:

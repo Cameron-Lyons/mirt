@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Cached bounded item/category probability tables in native likelihood and E-step
+  kernels, with contiguous output storage, in-place posterior normalization,
+  zero-copy posterior transfers, and GIL release during native fitting.
+- Added batched Rust GRM/GPCM/PCM M-steps with analytic gradients and bounded
+  optimization, and native unidimensional 1PL–4PL MAP/ML scoring.
+- Compressed repetitive EM data into frequency-weighted response patterns while
+  preserving sample counts, latent-density updates, and uncertainty objectives.
+- Streamed marginal-information perturbations to remove quadratic person-array
+  caching; built-in unidimensional EM models use analytic item curvature at the
+  default SE step setting to avoid finite-difference cancellation.
+- Added likelihood, optimization, and information benchmark suites, including
+  traced information-memory peaks and BLAS/Rayon thread metadata.
 - Accelerated pairwise availability counts with bounded BLAS matrix products
   and exact integer accumulation.
 - Shared memory-bounded category counting between imputation and item statistics.

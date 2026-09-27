@@ -259,67 +259,6 @@ def _marginal_log_likelihoods(
     return result
 
 
-def _finite_difference_values(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    quadrature: GaussHermiteQuadrature,
-    prior_mass: NDArray[np.float64],
-    h: float,
-    *,
-    include_cross_terms: bool,
-) -> tuple[
-    NDArray[np.float64],
-    dict[str, _ParameterLayout],
-    dict[tuple[float, ...], NDArray[np.float64]],
-]:
-    params_flat, layouts = _flatten_parameters(model)
-    original = model.parameters
-    cache: dict[tuple[float, ...], NDArray[np.float64]] = {}
-
-    def evaluate(candidate: NDArray[np.float64]) -> NDArray[np.float64]:
-        key = tuple(float(value) for value in candidate)
-        if key not in cache:
-            _set_flat_parameters(model, candidate, layouts)
-            cache[key] = _marginal_log_likelihoods(
-                model, responses, quadrature, prior_mass
-            )
-        return cache[key]
-
-    try:
-        evaluate(params_flat)
-        for index in range(params_flat.size):
-            plus = params_flat.copy()
-            minus = params_flat.copy()
-            plus[index] += h
-            minus[index] -= h
-            evaluate(plus)
-            evaluate(minus)
-        if include_cross_terms:
-            for row in range(params_flat.size):
-                for column in range(row + 1, params_flat.size):
-                    for row_sign, column_sign in (
-                        (1.0, 1.0),
-                        (1.0, -1.0),
-                        (-1.0, 1.0),
-                        (-1.0, -1.0),
-                    ):
-                        candidate = params_flat.copy()
-                        candidate[row] += row_sign * h
-                        candidate[column] += column_sign * h
-                        evaluate(candidate)
-    finally:
-        _restore_parameters(model, original)
-
-    return params_flat, layouts, cache
-
-
-def _cached_value(
-    cache: dict[tuple[float, ...], NDArray[np.float64]],
-    candidate: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    return cache[tuple(float(value) for value in candidate)]
-
-
 def _finite_difference_information(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -328,53 +267,55 @@ def _finite_difference_information(
     h: float,
     person_weights: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
-    params, layouts, cache = _finite_difference_values(
-        model,
-        responses,
-        quadrature,
-        prior_mass,
-        h,
-        include_cross_terms=True,
-    )
-    n_persons = responses.shape[0]
+    """Stream perturbations with O(N + P²) retained storage.
+
+    Difference person-level values before summing to preserve the original
+    numerical cancellation behavior, including survey-weighted information.
+    """
+    params, layouts = _flatten_parameters(model)
+    original = model.parameters
     weights = (
-        np.ones(n_persons, dtype=np.float64)
+        np.ones(responses.shape[0], dtype=np.float64)
         if person_weights is None
         else np.asarray(person_weights, dtype=np.float64)
     )
-    center = _cached_value(cache, params)
     information = np.zeros((params.size, params.size), dtype=np.float64)
 
-    for row in range(params.size):
-        plus = params.copy()
-        minus = params.copy()
-        plus[row] += h
-        minus[row] -= h
-        second = _cached_value(cache, plus) - 2.0 * center + _cached_value(cache, minus)
-        information[row, row] = -float(weights @ second) / h**2
+    def evaluate(candidate: NDArray[np.float64]) -> NDArray[np.float64]:
+        _set_flat_parameters(model, candidate, layouts)
+        return _marginal_log_likelihoods(model, responses, quadrature, prior_mass)
 
-        for column in range(row + 1, params.size):
-            plus_plus = params.copy()
-            plus_minus = params.copy()
-            minus_plus = params.copy()
-            minus_minus = params.copy()
-            plus_plus[row] += h
-            plus_plus[column] += h
-            plus_minus[row] += h
-            plus_minus[column] -= h
-            minus_plus[row] -= h
-            minus_plus[column] += h
-            minus_minus[row] -= h
-            minus_minus[column] -= h
-            cross = (
-                _cached_value(cache, plus_plus)
-                - _cached_value(cache, plus_minus)
-                - _cached_value(cache, minus_plus)
-                + _cached_value(cache, minus_minus)
-            )
-            value = -float(weights @ cross) / (4.0 * h**2)
-            information[row, column] = value
-            information[column, row] = value
+    try:
+        center = evaluate(params)
+        for row in range(params.size):
+            plus, minus = params.copy(), params.copy()
+            plus[row] += h
+            minus[row] -= h
+            second = evaluate(plus) - 2.0 * center + evaluate(minus)
+            information[row, row] = -float(weights @ second) / h**2
+            for column in range(row + 1, params.size):
+                cross = None
+                for row_sign, column_sign, coefficient in (
+                    (1, 1, 1),
+                    (1, -1, -1),
+                    (-1, 1, -1),
+                    (-1, -1, 1),
+                ):
+                    candidate = params.copy()
+                    candidate[row] += row_sign * h
+                    candidate[column] += column_sign * h
+                    values = evaluate(candidate)
+                    if cross is None:
+                        cross = values
+                    elif coefficient == 1:
+                        cross += values
+                    else:
+                        cross -= values
+                value = -float(weights @ cross) / (4.0 * h**2)
+                information[row, column] = value
+                information[column, row] = value
+    finally:
+        _restore_parameters(model, original)
     return information, layouts
 
 
@@ -385,23 +326,24 @@ def _finite_difference_scores(
     prior_mass: NDArray[np.float64],
     h: float,
 ) -> tuple[NDArray[np.float64], dict[str, _ParameterLayout]]:
-    params, layouts, cache = _finite_difference_values(
-        model,
-        responses,
-        quadrature,
-        prior_mass,
-        h,
-        include_cross_terms=False,
-    )
+    """Retain only the output score matrix and the current perturbation pair."""
+    params, layouts = _flatten_parameters(model)
+    original = model.parameters
     scores = np.empty((responses.shape[0], params.size), dtype=np.float64)
-    for column in range(params.size):
-        plus = params.copy()
-        minus = params.copy()
-        plus[column] += h
-        minus[column] -= h
-        scores[:, column] = (
-            _cached_value(cache, plus) - _cached_value(cache, minus)
-        ) / (2.0 * h)
+    try:
+        for column in range(params.size):
+            plus, minus = params.copy(), params.copy()
+            plus[column] += h
+            minus[column] -= h
+            _set_flat_parameters(model, plus, layouts)
+            values = _marginal_log_likelihoods(model, responses, quadrature, prior_mass)
+            _set_flat_parameters(model, minus, layouts)
+            values -= _marginal_log_likelihoods(
+                model, responses, quadrature, prior_mass
+            )
+            scores[:, column] = values / (2.0 * h)
+    finally:
+        _restore_parameters(model, original)
     return scores, layouts
 
 

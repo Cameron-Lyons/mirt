@@ -1,13 +1,18 @@
 //! E-step and expected counts computation functions.
 
 use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3, ToPyArray};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArray3,
+    ToPyArray,
+};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+use crate::likelihood_cache::cached_likelihoods;
 use crate::utils::{
-    compute_log_weights, log_likelihood_2pl_view, logsumexp, normalized_log_gaussian_adjustment,
+    compute_log_weights, log_likelihood_2pl_view, log_sigmoid, logsumexp,
+    normalized_log_gaussian_adjustment,
 };
 
 /// Complete E-step computation with posterior weights
@@ -33,56 +38,44 @@ pub fn e_step_complete<'py>(
     let n_persons = responses.nrows();
     let n_quad = quad_points.len();
 
-    let disc_arc = Arc::new(discrimination.to_vec());
-    let diff_arc = Arc::new(difficulty.to_vec());
-    let quad_vec: Vec<f64> = quad_points.to_vec();
-    let weight_vec: Vec<f64> = quad_weights.to_vec();
-    let responses_owned = responses.to_owned();
-
+    let quad_vec = quad_points.to_vec();
+    let weight_vec = quad_weights.to_vec();
     let log_weights = compute_log_weights(&weight_vec);
-    let log_prior_adjustment =
+    let adjustment =
         normalized_log_gaussian_adjustment(&quad_vec, &weight_vec, prior_mean, prior_var);
-
-    let (posterior_weights, marginal_ll) = py.detach(|| {
-        let results: Vec<(Vec<f64>, f64)> = (0..n_persons)
-            .into_par_iter()
-            .map(|i| {
-                let disc = Arc::clone(&disc_arc);
-                let diff = Arc::clone(&diff_arc);
-                let resp_row = responses_owned.row(i);
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| {
-                        let ll = log_likelihood_2pl_view(resp_row, quad_vec[q], &disc, &diff);
-                        ll + log_prior_adjustment[q] + log_weights[q]
-                    })
-                    .collect();
-
-                let log_marginal = logsumexp(&log_joint);
-
-                let posterior: Vec<f64> = log_joint
-                    .iter()
-                    .map(|&lj| (lj - log_marginal).exp())
-                    .collect();
-
-                (posterior, log_marginal.exp())
-            })
-            .collect();
-
-        let mut posterior_weights = Array2::zeros((n_persons, n_quad));
-        let mut marginal_ll = Array1::zeros(n_persons);
-
-        for (i, (post, marg)) in results.iter().enumerate() {
-            for (q, &p) in post.iter().enumerate() {
-                posterior_weights[[i, q]] = p;
-            }
-            marginal_ll[i] = *marg;
+    let (posterior, marginal) = py.detach(|| {
+        let mut posterior = cached_likelihoods(
+            responses,
+            n_quad,
+            &vec![2; responses.ncols()],
+            true,
+            |q, j, row| {
+                let z = discrimination[j] * (quad_vec[q] - difficulty[j]);
+                row[0] = log_sigmoid(-z);
+                row[1] = log_sigmoid(z);
+            },
+        );
+        let mut marginal = vec![0.0; n_persons];
+        if n_quad > 0 {
+            posterior
+                .as_slice_mut()
+                .expect("contiguous posterior")
+                .par_chunks_mut(n_quad)
+                .zip(marginal.par_iter_mut())
+                .for_each(|(row, marginal)| {
+                    for (q, value) in row.iter_mut().enumerate() {
+                        *value += log_weights[q] + adjustment[q];
+                    }
+                    let norm = logsumexp(row);
+                    *marginal = norm.exp();
+                    for value in row {
+                        *value = (*value - norm).exp();
+                    }
+                });
         }
-
-        (posterior_weights, marginal_ll)
+        (posterior, marginal)
     });
-
-    (posterior_weights.to_pyarray(py), marginal_ll.to_pyarray(py))
+    (posterior.into_pyarray(py), marginal.into_pyarray(py))
 }
 
 /// Compute r_k (expected counts) for dichotomous items

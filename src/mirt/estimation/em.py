@@ -78,6 +78,7 @@ class EMEstimator(BaseEstimator):
         self._quadrature: GaussHermiteQuadrature | None = None
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
+        self._pattern_frequencies: NDArray[np.float64] | None = None
 
     @property
     def _should_use_gpu(self) -> bool:
@@ -98,6 +99,15 @@ class EMEstimator(BaseEstimator):
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
+        from mirt.estimation._patterns import (
+            compress_responses,
+            supports_pattern_compression,
+        )
+
+        self._pattern_frequencies = None
+        if type(self) is EMEstimator and supports_pattern_compression(model):
+            responses, self._pattern_frequencies = compress_responses(responses)
+        frequencies = self._pattern_frequencies
 
         self._quadrature = GaussHermiteQuadrature(
             n_points=self.n_quadpts,
@@ -142,7 +152,12 @@ class EMEstimator(BaseEstimator):
 
             if rust_result is None:
                 posterior_weights, marginal_ll = self._e_step(model, responses)
-                current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+                current_ll = float(
+                    np.sum(
+                        np.log(marginal_ll + 1e-300)
+                        * (1.0 if frequencies is None else frequencies)
+                    )
+                )
             else:
                 (
                     new_discrimination,
@@ -164,8 +179,13 @@ class EMEstimator(BaseEstimator):
 
             prev_ll = current_ll
 
+            weighted_posterior = (
+                posterior_weights
+                if frequencies is None
+                else posterior_weights * frequencies[:, None]
+            )
             if rust_result is None:
-                self._m_step(model, responses, posterior_weights, valid_masks)
+                self._m_step(model, responses, weighted_posterior, valid_masks)
             else:
                 model.set_parameters(
                     discrimination=new_discrimination,
@@ -173,18 +193,28 @@ class EMEstimator(BaseEstimator):
                     guessing=new_guessing,
                 )
 
-            n_k = posterior_weights.sum(axis=0)
+            n_k = weighted_posterior.sum(axis=0)
             self._latent_density.update(self._quadrature.nodes, n_k)
         else:
             posterior_weights, marginal_ll = self._e_step(model, responses)
-            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            current_ll = float(
+                np.sum(
+                    np.log(marginal_ll + 1e-300)
+                    * (1.0 if frequencies is None else frequencies)
+                )
+            )
             self._convergence_history.append(current_ll)
             converged = self._check_convergence(prev_ll, current_ll)
 
         model._is_fitted = True
 
+        weighted_posterior = (
+            posterior_weights
+            if frequencies is None
+            else posterior_weights * frequencies[:, None]
+        )
         standard_errors = (
-            self._compute_standard_errors(model, responses, posterior_weights)
+            self._compute_standard_errors(model, responses, weighted_posterior)
             if self.compute_standard_errors
             else {}
         )
@@ -296,6 +326,7 @@ class EMEstimator(BaseEstimator):
                 damping_c=0.3,
                 regularization=0.01,
                 regularization_c=0.1,
+                frequencies=self._pattern_frequencies,
             )
         except Exception:
             return None
@@ -468,6 +499,21 @@ class EMEstimator(BaseEstimator):
         quad_points = self._quadrature.nodes
         n_items = model.n_items
         n_quad = len(quad_points)
+
+        if model.is_polytomous and should_use_rust(self.use_rust):
+            from mirt.backends.rust.polytomous_mstep import try_polytomous_m_step
+
+            if try_polytomous_m_step(
+                model,
+                responses,
+                posterior_weights,
+                quad_points,
+                max_iter=self.item_optim_maxiter,
+                ftol=self.item_optim_ftol,
+                epsilon=self.prob_epsilon,
+                n_jobs=self.n_jobs,
+            ):
+                return
 
         n_k = posterior_weights.sum(axis=0)
 
@@ -823,6 +869,18 @@ class EMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
+        from mirt.estimation._item_information import item_standard_errors
+
+        if self.se_step_size == 1e-5:
+            analytic = item_standard_errors(
+                model,
+                responses,
+                posterior_weights,
+                self._quadrature.nodes,
+                self.prob_epsilon,
+            )
+            if analytic is not None:
+                return analytic
         standard_errors: dict[str, NDArray[np.float64]] = {}
         params = model.parameters
         free_masks = model.free_parameter_masks

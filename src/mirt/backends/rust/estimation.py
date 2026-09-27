@@ -58,6 +58,7 @@ def em_fit_2pl(
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
+    frequencies: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float, int, bool]:
     """Fit 2PL model using EM algorithm in Rust.
 
@@ -68,12 +69,17 @@ def em_fit_2pl(
     """
     n_quadpts, max_iter, tol = _validate_em_controls(n_quadpts, max_iter, tol)
 
+    if frequencies is None:
+        from mirt.estimation._patterns import compress_responses
+
+        responses, frequencies = compress_responses(np.asarray(responses))
     if rust_enabled():
         return mirt_rs.em_fit_2pl(
             _ensure_i32(responses),
             n_quadpts,
             max_iter,
             tol,
+            _ensure_f64(frequencies),
         )
 
     rust_required("em_fit_2pl")
@@ -291,6 +297,7 @@ def em_iteration_3pl(
     damping_c: float = 0.3,
     regularization: float = 0.01,
     regularization_c: float = 0.1,
+    frequencies: NDArray[np.float64] | None = None,
 ) -> (
     tuple[
         NDArray[np.float64],
@@ -367,6 +374,7 @@ def em_iteration_3pl(
             damping_c,
             regularization,
             regularization_c,
+            _ensure_f64(frequencies),
         )
 
     return None

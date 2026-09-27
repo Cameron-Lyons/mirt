@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform
 import statistics
 import sys
 import time
+import tracemalloc
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,7 +23,17 @@ import mirt
 from mirt.cat import CATEngine
 
 SCHEMA_VERSION = 1
-SUITE_ORDER = ("fit", "scoring", "posterior", "patterns", "data", "cat")
+SUITE_ORDER = (
+    "fit",
+    "scoring",
+    "posterior",
+    "patterns",
+    "data",
+    "cat",
+    "kernels",
+    "optimization",
+    "information",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +42,7 @@ class BenchResult:
 
     name: str
     times: tuple[float, ...]
+    peak_traced_bytes: int | None = None
 
     def __post_init__(self) -> None:
         resolved_name = self.name.strip()
@@ -40,6 +53,12 @@ class BenchResult:
             raise ValueError("benchmark times must contain at least one measurement")
         if any(not math.isfinite(value) or value < 0.0 for value in resolved_times):
             raise ValueError("benchmark times must be finite non-negative values")
+        if self.peak_traced_bytes is not None and (
+            isinstance(self.peak_traced_bytes, bool)
+            or not isinstance(self.peak_traced_bytes, int)
+            or self.peak_traced_bytes < 0
+        ):
+            raise ValueError("peak traced bytes must be a non-negative integer")
         object.__setattr__(self, "name", resolved_name)
         object.__setattr__(self, "times", resolved_times)
 
@@ -70,7 +89,7 @@ class BenchResult:
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-compatible measurement record."""
-        return {
+        payload = {
             "name": self.name,
             "times_seconds": list(self.times),
             "median_seconds": self.median,
@@ -80,6 +99,9 @@ class BenchResult:
             "standard_deviation_seconds": self.standard_deviation,
             "repeats": len(self.times),
         }
+        if self.peak_traced_bytes is not None:
+            payload["peak_traced_bytes"] = self.peak_traced_bytes
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +211,134 @@ def bench_scoring(
         "eap_scoring",
         _time(run, repeats=repeats, warmups=warmups),
     )
+
+
+def bench_kernels(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Isolate cached likelihood kernels on responses with missing values."""
+    from mirt.backends.rust import compute_log_likelihoods_2pl
+
+    rng = np.random.default_rng(61)
+    points = np.linspace(-3, 3, 41)
+    a, b = rng.uniform(0.5, 1.5, n_items), rng.normal(size=n_items)
+    responses = rng.integers(-1, 2, (n_persons, n_items))
+    results = [
+        BenchResult(
+            "likelihood_2pl",
+            _time(
+                lambda: compute_log_likelihoods_2pl(responses, points, a, b),
+                repeats=repeats,
+                warmups=warmups,
+            ),
+        )
+    ]
+    for factory in (mirt.GradedResponseModel, mirt.GeneralizedPartialCredit):
+        model = factory(n_items, n_categories=5)
+        data = rng.integers(-1, 5, (n_persons, n_items))
+        results.append(
+            BenchResult(
+                f"likelihood_{model.model_name.lower()}",
+                _time(
+                    lambda: model.log_likelihood_batch(data, points[:, None]),
+                    repeats=repeats,
+                    warmups=warmups,
+                ),
+            )
+        )
+    return results
+
+
+def bench_optimization(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Time complete polytomous fits, MAP/ML scoring, and repetitive EM data."""
+    results = []
+    for kind in ("GRM", "GPCM", "PCM"):
+        data = mirt.simdata(
+            model=kind, n_categories=5, n_persons=n_persons, n_items=n_items, seed=62
+        )
+        results.append(
+            BenchResult(
+                f"em_fit_{kind.lower()}",
+                _time(
+                    lambda: mirt.fit_mirt(
+                        data,
+                        model=kind,
+                        n_categories=5,
+                        n_quadpts=21,
+                        max_iter=20,
+                        tol=1e-12,
+                    ),
+                    repeats=repeats,
+                    warmups=warmups,
+                ),
+            )
+        )
+    rng = np.random.default_rng(63)
+    model = mirt.TwoParameterLogistic(n_items)
+    model.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, n_items),
+        difficulty=rng.normal(size=n_items),
+    )
+    model._is_fitted = True
+    data = rng.integers(-1, 2, (n_persons, n_items))
+    for method in ("MAP", "ML"):
+        results.append(
+            BenchResult(
+                f"{method.lower()}_scoring",
+                _time(
+                    lambda: mirt.fscores(model, data, method=method),
+                    repeats=repeats,
+                    warmups=warmups,
+                ),
+            )
+        )
+    pool = data[: min(32, n_persons)]
+    repeated = pool[rng.integers(0, len(pool), n_persons)]
+    results.append(
+        BenchResult(
+            "em_fit_repeated",
+            _time(
+                lambda: mirt.fit_mirt(
+                    repeated, model="2PL", n_quadpts=21, max_iter=20, tol=1e-12
+                ),
+                repeats=repeats,
+                warmups=warmups,
+            ),
+        )
+    )
+    return results
+
+
+def bench_information(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> BenchResult:
+    """Measure marginal-information time and separately traced Python/NumPy peak storage."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _posterior_from_model,
+        compute_observed_information,
+    )
+
+    model = mirt.TwoParameterLogistic(n_items)
+    data = np.random.default_rng(64).integers(0, 2, (n_persons, n_items))
+    quad = GaussHermiteQuadrature(n_points=15)
+    posterior = _posterior_from_model(model, data, quad)
+
+    def run():
+        return compute_observed_information(
+            model, data, posterior, quad, prior_mass=quad.weights
+        )
+
+    times = _time(run, repeats=repeats, warmups=warmups)
+    tracemalloc.start()
+    try:
+        run()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return BenchResult("marginal_information", times, peak_traced_bytes=peak)
 
 
 def bench_posterior(
@@ -422,6 +572,12 @@ def run_suites(
         results.extend(bench_data(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
+    if "kernels" in suites:
+        results.extend(bench_kernels(n_persons, n_items, repeats, warmups))
+    if "optimization" in suites:
+        results.extend(bench_optimization(n_persons, n_items, repeats, warmups))
+    if "information" in suites:
+        results.append(bench_information(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -438,6 +594,15 @@ def environment_metadata(backend_info: Mapping[str, Any]) -> dict[str, Any]:
         "requested_backend": backend_info["current_backend"],
         "effective_backend": backend_info["effective_backend"],
         "rust_available": bool(backend_info["rust_available"]),
+        "thread_settings": {
+            name: os.environ.get(name)
+            for name in (
+                "OPENBLAS_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "RAYON_NUM_THREADS",
+            )
+        },
     }
 
 
@@ -534,6 +699,16 @@ def _validate_baseline_compatibility(
         "pairwise_available",
         "mode_imputation",
         "item_statistics",
+        "likelihood_2pl",
+        "likelihood_grm",
+        "likelihood_gpcm",
+        "em_fit_grm",
+        "em_fit_gpcm",
+        "em_fit_pcm",
+        "em_fit_repeated",
+        "map_scoring",
+        "ml_scoring",
+        "marginal_information",
     }
     if current_names & person_workloads and baseline_config.get(
         "persons"
@@ -543,6 +718,10 @@ def _validate_baseline_compatibility(
         "effective_backend"
     ):
         raise ValueError("baseline effective backend does not match the current run")
+    if "thread_settings" in baseline_environment and baseline_environment[
+        "thread_settings"
+    ] != current_environment.get("thread_settings"):
+        raise ValueError("baseline thread settings do not match the current run")
 
 
 def compare_results(
@@ -617,13 +796,15 @@ def print_human_report(
         file=stream,
     )
     for benchmark in report["benchmarks"]:
+        peak = benchmark.get("peak_traced_bytes")
+        memory = "" if peak is None else f"  traced_peak={peak / 1024**2:.2f}MiB"
         print(
             f"{benchmark['name']:16s}  "
             f"median={benchmark['median_seconds']:.4f}s  "
             f"mean={benchmark['mean_seconds']:.4f}s  "
             f"min={benchmark['min_seconds']:.4f}s  "
             f"max={benchmark['max_seconds']:.4f}s  "
-            f"n={benchmark['repeats']}",
+            f"n={benchmark['repeats']}{memory}",
             file=stream,
         )
     for comparison in comparisons:

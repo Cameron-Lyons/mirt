@@ -64,6 +64,26 @@ class MAPScorer:
 
         prior_prec = np.linalg.inv(prior_cov)
 
+        from mirt.backends.rust.optimization_scoring import try_optimized_scores
+
+        native = None
+        if type(self) is MAPScorer and "_score_unidimensional" not in vars(self):
+            native = try_optimized_scores(
+                model,
+                patterns,
+                bounds=self.theta_bounds,
+                method="MAP",
+                n_jobs=self.n_jobs,
+                prior_mean=prior_mean[0],
+                prior_var=prior_cov[0, 0],
+            )
+        if native is not None:
+            return ScoreResult(
+                theta=native[0][inverse],
+                standard_error=native[1][inverse],
+                method="MAP",
+            )
+
         def score_person(
             i: int,
         ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:

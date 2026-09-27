@@ -1,23 +1,48 @@
 //! Polytomous IRT model computations (GRM, GPCM).
 
-use numpy::ndarray::Array2;
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use crate::likelihood_cache::cached_likelihoods;
+use crate::utils::grm_category_probability;
+use numpy::ndarray::ArrayView2;
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::sync::Arc;
 
-use crate::utils::grm_category_probability;
+fn validate_categories(
+    responses: ArrayView2<'_, i32>,
+    categories: &[usize],
+    n_parameters: usize,
+    parameters: ArrayView2<'_, f64>,
+    includes_zero: bool,
+) -> PyResult<()> {
+    let items = responses.ncols();
+    if categories.len() != items
+        || n_parameters != items
+        || parameters.nrows() != items
+        || categories
+            .iter()
+            .any(|&k| k < 2 || k - usize::from(!includes_zero) > parameters.ncols())
+    {
+        return Err(PyValueError::new_err(
+            "incompatible item parameters or category counts",
+        ));
+    }
+    for row in responses.rows() {
+        if row
+            .iter()
+            .zip(categories)
+            .any(|(&r, &k)| r >= 0 && r as usize >= k)
+        {
+            return Err(PyIndexError::new_err(
+                "response category is outside the item category range",
+            ));
+        }
+    }
+    Ok(())
+}
 
-/// Compute log-likelihoods for GRM at all quadrature points
-///
-/// Parameters:
-/// - responses: (n_persons, n_items) response matrix
-/// - quad_points: (n_quad,) quadrature points
-/// - discrimination: (n_items,) discrimination parameters
-/// - thresholds: (n_items, n_categories-1) threshold parameters
-/// - n_categories: (n_items,) number of categories per item
+/// Compute GRM likelihoods using a bounded shared category-probability table.
 #[pyfunction]
-#[pyo3(signature = (responses, quad_points, discrimination, thresholds, n_categories))]
 pub fn compute_log_likelihoods_grm<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -25,85 +50,36 @@ pub fn compute_log_likelihoods_grm<'py>(
     discrimination: PyReadonlyArray1<f64>,
     thresholds: PyReadonlyArray2<f64>,
     n_categories: PyReadonlyArray1<i32>,
-) -> Bound<'py, PyArray2<f64>> {
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let responses = responses.as_array();
-    let quad_points = quad_points.as_array();
-    let discrimination = discrimination.as_array();
+    let points = quad_points.as_array();
+    let disc = discrimination.as_array();
     let thresholds = thresholds.as_array();
-    let n_categories = n_categories.as_array();
-
-    let n_persons = responses.nrows();
-    let n_items = responses.ncols();
-    let n_quad = quad_points.len();
-
-    let disc_arc = Arc::new(discrimination.to_vec());
-    let n_cat_arc = Arc::new(
-        n_categories
-            .iter()
-            .map(|&x| x as usize)
-            .collect::<Vec<usize>>(),
-    );
-    let quad_vec: Vec<f64> = quad_points.to_vec();
-    let responses_owned = responses.to_owned();
-
-    let thresh_arc: Arc<Vec<Vec<f64>>> = Arc::new(
-        (0..n_items)
-            .map(|j| {
-                let n_thresh = n_cat_arc[j] - 1;
-                (0..n_thresh).map(|k| thresholds[[j, k]]).collect()
-            })
-            .collect(),
-    );
-
+    let categories: Vec<usize> = n_categories
+        .as_array()
+        .iter()
+        .map(|&v| v.max(0) as usize)
+        .collect();
+    validate_categories(responses, &categories, disc.len(), thresholds, false)?;
+    let thresholds: Vec<Vec<f64>> = thresholds
+        .rows()
+        .into_iter()
+        .map(|row| row.to_vec())
+        .collect();
     let result = py.detach(|| {
-        let log_likes: Vec<Vec<f64>> = (0..n_persons)
-            .into_par_iter()
-            .map(|i| {
-                let disc = Arc::clone(&disc_arc);
-                let n_cat = Arc::clone(&n_cat_arc);
-                let thresh = Arc::clone(&thresh_arc);
-                let resp_row = responses_owned.row(i);
-                (0..n_quad)
-                    .map(|q| {
-                        let theta = quad_vec[q];
-                        let mut ll = 0.0;
-
-                        for j in 0..n_items {
-                            let resp = resp_row[j];
-                            if resp < 0 {
-                                continue;
-                            }
-
-                            let prob = grm_category_probability(
-                                theta,
-                                disc[j],
-                                &thresh[j],
-                                resp as usize,
-                                n_cat[j],
-                            );
-                            ll += prob.ln();
-                        }
-                        ll
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let mut result = Array2::zeros((n_persons, n_quad));
-        for (i, row) in log_likes.iter().enumerate() {
-            for (q, &val) in row.iter().enumerate() {
-                result[[i, q]] = val;
+        cached_likelihoods(responses, points.len(), &categories, false, |q, j, row| {
+            for (k, value) in row.iter_mut().enumerate() {
+                *value =
+                    grm_category_probability(points[q], disc[j], &thresholds[j], k, categories[j])
+                        .ln();
             }
-        }
-        result
+        })
     });
-
-    result.to_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
-/// Compute log-likelihoods for GPCM at all quadrature points
+/// Compute GPCM likelihoods; normalizers are shared across all respondents.
 #[pyfunction]
-#[pyo3(signature = (responses, quad_points, discrimination, steps, n_categories))]
 pub fn compute_log_likelihoods_gpcm<'py>(
     py: Python<'py>,
     responses: PyReadonlyArray2<i32>,
@@ -111,85 +87,30 @@ pub fn compute_log_likelihoods_gpcm<'py>(
     discrimination: PyReadonlyArray1<f64>,
     steps: PyReadonlyArray2<f64>,
     n_categories: PyReadonlyArray1<i32>,
-) -> Bound<'py, PyArray2<f64>> {
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let responses = responses.as_array();
-    let quad_points = quad_points.as_array();
-    let discrimination = discrimination.as_array();
+    let points = quad_points.as_array();
+    let disc = discrimination.as_array();
     let steps = steps.as_array();
-    let n_categories = n_categories.as_array();
-
-    let n_persons = responses.nrows();
-    let n_items = responses.ncols();
-    let n_quad = quad_points.len();
-
-    let n_cat_tmp: Vec<usize> = n_categories.iter().map(|&x| x as usize).collect();
-    let disc_arc = Arc::new(discrimination.to_vec());
-    let n_cat_arc = Arc::new(n_cat_tmp.clone());
-    let quad_vec: Vec<f64> = quad_points.to_vec();
-    let responses_owned = responses.to_owned();
-
-    let step_arc: Arc<Vec<Vec<f64>>> = Arc::new(
-        (0..n_items)
-            .map(|j| {
-                let n_steps = n_cat_tmp[j];
-                (0..n_steps).map(|k| steps[[j, k]]).collect()
-            })
-            .collect(),
-    );
-
+    let categories: Vec<usize> = n_categories
+        .as_array()
+        .iter()
+        .map(|&v| v.max(0) as usize)
+        .collect();
+    validate_categories(responses, &categories, disc.len(), steps, true)?;
     let result = py.detach(|| {
-        let log_likes: Vec<Vec<f64>> = (0..n_persons)
-            .into_par_iter()
-            .map(|i| {
-                let disc = Arc::clone(&disc_arc);
-                let n_cat_v = Arc::clone(&n_cat_arc);
-                let step_v = Arc::clone(&step_arc);
-                let resp_row = responses_owned.row(i);
-                (0..n_quad)
-                    .map(|q| {
-                        let theta = quad_vec[q];
-                        let mut ll = 0.0;
-
-                        for j in 0..n_items {
-                            let resp = resp_row[j];
-                            if resp < 0 {
-                                continue;
-                            }
-
-                            let a = disc[j];
-                            let n_cat = n_cat_v[j];
-
-                            let mut numerators = vec![0.0; n_cat];
-                            numerators[0] = 0.0;
-                            for k in 1..n_cat {
-                                numerators[k] = numerators[k - 1] + a * (theta - step_v[j][k]);
-                            }
-
-                            let max_num =
-                                numerators.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                            let sum_exp: f64 =
-                                numerators.iter().map(|&x| (x - max_num).exp()).sum();
-                            let log_denom = max_num + sum_exp.ln();
-
-                            let prob = (numerators[resp as usize] - log_denom).exp().max(1e-10);
-                            ll += prob.ln();
-                        }
-                        ll
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let mut result = Array2::zeros((n_persons, n_quad));
-        for (i, row) in log_likes.iter().enumerate() {
-            for (q, &val) in row.iter().enumerate() {
-                result[[i, q]] = val;
+        cached_likelihoods(responses, points.len(), &categories, false, |q, j, row| {
+            for k in 1..row.len() {
+                row[k] = row[k - 1] + disc[j] * (points[q] - steps[[j, k]]);
             }
-        }
-        result
+            let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let log_denom = max + row.iter().map(|&v| (v - max).exp()).sum::<f64>().ln();
+            for value in row {
+                *value = (*value - log_denom).exp().max(1e-10).ln();
+            }
+        })
     });
-
-    result.to_pyarray(py)
+    Ok(result.into_pyarray(py))
 }
 
 /// Compute classical test theory statistics efficiently
