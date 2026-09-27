@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Kept EM convergence and final likelihoods in log space to avoid underflow on
+  long tests, and reused built-in likelihood buffers for posterior normalization.
+- Batched generic EM expected counts with bounded matrix products and cached
+  response preparation; reused Python and Rust worker pools within each fit.
+- Retained response-pattern compression through native 2PL standard errors,
+  weighting posterior contributions by pattern frequencies.
+- Made the legacy Rust-backend namespace lazy and routed internal imports to
+  their owning backend modules.
 - Cached bounded item/category probability tables in native likelihood and E-step
   kernels, with contiguous output storage, in-place posterior normalization,
   zero-copy posterior transfers, and GIL release during native fitting.

@@ -294,7 +294,7 @@ def compute_q3(
         Matrix of Q3 statistics
     """
     from mirt._backend_config import should_use_rust
-    from mirt._rust_backend import compute_q3_matrix as rust_compute_q3
+    from mirt.backends.rust.diagnostics import compute_q3_matrix as rust_compute_q3
 
     responses = np.asarray(responses)
     n_persons = responses.shape[0]
@@ -352,7 +352,9 @@ def compute_ld_chi2(
         Matrix of raw or adjusted p-values, according to ``p_adjust``.
     """
     from mirt._backend_config import should_use_rust
-    from mirt._rust_backend import compute_ld_chi2_matrix as rust_compute_chi2
+    from mirt.backends.rust.diagnostics import (
+        compute_ld_chi2_matrix as rust_compute_chi2,
+    )
 
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
@@ -403,7 +405,7 @@ def _compute_residuals(
 ) -> NDArray[np.float64]:
     """Compute standardized residuals for each person-item combination."""
     from mirt._backend_config import should_use_rust
-    from mirt._rust_backend import compute_standardized_residuals
+    from mirt.backends.rust.diagnostics import compute_standardized_residuals
 
     if should_use_rust() and not model.is_polytomous:
         disc = model.parameters.get("discrimination")

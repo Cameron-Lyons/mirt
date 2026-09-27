@@ -12,8 +12,10 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt._categorical import item_category_frequencies
 from mirt._classical import _alpha_if_deleted_numpy, _sample_variance
-from mirt._rust_backend import RUST_AVAILABLE
-from mirt._rust_backend import compute_alpha_if_deleted as _rust_alpha_if_deleted
+from mirt.backends.rust._helpers import RUST_AVAILABLE
+from mirt.backends.rust.polytomous import (
+    compute_alpha_if_deleted as _rust_alpha_if_deleted,
+)
 
 _ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
 _RESPONSE_VALIDATION_CHUNK_ELEMENTS = 1_000_000

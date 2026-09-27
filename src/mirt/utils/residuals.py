@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 try:
     from mirt._backend_config import should_use_rust
-    from mirt._rust_backend import (
+    from mirt.backends.rust.diagnostics import (
         compute_ld_chi2_matrix,
         compute_q3_matrix,
         compute_standardized_residuals,

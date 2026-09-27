@@ -15,7 +15,7 @@ from mirt._gpu_backend import (
     is_gpu_available,
     is_torch_available,
 )
-from mirt._rust_backend import RUST_AVAILABLE
+from mirt.backends.rust._helpers import RUST_AVAILABLE
 
 BackendChoice = Literal["auto", "gpu", "rust", "numpy"]
 

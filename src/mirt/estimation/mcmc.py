@@ -311,7 +311,7 @@ class MHRMEstimator(BaseEstimator):
             Fitted model result
         """
         from mirt._backend_config import should_use_rust
-        from mirt._rust_backend import mhrm_fit_2pl
+        from mirt.backends.rust.estimation import mhrm_fit_2pl
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
@@ -341,7 +341,8 @@ class MHRMEstimator(BaseEstimator):
             aic = -2 * log_likelihood + 2 * n_params
             bic = -2 * log_likelihood + np.log(n_persons) * n_params
 
-            from mirt._rust_backend import compute_item_se_parallel, e_step_complete
+            from mirt.backends.rust.diagnostics import compute_item_se_parallel
+            from mirt.backends.rust.estep import e_step_complete
             from mirt.estimation.quadrature import GaussHermiteQuadrature
 
             disc = np.asarray(discrimination)
@@ -657,7 +658,7 @@ class GibbsSampler(BaseEstimator):
             MCMC estimation result with chains and diagnostics
         """
         from mirt._backend_config import should_use_rust
-        from mirt._rust_backend import gibbs_sample_2pl
+        from mirt.backends.rust.estimation import gibbs_sample_2pl
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape

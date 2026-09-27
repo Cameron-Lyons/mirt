@@ -36,8 +36,8 @@ def test_em_refreshes_likelihood_and_posterior_after_last_m_step(monkeypatch):
     monkeypatch.setattr(estimator, "_compute_standard_errors", capture_standard_errors)
 
     result = estimator.fit(model, responses)
-    expected_posterior, marginal = estimator._e_step(model, responses)
-    expected_ll = float(np.sum(np.log(marginal + 1e-300)))
+    expected_posterior, log_marginal = estimator._e_step(model, responses)
+    expected_ll = float(np.sum(log_marginal))
 
     assert result.log_likelihood == pytest.approx(expected_ll)
     assert result.converged

@@ -4,8 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt._rust_backend import (
-    RUST_AVAILABLE,
+from mirt.backends.rust._helpers import RUST_AVAILABLE
+from mirt.backends.rust.polytomous import (
     compute_log_likelihoods_gpcm,
     compute_log_likelihoods_grm,
 )

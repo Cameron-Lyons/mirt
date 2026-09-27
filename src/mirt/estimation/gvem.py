@@ -12,15 +12,9 @@ from mirt._gpu_backend import (
     gvem_m_step_gpu,
     is_gpu_available,
 )
-from mirt._rust_backend import (
-    gvem_compute_elbo as _rust_gvem_compute_elbo,
-)
-from mirt._rust_backend import (
-    gvem_e_step as _rust_gvem_e_step,
-)
-from mirt._rust_backend import (
-    gvem_m_step as _rust_gvem_m_step,
-)
+from mirt.backends.rust.gvem import gvem_compute_elbo as _rust_gvem_compute_elbo
+from mirt.backends.rust.gvem import gvem_e_step as _rust_gvem_e_step
+from mirt.backends.rust.gvem import gvem_m_step as _rust_gvem_m_step
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
