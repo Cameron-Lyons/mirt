@@ -14,6 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt._correlation import pairwise_correlations
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel
@@ -244,43 +245,13 @@ def _pairwise_complete_correlations(
             "residuals and observed must have the same two-dimensional shape"
         )
 
-    n_persons, n_items = residual_values.shape
-    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
-    pair_sums = np.zeros_like(pair_counts)
-    pair_square_sums = np.zeros_like(pair_counts)
-    pair_cross_products = np.zeros_like(pair_counts)
-    chunk_size = max(
-        1,
-        _PAIRWISE_CORRELATION_TARGET_ELEMENTS // max(1, n_items),
+    return pairwise_correlations(
+        residual_values,
+        observed_values,
+        chunk_size=max(
+            1, _PAIRWISE_CORRELATION_TARGET_ELEMENTS // max(1, residual_values.shape[1])
+        ),
     )
-
-    for start in range(0, n_persons, chunk_size):
-        stop = min(start + chunk_size, n_persons)
-        valid = observed_values[start:stop] & np.isfinite(residual_values[start:stop])
-        valid_float = valid.astype(np.float64)
-        values = np.where(valid, residual_values[start:stop], 0.0)
-        squares = values * values
-        pair_counts += valid_float.T @ valid_float
-        pair_sums += values.T @ valid_float
-        pair_square_sums += squares.T @ valid_float
-        pair_cross_products += values.T @ values
-
-    safe_counts = np.maximum(pair_counts, 1.0)
-    covariance = pair_cross_products - pair_sums * pair_sums.T / safe_counts
-    variance_rows = pair_square_sums - pair_sums * pair_sums / safe_counts
-    np.maximum(variance_rows, 0.0, out=variance_rows)
-    denominator = np.sqrt(variance_rows * variance_rows.T)
-
-    correlations = np.full((n_items, n_items), np.nan, dtype=np.float64)
-    eligible = (pair_counts >= 2.0) & (denominator > 0.0)
-    np.divide(
-        covariance,
-        denominator,
-        out=correlations,
-        where=eligible,
-    )
-    np.clip(correlations, -1.0, 1.0, out=correlations)
-    return correlations, pair_counts.astype(np.intp)
 
 
 class TestletModel(DichotomousItemModel):

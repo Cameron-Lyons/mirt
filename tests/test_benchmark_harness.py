@@ -270,7 +270,14 @@ class TestBenchmarkComparisons:
             )
 
     @pytest.mark.parametrize(
-        "name", ["patterns_repeated", "patterns_distinct", "posterior_highest_density"]
+        "name",
+        [
+            "patterns_repeated",
+            "patterns_distinct",
+            "posterior_highest_density",
+            "q3_complete",
+            "q3_missing",
+        ],
     )
     def test_new_workloads_reject_mismatched_person_counts(self, name: str) -> None:
         result = benchmark.BenchResult(name, (1.0,))
@@ -314,6 +321,7 @@ class TestBenchmarkCommand:
             "posterior",
             "patterns",
             "data",
+            "diagnostics",
             "cat",
             "kernels",
             "optimization",
@@ -326,6 +334,7 @@ class TestBenchmarkCommand:
             "posterior",
             "patterns",
             "data",
+            "diagnostics",
             "cat",
             "kernels",
             "optimization",
@@ -349,6 +358,14 @@ class TestBenchmarkCommand:
                     _report(result, persons=40),
                     max_regression_percent=20.0,
                 )
+
+    def test_diagnostics_suite_records_time_and_memory(self) -> None:
+        results = benchmark.run_suites(
+            ("diagnostics",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == ["q3_complete", "q3_missing"]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
 
     def test_patterns_suite_runs(self) -> None:
         results = benchmark.run_suites(

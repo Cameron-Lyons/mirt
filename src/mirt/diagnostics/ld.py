@@ -29,6 +29,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
+from mirt._correlation import q3_correlations
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
@@ -487,37 +488,7 @@ def _compute_q3(
     responses: NDArray[np.int_],
 ) -> NDArray[np.float64]:
     """Compute Q3 (residual correlation) matrix."""
-    n_items = residuals.shape[1]
-    q3_matrix = np.zeros((n_items, n_items))
-
-    valid = (responses >= 0) & ~np.isnan(residuals)
-    valid_float = valid.astype(np.float64)
-    values = np.where(valid, residuals, 0.0)
-
-    pair_counts = valid_float.T @ valid_float
-    safe_counts = np.where(pair_counts > 0, pair_counts, 1.0)
-    pair_sums = values.T @ valid_float
-    pair_square_sums = (values * values).T @ valid_float
-    pair_cross_products = values.T @ values
-
-    covariance = pair_cross_products - (pair_sums * pair_sums.T) / safe_counts
-    variance_rows = pair_square_sums - (pair_sums * pair_sums) / safe_counts
-    variance_columns = pair_square_sums.T - (pair_sums.T * pair_sums.T) / safe_counts
-    np.maximum(variance_rows, 0.0, out=variance_rows)
-    np.maximum(variance_columns, 0.0, out=variance_columns)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        correlations = covariance / np.sqrt(variance_rows * variance_columns)
-
-    rows, columns = np.triu_indices(n_items, k=1)
-    eligible = pair_counts[rows, columns] > 2
-    eligible_rows = rows[eligible]
-    eligible_columns = columns[eligible]
-    q3_values = correlations[eligible_rows, eligible_columns]
-    q3_matrix[eligible_rows, eligible_columns] = q3_values
-    q3_matrix[eligible_columns, eligible_rows] = q3_values
-
-    return q3_matrix
+    return q3_correlations(residuals, responses >= 0)
 
 
 def _adjust_q3(q3_matrix: NDArray[np.float64]) -> NDArray[np.float64]:

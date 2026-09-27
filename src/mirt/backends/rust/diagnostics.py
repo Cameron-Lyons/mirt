@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt._correlation import q3_correlations
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
@@ -276,41 +277,11 @@ def _q3_from_residuals_numpy(
     residuals: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute pairwise-complete residual correlations in bounded chunks."""
-    n_persons, n_items = responses.shape
-    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
-    pair_sums = np.zeros((n_items, n_items), dtype=np.float64)
-    pair_square_sums = np.zeros((n_items, n_items), dtype=np.float64)
-    pair_cross_products = np.zeros((n_items, n_items), dtype=np.float64)
-    chunk_size = _entry_chunk_size(n_persons, n_items)
-
-    for start in range(0, n_persons, chunk_size):
-        stop = min(start + chunk_size, n_persons)
-        valid = (responses[start:stop] >= 0) & np.isfinite(residuals[start:stop])
-        valid_float = valid.astype(np.float64)
-        values = np.where(valid, residuals[start:stop], 0.0)
-        pair_counts += valid_float.T @ valid_float
-        pair_sums += values.T @ valid_float
-        pair_square_sums += (values * values).T @ valid_float
-        pair_cross_products += values.T @ values
-
-    safe_counts = np.where(pair_counts > 0.0, pair_counts, 1.0)
-    covariance = pair_cross_products - pair_sums * pair_sums.T / safe_counts
-    variance_rows = pair_square_sums - pair_sums * pair_sums / safe_counts
-    variance_columns = pair_square_sums.T - pair_sums.T * pair_sums.T / safe_counts
-    np.maximum(variance_rows, 0.0, out=variance_rows)
-    np.maximum(variance_columns, 0.0, out=variance_columns)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        correlations = covariance / np.sqrt(variance_rows * variance_columns)
-
-    q3_matrix = np.zeros((n_items, n_items), dtype=np.float64)
-    rows, columns = np.triu_indices(n_items, k=1)
-    eligible = pair_counts[rows, columns] > 2.0
-    rows = rows[eligible]
-    columns = columns[eligible]
-    values = correlations[rows, columns]
-    q3_matrix[rows, columns] = values
-    q3_matrix[columns, rows] = values
-    return q3_matrix
+    return q3_correlations(
+        residuals,
+        responses >= 0,
+        chunk_size=_entry_chunk_size(*responses.shape),
+    )
 
 
 def _ld_chi2_numpy(
