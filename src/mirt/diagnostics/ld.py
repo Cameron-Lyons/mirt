@@ -30,6 +30,7 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt._correlation import q3_correlations
+from mirt._local_dependence import ld_pair_statistics
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
@@ -525,52 +526,8 @@ def _compute_ld_chi2_g2(
     elif positive_probabilities.shape != (n_persons, n_items):
         raise ValueError("positive_probabilities must match the response matrix shape")
 
-    valid = responses >= 0
-    valid_float = valid.astype(np.float64)
-    observed_positive = ((responses > 0) & valid).astype(np.float64)
-    observed_zero = valid_float - observed_positive
-    expected_positive = np.where(valid, positive_probabilities, 0.0)
-    expected_zero = valid_float - expected_positive
-
-    chi2_values = np.zeros((n_items, n_items), dtype=np.float64)
-    g2_values = np.zeros((n_items, n_items), dtype=np.float64)
-    tables = (
-        (observed_zero, observed_zero, expected_zero, expected_zero),
-        (observed_zero, observed_positive, expected_zero, expected_positive),
-        (observed_positive, observed_zero, expected_positive, expected_zero),
-        (
-            observed_positive,
-            observed_positive,
-            expected_positive,
-            expected_positive,
-        ),
-    )
-    for observed_left, observed_right, expected_left, expected_right in tables:
-        observed_counts = observed_left.T @ observed_right
-        expected_counts = expected_left.T @ expected_right
-        np.maximum(expected_counts, 0.5, out=expected_counts)
-        chi2_values += (observed_counts - expected_counts) ** 2 / expected_counts
-        g2_values += (
-            2.0
-            * observed_counts
-            * np.log(observed_counts / expected_counts + PROB_EPSILON)
-        )
-
-    pair_counts = valid_float.T @ valid_float
-    rows, columns = np.triu_indices(n_items, k=1)
-    eligible = pair_counts[rows, columns] >= 10
-    eligible_rows = rows[eligible]
-    eligible_columns = columns[eligible]
-
-    chi2_matrix = np.full((n_items, n_items), np.nan)
-    g2_matrix = np.full((n_items, n_items), np.nan)
-    pair_chi2 = chi2_values[eligible_rows, eligible_columns]
-    pair_g2 = g2_values[eligible_rows, eligible_columns]
-    chi2_matrix[eligible_rows, eligible_columns] = pair_chi2
-    chi2_matrix[eligible_columns, eligible_rows] = pair_chi2
-    g2_matrix[eligible_rows, eligible_columns] = pair_g2
-    g2_matrix[eligible_columns, eligible_rows] = pair_g2
-
+    chi2_matrix, g2_matrix = ld_pair_statistics(responses, positive_probabilities)
+    assert g2_matrix is not None
     return chi2_matrix, g2_matrix
 
 

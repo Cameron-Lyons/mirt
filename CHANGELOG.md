@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Shared bounded-memory LD chi-square/G² calculations between local-dependence
+  diagnostics and the NumPy backend fallback, reusing transposed cells and
+  complete-block observed margins to reduce matrix products. Extended the
+  `diagnostics` benchmark suite with complete/missing-data LD workloads.
 - Consolidated pairwise residual correlations across diagnostics, testlet models,
   and NumPy backend fallbacks into one bounded-memory kernel. Complete-data blocks
   use a single matrix product, and column offsets improve numerical stability.
