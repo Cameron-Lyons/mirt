@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   diagnostics and the NumPy backend fallback, reusing transposed cells and
   complete-block observed margins to reduce matrix products. Extended the
   `diagnostics` benchmark suite with complete/missing-data LD workloads.
+- Streamed misfit identification in bounded probability blocks, retaining only
+  flagged responses and fit totals instead of a full residual analysis and
+  unused response-pattern summaries. Added complete/missing-data 2PL and GRM
+  timing and traced-memory workloads to the `misfit` benchmark suite.
 - Consolidated pairwise residual correlations across diagnostics, testlet models,
   and NumPy backend fallbacks into one bounded-memory kernel. Complete-data blocks
   use a single matrix product, and column offsets improve numerical stability.

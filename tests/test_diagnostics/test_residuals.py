@@ -457,9 +457,7 @@ class TestComputeOutfitInfit:
             compute_outfit_infit(model, responses, np.zeros(2), **kwargs)
 
 
-def test_fit_statistics_chunking_matches_direct_aggregation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_fit_statistics_chunking_matches_direct_aggregation() -> None:
     rng = np.random.default_rng(20260830)
     residuals = rng.normal(size=(17, 13))
     variances = rng.uniform(0.05, 0.25, size=residuals.shape)
@@ -468,9 +466,11 @@ def test_fit_statistics_chunking_matches_direct_aggregation(
     variances[missing] = np.nan
     residuals[:, -1] = np.nan
     variances[:, -1] = np.nan
-    monkeypatch.setattr(residuals_module, "_FIT_STATISTICS_CHUNK_ELEMENTS", 34)
-
-    actual = residuals_module._fit_statistics(residuals, variances)
+    accumulator = residuals_module._FitAccumulator.create(*residuals.shape)
+    for start in range(0, len(residuals), 3):
+        rows = slice(start, start + 3)
+        accumulator.add(residuals[rows], variances[rows], rows=rows)
+    actual = accumulator.finish()
 
     valid = np.isfinite(residuals)
     squared = np.where(valid, np.square(residuals), 0.0)

@@ -162,6 +162,21 @@ cells from margins in complete blocks. Expected cells use direct probability
 products to preserve accuracy near zero and one; expected-count floors and
 pair eligibility are applied after all blocks have accumulated.
 
+The `misfit` benchmark suite measures `identify_misfitting_patterns` on complete
+and incomplete 2PL/GRM data. It includes probability evaluation, fit totals,
+and returned flag dictionaries, while excluding simulation and ability scoring:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite misfit --persons 20000 --items 100 --repeats 5 --warmups 1 --backend numpy --json /tmp/mirt-misfit.json
+```
+
+Misfit identification evaluates standardized residuals in row blocks sized by
+item/category count. It retains per-person/item sums and flagged entries instead
+of full residual matrices or response-pattern summaries. The returned lists still
+grow with the number of flagged entries. Models without batch metadata retain
+their itemwise probability fallback. Traced peaks measure Python/NumPy allocations,
+not process RSS or native allocations.
+
 To measure native likelihoods, GRM/GPCM/PCM fits, MAP/ML scoring, and repetitive
 EM data, use the `kernels` and `optimization` suites:
 
