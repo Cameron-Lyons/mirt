@@ -324,53 +324,82 @@ def compute_fit_stats(
         raise ValueError("variance must have the same shape as responses")
 
     n_persons, n_items = response_array.shape
-    output_size = response_array.shape[1 - axis]
-    infit_numerator = np.zeros(output_size)
-    infit_denominator = np.zeros(output_size)
-    outfit_sum = np.zeros(output_size)
-    outfit_count = np.zeros(output_size, dtype=np.intp)
+    accumulator = _FitStatsAccumulator(response_array.shape[1 - axis])
     rows_per_chunk = max(1, _FIT_TARGET_CHUNK_ELEMENTS // max(n_items, 1))
 
     for start in range(0, n_persons, rows_per_chunk):
         stop = min(start + rows_per_chunk, n_persons)
-        block_responses = response_array[start:stop]
-        block_expected = expected_array[start:stop]
-        block_variance = variance_array[start:stop]
-        if not np.all(np.isfinite(block_responses)):
+        accumulator.add(
+            response_array[start:stop],
+            expected_array[start:stop],
+            variance_array[start:stop],
+            axis=axis,
+            target=slice(start, stop) if axis == 1 else slice(None),
+        )
+
+    return accumulator.finish()
+
+
+class _FitStatsAccumulator:
+    """Accumulate bounded response blocks without averaging partial ratios."""
+
+    def __init__(self, output_size: int) -> None:
+        self.infit_numerator = np.zeros(output_size)
+        self.infit_denominator = np.zeros(output_size)
+        self.outfit_sum = np.zeros(output_size)
+        self.outfit_count = np.zeros(output_size, dtype=np.intp)
+
+    def add(
+        self,
+        responses: NDArray,
+        expected: NDArray[np.float64],
+        variance: NDArray[np.float64],
+        *,
+        axis: int = 0,
+        target: slice = slice(None),
+    ) -> None:
+        """Add an aligned block to item totals or a slice of person totals."""
+        if responses.dtype.kind not in "biuf" or not np.all(np.isfinite(responses)):
             raise ValueError("responses must contain only finite numeric values")
-        if not np.all(np.isfinite(block_expected)):
+        if not np.all(np.isfinite(expected)):
             raise ValueError("expected must contain only finite values")
-        if not np.all(np.isfinite(block_variance)) or np.any(
-            block_variance < -_PROBABILITY_TOLERANCE
+        if not np.all(np.isfinite(variance)) or np.any(
+            variance < -_PROBABILITY_TOLERANCE
         ):
             raise ValueError("variance must contain finite non-negative values")
 
-        block_variance = np.maximum(block_variance, 0.0)
-        valid = block_responses >= 0
-        squared = np.where(valid, block_responses, block_expected)
-        squared -= block_expected
+        block_variance = np.maximum(variance, 0.0)
+        valid = responses >= 0
+        squared = np.where(valid, responses, expected)
+        squared -= expected
         np.square(squared, out=squared)
-        target = slice(start, stop) if axis == 1 else slice(None)
-        infit_numerator[target] += np.sum(squared, axis=axis)
+        self.infit_numerator[target] += np.sum(squared, axis=axis)
         block_variance = np.where(valid, block_variance, 0.0)
-        infit_denominator[target] += np.sum(block_variance, axis=axis)
+        self.infit_denominator[target] += np.sum(block_variance, axis=axis)
 
         eligible = block_variance > PROB_EPSILON
-        outfit_count[target] += np.sum(eligible, axis=axis)
+        self.outfit_count[target] += np.sum(eligible, axis=axis)
         squared = np.where(eligible, squared, 0.0)
         np.maximum(block_variance, PROB_EPSILON, out=block_variance)
         np.divide(squared, block_variance, out=squared)
-        outfit_sum[target] += np.sum(squared, axis=axis)
+        self.outfit_sum[target] += np.sum(squared, axis=axis)
 
-    outfit = np.full_like(outfit_sum, np.nan, dtype=np.float64)
-    np.divide(outfit_sum, outfit_count, out=outfit, where=outfit_count > 0)
+    def finish(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Apply eligibility thresholds after all blocks have accumulated."""
+        outfit = np.full_like(self.outfit_sum, np.nan)
+        np.divide(
+            self.outfit_sum,
+            self.outfit_count,
+            out=outfit,
+            where=self.outfit_count > 0,
+        )
 
-    infit = np.full_like(infit_numerator, np.nan, dtype=np.float64)
-    np.divide(
-        infit_numerator,
-        infit_denominator,
-        out=infit,
-        where=infit_denominator > PROB_EPSILON,
-    )
+        infit = np.full_like(self.infit_numerator, np.nan)
+        np.divide(
+            self.infit_numerator,
+            self.infit_denominator,
+            out=infit,
+            where=self.infit_denominator > PROB_EPSILON,
+        )
 
-    return np.asarray(infit), np.asarray(outfit)
+        return infit, outfit

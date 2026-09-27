@@ -7,6 +7,8 @@ from numpy.testing import assert_allclose
 import mirt.diagnostics.itemfit as itemfit_module
 from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 from mirt.diagnostics.itemfit import compute_itemfit, compute_s_x2
+from mirt.diagnostics.multiple_testing import adjust_p_values
+from mirt.utils.numeric import compute_fit_stats, compute_probability_moments
 
 
 class FixedProbabilityModel:
@@ -78,6 +80,120 @@ def reference_s_x2(responses, expected, score_scales, n_groups):
             degrees[item_idx] += 1
 
     return statistics, np.maximum(degrees - 1, 1)
+
+
+class IndexedProbabilityModel(FixedProbabilityModel):
+    """Use ability values as row indices to test arbitrary probability blocks."""
+
+    def __init__(self, probabilities, n_categories=None):
+        super().__init__(probabilities, n_categories)
+        self.batch_sizes = []
+
+    def probability(self, theta, item_idx=None):
+        assert item_idx is None
+        self.batch_sizes.append(len(theta))
+        return self.probabilities[np.asarray(theta[:, 0], dtype=np.intp)].copy()
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+@pytest.mark.parametrize("block_rows", [1, 7, 1000])
+@pytest.mark.parametrize(
+    "statistics", [["infit", "outfit"], ["S_X2"], ["infit", "outfit", "S_X2"]]
+)
+def test_itemfit_blocks_preserve_population_statistics(
+    monkeypatch, polytomous, block_rows, statistics
+):
+    from scipy.special import chdtrc
+
+    rng = np.random.default_rng(4218)
+    n_persons, n_items = 103, 4
+    categories = [2, 4, 3, 5] if polytomous else None
+    if polytomous:
+        probabilities = rng.uniform(0.1, 1.0, size=(n_persons, n_items, 5))
+        probabilities *= np.arange(5) < np.asarray(categories)[:, None]
+        probabilities /= probabilities.sum(axis=2, keepdims=True)
+    else:
+        probabilities = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
+        probabilities[:10, 1] = 0.0
+        probabilities[10:20, 1] = 1.0
+    responses = rng.integers(
+        0, categories if polytomous else 2, size=(n_persons, n_items)
+    )
+    responses[rng.random(responses.shape) < 0.2] = -9
+    responses[0] = -1
+    responses[:, 3] = -1
+    responses.setflags(write=False)
+    theta = np.arange(n_persons, dtype=float)[:, None]
+    model = IndexedProbabilityModel(probabilities, categories)
+    _, expected, variance = compute_probability_moments(model, theta, n_items)
+    infit, outfit = compute_fit_stats(responses, expected, variance, axis=0)
+    scales = np.asarray(categories) - 1 if polytomous else np.ones(n_items)
+    sx2, df = reference_s_x2(responses, expected, scales, n_groups=11)
+    reference = {"infit": infit, "outfit": outfit, "S_X2": sx2}
+    p_values = chdtrc(df, sx2)
+    model.batch_sizes.clear()
+    monkeypatch.setattr(
+        itemfit_module,
+        "_ITEMFIT_TARGET_CHUNK_ELEMENTS",
+        block_rows * n_items * (5 if polytomous else 1),
+    )
+    monkeypatch.setattr(itemfit_module, "_SX2_TARGET_CHUNK_ELEMENTS", 9)
+
+    actual = compute_itemfit(
+        model,
+        responses,
+        theta=theta,
+        statistics=statistics,
+        n_groups=11,
+        p_adjust="holm",
+    )
+
+    assert max(model.batch_sizes) <= block_rows
+    assert sum(model.batch_sizes) == n_persons
+    for name in statistics:
+        assert_allclose(actual[name], reference[name], rtol=1e-12, atol=1e-12)
+    if "S_X2" in statistics:
+        assert_allclose(actual["df"], df)
+        assert_allclose(actual["p_value"], p_values, rtol=1e-12, atol=1e-12)
+        assert_allclose(
+            actual["p_value_adjusted"],
+            adjust_p_values(p_values, "holm"),
+            rtol=1e-12,
+            atol=1e-12,
+        )
+        direct = compute_s_x2(
+            model, responses, theta=theta, n_groups=11, p_adjust="holm"
+        )
+        for name, values in direct.items():
+            assert_allclose(actual[name], values, rtol=1e-12, atol=1e-12)
+    else:
+        assert set(actual) == set(statistics)
+
+
+def test_itemfit_accumulates_small_variances_before_infit_threshold(monkeypatch):
+    from mirt.constants import PROB_EPSILON
+
+    model = IndexedProbabilityModel(np.full((9, 1), PROB_EPSILON / 2))
+    responses = np.ones((9, 1))
+    theta = np.arange(9)[:, None]
+    monkeypatch.setattr(itemfit_module, "_ITEMFIT_TARGET_CHUNK_ELEMENTS", 1)
+
+    result = compute_itemfit(model, responses, theta=theta)
+
+    p = PROB_EPSILON / 2
+    assert_allclose(result["infit"], [(1 - p) / p])
+    assert np.isnan(result["outfit"][0])
+
+
+@pytest.mark.parametrize(
+    "theta", [np.empty((0, 1)), np.zeros((2, 1)), np.zeros((3, 1, 1))]
+)
+@pytest.mark.parametrize("compute", [compute_itemfit, compute_s_x2])
+def test_itemfit_rejects_unaligned_theta(theta, compute):
+    model = FixedProbabilityModel(np.full((3, 2), 0.5))
+    with pytest.raises(ValueError, match="one row per person"):
+        compute(model, np.ones((3, 2)), theta=theta)
+    assert model.probability_calls == 0
 
 
 class TestComputeItemfit:

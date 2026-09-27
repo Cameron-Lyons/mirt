@@ -187,20 +187,24 @@ on exceptions. The legacy `mirt._rust_backend` module remains a lazy compatibili
 namespace; new internal code should import from the owning backend module.
 
 The `fit-statistics` benchmark suite measures item/person mean squares on
-complete and incomplete data, plus full 2PL/GRM person-fit diagnostics with
-population-wide p-value adjustment:
+complete and incomplete data, plus full 2PL/GRM item- and person-fit diagnostics
+with population-wide p-value adjustment:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite fit-statistics --persons 20000 --items 150 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-fit-statistics.json
 ```
 
 Mean-square reductions use bounded row blocks, reuse residual storage, and
-apply denominator thresholds after accumulation. Person-fit diagnostics share
-one probability evaluation per block across all requested statistics; block
+apply denominator thresholds after accumulation. Item- and person-fit diagnostics
+share one probability evaluation per block across all requested statistics; block
 sizes account for the number of response categories. Small inputs still use
 one probability call. Reports record timing and a separate `tracemalloc` peak
-for Python/NumPy allocations, including probability evaluation for person fit.
+for Python/NumPy allocations, including probability evaluation for item/person fit.
 This measures temporary allocation, not process RSS or native allocation.
+Item-fit reductions reuse the mean-square accumulator, and direct `compute_s_x2`
+calls share the same streaming path. S-X2 score groups are calculated once from
+all respondents; group-count eligibility and p-value adjustments are applied
+after accumulation.
 
 ## Experimental APIs
 
