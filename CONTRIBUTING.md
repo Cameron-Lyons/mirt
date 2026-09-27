@@ -192,6 +192,22 @@ and own any Python/Rust worker pools. Contexts release the pools on success and
 on exceptions. The legacy `mirt._rust_backend` module remains a lazy compatibility
 namespace; new internal code should import from the owning backend module.
 
+The `fit-statistics` benchmark suite measures item/person mean squares on
+complete and incomplete data, plus full 2PL/GRM person-fit diagnostics with
+population-wide p-value adjustment:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite fit-statistics --persons 20000 --items 150 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-fit-statistics.json
+```
+
+Mean-square reductions use bounded row blocks, reuse residual storage, and
+apply denominator thresholds after accumulation. Person-fit diagnostics share
+one probability evaluation per block across all requested statistics; block
+sizes account for the number of response categories. Small inputs still use
+one probability call. Reports record timing and a separate `tracemalloc` peak
+for Python/NumPy allocations, including probability evaluation for person fit.
+This measures temporary allocation, not process RSS or native allocation.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

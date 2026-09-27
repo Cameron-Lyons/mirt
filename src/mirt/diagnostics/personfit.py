@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 _ZH_TARGET_CHUNK_ELEMENTS = 2_000_000
+_PERSONFIT_TARGET_CHUNK_ELEMENTS = 262_144
 PersonFitAlternative: TypeAlias = Literal["lower", "two-sided", "upper"]
 _PERSON_FIT_ALTERNATIVES = frozenset({"lower", "two-sided", "upper"})
 
@@ -40,6 +41,9 @@ def compute_personfit(
     unexpectedly improbable response patterns. ``None`` preserves the legacy
     output; ``"none"`` adds unadjusted significance columns without correcting
     across respondents.
+
+    Model probabilities and intermediate statistics are evaluated in bounded
+    row blocks. Multiplicity corrections use the full respondent population.
     """
     if statistics is None:
         statistics = ["infit", "outfit", "Zh"]
@@ -69,25 +73,39 @@ def compute_personfit(
     if not compute_mean_squares and not compute_zh:
         return result
 
-    probabilities, expected, variance = compute_probability_moments(
-        model,
-        theta,
-        n_items,
+    if theta.ndim != 2 or theta.shape[0] != n_persons or n_persons == 0:
+        raise ValueError("theta must be a non-empty matrix with one row per person")
+
+    category_width = max(model.n_categories) if model.is_polytomous else 1
+    rows_per_chunk = max(
+        1, _PERSONFIT_TARGET_CHUNK_ELEMENTS // max(n_items * category_width, 1)
     )
+    infit = np.empty(n_persons) if compute_mean_squares else None
+    outfit = np.empty(n_persons) if compute_mean_squares else None
+    zh = np.empty(n_persons) if compute_zh else None
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block_responses = responses[start:stop]
+        probabilities, expected, variance = compute_probability_moments(
+            model, theta[start:stop], n_items
+        )
+        if infit is not None and outfit is not None:
+            infit[start:stop], outfit[start:stop] = compute_fit_stats(
+                block_responses, expected, variance, axis=1
+            )
+        if zh is not None:
+            zh[start:stop] = _compute_zh_vectorized(
+                model, block_responses, probabilities, block_responses >= 0
+            )
 
-    if compute_mean_squares:
-        infit, outfit = compute_fit_stats(responses, expected, variance, axis=1)
-
+    if infit is not None and outfit is not None:
         if "outfit" in statistics:
             result["outfit"] = outfit
 
         if "infit" in statistics:
             result["infit"] = infit
 
-    if compute_zh:
-        valid_mask = responses >= 0
-        zh = _compute_zh_vectorized(model, responses, probabilities, valid_mask)
-
+    if zh is not None:
         if "Zh" in statistics:
             result["Zh"] = zh
         if "lz" in statistics:

@@ -7,6 +7,7 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy.special import ndtr, ndtri
 
+import mirt.diagnostics.personfit as personfit_module
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.personfit import (
     compute_personfit,
@@ -14,6 +15,7 @@ from mirt.diagnostics.personfit import (
     flag_aberrant_persons,
 )
 from mirt.typing import PersonFitStatistic
+from mirt.utils.numeric import compute_fit_stats, compute_probability_moments
 
 
 class FixedProbabilityModel:
@@ -283,6 +285,74 @@ class TestComputePersonfit:
         }
         assert model.probability_calls == 1
         assert result["aberrant"].dtype == bool
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+@pytest.mark.parametrize("block_rows", [1, 4, 100])
+@pytest.mark.parametrize(
+    "statistics", [["infit", "outfit", "Zh", "lz"], ["infit"], ["Zh"]]
+)
+def test_personfit_blocks_match_full_population_reference(
+    monkeypatch, polytomous, block_rows, statistics
+):
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.polytomous import GradedResponseModel
+
+    rng = np.random.default_rng(731)
+    categories = [2, 4, 3]
+    model = (
+        GradedResponseModel(3, n_categories=categories)
+        if polytomous
+        else TwoParameterLogistic(3)
+    )
+    theta = np.linspace(-3, 3, 17)[:, None]
+    responses = rng.integers(0, categories if polytomous else 2, size=(17, 3))
+    responses[rng.random(responses.shape) < 0.2] = -9
+    responses[0] = -1
+    responses[-1, :2] = -1
+    probabilities, expected, variance = compute_probability_moments(model, theta, 3)
+    infit, outfit = compute_fit_stats(responses, expected, variance, axis=1)
+    zh = reference_zh(responses, probabilities, categories if polytomous else None)
+    reference = {"infit": infit, "outfit": outfit, "Zh": zh, "lz": zh}
+    significance = compute_personfit_significance(zh, p_adjust="holm")
+
+    monkeypatch.setattr(
+        personfit_module,
+        "_PERSONFIT_TARGET_CHUNK_ELEMENTS",
+        block_rows * 3 * (4 if polytomous else 1),
+    )
+    original_probability = model.probability
+    batch_sizes = []
+
+    def record_probability(theta, item_idx=None):
+        assert item_idx is None
+        batch_sizes.append(len(theta))
+        return original_probability(theta)
+
+    monkeypatch.setattr(model, "probability", record_probability)
+    actual = compute_personfit(
+        model, responses, theta, statistics=statistics, p_adjust="holm"
+    )
+
+    assert max(batch_sizes) <= block_rows
+    assert sum(batch_sizes) == len(theta)
+    assert set(actual) == set(statistics) | set(significance)
+    for name in statistics:
+        assert_allclose(actual[name], reference[name], rtol=1e-12, atol=1e-12)
+    for name, values in significance.items():
+        assert_allclose(actual[name], values, rtol=1e-12, atol=1e-12)
+    if "lz" in actual:
+        assert actual["lz"] is actual["Zh"]
+
+
+@pytest.mark.parametrize(
+    "theta", [np.empty((0, 1)), np.zeros((2, 1)), np.zeros((3, 1, 1))]
+)
+def test_personfit_rejects_unaligned_theta_before_batching(theta):
+    from mirt.models.dichotomous import TwoParameterLogistic
+
+    with pytest.raises(ValueError, match="one row per person"):
+        compute_personfit(TwoParameterLogistic(2), np.ones((3, 2)), theta)
 
 
 class TestPersonfitSignificance:

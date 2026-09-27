@@ -324,6 +324,7 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "diagnostics",
+            "fit-statistics",
             "cat",
             "kernels",
             "optimization",
@@ -337,6 +338,7 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "diagnostics",
+            "fit-statistics",
             "cat",
             "kernels",
             "optimization",
@@ -383,6 +385,21 @@ class TestBenchmarkCommand:
             "patterns_distinct",
         ]
         assert all(len(result.times) == 2 for result in results)
+
+    def test_fit_statistics_suite_records_time_and_memory(self) -> None:
+        results = benchmark.run_suites(
+            ("fit-statistics",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "mean_squares_item_complete",
+            "mean_squares_person_complete",
+            "mean_squares_item_missing",
+            "mean_squares_person_missing",
+            "personfit_2pl",
+            "personfit_grm",
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
 
     def test_posterior_suite_runs_and_checks_person_count(self) -> None:
         results = benchmark.run_suites(

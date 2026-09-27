@@ -30,6 +30,7 @@ SUITE_ORDER = (
     "patterns",
     "data",
     "diagnostics",
+    "fit-statistics",
     "cat",
     "kernels",
     "optimization",
@@ -476,6 +477,57 @@ def bench_diagnostics(
     return results
 
 
+def bench_fit_statistics(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure mean squares and person fit, including temporary allocations."""
+    from mirt.diagnostics.personfit import compute_personfit
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.polytomous import GradedResponseModel
+    from mirt.utils.numeric import compute_fit_stats
+
+    rng = np.random.default_rng(5187)
+    results = []
+    for label, missing_fraction in (("complete", 0.0), ("missing", 0.15)):
+        expected = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
+        variance = expected * (1.0 - expected)
+        responses = (rng.random(expected.shape) < expected).astype(np.int32)
+        responses[rng.random(responses.shape) < missing_fraction] = -1
+        for axis, dimension in ((0, "item"), (1, "person")):
+
+            def run_mean_squares():
+                return compute_fit_stats(responses, expected, variance, axis)
+
+            times = _time(run_mean_squares, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"mean_squares_{dimension}_{label}",
+                    times,
+                    _peak_traced_bytes(run_mean_squares),
+                )
+            )
+
+    theta = rng.normal(size=(n_persons, 1))
+    for name, model, categories in (
+        ("2pl", TwoParameterLogistic(n_items), 2),
+        ("grm", GradedResponseModel(n_items, n_categories=5), 5),
+    ):
+        responses = rng.integers(0, categories, size=(n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.15] = -1
+
+        def run_personfit():
+            return compute_personfit(model, responses, theta, p_adjust="fdr_bh")
+
+        times = _time(run_personfit, repeats=repeats, warmups=warmups)
+        results.append(
+            BenchResult(f"personfit_{name}", times, _peak_traced_bytes(run_personfit))
+        )
+    return results
+
+
 def bench_cat(
     n_items: int,
     repeats: int,
@@ -619,6 +671,8 @@ def run_suites(
         results.extend(bench_data(n_persons, n_items, repeats, warmups))
     if "diagnostics" in suites:
         results.extend(bench_diagnostics(n_persons, n_items, repeats, warmups))
+    if "fit-statistics" in suites:
+        results.extend(bench_fit_statistics(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
     if "kernels" in suites:

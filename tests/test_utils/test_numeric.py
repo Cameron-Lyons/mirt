@@ -5,6 +5,8 @@ import warnings
 import numpy as np
 import pytest
 
+import mirt.utils.numeric as numeric_module
+from mirt.constants import PROB_EPSILON
 from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 from mirt.utils.numeric import (
@@ -258,6 +260,93 @@ class TestExpectedVariance:
 
 
 class TestFitStatistics:
+    @pytest.mark.parametrize("axis", [0, 1])
+    @pytest.mark.parametrize("block_rows", [1, 3, 100])
+    def test_blocks_match_scalar_reference_and_preserve_inputs(
+        self, monkeypatch, axis, block_rows
+    ) -> None:
+        rng = np.random.default_rng(153)
+        responses = rng.integers(-1, 5, size=(11, 14))[:, ::2]
+        expected = rng.uniform(0, 4, size=(11, 14))[:, ::2]
+        variance = rng.uniform(0, 2, size=(11, 14))[:, ::2]
+        responses[0] = -9
+        responses[:, 0] = -1
+        variance[1, 1:5] = [0, -1e-12, PROB_EPSILON / 2, PROB_EPSILON]
+        variance[:, 5] = 0
+        arrays = (responses, expected, variance)
+        originals = [array.copy() for array in arrays]
+        for array in arrays:
+            array.setflags(write=False)
+        monkeypatch.setattr(
+            numeric_module, "_FIT_TARGET_CHUNK_ELEMENTS", block_rows * 7
+        )
+
+        reference = np.full((2, responses.shape[1 - axis]), np.nan)
+        for group in range(reference.shape[1]):
+            selector = (slice(None), group) if axis == 0 else (group, slice(None))
+            numerator = denominator = standardized = 0.0
+            count = 0
+            for response, mean, var in zip(
+                *(array[selector] for array in arrays), strict=True
+            ):
+                if response < 0:
+                    continue
+                var = max(var, 0)
+                squared = (response - mean) ** 2
+                numerator += squared
+                denominator += var
+                if var > PROB_EPSILON:
+                    standardized += squared / var
+                    count += 1
+            if denominator > PROB_EPSILON:
+                reference[0, group] = numerator / denominator
+            if count:
+                reference[1, group] = standardized / count
+
+        actual = compute_fit_stats(*arrays, axis=axis)
+
+        np.testing.assert_allclose(actual, reference, rtol=1e-14, equal_nan=True)
+        for array, original in zip(arrays, originals, strict=True):
+            np.testing.assert_array_equal(array, original)
+
+    def test_infit_threshold_is_applied_after_all_blocks(self, monkeypatch) -> None:
+        monkeypatch.setattr(numeric_module, "_FIT_TARGET_CHUNK_ELEMENTS", 1)
+        responses = np.ones((3, 1))
+        expected = np.full((3, 1), 0.5)
+        variance = np.full((3, 1), PROB_EPSILON / 2)
+
+        infit, outfit = compute_fit_stats(responses, expected, variance, axis=0)
+
+        np.testing.assert_allclose(infit, [0.5 / PROB_EPSILON])
+        assert np.isnan(outfit[0])
+
+    @pytest.mark.parametrize("axis", [0, 1])
+    @pytest.mark.parametrize("shape", [(0, 3), (3, 0), (0, 0)])
+    def test_empty_axes_are_defined(self, shape, axis) -> None:
+        values = np.empty(shape)
+        with np.errstate(all="raise"):
+            infit, outfit = compute_fit_stats(values, values, values, axis)
+        assert infit.shape == outfit.shape == (shape[1 - axis],)
+        assert np.isnan(infit).all() and np.isnan(outfit).all()
+
+    def test_missing_codes_do_not_overflow_residuals(self) -> None:
+        with np.errstate(all="raise"):
+            infit, outfit = compute_fit_stats(
+                [[-1e300, 1]], [[0.5, 0.5]], [[0.25, 0.25]], axis=1
+            )
+        np.testing.assert_array_equal(infit, [1])
+        np.testing.assert_array_equal(outfit, [1])
+
+    @pytest.mark.parametrize("input_index", [0, 1, 2])
+    def test_invalid_values_in_later_blocks_are_rejected(
+        self, monkeypatch, input_index
+    ) -> None:
+        monkeypatch.setattr(numeric_module, "_FIT_TARGET_CHUNK_ELEMENTS", 2)
+        arrays = [np.ones((7, 2)) for _ in range(3)]
+        arrays[input_index][-1, -1] = np.nan
+        with pytest.raises(ValueError, match="finite"):
+            compute_fit_stats(*arrays, axis=0)
+
     def test_matches_manual_calculation_with_missing_responses(self) -> None:
         responses = np.array([[1, 0, -1], [0, 1, 1], [1, -9, 0]])
         expected = np.array([[0.7, 0.4, 0.5], [0.6, 0.8, 0.4], [0.9, 0.3, 0.2]])
