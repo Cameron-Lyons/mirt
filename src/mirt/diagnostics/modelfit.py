@@ -23,6 +23,70 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+_MOMENT_CHUNK_ELEMENTS = 262_144
+
+
+@dataclass(frozen=True)
+class _ScoreMoments:
+    """Final score moments and pairwise means on the same observations."""
+
+    univariate: NDArray[np.float64]
+    bivariate: NDArray[np.float64]
+    correlation: NDArray[np.float64]
+    pair_means: NDArray[np.float64]
+
+
+class _SampleMomentAccumulator:
+    """Accumulate score moments with shared pairwise observation counts."""
+
+    def __init__(self, n_items: int) -> None:
+        self.sums = np.zeros(n_items)
+        self.products = np.zeros((n_items, n_items))
+        self.pair_sums = np.zeros_like(self.products)
+        self.pair_seconds = np.zeros_like(self.products)
+
+    def add(
+        self,
+        means: NDArray[np.float64],
+        seconds: NDArray[np.float64],
+        mask: NDArray[np.float64] | None,
+    ) -> None:
+        if mask is not None:
+            means = means * mask
+            seconds = seconds * mask
+        sums = means.sum(axis=0)
+        self.sums += sums
+        self.products += means.T @ means
+        if mask is None:
+            self.pair_sums += sums[:, None]
+            self.pair_seconds += seconds.sum(axis=0)[:, None]
+        else:
+            self.pair_sums += means.T @ mask
+            self.pair_seconds += seconds.T @ mask
+
+    def finish(self, pair_counts: NDArray[np.float64]) -> _ScoreMoments:
+        univariate = _safe_divide(self.sums, pair_counts.diagonal())
+        bivariate = _safe_divide(self.products, pair_counts)
+        pair_means = _safe_divide(self.pair_sums, pair_counts)
+        pair_seconds = _safe_divide(self.pair_seconds, pair_counts)
+        return _ScoreMoments(
+            univariate,
+            bivariate,
+            _score_correlations(bivariate, pair_means, pair_seconds),
+            pair_means,
+        )
+
+
+def _score_correlations(
+    bivariate: NDArray[np.float64],
+    pair_means: NDArray[np.float64],
+    pair_seconds: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    covariance = bivariate - pair_means * pair_means.T
+    variances = np.maximum(pair_seconds - pair_means**2, 0.0)
+    return _safe_divide(covariance, np.sqrt(variances * variances.T))
+
+
 @dataclass(frozen=True)
 class _FitMoments:
     """Observed and model-implied first- and second-order score moments."""
@@ -33,6 +97,7 @@ class _FitMoments:
     expected_bi: NDArray[np.float64]
     observed_corr: NDArray[np.float64]
     expected_corr: NDArray[np.float64]
+    observed_pair_means: NDArray[np.float64]
     uni_counts: NDArray[np.float64]
     pair_counts: NDArray[np.float64]
 
@@ -70,11 +135,11 @@ def compute_m2(
         - 'p_value': P-value
         - 'M2_df_ratio': M2/df ratio
     """
-    response_values, valid_mask = _validate_diagnostic_inputs(model, responses)
+    response_values, max_observed = _validate_diagnostic_inputs(model, responses)
     moments = _prepare_fit_moments(
         model,
         response_values,
-        valid_mask,
+        max_observed,
         theta,
         n_quadpts,
     )
@@ -112,12 +177,12 @@ def compute_fit_indices(
         - 'TLI': Tucker-Lewis Index (NNFI)
         - 'SRMSR': Standardized Root Mean Square Residual
     """
-    response_values, valid_mask = _validate_diagnostic_inputs(model, responses)
+    response_values, max_observed = _validate_diagnostic_inputs(model, responses)
     n_persons = response_values.shape[0]
     moments = _prepare_fit_moments(
         model,
         response_values,
-        valid_mask,
+        max_observed,
         theta,
         n_quadpts,
     )
@@ -125,7 +190,9 @@ def compute_fit_indices(
     M2 = m2_result["M2"]
     df = m2_result["df"]
 
-    M2_0, df_0 = _compute_baseline_m2(response_values)
+    M2_0, df_0 = _baseline_m2(
+        moments.observed_bi, moments.observed_pair_means, moments.pair_counts
+    )
 
     rmsea = _compute_rmsea(M2, df, n_persons)
     rmsea_ci = _compute_rmsea_ci(M2, df, n_persons)
@@ -149,37 +216,13 @@ def compute_fit_indices(
     }
 
 
-def _compute_observed_margins(
-    responses: NDArray[np.int_],
-    valid_mask: NDArray[np.bool_],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute observed univariate and bivariate score moments."""
-    values = np.where(valid_mask, responses, 0.0).astype(np.float64, copy=False)
-    observed_uni, observed_bi, _, _, _ = _sample_score_moments(
-        values,
-        values**2,
-        valid_mask,
-    )
-    return observed_uni, observed_bi
-
-
 def _compute_expected_margins(
     model: BaseItemModel,
     n_quadpts: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute expected score moments under the model using quadrature."""
-    from mirt.estimation.quadrature import GaussHermiteQuadrature
-
-    _validate_quadrature_count(n_quadpts)
-    quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=model.n_factors)
-    weights = _normalized_weights(quad.weights)
-    expected_scores, expected_squares, _ = _conditional_score_moments(model, quad.nodes)
-    expected_uni, expected_bi, _ = _population_score_moments(
-        expected_scores,
-        expected_squares,
-        weights,
-    )
-    return expected_uni, expected_bi
+    moments, _ = _integrate_model_moments(model, n_quadpts)
+    return moments.univariate, moments.bivariate
 
 
 def _count_model_parameters(model: BaseItemModel) -> int:
@@ -187,18 +230,14 @@ def _count_model_parameters(model: BaseItemModel) -> int:
     return int(model.n_parameters)
 
 
-def _compute_baseline_m2(responses: NDArray[np.int_]) -> tuple[float, int]:
-    """Compute M2 for baseline (independence) model."""
-    valid_mask = np.isfinite(responses) & (responses >= 0)
-    mask = valid_mask.astype(np.float64)
-    values = np.where(valid_mask, responses, 0.0).astype(np.float64, copy=False)
-    pair_counts = mask.T @ mask
-    observed_bi = _safe_divide(values.T @ values, pair_counts)
-    pair_sums = values.T @ mask
-    pair_mean_left = _safe_divide(pair_sums, pair_counts)
-    expected_bi = pair_mean_left * pair_mean_left.T
-
-    upper = np.triu_indices(responses.shape[1], k=1)
+def _baseline_m2(
+    observed_bi: NDArray[np.float64],
+    pair_means: NDArray[np.float64],
+    pair_counts: NDArray[np.float64],
+) -> tuple[float, int]:
+    """Compute independence-model M2 from the existing observed moments."""
+    expected_bi = pair_means * pair_means.T
+    upper = np.triu_indices_from(pair_counts, k=1)
     usable = pair_counts[upper] > 0
     residuals = observed_bi[upper][usable] - expected_bi[upper][usable]
     counts = pair_counts[upper][usable]
@@ -208,9 +247,9 @@ def _compute_baseline_m2(responses: NDArray[np.int_]) -> tuple[float, int]:
 def _validate_diagnostic_inputs(
     model: BaseItemModel,
     responses: NDArray[np.int_],
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Validate response data and return values plus an observed-data mask."""
-    values = np.asarray(responses, dtype=np.float64)
+) -> tuple[NDArray[np.float64], float]:
+    """Validate response blocks without retaining a full mask or float copy."""
+    values = np.asarray(responses)
     if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] == 0:
         raise ValueError(
             "responses must be a two-dimensional matrix with at least "
@@ -220,16 +259,19 @@ def _validate_diagnostic_inputs(
         raise ValueError(
             f"responses have {values.shape[1]} items, expected {model.n_items}"
         )
-    if np.any(np.isinf(values)):
-        raise ValueError("responses must not contain infinite values")
-
-    valid_mask = np.isfinite(values) & (values >= 0)
-    observed = values[valid_mask]
-    if observed.size == 0:
+    rows_per_chunk = max(1, _MOMENT_CHUNK_ELEMENTS // model.n_items)
+    max_observed = -1.0
+    for start in range(0, values.shape[0], rows_per_chunk):
+        block = np.asarray(values[start : start + rows_per_chunk], dtype=np.float64)
+        if np.any(np.isinf(block)):
+            raise ValueError("responses must not contain infinite values")
+        observed = block[np.isfinite(block) & (block >= 0)]
+        if np.any(observed != np.floor(observed)):
+            raise ValueError("observed responses must be integer category codes")
+        max_observed = max(max_observed, float(np.max(observed, initial=-1.0)))
+    if max_observed < 0:
         raise ValueError("responses contain no observed values")
-    if np.any(observed != np.floor(observed)):
-        raise ValueError("observed responses must be integer category codes")
-    return values, valid_mask
+    return values, max_observed
 
 
 def _prepare_theta(
@@ -326,110 +368,103 @@ def _safe_divide(
     return np.divide(numerator, denominator, out=result, where=denominator > 0)
 
 
-def _sample_score_moments(
-    conditional_means: NDArray[np.float64],
-    conditional_seconds: NDArray[np.float64],
-    valid_mask: NDArray[np.bool_],
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
-    """Aggregate score moments over persons with pairwise missingness."""
-    mask = valid_mask.astype(np.float64)
-    means = conditional_means * mask
-    seconds = conditional_seconds * mask
-    uni_counts = np.sum(mask, axis=0)
-    pair_counts = mask.T @ mask
-
-    univariate = _safe_divide(np.sum(means, axis=0), uni_counts)
-    bivariate = _safe_divide(means.T @ means, pair_counts)
-
-    pair_mean_left = _safe_divide(means.T @ mask, pair_counts)
-    pair_second_left = _safe_divide(seconds.T @ mask, pair_counts)
-    covariance = bivariate - pair_mean_left * pair_mean_left.T
-    variance_left = np.maximum(pair_second_left - pair_mean_left**2, 0.0)
-    denominator = np.sqrt(variance_left * variance_left.T)
-    correlation = _safe_divide(covariance, denominator)
-    return univariate, bivariate, correlation, uni_counts, pair_counts
+def _moment_rows_per_chunk(model: BaseItemModel) -> int:
+    """Budget probability storage by the widest item category count."""
+    width = max(model.n_categories) if model.is_polytomous else 1
+    return max(1, _MOMENT_CHUNK_ELEMENTS // (model.n_items * width))
 
 
-def _population_score_moments(
-    conditional_means: NDArray[np.float64],
-    conditional_seconds: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Integrate score moments over a latent population distribution."""
-    if weights.size != conditional_means.shape[0]:
-        raise ValueError("quadrature weights and probability rows must have equal size")
-    univariate = weights @ conditional_means
-    bivariate = (conditional_means * weights[:, None]).T @ conditional_means
-    second_moments = weights @ conditional_seconds
-    covariance = bivariate - np.outer(univariate, univariate)
-    variances = np.maximum(second_moments - univariate**2, 0.0)
-    denominator = np.sqrt(np.outer(variances, variances))
-    correlation = _safe_divide(covariance, denominator)
-    return univariate, bivariate, correlation
+def _integrate_model_moments(
+    model: BaseItemModel, n_quadpts: int
+) -> tuple[_ScoreMoments, int]:
+    """Integrate model moments without retaining full-grid probability arrays."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+    _validate_quadrature_count(n_quadpts)
+    quadrature = GaussHermiteQuadrature(
+        n_points=n_quadpts, n_dimensions=model.n_factors
+    )
+    weights = _normalized_weights(quadrature.weights)
+    univariate = np.zeros(model.n_items)
+    seconds = np.zeros(model.n_items)
+    bivariate = np.zeros((model.n_items, model.n_items))
+    rows_per_chunk = _moment_rows_per_chunk(model)
+    max_score = 0
+    for start in range(0, weights.size, rows_per_chunk):
+        stop = start + rows_per_chunk
+        means, conditional_seconds, max_score = _conditional_score_moments(
+            model, quadrature.nodes[start:stop]
+        )
+        block_weights = weights[start:stop]
+        univariate += block_weights @ means
+        seconds += block_weights @ conditional_seconds
+        bivariate += (means * block_weights[:, None]).T @ means
+    pair_means = univariate[:, None]
+    return _ScoreMoments(
+        univariate,
+        bivariate,
+        _score_correlations(bivariate, pair_means, seconds[:, None]),
+        pair_means,
+    ), max_score
 
 
 def _prepare_fit_moments(
     model: BaseItemModel,
     responses: NDArray[np.float64],
-    valid_mask: NDArray[np.bool_],
+    max_observed: float,
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
 ) -> _FitMoments:
-    """Compute observed and expected moments with one probability evaluation."""
-    observed_scores = np.where(valid_mask, responses, 0.0)
-    observed_uni, observed_bi, observed_corr, uni_counts, pair_counts = (
-        _sample_score_moments(
-            observed_scores,
-            observed_scores**2,
-            valid_mask,
-        )
+    """Stream moments, sharing observation counts and complete-block shortcuts."""
+    observed = _SampleMomentAccumulator(model.n_items)
+    expected = _SampleMomentAccumulator(model.n_items) if theta is not None else None
+    pair_counts = np.zeros((model.n_items, model.n_items))
+    theta_values = (
+        _prepare_theta(model, theta, responses.shape[0]) if theta is not None else None
     )
-
     if theta is None:
-        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        expected_moments, max_score = _integrate_model_moments(model, n_quadpts)
 
-        _validate_quadrature_count(n_quadpts)
-        quadrature = GaussHermiteQuadrature(
-            n_points=n_quadpts,
-            n_dimensions=model.n_factors,
-        )
-        expected_scores, expected_squares, max_score = _conditional_score_moments(
-            model, quadrature.nodes
-        )
-        expected_uni, expected_bi, expected_corr = _population_score_moments(
-            expected_scores,
-            expected_squares,
-            _normalized_weights(quadrature.weights),
-        )
-    else:
-        theta_values = _prepare_theta(model, theta, responses.shape[0])
-        expected_scores, expected_squares, max_score = _conditional_score_moments(
-            model, theta_values
-        )
-        expected_uni, expected_bi, expected_corr, _, _ = _sample_score_moments(
-            expected_scores,
-            expected_squares,
-            valid_mask,
-        )
+    rows_per_chunk = (
+        _moment_rows_per_chunk(model)
+        if theta is not None
+        else max(1, _MOMENT_CHUNK_ELEMENTS // model.n_items)
+    )
+    for start in range(0, responses.shape[0], rows_per_chunk):
+        stop = start + rows_per_chunk
+        block = np.asarray(responses[start:stop], dtype=np.float64)
+        valid = np.isfinite(block) & (block >= 0)
+        mask = None
+        if np.all(valid):
+            pair_counts += block.shape[0]
+            scores = block
+        else:
+            mask = valid.astype(np.float64)
+            pair_counts += mask.T @ mask
+            scores = np.where(valid, block, 0.0)
+        observed.add(scores, scores**2, mask)
+        if expected is not None and theta_values is not None:
+            means, seconds, max_score = _conditional_score_moments(
+                model, theta_values[start:stop]
+            )
+            expected.add(means, seconds, mask)
+        if max_observed > max_score:
+            raise ValueError(
+                f"observed response categories must be between 0 and {max_score}"
+            )
 
-    if np.any(responses[valid_mask] > max_score):
-        raise ValueError(
-            f"observed response categories must be between 0 and {max_score}"
-        )
+    observed_moments = observed.finish(pair_counts)
+    if expected is not None:
+        expected_moments = expected.finish(pair_counts)
     return _FitMoments(
-        observed_uni=observed_uni,
-        observed_bi=observed_bi,
-        expected_uni=expected_uni,
-        expected_bi=expected_bi,
-        observed_corr=observed_corr,
-        expected_corr=expected_corr,
-        uni_counts=uni_counts,
+        observed_uni=observed_moments.univariate,
+        observed_bi=observed_moments.bivariate,
+        expected_uni=expected_moments.univariate,
+        expected_bi=expected_moments.bivariate,
+        observed_corr=observed_moments.correlation,
+        expected_corr=expected_moments.correlation,
+        observed_pair_means=observed_moments.pair_means,
+        uni_counts=pair_counts.diagonal(),
         pair_counts=pair_counts,
     )
 
@@ -583,11 +618,11 @@ def _compute_srmsr(
     theta: NDArray[np.float64] | None = None,
 ) -> float:
     """Compute Standardized Root Mean Square Residual."""
-    response_values, valid_mask = _validate_diagnostic_inputs(model, responses)
+    response_values, max_observed = _validate_diagnostic_inputs(model, responses)
     moments = _prepare_fit_moments(
         model,
         response_values,
-        valid_mask,
+        max_observed,
         theta,
         n_quadpts,
     )

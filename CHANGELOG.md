@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Streamed model-fit moments in bounded response and probability blocks, sharing
+  pairwise counts and reusing observed moments for the independence baseline.
+  Complete blocks avoid missing-data matrix products. Added a `model-fit`
+  benchmark suite for empirical/quadrature integration and traced memory peaks.
 - Shared bounded-memory LD chi-square/G² calculations between local-dependence
   diagnostics and the NumPy backend fallback, reusing transposed cells and
   complete-block observed margins to reduce matrix products. Extended the

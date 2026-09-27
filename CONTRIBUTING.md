@@ -212,6 +212,23 @@ calls share the same streaming path. S-X2 score groups are calculated once from
 all respondents; group-count eligibility and p-value adjustments are applied
 after accumulation.
 
+The `model-fit` benchmark suite measures full M2/RMSEA/CFI/TLI/SRMSR diagnostics
+for 2PL and GRM models with complete and incomplete data, using both supplied
+abilities and quadrature integration. Timing includes probability evaluation;
+fitting and data generation are excluded:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite model-fit --persons 20000 --items 150 --repeats 5 --warmups 1 --backend numpy --json /tmp/mirt-model-fit.json
+```
+
+Model-fit calculations stream response and probability blocks, accounting for
+category width, and retain item-pair matrices rather than respondent-wide moment
+arrays. Empirical expected moments share observed pair counts; the independence
+baseline reuses observed pairwise means. Missing pairs and undefined correlations
+retain their existing conventions. Traced peaks measure Python/NumPy temporary
+allocations, not process RSS or native allocations; the quadrature grid itself
+still grows with the number of latent dimensions.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

@@ -31,6 +31,7 @@ SUITE_ORDER = (
     "data",
     "diagnostics",
     "fit-statistics",
+    "model-fit",
     "cat",
     "kernels",
     "optimization",
@@ -543,6 +544,42 @@ def bench_fit_statistics(
     return results
 
 
+def bench_model_fit(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure model-fit moments with empirical and quadrature integration."""
+    from mirt.diagnostics.modelfit import compute_fit_indices
+    from mirt.models import GradedResponseModel, TwoParameterLogistic
+
+    rng = np.random.default_rng(7241)
+    theta = rng.normal(size=(n_persons, 1))
+    results = []
+    for name, model, categories in (
+        ("2pl", TwoParameterLogistic(n_items), 2),
+        ("grm", GradedResponseModel(n_items, n_categories=5), 5),
+    ):
+        for label, missing_fraction in (("complete", 0.0), ("missing", 0.15)):
+            responses = rng.integers(0, categories, size=(n_persons, n_items))
+            responses[rng.random(responses.shape) < missing_fraction] = -1
+            for integration, abilities in (("empirical", theta), ("quadrature", None)):
+
+                def run():
+                    return compute_fit_indices(model, responses, theta=abilities)
+
+                times = _time(run, repeats=repeats, warmups=warmups)
+                results.append(
+                    BenchResult(
+                        f"model_fit_{name}_{label}_{integration}",
+                        times,
+                        _peak_traced_bytes(run),
+                    )
+                )
+    return results
+
+
 def bench_cat(
     n_items: int,
     repeats: int,
@@ -688,6 +725,8 @@ def run_suites(
         results.extend(bench_diagnostics(n_persons, n_items, repeats, warmups))
     if "fit-statistics" in suites:
         results.extend(bench_fit_statistics(n_persons, n_items, repeats, warmups))
+    if "model-fit" in suites:
+        results.extend(bench_model_fit(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
     if "kernels" in suites:
@@ -832,6 +871,11 @@ def _validate_baseline_compatibility(
         "ml_scoring",
         "marginal_information",
     }
+    person_workloads.update(
+        name
+        for name in current_names
+        if name.startswith(("model_fit_", "mean_squares_", "itemfit_", "personfit_"))
+    )
     if current_names & person_workloads and baseline_config.get(
         "persons"
     ) != current_config.get("persons"):
