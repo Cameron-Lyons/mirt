@@ -30,6 +30,7 @@ SUITE_ORDER = (
     "patterns",
     "data",
     "diagnostics",
+    "misfit",
     "fit-statistics",
     "model-fit",
     "cat",
@@ -478,6 +479,47 @@ def bench_diagnostics(
     return results
 
 
+def bench_misfit(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure misfit identification, including probability and result storage."""
+    from mirt.diagnostics.residuals import identify_misfitting_patterns
+    from mirt.models import GradedResponseModel, TwoParameterLogistic
+
+    rng = np.random.default_rng(8392)
+    theta = rng.normal(size=(n_persons, 1))
+    results = []
+    for name, model in (
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("grm", GradedResponseModel(n_items, n_categories=5)),
+    ):
+        probabilities = model.probability(theta)
+        draws = rng.random((n_persons, n_items))
+        if probabilities.ndim == 2:
+            responses = (draws < probabilities).astype(np.int_)
+        else:
+            responses = np.sum(
+                draws[:, :, None] > np.cumsum(probabilities, axis=2)[:, :, :-1],
+                axis=2,
+            )
+        del probabilities, draws
+        for label, missing_fraction in (("complete", 0.0), ("missing", 0.15)):
+            data = responses.copy()
+            data[rng.random(data.shape) < missing_fraction] = -1
+
+            def run():
+                return identify_misfitting_patterns(model, data, theta)
+
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(f"misfit_{name}_{label}", times, _peak_traced_bytes(run))
+            )
+    return results
+
+
 def bench_fit_statistics(
     n_persons: int,
     n_items: int,
@@ -723,6 +765,8 @@ def run_suites(
         results.extend(bench_data(n_persons, n_items, repeats, warmups))
     if "diagnostics" in suites:
         results.extend(bench_diagnostics(n_persons, n_items, repeats, warmups))
+    if "misfit" in suites:
+        results.extend(bench_misfit(n_persons, n_items, repeats, warmups))
     if "fit-statistics" in suites:
         results.extend(bench_fit_statistics(n_persons, n_items, repeats, warmups))
     if "model-fit" in suites:
@@ -860,6 +904,10 @@ def _validate_baseline_compatibility(
         "q3_missing",
         "ld_complete",
         "ld_missing",
+        "misfit_2pl_complete",
+        "misfit_2pl_missing",
+        "misfit_grm_complete",
+        "misfit_grm_missing",
         "likelihood_2pl",
         "likelihood_grm",
         "likelihood_gpcm",

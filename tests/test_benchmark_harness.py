@@ -324,6 +324,7 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "diagnostics",
+            "misfit",
             "fit-statistics",
             "model-fit",
             "cat",
@@ -339,6 +340,7 @@ class TestBenchmarkCommand:
             "patterns",
             "data",
             "diagnostics",
+            "misfit",
             "fit-statistics",
             "model-fit",
             "cat",
@@ -387,6 +389,26 @@ class TestBenchmarkCommand:
             "patterns_distinct",
         ]
         assert all(len(result.times) == 2 for result in results)
+
+    def test_misfit_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("misfit",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "misfit_2pl_complete",
+            "misfit_2pl_missing",
+            "misfit_grm_complete",
+            "misfit_grm_missing",
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=40),
+                    max_regression_percent=20.0,
+                )
 
     def test_fit_statistics_suite_records_time_and_memory(self) -> None:
         results = benchmark.run_suites(

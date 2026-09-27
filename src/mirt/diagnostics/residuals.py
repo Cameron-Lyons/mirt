@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
 _RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
 _RESIDUAL_MAX_PROBABILITY_VALUES = 1_000_000
-_FIT_STATISTICS_CHUNK_ELEMENTS = 1_000_000
+_MISFIT_TARGET_CHUNK_ELEMENTS = 262_144
 
 
 @dataclass
@@ -100,6 +100,29 @@ class _FitAccumulator:
             "item_n": self.item_n,
             "person_n": self.person_n,
         }
+
+    def add(
+        self,
+        residuals: NDArray[np.float64],
+        variances: NDArray[np.float64],
+        *,
+        rows: slice = slice(None),
+    ) -> None:
+        """Reduce a row block without retaining its temporary arrays."""
+        valid = np.isfinite(residuals)
+        squared = np.zeros_like(residuals)
+        np.square(residuals, out=squared, where=valid)
+        self.item_square_sum += np.sum(squared, axis=0)
+        self.item_n += np.sum(valid, axis=0, dtype=np.intp)
+        self.person_square_sum[rows] += np.sum(squared, axis=1)
+        self.person_n[rows] += np.sum(valid, axis=1, dtype=np.intp)
+        self.item_variance_sum += np.sum(variances, axis=0, where=valid, initial=0.0)
+        self.person_variance_sum[rows] += np.sum(
+            variances, axis=1, where=valid, initial=0.0
+        )
+        np.multiply(squared, variances, out=squared, where=valid)
+        self.item_weighted_sum += np.sum(squared, axis=0)
+        self.person_weighted_sum[rows] += np.sum(squared, axis=1)
 
 
 @dataclass
@@ -233,6 +256,22 @@ def _item_expected_value_variance(
     )
 
 
+def _probability_values_per_row(model: BaseItemModel, n_items: int) -> int:
+    """Return the batch probability width, including padded item categories."""
+    is_polytomous = bool(getattr(model, "is_polytomous", False))
+    n_categories = 1
+    if is_polytomous:
+        n_categories = getattr(model, "max_categories", None)
+        if n_categories is None:
+            category_counts = getattr(model, "n_categories", 1)
+            if np.isscalar(category_counts):
+                n_categories = int(category_counts)
+            else:
+                n_categories = max(category_counts)
+
+    return n_items * int(n_categories)
+
+
 def _all_item_expected_value_variance(
     model: BaseItemModel,
     theta: NDArray[np.float64],
@@ -250,23 +289,12 @@ def _all_item_expected_value_variance(
         return None
 
     n_persons = theta.shape[0]
-    is_polytomous = bool(getattr(model, "is_polytomous", False))
-    n_categories = 1
-    if is_polytomous:
-        n_categories = getattr(model, "max_categories", None)
-        if n_categories is None:
-            category_counts = getattr(model, "n_categories", 1)
-            if np.isscalar(category_counts):
-                n_categories = int(category_counts)
-            else:
-                n_categories = max(category_counts)
-
-    probability_values = n_persons * n_items * int(n_categories)
+    probability_values = n_persons * _probability_values_per_row(model, n_items)
     if probability_values > _RESIDUAL_MAX_PROBABILITY_VALUES:
         return None
 
     probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-    if is_polytomous:
+    if bool(getattr(model, "is_polytomous", False)):
         if probabilities.ndim == 2 and n_items == 1:
             probabilities = probabilities[:, None, :]
         if (
@@ -450,14 +478,28 @@ def compute_residuals(
     return computation.residuals[residual_type]
 
 
-def _analyze_residuals(
+def analyze_residuals(
     model: BaseItemModel,
     responses: NDArray[np.int_],
-    theta: NDArray[np.float64] | None,
-    *,
-    store_variances: bool,
-) -> tuple[ResidualAnalysisResult, NDArray[np.float64] | None]:
-    """Build residual analysis and optionally retain variances for fit statistics."""
+    theta: NDArray[np.float64] | None = None,
+) -> ResidualAnalysisResult:
+    """Comprehensive residual analysis for IRT model.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted IRT model
+    responses : ndarray
+        Response matrix
+    theta : ndarray, optional
+        Ability estimates
+
+    Returns
+    -------
+    ResidualAnalysisResult
+        Complete residual analysis results
+    """
+    responses = np.asarray(responses)
     theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
@@ -465,7 +507,6 @@ def _analyze_residuals(
         theta_array,
         ("raw", "standardized", "pearson", "deviance"),
         store_expected=True,
-        store_variances=store_variances,
     )
     raw = computation.residuals["raw"]
     standardized = computation.residuals["standardized"]
@@ -518,7 +559,7 @@ def _analyze_residuals(
             stats["mean_z"] = 0
             stats["mean_z_sq"] = 0
 
-    result = ResidualAnalysisResult(
+    return ResidualAnalysisResult(
         raw_residuals=raw,
         standardized_residuals=standardized,
         pearson_residuals=pearson,
@@ -530,85 +571,6 @@ def _analyze_residuals(
         pattern_residuals=pattern_residuals,
         item_residuals=item_residuals,
     )
-    return result, computation.variances
-
-
-def analyze_residuals(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    theta: NDArray[np.float64] | None = None,
-) -> ResidualAnalysisResult:
-    """Comprehensive residual analysis for IRT model.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
-    theta : ndarray, optional
-        Ability estimates
-
-    Returns
-    -------
-    ResidualAnalysisResult
-        Complete residual analysis results
-    """
-    responses = np.asarray(responses)
-    result, _ = _analyze_residuals(
-        model,
-        responses,
-        theta,
-        store_variances=False,
-    )
-    return result
-
-
-def _fit_statistics(
-    standardized_residuals: NDArray[np.float64],
-    variances: NDArray[np.float64],
-) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
-    """Aggregate residuals in bounded chunks without full-size temporaries."""
-    if standardized_residuals.shape != variances.shape:
-        raise ValueError("standardized_residuals and variances must have equal shapes")
-
-    n_persons, n_items = standardized_residuals.shape
-    accumulator = _FitAccumulator.create(n_persons, n_items)
-
-    chunk_size = min(
-        n_items,
-        max(1, _FIT_STATISTICS_CHUNK_ELEMENTS // max(1, n_persons)),
-    )
-    for start in range(0, n_items, chunk_size):
-        stop = min(start + chunk_size, n_items)
-        residual_block = standardized_residuals[:, start:stop]
-        variance_block = variances[:, start:stop]
-        valid = np.isfinite(residual_block)
-        squared = np.zeros_like(residual_block)
-        np.square(residual_block, out=squared, where=valid)
-
-        accumulator.item_square_sum[start:stop] = np.sum(squared, axis=0)
-        accumulator.item_n[start:stop] = np.sum(valid, axis=0, dtype=np.intp)
-        accumulator.person_square_sum += np.sum(squared, axis=1)
-        accumulator.person_n += np.sum(valid, axis=1, dtype=np.intp)
-        accumulator.item_variance_sum[start:stop] = np.sum(
-            variance_block,
-            axis=0,
-            where=valid,
-            initial=0.0,
-        )
-        accumulator.person_variance_sum += np.sum(
-            variance_block,
-            axis=1,
-            where=valid,
-            initial=0.0,
-        )
-
-        np.multiply(squared, variance_block, out=squared, where=valid)
-        accumulator.item_weighted_sum[start:stop] = np.sum(squared, axis=0)
-        accumulator.person_weighted_sum += np.sum(squared, axis=1)
-
-    return accumulator.finish()
 
 
 def _stream_fit_statistics(
@@ -698,6 +660,10 @@ def identify_misfitting_patterns(
 ) -> dict[str, list]:
     """Identify misfitting persons and items.
 
+    Compute standardized residuals in bounded probability blocks and retain only
+    flagged entries and fit-statistic totals. Models without batch metadata
+    retain the itemwise probability fallback.
+
     Parameters
     ----------
     model : BaseItemModel
@@ -717,14 +683,45 @@ def identify_misfitting_patterns(
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
     responses = np.asarray(responses)
-    analysis, variances = _analyze_residuals(
-        model,
-        responses,
-        theta,
-        store_variances=True,
-    )
-    assert variances is not None
-    fit_stats = _fit_statistics(analysis.standardized_residuals, variances)
+    theta_array = _resolve_theta(model, responses, theta)
+    n_persons, n_items = responses.shape
+    accumulator = _FitAccumulator.create(n_persons, n_items)
+    rows_per_chunk = max(1, n_persons)
+    if getattr(model, "n_items", None) == n_items:
+        rows_per_chunk = max(
+            1,
+            min(_MISFIT_TARGET_CHUNK_ELEMENTS, _RESIDUAL_MAX_PROBABILITY_VALUES)
+            // max(1, _probability_values_per_row(model, n_items)),
+        )
+
+    aberrant: list[dict] = []
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block = responses[start:stop]
+        computation = _compute_residual_arrays(
+            model,
+            block,
+            theta_array[start:stop],
+            ("standardized",),
+            store_expected=True,
+            store_variances=True,
+        )
+        z = computation.residuals["standardized"]
+        expected = computation.expected_values
+        variances = computation.variances
+        assert expected is not None and variances is not None
+        accumulator.add(z, variances, rows=slice(start, stop))
+        aberrant.extend(
+            {
+                "person": int(start + i),
+                "item": int(j),
+                "response": block[i, j],
+                "expected": expected[i, j],
+                "z": z[i, j],
+            }
+            for i, j in np.argwhere(np.isfinite(z) & (np.abs(z) > z_threshold))
+        )
+    fit_stats = accumulator.finish()
 
     misfitting_items = [
         {
@@ -741,18 +738,6 @@ def identify_misfitting_patterns(
             "infit": fit_stats["person_infit"][i],
         }
         for i in np.flatnonzero(fit_stats["person_outfit"] > outfit_threshold)
-    ]
-
-    z = analysis.standardized_residuals
-    aberrant = [
-        {
-            "person": int(i),
-            "item": int(j),
-            "response": responses[i, j],
-            "expected": analysis.expected_values[i, j],
-            "z": z[i, j],
-        }
-        for i, j in np.argwhere(np.isfinite(z) & (np.abs(z) > z_threshold))
     ]
 
     return {
