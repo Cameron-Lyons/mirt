@@ -483,7 +483,8 @@ def bench_fit_statistics(
     repeats: int,
     warmups: int = 0,
 ) -> list[BenchResult]:
-    """Measure mean squares and person fit, including temporary allocations."""
+    """Measure mean squares and item/person fit, including allocations."""
+    from mirt.diagnostics.itemfit import compute_itemfit
     from mirt.diagnostics.personfit import compute_personfit
     from mirt.models.dichotomous import TwoParameterLogistic
     from mirt.models.polytomous import GradedResponseModel
@@ -524,6 +525,20 @@ def bench_fit_statistics(
         times = _time(run_personfit, repeats=repeats, warmups=warmups)
         results.append(
             BenchResult(f"personfit_{name}", times, _peak_traced_bytes(run_personfit))
+        )
+
+        def run_itemfit():
+            return compute_itemfit(
+                model,
+                responses,
+                theta=theta,
+                statistics=["infit", "outfit", "S_X2"],
+                p_adjust="fdr_bh",
+            )
+
+        times = _time(run_itemfit, repeats=repeats, warmups=warmups)
+        results.append(
+            BenchResult(f"itemfit_{name}", times, _peak_traced_bytes(run_itemfit))
         )
     return results
 

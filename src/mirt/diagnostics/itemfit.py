@@ -11,13 +11,14 @@ from mirt.diagnostics.multiple_testing import (
     _validate_p_value_adjustment,
     adjust_p_values,
 )
-from mirt.utils.numeric import compute_expected_variance, compute_fit_stats
+from mirt.utils.numeric import _FitStatsAccumulator, compute_expected_variance
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
 _SX2_TARGET_CHUNK_ELEMENTS = 1_000_000
+_ITEMFIT_TARGET_CHUNK_ELEMENTS = 262_144
 
 
 def compute_itemfit(
@@ -34,6 +35,9 @@ def compute_itemfit(
     the keys ``"S_X2"``, ``"df"``, and ``"p_value"``. When ``p_adjust`` is
     not ``"none"``, ``"p_value_adjusted"`` contains multiplicity-adjusted
     p-values across items.
+
+    Probabilities, score moments, and group reductions use bounded row blocks.
+    Score groups and multiplicity corrections use the full population.
     """
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     if statistics is None:
@@ -44,6 +48,15 @@ def compute_itemfit(
 
     responses = np.asarray(responses)
     n_persons, n_items = responses.shape
+    if n_persons == 0:
+        raise ValueError("responses must contain at least one person")
+
+    compute_mean_squares = "infit" in statistics or "outfit" in statistics
+    compute_sx2 = "S_X2" in statistics
+    if not compute_mean_squares and not compute_sx2:
+        return {}
+    if compute_sx2:
+        n_groups = _validate_n_groups(n_groups)
 
     if theta is None:
         from mirt.scoring import fscores
@@ -55,11 +68,47 @@ def compute_itemfit(
     if theta.ndim == 1:
         theta = theta.reshape(-1, 1)
 
-    expected, variance = compute_expected_variance(model, theta, n_items)
-    result: dict[str, NDArray[np.float64]] = {}
+    if theta.ndim != 2 or theta.shape[0] != n_persons:
+        raise ValueError("theta must be a matrix with one row per person")
 
-    if "outfit" in statistics or "infit" in statistics:
-        infit, outfit = compute_fit_stats(responses, expected, variance, axis=0)
+    category_width = max(model.n_categories) if model.is_polytomous else 1
+    rows_per_chunk = max(
+        1, _ITEMFIT_TARGET_CHUNK_ELEMENTS // max(n_items * category_width, 1)
+    )
+    accumulator = _FitStatsAccumulator(n_items) if compute_mean_squares else None
+    group_indices = None
+    if compute_sx2:
+        group_indices = _score_group_indices(responses, n_groups)
+        score_scales = (
+            np.asarray(model.n_categories, dtype=np.float64) - 1.0
+            if model.is_polytomous
+            else np.ones(n_items)
+        )
+        group_sums = tuple(np.zeros((n_groups, n_items)) for _ in range(3))
+
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block_responses = responses[start:stop]
+        expected, variance = compute_expected_variance(
+            model, theta[start:stop], n_items
+        )
+        if accumulator is not None:
+            accumulator.add(block_responses, expected, variance)
+        if group_indices is not None:
+            block_sums = _grouped_item_sums(
+                block_responses,
+                expected,
+                block_responses >= 0,
+                group_indices[start:stop],
+                score_scales,
+                n_groups,
+            )
+            for total, block_sum in zip(group_sums, block_sums, strict=True):
+                total += block_sum
+
+    result: dict[str, NDArray[np.float64]] = {}
+    if accumulator is not None:
+        infit, outfit = accumulator.finish()
 
         if "outfit" in statistics:
             result["outfit"] = outfit
@@ -67,13 +116,8 @@ def compute_itemfit(
         if "infit" in statistics:
             result["infit"] = infit
 
-    if "S_X2" in statistics:
-        s_x2_result = _compute_s_x2_from_expected(
-            model,
-            responses,
-            expected,
-            n_groups=n_groups,
-        )
+    if group_indices is not None:
+        s_x2_result = _s_x2_from_group_sums(*group_sums)
         _include_adjusted_p_values(s_x2_result, p_adjust)
         result.update(s_x2_result)
 
@@ -100,46 +144,37 @@ def _validate_n_groups(n_groups: int) -> int:
     return int(n_groups)
 
 
-def _compute_s_x2_from_expected(
-    model: BaseItemModel,
+def _score_group_indices(
     responses: NDArray[np.int_],
-    expected: NDArray[np.float64],
-    *,
     n_groups: int,
-) -> dict[str, NDArray[np.float64]]:
-    """Aggregate observed and expected scores into S-X2 statistics."""
-    from scipy import special
-
-    n_groups = _validate_n_groups(n_groups)
+) -> NDArray[np.intp]:
+    """Build population-wide score groups without a full-size missing mask."""
     n_persons, n_items = responses.shape
-    if n_persons == 0:
-        raise ValueError("responses must contain at least one person")
-
-    valid_mask = responses >= 0
-    sum_scores = np.sum(np.where(valid_mask, responses, 0), axis=1)
+    sum_scores = np.empty(n_persons, dtype=np.sum(responses[:0], axis=1).dtype)
+    rows_per_chunk = max(1, _SX2_TARGET_CHUNK_ELEMENTS // max(n_items, 1))
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block = responses[start:stop]
+        sum_scores[start:stop] = np.sum(np.where(block >= 0, block, 0), axis=1)
     score_cuts = np.percentile(
         sum_scores,
         np.linspace(0.0, 100.0, n_groups + 1),
     )
-    group_indices = np.searchsorted(
+    return np.searchsorted(
         score_cuts[1:-1],
         sum_scores,
         side="right",
     )
 
-    if model.is_polytomous:
-        score_scales = np.asarray(model.n_categories, dtype=np.float64) - 1.0
-    else:
-        score_scales = np.ones(n_items, dtype=np.float64)
 
-    counts, observed_sums, expected_sums = _grouped_item_sums(
-        responses,
-        expected,
-        valid_mask,
-        group_indices,
-        score_scales,
-        n_groups,
-    )
+def _s_x2_from_group_sums(
+    counts: NDArray[np.float64],
+    observed_sums: NDArray[np.float64],
+    expected_sums: NDArray[np.float64],
+) -> dict[str, NDArray[np.float64]]:
+    """Apply count floors and compute S-X2 after all blocks have accumulated."""
+    from scipy import special
+
     eligible = counts >= 5
     safe_counts = np.where(eligible, counts, 1.0)
     observed_means = observed_sums / safe_counts
@@ -243,27 +278,11 @@ def compute_s_x2(
     ``"p_value_adjusted"`` key. The default preserves the original result
     shape.
     """
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    n_groups = _validate_n_groups(n_groups)
-    responses = np.asarray(responses)
-    _, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        score_result = fscores(model, responses, method="EAP")
-        theta = score_result.theta
-
-    theta_array = np.asarray(theta)
-    if theta_array.ndim == 1:
-        theta_array = theta_array.reshape(-1, 1)
-
-    expected, _ = compute_expected_variance(model, theta_array, n_items)
-    result = _compute_s_x2_from_expected(
+    return compute_itemfit(
         model,
         responses,
-        expected,
+        statistics=["S_X2"],
+        theta=theta,
         n_groups=n_groups,
+        p_adjust=p_adjust,
     )
-    _include_adjusted_p_values(result, p_adjust)
-    return result
