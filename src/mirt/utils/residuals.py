@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._correlation import pairwise_correlations
 from mirt.constants import PROB_EPSILON
 
 _MIN_LD_PAIR_RESPONSES = 5
@@ -430,55 +431,11 @@ def _compute_ld_matrix(
     ):
         raise ValueError("suppress_abs must be finite and nonnegative")
 
-    valid = np.isfinite(values)
-    valid_float = valid.astype(np.float64)
-    filled = np.where(valid, values, 0.0)
-    counts = valid_float.T @ valid_float
-    sums = filled.T @ valid_float
-    squared_sums = (filled**2).T @ valid_float
-    cross_products = filled.T @ filled
-
-    n_items = values.shape[1]
-    ld_matrix = np.full((n_items, n_items), np.nan, dtype=np.float64)
-    row_indices, column_indices = np.triu_indices(n_items, k=1)
-    pair_counts = counts[row_indices, column_indices]
-    sum_rows = sums[row_indices, column_indices]
-    sum_columns = sums[column_indices, row_indices]
-    covariance = cross_products[row_indices, column_indices] - np.divide(
-        sum_rows * sum_columns,
-        pair_counts,
-        out=np.zeros_like(pair_counts),
-        where=pair_counts > 0,
-    )
-    variance_rows = squared_sums[row_indices, column_indices] - np.divide(
-        sum_rows**2,
-        pair_counts,
-        out=np.zeros_like(pair_counts),
-        where=pair_counts > 0,
-    )
-    variance_columns = squared_sums[column_indices, row_indices] - np.divide(
-        sum_columns**2,
-        pair_counts,
-        out=np.zeros_like(pair_counts),
-        where=pair_counts > 0,
-    )
-    denominator = np.sqrt(
-        np.maximum(variance_rows, 0.0) * np.maximum(variance_columns, 0.0)
-    )
-    pair_correlations = np.divide(
-        covariance,
-        denominator,
-        out=np.full_like(covariance, np.nan),
-        where=(pair_counts > 2) & (denominator > PROB_EPSILON),
+    ld_matrix, _ = pairwise_correlations(
+        values, min_count=3, min_denominator=PROB_EPSILON
     )
     if suppress_abs is not None:
-        pair_correlations = np.where(
-            np.abs(pair_correlations) < suppress_abs,
-            0.0,
-            pair_correlations,
-        )
-    ld_matrix[row_indices, column_indices] = pair_correlations
-    ld_matrix[column_indices, row_indices] = pair_correlations
+        ld_matrix[np.abs(ld_matrix) < suppress_abs] = 0.0
     np.fill_diagonal(ld_matrix, 1.0)
     return ld_matrix
 

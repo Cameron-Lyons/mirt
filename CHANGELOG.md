@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Consolidated pairwise residual correlations across diagnostics, testlet models,
+  and NumPy backend fallbacks into one bounded-memory kernel. Complete-data blocks
+  use a single matrix product, and column offsets improve numerical stability.
+- Added a `diagnostics` benchmark suite for complete/missing-data Q3 timing and
+  traced Python/NumPy memory peaks.
 - Kept EM convergence and final likelihoods in log space to avoid underflow on
   long tests, and reused built-in likelihood buffers for posterior normalization.
 - Batched generic EM expected counts with bounded matrix products and cached

@@ -142,6 +142,20 @@ Keep BLAS thread settings the same when comparing runs. Pairwise counts use
 bounded floating-point matrix products with exact integer accumulation;
 imputation and item statistics share bounded category counting.
 
+The `diagnostics` suite measures the shared NumPy Q3 correlation kernel on
+complete residuals and residuals with 15% missing entries. Timing excludes model
+fitting and probability evaluation. Each workload also records a separate
+`tracemalloc` peak for Python/NumPy allocations, rather than process RSS:
+
+```bash
+OPENBLAS_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite diagnostics --persons 20000 --items 150 --repeats 7 --warmups 1 --backend numpy --json /tmp/mirt-diagnostics.json
+```
+
+Residual utilities, local-dependence diagnostics, testlet Q3, and the native
+backend's NumPy fallback share the correlation kernel. It processes bounded row
+blocks and skips missing-data matrix products for complete blocks. Each caller
+retains its minimum pair count, undefined-value, and diagonal conventions.
+
 To measure native likelihoods, GRM/GPCM/PCM fits, MAP/ML scoring, and repetitive
 EM data, use the `kernels` and `optimization` suites:
 

@@ -29,6 +29,7 @@ SUITE_ORDER = (
     "posterior",
     "patterns",
     "data",
+    "diagnostics",
     "cat",
     "kernels",
     "optimization",
@@ -152,6 +153,16 @@ def _time(
         fn()
         times.append(time.perf_counter() - start)
     return tuple(times)
+
+
+def _peak_traced_bytes(fn: Callable[[], object]) -> int:
+    """Measure Python/NumPy allocations in a separate, untimed execution."""
+    tracemalloc.start()
+    try:
+        fn()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
 
 
 def bench_em_fit(
@@ -332,12 +343,7 @@ def bench_information(
         )
 
     times = _time(run, repeats=repeats, warmups=warmups)
-    tracemalloc.start()
-    try:
-        run()
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
+    peak = _peak_traced_bytes(run)
     return BenchResult("marginal_information", times, peak_traced_bytes=peak)
 
 
@@ -427,6 +433,29 @@ def bench_data(
         BenchResult(name, _time(run, repeats=repeats, warmups=warmups))
         for name, run in workloads
     ]
+
+
+def bench_diagnostics(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure shared NumPy Q3 kernels with complete and incomplete residuals."""
+    from mirt.utils.residuals import _compute_ld_matrix
+
+    rng = np.random.default_rng(4781)
+    results = []
+    for name, missing_fraction in (("q3_complete", 0.0), ("q3_missing", 0.15)):
+        residuals = rng.normal(size=(n_persons, n_items))
+        residuals[rng.random(residuals.shape) < missing_fraction] = np.nan
+
+        def run():
+            return _compute_ld_matrix(residuals)
+
+        times = _time(run, repeats=repeats, warmups=warmups)
+        results.append(BenchResult(name, times, _peak_traced_bytes(run)))
+    return results
 
 
 def bench_cat(
@@ -570,6 +599,8 @@ def run_suites(
         results.extend(bench_patterns(n_persons, n_items, repeats, warmups))
     if "data" in suites:
         results.extend(bench_data(n_persons, n_items, repeats, warmups))
+    if "diagnostics" in suites:
+        results.extend(bench_diagnostics(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
     if "kernels" in suites:
@@ -699,6 +730,8 @@ def _validate_baseline_compatibility(
         "pairwise_available",
         "mode_imputation",
         "item_statistics",
+        "q3_complete",
+        "q3_missing",
         "likelihood_2pl",
         "likelihood_grm",
         "likelihood_gpcm",
