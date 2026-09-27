@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 
 _PROBABILITY_TOLERANCE = 1e-10
+_FIT_TARGET_CHUNK_ELEMENTS = 262_144
 
 
 @lru_cache(maxsize=16)
@@ -300,6 +301,12 @@ def compute_fit_stats(
         Infit mean square statistics.
     outfit : array
         Outfit mean square statistics.
+
+    Notes
+    -----
+    Temporary arrays are limited to a block of rows (at least one row).
+    Missing responses and zero-variance entries retain separate infit and
+    outfit eligibility rules; final ratios use sums across all blocks.
     """
     if isinstance(axis, (bool, np.bool_)) or axis not in (0, 1):
         raise ValueError("axis must be 0 or 1")
@@ -309,40 +316,55 @@ def compute_fit_stats(
     variance_array = np.asarray(variance, dtype=np.float64)
     if response_array.ndim != 2:
         raise ValueError("responses must be a two-dimensional array")
-    if response_array.dtype.kind not in "biuf" or not np.all(
-        np.isfinite(response_array)
-    ):
+    if response_array.dtype.kind not in "biuf":
         raise ValueError("responses must contain only finite numeric values")
     if expected_array.shape != response_array.shape:
         raise ValueError("expected must have the same shape as responses")
     if variance_array.shape != response_array.shape:
         raise ValueError("variance must have the same shape as responses")
-    if not np.all(np.isfinite(expected_array)):
-        raise ValueError("expected must contain only finite values")
-    if not np.all(np.isfinite(variance_array)) or np.any(
-        variance_array < -_PROBABILITY_TOLERANCE
-    ):
-        raise ValueError("variance must contain finite non-negative values")
 
-    variance_array = np.maximum(variance_array, 0.0)
-    valid_mask = response_array >= 0
-    residuals_squared = (response_array - expected_array) ** 2
+    n_persons, n_items = response_array.shape
+    output_size = response_array.shape[1 - axis]
+    infit_numerator = np.zeros(output_size)
+    infit_denominator = np.zeros(output_size)
+    outfit_sum = np.zeros(output_size)
+    outfit_count = np.zeros(output_size, dtype=np.intp)
+    rows_per_chunk = max(1, _FIT_TARGET_CHUNK_ELEMENTS // max(n_items, 1))
 
-    outfit_mask = valid_mask & (variance_array > PROB_EPSILON)
-    standardized_squared = np.zeros_like(variance_array)
-    np.divide(
-        residuals_squared,
-        variance_array,
-        out=standardized_squared,
-        where=outfit_mask,
-    )
-    outfit_count = np.sum(outfit_mask, axis=axis)
-    outfit_sum = np.sum(standardized_squared, axis=axis)
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        block_responses = response_array[start:stop]
+        block_expected = expected_array[start:stop]
+        block_variance = variance_array[start:stop]
+        if not np.all(np.isfinite(block_responses)):
+            raise ValueError("responses must contain only finite numeric values")
+        if not np.all(np.isfinite(block_expected)):
+            raise ValueError("expected must contain only finite values")
+        if not np.all(np.isfinite(block_variance)) or np.any(
+            block_variance < -_PROBABILITY_TOLERANCE
+        ):
+            raise ValueError("variance must contain finite non-negative values")
+
+        block_variance = np.maximum(block_variance, 0.0)
+        valid = block_responses >= 0
+        squared = np.where(valid, block_responses, block_expected)
+        squared -= block_expected
+        np.square(squared, out=squared)
+        target = slice(start, stop) if axis == 1 else slice(None)
+        infit_numerator[target] += np.sum(squared, axis=axis)
+        block_variance = np.where(valid, block_variance, 0.0)
+        infit_denominator[target] += np.sum(block_variance, axis=axis)
+
+        eligible = block_variance > PROB_EPSILON
+        outfit_count[target] += np.sum(eligible, axis=axis)
+        squared = np.where(eligible, squared, 0.0)
+        np.maximum(block_variance, PROB_EPSILON, out=block_variance)
+        np.divide(squared, block_variance, out=squared)
+        outfit_sum[target] += np.sum(squared, axis=axis)
+
     outfit = np.full_like(outfit_sum, np.nan, dtype=np.float64)
     np.divide(outfit_sum, outfit_count, out=outfit, where=outfit_count > 0)
 
-    infit_numerator = np.sum(np.where(valid_mask, residuals_squared, 0.0), axis=axis)
-    infit_denominator = np.sum(np.where(valid_mask, variance_array, 0.0), axis=axis)
     infit = np.full_like(infit_numerator, np.nan, dtype=np.float64)
     np.divide(
         infit_numerator,
