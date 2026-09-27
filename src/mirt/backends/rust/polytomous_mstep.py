@@ -15,6 +15,7 @@ from mirt.backends.rust._helpers import _ensure_f64, _ensure_i32, mirt_rs, rust_
 FALLBACK_MODE = "optional"
 
 if TYPE_CHECKING:
+    from mirt.estimation._em_context import EMFitContext
     from mirt.models.base import BaseItemModel
 
 
@@ -28,6 +29,7 @@ def try_polytomous_m_step(
     ftol: float,
     epsilon: float,
     n_jobs: int,
+    context: EMFitContext | None = None,
 ) -> bool:
     from mirt.models.polytomous import (
         GeneralizedPartialCredit,
@@ -70,6 +72,7 @@ def try_polytomous_m_step(
         free & ((packed < lower) | (packed > upper))
     ):
         return False
+    workers = resolve_n_jobs(n_jobs)
     optimized = mirt_rs.m_step_polytomous(
         _ensure_i32(responses),
         _ensure_f64(posterior),
@@ -81,7 +84,8 @@ def try_polytomous_m_step(
         int(max_iter),
         float(ftol),
         float(epsilon),
-        resolve_n_jobs(n_jobs),
+        workers,
+        None if context is None else context.native_pool(workers),
     )
     updated = {name: optimized[:, 1:]}
     if type(model) is not PartialCreditModel:

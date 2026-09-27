@@ -16,8 +16,10 @@ from mirt._gpu_backend import (
     compute_log_likelihoods_grm_gpu,
     is_gpu_available,
 )
-from mirt._rust_backend import RUST_AVAILABLE, em_iteration_3pl
+from mirt.backends.rust._helpers import RUST_AVAILABLE
+from mirt.backends.rust.estimation import em_iteration_3pl
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._em_context import EMFitContext
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import _valid_second_derivative
@@ -79,6 +81,7 @@ class EMEstimator(BaseEstimator):
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
         self._pattern_frequencies: NDArray[np.float64] | None = None
+        self._fit_context: EMFitContext | None = None
 
     @property
     def _should_use_gpu(self) -> bool:
@@ -94,21 +97,10 @@ class EMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
     ) -> FitResult:
+        from mirt.estimation._patterns import supports_pattern_compression
         from mirt.estimation.latent_density import GaussianDensity, create_density
-        from mirt.results.fit_result import FitResult
 
         responses = self._validate_responses(responses, model.n_items)
-        n_persons = responses.shape[0]
-        from mirt.estimation._patterns import (
-            compress_responses,
-            supports_pattern_compression,
-        )
-
-        self._pattern_frequencies = None
-        if type(self) is EMEstimator and supports_pattern_compression(model):
-            responses, self._pattern_frequencies = compress_responses(responses)
-        frequencies = self._pattern_frequencies
-
         self._quadrature = GaussHermiteQuadrature(
             n_points=self.n_quadpts,
             n_dimensions=model.n_factors,
@@ -136,7 +128,26 @@ class EMEstimator(BaseEstimator):
         if not model._is_fitted:
             model._initialize_parameters()
 
-        valid_masks = [responses[:, j] >= 0 for j in range(model.n_items)]
+        builtin = supports_pattern_compression(model)
+        with EMFitContext(
+            responses,
+            compress=type(self) is EMEstimator and builtin,
+            native=builtin and should_use_rust(self.use_rust),
+        ) as context:
+            self._fit_context = context
+            self._pattern_frequencies = context.frequencies
+            try:
+                return self._fit_prepared(model, context)
+            finally:
+                self._fit_context = None
+
+    def _fit_prepared(self, model: BaseItemModel, context: EMFitContext) -> FitResult:
+        from mirt.results.fit_result import FitResult
+
+        responses = context.responses
+        n_persons = context.n_observations
+        frequencies = context.frequencies
+        valid_masks = [context.observed[:, j] for j in range(model.n_items)]
         use_rust_3pl = self._can_use_rust_3pl(model, responses)
 
         self._convergence_history = []
@@ -151,12 +162,9 @@ class EMEstimator(BaseEstimator):
                     use_rust_3pl = False
 
             if rust_result is None:
-                posterior_weights, marginal_ll = self._e_step(model, responses)
+                posterior_weights, log_marginal = self._e_step(model, responses)
                 current_ll = float(
-                    np.sum(
-                        np.log(marginal_ll + 1e-300)
-                        * (1.0 if frequencies is None else frequencies)
-                    )
+                    np.sum(log_marginal * (1.0 if frequencies is None else frequencies))
                 )
             else:
                 (
@@ -196,12 +204,9 @@ class EMEstimator(BaseEstimator):
             n_k = weighted_posterior.sum(axis=0)
             self._latent_density.update(self._quadrature.nodes, n_k)
         else:
-            posterior_weights, marginal_ll = self._e_step(model, responses)
+            posterior_weights, log_marginal = self._e_step(model, responses)
             current_ll = float(
-                np.sum(
-                    np.log(marginal_ll + 1e-300)
-                    * (1.0 if frequencies is None else frequencies)
-                )
+                np.sum(log_marginal * (1.0 if frequencies is None else frequencies))
             )
             self._convergence_history.append(current_ll)
             converged = self._check_convergence(prev_ll, current_ll)
@@ -381,6 +386,7 @@ class EMEstimator(BaseEstimator):
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return normalized posterior weights and per-person log marginals."""
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
 
@@ -390,15 +396,22 @@ class EMEstimator(BaseEstimator):
             quad_points, quad_weights
         )
 
-        log_joint = log_likelihoods + log_prior_mass[None, :]
+        # Built-in likelihoods allocate their output. Custom likelihoods may
+        # return cached arrays or views, which must not be overwritten.
+        from mirt.estimation._patterns import supports_pattern_compression
 
-        log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-        log_posterior = log_joint - log_marginal
-
-        posterior_weights = np.exp(log_posterior)
-        marginal_ll = np.exp(log_marginal.ravel())
-
-        return posterior_weights, marginal_ll
+        if not (
+            type(self) is EMEstimator
+            and "_compute_log_likelihoods" not in vars(self)
+            and supports_pattern_compression(model)
+            and log_likelihoods.flags.writeable
+        ):
+            log_likelihoods = log_likelihoods.copy()
+        log_likelihoods += log_prior_mass[None, :]
+        log_marginal = logsumexp(log_likelihoods, axis=1)
+        log_likelihoods -= log_marginal[:, None]
+        np.exp(log_likelihoods, out=log_likelihoods)
+        return log_likelihoods, log_marginal
 
     def _compute_log_likelihoods(
         self,
@@ -498,7 +511,7 @@ class EMEstimator(BaseEstimator):
 
         quad_points = self._quadrature.nodes
         n_items = model.n_items
-        n_quad = len(quad_points)
+        context = self._fit_context
 
         if model.is_polytomous and should_use_rust(self.use_rust):
             from mirt.backends.rust.polytomous_mstep import try_polytomous_m_step
@@ -512,6 +525,7 @@ class EMEstimator(BaseEstimator):
                 ftol=self.item_optim_ftol,
                 epsilon=self.prob_epsilon,
                 n_jobs=self.n_jobs,
+                context=context,
             ):
                 return
 
@@ -521,15 +535,8 @@ class EMEstimator(BaseEstimator):
             valid_masks = [responses[:, j] >= 0 for j in range(n_items)]
 
         if not model.is_polytomous:
-            r_k_all = np.zeros((n_items, n_quad))
-            n_k_valid_all = np.zeros((n_items, n_quad))
-            for j in range(n_items):
-                valid = valid_masks[j]
-                item_resp = responses[:, j]
-                r_k_all[j] = np.sum(
-                    item_resp[valid, None] * posterior_weights[valid, :], axis=0
-                )
-                n_k_valid_all[j] = np.sum(posterior_weights[valid], axis=0)
+            prepared = context or EMFitContext(responses)
+            r_k_all, n_k_valid_all = prepared.expected_counts(posterior_weights)
         else:
             r_k_all = None
             n_k_valid_all = None
@@ -574,8 +581,13 @@ class EMEstimator(BaseEstimator):
                     n_k_valid,
                 )
 
-            with ThreadPoolExecutor(max_workers=min(n_jobs, n_items)) as executor:
-                results = list(executor.map(optimize_single_item, range(n_items)))
+            if context is not None:
+                results = list(
+                    context.executor(n_jobs).map(optimize_single_item, range(n_items))
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=min(n_jobs, n_items)) as executor:
+                    results = list(executor.map(optimize_single_item, range(n_items)))
 
             for item_idx, optimal_params in results:
                 self._set_item_params(model, item_idx, optimal_params)

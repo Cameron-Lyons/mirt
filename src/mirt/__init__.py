@@ -114,11 +114,10 @@ def fit_mirt(
     import numpy as np
 
     from mirt._backend_config import should_use_rust
-    from mirt._rust_backend import (
-        compute_item_se_parallel,
-        e_step_complete,
-        em_fit_2pl,
-    )
+    from mirt.backends.rust.diagnostics import compute_item_se_parallel
+    from mirt.backends.rust.estep import e_step_complete
+    from mirt.backends.rust.estimation import _em_fit_2pl_prepared
+    from mirt.estimation._em_context import EMFitContext
     from mirt.estimation.em import EMEstimator
     from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
     from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -199,58 +198,63 @@ def fit_mirt(
         and n_factors == 1
         and estimation_method == "EM"
     ):
-        discrimination, difficulty, log_likelihood, n_iterations, converged = (
-            em_fit_2pl(data, n_quadpts=n_quadpts, max_iter=max_iter, tol=tol)
-        )
-
-        irt_model = TwoParameterLogistic(
-            n_items=n_items, n_factors=n_factors, item_names=item_names
-        )
-        discrimination = np.asarray(discrimination)
-        difficulty = np.asarray(difficulty)
-        irt_model._parameters = {
-            "discrimination": discrimination,
-            "difficulty": difficulty,
-        }
-        irt_model._is_fitted = True
-
-        standard_errors: dict[str, NDArray[np.float64]] = {}
-        if compute_standard_errors:
-            quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
-            posterior_weights, _ = e_step_complete(
-                data,
-                quad.nodes.ravel(),
-                quad.weights.ravel(),
-                discrimination,
-                difficulty,
+        with EMFitContext(data, compress=True, native=True) as context:
+            discrimination, difficulty, log_likelihood, n_iterations, converged = (
+                _em_fit_2pl_prepared(
+                    context.responses, n_quadpts, max_iter, tol, context.frequencies
+                )
             )
-            se_a, se_b = compute_item_se_parallel(
-                data,
-                posterior_weights,
-                quad.nodes.ravel(),
-                discrimination,
-                difficulty,
+
+            irt_model = TwoParameterLogistic(
+                n_items=n_items, n_factors=n_factors, item_names=item_names
             )
-            standard_errors = {
-                "discrimination": np.asarray(se_a),
-                "difficulty": np.asarray(se_b),
+            discrimination = np.asarray(discrimination)
+            difficulty = np.asarray(difficulty)
+            irt_model._parameters = {
+                "discrimination": discrimination,
+                "difficulty": difficulty,
             }
+            irt_model._is_fitted = True
 
-        n_params = 2 * n_items
-        aic = -2 * log_likelihood + 2 * n_params
-        bic = -2 * log_likelihood + np.log(n_persons) * n_params
+            standard_errors: dict[str, NDArray[np.float64]] = {}
+            if compute_standard_errors:
+                quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
+                posterior_weights, _ = e_step_complete(
+                    context.responses,
+                    quad.nodes.ravel(),
+                    quad.weights.ravel(),
+                    discrimination,
+                    difficulty,
+                )
+                if context.frequencies is not None:
+                    posterior_weights *= context.frequencies[:, None]
+                se_a, se_b = compute_item_se_parallel(
+                    context.responses,
+                    posterior_weights,
+                    quad.nodes.ravel(),
+                    discrimination,
+                    difficulty,
+                )
+                standard_errors = {
+                    "discrimination": np.asarray(se_a),
+                    "difficulty": np.asarray(se_b),
+                }
 
-        return FitResult(
-            model=irt_model,
-            log_likelihood=log_likelihood,
-            n_iterations=n_iterations,
-            converged=converged,
-            standard_errors=standard_errors,
-            aic=aic,
-            bic=bic,
-            n_observations=n_persons,
-            n_parameters=n_params,
-        )
+            n_params = 2 * n_items
+            aic = -2 * log_likelihood + 2 * n_params
+            bic = -2 * log_likelihood + np.log(n_persons) * n_params
+
+            return FitResult(
+                model=irt_model,
+                log_likelihood=log_likelihood,
+                n_iterations=n_iterations,
+                converged=converged,
+                standard_errors=standard_errors,
+                aic=aic,
+                bic=bic,
+                n_observations=n_persons,
+                n_parameters=n_params,
+            )
 
     if model == "1PL":
         irt_model = OneParameterLogistic(n_items=n_items, item_names=item_names)

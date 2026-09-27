@@ -104,6 +104,55 @@ def test_public_backend_export_order_is_unchanged() -> None:
     assert rust_backend.__all__ == list(EXPECTED_EXPORTS)
 
 
+def test_compatibility_shim_defers_and_caches_symbols() -> None:
+    result = _run_probe(
+        """
+        import json
+        import sys
+        import mirt._rust_backend as legacy
+
+        unloaded = "numpy" not in sys.modules
+        available = legacy.RUST_AVAILABLE
+        modules = sorted(name for name in sys.modules
+                         if name.startswith("mirt.backends.rust."))
+        cached = "RUST_AVAILABLE" in legacy.__dict__
+        from mirt.backends.rust._helpers import RUST_AVAILABLE
+        try:
+            legacy.no_such_function
+        except AttributeError:
+            unknown_rejected = True
+        else:
+            unknown_rejected = False
+        print(json.dumps({
+            "unloaded": unloaded,
+            "modules": modules,
+            "cached": cached,
+            "same": available is RUST_AVAILABLE,
+            "unknown_rejected": unknown_rejected,
+            "exports_visible": all(name in dir(legacy) for name in legacy.__all__),
+        }))
+        """
+    )
+    assert result == {
+        "unloaded": True,
+        "modules": ["mirt.backends.rust._helpers"],
+        "cached": True,
+        "same": True,
+        "unknown_rejected": True,
+        "exports_visible": True,
+    }
+
+
+def test_compatibility_star_import_retains_all_exports() -> None:
+    import mirt.backends.rust as backend
+
+    namespace = {}
+    exec("from mirt._rust_backend import *", namespace)
+    for name in EXPECTED_EXPORTS:
+        assert namespace[name] is getattr(backend, name)
+    assert namespace["_MAX_VECTOR_CHUNK_ENTRIES"] == 1_000_000
+
+
 def test_plain_backend_import_defers_dependencies_and_modules() -> None:
     result = _run_probe(
         """

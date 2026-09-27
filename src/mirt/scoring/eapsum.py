@@ -348,7 +348,7 @@ class EAPSumScorer:
         Uses Lord-Wingersky recursion for efficiency.
         Uses Rust backend when available for ~10x speedup.
         """
-        from mirt._rust_backend import lord_wingersky_recursion
+        from mirt.backends.rust.eapsum import lord_wingersky_recursion
 
         if item_indices is None:
             item_indices = tuple(range(model.n_items))

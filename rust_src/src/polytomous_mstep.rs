@@ -8,6 +8,28 @@ use rayon::prelude::*;
 
 use crate::utils::sigmoid;
 
+/// Worker pool whose lifetime is controlled by the Python fit context.
+#[pyclass]
+pub struct EMThreadPool {
+    pool: rayon::ThreadPool,
+}
+
+#[pymethods]
+impl EMThreadPool {
+    #[new]
+    fn new(n_jobs: usize) -> PyResult<Self> {
+        if n_jobs == 0 {
+            return Err(PyValueError::new_err("n_jobs must be positive"));
+        }
+        Ok(Self {
+            pool: rayon::ThreadPoolBuilder::new()
+                .num_threads(n_jobs)
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+        })
+    }
+}
+
 /// Negative expected log likelihood and its gradient in (a, b_1, ...).
 fn objective(
     x: &[f64],
@@ -227,6 +249,7 @@ fn optimize(
 }
 
 #[pyfunction]
+#[pyo3(signature = (responses, posterior, points, parameters, free, categories, grm, max_iter, ftol, epsilon, n_jobs, pool=None))]
 #[allow(clippy::too_many_arguments)]
 pub fn m_step_polytomous<'py>(
     py: Python<'py>,
@@ -241,6 +264,7 @@ pub fn m_step_polytomous<'py>(
     ftol: f64,
     epsilon: f64,
     n_jobs: usize,
+    pool: Option<PyRef<'_, EMThreadPool>>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
     let responses = responses.as_array();
     let posterior = posterior.as_array();
@@ -316,15 +340,22 @@ pub fn m_step_polytomous<'py>(
         }
         params
     };
+    let shared_pool = pool.as_ref().map(|value| &value.pool);
+    if shared_pool.is_some_and(|pool| pool.current_num_threads() != n_jobs.min(items)) {
+        return Err(PyValueError::new_err(
+            "pool size must match n_jobs and item count",
+        ));
+    }
     let results = py.detach(|| -> PyResult<Vec<Vec<f64>>> {
         if n_jobs == 1 || items < 2 {
             Ok((0..items).map(fit_item).collect())
-        } else {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(n_jobs.min(items))
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        } else if let Some(pool) = shared_pool {
             Ok(pool.install(|| (0..items).into_par_iter().map(fit_item).collect()))
+        } else {
+            let pool = EMThreadPool::new(n_jobs.min(items))?;
+            Ok(pool
+                .pool
+                .install(|| (0..items).into_par_iter().map(fit_item).collect()))
         }
     })?;
     let output = Array2::from_shape_vec(parameters.dim(), results.into_iter().flatten().collect())
@@ -333,6 +364,7 @@ pub fn m_step_polytomous<'py>(
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<EMThreadPool>()?;
     m.add_function(wrap_pyfunction!(m_step_polytomous, m)?)?;
     Ok(())
 }

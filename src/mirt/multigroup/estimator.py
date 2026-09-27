@@ -7,7 +7,7 @@ from numpy.typing import NDArray
 from scipy.optimize import minimize
 
 from mirt._backend_config import should_use_rust
-from mirt._rust_backend import (
+from mirt.backends.rust.multigroup import (
     multigroup_e_step_2pl,
     multigroup_e_step_3pl,
     multigroup_e_step_gpcm,

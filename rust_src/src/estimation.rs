@@ -73,7 +73,7 @@ pub fn em_fit_2pl<'py>(
         for iter in 0..max_iter {
             iteration = iter + 1;
 
-            let (mut posterior_weights, marginal_ll) = e_step_2pl_internal(
+            let (mut posterior_weights, log_marginal) = e_step_2pl_internal(
                 &responses,
                 &quad_points,
                 &quad_weights,
@@ -84,10 +84,10 @@ pub fn em_fit_2pl<'py>(
                 n_quadpts,
             );
 
-            let current_ll: f64 = marginal_ll
+            let current_ll: f64 = log_marginal
                 .iter()
                 .zip(&frequencies)
-                .map(|(&value, &frequency)| frequency * value.max(f64::MIN_POSITIVE).ln())
+                .map(|(&value, &frequency)| frequency * value)
                 .sum();
 
             if (current_ll - prev_ll).abs() < tol {
@@ -112,7 +112,7 @@ pub fn em_fit_2pl<'py>(
             );
         }
 
-        let (_, final_marginal) = e_step_2pl_internal(
+        let (_, final_log_marginal) = e_step_2pl_internal(
             &responses,
             &quad_points,
             &quad_weights,
@@ -122,10 +122,10 @@ pub fn em_fit_2pl<'py>(
             n_items,
             n_quadpts,
         );
-        let final_log_likelihood = final_marginal
+        let final_log_likelihood = final_log_marginal
             .iter()
             .zip(&frequencies)
-            .map(|(&value, &frequency)| frequency * value.max(f64::MIN_POSITIVE).ln())
+            .map(|(&value, &frequency)| frequency * value)
             .sum();
 
         let disc_arr: Array1<f64> = discrimination.into();
@@ -177,7 +177,7 @@ fn e_step_2pl_internal(
                 *value += weight;
             }
             let norm = logsumexp(row);
-            *marginal = norm.exp();
+            *marginal = norm;
             for value in row {
                 *value = (*value - norm).exp();
             }
@@ -736,7 +736,7 @@ pub fn bootstrap_fit_2pl<'py>(
             let mut prev_ll = f64::NEG_INFINITY;
 
             for _ in 0..max_iter {
-                let (posterior_weights, marginal_ll) = e_step_2pl_internal(
+                let (posterior_weights, log_marginal) = e_step_2pl_internal(
                     &boot_responses.view(),
                     &quad_points,
                     &quad_weights,
@@ -747,10 +747,7 @@ pub fn bootstrap_fit_2pl<'py>(
                     n_quadpts,
                 );
 
-                let current_ll: f64 = marginal_ll
-                    .iter()
-                    .map(|&value| value.max(f64::MIN_POSITIVE).ln())
-                    .sum();
+                let current_ll: f64 = log_marginal.iter().sum();
 
                 if (current_ll - prev_ll).abs() < tol {
                     break;

@@ -560,7 +560,9 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
         if should_use_rust():
             try:
-                from mirt._rust_backend import coordinate_descent_mstep_regularized
+                from mirt.backends.rust.regularized import (
+                    coordinate_descent_mstep_regularized,
+                )
 
                 result = coordinate_descent_mstep_regularized(
                     r_k_all,

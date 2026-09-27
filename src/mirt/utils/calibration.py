@@ -17,10 +17,8 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 try:
-    from mirt._rust_backend import (
-        RUST_AVAILABLE,
-        fixed_calib_em,
-    )
+    from mirt.backends.rust._helpers import RUST_AVAILABLE
+    from mirt.backends.rust.calibration import fixed_calib_em
 except ImportError:
     RUST_AVAILABLE = False
 

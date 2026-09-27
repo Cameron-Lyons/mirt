@@ -233,8 +233,8 @@ def test_real_native_fit_refreshes_final_likelihood(
     monkeypatch.setattr(estimator, "_compute_standard_errors", lambda *args: {})
 
     result = estimator.fit(model, responses)
-    _, marginal_likelihood = estimator._e_step(model, responses)
-    expected_log_likelihood = np.sum(np.log(marginal_likelihood + 1e-300))
+    _, log_marginal = estimator._e_step(model, responses)
+    expected_log_likelihood = np.sum(log_marginal)
 
     assert calls == 2
     assert result.log_likelihood == pytest.approx(expected_log_likelihood)

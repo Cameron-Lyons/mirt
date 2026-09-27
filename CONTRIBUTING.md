@@ -164,6 +164,14 @@ fixed-iteration fits can differ slightly from SciPy fits. Compare the objective,
 parameter recovery, and convergence as well as speed. Itemwise EM standard errors
 and full marginal-information standard errors retain their separate objectives.
 
+Core EM E-steps return per-person **log** marginal likelihoods internally; avoid
+converting them to probabilities for convergence or fit statistics. Prepared fit
+contexts retain compressed rows and their frequencies through standard errors,
+cache bounded response components for generic expected-count matrix products,
+and own any Python/Rust worker pools. Contexts release the pools on success and
+on exceptions. The legacy `mirt._rust_backend` module remains a lazy compatibility
+namespace; new internal code should import from the owning backend module.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

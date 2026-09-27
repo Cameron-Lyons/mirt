@@ -8,10 +8,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._backend_config import should_use_rust
-from mirt._rust_backend import (
-    cat_conditional_mse as rust_cat_conditional_mse,
-)
-from mirt._rust_backend import (
+from mirt.backends.rust.cat import cat_conditional_mse as rust_cat_conditional_mse
+from mirt.backends.rust.cat import (
     cat_simulate_batch_full as rust_cat_simulate_batch_full,
 )
 from mirt.cat._engine_common import (

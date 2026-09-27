@@ -74,9 +74,9 @@ def test_python_e_steps_retain_standard_prior_without_information() -> None:
     core = EMEstimator(n_quadpts=21, use_gpu=False)
     core._quadrature = GaussHermiteQuadrature(n_points=21)
     core._latent_density = GaussianDensity()
-    posterior, marginal = core._e_step(TwoParameterLogistic(1), responses)
+    posterior, log_marginal = core._e_step(TwoParameterLogistic(1), responses)
     np.testing.assert_allclose(posterior[0], core._quadrature.weights, atol=1e-14)
-    np.testing.assert_allclose(marginal, 1.0, atol=1e-14)
+    np.testing.assert_allclose(log_marginal, 0.0, atol=1e-14)
 
     weighted = WeightedEMEstimator(n_quadpts=21)
     weighted._quadrature = GaussHermiteQuadrature(n_points=21)

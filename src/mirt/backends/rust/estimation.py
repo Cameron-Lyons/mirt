@@ -73,6 +73,18 @@ def em_fit_2pl(
         from mirt.estimation._patterns import compress_responses
 
         responses, frequencies = compress_responses(np.asarray(responses))
+    return _em_fit_2pl_prepared(responses, n_quadpts, max_iter, tol, frequencies)
+
+
+def _em_fit_2pl_prepared(
+    responses: NDArray[np.int_],
+    n_quadpts: int,
+    max_iter: int,
+    tol: float,
+    frequencies: NDArray[np.float64] | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], float, int, bool]:
+    """Fit already prepared rows without repeating pattern detection."""
+    n_quadpts, max_iter, tol = _validate_em_controls(n_quadpts, max_iter, tol)
     if rust_enabled():
         return mirt_rs.em_fit_2pl(
             _ensure_i32(responses),
