@@ -277,6 +277,8 @@ class TestBenchmarkComparisons:
             "posterior_highest_density",
             "q3_complete",
             "q3_missing",
+            "ld_complete",
+            "ld_missing",
         ],
     )
     def test_new_workloads_reject_mismatched_person_counts(self, name: str) -> None:
@@ -363,7 +365,12 @@ class TestBenchmarkCommand:
         results = benchmark.run_suites(
             ("diagnostics",), n_persons=20, n_items=3, repeats=2, warmups=1
         )
-        assert [result.name for result in results] == ["q3_complete", "q3_missing"]
+        assert [result.name for result in results] == [
+            "q3_complete",
+            "q3_missing",
+            "ld_complete",
+            "ld_missing",
+        ]
         assert all(len(result.times) == 2 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)
 

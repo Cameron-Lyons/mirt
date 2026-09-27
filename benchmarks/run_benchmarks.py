@@ -441,7 +441,8 @@ def bench_diagnostics(
     repeats: int,
     warmups: int = 0,
 ) -> list[BenchResult]:
-    """Measure shared NumPy Q3 kernels with complete and incomplete residuals."""
+    """Measure NumPy pairwise diagnostics with complete and incomplete data."""
+    from mirt.diagnostics.ld import _compute_ld_chi2_g2
     from mirt.utils.residuals import _compute_ld_matrix
 
     rng = np.random.default_rng(4781)
@@ -455,6 +456,23 @@ def bench_diagnostics(
 
         times = _time(run, repeats=repeats, warmups=warmups)
         results.append(BenchResult(name, times, _peak_traced_bytes(run)))
+
+    for name, missing_fraction in (("ld_complete", 0.0), ("ld_missing", 0.15)):
+        probabilities = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
+        responses = (rng.random(probabilities.shape) < probabilities).astype(np.int32)
+        responses[rng.random(responses.shape) < missing_fraction] = -1
+
+        def run_ld():
+            return _compute_ld_chi2_g2(
+                None,
+                responses,
+                np.empty((n_persons, 1)),
+                n_quadpts=21,
+                positive_probabilities=probabilities,
+            )
+
+        times = _time(run_ld, repeats=repeats, warmups=warmups)
+        results.append(BenchResult(name, times, _peak_traced_bytes(run_ld)))
     return results
 
 
@@ -732,6 +750,8 @@ def _validate_baseline_compatibility(
         "item_statistics",
         "q3_complete",
         "q3_missing",
+        "ld_complete",
+        "ld_missing",
         "likelihood_2pl",
         "likelihood_grm",
         "likelihood_gpcm",

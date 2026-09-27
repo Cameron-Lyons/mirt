@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt._correlation import q3_correlations
+from mirt._local_dependence import ld_pair_statistics
 from mirt.backends.rust._helpers import (
     _ensure_f64,
     _ensure_i32,
@@ -290,75 +291,23 @@ def _ld_chi2_numpy(
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Compute all binary LD chi-square tables with matrix products."""
-    n_persons, n_items = responses.shape
-    observed_tables = np.zeros((4, n_items, n_items), dtype=np.float64)
-    expected_tables = np.zeros((4, n_items, n_items), dtype=np.float64)
-    pair_counts = np.zeros((n_items, n_items), dtype=np.float64)
-    chunk_size = _entry_chunk_size(n_persons, n_items)
+    """Compute binary LD chi-square with bounded probability evaluation."""
 
-    for start in range(0, n_persons, chunk_size):
-        stop = min(start + chunk_size, n_persons)
-        response_chunk = responses[start:stop]
-        valid = response_chunk >= 0
-        valid_float = valid.astype(np.float64)
-        observed_positive = ((response_chunk > 0) & valid).astype(np.float64)
-        observed_zero = valid_float - observed_positive
-        probabilities = np.asarray(
+    def probabilities(rows: slice) -> NDArray[np.float64]:
+        return np.asarray(
             sigmoid(
-                discrimination[None, :]
-                * (theta[start:stop, None] - difficulty[None, :])
+                discrimination[None, :] * (theta[rows, None] - difficulty[None, :])
             ),
             dtype=np.float64,
         )
-        expected_positive = np.where(valid, probabilities, 0.0)
-        expected_zero = valid_float - expected_positive
 
-        pair_counts += valid_float.T @ valid_float
-        tables = (
-            (observed_zero, observed_zero, expected_zero, expected_zero),
-            (
-                observed_zero,
-                observed_positive,
-                expected_zero,
-                expected_positive,
-            ),
-            (
-                observed_positive,
-                observed_zero,
-                expected_positive,
-                expected_zero,
-            ),
-            (
-                observed_positive,
-                observed_positive,
-                expected_positive,
-                expected_positive,
-            ),
-        )
-        for index, (
-            observed_left,
-            observed_right,
-            expected_left,
-            expected_right,
-        ) in enumerate(tables):
-            observed_tables[index] += observed_left.T @ observed_right
-            expected_tables[index] += expected_left.T @ expected_right
-
-    np.maximum(expected_tables, 0.5, out=expected_tables)
-    chi2_values = np.sum(
-        (observed_tables - expected_tables) ** 2 / expected_tables,
-        axis=0,
+    chi2, _ = ld_pair_statistics(
+        responses,
+        probabilities,
+        compute_g2=False,
+        chunk_size=_entry_chunk_size(*responses.shape),
     )
-    chi2_matrix = np.full((n_items, n_items), np.nan)
-    rows, columns = np.triu_indices(n_items, k=1)
-    eligible = pair_counts[rows, columns] >= 10.0
-    rows = rows[eligible]
-    columns = columns[eligible]
-    values = chi2_values[rows, columns]
-    chi2_matrix[rows, columns] = values
-    chi2_matrix[columns, rows] = values
-    return chi2_matrix
+    return chi2
 
 
 def _prepare_item_information_inputs(
