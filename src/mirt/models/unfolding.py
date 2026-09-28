@@ -926,6 +926,19 @@ class IdealPointModel(_UnfoldingDichotomousModel):
             exponent = -self._parameters["discrimination"][None, :] * distance**2
         return self._parameters["peak_height"][None, :] * np.exp(exponent)
 
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        values = _theta_values(self, theta_2d)
+        distance = values - self._parameters["location"][indices]
+        with np.errstate(over="ignore"):
+            exponent = -self._parameters["discrimination"][indices] * distance**2
+        return self._parameters["peak_height"][indices] * np.exp(exponent)
+
     @staticmethod
     def _information_from_scaled_distance(
         scaled_distance: NDArray[np.float64],
@@ -1086,6 +1099,23 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         return self._stable_probability(
             self._linear_predictor_from_values(values, None)
         )
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in one vectorized pass."""
+        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
+        values = _theta_values(self, theta_2d)
+        predictor = _stable_affine_predictor(
+            values,
+            self._parameters["discrimination"][indices],
+            self._parameters["location"][indices],
+            self._parameters["asymmetry"][indices],
+            saturate=False,
+        )
+        return self._stable_probability(predictor)
 
     def information(
         self,
