@@ -476,6 +476,45 @@ class TestHyperbolicCosineModel:
 class TestDichotomousUnfoldingBehavior:
     """Shared binary likelihood and response-validation behavior."""
 
+    def test_probability_pairs_match_itemwise_evaluation_without_dispatch(
+        self,
+        model_type: type[IdealPointModel] | type[HyperbolicCosineModel],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model = model_type(n_items=3)
+        parameters = {
+            "discrimination": np.array([0.7, 1.3, 2.1]),
+            "location": np.array([-0.8, 0.2, 1.1]),
+        }
+        if isinstance(model, IdealPointModel):
+            parameters["peak_height"] = np.array([0.9, 0.6, 1.0])
+        else:
+            parameters["asymmetry"] = np.array([0.4, -0.6, 0.1])
+        model.set_parameters(**parameters)
+        theta = np.array([[-2.0], [-0.3], [0.5], [1.8], [1e200]])
+        item_indices = np.array([2, 0, 2, 1, 0])
+        expected = np.array(
+            [
+                model.probability(theta[row : row + 1], int(item))[0]
+                for row, item in enumerate(item_indices)
+            ]
+        )
+
+        def fail_probability(*args: object, **kwargs: object) -> NDArray[np.float64]:
+            raise AssertionError("paired evaluation should not dispatch by item")
+
+        monkeypatch.setattr(model, "probability", fail_probability)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            actual = model.probability_pairs(theta, item_indices)
+            empty = model.probability_pairs(
+                np.empty((0, 1)), np.empty(0, dtype=np.intp)
+            )
+
+        np.testing.assert_allclose(actual, expected)
+        assert empty.shape == (0,)
+
     def test_log_likelihood_matches_manual_selection(
         self,
         model_type: type[IdealPointModel] | type[HyperbolicCosineModel],
