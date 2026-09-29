@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrays while preserving missing-data bounds, shifted priors, and each
   estimator's lower bound on local variational parameters. Small samples use
   one block without copying outputs. Added a `variational` timing and memory suite.
+- Shared bounded M-step statistics between NumPy GVEM and sparse Bayesian fitting,
+  reusing weighted means for intercept updates and batching GVEM item solves.
+  Fixed loadings skip covariance calculations. Added a `variational-mstep`
+  benchmark suite for free- and fixed-loading updates and traced allocations.
 - Shared the NumPy variational objective between GVEM and sparse Bayesian
   estimation, bounding likelihood and Gaussian KL scratch space by respondent
   blocks and reusing temporary arrays. Added a `variational-objective` benchmark

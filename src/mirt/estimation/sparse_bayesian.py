@@ -16,6 +16,7 @@ from mirt.constants import (
 )
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation._variational_objective import variational_elbo
+from mirt.estimation._variational_statistics import variational_item_statistics
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
 
@@ -685,39 +686,23 @@ class SparseBayesianEstimator(BaseEstimator):
         responses: NDArray[np.int_],
     ) -> None:
         """M-step with spike-slab LASSO penalty."""
-        valid_mask = responses >= 0
-        lam = self._lambda_jj(self._xi)
+        stats = variational_item_statistics(
+            responses,
+            self._mu,
+            self._sigma,
+            self._xi,
+            self._intercepts,
+            self._lambda_jj,
+            estimate_loadings=not self._fixed_loadings,
+        )
 
         if self._fixed_loadings:
             self._loadings.fill(1.0)
             self._gamma.fill(1.0)
         else:
-            second_moments = self._sigma + np.einsum(
-                "if,ig->ifg",
-                self._mu,
-                self._mu,
-                optimize=True,
-            )
-            weights = np.where(valid_mask, 2.0 * lam, 0.0)
-            curvature = np.einsum(
-                "ij,ifg->jfg",
-                weights,
-                second_moments,
-                optimize=True,
-            )
+            assert stats.curvature is not None and stats.score is not None
+            curvature, score = stats.curvature, stats.score
             curvature += REGULARIZATION_EPSILON * np.eye(self.k_max)
-
-            coefficients = np.where(
-                valid_mask,
-                responses - 0.5 - 2.0 * lam * self._intercepts,
-                0.0,
-            )
-            score = np.einsum(
-                "ij,if->jf",
-                coefficients,
-                self._mu,
-                optimize=True,
-            )
             unpenalized = np.linalg.solve(curvature, score[..., None])[..., 0]
             self._gamma = self._ssl_prior.compute_posterior_inclusion(unpenalized)
 
@@ -729,21 +714,14 @@ class SparseBayesianEstimator(BaseEstimator):
                 threshold,
             )
 
-        linear_terms = self._mu @ self._loadings.T
-        intercept_score = np.sum(
-            np.where(
-                valid_mask,
-                responses - 0.5 - 2.0 * lam * linear_terms,
-                0.0,
-            ),
-            axis=0,
+        intercept_score = stats.response_sum - np.einsum(
+            "jf,jf->j", self._loadings, stats.weighted_mean
         )
-        intercept_curvature = np.sum(np.where(valid_mask, 2.0 * lam, 0.0), axis=0)
         self._intercepts = np.divide(
             intercept_score,
-            intercept_curvature,
+            stats.weight_sum,
             out=self._intercepts.copy(),
-            where=intercept_curvature > PROB_EPSILON,
+            where=stats.weight_sum > PROB_EPSILON,
         )
         self._intercepts = np.clip(self._intercepts, -10.0, 10.0)
 

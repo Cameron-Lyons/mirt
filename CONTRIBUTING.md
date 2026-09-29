@@ -342,6 +342,22 @@ the logistic bound, while every respondent contributes a Gaussian KL term. The
 sparse loading prior remains separate. Traced peaks cover Python/NumPy scratch
 allocations, excluding input generation, native workspace, and process RSS.
 
+The `variational-mstep` suite measures NumPy GVEM and sparse Bayesian item updates
+for 2PL models in one, three, and six dimensions, plus fixed-loading 1PL updates.
+It includes statistic accumulation, parameter solves, and resetting item state
+between repeats. Posterior state generation and complete fitting are excluded:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite variational-mstep --persons 10000 --items 100 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-variational-mstep.json
+```
+
+Both estimators accumulate curvature, scores, and weighted means in bounded
+respondent blocks, retaining item-level statistics. Intercepts reuse these
+statistics after loadings are updated. Fixed-loading models omit covariance
+calculations; GVEM retains its itemwise least-squares fallback for singular
+curvature. These workloads exercise NumPy on either backend selection. Traced
+peaks exclude input generation, native workspace, and process RSS.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

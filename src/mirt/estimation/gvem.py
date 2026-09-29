@@ -18,6 +18,7 @@ from mirt.backends.rust.gvem import gvem_m_step as _rust_gvem_m_step
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation._variational_objective import variational_elbo
+from mirt.estimation._variational_statistics import variational_item_statistics
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
 
@@ -487,55 +488,47 @@ class GVEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
     ) -> None:
         """Python fallback for M-step."""
-        n_persons, n_items = responses.shape
-        n_factors = model.n_factors
-
-        valid_mask = responses >= 0
-
-        lam = self._lambda(self._xi)
-
-        second_moments = self._sigma + np.einsum("ik,il->ikl", self._mu, self._mu)
-
-        for j in range(n_items):
-            valid_persons = valid_mask[:, j]
-            if not valid_persons.any():
-                continue
-
-            y_valid = responses[valid_persons, j].astype(np.float64)
-            mu_valid = self._mu[valid_persons]
-            lam_valid = lam[valid_persons, j]
-            sm_valid = second_moments[valid_persons]
-
-            d_j = self._intercepts[j]
-
-            A_j = np.einsum("i,ijk->jk", 2 * lam_valid, sm_valid)
-
-            coeffs = y_valid - 0.5 - 2 * lam_valid * d_j
-            b_j = np.einsum("i,ik->k", coeffs, mu_valid)
-
-            A_j += REGULARIZATION_EPSILON * np.eye(n_factors)
-
+        fixed_loadings = model.model_name == "1PL"
+        stats = variational_item_statistics(
+            responses,
+            self._mu,
+            self._sigma,
+            self._xi,
+            self._intercepts,
+            self._lambda,
+            estimate_loadings=not fixed_loadings,
+        )
+        observed = stats.observed
+        if fixed_loadings:
+            self._slopes[observed] = 1.0
+        else:
+            assert stats.curvature is not None and stats.score is not None
+            curvature = stats.curvature[observed]
+            score = stats.score[observed]
+            curvature += REGULARIZATION_EPSILON * np.eye(model.n_factors)
             try:
-                a_j_new = np.linalg.solve(A_j, b_j)
+                loadings = np.linalg.solve(curvature, score[..., None])[..., 0]
             except np.linalg.LinAlgError:
-                a_j_new = np.linalg.lstsq(A_j, b_j, rcond=None)[0]
+                loadings = np.empty_like(score)
+                for item, (matrix, rhs) in enumerate(
+                    zip(curvature, score, strict=True)
+                ):
+                    try:
+                        loadings[item] = np.linalg.solve(matrix, rhs)
+                    except np.linalg.LinAlgError:
+                        loadings[item] = np.linalg.lstsq(matrix, rhs, rcond=None)[0]
+            self._slopes[observed] = loadings
 
-            if model.model_name == "1PL":
-                a_j_new = np.ones(n_factors)
-
-            self._slopes[j] = a_j_new
-
-            linear_terms = mu_valid @ a_j_new
-            d_numerator = np.sum(y_valid - 0.5 - 2 * lam_valid * linear_terms)
-            d_denominator = 2 * np.sum(lam_valid)
-
-            if d_denominator > PROB_EPSILON:
-                d_j_new = d_numerator / d_denominator
-            else:
-                d_j_new = 0.0
-
-            d_j_new = np.clip(d_j_new, -10.0, 10.0)
-            self._intercepts[j] = d_j_new
+        numerator = stats.response_sum - np.einsum(
+            "jf,jf->j", self._slopes, stats.weighted_mean
+        )
+        updated = np.divide(
+            numerator,
+            stats.weight_sum,
+            out=np.zeros_like(self._intercepts),
+            where=stats.weight_sum > PROB_EPSILON,
+        )
+        self._intercepts[observed] = np.clip(updated[observed], -10.0, 10.0)
 
     def _compute_elbo(
         self,

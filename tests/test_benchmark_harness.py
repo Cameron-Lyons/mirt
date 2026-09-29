@@ -350,6 +350,7 @@ class TestBenchmarkCommand:
             "variational",
             "gvem-uncertainty",
             "variational-objective",
+            "variational-mstep",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -385,6 +386,7 @@ class TestBenchmarkCommand:
             "variational",
             "gvem-uncertainty",
             "variational-objective",
+            "variational-mstep",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -455,6 +457,24 @@ class TestBenchmarkCommand:
         assert [result.name for result in results] == [
             f"variational_objective_{name}_{n_factors}d"
             for n_factors in (1, 3, 6)
+            for name in ("gvem", "sparse")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12),
+                _report(*results, persons=13),
+                max_regression_percent=20,
+            )
+
+    def test_variational_mstep_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ("variational-mstep",), n_persons=12, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"variational_mstep_{name}_{label}"
+            for label in ("2pl_1d", "2pl_3d", "2pl_6d", "1pl")
             for name in ("gvem", "sparse")
         ]
         assert all(len(result.times) == 2 for result in results)
