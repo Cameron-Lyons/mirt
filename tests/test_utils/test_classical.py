@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 
+import mirt
 import mirt._classical as classical_core
 import mirt.backends.rust.polytomous as polytomous_backend
 import mirt.utils.classical as classical
@@ -23,6 +24,25 @@ def _alpha(responses: np.ndarray) -> float:
     return float(
         n_items / (n_items - 1) * (1.0 - item_variances.sum() / total_variance)
     )
+
+
+def _variance_with_missing(values: np.ndarray) -> float:
+    observed = values[np.isfinite(values)]
+    return float(np.var(observed, ddof=1)) if observed.size > 1 else 0.0
+
+
+def _alpha_with_missing(responses: np.ndarray) -> float:
+    if responses.shape[1] < 2:
+        return 0.0
+    scored = np.any(np.isfinite(responses), axis=1)
+    variance = _variance_with_missing(np.nansum(responses[scored], axis=1))
+    if variance == 0:
+        return 0.0
+    item_variances = [
+        _variance_with_missing(responses[:, item]) for item in range(responses.shape[1])
+    ]
+    n_items = responses.shape[1]
+    return n_items / (n_items - 1) * (1 - sum(item_variances) / variance)
 
 
 def _scalar_item_fit_groups(
@@ -241,6 +261,155 @@ def test_traditional_supports_uncorrected_correlations() -> None:
 
     expected = np.array([np.corrcoef(responses[:, j], totals)[0, 1] for j in range(3)])
     np.testing.assert_allclose(result.discrimination, expected)
+
+
+@pytest.mark.parametrize("persons, items", [(97, 2000), (97, 10000), (101, 5000)])
+def test_traditional_centers_long_nearly_constant_tests(persons, items) -> None:
+    responses = np.ones((persons, items))
+    responses[0, 0] = 0.0
+
+    uncorrected = traditional(responses, use_corrected_correlation=False)
+    corrected = traditional(responses)
+
+    assert uncorrected.discrimination[0] == pytest.approx(1.0, abs=1e-14, rel=0)
+    assert np.all(np.abs(uncorrected.discrimination) <= 1.0)
+    np.testing.assert_array_equal(uncorrected.discrimination[1:], 0.0)
+    np.testing.assert_array_equal(corrected.discrimination, 0.0)
+
+
+@pytest.mark.parametrize("backend", ["auto", "numpy"])
+@pytest.mark.parametrize("budget", [1, 71, 262_144])
+@pytest.mark.parametrize("corrected", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_traditional_blocks_match_scalar_statistics(
+    monkeypatch, backend, budget, corrected, missing
+) -> None:
+    rng = np.random.default_rng(961)
+    responses = rng.integers(0, 2, (53, 9)).astype(float)
+    if missing:
+        responses[rng.random(responses.shape) < 0.2] = np.nan
+        responses[:, -1] = np.nan
+        responses[3:, -2] = 1.0
+        responses[:3] = np.nan
+        responses[1, 0] = 1.0
+        responses[2, 1] = 0.0
+    responses = np.asfortranarray(responses)
+    responses.setflags(write=False)
+    before = responses.copy()
+    totals = np.nansum(responses, axis=1)
+    scored = np.any(np.isfinite(responses), axis=1)
+    expected_difficulty = []
+    expected_discrimination = []
+    for item in range(responses.shape[1]):
+        valid = np.isfinite(responses[:, item])
+        values = responses[valid, item]
+        item_totals = totals[valid] - values if corrected else totals[valid]
+        expected_difficulty.append(values.mean() if values.size else np.nan)
+        correlation = 0.0
+        if values.size > 1 and np.ptp(values) > 0 and np.ptp(item_totals) > 0:
+            correlation = np.corrcoef(values, item_totals)[0, 1]
+        expected_discrimination.append(correlation)
+    expected_deleted = [
+        _alpha_with_missing(np.delete(responses, item, axis=1))
+        for item in range(responses.shape[1])
+    ]
+    monkeypatch.setattr(classical, "_TRADITIONAL_CHUNK_ELEMENTS", budget)
+    original_backend = mirt.get_backend()
+    try:
+        mirt.set_backend(backend)
+        result = traditional(responses, use_corrected_correlation=corrected)
+    finally:
+        mirt.set_backend(original_backend)
+
+    np.testing.assert_allclose(result.difficulty, expected_difficulty, atol=1e-14)
+    np.testing.assert_allclose(
+        result.discrimination, expected_discrimination, atol=1e-14
+    )
+    np.testing.assert_allclose(result.alpha_if_deleted, expected_deleted, atol=1e-14)
+    assert result.alpha == pytest.approx(_alpha_with_missing(responses), abs=1e-14)
+    assert result.mean_score == pytest.approx(np.mean(totals[scored]))
+    assert result.sd_score == pytest.approx(np.std(totals[scored], ddof=1))
+    assert result.n_persons == 53
+    assert result.n_items == 9
+    np.testing.assert_array_equal(responses, before)
+
+
+def test_traditional_numpy_reuses_moments_with_bounded_variance_buffers(
+    monkeypatch,
+) -> None:
+    responses = np.random.default_rng(96).integers(0, 2, (53, 9)).astype(float)
+    responses[::5, ::2] = np.nan
+    original_variance = classical_core._sample_variance
+    matrix_sizes = []
+
+    def bounded_variance(values, **kwargs):
+        if values.ndim == 2:
+            matrix_sizes.append(values.size)
+        return original_variance(values, **kwargs)
+
+    def unexpected_native(*args, **kwargs):
+        raise AssertionError("the NumPy backend must reuse its prepared moments")
+
+    monkeypatch.setattr(classical, "_sample_variance", bounded_variance)
+    monkeypatch.setattr(classical_core, "_sample_variance", bounded_variance)
+    monkeypatch.setattr(classical_core, "_ALPHA_DELETED_CHUNK_ELEMENTS", 53 * 2)
+    monkeypatch.setattr(classical, "_rust_alpha_if_deleted", unexpected_native)
+    original_backend = mirt.get_backend()
+    try:
+        mirt.set_backend("numpy")
+        actual = traditional(responses)
+    finally:
+        mirt.set_backend(original_backend)
+
+    assert matrix_sizes
+    assert max(matrix_sizes) <= 53 * 2
+    expected = [
+        _alpha_with_missing(np.delete(responses, item, axis=1))
+        for item in range(responses.shape[1])
+    ]
+    np.testing.assert_allclose(actual.alpha_if_deleted, expected, atol=1e-14)
+
+
+@pytest.mark.parametrize("axis", [None, 0, 1, -1])
+def test_sample_variance_reuses_owned_buffer_without_mutating_input(axis) -> None:
+    values = np.asfortranarray(np.arange(20, dtype=float).reshape(4, 5))
+    values[:3, 0] = np.nan
+    values[:, 2] = np.nan
+    before = values.copy()
+    values.setflags(write=False)
+    expected = (
+        _variance_with_missing(values)
+        if axis is None
+        else np.apply_along_axis(_variance_with_missing, axis, values)
+    )
+
+    actual = classical_core._sample_variance(values, axis=axis)
+
+    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_array_equal(values, before)
+
+
+@pytest.mark.skipif(not classical.RUST_AVAILABLE, reason="native extension unavailable")
+@pytest.mark.parametrize("layout", ["C", "F", "strided"])
+def test_native_alpha_accepts_readonly_response_layouts(monkeypatch, layout) -> None:
+    responses = np.random.default_rng(13).integers(0, 4, (17, 12)).astype(float)
+    responses[::3, ::2] = np.nan
+    if layout == "F":
+        responses = np.asfortranarray(responses)
+    elif layout == "strided":
+        responses = responses[::-1, ::2]
+    before = responses.copy()
+    responses.setflags(write=False)
+    expected = [
+        _alpha_with_missing(np.delete(responses, item, axis=1))
+        for item in range(responses.shape[1])
+    ]
+    monkeypatch.setattr(polytomous_backend, "rust_enabled", lambda: True)
+
+    actual = polytomous_backend.compute_alpha_if_deleted(responses)
+
+    np.testing.assert_allclose(actual, expected, atol=1e-14)
+    np.testing.assert_array_equal(responses, before)
 
 
 def test_traditional_validates_correlation_option() -> None:

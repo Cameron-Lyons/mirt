@@ -1,7 +1,13 @@
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt._core import sigmoid
+from mirt._logistic import (
+    _affine_logits,
+    _affine_probability,
+    _information,
+    _item_information,
+    _test_information,
+)
 from mirt.models.base import DichotomousItemModel
 
 
@@ -88,45 +94,51 @@ class BifactorModel(DichotomousItemModel):
             for label in self._specific_factor_labels
         }
 
+    def _curve_parameters(
+        self, item_idx: int | None
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.intp]]:
+        if item_idx is None:
+            slopes = np.column_stack((self.general_loadings, self.specific_loadings))
+            return slopes, self.intercepts, self._specific_factor_indices
+        return (
+            np.array(
+                [self.general_loadings[item_idx], self.specific_loadings[item_idx]]
+            ),
+            self.intercepts[item_idx],
+            np.asarray(self._specific_factor_indices[item_idx]),
+        )
+
     def probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        a_g = self._parameters["general_loadings"]
-        a_s = self._parameters["specific_loadings"]
-        d = self._parameters["intercepts"]
+        slopes, intercepts, columns = self._curve_parameters(item_idx)
+        return _affine_probability(theta, slopes, intercepts, specific_indices=columns)
 
-        theta_g = theta[:, 0]
-
-        if item_idx is not None:
-            factor_idx = self._specific_factor_indices[item_idx]
-            theta_s = theta[:, 1 + factor_idx]
-
-            z = a_g[item_idx] * theta_g + a_s[item_idx] * theta_s + d[item_idx]
-            return sigmoid(z)
-
-        theta_s = theta[:, 1 + self._specific_factor_indices]
-        z = a_g[None, :] * theta_g[:, None] + a_s[None, :] * theta_s + d[None, :]
-        return sigmoid(z)
+    def _logits(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        slopes, intercepts, columns = self._curve_parameters(item_idx)
+        return _affine_logits(theta, slopes, intercepts, specific_indices=columns)
 
     def probability_pairs(
         self,
         theta: NDArray[np.float64],
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
-        specific_columns = 1 + self._specific_factor_indices[indices]
-        row_indices = np.arange(indices.size)
-        logits = self._parameters["general_loadings"][indices] * theta_2d[:, 0]
-        logits += (
-            self._parameters["specific_loadings"][indices]
-            * theta_2d[row_indices, specific_columns]
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return _affine_probability(
+            theta,
+            (self.general_loadings, self.specific_loadings),
+            self.intercepts,
+            item_indices=indices,
+            specific_indices=self._specific_factor_indices,
         )
-        logits += self._parameters["intercepts"][indices]
-        return sigmoid(logits)
 
     def information(
         self,
@@ -134,19 +146,14 @@ class BifactorModel(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-
-        p = self.probability(theta, item_idx)
-        q = 1.0 - p
-
-        a_g = self._parameters["general_loadings"]
-        a_s = self._parameters["specific_loadings"]
-
-        if item_idx is not None:
-            a_sq_total = a_g[item_idx] ** 2 + a_s[item_idx] ** 2
-            return a_sq_total * p * q
-
-        a_sq_total = a_g**2 + a_s**2
-        return a_sq_total[None, :] * p * q
+        slopes, intercepts, columns = self._curve_parameters(item_idx)
+        return _information(
+            theta,
+            slopes,
+            lambda points: _affine_logits(
+                points, slopes, intercepts, specific_indices=columns
+            ),
+        )
 
     def item_information_matrix(
         self,
@@ -158,13 +165,8 @@ class BifactorModel(DichotomousItemModel):
             raise IndexError(f"item_idx {item_idx} out of range [0, {self.n_items})")
 
         theta = self._ensure_theta_2d(theta)
-        probability = self.probability(theta, item_idx)
-        slope = self._item_slope(item_idx)
-        slope_outer = np.outer(slope, slope)
-        return (
-            probability[:, None, None]
-            * (1.0 - probability[:, None, None])
-            * (slope_outer[None, :, :])
+        return _item_information(
+            self._logits(theta, item_idx), self._item_slope(item_idx)
         )
 
     def test_information_matrix(
@@ -173,16 +175,7 @@ class BifactorModel(DichotomousItemModel):
     ) -> NDArray[np.float64]:
         """Return summed Fisher matrices across all items and theta points."""
         theta = self._ensure_theta_2d(theta)
-        probability = self.probability(theta)
-        variance = probability * (1.0 - probability)
-        slopes = self.get_loading_matrix()
-        return np.einsum(
-            "ni,ij,ik->njk",
-            variance,
-            slopes,
-            slopes,
-            optimize=True,
-        )
+        return _test_information(theta, self.get_loading_matrix(), self._logits)
 
     def omega_hierarchical(self) -> float:
         """Estimate general-factor reliability for the total score."""
@@ -278,7 +271,7 @@ class BifactorModel(DichotomousItemModel):
 
     def copy(self) -> "BifactorModel":
         """Return an independent copy that preserves the bifactor structure."""
-        new_model = BifactorModel(
+        new_model = self.__class__(
             n_items=self.n_items,
             specific_factors=self._specific_factors.copy(),
             item_names=self.item_names.copy(),

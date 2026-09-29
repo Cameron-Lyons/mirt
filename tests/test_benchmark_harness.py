@@ -333,6 +333,19 @@ class TestBenchmarkCommand:
             "optimization",
             "information",
             "latent-density",
+            "kernel-smoothing",
+            "empirical",
+            "classical",
+            "reliability",
+            "curves",
+            "asymmetric",
+            "logistic-information",
+            "unipolar",
+            "logistic-probability",
+            "multidimensional-information",
+            "multidimensional-probability",
+            "multidimensional-fit",
+            "logistic-fit",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -351,6 +364,19 @@ class TestBenchmarkCommand:
             "optimization",
             "information",
             "latent-density",
+            "kernel-smoothing",
+            "empirical",
+            "classical",
+            "reliability",
+            "curves",
+            "asymmetric",
+            "logistic-information",
+            "unipolar",
+            "logistic-probability",
+            "multidimensional-information",
+            "multidimensional-probability",
+            "multidimensional-fit",
+            "logistic-fit",
         )
 
     def test_latent_density_suite_records_time_memory_and_checks_point_count(
@@ -363,6 +389,272 @@ class TestBenchmarkCommand:
             f"gaussian_{method}_{n_dimensions}d"
             for n_dimensions in (1, 3, 8)
             for method in ("update", "log_density")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_kernel_smoothing_suite_records_time_memory_and_checks_person_count(
+        self,
+    ) -> None:
+        results = benchmark.run_suites(
+            ("kernel-smoothing",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"kernel_smoothing_{n_points}_{label}"
+            for n_points in (81, 401)
+            for label in ("complete", "missing")
+        ] + [
+            f"kernel_smoothing_gam_{kind}_{label}"
+            for kind in ("2pl", "grm")
+            for label in ("complete", "missing")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_empirical_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("empirical",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"empirical_rmsea_{kind}_{n_bins}_{label}"
+            for kind in ("2pl", "grm")
+            for n_bins in (10, 100)
+            for label in ("complete", "missing")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_classical_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("classical",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"traditional_{correlation}_{label}"
+            for correlation in ("corrected", "uncorrected")
+            for label in ("complete", "missing")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_reliability_suite_records_time_memory_and_checks_person_count(
+        self,
+    ) -> None:
+        results = benchmark.run_suites(
+            ("reliability",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"reliability_{method}_{kind}"
+            for kind in ("2pl", "grm")
+            for method in ("sem", "empirical")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_curves_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("curves",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"curves_{method}_{kind}"
+            for kind in ("2pl", "grm")
+            for method in (
+                "test_information",
+                "item_information",
+                "selected_information",
+                "expected_score",
+            )
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_asymmetric_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("asymmetric",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"asymmetric_{label}{method}"
+            for label in ("", "cll_", "nll_")
+            for method in ("probability", "information", "pairs")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
+                    max_regression_percent=20.0,
+                )
+
+    def test_logistic_information_suite_measures_full_and_single_queries(self) -> None:
+        results = benchmark.run_suites(
+            ("logistic-information",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"logistic_information_{model}_{selection}"
+            for model in ("2pl", "3pl", "4pl", "2pl_multi")
+            for selection in ("full", "single")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_unipolar_suite_records_time_memory_and_checks_person_count(self) -> None:
+        results = benchmark.run_suites(
+            ("unipolar",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"unipolar_{method}" for method in ("probability", "information", "pairs")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_logistic_probability_suite_measures_full_single_and_pairs(self) -> None:
+        results = benchmark.run_suites(
+            ("logistic-probability",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"logistic_probability_{model}_{selection}"
+            for model in ("1pl", "2pl", "3pl", "4pl", "2pl_multi")
+            for selection in ("full", "single", "pairs")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_multidimensional_information_suite_measures_scalars_and_matrices(
+        self,
+    ) -> None:
+        results = benchmark.run_suites(
+            ("multidimensional-information",),
+            n_persons=20,
+            n_items=3,
+            repeats=2,
+            warmups=1,
+        )
+        assert [result.name for result in results] == [
+            f"multidimensional_information_{model}_{selection}"
+            for model in ("mirt", "bifactor")
+            for selection in (
+                "full",
+                "single",
+                "item_matrix",
+                "test_matrix",
+                "selection",
+            )
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_multidimensional_probability_suite_measures_all_query_forms(self) -> None:
+        results = benchmark.run_suites(
+            ("multidimensional-probability",),
+            n_persons=20,
+            n_items=3,
+            repeats=2,
+            warmups=1,
+        )
+        assert [result.name for result in results] == [
+            f"multidimensional_probability_{model}_{selection}"
+            for model in ("mirt", "bifactor")
+            for selection in ("full", "single", "pairs", "one_person")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_multidimensional_fit_suite_measures_affine_em(self) -> None:
+        results = benchmark.run_suites(
+            ("multidimensional-fit",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"multidimensional_fit_{model}"
+            for model in ("mirt", "bifactor", "confirmatory")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=20),
+                _report(*results, persons=21),
+                max_regression_percent=20.0,
+            )
+
+    def test_logistic_fit_suite_measures_python_item_objectives(self) -> None:
+        results = benchmark.run_suites(
+            ("logistic-fit",), n_persons=20, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"logistic_fit_{model}"
+            for model in ("1pl", "2pl", "2pl_multi", "3pl", "4pl")
         ]
         assert all(len(result.times) == 2 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)

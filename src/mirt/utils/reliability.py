@@ -5,8 +5,9 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from scipy.special import expit
 
-from mirt.constants import PROB_EPSILON
+from mirt._information import _test_information, _theta_array
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -16,61 +17,10 @@ Density = Literal["norm", "uniform"] | Callable[[NDArray[np.float64]], ArrayLike
 Reliability = float | NDArray[np.float64]
 
 
-def _theta_array(
-    model: "BaseItemModel",
-    theta: ArrayLike,
-) -> NDArray[np.float64]:
-    """Normalize theta without confusing factors with respondents."""
-    values = np.asarray(theta, dtype=np.float64)
-    if values.ndim == 0:
-        values = values.reshape(1, 1)
-    elif values.ndim == 1:
-        if model.n_factors == 1:
-            values = values.reshape(-1, 1)
-        elif values.size == model.n_factors:
-            values = values.reshape(1, -1)
-        else:
-            raise ValueError(
-                f"theta must have {model.n_factors} columns for this model"
-            )
-
-    if values.ndim != 2:
-        raise ValueError("theta must be a scalar, a one-dimensional array, or a matrix")
-    if values.shape[0] == 0:
-        raise ValueError("theta must contain at least one estimate")
-    if values.shape[1] != model.n_factors:
-        raise ValueError(
-            f"theta has {values.shape[1]} factors, expected {model.n_factors}"
-        )
-    if not np.all(np.isfinite(values)):
-        raise ValueError("theta must contain only finite values")
-    return values
-
-
-def _test_information(
-    model: "BaseItemModel",
-    theta: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Return total information while preserving genuinely uninformative points."""
-    information = np.asarray(model.information(theta), dtype=np.float64)
-    if information.ndim == 1:
-        test_information = information
-    elif information.ndim == 2:
-        test_information = np.sum(information, axis=1)
-    else:
-        raise ValueError(
-            "model.information() must return test information or item information"
-        )
-
-    if test_information.shape != (theta.shape[0],):
-        raise ValueError(
-            "model.information() returned an incompatible number of theta points"
-        )
-    if not np.all(np.isfinite(test_information)):
-        raise ValueError("model information must contain only finite values")
-    if np.any(test_information < 0.0):
-        raise ValueError("model information must be non-negative")
-    return test_information
+def _centered_theta(theta: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Remove a finite midpoint before scaling, preserving small score differences."""
+    midpoint = 0.5 * np.min(theta, axis=0) + 0.5 * np.max(theta, axis=0)
+    return theta - midpoint
 
 
 def _conditional_reliability(
@@ -144,7 +94,14 @@ def _quadrature_weights(
     density: Density,
 ) -> NDArray[np.float64]:
     if isinstance(density, str) and density == "norm":
-        density_values = np.exp(-0.5 * theta**2) / np.sqrt(2.0 * np.pi)
+        absolute_theta = np.abs(theta)
+        closest = np.min(absolute_theta)
+        # Subtract the largest log-density before exponentiating. Factoring
+        # the difference of squares also works when theta**2 would overflow.
+        with np.errstate(over="ignore", under="ignore"):
+            density_values = np.exp(
+                -(absolute_theta - closest) * (0.5 * absolute_theta + 0.5 * closest)
+            )
     elif isinstance(density, str) and density == "uniform":
         density_values = np.ones_like(theta)
     elif callable(density):
@@ -161,14 +118,17 @@ def _quadrature_weights(
     if np.any(density_values < 0.0):
         raise ValueError("density weights must be non-negative")
 
+    largest = float(np.max(density_values))
+    if largest <= 0.0:
+        raise ValueError("density weights must have a positive sum")
+    density_values /= largest
+
     # The points are evenly spaced, so the common interval width cancels
     # during normalization. Half-weighting the endpoints gives trapezoidal
     # integration without allocating another grid-sized array.
     density_values[[0, -1]] *= 0.5
-    total = float(np.sum(density_values))
-    if total <= 0.0:
-        raise ValueError("density weights must have a positive sum")
-    return density_values / total
+    density_values /= np.sum(density_values)
+    return density_values
 
 
 def marginal_rxx(
@@ -218,16 +178,30 @@ def marginal_rxx(
     if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
         raise ValueError("theta_range must contain finite bounds with lower < upper")
 
-    theta = np.linspace(lower, upper, n_points)
+    if lower < 0.0 < upper and upper > np.finfo(np.float64).max + lower:
+        theta = np.linspace(0.5 * lower, 0.5 * upper, n_points) * 2.0
+    else:
+        theta = np.linspace(lower, upper, n_points)
     weights = _quadrature_weights(theta, density)
     test_information = _test_information(model, theta.reshape(-1, 1))
 
-    mean_theta = float(np.sum(weights * theta))
-    theta_variance = float(np.sum(weights * (theta - mean_theta) ** 2))
-    if theta_variance <= PROB_EPSILON:
+    centered = _centered_theta(theta[:, None])[:, 0]
+    scale = float(np.max(np.abs(centered)))
+    if scale == 0.0:
+        raise ValueError("the weighted theta distribution must have positive variance")
+    centered /= scale
+    centered -= np.dot(weights, centered)
+    theta_variance = float(np.dot(weights, centered**2))
+    if theta_variance <= 0.0:
         raise ValueError("the weighted theta distribution must have positive variance")
 
-    local_reliability = _conditional_reliability(test_information, theta_variance)
+    # Keep the scale separate so tiny and very large positive variances do
+    # not disappear or overflow before combining with test information.
+    with np.errstate(divide="ignore"):
+        log_scaled_information = (
+            np.log(test_information) + np.log(theta_variance) + 2.0 * np.log(scale)
+        )
+    local_reliability = expit(log_scaled_information)
     reliability = float(np.sum(weights * local_reliability))
     return float(np.clip(reliability, 0.0, 1.0))
 
@@ -272,8 +246,6 @@ def empirical_rxx(
     if theta.shape[0] < 2:
         raise ValueError("theta_estimates must contain at least two respondents")
 
-    observed_variance = np.var(theta, axis=0, ddof=1)
-
     if method == "posterior_variance":
         if standard_errors is None:
             raise ValueError(
@@ -288,7 +260,6 @@ def empirical_rxx(
             )
         if not np.all(np.isfinite(errors)) or np.any(errors < 0.0):
             raise ValueError("standard_errors must contain finite, non-negative values")
-        average_error_variance = np.mean(errors**2, axis=0)
     else:
         if standard_errors is not None:
             raise ValueError("standard_errors can only be used with posterior_variance")
@@ -298,20 +269,29 @@ def empirical_rxx(
                 "use posterior_variance with factor-specific standard_errors"
             )
         test_information = _test_information(model, theta)
-        error_variance = np.divide(
-            1.0,
-            test_information,
-            out=np.full_like(test_information, np.inf),
-            where=test_information > 0.0,
-        )
-        average_error_variance = np.array([np.mean(error_variance)])
+        if np.any(test_information == 0.0):
+            return 0.0
+        # Taking the square root first keeps errors finite even when the
+        # inverse of small positive information would overflow.
+        errors = (1.0 / np.sqrt(test_information))[:, None]
+
+    centered = _centered_theta(theta)
+    scale = np.maximum(np.max(np.abs(centered), axis=0), np.max(errors, axis=0))
+    scale[scale == 0.0] = 1.0
+    centered /= scale
+    centered -= np.mean(centered, axis=0)
+    observed_variance = np.einsum("ij,ij->j", centered, centered) / (theta.shape[0] - 1)
+    scaled_errors = errors / scale
+    average_error_variance = (
+        np.einsum("ij,ij->j", scaled_errors, scaled_errors) / theta.shape[0]
+    )
 
     denominator = observed_variance + average_error_variance
     reliability = np.divide(
         observed_variance,
         denominator,
         out=np.zeros_like(observed_variance),
-        where=denominator > PROB_EPSILON,
+        where=denominator > 0.0,
     )
     reliability = np.clip(reliability, 0.0, 1.0)
     if model.n_factors == 1:

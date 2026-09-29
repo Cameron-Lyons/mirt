@@ -6,11 +6,14 @@ data for observed vs expected plots.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
+
+from mirt._smoothing import smooth_response_curves
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -18,6 +21,7 @@ if TYPE_CHECKING:
 SILVERMAN_CONSTANT = 1.06
 SILVERMAN_EXPONENT = -1 / 5
 KERNEL_BLOCK_ELEMENTS = 2_000_000
+_EMPIRICAL_MAX_PROBABILITY_VALUES = 262_144
 
 
 @dataclass
@@ -175,6 +179,24 @@ def _expected_item_score(
     return probabilities @ categories, probabilities.shape[1] - 1
 
 
+def _model_category_counts(model: BaseItemModel) -> NDArray[np.intp] | None:
+    """Resolve shared or item-specific category counts without truncation."""
+    category_counts = getattr(model, "n_categories", None)
+    if category_counts is None:
+        return None
+    counts = np.asarray(category_counts)
+    if counts.ndim == 0:
+        counts = np.broadcast_to(counts, (model.n_items,))
+    if (
+        counts.shape != (model.n_items,)
+        or counts.dtype.kind not in "iu"
+        or np.any(counts < 2)
+        or np.any(counts > np.iinfo(np.intp).max)
+    ):
+        raise ValueError("model category counts are malformed")
+    return counts.astype(np.intp, copy=False)
+
+
 def _expected_all_item_scores(
     model: BaseItemModel,
     theta: NDArray[np.float64],
@@ -211,10 +233,9 @@ def _expected_all_item_scores(
     categories = np.arange(probabilities.shape[2], dtype=np.float64)
     expected_scores = probabilities @ categories
 
-    category_counts = getattr(model, "n_categories", None)
-    if category_counts is not None:
-        counts = np.asarray(category_counts, dtype=np.intp)
-        if counts.shape != (model.n_items,) or np.any(counts < 2):
+    counts = _model_category_counts(model)
+    if counts is not None:
+        if np.any(counts > probabilities.shape[2]):
             raise ValueError("model category counts are malformed")
         max_scores = counts - 1
     else:
@@ -241,24 +262,41 @@ def _validate_observed_scores(
         )
 
 
+def _theta_bin_indices(
+    theta: NDArray[np.float64],
+    n_bins: int,
+) -> tuple[NDArray[np.intp], NDArray[np.float64]]:
+    """Assign shared quantile bins without overflowing finite edge values."""
+    percentiles = np.linspace(0.0, 100.0, n_bins + 1)
+    largest = max(abs(float(theta.min())), abs(float(theta.max())))
+    if largest > np.finfo(np.float64).max / 2:
+        # Power-of-two scaling keeps interpolation differences finite without
+        # changing the precision of the represented input values.
+        bin_edges = np.percentile(theta * 0.5, percentiles) * 2.0
+    else:
+        bin_edges = np.percentile(theta, percentiles)
+    # Interior edges suffice: the first and last bins include the endpoints.
+    # This also avoids nextafter(max_float, inf) and retains right-sided ties.
+    bin_indices = np.searchsorted(bin_edges[1:-1], theta, side="right")
+    return bin_indices, bin_edges
+
+
 def _build_theta_bins(
     theta: NDArray[np.float64],
     n_bins: int,
 ) -> tuple[NDArray[np.intp], NDArray[np.float64]]:
-    """Assign persons to shared theta quantile bins."""
-    percentiles = np.linspace(0.0, 100.0, n_bins + 1)
-    bin_edges = np.percentile(theta, percentiles)
-    bin_edges[-1] = np.nextafter(bin_edges[-1], np.inf)
-
-    bin_indices = np.clip(np.digitize(theta, bin_edges) - 1, 0, n_bins - 1).astype(
-        np.intp
-    )
+    """Return shared theta bins with finite midpoints and observed bin means."""
+    bin_indices, bin_edges = _theta_bin_indices(theta, n_bins)
     n_per_bin = np.bincount(bin_indices, minlength=n_bins).astype(np.intp)
     nonempty = n_per_bin > 0
 
-    theta_bins = (bin_edges[:-1] + bin_edges[1:]) / 2
-    theta_sums = np.bincount(bin_indices, weights=theta, minlength=n_bins)
+    scale = max(1.0, abs(float(bin_edges[0])), abs(float(bin_edges[-1])))
+    scaled_edges = bin_edges / scale
+    theta_bins = (scaled_edges[:-1] + scaled_edges[1:]) * 0.5
+    theta_sums = np.bincount(bin_indices, weights=theta / scale, minlength=n_bins)
     theta_bins[nonempty] = theta_sums[nonempty] / n_per_bin[nonempty]
+    np.clip(theta_bins, -1.0, 1.0, out=theta_bins)
+    theta_bins *= scale
 
     return bin_indices, theta_bins
 
@@ -473,6 +511,68 @@ def empirical_plot(
     )
 
 
+def _expected_score_blocks(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+) -> Iterator[tuple[slice, NDArray[np.float64], NDArray[np.intp]]]:
+    """Budget probability output by known or probed category width."""
+    counts = _model_category_counts(model)
+    width = 1 if counts is None else int(np.max(counts))
+    start = 0
+    if counts is None and getattr(model, "is_polytomous", None) is not False:
+        expected, max_scores = _expected_all_item_scores(model, theta[:1])
+        yield slice(0, 1), expected, max_scores
+        width = int(np.max(max_scores)) + 1
+        start = 1
+    rows_per_block = max(
+        1, _EMPIRICAL_MAX_PROBABILITY_VALUES // (model.n_items * width)
+    )
+    for row in range(start, theta.shape[0], rows_per_block):
+        rows = slice(row, row + rows_per_block)
+        expected, max_scores = _expected_all_item_scores(model, theta[rows])
+        yield rows, expected, max_scores
+
+
+def _accumulate_bin_residuals(
+    counts: NDArray[np.intp],
+    residual_sums: NDArray[np.float64],
+    bin_indices: NDArray[np.intp],
+    responses: NDArray[np.float64],
+    expected: NDArray[np.float64],
+) -> None:
+    """Reduce one response block without a dense person-by-bin matrix."""
+    n_bins, n_items = counts.shape
+    # Compact sparse bin labels when a full histogram would exceed the block
+    # budget. Each update then allocates only the bins present in this block.
+    if counts.size > _EMPIRICAL_MAX_PROBABILITY_VALUES:
+        occupied_bins, local_bins = np.unique(bin_indices, return_inverse=True)
+        output_size = occupied_bins.size * n_items
+    else:
+        occupied_bins = slice(None)
+        local_bins = bin_indices
+        output_size = n_bins * n_items
+    valid = np.isfinite(responses) & (responses >= 0.0)
+    codes = local_bins[:, None] * n_items + np.arange(n_items, dtype=np.intp)
+    residuals = responses - expected
+    if np.all(valid):
+        counts[occupied_bins] += np.bincount(
+            local_bins, minlength=output_size // n_items
+        )[:, None]
+        codes = codes.ravel()
+        weights = residuals.ravel()
+    else:
+        codes = codes[valid]
+        weights = residuals[valid]
+        counts[occupied_bins] += np.bincount(codes, minlength=output_size).reshape(
+            -1, n_items
+        )
+    residual_sums[occupied_bins] += np.bincount(
+        codes,
+        weights=weights,
+        minlength=output_size,
+    ).reshape(-1, n_items)
+
+
 def empirical_rmsea(
     model: BaseItemModel,
     responses: NDArray[np.float64],
@@ -483,8 +583,9 @@ def empirical_rmsea(
 
     Measures root mean square error of approximation between observed and
     expected item scores across ability bins. Model expectations for all
-    items are evaluated together once, and every item uses the same theta-bin
-    boundaries so item-level missingness cannot shift the conditioning groups.
+    items are evaluated together in bounded response blocks. Every item uses
+    the same theta-bin boundaries so item-level missingness cannot shift the
+    conditioning groups. Empty bins do not contribute to the mean square.
 
     Parameters
     ----------
@@ -504,37 +605,32 @@ def empirical_rmsea(
     """
     responses, theta_2d = _validate_empirical_inputs(model, responses, theta)
     n_bins = _validate_positive_integer(n_bins, "n_bins")
-    expected_scores, max_scores = _expected_all_item_scores(model, theta_2d)
-    for item_idx, max_score in enumerate(max_scores):
-        _validate_observed_scores(responses[:, item_idx], int(max_score), item_idx)
+    bin_indices, _ = _theta_bin_indices(theta_2d[:, 0], n_bins)
+    if n_bins > responses.shape[0]:
+        occupied, bin_indices = np.unique(bin_indices, return_inverse=True)
+        n_bins = occupied.size
+    counts = np.zeros((n_bins, model.n_items), dtype=np.intp)
+    residual_sums = np.zeros((n_bins, model.n_items), dtype=np.float64)
+    for rows, expected_scores, max_scores in _expected_score_blocks(model, theta_2d):
+        response_block = responses[rows]
+        for item_idx, max_score in enumerate(max_scores):
+            _validate_observed_scores(
+                response_block[:, item_idx], int(max_score), item_idx
+            )
+        _accumulate_bin_residuals(
+            counts,
+            residual_sums,
+            bin_indices[rows],
+            response_block,
+            expected_scores,
+        )
 
-    bin_indices, _ = _build_theta_bins(theta_2d[:, 0], n_bins)
-    membership = (
-        bin_indices[:, None] == np.arange(n_bins, dtype=np.intp)[None, :]
-    ).T.astype(np.float64)
-    valid = np.isfinite(responses) & (responses >= 0)
-    valid_float = valid.astype(np.float64)
-    counts = membership @ valid_float
-    observed_sums = membership @ np.where(valid, responses, 0.0)
-    expected_sums = membership @ np.where(valid, expected_scores, 0.0)
-
-    observed_bins = np.divide(
-        observed_sums,
-        counts,
-        out=np.zeros_like(observed_sums),
-        where=counts > 0,
-    )
-    expected_bins = np.divide(
-        expected_sums,
-        counts,
-        out=np.zeros_like(expected_sums),
-        where=counts > 0,
-    )
     estimable = counts > 0
-    squared_residuals = np.where(estimable, (observed_bins - expected_bins) ** 2, 0.0)
+    np.divide(residual_sums, counts, out=residual_sums, where=estimable)
+    np.square(residual_sums, out=residual_sums)
     estimable_bins = estimable.sum(axis=0)
     mean_squared = np.divide(
-        squared_residuals.sum(axis=0),
+        residual_sums.sum(axis=0),
         estimable_bins,
         out=np.full(model.n_items, np.nan, dtype=np.float64),
         where=estimable_bins > 0,
@@ -966,69 +1062,54 @@ def itemGAM(
     margin = theta_margin * (theta_max - theta_min)
     theta_grid = np.linspace(theta_min - margin, theta_max + margin, n_grid)
 
-    results = []
-    for idx in item_indices:
-        item_responses = responses[:, idx]
-        valid_mask = np.isfinite(item_responses) & (item_responses >= 0)
-        item_resp_valid = item_responses[valid_mask]
-        theta_valid = theta_values[valid_mask]
-
+    if not item_indices:
+        return []
+    selected = (
+        responses
+        if item_indices == list(range(model.n_items))
+        else responses[:, item_indices]
+    )
+    valid = np.isfinite(selected) & (selected >= 0)
+    all_observed = bool(np.all(valid))
+    expected = []
+    max_scores = []
+    for column, idx in enumerate(item_indices):
         model_probs, max_score = _expected_item_score(
             model, theta_grid.reshape(-1, 1), idx
         )
-        _validate_observed_scores(item_resp_valid, max_score, idx)
+        _validate_observed_scores(selected[:, column], max_score, idx)
+        expected.append(model_probs)
+        max_scores.append(max_score)
 
-        if item_resp_valid.size == 0:
-            smoothed_probs = np.full(n_grid, np.nan, dtype=np.float64)
-            if se:
-                se_lower = np.full(n_grid, np.nan, dtype=np.float64)
-                se_upper = np.full(n_grid, np.nan, dtype=np.float64)
-            else:
-                se_lower = np.zeros(n_grid, dtype=np.float64)
-                se_upper = np.zeros(n_grid, dtype=np.float64)
-        else:
-            smoothed_probs = np.empty(n_grid, dtype=np.float64)
+    smoothed_curves, standard_errors = smooth_response_curves(
+        theta_values,
+        theta_grid,
+        selected if all_observed else np.where(valid, selected, 0.0),
+        None if all_observed else valid,
+        resolved_bandwidth,
+        max_elements=KERNEL_BLOCK_ELEMENTS,
+        calculate_se=bool(se),
+    )
+
+    results = []
+    for column, idx in enumerate(item_indices):
+        smoothed_probs = smoothed_curves[column]
+        if standard_errors is None:
             se_lower = np.zeros(n_grid, dtype=np.float64)
             se_upper = np.zeros(n_grid, dtype=np.float64)
-            block_size = max(
-                1,
-                min(n_grid, KERNEL_BLOCK_ELEMENTS // item_resp_valid.size),
-            )
-            for start in range(0, n_grid, block_size):
-                stop = min(start + block_size, n_grid)
-                scaled_distance = (
-                    theta_grid[start:stop, None] - theta_valid[None, :]
-                ) / resolved_bandwidth
-                log_weights = -0.5 * scaled_distance**2
-                log_weights -= np.max(log_weights, axis=1, keepdims=True)
-                weights = np.exp(log_weights)
-                weights /= np.sum(weights, axis=1, keepdims=True)
-
-                block_smoothed = weights @ item_resp_valid
-                smoothed_probs[start:stop] = block_smoothed
-                if se:
-                    local_second_moment = weights @ (item_resp_valid**2)
-                    local_variance = np.maximum(
-                        local_second_moment - block_smoothed**2, 0.0
-                    )
-                    effective_n = 1.0 / np.sum(weights**2, axis=1)
-                    se_values = np.sqrt(local_variance / effective_n)
-                    se_lower[start:stop] = np.clip(
-                        block_smoothed - z_crit * se_values, 0, max_score
-                    )
-                    se_upper[start:stop] = np.clip(
-                        block_smoothed + z_crit * se_values, 0, max_score
-                    )
-
+        else:
+            margin = z_crit * standard_errors[column]
+            se_lower = np.clip(smoothed_probs - margin, 0, max_scores[column])
+            se_upper = np.clip(smoothed_probs + margin, 0, max_scores[column])
         results.append(
             ItemGAMResult(
                 item_idx=idx,
                 theta_grid=theta_grid,
                 smoothed_probs=smoothed_probs,
-                model_probs=model_probs,
+                model_probs=expected[column],
                 se_bands=np.array([se_lower, se_upper]),
-                raw_theta=theta_valid,
-                raw_probs=item_resp_valid,
+                raw_theta=theta_values[valid[:, column]],
+                raw_probs=selected[valid[:, column], column],
             )
         )
 

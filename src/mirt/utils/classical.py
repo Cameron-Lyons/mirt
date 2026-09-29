@@ -12,7 +12,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt._categorical import item_category_frequencies
 from mirt._classical import _alpha_if_deleted_numpy, _sample_variance
-from mirt.backends.rust._helpers import RUST_AVAILABLE
+from mirt.backends.rust._helpers import RUST_AVAILABLE, rust_enabled
 from mirt.backends.rust.polytomous import (
     compute_alpha_if_deleted as _rust_alpha_if_deleted,
 )
@@ -20,6 +20,7 @@ from mirt.backends.rust.polytomous import (
 _ITEM_FIT_CHUNK_ELEMENTS = 1_000_000
 _RESPONSE_VALIDATION_CHUNK_ELEMENTS = 1_000_000
 _ITEM_STATS_MOMENT_CHUNK_ELEMENTS = 1_000_000
+_TRADITIONAL_CHUNK_ELEMENTS = 262_144
 
 
 def _clean_response_matrix(
@@ -37,7 +38,9 @@ def _clean_response_matrix(
     if raw.dtype.kind not in "biuf":
         raise ValueError("responses must contain numeric values")
 
-    values = np.asarray(raw, dtype=np.float64)
+    # Own one contiguous float buffer so normalization never mutates the input
+    # or needs a second matrix-sized copy, including for Fortran-order inputs.
+    values = np.array(raw, dtype=np.float64, order="C", copy=True)
     finite = np.isfinite(values)
     missing = np.isnan(values) | ((values < 0.0) & finite) | (values == missing_code)
     del finite
@@ -54,7 +57,8 @@ def _clean_response_matrix(
         if binary and np.any((observed != 0.0) & (observed != 1.0)):
             raise ValueError("responses must contain only 0, 1, or missing values")
 
-    return np.where(missing, np.nan, values), missing
+    values[missing] = np.nan
+    return values, missing
 
 
 def _cronbach_alpha(responses: NDArray[np.float64]) -> float:
@@ -108,6 +112,79 @@ class TraditionalStats:
     alpha_if_deleted: NDArray[np.float64]
 
 
+def _traditional_moments(
+    responses: NDArray[np.float64],
+    missing: NDArray[np.bool_],
+    corrected: bool,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.intp],
+]:
+    """Share binary moments and compute centered item-total correlations."""
+    n_persons, n_items = responses.shape
+    rows_per_block = max(1, _TRADITIONAL_CHUNK_ELEMENTS // n_items)
+    counts = np.zeros(n_items, dtype=np.intp)
+    item_sums = np.zeros(n_items)
+    total_scores = np.empty(n_persons)
+    observed_counts = np.empty(n_persons, dtype=np.intp)
+    for start in range(0, n_persons, rows_per_block):
+        rows = slice(start, start + rows_per_block)
+        valid = ~missing[rows]
+        counts += np.sum(valid, axis=0, dtype=np.intp)
+        item_sums += np.sum(responses[rows], axis=0, where=valid, initial=0.0)
+        total_scores[rows] = np.sum(responses[rows], axis=1, where=valid, initial=0.0)
+        observed_counts[rows] = np.sum(valid, axis=1, dtype=np.intp)
+    if np.count_nonzero(observed_counts) < 2:
+        raise ValueError("traditional requires at least two respondents with data")
+
+    difficulty = np.divide(item_sums, counts, out=np.zeros(n_items), where=counts > 0)
+    # Binary item moments need no second response pass or squared-response array.
+    item_square_sums = difficulty * (counts - item_sums)
+    item_variances = np.divide(
+        item_square_sums, counts - 1, out=np.zeros(n_items), where=counts > 1
+    )
+    total_sums = np.zeros(n_items)
+    for start in range(0, n_persons, rows_per_block):
+        rows = slice(start, start + rows_per_block)
+        valid = ~missing[rows]
+        if np.all(valid):
+            total_sums += np.sum(total_scores[rows])
+        else:
+            total_sums += valid.T @ total_scores[rows]
+    if corrected:
+        total_sums -= item_sums
+    total_means = np.divide(total_sums, counts, out=total_sums, where=counts > 0)
+
+    covariance = np.zeros(n_items)
+    total_square_sums = np.zeros(n_items)
+    for start in range(0, n_persons, rows_per_block):
+        rows = slice(start, start + rows_per_block)
+        response_block = responses[rows]
+        # Subtract the binary item before centering so constant corrected
+        # totals remain exactly constant, even on very long tests.
+        if corrected:
+            total_deviations = total_scores[rows, None] - response_block
+            total_deviations -= total_means
+        else:
+            total_deviations = total_scores[rows, None] - total_means
+        item_deviations = response_block - difficulty
+        np.copyto(item_deviations, 0.0, where=missing[rows])
+        np.copyto(total_deviations, 0.0, where=missing[rows])
+        covariance += np.einsum("ij,ij->j", item_deviations, total_deviations)
+        total_square_sums += np.einsum("ij,ij->j", total_deviations, total_deviations)
+
+    denominator = np.sqrt(item_square_sums * total_square_sums)
+    discrimination = np.divide(
+        covariance, denominator, out=np.zeros(n_items), where=denominator > 0.0
+    )
+    np.clip(discrimination, -1.0, 1.0, out=discrimination)
+    difficulty[counts == 0] = np.nan
+    return difficulty, discrimination, item_variances, total_scores, observed_counts
+
+
 def traditional(
     responses: ArrayLike,
     use_corrected_correlation: bool = True,
@@ -140,7 +217,7 @@ def traditional(
     """
     if not isinstance(use_corrected_correlation, (bool, np.bool_)):
         raise ValueError("use_corrected_correlation must be boolean")
-    responses, _ = _clean_response_matrix(
+    responses, missing = _clean_response_matrix(
         responses,
         missing_code=missing_code,
         binary=True,
@@ -150,72 +227,26 @@ def traditional(
         raise ValueError("traditional requires at least two respondents")
     if n_items < 2:
         raise ValueError("traditional requires at least two items")
-    scored = np.any(np.isfinite(responses), axis=1)
-    if np.count_nonzero(scored) < 2:
-        raise ValueError("traditional requires at least two respondents with data")
-
-    valid_counts = np.sum(np.isfinite(responses), axis=0)
-    difficulty = np.divide(
-        np.nansum(responses, axis=0),
-        valid_counts,
-        out=np.full(n_items, np.nan),
-        where=valid_counts > 0,
+    difficulty, discrimination, item_variances, total_scores, observed_counts = (
+        _traditional_moments(responses, missing, use_corrected_correlation)
     )
-
-    total_scores = np.nansum(responses, axis=1)
-    total_scores[np.all(np.isnan(responses), axis=1)] = np.nan
-
-    valid = np.isfinite(responses)
-    item_values = np.where(valid, responses, 0.0)
-    if use_corrected_correlation:
-        correlation_totals = np.where(
-            valid,
-            total_scores[:, None] - item_values,
-            0.0,
-        )
-    else:
-        correlation_totals = np.where(valid, total_scores[:, None], 0.0)
-
-    counts = np.sum(valid, axis=0)
-    item_sums = np.sum(item_values, axis=0)
-    total_sums = np.sum(correlation_totals, axis=0)
-    covariance_numerator = np.sum(item_values * correlation_totals, axis=0)
-    covariance_numerator -= np.divide(
-        item_sums * total_sums,
-        counts,
-        out=np.zeros(n_items),
-        where=counts > 0,
-    )
-    item_squared = np.sum(item_values**2, axis=0) - np.divide(
-        item_sums**2,
-        counts,
-        out=np.zeros(n_items),
-        where=counts > 0,
-    )
-    total_squared = np.sum(correlation_totals**2, axis=0) - np.divide(
-        total_sums**2,
-        counts,
-        out=np.zeros(n_items),
-        where=counts > 0,
-    )
-    denominator = np.sqrt(np.maximum(item_squared * total_squared, 0.0))
-    discrimination = np.divide(
-        covariance_numerator,
-        denominator,
-        out=np.zeros(n_items),
-        where=denominator > 0.0,
-    )
-
-    scored_responses = responses[scored]
-    alpha = _cronbach_alpha(scored_responses)
-
-    if RUST_AVAILABLE:
-        alpha_if_deleted = _rust_alpha_if_deleted(scored_responses)
-    else:
-        alpha_if_deleted = _alpha_if_deleted_numpy(scored_responses)
-
-    valid_scores = total_scores[np.isfinite(total_scores)]
+    valid_scores = total_scores[observed_counts > 0]
     score_variance = float(_sample_variance(valid_scores))
+    alpha = (
+        n_items / (n_items - 1) * (1.0 - float(np.sum(item_variances)) / score_variance)
+        if score_variance > 0.0
+        else 0.0
+    )
+
+    if RUST_AVAILABLE and rust_enabled():
+        alpha_if_deleted = _rust_alpha_if_deleted(responses)
+    else:
+        alpha_if_deleted = _alpha_if_deleted_numpy(
+            responses,
+            total_scores=total_scores,
+            observed_counts=observed_counts,
+            item_variances=item_variances,
+        )
 
     return TraditionalStats(
         difficulty=difficulty,

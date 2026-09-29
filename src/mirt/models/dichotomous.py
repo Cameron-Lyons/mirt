@@ -1,33 +1,546 @@
+from abc import abstractmethod
 from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt._core import sigmoid
+from mirt._logistic import (
+    _logistic_probability,
+    _scaled_information,
+    _sigmoid_derivative,
+)
 from mirt.exceptions import MirtValidationError
 from mirt.models.base import DichotomousItemModel
 
-_MIN_EXP_INPUT = -745.0
 _MAX_DOUBLE_EXP_INPUT = 50.0
-
-
-def _fisher_information(
-    probability: NDArray[np.float64],
-    derivative: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Compute Bernoulli Fisher information without unstable tail division."""
-    denominator = probability * (1.0 - probability)
-    return np.divide(
-        derivative**2,
-        denominator,
-        out=np.zeros_like(probability, dtype=np.float64),
-        where=denominator > 0,
-    )
+_FIVE_PL_CURVE_CHUNK_ELEMENTS = 262_144
+_UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS = 262_144
+_LOGISTIC_CURVE_CHUNK_ELEMENTS = 262_144
 
 
 def _bounded_exponential(value: NDArray[np.float64]) -> NDArray[np.float64]:
     """Exponentiate safely for links containing a second exponential."""
-    return np.exp(np.clip(value, _MIN_EXP_INPUT, _MAX_DOUBLE_EXP_INPUT))
+    result = np.minimum(value, _MAX_DOUBLE_EXP_INPUT)
+    with np.errstate(under="ignore"):
+        np.exp(result, out=result)
+    return result
+
+
+def _double_exponential_log_information(
+    logits: NDArray[np.float64], discrimination: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Recover information when the unscaled double-exponential tail underflows."""
+    # I = a² exp(2z - exp(z)) / (1 - exp(-exp(z))). In the left tail
+    # its log is 2 log|a| + z to floating-point precision.
+    result = 2.0 * np.log(np.abs(discrimination))
+    with np.errstate(over="ignore", under="ignore"):
+        result += logits
+        right = logits > -36.0
+        if np.any(right):
+            z = np.minimum(logits[right], _MAX_DOUBLE_EXP_INPUT)
+            power = np.exp(z)
+            result[right] = (
+                2.0 * np.log(np.abs(discrimination[right]))
+                + 2.0 * z
+                - power
+                - np.log(-np.expm1(-power))
+            )
+        np.exp(result, out=result)
+    return result
+
+
+def _double_exponential_information(
+    logits: NDArray[np.float64], discrimination: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Evaluate both mirrored links from their separate success/failure tails."""
+    power = _bounded_exponential(logits)
+    information = -power
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        denominator = np.expm1(information)
+        denominator *= -1.0
+        np.exp(information, out=information)
+        information *= power
+        np.divide(power, denominator, out=power, where=denominator > 0.0)
+        information *= power
+        exceptional = (
+            (information < np.finfo(float).tiny)
+            & np.isfinite(logits)
+            & (discrimination != 0.0)
+        )
+        information *= discrimination
+        information *= discrimination
+    if np.any(exceptional):
+        information[exceptional] = _double_exponential_log_information(
+            logits[exceptional],
+            np.broadcast_to(discrimination, logits.shape)[exceptional],
+        )
+    return information
+
+
+def _unidimensional_logits(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    *,
+    item_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    """Compute logits without losing finite offsets before slope rescaling."""
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        if item_indices is None:
+            logits = theta - difficulty
+            logits *= discrimination
+        else:
+            logits = theta - difficulty[item_indices]
+            logits *= discrimination[item_indices]
+        recover = ~np.isfinite(logits)
+        if np.any(recover):
+            # For finite inputs, an overflowing difference can still yield a
+            # finite logit with a small slope. Scale before subtracting here.
+            if item_indices is None:
+                a, t, b = (
+                    np.broadcast_to(value, logits.shape)[recover]
+                    for value in (discrimination, theta, difficulty)
+                )
+            else:
+                indices = item_indices[recover]
+                a, t, b = discrimination[indices], theta[recover], difficulty[indices]
+            finite = np.isfinite(t) & np.isfinite(b) & (np.abs(a) <= 1.0)
+            positions = np.flatnonzero(recover)[finite]
+            logits.flat[positions] = a[finite] * t[finite] - a[finite] * b[finite]
+    return logits
+
+
+def _centered_logit_pairs(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Recenter suspicious dot products, resolving severe cancellation exactly."""
+    products = _unidimensional_logits(theta, discrimination, difficulty[:, None])
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        logits = np.sum(products, axis=1)
+        bound = np.sum(np.abs(products), axis=1)
+        error = 4.0 * np.finfo(float).eps * theta.shape[1] * bound
+        precise = ~np.isfinite(logits) | (
+            (bound > 1000.0) & (np.abs(logits) <= 2500.0 + error)
+        )
+    if np.any(precise):
+        from fractions import Fraction
+
+        slopes = np.broadcast_to(discrimination, theta.shape)
+        for row in np.flatnonzero(precise):
+            location = Fraction(float(difficulty[row]))
+            value = sum(
+                Fraction(float(slope)) * (Fraction(float(point)) - location)
+                for slope, point in zip(slopes[row], theta[row], strict=True)
+            )
+            try:
+                logits[row] = float(value)
+            except OverflowError:
+                logits[row] = -np.inf if value < 0 else np.inf
+    return logits
+
+
+def _multidimensional_logits(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    *,
+    item_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    """Keep BLAS for ordinary inputs and recenter affected respondent-item cells."""
+    if item_indices is not None:
+        discrimination = discrimination[item_indices]
+        difficulty = difficulty[item_indices]
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        offset = np.sum(discrimination, axis=-1) * difficulty
+        if item_indices is not None:
+            logits = np.einsum("ij,ij->i", theta, discrimination) - offset
+        else:
+            logits = np.dot(theta, discrimination.T) - offset
+        theta_scale = np.max(np.abs(theta), initial=0.0)
+        parameter_scale = np.max(np.abs(discrimination), initial=0.0) * theta.shape[1]
+        max_bound = (
+            theta_scale + np.max(np.abs(difficulty), initial=0.0)
+        ) * parameter_scale
+        if max_bound <= 1000.0:
+            return logits
+        row_scale = np.max(np.abs(theta), axis=1)
+        slope_bound = np.sum(np.abs(discrimination), axis=-1)
+        if logits.ndim == 2:
+            row_scale = row_scale[:, None]
+        bound = (row_scale + np.abs(difficulty)) * slope_bound
+        error = 4.0 * np.finfo(float).eps * theta.shape[1] * bound
+        recover = ~np.isfinite(logits) | (
+            (bound > 1000.0) & (np.abs(logits) <= 2500.0 + error)
+        )
+    # Outside this range both the sigmoid and Fisher-information tails have
+    # saturated even at the largest finite slope. Only uncertain cells need
+    # centered respondent-by-factor buffers, whose storage is bounded here.
+    positions = np.flatnonzero(recover)
+    per_block = max(1, _LOGISTIC_CURVE_CHUNK_ELEMENTS // theta.shape[1])
+    for start in range(0, positions.size, per_block):
+        selected = positions[start : start + per_block]
+        if logits.ndim == 2:
+            rows, items = np.divmod(selected, logits.shape[1])
+            slopes = discrimination[items]
+            locations = difficulty[items]
+        else:
+            rows = selected
+            if item_indices is None:
+                slopes = np.broadcast_to(discrimination, (rows.size, theta.shape[1]))
+                locations = np.full(rows.size, difficulty)
+            else:
+                slopes, locations = discrimination[rows], difficulty[rows]
+        points = theta[rows]
+        finite = (
+            np.all(np.isfinite(points), axis=1)
+            & np.all(np.isfinite(slopes), axis=1)
+            & np.isfinite(locations)
+        )
+        if np.any(finite):
+            logits.flat[selected[finite]] = _centered_logit_pairs(
+                points[finite], slopes[finite], locations[finite]
+            )
+    return logits
+
+
+def _double_exponential_curve(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    *,
+    negative: bool,
+    information: bool,
+    item_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    logits = _unidimensional_logits(
+        theta, discrimination, difficulty, item_indices=item_indices
+    )
+    if negative:
+        logits *= -1.0
+    if information:
+        if item_indices is not None:
+            discrimination = discrimination[item_indices]
+        return _double_exponential_information(logits, discrimination)
+    probability = _bounded_exponential(logits)
+    probability *= -1.0
+    with np.errstate(under="ignore"):
+        if negative:
+            np.exp(probability, out=probability)
+        else:
+            np.expm1(probability, out=probability)
+            probability *= -1.0
+    return probability
+
+
+def _logistic_information(
+    logits: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    guessing: NDArray[np.float64] | None = None,
+    upper: NDArray[np.float64] | None = None,
+    *,
+    norm_factor: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Preserve both logistic tails and defer slope scaling until after reduction."""
+    if guessing is None:
+        return _scaled_information(logits, discrimination, norm_factor=norm_factor)
+
+    from scipy.special import expit
+
+    with np.errstate(over="ignore", under="ignore", invalid="ignore", divide="ignore"):
+        width = 1.0 - guessing if upper is None else upper - guessing
+        success = expit(logits)
+        failure = expit(-logits)
+        information = success * failure
+        information *= width
+        information *= discrimination
+        np.square(information, out=information)
+        success *= width
+        success += guessing
+        failure *= width
+        if upper is not None:
+            failure += 1.0 - upper
+        success *= failure
+        exceptional = (information < np.finfo(float).tiny) | (
+            success < np.finfo(float).tiny
+        )
+        exceptional &= width > 0.0
+        np.divide(information, success, out=information, where=success > 0.0)
+        exceptional &= np.isfinite(logits) & (discrimination != 0.0)
+    if np.any(exceptional):
+        z = logits[exceptional]
+        information[exceptional] = _five_pl_log_information(
+            z,
+            np.broadcast_to(discrimination, logits.shape)[exceptional],
+            np.broadcast_to(guessing, logits.shape)[exceptional],
+            np.ones_like(z)
+            if upper is None
+            else np.broadcast_to(upper, logits.shape)[exceptional],
+            np.ones_like(z),
+        )
+    return information
+
+
+def _unipolar_curve(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    *,
+    information: bool,
+    item_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    logits = _unidimensional_logits(
+        theta, discrimination, difficulty, item_indices=item_indices
+    )
+    result = _sigmoid_derivative(logits)
+    # Division can round a nearly maximal probability one ulp above 0.25.
+    np.minimum(result, 0.25, out=result)
+    if not information:
+        return result
+    if item_indices is not None:
+        discrimination = discrimination[item_indices]
+    exceptional = (result < np.finfo(float).tiny) & np.isfinite(logits)
+    with np.errstate(over="ignore", under="ignore"):
+        # I = a² P tanh²(z/2) / (1-P). The tanh form retains the small
+        # derivative near z=0, where 1-2*sigmoid(z) would cancel to zero.
+        scaled_slope = logits * 0.5
+        np.tanh(scaled_slope, out=scaled_slope)
+        scaled_slope *= discrimination
+        result /= 1.0 - result
+        result *= scaled_slope
+        result *= scaled_slope
+        if np.any(exceptional):
+            # In either far tail, I = a² exp(-|z|) to float precision.
+            a = np.broadcast_to(discrimination, logits.shape)[exceptional]
+            result[exceptional] = np.exp(2.0 * np.log(a) - np.abs(logits[exceptional]))
+    return result
+
+
+def _log_powered_sigmoid(
+    logits: NDArray[np.float64], asymmetry: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Keep sigmoid powers accurate when the unpowered sigmoid rounds to 0 or 1."""
+    log_power = np.abs(logits)
+    np.negative(log_power, out=log_power)
+    with np.errstate(over="ignore", under="ignore"):
+        # log(sigmoid(z)) = min(z, 0) - log1p(exp(-abs(z))). NumPy's
+        # vectorized elementary functions also keep paired queries inexpensive.
+        np.exp(log_power, out=log_power)
+        np.log1p(log_power, out=log_power)
+        np.subtract(np.minimum(logits, 0.0), log_power, out=log_power)
+        log_power *= asymmetry
+        tail = logits > 700.0
+        if np.any(tail):
+            # Combine the exponent with the shape parameter before exponentiating
+            # so a large shape can recover an otherwise underflowing tail.
+            shape = np.broadcast_to(asymmetry, logits.shape)[tail]
+            log_power[tail] = -np.exp(np.log(shape) - logits[tail])
+    return log_power
+
+
+def _five_pl_probability(
+    logits: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    asymmetry: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    probability = _log_powered_sigmoid(logits, asymmetry)
+    with np.errstate(under="ignore"):
+        np.exp(probability, out=probability)
+    probability *= upper - guessing
+    probability += guessing
+    return probability
+
+
+def _five_pl_log_information(
+    logits: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    asymmetry: NDArray[np.float64],
+    *,
+    log_power: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Evaluate Fisher information with separate success and failure tails."""
+    from scipy.special import log_expit
+
+    if log_power is None:
+        log_power = _log_powered_sigmoid(logits, asymmetry)
+    width = upper - guessing
+    usable = (
+        (np.isfinite(logits) | np.isneginf(logits))
+        & np.isfinite(log_power)
+        & (discrimination != 0.0)
+        & (width > 0.0)
+    )
+    information = np.zeros_like(logits)
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+        log_width = np.log(width)
+        log_shape = np.log(asymmetry)
+        log_failure_power = np.log(-np.expm1(log_power))
+        rounded = log_power > -np.finfo(float).tiny
+        if np.any(rounded):
+            z = logits[rounded]
+            log_softplus = np.where(z > 36.0, -z, np.log(-log_expit(z)))
+            log_failure_power[rounded] = (
+                np.broadcast_to(log_shape, logits.shape)[rounded] + log_softplus
+            )
+        log_success = np.logaddexp(np.log(guessing), log_width + log_power)
+        log_failure = np.logaddexp(np.log1p(-upper), log_width + log_failure_power)
+        log_slope = np.log(np.abs(discrimination)) + log_shape + log_expit(-logits)
+        log_information = (
+            2.0 * (log_width + log_slope)
+            + log_power
+            + (log_power - log_success)
+            - log_failure
+        )
+        np.exp(log_information, out=information, where=usable)
+    return information
+
+
+def _five_pl_curve(
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    asymmetry: NDArray[np.float64],
+    *,
+    information: bool = False,
+    item_indices: NDArray[np.intp] | None = None,
+) -> NDArray[np.float64]:
+    """Evaluate a 5PL curve while recovering representable overflowed products."""
+    with np.errstate(over="ignore", invalid="ignore", under="ignore"):
+        if item_indices is None:
+            logits = theta - difficulty
+            logits *= discrimination
+        else:
+            logits = theta - difficulty[item_indices]
+            logits *= discrimination[item_indices]
+    exceptional = ~np.isfinite(logits)
+    positions = np.empty(0, dtype=np.intp)
+    if np.any(exceptional):
+        if item_indices is None:
+            arguments = [
+                np.broadcast_to(value, logits.shape)[exceptional]
+                for value in (
+                    theta,
+                    discrimination,
+                    difficulty,
+                    guessing,
+                    upper,
+                    asymmetry,
+                )
+            ]
+        else:
+            selected = item_indices[exceptional]
+            arguments = [theta[exceptional]] + [
+                value[selected]
+                for value in (discrimination, difficulty, guessing, upper, asymmetry)
+            ]
+        finite = np.logical_and.reduce([np.isfinite(value) for value in arguments])
+        positions = np.flatnonzero(exceptional)[finite]
+        selected_theta, a, b, c, d, e = [value[finite] for value in arguments]
+        # Halve the difference before subtracting, then combine binary exponents
+        # so neither the difference nor a product needs to overflow prematurely.
+        difference = 0.5 * selected_theta - 0.5 * b
+        slope_fraction, slope_exponent = np.frexp(a)
+        delta_fraction, delta_exponent = np.frexp(difference)
+        with np.errstate(over="ignore", under="ignore"):
+            recovered = np.ldexp(
+                slope_fraction * delta_fraction, slope_exponent + delta_exponent + 1
+            )
+        logits.flat[positions] = recovered
+        negative = np.isneginf(recovered)
+        positions = positions[negative]
+        a, c, d, e = (value[negative] for value in (a, c, d, e))
+        if positions.size:
+            shape_fraction, shape_exponent = np.frexp(e)
+            with np.errstate(over="ignore", under="ignore"):
+                # In this tail log(sigmoid(z)) equals z to floating-point
+                # precision. Apply the shape before materializing the product.
+                log_power = np.ldexp(
+                    slope_fraction[negative]
+                    * delta_fraction[negative]
+                    * shape_fraction,
+                    slope_exponent[negative]
+                    + delta_exponent[negative]
+                    + shape_exponent
+                    + 1,
+                )
+    del exceptional
+    if item_indices is not None:
+        guessing = guessing[item_indices]
+        upper = upper[item_indices]
+        asymmetry = asymmetry[item_indices]
+        if information:
+            discrimination = discrimination[item_indices]
+    result = (
+        _five_pl_information(logits, discrimination, guessing, upper, asymmetry)
+        if information
+        else _five_pl_probability(logits, guessing, upper, asymmetry)
+    )
+    if positions.size:
+        if information:
+            result.flat[positions] = _five_pl_log_information(
+                np.full(positions.size, -np.inf), a, c, d, e, log_power=log_power
+            )
+        else:
+            with np.errstate(under="ignore"):
+                np.exp(log_power, out=log_power)
+            log_power *= d - c
+            log_power += c
+            result.flat[positions] = log_power
+    return result
+
+
+def _five_pl_information(
+    logits: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    guessing: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    asymmetry: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Reuse probability buffers, resolving underflowed cells in log space."""
+    from scipy.special import expit
+
+    width = upper - guessing
+    failure = _log_powered_sigmoid(logits, asymmetry)
+    with np.errstate(over="ignore", under="ignore", divide="ignore", invalid="ignore"):
+        power = np.exp(failure)
+        np.expm1(failure, out=failure)
+        failure *= -width
+        failure += 1.0 - upper
+        success = power * width
+        success += guessing
+        information = expit(-logits)
+        information *= asymmetry
+        # The product of the powered curve and its log derivative is bounded
+        # by one. Multiply these before the slope to avoid intermediate overflow.
+        information *= power
+        exceptional = (power < np.finfo(float).tiny) | (
+            information < np.finfo(float).tiny
+        )
+        information *= discrimination
+        information *= width
+        np.square(information, out=information)
+        success *= failure
+        exceptional |= (information < np.finfo(float).tiny) | (
+            success < np.finfo(float).tiny
+        )
+        exceptional &= np.isfinite(logits) & (discrimination != 0.0) & (width > 0.0)
+        del power
+        np.divide(information, success, out=information, where=success > 0.0)
+    if np.any(exceptional):
+        information[exceptional] = _five_pl_log_information(
+            logits[exceptional],
+            np.broadcast_to(discrimination, logits.shape)[exceptional],
+            np.broadcast_to(guessing, logits.shape)[exceptional],
+            np.broadcast_to(upper, logits.shape)[exceptional],
+            np.broadcast_to(asymmetry, logits.shape)[exceptional],
+        )
+    return information
 
 
 class _ParameterizedDichotomousModel(DichotomousItemModel):
@@ -162,16 +675,83 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
             raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
         return item_idx
 
-    def _unidimensional_pair_logits(
+    def _evaluate_logistic(
         self,
         theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> tuple[NDArray[np.intp], NDArray[np.float64]]:
-        """Gather parameters and evaluate aligned unidimensional logits."""
-        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
-        discrimination = self._parameters["discrimination"][indices]
-        difficulty = self._parameters["difficulty"][indices]
-        return indices, discrimination * (theta_2d[:, 0] - difficulty)
+        item_idx: int | None,
+        *,
+        information: bool = False,
+        item_indices: NDArray[np.intp] | None = None,
+    ) -> NDArray[np.float64]:
+        """Share bounded full, single-item, and paired evaluation across 1PL–4PL."""
+        if item_indices is None:
+            theta = self._ensure_theta_2d(theta)
+        slope = self._parameters["discrimination"]
+        location = self._parameters["difficulty"]
+        guessing = self._parameters.get("guessing")
+        upper = self._parameters.get("upper")
+        all_items = item_idx is None and item_indices is None
+        width = self.n_items if all_items else 1
+        shape = (theta.shape[0], self.n_items) if all_items else (theta.shape[0],)
+        if item_idx is not None:
+            slope, location = slope[item_idx], location[item_idx]
+            if guessing is not None:
+                guessing = guessing[item_idx]
+            if upper is not None:
+                upper = upper[item_idx]
+        norm_factor = None
+        magnitude = slope
+        if information and self.n_factors != 1:
+            # Keep the squared norm factored until after the logistic tail
+            # reduction, including for exactly zero slope vectors.
+            magnitude = np.max(np.abs(slope), axis=-1)
+            normalized = np.divide(
+                slope,
+                magnitude[..., None],
+                out=np.zeros_like(slope),
+                where=magnitude[..., None] > 0.0,
+            )
+            norm_factor = np.sum(normalized**2, axis=-1)
+
+        def evaluate(
+            points: NDArray[np.float64],
+            selected: NDArray[np.intp] | None,
+        ) -> NDArray[np.float64]:
+            if self.n_factors == 1:
+                abilities = points[:, 0, None] if all_items else points[:, 0]
+                logits = _unidimensional_logits(
+                    abilities, slope, location, item_indices=selected
+                )
+            else:
+                logits = _multidimensional_logits(
+                    points, slope, location, item_indices=selected
+                )
+            c, d, a, factor = guessing, upper, magnitude, norm_factor
+            if selected is not None:
+                if c is not None:
+                    c = c[selected]
+                if d is not None:
+                    d = d[selected]
+                if information:
+                    a = a[selected]
+                    if factor is not None:
+                        factor = factor[selected]
+            if information:
+                return _logistic_information(logits, a, c, d, norm_factor=factor)
+            return _logistic_probability(logits, c, d)
+
+        rows_per_block = max(
+            1, _LOGISTIC_CURVE_CHUNK_ELEMENTS // max(width, self.n_factors)
+        )
+        if theta.shape[0] <= rows_per_block:
+            return evaluate(theta, item_indices)
+        result = np.empty(shape)
+        for start in range(0, theta.shape[0], rows_per_block):
+            rows = slice(start, start + rows_per_block)
+            result[rows] = evaluate(
+                theta[rows], None if item_indices is None else item_indices[rows]
+            )
+        return result
 
 
 class TwoParameterLogistic(_ParameterizedDichotomousModel):
@@ -200,68 +780,23 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if self.n_factors == 1:
-            theta_1d = theta.ravel()
-
-            if item_idx is not None:
-                z = a[item_idx] * (theta_1d - b[item_idx])
-                return sigmoid(z)
-
-            z = a[None, :] * (theta_1d[:, None] - b[None, :])
-            return sigmoid(z)
-
-        else:
-            if item_idx is not None:
-                z = np.dot(theta, a[item_idx]) - a[item_idx].sum() * b[item_idx]
-                return sigmoid(z)
-
-            z = np.dot(theta, a.T) - np.sum(a, axis=1) * b
-            return sigmoid(z)
+        return self._evaluate_logistic(theta, item_idx)
 
     def probability_pairs(
         self,
         theta: NDArray[np.float64],
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        theta_2d, indices = self._prepare_probability_pairs(theta, item_indices)
-        discrimination = self._parameters["discrimination"][indices]
-        difficulty = self._parameters["difficulty"][indices]
-        if self.n_factors == 1:
-            logits = discrimination * (theta_2d[:, 0] - difficulty)
-        else:
-            logits = np.einsum("ij,ij->i", theta_2d, discrimination)
-            logits -= np.sum(discrimination, axis=1) * difficulty
-        return sigmoid(logits)
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return self._evaluate_logistic(theta, None, item_indices=indices)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        p = self.probability(theta, item_idx)
-        q = 1.0 - p
-
-        a = self._parameters["discrimination"]
-
-        if item_idx is not None:
-            if self.n_factors == 1:
-                a_val = a[item_idx]
-            else:
-                a_val = np.sqrt(np.sum(a[item_idx] ** 2))
-            return (a_val**2) * p * q
-
-        if self.n_factors == 1:
-            return (a[None, :] ** 2) * p * q
-        else:
-            a_sq = np.sum(a**2, axis=1)
-            return a_sq[None, :] * p * q
+        return self._evaluate_logistic(theta, item_idx, information=True)
 
 
 class OneParameterLogistic(TwoParameterLogistic):
@@ -356,56 +891,23 @@ class ThreeParameterLogistic(_ParameterizedDichotomousModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            p_star = sigmoid(z)
-            return c[item_idx] + (1.0 - c[item_idx]) * p_star
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_star = sigmoid(z)
-        return c[None, :] + (1.0 - c[None, :]) * p_star
+        return self._evaluate_logistic(theta, item_idx)
 
     def probability_pairs(
         self,
         theta: NDArray[np.float64],
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
-        guessing = self._parameters["guessing"][indices]
-        logistic = sigmoid(logits)
-        return guessing + (1.0 - guessing) * logistic
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return self._evaluate_logistic(theta, None, item_indices=indices)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-
-        if item_idx is not None:
-            a_val = a[item_idx]
-            c_val = c[item_idx]
-            logistic = sigmoid(a_val * (theta_1d - b[item_idx]))
-            probability = c_val + (1.0 - c_val) * logistic
-            derivative = a_val * (1.0 - c_val) * logistic * (1.0 - logistic)
-            return _fisher_information(probability, derivative)
-
-        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
-        probability = c[None, :] + (1.0 - c[None, :]) * logistic
-        derivative = a[None, :] * (1.0 - c[None, :]) * logistic * (1.0 - logistic)
-        return _fisher_information(probability, derivative)
+        return self._evaluate_logistic(theta, item_idx, information=True)
 
 
 class FourParameterLogistic(_ParameterizedDichotomousModel):
@@ -450,61 +952,23 @@ class FourParameterLogistic(_ParameterizedDichotomousModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-        d = self._parameters["upper"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            p_star = sigmoid(z)
-            return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        p_star = sigmoid(z)
-        return c[None, :] + (d[None, :] - c[None, :]) * p_star
+        return self._evaluate_logistic(theta, item_idx)
 
     def probability_pairs(
         self,
         theta: NDArray[np.float64],
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
-        guessing = self._parameters["guessing"][indices]
-        upper = self._parameters["upper"][indices]
-        return guessing + (upper - guessing) * sigmoid(logits)
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return self._evaluate_logistic(theta, None, item_indices=indices)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-        d = self._parameters["upper"]
-
-        if item_idx is not None:
-            a_val = a[item_idx]
-            c_val = c[item_idx]
-            d_val = d[item_idx]
-            logistic = sigmoid(a_val * (theta_1d - b[item_idx]))
-            probability = c_val + (d_val - c_val) * logistic
-            derivative = a_val * (d_val - c_val) * logistic * (1.0 - logistic)
-            return _fisher_information(probability, derivative)
-
-        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
-        probability = c[None, :] + (d[None, :] - c[None, :]) * logistic
-        derivative = (
-            a[None, :] * (d[None, :] - c[None, :]) * logistic * (1.0 - logistic)
-        )
-        return _fisher_information(probability, derivative)
+        return self._evaluate_logistic(theta, item_idx, information=True)
 
 
 Rasch = OneParameterLogistic
@@ -512,16 +976,122 @@ Rasch = OneParameterLogistic
 ThreeParameterLogisticUpper = FourParameterLogistic
 
 
-class UnipolarLogLogistic(_ParameterizedDichotomousModel):
+class _UnidimensionalCurveModel(_ParameterizedDichotomousModel):
+    """Shared bounded evaluation for two-parameter unidimensional curves."""
+
+    n_params_per_item = 2
+    supports_multidimensional = False
+
+    def __init__(
+        self,
+        n_items: int,
+        n_factors: int = 1,
+        item_names: list[str] | None = None,
+    ) -> None:
+        if n_factors != 1:
+            raise ValueError(
+                f"{self.model_name} model only supports unidimensional analysis"
+            )
+        super().__init__(n_items, n_factors=1, item_names=item_names)
+
+    def _initialize_parameters(self) -> None:
+        self._parameters["discrimination"] = np.ones(self.n_items)
+        self._parameters["difficulty"] = np.zeros(self.n_items)
+
+    @property
+    def discrimination(self) -> NDArray[np.float64]:
+        return self._parameters["discrimination"]
+
+    @property
+    def difficulty(self) -> NDArray[np.float64]:
+        return self._parameters["difficulty"]
+
+    @abstractmethod
+    def _evaluate_block(
+        self,
+        theta: NDArray[np.float64],
+        discrimination: NDArray[np.float64],
+        difficulty: NDArray[np.float64],
+        *,
+        information: bool,
+        item_indices: NDArray[np.intp] | None = None,
+    ) -> NDArray[np.float64]: ...
+
+    def _evaluate_curve(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None,
+        *,
+        information: bool = False,
+        item_indices: NDArray[np.intp] | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        slope = self._parameters["discrimination"]
+        location = self._parameters["difficulty"]
+        if item_indices is not None:
+            points = theta[:, 0]
+            shape = (theta.shape[0],)
+            width = 1
+        elif item_idx is None:
+            points = theta[:, 0, None]
+            shape = (theta.shape[0], self.n_items)
+            width = self.n_items
+        else:
+            points = theta[:, 0]
+            slope, location = slope[item_idx], location[item_idx]
+            shape = (theta.shape[0],)
+            width = 1
+        rows_per_block = max(1, _UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS // width)
+        if theta.shape[0] <= rows_per_block:
+            return self._evaluate_block(
+                points,
+                slope,
+                location,
+                information=information,
+                item_indices=item_indices,
+            )
+        result = np.empty(shape)
+        for start in range(0, theta.shape[0], rows_per_block):
+            rows = slice(start, start + rows_per_block)
+            result[rows] = self._evaluate_block(
+                points[rows],
+                slope,
+                location,
+                information=information,
+                item_indices=None if item_indices is None else item_indices[rows],
+            )
+        return result
+
+    def probability(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        return self._evaluate_curve(theta, item_idx)
+
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return self._evaluate_curve(theta, None, item_indices=indices)
+
+    def information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        return self._evaluate_curve(theta, item_idx, information=True)
+
+
+class UnipolarLogLogistic(_UnidimensionalCurveModel):
     """Unipolar Log-Logistic (ULL) model for dichotomous items.
 
-    The ULL model is designed for items where only positive trait levels
-    are expected to endorse the item. It has a lower asymptote at 0 and
-    approaches 1 more slowly than the standard logistic.
-
-    This is useful for clinical or personality assessment where items
-    measure presence/absence of a trait that only manifests at higher
-    trait levels.
+    This implementation uses a symmetric, bell-shaped response curve.
+    Endorsement is greatest at the item location and declines in either
+    direction. The maximum response probability is 0.25.
 
     Parameters
     ----------
@@ -543,97 +1113,29 @@ class UnipolarLogLogistic(_ParameterizedDichotomousModel):
 
         P(X=1|θ) = exp(a(θ - b)) / (1 + exp(a(θ - b)))^2
 
-    which is the derivative of the logistic function, giving a
-    bell-shaped response function peaking near b.
-
-    Alternatively, using the log-logistic formulation:
-
-        P(X=1|θ) = 1 / (1 + exp(-a(θ - b)))  for θ >= b
-        P(X=1|θ) ≈ 0                          for θ << b
-
-    References
-    ----------
-    Samejima, F. (1995). Acceleration model in the heterogeneous case
-        of the general graded response model. Psychometrika, 60, 549-572.
+    This is the derivative of the logistic sigmoid with respect to its
+    logit. Its peak is at θ = b, and it approaches zero in both tails.
     """
 
     model_name = "ULL"
-    n_params_per_item = 2
-    supports_multidimensional = False
     _requires_positive_discrimination = True
 
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("ULL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
-    def _initialize_parameters(self) -> None:
-        self._parameters["discrimination"] = np.ones(self.n_items)
-        self._parameters["difficulty"] = np.zeros(self.n_items)
-
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
-    def probability(
+    def _evaluate_block(
         self,
         theta: NDArray[np.float64],
-        item_idx: int | None = None,
+        discrimination: NDArray[np.float64],
+        difficulty: NDArray[np.float64],
+        *,
+        information: bool,
+        item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            logistic = sigmoid(z)
-            return logistic * (1.0 - logistic)
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        logistic = sigmoid(z)
-        return logistic * (1.0 - logistic)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        _, logits = self._unidimensional_pair_logits(theta, item_indices)
-        logistic = sigmoid(logits)
-        return logistic * (1.0 - logistic)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            logistic = sigmoid(a[item_idx] * (theta_1d - b[item_idx]))
-            probability = logistic * (1.0 - logistic)
-            derivative = a[item_idx] * probability * (1.0 - 2.0 * logistic)
-            return _fisher_information(probability, derivative)
-
-        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
-        probability = logistic * (1.0 - logistic)
-        derivative = a[None, :] * probability * (1.0 - 2.0 * logistic)
-        return _fisher_information(probability, derivative)
+        return _unipolar_curve(
+            theta,
+            discrimination,
+            difficulty,
+            information=information,
+            item_indices=item_indices,
+        )
 
 
 class FiveParameterLogistic(_ParameterizedDichotomousModel):
@@ -718,84 +1220,103 @@ class FiveParameterLogistic(_ParameterizedDichotomousModel):
     def asymmetry(self) -> NDArray[np.float64]:
         return self._parameters["asymmetry"]
 
+    def _evaluate_curve(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None,
+        *,
+        information: bool = False,
+        item_indices: NDArray[np.intp] | None = None,
+    ) -> NDArray[np.float64]:
+        theta = self._ensure_theta_2d(theta)
+        parameters = [
+            self._parameters[name]
+            for name in (
+                "discrimination",
+                "difficulty",
+                "guessing",
+                "upper",
+                "asymmetry",
+            )
+        ]
+        if item_indices is not None:
+            points = theta[:, 0]
+            shape = (theta.shape[0],)
+            width = 1
+        elif item_idx is None:
+            points = theta[:, 0, None]
+            shape = (theta.shape[0], self.n_items)
+            width = self.n_items
+        else:
+            points = theta[:, 0]
+            parameters = [parameter[item_idx] for parameter in parameters]
+            shape = (theta.shape[0],)
+            width = 1
+        rows_per_block = max(1, _FIVE_PL_CURVE_CHUNK_ELEMENTS // width)
+        if theta.shape[0] <= rows_per_block:
+            return _five_pl_curve(
+                points, *parameters, information=information, item_indices=item_indices
+            )
+        result = np.empty(shape)
+        for start in range(0, theta.shape[0], rows_per_block):
+            rows = slice(start, start + rows_per_block)
+            result[rows] = _five_pl_curve(
+                points[rows],
+                *parameters,
+                information=information,
+                item_indices=None if item_indices is None else item_indices[rows],
+            )
+        return result
+
     def probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-        d = self._parameters["upper"]
-        e = self._parameters["asymmetry"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            logistic = sigmoid(z)
-            p_star = np.power(logistic, e[item_idx])
-            return c[item_idx] + (d[item_idx] - c[item_idx]) * p_star
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        logistic = sigmoid(z)
-        p_star = np.power(logistic, e[None, :])
-        return c[None, :] + (d[None, :] - c[None, :]) * p_star
+        return self._evaluate_curve(theta, item_idx)
 
     def probability_pairs(
         self,
         theta: NDArray[np.float64],
         item_indices: NDArray[np.int_],
     ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        indices, logits = self._unidimensional_pair_logits(theta, item_indices)
-        guessing = self._parameters["guessing"][indices]
-        upper = self._parameters["upper"][indices]
-        asymmetry = self._parameters["asymmetry"][indices]
-        powered = np.power(sigmoid(logits), asymmetry)
-        return guessing + (upper - guessing) * powered
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return self._evaluate_curve(theta, None, item_indices=indices)
 
     def information(
         self,
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-        c = self._parameters["guessing"]
-        d = self._parameters["upper"]
-        e = self._parameters["asymmetry"]
+        return self._evaluate_curve(theta, item_idx, information=True)
 
-        if item_idx is not None:
-            logistic = sigmoid(a[item_idx] * (theta_1d - b[item_idx]))
-            powered = np.power(logistic, e[item_idx])
-            probability = c[item_idx] + (d[item_idx] - c[item_idx]) * powered
-            derivative = (
-                a[item_idx]
-                * e[item_idx]
-                * (d[item_idx] - c[item_idx])
-                * powered
-                * (1.0 - logistic)
-            )
-            return _fisher_information(probability, derivative)
 
-        logistic = sigmoid(a[None, :] * (theta_1d[:, None] - b[None, :]))
-        powered = np.power(logistic, e[None, :])
-        probability = c[None, :] + (d[None, :] - c[None, :]) * powered
-        derivative = (
-            a[None, :]
-            * e[None, :]
-            * (d[None, :] - c[None, :])
-            * powered
-            * (1.0 - logistic)
+class _DoubleExponentialModel(_UnidimensionalCurveModel):
+    """Select the direction of the mirrored CLL and NLL response curves."""
+
+    _negative_loglog = False
+
+    def _evaluate_block(
+        self,
+        theta: NDArray[np.float64],
+        discrimination: NDArray[np.float64],
+        difficulty: NDArray[np.float64],
+        *,
+        information: bool,
+        item_indices: NDArray[np.intp] | None = None,
+    ) -> NDArray[np.float64]:
+        return _double_exponential_curve(
+            theta,
+            discrimination,
+            difficulty,
+            negative=self._negative_loglog,
+            information=information,
+            item_indices=item_indices,
         )
-        return _fisher_information(probability, derivative)
 
 
-class ComplementaryLogLog(_ParameterizedDichotomousModel):
+class ComplementaryLogLog(_DoubleExponentialModel):
     """Complementary Log-Log (CLL) model for dichotomous items.
 
     The CLL model uses an asymmetric link function instead of the
@@ -829,88 +1350,9 @@ class ComplementaryLogLog(_ParameterizedDichotomousModel):
     """
 
     model_name = "CLL"
-    n_params_per_item = 2
-    supports_multidimensional = False
-
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("CLL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
-    def _initialize_parameters(self) -> None:
-        self._parameters["discrimination"] = np.ones(self.n_items)
-        self._parameters["difficulty"] = np.zeros(self.n_items)
-
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = _bounded_exponential(z)
-            return -np.expm1(-exp_z)
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = _bounded_exponential(z)
-        return -np.expm1(-exp_z)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        _, logits = self._unidimensional_pair_logits(theta, item_indices)
-        return -np.expm1(-_bounded_exponential(logits))
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            z = a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = _bounded_exponential(z)
-            exp_neg_exp_z = np.exp(-exp_z)
-            probability = -np.expm1(-exp_z)
-            derivative = a[item_idx] * exp_z * exp_neg_exp_z
-            return _fisher_information(probability, derivative)
-
-        z = a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = _bounded_exponential(z)
-        exp_neg_exp_z = np.exp(-exp_z)
-        probability = -np.expm1(-exp_z)
-        derivative = a[None, :] * exp_z * exp_neg_exp_z
-        return _fisher_information(probability, derivative)
 
 
-class NegativeLogLog(_ParameterizedDichotomousModel):
+class NegativeLogLog(_DoubleExponentialModel):
     """Negative Log-Log (NLL) model for dichotomous items.
 
     The NLL model is the mirror image of CLL, approaching 1 slowly
@@ -924,78 +1366,4 @@ class NegativeLogLog(_ParameterizedDichotomousModel):
     """
 
     model_name = "NLL"
-    n_params_per_item = 2
-    supports_multidimensional = False
-
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("NLL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
-    def _initialize_parameters(self) -> None:
-        self._parameters["discrimination"] = np.ones(self.n_items)
-        self._parameters["difficulty"] = np.zeros(self.n_items)
-
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            z = -a[item_idx] * (theta_1d - b[item_idx])
-            return np.exp(-_bounded_exponential(z))
-
-        z = -a[None, :] * (theta_1d[:, None] - b[None, :])
-        return np.exp(-_bounded_exponential(z))
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in one vectorized pass."""
-        _, logits = self._unidimensional_pair_logits(theta, item_indices)
-        return np.exp(-_bounded_exponential(-logits))
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        theta_1d = theta.ravel()
-
-        a = self._parameters["discrimination"]
-        b = self._parameters["difficulty"]
-
-        if item_idx is not None:
-            z = -a[item_idx] * (theta_1d - b[item_idx])
-            exp_z = _bounded_exponential(z)
-            probability = np.exp(-exp_z)
-            derivative = a[item_idx] * exp_z * probability
-            return _fisher_information(probability, derivative)
-
-        z = -a[None, :] * (theta_1d[:, None] - b[None, :])
-        exp_z = _bounded_exponential(z)
-        probability = np.exp(-exp_z)
-        derivative = a[None, :] * exp_z * probability
-        return _fisher_information(probability, derivative)
+    _negative_loglog = True

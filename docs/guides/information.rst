@@ -33,6 +33,12 @@ Inspect fitted information
 row-wise sum and can be converted to conditional standard error with
 ``1 / np.sqrt(test_information)`` wherever information is positive.
 
+For multidimensional models, supply one row per ability point and one column
+per factor. A vector of length ``model.n_factors`` represents a single point.
+``iteminfo`` and ``expected_score`` accept a scalar integer item index or a
+one-dimensional selection, including NumPy arrays. Selections preserve their
+order and repeated indices; an empty selection returns zero columns.
+
 Inspect conditional reliability
 -------------------------------
 
