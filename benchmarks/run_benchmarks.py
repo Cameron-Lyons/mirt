@@ -55,6 +55,7 @@ SUITE_ORDER = (
     "weighted-em",
     "variational",
     "gvem-uncertainty",
+    "variational-objective",
 )
 
 
@@ -338,6 +339,54 @@ def bench_gvem_uncertainty(
                     f"gvem_{name}_{n_factors}d",
                     _time(run, repeats=repeats, warmups=warmups),
                     peak_traced_bytes=_peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_variational_objective(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure NumPy logistic bounds on precomputed Gaussian variational states."""
+    from mirt.estimation.gvem import GVEMEstimator
+    from mirt.estimation.sparse_bayesian import SparseBayesianEstimator
+    from mirt.models.dichotomous import TwoParameterLogistic
+
+    rng = np.random.default_rng(92)
+    results = []
+    for n_factors in (1, 3, 6):
+        responses = rng.integers(0, 2, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        loadings = rng.normal(scale=0.5, size=(n_items, n_factors))
+        intercepts = rng.normal(size=n_items)
+        mu = rng.normal(scale=0.5, size=(n_persons, n_factors))
+        root = rng.normal(scale=0.1, size=(n_persons, n_factors, n_factors))
+        sigma = root @ root.swapaxes(1, 2) + np.eye(n_factors) * 0.5
+        xi = rng.uniform(0.0, 3.0, size=responses.shape)
+        prior_mean = rng.normal(scale=0.2, size=n_factors)
+        prior_cov = np.eye(n_factors) * 1.2 + 0.1
+        model = TwoParameterLogistic(n_items, n_factors)
+        gvem = GVEMEstimator(use_gpu=False)
+        sparse = SparseBayesianEstimator(k_max=n_factors)
+        gvem._slopes = sparse._loadings = loadings
+        gvem._intercepts = sparse._intercepts = intercepts
+        gvem._mu = sparse._mu = mu
+        gvem._sigma = sparse._sigma = sigma
+        gvem._xi = sparse._xi = xi
+
+        def run_gvem() -> float:
+            return gvem._compute_elbo_python(model, responses, prior_mean, prior_cov)
+
+        def run_sparse() -> float:
+            return sparse._compute_elbo(responses, prior_mean, prior_cov)
+
+        for name, run in (("gvem", run_gvem), ("sparse", run_sparse)):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"variational_objective_{name}_{n_factors}d",
+                    times,
+                    _peak_traced_bytes(run),
                 )
             )
     return results
@@ -1595,6 +1644,10 @@ def run_suites(
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
         results.extend(bench_gvem_uncertainty(n_persons, n_items, repeats, warmups))
+    if "variational-objective" in suites:
+        results.extend(
+            bench_variational_objective(n_persons, n_items, repeats, warmups)
+        )
     return results
 
 
@@ -1774,6 +1827,7 @@ def _validate_baseline_compatibility(
                 "variational_",
                 "gvem_standard_errors_",
                 "gvem_fit_",
+                "variational_objective_",
             )
         )
     )
