@@ -61,6 +61,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reusing kernels across items and bounding temporary memory for both means and
   uncertainty bands. Extended the smoothing benchmarks to binary and polytomous
   empirical curves with complete and missing responses.
+- Batched built-in survey-weighted EM likelihoods over quadrature points and
+  retained log marginals through convergence and fit statistics, avoiding
+  likelihood underflow on long tests. Reused posterior normalization storage
+  and shared item-curvature calculations for weighted standard errors,
+  preserving fixed-parameter masks and avoiding repeated finite differences.
+  Added a `weighted-em` timing and traced-memory benchmark suite.
 - Streamed model-fit moments in bounded response and probability blocks, sharing
   pairwise counts and reusing observed moments for the independence baseline.
   Complete blocks avoid missing-data matrix products. Added a `model-fit`

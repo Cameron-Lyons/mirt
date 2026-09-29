@@ -52,6 +52,7 @@ SUITE_ORDER = (
     "multidimensional-probability",
     "multidimensional-fit",
     "logistic-fit",
+    "weighted-em",
 )
 
 
@@ -240,6 +241,63 @@ def bench_scoring(
         "eap_scoring",
         _time(run, repeats=repeats, warmups=warmups),
     )
+
+
+def bench_weighted_em(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure weighted E-steps, uncertainty, and five-iteration complete fits."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.weighted import WeightedEMEstimator
+
+    rng = np.random.default_rng(42)
+    weights = rng.uniform(0.25, 2.0, n_persons)
+    results = []
+    for name, model in (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("mirt", mirt.TwoParameterLogistic(n_items, n_factors=2)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
+    ):
+        responses = mirt.simdata(
+            model=model.model_name,
+            n_items=n_items,
+            n_categories=5,
+            theta=rng.normal(size=(n_persons, model.n_factors)),
+            seed=42,
+        )
+        responses[rng.random(responses.shape) < 0.1] = -1
+        estimator = WeightedEMEstimator(n_quadpts=7 if name == "mirt" else 21)
+        estimator._quadrature = GaussHermiteQuadrature(
+            n_points=estimator.n_quadpts, n_dimensions=model.n_factors
+        )
+        mean, cov = np.zeros(model.n_factors), np.eye(model.n_factors)
+
+        def e_step():
+            return estimator._e_step_weighted(model, responses, mean, cov, weights)
+
+        results.append(
+            BenchResult(
+                f"weighted_e_step_{name}",
+                _time(e_step, repeats=repeats, warmups=warmups),
+                peak_traced_bytes=_peak_traced_bytes(e_step),
+            )
+        )
+        if name == "mirt":
+            continue
+
+        def fit():
+            return WeightedEMEstimator(n_quadpts=21, max_iter=5, tol=1e-12).fit(
+                model.copy(), responses, weights=weights
+            )
+
+        results.append(
+            BenchResult(
+                f"weighted_fit_{name}",
+                _time(fit, repeats=repeats, warmups=warmups),
+                peak_traced_bytes=_peak_traced_bytes(fit),
+            )
+        )
+    return results
 
 
 def bench_kernels(
@@ -1444,6 +1502,8 @@ def run_suites(
         results.extend(bench_multidimensional_fit(n_persons, n_items, repeats, warmups))
     if "logistic-fit" in suites:
         results.extend(bench_logistic_fit(n_persons, n_items, repeats, warmups))
+    if "weighted-em" in suites:
+        results.extend(bench_weighted_em(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1592,6 +1652,11 @@ def _validate_baseline_compatibility(
         "gaussian_log_density_1d",
         "gaussian_log_density_3d",
         "gaussian_log_density_8d",
+        "weighted_e_step_2pl",
+        "weighted_e_step_mirt",
+        "weighted_e_step_grm",
+        "weighted_fit_2pl",
+        "weighted_fit_grm",
     }
     person_workloads.update(
         name

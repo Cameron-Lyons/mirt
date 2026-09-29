@@ -80,7 +80,7 @@ def test_python_e_steps_retain_standard_prior_without_information() -> None:
 
     weighted = WeightedEMEstimator(n_quadpts=21)
     weighted._quadrature = GaussHermiteQuadrature(n_points=21)
-    posterior, marginal = weighted._e_step_weighted(
+    posterior, log_marginal = weighted._e_step_weighted(
         TwoParameterLogistic(1),
         responses,
         prior_mean=np.zeros(1),
@@ -88,7 +88,7 @@ def test_python_e_steps_retain_standard_prior_without_information() -> None:
         weights=np.ones(1),
     )
     np.testing.assert_allclose(posterior[0], weighted._quadrature.weights, atol=1e-14)
-    np.testing.assert_allclose(marginal, 1.0, atol=1e-14)
+    np.testing.assert_allclose(log_marginal, 0.0, atol=1e-14)
 
 
 def test_multidimensional_python_e_steps_retain_standard_prior() -> None:
