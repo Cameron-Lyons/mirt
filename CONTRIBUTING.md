@@ -293,6 +293,21 @@ covers Python/NumPy allocations, excluding native workspace and process RSS.
 Weighted standard errors share the core EM item-curvature implementation,
 including analytic built-in derivatives and numerical custom-model fallbacks.
 
+The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
+Bayesian estimation in one, three, and six dimensions. Each call starts from the
+same local bound values and performs three inner iterations with 10% missing
+responses. It calls the NumPy paths directly; input generation is excluded:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite variational --persons 10000 --items 100 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-variational.json
+```
+
+Row blocks are sized by item and factor counts, with at least one respondent per
+block. Means, covariance matrices, and local variational bounds still scale with
+sample size. The reported peaks measure Python/NumPy allocations during E-steps;
+they exclude input creation, native workspace, process RSS, and other fitting
+stages. The benchmark does not measure complete-fit speedups.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

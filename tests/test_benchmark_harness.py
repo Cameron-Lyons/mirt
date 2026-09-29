@@ -347,6 +347,7 @@ class TestBenchmarkCommand:
             "multidimensional-fit",
             "logistic-fit",
             "weighted-em",
+            "variational",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -379,6 +380,7 @@ class TestBenchmarkCommand:
             "multidimensional-fit",
             "logistic-fit",
             "weighted-em",
+            "variational",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -399,6 +401,25 @@ class TestBenchmarkCommand:
                 benchmark.compare_results(
                     _report(result, persons=8, items=2),
                     _report(result, persons=9, items=2),
+                    max_regression_percent=5.0,
+                )
+
+    def test_variational_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ["variational"], n_persons=20, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"variational_{kind}_{dimensions}d"
+            for dimensions in (1, 3, 6)
+            for kind in ("gvem", "sparse")
+        ]
+        for result in results:
+            assert len(result.times) == 2
+            assert result.peak_traced_bytes > 0
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=20),
+                    _report(result, persons=21),
                     max_regression_percent=5.0,
                 )
 

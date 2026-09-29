@@ -14,6 +14,7 @@ from mirt.constants import (
     PROB_EPSILON,
     REGULARIZATION_EPSILON,
 )
+from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
 
@@ -657,17 +658,7 @@ class SparseBayesianEstimator(BaseEstimator):
     @staticmethod
     def _lambda_jj(xi: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute Jaakkola-Jordan lambda function."""
-        xi = np.abs(xi)
-        result = np.empty_like(xi)
-
-        small = xi < 1e-6
-        result[small] = 0.125
-
-        large = ~small
-        xi_large = xi[large]
-        result[large] = np.tanh(xi_large / 2) / (4 * xi_large)
-
-        return result
+        return jaakkola_lambda(xi)
 
     def _e_step(
         self,
@@ -676,44 +667,17 @@ class SparseBayesianEstimator(BaseEstimator):
         prior_cov_inv: NDArray[np.float64],
     ) -> None:
         """E-step: update variational parameters."""
-        valid_mask = responses >= 0
-        prior_natural_mean = prior_cov_inv @ prior_mean
-
-        for _ in range(self.n_inner_iter):
-            lam = self._lambda_jj(self._xi)
-            weights = np.where(valid_mask, 2.0 * lam, 0.0)
-            precision = prior_cov_inv + np.einsum(
-                "ij,jf,jg->ifg",
-                weights,
-                self._loadings,
-                self._loadings,
-                optimize=True,
-            )
-            self._sigma = np.linalg.inv(precision)
-
-            coeffs = np.where(
-                valid_mask,
-                responses - 0.5 - 2.0 * lam * self._intercepts,
-                0.0,
-            )
-            natural_mean = coeffs @ self._loadings + prior_natural_mean
-            self._mu = np.einsum(
-                "ifg,ig->if",
-                self._sigma,
-                natural_mean,
-                optimize=True,
-            )
-
-            eta_mean = self._mu @ self._loadings.T + self._intercepts
-            eta_variance = np.einsum(
-                "jf,ifg,jg->ij",
-                self._loadings,
-                self._sigma,
-                self._loadings,
-                optimize=True,
-            )
-            updated_xi = np.sqrt(np.maximum(eta_variance + eta_mean**2, PROB_EPSILON))
-            self._xi = np.where(valid_mask, updated_xi, self._xi)
+        self._mu, self._sigma, self._xi = variational_e_step(
+            responses,
+            self._loadings,
+            self._intercepts,
+            prior_mean,
+            prior_cov_inv,
+            self._xi,
+            self.n_inner_iter,
+            xi_floor=PROB_EPSILON,
+            lambda_function=self._lambda_jj,
+        )
 
     def _m_step_ssl(
         self,
