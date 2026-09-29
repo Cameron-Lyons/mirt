@@ -308,6 +308,24 @@ sample size. The reported peaks measure Python/NumPy allocations during E-steps;
 they exclude input creation, native workspace, process RSS, and other fitting
 stages. The benchmark does not measure complete-fit speedups.
 
+The `gvem-uncertainty` suite measures diagonal standard errors on a precomputed
+variational state and complete five-iteration 2PL GVEM fits, including standard
+errors, in one and three dimensions. Simulated responses contain 10% missing
+data. GPU dispatch is disabled; `--backend` selects the other fitting kernels:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite gvem-uncertainty --persons 1000 --items 20 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-gvem-uncertainty.json
+```
+
+At the default SE step size, built-in 1PL/2PL models use exact diagonal curvature
+of the same bound with the variational distribution held fixed. Custom objectives,
+estimator/model subclasses, and nondefault step sizes retain numerical
+differentiation. This preserves the diagonal curvature convention; it does not
+compute a full covariance matrix or profile the variational distribution.
+Curvature scratch space is bounded by row and factor counts, and missing items
+retain undefined standard errors. Traced peaks exclude input generation, native
+workspace, and process RSS.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

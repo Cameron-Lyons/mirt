@@ -54,6 +54,7 @@ SUITE_ORDER = (
     "logistic-fit",
     "weighted-em",
     "variational",
+    "gvem-uncertainty",
 )
 
 
@@ -298,6 +299,47 @@ def bench_weighted_em(
                 peak_traced_bytes=_peak_traced_bytes(fit),
             )
         )
+    return results
+
+
+def bench_gvem_uncertainty(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure diagonal GVEM uncertainty and complete five-iteration fits."""
+    from mirt.estimation.gvem import GVEMEstimator
+
+    rng = np.random.default_rng(82)
+    results = []
+    for n_factors in (1, 3):
+        model = mirt.TwoParameterLogistic(n_items, n_factors=n_factors)
+        responses = mirt.simdata(
+            n_persons=n_persons, n_items=n_items, n_factors=n_factors, seed=42
+        )
+        responses[rng.random(responses.shape) < 0.1] = -1
+        mean, cov = np.zeros(n_factors), np.eye(n_factors)
+        estimator = GVEMEstimator(use_gpu=False)
+        estimator._mu = rng.normal(size=(n_persons, n_factors))
+        estimator._sigma = np.broadcast_to(
+            cov, (n_persons, n_factors, n_factors)
+        ).copy()
+        estimator._xi = rng.uniform(0.1, 2.0, (n_persons, n_items))
+
+        def uncertainty():
+            return estimator._compute_standard_errors(model, responses, mean, cov)
+
+        def fit():
+            return GVEMEstimator(max_iter=5, tol=1e-12, use_gpu=False).fit(
+                model.copy(), responses
+            )
+
+        for name, run in (("standard_errors", uncertainty), ("fit", fit)):
+            results.append(
+                BenchResult(
+                    f"gvem_{name}_{n_factors}d",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    peak_traced_bytes=_peak_traced_bytes(run),
+                )
+            )
     return results
 
 
@@ -1551,6 +1593,8 @@ def run_suites(
         results.extend(bench_weighted_em(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
+    if "gvem-uncertainty" in suites:
+        results.extend(bench_gvem_uncertainty(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1728,6 +1772,8 @@ def _validate_baseline_compatibility(
                 "multidimensional_fit_",
                 "logistic_fit_",
                 "variational_",
+                "gvem_standard_errors_",
+                "gvem_fit_",
             )
         )
     )

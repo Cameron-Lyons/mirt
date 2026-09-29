@@ -72,6 +72,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrays while preserving missing-data bounds, shifted priors, and each
   estimator's lower bound on local variational parameters. Small samples use
   one block without copying outputs. Added a `variational` timing and memory suite.
+- Computed built-in GVEM standard errors directly from diagonal variational
+  curvature at the default step size, avoiding full-objective finite differences
+  and cancellation against parameter-independent terms. Curvature reductions
+  use bounded row blocks. Custom objectives and nondefault steps retain a shared
+  numerical fallback that restores parameters on failed trial evaluations.
+  Added a `gvem-uncertainty` benchmark suite for uncertainty and complete fits.
 - Streamed model-fit moments in bounded response and probability blocks, sharing
   pairwise counts and reusing observed moments for the independence baseline.
   Complete blocks avoid missing-data matrix products. Added a `model-fit`
