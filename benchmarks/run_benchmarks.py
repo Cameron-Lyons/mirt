@@ -53,6 +53,7 @@ SUITE_ORDER = (
     "multidimensional-fit",
     "logistic-fit",
     "weighted-em",
+    "variational",
 )
 
 
@@ -395,6 +396,50 @@ def bench_optimization(
             ),
         )
     )
+    return results
+
+
+def bench_variational(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure NumPy variational E-steps with three inner iterations."""
+    from mirt.estimation.gvem import GVEMEstimator
+    from mirt.estimation.sparse_bayesian import SparseBayesianEstimator
+
+    rng = np.random.default_rng(91)
+    responses = rng.integers(0, 2, (n_persons, n_items))
+    responses[rng.random(responses.shape) < 0.1] = -1
+    xi = rng.uniform(0.0, 2.0, (n_persons, n_items))
+    xi.setflags(write=False)
+    results = []
+    for n_factors in (1, 3, 6):
+        loadings = rng.normal(scale=0.5, size=(n_items, n_factors))
+        intercepts = rng.normal(size=n_items)
+        mean, precision = np.zeros(n_factors), np.eye(n_factors)
+        for kind in ("gvem", "sparse"):
+            if kind == "gvem":
+                estimator = GVEMEstimator(n_inner_iter=3, use_gpu=False)
+                estimator._slopes = loadings
+                update = estimator._e_step_python
+            else:
+                estimator = SparseBayesianEstimator(k_max=n_factors, n_inner_iter=3)
+                estimator._loadings = loadings
+                update = estimator._e_step
+            estimator._intercepts = intercepts
+
+            def run():
+                # Each measurement starts with the same local bound values.
+                # Initial means/covariances are not used by the closed-form update.
+                estimator._xi = xi
+                update(responses, mean, precision)
+
+            results.append(
+                BenchResult(
+                    f"variational_{kind}_{n_factors}d",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    peak_traced_bytes=_peak_traced_bytes(run),
+                )
+            )
     return results
 
 
@@ -1504,6 +1549,8 @@ def run_suites(
         results.extend(bench_logistic_fit(n_persons, n_items, repeats, warmups))
     if "weighted-em" in suites:
         results.extend(bench_weighted_em(n_persons, n_items, repeats, warmups))
+    if "variational" in suites:
+        results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1680,6 +1727,7 @@ def _validate_baseline_compatibility(
                 "multidimensional_probability_",
                 "multidimensional_fit_",
                 "logistic_fit_",
+                "variational_",
             )
         )
     )

@@ -16,6 +16,7 @@ from mirt.backends.rust.gvem import gvem_compute_elbo as _rust_gvem_compute_elbo
 from mirt.backends.rust.gvem import gvem_e_step as _rust_gvem_e_step
 from mirt.backends.rust.gvem import gvem_m_step as _rust_gvem_m_step
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
 
@@ -372,17 +373,7 @@ class GVEMEstimator(BaseEstimator):
 
         This is numerically stable for xi near 0 where the limit is 1/8.
         """
-        xi = np.abs(xi)
-        result = np.empty_like(xi)
-
-        small = xi < 1e-6
-        result[small] = 0.125
-
-        large = ~small
-        xi_large = xi[large]
-        result[large] = np.tanh(xi_large / 2) / (4 * xi_large)
-
-        return result
+        return jaakkola_lambda(xi)
 
     def _e_step(
         self,
@@ -437,44 +428,17 @@ class GVEMEstimator(BaseEstimator):
         prior_cov_inv: NDArray[np.float64],
     ) -> None:
         """Python fallback for E-step."""
-        valid_mask = responses >= 0
-        prior_natural_mean = prior_cov_inv @ prior_mean
-
-        for _ in range(self.n_inner_iter):
-            lam = self._lambda(self._xi)
-            weights = np.where(valid_mask, 2.0 * lam, 0.0)
-            precision = prior_cov_inv + np.einsum(
-                "ij,jf,jg->ifg",
-                weights,
-                self._slopes,
-                self._slopes,
-                optimize=True,
-            )
-            self._sigma = np.linalg.inv(precision)
-
-            coeffs = np.where(
-                valid_mask,
-                responses - 0.5 - 2.0 * lam * self._intercepts,
-                0.0,
-            )
-            natural_mean = coeffs @ self._slopes + prior_natural_mean
-            self._mu = np.einsum(
-                "ifg,ig->if",
-                self._sigma,
-                natural_mean,
-                optimize=True,
-            )
-
-            eta_mean = self._mu @ self._slopes.T + self._intercepts
-            eta_variance = np.einsum(
-                "jf,ifg,jg->ij",
-                self._slopes,
-                self._sigma,
-                self._slopes,
-                optimize=True,
-            )
-            updated_xi = np.sqrt(np.maximum(eta_variance + eta_mean**2, 0.0))
-            self._xi = np.where(valid_mask, updated_xi, self._xi)
+        self._mu, self._sigma, self._xi = variational_e_step(
+            responses,
+            self._slopes,
+            self._intercepts,
+            prior_mean,
+            prior_cov_inv,
+            self._xi,
+            self.n_inner_iter,
+            xi_floor=0.0,
+            lambda_function=self._lambda,
+        )
 
     def _m_step(
         self,

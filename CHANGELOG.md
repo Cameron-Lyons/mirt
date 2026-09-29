@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and shared item-curvature calculations for weighted standard errors,
   preserving fixed-parameter masks and avoiding repeated finite differences.
   Added a `weighted-em` timing and traced-memory benchmark suite.
+- Shared Gaussian variational E-step calculations between GVEM's NumPy
+  fallback and sparse Bayesian estimation. Respondent blocks bound temporary
+  arrays while preserving missing-data bounds, shifted priors, and each
+  estimator's lower bound on local variational parameters. Small samples use
+  one block without copying outputs. Added a `variational` timing and memory suite.
 - Streamed model-fit moments in bounded response and probability blocks, sharing
   pairwise counts and reusing observed moments for the independence baseline.
   Complete blocks avoid missing-data matrix products. Added a `model-fit`
