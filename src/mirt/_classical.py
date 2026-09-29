@@ -23,14 +23,10 @@ def _sample_variance(
         out=np.zeros_like(sums, dtype=np.float64),
         where=counts > 0,
     )
-    if axis is None:
-        squared_deviations = np.where(valid, (values - means) ** 2, 0.0)
-    else:
-        squared_deviations = np.where(
-            valid,
-            (values - np.expand_dims(means, axis=axis)) ** 2,
-            0.0,
-        )
+    squared_deviations = np.array(values, dtype=np.float64, copy=True)
+    squared_deviations -= means if axis is None else np.expand_dims(means, axis=axis)
+    np.square(squared_deviations, out=squared_deviations)
+    np.copyto(squared_deviations, 0.0, where=~valid)
     squared_sum = np.sum(squared_deviations, axis=axis)
     return np.divide(
         squared_sum,
@@ -42,18 +38,24 @@ def _sample_variance(
 
 def _alpha_if_deleted_numpy(
     responses: NDArray[np.float64],
+    *,
+    total_scores: NDArray[np.float64] | None = None,
+    observed_counts: NDArray[np.intp] | None = None,
+    item_variances: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Compute every deletion coefficient in bounded matrix chunks."""
+    """Compute deletion coefficients, optionally reusing prepared statistics."""
     n_persons, n_items = responses.shape
     remaining_items = n_items - 1
     alpha = np.zeros(n_items, dtype=np.float64)
     if remaining_items < 2:
         return alpha
 
-    valid = np.isfinite(responses)
-    observed_per_person = np.sum(valid, axis=1, dtype=np.intp)
-    total_scores = np.nansum(responses, axis=1)
-    item_variances = np.asarray(_sample_variance(responses, axis=0))
+    if observed_counts is None:
+        observed_counts = np.sum(np.isfinite(responses), axis=1, dtype=np.intp)
+    if total_scores is None:
+        total_scores = np.nansum(responses, axis=1)
+    if item_variances is None:
+        item_variances = np.asarray(_sample_variance(responses, axis=0))
     remaining_variance_sums = np.sum(item_variances) - item_variances
     chunk_size = min(
         n_items,
@@ -62,13 +64,13 @@ def _alpha_if_deleted_numpy(
 
     for start in range(0, n_items, chunk_size):
         stop = min(start + chunk_size, n_items)
-        valid_chunk = valid[:, start:stop]
+        valid_chunk = np.isfinite(responses[:, start:stop])
         deleted_scores = total_scores[:, None] - np.where(
             valid_chunk,
             responses[:, start:stop],
             0.0,
         )
-        deleted_scores[observed_per_person[:, None] == valid_chunk] = np.nan
+        deleted_scores[observed_counts[:, None] == valid_chunk] = np.nan
         total_variances = np.asarray(_sample_variance(deleted_scores, axis=0))
         usable = total_variances > 0.0
         alpha[start:stop] = np.divide(

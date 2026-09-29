@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from mirt.exceptions import MirtValidationError
+from mirt.models import dichotomous
 from mirt.models.base import BaseItemModel, PolytomousItemModel
 from mirt.models.bifactor import BifactorModel
 from mirt.models.compensatory import (
@@ -53,9 +54,13 @@ def _configure_dichotomous(model: BaseItemModel) -> BaseItemModel:
         lambda: FourParameterLogistic(4),
     ],
 )
+@pytest.mark.parametrize("chunk_elements", [3, 262_144])
 def test_dichotomous_pairs_match_individual_item_evaluation(
     factory: Callable[[], BaseItemModel],
+    chunk_elements: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(dichotomous, "_LOGISTIC_CURVE_CHUNK_ELEMENTS", chunk_elements)
     model = _configure_dichotomous(factory())
     theta = np.array([[-2.0], [-0.5], [0.2], [1.0], [2.5]])
     item_indices = np.array([3, 0, 2, 2, 1])

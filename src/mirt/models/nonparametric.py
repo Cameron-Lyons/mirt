@@ -13,10 +13,12 @@ from numpy.typing import NDArray
 from scipy.interpolate import BSpline
 from scipy.special import comb, expit
 
+from mirt._smoothing import smooth_response_curves
 from mirt.constants import PROB_EPSILON
 from mirt.models.base import DichotomousItemModel
 
 _POWER_BASIS_MAX_DEGREE = 12
+_KERNEL_MAX_VALUES = 1_000_000
 
 
 def _positive_integer(value: int, name: str) -> int:
@@ -125,66 +127,6 @@ def _relative_positive(log_values: NDArray[np.float64]) -> NDArray[np.float64]:
     centered = log_values - np.max(log_values, axis=1, keepdims=True)
     centered = np.maximum(centered, np.log(np.nextafter(0.0, 1.0)))
     return np.exp(centered)
-
-
-def _stable_gaussian_weights(
-    samples: NDArray[np.float64],
-    grid: NDArray[np.float64],
-    bandwidth: float,
-    sample_weight: NDArray[np.float64] | None = None,
-) -> NDArray[np.float64]:
-    """Return stable Gaussian and person weights relative to each grid maximum."""
-    sample_matrix = samples[:, None]
-    grid_matrix = grid[None, :]
-    log_sample_weight = np.zeros(samples.size, dtype=np.float64)
-    if sample_weight is not None:
-        log_sample_weight.fill(-np.inf)
-        np.log(
-            sample_weight,
-            out=log_sample_weight,
-            where=sample_weight > 0.0,
-        )
-    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
-        scaled_distance = (sample_matrix - grid_matrix) / bandwidth
-        log_weights = -0.5 * scaled_distance**2 + log_sample_weight[:, None]
-    column_maximum = np.max(log_weights, axis=0)
-    if np.all(np.isfinite(column_maximum)):
-        return np.exp(log_weights - column_maximum)
-
-    scale = np.maximum(np.abs(sample_matrix), np.abs(grid_matrix))
-    nonzero_scale = scale > 0
-    scaled_samples = np.divide(
-        sample_matrix, scale, out=np.zeros_like(scale), where=nonzero_scale
-    )
-    scaled_grid = np.divide(
-        grid_matrix, scale, out=np.zeros_like(scale), where=nonzero_scale
-    )
-    normalized_distance = np.abs(scaled_samples - scaled_grid)
-    with np.errstate(divide="ignore"):
-        log_distance = np.log(scale) + np.log(normalized_distance)
-
-    nearest_log_distance = np.min(log_distance, axis=0)
-    non_nearest = log_distance > nearest_log_distance[None, :]
-    log_squared_gap = np.full_like(log_distance, -np.inf)
-    relative_log_square = np.zeros_like(log_distance)
-    np.subtract(
-        nearest_log_distance[None, :],
-        log_distance,
-        out=relative_log_square,
-        where=non_nearest,
-    )
-    relative_log_square *= 2.0
-    with np.errstate(divide="ignore", invalid="ignore"):
-        log_squared_gap[non_nearest] = 2.0 * log_distance[non_nearest] + np.log1p(
-            -np.exp(relative_log_square[non_nearest])
-        )
-
-    log_penalty = log_squared_gap - np.log(2.0) - 2.0 * np.log(bandwidth)
-    max_log_penalty = np.log(-np.log(np.nextafter(0.0, 1.0)))
-    penalty = np.exp(np.minimum(log_penalty, max_log_penalty))
-    log_weights = -penalty + log_sample_weight[:, None]
-    column_maximum = np.max(log_weights, axis=0)
-    return np.exp(log_weights - column_maximum)
 
 
 def _fisher_information(
@@ -798,7 +740,6 @@ class KernelSmoothingModel(DichotomousItemModel):
             missing_items = np.flatnonzero(counts == 0).tolist()
             raise ValueError(f"items without observed responses: {missing_items}")
         all_observed = bool(np.all(valid))
-        valid_values: NDArray[np.float64] | None = None
         with np.errstate(over="ignore", invalid="ignore"):
             if all_observed:
                 calibration_weight_sums = np.full(
@@ -806,8 +747,7 @@ class KernelSmoothingModel(DichotomousItemModel):
                     np.sum(sample_weight_array),
                 )
             else:
-                valid_values = valid.astype(np.float64)
-                calibration_weight_sums = valid_values.T @ sample_weight_array
+                calibration_weight_sums = valid.T @ sample_weight_array
         if not np.all(np.isfinite(calibration_weight_sums)):
             raise ValueError("sample_weight totals must be finite; rescale the weights")
         if np.any(calibration_weight_sums <= 0.0):
@@ -816,46 +756,19 @@ class KernelSmoothingModel(DichotomousItemModel):
                 f"items without positive calibration weight: {missing_items}"
             )
 
-        kernel_weights = _stable_gaussian_weights(
+        if all_observed:
+            response_values = np.asarray(responses_array, dtype=np.float64)
+        else:
+            response_values = np.where(valid, responses_array, 0.0)
+        new_irf_values, _ = smooth_response_curves(
             theta_array,
             self._theta_grid,
+            response_values,
+            None if all_observed else valid,
             self.bandwidth,
-            sample_weight_array,
+            max_elements=_KERNEL_MAX_VALUES,
+            sample_weight=sample_weight_array,
         )
-        response_values = np.where(valid, responses_array, 0.0)
-        if all_observed:
-            new_irf_values = (
-                response_values.T @ kernel_weights / np.sum(kernel_weights, axis=0)
-            )
-        else:
-            assert valid_values is not None
-            denominator = valid_values.T @ kernel_weights
-            new_irf_values = np.divide(
-                response_values.T @ kernel_weights,
-                denominator,
-                out=np.zeros_like(denominator),
-                where=denominator > 0.0,
-            )
-            fallback_items = np.flatnonzero(
-                np.any(
-                    (denominator <= np.finfo(np.float64).tiny)
-                    | ~np.isfinite(denominator),
-                    axis=1,
-                )
-            )
-            for item_idx in fallback_items:
-                item_valid = valid[:, item_idx] & (sample_weight_array > 0.0)
-                item_kernel_weights = _stable_gaussian_weights(
-                    theta_array[item_valid],
-                    self._theta_grid,
-                    self.bandwidth,
-                    sample_weight_array[item_valid],
-                )
-                new_irf_values[item_idx] = (
-                    response_values[item_valid, item_idx]
-                    @ item_kernel_weights
-                    / np.sum(item_kernel_weights, axis=0)
-                )
 
         self._irf_values = np.clip(new_irf_values, 0.0, 1.0)
         self._calibration_counts = counts

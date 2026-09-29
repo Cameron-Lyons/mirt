@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+from mirt.models import dichotomous
 from mirt.models.dichotomous import (
     ComplementaryLogLog,
     FiveParameterLogistic,
@@ -161,3 +162,154 @@ def test_double_exponential_links_are_finite_without_warnings(model: object) -> 
     assert np.all((probability >= 0) & (probability <= 1))
     assert np.all(information >= 0)
     assert_allclose(information[[0, -1]], 0.0, atol=1e-15)
+
+
+@pytest.mark.parametrize("guessing,upper", [(0.0, 1.0), (0.2, 0.95)])
+def test_five_parameter_extreme_shapes_preserve_midpoint_probability_and_information(
+    guessing: float, upper: float
+) -> None:
+    shape = np.array([1e-20, 1e-3, 1.0, 1e10, 1e20, 1e308])
+    slope = np.array([1e20, 1e3, 1.0, 5.0, 10.0, 100.0])
+    log_half = np.log(0.5) / shape
+    theta = (log_half - np.log(-np.expm1(log_half))) / slope
+    model = FiveParameterLogistic(len(shape)).set_parameters(
+        discrimination=slope,
+        guessing=np.full(shape.size, guessing),
+        upper=np.full(shape.size, upper),
+        asymmetry=shape,
+    )
+    target = guessing + (upper - guessing) * 0.5
+    derivative = slope * (shape * -np.expm1(log_half)) * (upper - guessing) * 0.5
+    expected_information = derivative**2 / (target * (1.0 - target))
+    indices = np.arange(shape.size)
+    theta.flags.writeable = False
+
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        probabilities = model.probability(theta)
+        information = model.information(theta)
+        paired = model.probability_pairs(theta[:, None], indices)
+        individual = np.array(
+            [model.probability([point], item_idx=i)[0] for i, point in enumerate(theta)]
+        )
+        individual_information = np.array(
+            [model.information([point], item_idx=i)[0] for i, point in enumerate(theta)]
+        )
+
+    assert_allclose(np.diag(probabilities), target, rtol=3e-13, atol=0.0)
+    assert_allclose(paired, target, rtol=3e-13, atol=0.0)
+    assert_allclose(individual, paired, rtol=1e-14, atol=0.0)
+    assert_allclose(np.diag(information), expected_information, rtol=3e-12, atol=0.0)
+    assert_allclose(individual_information, expected_information, rtol=3e-12, atol=0.0)
+    assert np.all(np.isfinite(information))
+
+
+def test_five_parameter_information_preserves_both_logistic_tails() -> None:
+    model = FiveParameterLogistic(1).set_parameters(guessing=np.array([0.0]))
+    theta = np.array([-710.0, -400.0, 40.0, 400.0, 710.0])
+    exponential = np.exp(-np.abs(theta))
+    expected = exponential / (1.0 + exponential) ** 2
+
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = model.information(theta, item_idx=0)
+
+    assert_allclose(actual, expected, rtol=1e-12, atol=0.0)
+
+
+def test_five_parameter_large_shape_recovers_underflowing_sigmoid_tail() -> None:
+    model = FiveParameterLogistic(1).set_parameters(
+        guessing=np.array([0.0]), asymmetry=np.array([1e308])
+    )
+    theta = np.array([710.0, 800.0, 1000.0])
+    exponent = np.exp(np.log(1e308) - theta)
+    expected_probability = np.exp(-exponent)
+    expected_information = exponent**2 / np.expm1(exponent)
+
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        probability = model.probability(theta, item_idx=0)
+        information = model.information(theta, item_idx=0)
+
+    assert_allclose(probability, expected_probability, rtol=1e-14)
+    assert_allclose(information, expected_information, rtol=3e-12, atol=0.0)
+
+
+def test_five_parameter_subnormal_shape_preserves_information_scale() -> None:
+    shape = np.nextafter(0.0, 1.0)
+    slope = 1e308
+    model = FiveParameterLogistic(1).set_parameters(
+        discrimination=np.array([slope]),
+        guessing=np.array([0.0]),
+        asymmetry=np.array([shape]),
+    )
+    expected = np.exp(2.0 * np.log(slope) + np.log(shape) - np.log(4.0 * np.log(2.0)))
+
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        information = model.information([0.0], item_idx=0)
+
+    assert_allclose(information, expected, rtol=3e-12, atol=0.0)
+
+
+def test_subnormal_power_does_not_lose_precision_before_slope_rescaling() -> None:
+    slope = 1e170
+    shape = 1e308
+    theta = (np.log(shape) - np.log(740.0)) / slope
+    exponent = np.exp(np.log(shape) - slope * theta)
+    log_derivative = np.log(slope) + np.log(0.8) + np.log(exponent) - exponent
+    expected = np.exp(2.0 * log_derivative - np.log(0.2 * 0.8))
+    model = FiveParameterLogistic(1).set_parameters(
+        discrimination=np.array([slope]), asymmetry=np.array([shape])
+    )
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = model.information([theta], item_idx=0)
+    assert_allclose(actual, expected, rtol=3e-12, atol=0.0)
+
+
+@pytest.mark.parametrize(
+    "slope,guessing,upper", [(0.0, 0.2, 0.95), (1.0, 0.3, 0.3), (-1.0, 0.0, 1.0)]
+)
+def test_five_parameter_flat_and_decreasing_curves_are_supported(
+    slope, guessing, upper
+):
+    model = FiveParameterLogistic(1).set_parameters(
+        discrimination=np.array([slope]),
+        guessing=np.array([guessing]),
+        upper=np.array([upper]),
+    )
+    theta = np.array([-400.0, 0.0, 400.0])
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = model.information(theta, item_idx=0)
+    if slope == 0.0 or guessing == upper:
+        assert_allclose(actual, 0.0, atol=0.0)
+    else:
+        exponential = np.exp(-np.abs(theta))
+        assert_allclose(
+            actual, exponential / (1.0 + exponential) ** 2, rtol=1e-12, atol=0.0
+        )
+
+
+def test_five_parameter_information_bounds_blocks_and_limits_log_fallback(monkeypatch):
+    model = _five_parameter()
+    theta = np.concatenate(([-400.0], np.linspace(-2.0, 2.0, 21), [400.0]))
+    expected = np.column_stack([model.information(theta, i) for i in range(3)])
+    original = dichotomous._five_pl_information
+    original_log = dichotomous._five_pl_log_information
+    block_sizes = []
+    fallback_sizes = []
+
+    def tracked(logits, *parameters):
+        assert logits.size <= 31
+        block_sizes.append(logits.size)
+        return original(logits, *parameters)
+
+    def tracked_log(logits, *parameters):
+        assert np.all(np.abs(logits) > 100.0)
+        fallback_sizes.append(logits.size)
+        return original_log(logits, *parameters)
+
+    monkeypatch.setattr(dichotomous, "_FIVE_PL_CURVE_CHUNK_ELEMENTS", 31)
+    monkeypatch.setattr(dichotomous, "_five_pl_information", tracked)
+    monkeypatch.setattr(dichotomous, "_five_pl_log_information", tracked_log)
+    actual = model.information(theta)
+
+    assert_allclose(actual, expected, rtol=2e-13, atol=0.0)
+    assert sum(block_sizes) == theta.size * model.n_items
+    assert 0 < sum(fallback_sizes) < sum(block_sizes)

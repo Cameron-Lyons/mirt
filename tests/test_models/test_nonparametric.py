@@ -616,6 +616,117 @@ class TestKernelSmoothingModel:
 
         np.testing.assert_allclose(model.irf_values, 1.0, atol=1e-12)
 
+    @pytest.mark.parametrize("distance", [1e10, 1e100, 1e308])
+    def test_equal_distant_observations_retain_person_weights(self, distance):
+        model = KernelSmoothingModel(n_items=1, theta_grid=np.array([-1.0, 1.0]))
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
+            model.calibrate(
+                np.array([[0], [1]]),
+                np.array([distance, distance]),
+                sample_weight=np.array([1.0, 3.0]),
+            )
+
+        np.testing.assert_allclose(model.irf_values, 0.75)
+
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_zero_weight_neighbors_do_not_change_extreme_kernel(self, missing):
+        theta = np.array([0.0, 1.0, 2.0])
+        responses = np.array([[0, 1], [1, 0], [0, 1]])
+        if missing:
+            responses[0, 1] = -1
+        kwargs = dict(n_items=2, bandwidth=1e-300, theta_grid=np.array([0.0, 1.0]))
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
+            weighted = KernelSmoothingModel(**kwargs).calibrate(
+                responses, theta, sample_weight=np.array([0.0, 1.0, 1.0])
+            )
+            reference = KernelSmoothingModel(**kwargs).calibrate(
+                responses[1:], theta[1:]
+            )
+
+        np.testing.assert_array_equal(weighted.irf_values, reference.irf_values)
+        np.testing.assert_array_equal(weighted.irf_values, [[1.0, 1.0], [0.0, 0.0]])
+
+    @pytest.mark.parametrize("budget", [1, 37, 1_000_000])
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_kernel_grid_blocks_match_weighted_reference(
+        self, monkeypatch, budget, missing
+    ):
+        import mirt._smoothing as smoothing
+        import mirt.models.nonparametric as nonparametric
+
+        rng = np.random.default_rng(761)
+        theta = rng.normal(size=17)
+        grid = np.linspace(-3, 3, 13)
+        responses = rng.integers(0, 2, size=(theta.size, 4))
+        if missing:
+            responses[::3, ::2] = -1
+        sample_weight = rng.uniform(0.1, 3.0, theta.size)
+        sample_weight[::5] = 0.0
+        kernel = np.exp(-0.5 * ((theta[:, None] - grid) / 0.7) ** 2)
+        kernel *= sample_weight[:, None]
+        valid = responses >= 0
+        expected = (np.where(valid, responses, 0).T @ kernel) / (
+            valid.astype(float).T @ kernel
+        )
+        observed_shapes = []
+        original = smoothing._stable_gaussian_weights
+
+        def track_kernel(samples, points, *args):
+            observed_shapes.append((samples.size, points.size))
+            return original(samples, points, *args)
+
+        monkeypatch.setattr(nonparametric, "_KERNEL_MAX_VALUES", budget)
+        monkeypatch.setattr(smoothing, "_stable_gaussian_weights", track_kernel)
+        model = KernelSmoothingModel(4, bandwidth=0.7, theta_grid=grid).calibrate(
+            responses, theta, sample_weight=sample_weight
+        )
+
+        np.testing.assert_allclose(model.irf_values, expected, atol=1e-14)
+        assert observed_shapes
+        assert all(
+            rows * cols <= max(budget, theta.size) for rows, cols in observed_shapes
+        )
+
+    def test_extreme_grid_points_do_not_change_ordinary_kernel_columns(
+        self, monkeypatch
+    ):
+        import mirt.models.nonparametric as nonparametric
+
+        theta = np.array([0.0, 0.5, 1.0])
+        responses = np.array([[0, -1], [1, 0], [0, 1]])
+        weights = np.array([1.0, 3.0, 0.5])
+        model = KernelSmoothingModel(2, theta_grid=np.array([0.0, 1.0, 1e308]))
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
+            model.calibrate(responses, theta, sample_weight=weights)
+            expected = model.irf_values
+            monkeypatch.setattr(nonparametric, "_KERNEL_MAX_VALUES", 1)
+            model.calibrate(responses, theta, sample_weight=weights)
+
+        np.testing.assert_allclose(model.irf_values, expected, atol=1e-14)
+
+    def test_missing_item_fallback_only_recomputes_affected_grid_points(
+        self, monkeypatch
+    ):
+        import mirt._smoothing as smoothing
+
+        grids = []
+        original = smoothing._stable_gaussian_weights
+
+        def track_kernel(samples, grid, *args):
+            grids.append(grid.copy())
+            return original(samples, grid, *args)
+
+        monkeypatch.setattr(smoothing, "_stable_gaussian_weights", track_kernel)
+        model = KernelSmoothingModel(
+            2, bandwidth=0.01, theta_grid=np.array([0.0, 1.0, 2.0])
+        ).calibrate(np.array([[-1, 0], [1, 0], [0, 1]]), np.array([0.0, 1.0, 2.0]))
+
+        np.testing.assert_array_equal(
+            model.irf_values, [[1.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        )
+        assert len(grids) == 2
+        np.testing.assert_array_equal(grids[1], [0.0])
+
     def test_probability_clamps_outside_grid(self):
         model = self._fitted_model()
 

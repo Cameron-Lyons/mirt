@@ -253,7 +253,7 @@ def compute_alpha_if_deleted(
     """
     if rust_enabled():
         return mirt_rs.compute_alpha_if_deleted(
-            responses.astype(np.float64),
+            np.asarray(responses, dtype=np.float64),
         )
 
     return _alpha_if_deleted_numpy(np.asarray(responses, dtype=np.float64))

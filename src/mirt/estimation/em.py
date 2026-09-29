@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
+from scipy.special import xlog1py, xlogy
 
 from mirt._backend_config import should_use_rust
-from mirt._core import sigmoid
 from mirt._gpu_backend import (
     compute_log_likelihoods_2pl_gpu,
     compute_log_likelihoods_3pl_gpu,
@@ -592,10 +593,6 @@ class EMEstimator(BaseEstimator):
             for item_idx, optimal_params in results:
                 self._set_item_params(model, item_idx, optimal_params)
 
-    def _supports_analytic_dichotomous_gradient(self, model: BaseItemModel) -> bool:
-        """Return whether analytic item gradients are implemented for this model."""
-        return model.model_name in {"1PL", "2PL", "3PL", "4PL"}
-
     def _neg_expected_loglik_with_grad_dichotomous(
         self,
         model: BaseItemModel,
@@ -605,111 +602,17 @@ class EMEstimator(BaseEstimator):
         r_k: NDArray[np.float64],
         params: NDArray[np.float64],
     ) -> tuple[float, NDArray[np.float64]]:
-        """Compute negative expected log-likelihood and analytic gradient."""
-        eps = self.prob_epsilon
-        theta = quad_points
-        theta_1d = theta[:, 0]
-        model_name = model.model_name
+        """Evaluate the clipped item objective without assuming optimizer bounds."""
+        from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
 
-        if model_name == "1PL":
-            a = float(model._parameters["discrimination"][item_idx])
-            b = float(params[0])
-
-            z = a * (theta_1d - b)
-            p_star = sigmoid(z)
-            p = np.clip(p_star, eps, 1 - eps)
-
-            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
-            score = r_k / p - (n_k_valid - r_k) / (1 - p)
-            dp_dz = p_star * (1 - p_star)
-
-            grad_b = np.sum(score * dp_dz * (-a))
-            grad = np.array([grad_b], dtype=np.float64)
-            return -float(ll), -grad
-
-        if model_name == "2PL":
-            if model.n_factors == 1:
-                a = float(params[0])
-                b = float(params[1])
-                z = a * (theta_1d - b)
-                p_star = sigmoid(z)
-                p = np.clip(p_star, eps, 1 - eps)
-
-                ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
-                score = r_k / p - (n_k_valid - r_k) / (1 - p)
-                dp_dz = p_star * (1 - p_star)
-
-                common = score * dp_dz
-                grad_a = np.sum(common * (theta_1d - b))
-                grad_b = np.sum(common * (-a))
-                grad = np.array([grad_a, grad_b], dtype=np.float64)
-                return -float(ll), -grad
-
-            a_vec = np.asarray(params[:-1], dtype=np.float64)
-            b = float(params[-1])
-
-            z = theta @ a_vec - np.sum(a_vec) * b
-            p_star = sigmoid(z)
-            p = np.clip(p_star, eps, 1 - eps)
-
-            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
-            score = r_k / p - (n_k_valid - r_k) / (1 - p)
-            dp_dz = p_star * (1 - p_star)
-
-            common = score * dp_dz
-            grad_a = (theta - b).T @ common
-            grad_b = np.sum(common * (-np.sum(a_vec)))
-
-            grad = np.concatenate([grad_a, np.array([grad_b], dtype=np.float64)])
-            return -float(ll), -grad
-
-        if model_name == "3PL":
-            a = float(params[0])
-            b = float(params[1])
-            c = float(params[2])
-
-            z = a * (theta_1d - b)
-            p_star = sigmoid(z)
-            p = c + (1.0 - c) * p_star
-            p = np.clip(p, eps, 1 - eps)
-
-            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
-            score = r_k / p - (n_k_valid - r_k) / (1 - p)
-            dp_dz = (1.0 - c) * p_star * (1.0 - p_star)
-            common = score * dp_dz
-
-            grad_a = np.sum(common * (theta_1d - b))
-            grad_b = np.sum(common * (-a))
-            grad_c = np.sum(score * (1.0 - p_star))
-
-            grad = np.array([grad_a, grad_b, grad_c], dtype=np.float64)
-            return -float(ll), -grad
-
-        if model_name == "4PL":
-            a = float(params[0])
-            b = float(params[1])
-            c = float(params[2])
-            d = float(params[3])
-
-            z = a * (theta_1d - b)
-            p_star = sigmoid(z)
-            p = c + (d - c) * p_star
-            p = np.clip(p, eps, 1 - eps)
-
-            ll = np.sum(r_k * np.log(p) + (n_k_valid - r_k) * np.log(1 - p))
-            score = r_k / p - (n_k_valid - r_k) / (1 - p)
-            dp_dz = (d - c) * p_star * (1.0 - p_star)
-            common = score * dp_dz
-
-            grad_a = np.sum(common * (theta_1d - b))
-            grad_b = np.sum(common * (-a))
-            grad_c = np.sum(score * (1.0 - p_star))
-            grad_d = np.sum(score * p_star)
-
-            grad = np.array([grad_a, grad_b, grad_c, grad_d], dtype=np.float64)
-            return -float(ll), -grad
-
-        raise ValueError(f"Analytic gradient not implemented for {model_name}")
+        objective = prepare_dichotomous_objective(
+            model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon
+        )
+        if objective is None:
+            raise ValueError(
+                f"Analytic gradient not implemented for {type(model).__name__}"
+            )
+        return objective(params)
 
     def _optimize_item_params(
         self,
@@ -752,7 +655,7 @@ class EMEstimator(BaseEstimator):
                 probs = model.probability(quad_points, item_idx)
                 probs = np.clip(probs, eps, 1 - eps)
 
-                ll = np.sum(r_kc * np.log(probs))
+                ll = np.sum(xlogy(r_kc, probs))
 
                 return -ll
 
@@ -774,51 +677,41 @@ class EMEstimator(BaseEstimator):
                 axis=0,
             )
 
-        if self._supports_analytic_dichotomous_gradient(model):
+        from mirt.estimation._affine_objective import prepare_affine_objective
+        from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
 
-            def neg_ll_and_grad(
-                params: NDArray[np.float64],
-            ) -> tuple[float, NDArray[np.float64]]:
-                return self._neg_expected_loglik_with_grad_dichotomous(
-                    model,
-                    item_idx,
-                    quad_points,
-                    n_k_valid,
-                    r_k,
-                    params,
-                )
-
-            result = minimize(
-                neg_ll_and_grad,
-                x0=current_params,
-                method="L-BFGS-B",
-                jac=True,
-                bounds=bounds,
-                options={
-                    "maxiter": self.item_optim_maxiter,
-                    "ftol": self.item_optim_ftol,
-                },
+        prepared = prepare_dichotomous_objective(
+            model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
+        )
+        if prepared is None:
+            prepared = prepare_affine_objective(
+                model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
             )
-            return result.x
+        objective: Callable[
+            [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
+        ]
+        analytic = prepared is not None
+        if prepared is not None:
+            objective = prepared
+        else:
+            eps = self.prob_epsilon
 
-        eps = self.prob_epsilon
+            def neg_expected_log_likelihood_dichotomous(
+                params: NDArray[np.float64],
+            ) -> float:
+                self._set_item_params(model, item_idx, params)
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, eps, 1 - eps)
+                ll = np.sum(xlogy(r_k, probs) + xlog1py(n_k_valid - r_k, -probs))
+                return -ll
 
-        def neg_expected_log_likelihood_dichotomous(
-            params: NDArray[np.float64],
-        ) -> float:
-            self._set_item_params(model, item_idx, params)
-
-            probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, eps, 1 - eps)
-
-            ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
-
-            return -ll
+            objective = neg_expected_log_likelihood_dichotomous
 
         result = minimize(
-            neg_expected_log_likelihood_dichotomous,
+            objective,
             x0=current_params,
             method="L-BFGS-B",
+            jac=analytic,
             bounds=bounds,
             options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
         )
@@ -863,8 +756,14 @@ class EMEstimator(BaseEstimator):
         n_k_valid: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Optimize item parameters and return the result (for parallel execution)."""
+        from copy import deepcopy
+
+        # Numerical objectives update whole parameter arrays before evaluating
+        # one item. Keep custom state and instance method overrides as well as
+        # parameters when isolating workers from lost trial updates.
+        local_model = deepcopy(model)
         return self._optimize_item_params(
-            model,
+            local_model,
             item_idx,
             responses,
             posterior_weights,

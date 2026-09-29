@@ -39,6 +39,19 @@ SUITE_ORDER = (
     "optimization",
     "information",
     "latent-density",
+    "kernel-smoothing",
+    "empirical",
+    "classical",
+    "reliability",
+    "curves",
+    "asymmetric",
+    "logistic-information",
+    "unipolar",
+    "logistic-probability",
+    "multidimensional-information",
+    "multidimensional-probability",
+    "multidimensional-fit",
+    "logistic-fit",
 )
 
 
@@ -363,6 +376,552 @@ def bench_latent_density(
                 _peak_traced_bytes(evaluate),
             )
         )
+    return results
+
+
+def bench_kernel_smoothing(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure weighted calibration and shared empirical smoothing kernels."""
+    from mirt.models.nonparametric import KernelSmoothingModel
+    from mirt.models.polytomous import GradedResponseModel
+    from mirt.utils.empirical import itemGAM
+
+    rng = np.random.default_rng(69)
+    theta = rng.normal(size=n_persons)
+    responses = rng.integers(0, 2, size=(n_persons, n_items))
+    weights = rng.uniform(0.1, 2.0, size=n_persons)
+    missing_responses = responses.copy()
+    missing_responses[rng.random(responses.shape) < 0.1] = -1
+    missing_responses[0] = responses[0]
+    results = []
+    for n_points in (81, 401):
+        model = KernelSmoothingModel(
+            n_items=n_items, theta_grid=np.linspace(-4.0, 4.0, n_points)
+        )
+        for label, data in (("complete", responses), ("missing", missing_responses)):
+
+            def run() -> None:
+                model.calibrate(data, theta, sample_weight=weights)
+
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"kernel_smoothing_{n_points}_{label}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
+    for kind, model, categories in (
+        ("2pl", mirt.TwoParameterLogistic(n_items), 2),
+        ("grm", GradedResponseModel(n_items, 4), 4),
+    ):
+        data = rng.integers(0, categories, size=(n_persons, n_items))
+        missing_data = data.copy()
+        missing_data[rng.random(data.shape) < 0.1] = -1
+        missing_data[0] = data[0]
+        for label, item_responses in (("complete", data), ("missing", missing_data)):
+
+            def smooth() -> None:
+                itemGAM(model, item_responses, theta, n_grid=101, bandwidth=0.5)
+
+            times = _time(smooth, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"kernel_smoothing_gam_{kind}_{label}",
+                    times,
+                    _peak_traced_bytes(smooth),
+                )
+            )
+    return results
+
+
+def bench_empirical(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure binned empirical fit with complete and missing item scores."""
+    from mirt.models.polytomous import GradedResponseModel
+    from mirt.utils.empirical import empirical_rmsea
+
+    rng = np.random.default_rng(70)
+    theta = rng.normal(size=n_persons)
+    results = []
+    for kind, model, categories in (
+        ("2pl", mirt.TwoParameterLogistic(n_items), 2),
+        ("grm", GradedResponseModel(n_items, 4), 4),
+    ):
+        responses = rng.integers(0, categories, size=(n_persons, n_items))
+        missing = responses.copy()
+        missing[rng.random(responses.shape) < 0.1] = -1
+        for n_bins in (10, 100):
+            for label, data in (("complete", responses), ("missing", missing)):
+
+                def run() -> None:
+                    empirical_rmsea(model, data, theta, n_bins=n_bins)
+
+                times = _time(run, repeats=repeats, warmups=warmups)
+                results.append(
+                    BenchResult(
+                        f"empirical_rmsea_{kind}_{n_bins}_{label}",
+                        times,
+                        _peak_traced_bytes(run),
+                    )
+                )
+    return results
+
+
+def bench_classical(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure shared classical moments and alpha-if-deleted calculations."""
+    from mirt.utils.classical import traditional
+
+    if n_persons < 2 or n_items < 2:
+        raise ValueError("classical benchmarks require at least two persons and items")
+    rng = np.random.default_rng(71)
+    responses = rng.integers(0, 2, size=(n_persons, n_items))
+    missing = responses.copy()
+    missing[rng.random(responses.shape) < 0.1] = -1
+    missing[:2] = responses[:2]
+    results = []
+    for corrected, correlation in ((True, "corrected"), (False, "uncorrected")):
+        for label, data in (("complete", responses), ("missing", missing)):
+
+            def run() -> None:
+                traditional(data, use_corrected_correlation=corrected)
+
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"traditional_{correlation}_{label}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_reliability(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure information-based reliability and measurement-error summaries."""
+    from mirt.utils.reliability import empirical_rxx, sem
+
+    if n_persons < 2:
+        raise ValueError("reliability benchmarks require at least two persons")
+    rng = np.random.default_rng(72)
+    theta = rng.normal(size=n_persons)
+    models = (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=4)),
+    )
+    results = []
+    for label, model in models:
+        for name, statistic in (("sem", sem), ("empirical", empirical_rxx)):
+
+            def run() -> None:
+                statistic(model, theta)
+
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"reliability_{name}_{label}", times, _peak_traced_bytes(run)
+                )
+            )
+    return results
+
+
+def bench_curves(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure dense and selected information and expected-score curves."""
+    from mirt.utils.information import expected_score, iteminfo, testinfo
+
+    theta = np.random.default_rng(73).normal(size=n_persons)
+    selected = [n_items - 1, 0, n_items - 1]
+    results = []
+    for label, model in (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=4)),
+    ):
+        for name, run in (
+            ("test_information", lambda: testinfo(model, theta)),
+            ("item_information", lambda: iteminfo(model, theta)),
+            ("selected_information", lambda: iteminfo(model, theta, selected)),
+            ("expected_score", lambda: expected_score(model, theta)),
+        ):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(f"curves_{name}_{label}", times, _peak_traced_bytes(run))
+            )
+    return results
+
+
+def _bench_response_curves(
+    model: Any,
+    theta: np.ndarray,
+    indices: np.ndarray,
+    prefix: str,
+    repeats: int,
+    warmups: int,
+) -> list[BenchResult]:
+    results = []
+    for name, run in (
+        ("probability", lambda: model.probability(theta)),
+        ("information", lambda: model.information(theta)),
+        ("pairs", lambda: model.probability_pairs(theta, indices)),
+    ):
+        times = _time(run, repeats=repeats, warmups=warmups)
+        results.append(BenchResult(f"{prefix}{name}", times, _peak_traced_bytes(run)))
+    return results
+
+
+def bench_unipolar(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure the symmetric unipolar curve and its information function."""
+    from mirt.models.dichotomous import UnipolarLogLogistic
+
+    rng = np.random.default_rng(77)
+    model = UnipolarLogLogistic(n_items).set_parameters(
+        discrimination=rng.uniform(0.5, 2.0, n_items),
+        difficulty=rng.normal(size=n_items),
+    )
+    theta = rng.normal(size=(n_persons, 1))
+    indices = rng.integers(n_items, size=n_persons)
+    return _bench_response_curves(model, theta, indices, "unipolar_", repeats, warmups)
+
+
+def bench_asymmetric(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure asymmetric probabilities and information with realistic parameters."""
+    from mirt.models.dichotomous import (
+        ComplementaryLogLog,
+        FiveParameterLogistic,
+        NegativeLogLog,
+    )
+
+    rng = np.random.default_rng(75)
+    model = FiveParameterLogistic(n_items).set_parameters(
+        discrimination=rng.uniform(0.5, 2.0, n_items),
+        difficulty=rng.normal(size=n_items),
+        guessing=np.full(n_items, 0.2),
+        upper=np.full(n_items, 0.9),
+        asymmetry=rng.uniform(0.5, 2.0, n_items),
+    )
+    theta = rng.normal(size=(n_persons, 1))
+    indices = rng.integers(n_items, size=n_persons)
+    parameters = {
+        "discrimination": model.discrimination,
+        "difficulty": model.difficulty,
+    }
+    models = (
+        ("", model),
+        ("cll_", ComplementaryLogLog(n_items).set_parameters(**parameters)),
+        ("nll_", NegativeLogLog(n_items).set_parameters(**parameters)),
+    )
+    results = []
+    for label, model in models:
+        results.extend(
+            _bench_response_curves(
+                model, theta, indices, f"asymmetric_{label}", repeats, warmups
+            )
+        )
+    return results
+
+
+def bench_logistic_information(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure full and selected logistic information curves, including MIRT."""
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+
+    rng = np.random.default_rng(76)
+    results = []
+    for label, model in (
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("3pl", ThreeParameterLogistic(n_items)),
+        ("4pl", FourParameterLogistic(n_items)),
+        ("2pl_multi", TwoParameterLogistic(n_items, n_factors=3)),
+    ):
+        parameters = model.parameters
+        parameters["discrimination"] = rng.uniform(
+            0.5, 2.0, parameters["discrimination"].shape
+        )
+        parameters["difficulty"] = rng.normal(size=n_items)
+        if "upper" in parameters:
+            parameters["upper"] = np.full(n_items, 0.9)
+        model.set_parameters(**parameters)
+        theta = rng.normal(size=(n_persons, model.n_factors))
+        for selection, item_idx in (("full", None), ("single", n_items - 1)):
+
+            def run() -> None:
+                model.information(theta, item_idx)
+
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"logistic_information_{label}_{selection}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_logistic_probability(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure full, single-item, and paired logistic probabilities."""
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+
+    rng = np.random.default_rng(78)
+    results = []
+    for label, model in (
+        ("1pl", OneParameterLogistic(n_items)),
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("3pl", ThreeParameterLogistic(n_items)),
+        ("4pl", FourParameterLogistic(n_items)),
+        ("2pl_multi", TwoParameterLogistic(n_items, n_factors=3)),
+    ):
+        parameters = model.parameters
+        if label == "1pl":
+            parameters.pop("discrimination")
+        else:
+            parameters["discrimination"] = rng.uniform(
+                0.5, 2.0, parameters["discrimination"].shape
+            )
+        parameters["difficulty"] = rng.normal(size=n_items)
+        if "upper" in parameters:
+            parameters["upper"] = np.full(n_items, 0.9)
+        model.set_parameters(**parameters)
+        theta = rng.normal(size=(n_persons, model.n_factors))
+        indices = rng.integers(n_items, size=n_persons)
+        for selection, run in (
+            ("full", lambda: model.probability(theta)),
+            ("single", lambda: model.probability(theta, n_items - 1)),
+            ("pairs", lambda: model.probability_pairs(theta, indices)),
+        ):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"logistic_probability_{label}_{selection}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_logistic_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure Python 1PL–4PL EM objectives, including multidimensional 2PL."""
+    from mirt.estimation.em import EMEstimator
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+
+    rng = np.random.default_rng(82)
+    models = (
+        ("1pl", OneParameterLogistic(n_items)),
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("2pl_multi", TwoParameterLogistic(n_items, n_factors=2)),
+        ("3pl", ThreeParameterLogistic(n_items)),
+        ("4pl", FourParameterLogistic(n_items)),
+    )
+    results = []
+    for label, template in models:
+        theta = rng.normal(size=(n_persons, template.n_factors))
+        responses = (
+            rng.random((n_persons, n_items)) < template.probability(theta)
+        ).astype(int)
+        responses[rng.random(responses.shape) < 0.1] = -1
+
+        def run() -> None:
+            EMEstimator(
+                n_quadpts=15 if template.n_factors == 1 else 7,
+                max_iter=8,
+                tol=1e-9,
+                use_rust=False,
+                use_gpu=False,
+                compute_standard_errors=False,
+            ).fit(template.copy(), responses)
+
+        results.append(
+            BenchResult(
+                f"logistic_fit_{label}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
+def bench_multidimensional_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure NumPy EM fitting with affine item gradients and missing responses."""
+    from mirt.estimation.em import EMEstimator
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    rng = np.random.default_rng(81)
+    pattern = np.ones((n_items, 3))
+    pattern[: n_items // 2, 2] = 0.0
+    pattern[n_items // 2 :, 1] = 0.0
+    models = (
+        ("mirt", MultidimensionalModel(n_items, 2)),
+        ("bifactor", BifactorModel(n_items, np.arange(n_items) % 2)),
+        (
+            "confirmatory",
+            MultidimensionalModel(
+                n_items,
+                3,
+                model_type="confirmatory",
+                loading_pattern=pattern,
+            ),
+        ),
+    )
+    results = []
+    for label, template in models:
+        theta = rng.normal(size=(n_persons, template.n_factors))
+        responses = (
+            rng.random((n_persons, n_items)) < template.probability(theta)
+        ).astype(int)
+        responses[rng.random(responses.shape) < 0.1] = -1
+
+        def run() -> None:
+            EMEstimator(
+                n_quadpts=7,
+                max_iter=8,
+                tol=1e-9,
+                use_rust=False,
+                use_gpu=False,
+                compute_standard_errors=False,
+            ).fit(template.copy(), responses)
+
+        results.append(
+            BenchResult(
+                f"multidimensional_fit_{label}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
+def bench_multidimensional_probability(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure dense and bifactor full, single-item, and aligned probabilities."""
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    rng = np.random.default_rng(80)
+    models = (
+        (
+            "mirt",
+            MultidimensionalModel(n_items, 3).set_parameters(
+                slopes=rng.normal(size=(n_items, 3)),
+                intercepts=rng.normal(size=n_items),
+            ),
+        ),
+        (
+            "bifactor",
+            BifactorModel(n_items, np.arange(n_items) % 4).set_parameters(
+                general_loadings=rng.uniform(0.5, 2.0, n_items),
+                specific_loadings=rng.normal(size=n_items),
+                intercepts=rng.normal(size=n_items),
+            ),
+        ),
+    )
+    results = []
+    for label, model in models:
+        theta = rng.normal(size=(n_persons, model.n_factors))
+        indices = rng.integers(n_items, size=n_persons)
+        for selection, run in (
+            ("full", lambda: model.probability(theta)),
+            ("single", lambda: model.probability(theta, n_items - 1)),
+            ("pairs", lambda: model.probability_pairs(theta, indices)),
+            ("one_person", lambda: model.probability(theta[:1])),
+        ):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"multidimensional_probability_{label}_{selection}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_multidimensional_information(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure Fisher information and adaptive selection using item matrices."""
+    from mirt.cat.mcat_selection import DOptimality
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    rng = np.random.default_rng(79)
+    models = (
+        (
+            "mirt",
+            MultidimensionalModel(n_items, n_factors=3).set_parameters(
+                slopes=rng.normal(size=(n_items, 3)),
+                intercepts=rng.normal(size=n_items),
+            ),
+        ),
+        (
+            "bifactor",
+            BifactorModel(n_items, np.arange(n_items) % 4).set_parameters(
+                general_loadings=rng.uniform(0.5, 2.0, n_items),
+                specific_loadings=rng.normal(size=n_items),
+                intercepts=rng.normal(size=n_items),
+            ),
+        ),
+    )
+    results = []
+    for label, model in models:
+        theta = rng.normal(size=(n_persons, model.n_factors))
+        covariance = np.eye(model.n_factors)
+        available_items = set(range(n_items))
+        strategy = DOptimality()
+        for selection, run in (
+            ("full", lambda: model.information(theta)),
+            ("single", lambda: model.information(theta, n_items - 1)),
+            ("item_matrix", lambda: model.item_information_matrix(theta, n_items - 1)),
+            ("test_matrix", lambda: model.test_information_matrix(theta)),
+            (
+                "selection",
+                lambda: strategy.get_item_criteria(
+                    model, theta[0], covariance, available_items
+                ),
+            ),
+        ):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"multidimensional_information_{label}_{selection}",
+                    times,
+                    _peak_traced_bytes(run),
+                )
+            )
     return results
 
 
@@ -855,6 +1414,36 @@ def run_suites(
         results.append(bench_information(n_persons, n_items, repeats, warmups))
     if "latent-density" in suites:
         results.extend(bench_latent_density(n_persons, repeats, warmups))
+    if "kernel-smoothing" in suites:
+        results.extend(bench_kernel_smoothing(n_persons, n_items, repeats, warmups))
+    if "empirical" in suites:
+        results.extend(bench_empirical(n_persons, n_items, repeats, warmups))
+    if "classical" in suites:
+        results.extend(bench_classical(n_persons, n_items, repeats, warmups))
+    if "reliability" in suites:
+        results.extend(bench_reliability(n_persons, n_items, repeats, warmups))
+    if "curves" in suites:
+        results.extend(bench_curves(n_persons, n_items, repeats, warmups))
+    if "asymmetric" in suites:
+        results.extend(bench_asymmetric(n_persons, n_items, repeats, warmups))
+    if "logistic-information" in suites:
+        results.extend(bench_logistic_information(n_persons, n_items, repeats, warmups))
+    if "unipolar" in suites:
+        results.extend(bench_unipolar(n_persons, n_items, repeats, warmups))
+    if "logistic-probability" in suites:
+        results.extend(bench_logistic_probability(n_persons, n_items, repeats, warmups))
+    if "multidimensional-information" in suites:
+        results.extend(
+            bench_multidimensional_information(n_persons, n_items, repeats, warmups)
+        )
+    if "multidimensional-probability" in suites:
+        results.extend(
+            bench_multidimensional_probability(n_persons, n_items, repeats, warmups)
+        )
+    if "multidimensional-fit" in suites:
+        results.extend(bench_multidimensional_fit(n_persons, n_items, repeats, warmups))
+    if "logistic-fit" in suites:
+        results.extend(bench_logistic_fit(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1007,7 +1596,27 @@ def _validate_baseline_compatibility(
     person_workloads.update(
         name
         for name in current_names
-        if name.startswith(("model_fit_", "mean_squares_", "itemfit_", "personfit_"))
+        if name.startswith(
+            (
+                "model_fit_",
+                "mean_squares_",
+                "itemfit_",
+                "personfit_",
+                "kernel_smoothing_",
+                "empirical_rmsea_",
+                "traditional_",
+                "reliability_",
+                "curves_",
+                "asymmetric_",
+                "logistic_information_",
+                "unipolar_",
+                "logistic_probability_",
+                "multidimensional_information_",
+                "multidimensional_probability_",
+                "multidimensional_fit_",
+                "logistic_fit_",
+            )
+        )
     )
     if current_names & person_workloads and baseline_config.get(
         "persons"

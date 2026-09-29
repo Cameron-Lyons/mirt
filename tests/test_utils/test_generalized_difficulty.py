@@ -282,3 +282,48 @@ def test_custom_logistic_name_uses_numerical_fallback():
 
     expected = model.difficulty[2] + np.log(0.7 / 0.3) / model.discrimination[2]
     assert actual == pytest.approx(expected, abs=5e-7)
+
+
+@pytest.mark.parametrize(
+    "shape,slope", [(1e-20, 1e20), (1e10, 5.0), (1e20, 10.0), (1e308, 100.0)]
+)
+def test_extreme_asymmetry_inverts_interior_targets_without_clamping(shape, slope):
+    model = FiveParameterLogistic(1).set_parameters(
+        discrimination=np.array([slope]),
+        guessing=np.array([0.0]),
+        asymmetry=np.array([shape]),
+    )
+    log_half = np.log(0.5) / shape
+    expected = (log_half - np.log(-np.expm1(log_half))) / slope
+
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = gen_difficulty(model, item_idx=0, target_prob=0.5)
+        probability = model.probability([actual], item_idx=0)[0]
+
+    assert actual == pytest.approx(expected, rel=3e-13)
+    assert probability == pytest.approx(0.5, abs=1e-13)
+    assert -10.0 < actual < 10.0
+
+
+@pytest.mark.parametrize("target", [np.nextafter(0.0, 1.0), np.nextafter(1.0, 0.0)])
+def test_logistic_inversion_handles_adjacent_probability_boundaries(target):
+    model = TwoParameterLogistic(1)
+    expected = np.log(target) - np.log1p(-target)
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = gen_difficulty(model, 0, target, theta_range=(-1000.0, 1000.0))
+    assert actual == pytest.approx(expected, rel=2e-14)
+
+
+def test_large_asymmetry_preserves_target_next_to_upper_asymptote():
+    model = FiveParameterLogistic(1).set_parameters(
+        discrimination=np.array([100.0]),
+        guessing=np.array([0.0]),
+        asymmetry=np.array([1e308]),
+    )
+    target = np.nextafter(1.0, 0.0)
+    expected = (np.log(1e308) - np.log(-np.log(target))) / 100.0
+    with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
+        actual = gen_difficulty(model, 0, target)
+        probability = model.probability([actual], item_idx=0)[0]
+    assert actual == pytest.approx(expected, rel=2e-14)
+    assert probability == target

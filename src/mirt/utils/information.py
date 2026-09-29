@@ -9,6 +9,13 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt import _information
+from mirt._information import (
+    _test_information,
+    _theta_array,
+    _validate_information_values,
+)
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -22,47 +29,64 @@ _GENERALIZED_DIFFICULTY_GRID_ELEMENTS = 2_000_000
 _GENERALIZED_DIFFICULTY_THETA_TOLERANCE = 1e-6
 _INFORMATION_INTERVAL_TARGET_ELEMENTS = 2_000_000
 _INFORMATION_INTERVAL_THETA_TOLERANCE = 1e-8
-
-
-def _theta_matrix(
-    theta: NDArray[np.float64] | float | list[float],
-) -> NDArray[np.float64]:
-    """Normalize scalar and one-dimensional ability inputs."""
-    theta_arr = np.atleast_1d(np.asarray(theta, dtype=np.float64))
-    if theta_arr.ndim == 1:
-        theta_arr = theta_arr.reshape(-1, 1)
-    return theta_arr
+_EXPECTED_SCORE_CHUNK_ELEMENTS = 262_144
 
 
 def _item_information_matrix(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
-    item_indices: list[int] | None = None,
+    item_indices: NDArray[np.intp] | None = None,
+    *,
+    single_item: bool = False,
 ) -> NDArray[np.float64]:
     """Return selected item information across model-family conventions."""
-    indices = range(model.n_items) if item_indices is None else item_indices
-    if item_indices is not None and len(item_indices) == 0:
-        return np.empty((theta.shape[0], 0), dtype=np.float64)
-
-    if getattr(model, "is_polytomous", False):
-        return np.column_stack(
-            [model.information(theta, item_idx=idx) for idx in indices]
-        )
-
-    information = np.asarray(model.information(theta), dtype=np.float64)
-    expected_shape = (theta.shape[0], model.n_items)
-    if information.shape == expected_shape:
-        return information if item_indices is None else information[:, item_indices]
-
-    if information.shape == (theta.shape[0],):
-        return np.column_stack(
-            [model.information(theta, item_idx=idx) for idx in indices]
-        )
-
-    raise ValueError(
-        f"model information has shape {information.shape}, expected "
-        f"{expected_shape} or {(theta.shape[0],)}"
+    indices = range(model.n_items) if item_indices is None else item_indices.tolist()
+    result = np.empty((theta.shape[0], len(indices)))
+    if not indices:
+        return result
+    individual = (
+        single_item
+        or getattr(model, "is_polytomous", False)
+        or (item_indices is not None and len(set(indices)) * 4 < model.n_items)
     )
+    # Keep column writes within a bounded output block, including when an
+    # ordinal model evaluates each item separately.
+    width = len(indices) if individual else model.n_items
+    rows_per_block = max(1, _information._INFORMATION_CHUNK_ELEMENTS // width)
+    for start in range(0, theta.shape[0], rows_per_block):
+        block = theta[start : start + rows_per_block]
+        target = result[start : start + rows_per_block]
+        if not individual:
+            values = np.asarray(model.information(block), dtype=np.float64)
+            if values.shape == (block.shape[0], model.n_items):
+                if item_indices is not None:
+                    values = values[:, item_indices]
+                _validate_information_values(values)
+                target[:] = values
+                continue
+            if values.shape != (block.shape[0],):
+                raise ValueError(
+                    f"model information has shape {values.shape}, expected "
+                    f"{(block.shape[0], model.n_items)} or {(block.shape[0],)}"
+                )
+            # A model returning only totals needs item-wise evaluation.
+            individual = True
+        first_columns: dict[int, int] = {}
+        for column, index in enumerate(indices):
+            if index in first_columns:
+                target[:, column] = target[:, first_columns[index]]
+                continue
+            values = np.asarray(
+                model.information(block, item_idx=index), dtype=np.float64
+            )
+            if values.shape != (block.shape[0],):
+                raise ValueError(
+                    "model item information must return one value per theta point"
+                )
+            _validate_information_values(values)
+            target[:, column] = values
+            first_columns[index] = column
+    return result
 
 
 def testinfo(
@@ -94,24 +118,13 @@ def testinfo(
     >>> info = testinfo(result.model, theta)
     >>> print(f"Max information at theta = {theta[np.argmax(info)]:.2f}")
     """
-    theta_arr = _theta_matrix(theta)
-    information = np.asarray(model.information(theta_arr), dtype=np.float64)
-
-    if information.shape == (theta_arr.shape[0],):
-        return information
-    if information.shape == (theta_arr.shape[0], model.n_items):
-        return np.sum(information, axis=1)
-
-    raise ValueError(
-        f"model information has shape {information.shape}, expected "
-        f"{(theta_arr.shape[0], model.n_items)} or {(theta_arr.shape[0],)}"
-    )
+    return _test_information(model, _theta_array(model, theta, allow_empty=True))
 
 
 def iteminfo(
     model: "BaseItemModel",
     theta: NDArray[np.float64] | float | list[float],
-    item_idx: int | list[int] | None = None,
+    item_idx: int | ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """Compute item information function at given theta values.
 
@@ -121,7 +134,7 @@ def iteminfo(
         A fitted IRT model.
     theta : array-like
         Ability values at which to compute information.
-    item_idx : int, list of int, or None
+    item_idx : int, array-like, or None
         Index or indices of items. If None, returns information for all items.
 
     Returns
@@ -135,24 +148,21 @@ def iteminfo(
     >>> info = iteminfo(result.model, theta=0.0, item_idx=0)
     >>> print(f"Item 0 information at theta=0: {info[0]:.3f}")
     """
-    theta_arr = _theta_matrix(theta)
-
+    theta_arr = _theta_array(model, theta, allow_empty=True)
     if item_idx is None:
         return _item_information_matrix(model, theta_arr)
-
-    if isinstance(item_idx, int):
-        return np.asarray(
-            model.information(theta_arr, item_idx=item_idx), dtype=np.float64
-        )
-
-    return _item_information_matrix(model, theta_arr, item_idx)
+    indices, scalar_item, _ = _item_indices(model, item_idx)
+    information = _item_information_matrix(
+        model, theta_arr, indices, single_item=scalar_item
+    )
+    return information[:, 0] if scalar_item else information
 
 
 def areainfo(
     model: "BaseItemModel",
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 100,
-    item_idx: int | list[int] | None = None,
+    item_idx: int | ArrayLike | None = None,
 ) -> float | NDArray[np.float64]:
     """Compute area under the information curve.
 
@@ -167,7 +177,7 @@ def areainfo(
         Range of theta values for integration. Default (-4, 4).
     n_points : int
         Number of quadrature points. Default 100.
-    item_idx : int, list of int, or None
+    item_idx : int, array-like, or None
         If provided, compute area for the selected item or items. If None,
         compute area for test information. A list preserves selection order.
 
@@ -186,7 +196,16 @@ def areainfo(
     >>> print(f"Item 0 information area: {item_area:.2f}")
     >>> selected_areas = areainfo(result.model, item_idx=[2, 0])
     """
-    theta = np.linspace(theta_range[0], theta_range[1], n_points)
+    if model.n_factors != 1:
+        raise ValueError("areainfo supports unidimensional models only")
+    lower, upper = _difficulty_theta_bounds(theta_range)
+    if (
+        isinstance(n_points, (bool, np.bool_))
+        or not isinstance(n_points, (int, np.integer))
+        or n_points < 2
+    ):
+        raise ValueError("n_points must be an integer greater than or equal to 2")
+    theta = np.linspace(lower, upper, int(n_points))
 
     if item_idx is not None:
         info = iteminfo(model, theta, item_idx)
@@ -194,7 +213,7 @@ def areainfo(
         info = testinfo(model, theta)
 
     area = np.trapezoid(info, theta, axis=0)
-    if isinstance(item_idx, list):
+    if np.ndim(area) > 0:
         return np.asarray(area, dtype=np.float64)
     return float(area)
 
@@ -416,7 +435,12 @@ def probtrace(
     >>> traces = probtrace(result.model, theta, item_idx=0)
     >>> # For 2PL: traces has shape (61,) - probability of correct response
     """
-    theta_arr = _theta_matrix(theta)
+    theta_arr = _theta_array(model, theta, allow_empty=True)
+    if item_idx is not None:
+        indices, scalar_item, _ = _item_indices(model, item_idx)
+        if not scalar_item:
+            raise ValueError("item_idx must be one integer item index")
+        item_idx = int(indices[0])
 
     probs = model.probability(theta_arr, item_idx=item_idx)
     return probs
@@ -425,7 +449,7 @@ def probtrace(
 def expected_score(
     model: "BaseItemModel",
     theta: NDArray[np.float64] | float | list[float],
-    item_idx: int | list[int] | None = None,
+    item_idx: int | ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """Compute expected score at given theta values.
 
@@ -438,7 +462,7 @@ def expected_score(
         A fitted IRT model.
     theta : array-like
         Ability values.
-    item_idx : int, list of int, or None
+    item_idx : int, array-like, or None
         Item index or indices. If None, returns expected test score.
 
     Returns
@@ -452,41 +476,60 @@ def expected_score(
     >>> expected = expected_score(result.model, theta)
     >>> print(f"Expected test score at theta=0: {expected[1]:.2f}")
     """
-    theta_arr = _theta_matrix(theta)
+    theta_arr = _theta_array(model, theta, allow_empty=True)
+    score_method = getattr(model, "expected_score", None)
 
     def score_one(index: int | None) -> NDArray[np.float64]:
-        score_method = getattr(model, "expected_score", None)
-        if callable(score_method):
-            return np.asarray(score_method(theta_arr, item_idx=index), dtype=np.float64)
+        result = np.empty(theta_arr.shape[0])
+        width = model.n_items if index is None else 1
+        if not callable(score_method) and getattr(model, "is_polytomous", False):
+            width *= max(1, int(np.max(getattr(model, "n_categories", 1))))
+        rows_per_block = max(1, _EXPECTED_SCORE_CHUNK_ELEMENTS // width)
+        for start in range(0, theta_arr.shape[0], rows_per_block):
+            block = theta_arr[start : start + rows_per_block]
+            if callable(score_method):
+                scores = np.asarray(
+                    score_method(block, item_idx=index), dtype=np.float64
+                )
+            else:
+                probabilities = np.asarray(
+                    model.probability(block, item_idx=index), dtype=np.float64
+                )
+                if getattr(model, "is_polytomous", False):
+                    scores = probabilities @ np.arange(probabilities.shape[-1])
+                else:
+                    scores = probabilities
+                if index is None and scores.ndim > 1:
+                    scores = np.sum(scores, axis=1)
+            if scores.shape != (block.shape[0],) or not np.all(np.isfinite(scores)):
+                raise ValueError(
+                    "model expected scores must be finite with one value per theta"
+                )
+            result[start : start + rows_per_block] = scores
+        return result
 
-        probabilities = np.asarray(
-            model.probability(theta_arr, item_idx=index), dtype=np.float64
-        )
-        if getattr(model, "is_polytomous", False):
-            category_scores = np.arange(probabilities.shape[-1])
-            scores = (
-                probabilities @ category_scores
-                if index is not None
-                else np.sum(probabilities * category_scores, axis=-1)
-            )
+    if item_idx is None:
+        return score_one(None)
+    indices, scalar_item, _ = _item_indices(model, item_idx)
+    if scalar_item:
+        return score_one(int(indices[0]))
+
+    result = np.empty((theta_arr.shape[0], indices.size))
+    first_columns: dict[int, int] = {}
+    for column, index in enumerate(indices.tolist()):
+        if index in first_columns:
+            result[:, column] = result[:, first_columns[index]]
         else:
-            scores = probabilities
-
-        return np.sum(scores, axis=1) if index is None and scores.ndim > 1 else scores
-
-    if item_idx is None or isinstance(item_idx, int):
-        return score_one(item_idx)
-
-    if not item_idx:
-        return np.empty((theta_arr.shape[0], 0), dtype=np.float64)
-    return np.column_stack([score_one(index) for index in item_idx])
+            result[:, column] = score_one(index)
+            first_columns[index] = column
+    return result
 
 
-def _difficulty_item_indices(
+def _item_indices(
     model: "BaseItemModel",
     item_idx: int | ArrayLike | None,
 ) -> tuple[NDArray[np.intp], bool, tuple[int, ...]]:
-    """Validate requested generalized-difficulty item indices."""
+    """Validate item selections while preserving order and repeated indices."""
     if item_idx is None:
         return np.arange(model.n_items, dtype=np.intp), False, (model.n_items,)
     if isinstance(item_idx, (bool, np.bool_)):
@@ -612,14 +655,29 @@ def _logistic_difficulties(
     result[above] = upper_bound
     interior = ~(below | above)
     if np.any(interior):
-        scaled = (targets[interior] - selected_lower[interior]) / (
-            selected_upper[interior] - selected_lower[interior]
-        )
-        logistic = scaled ** (1.0 / selected_asymmetry[interior])
-        logit = np.log(logistic) - np.log1p(-logistic)
-        result[interior] = selected_difficulty[interior] + (
-            logit / selected_discrimination[interior]
-        )
+        from_lower = targets[interior] - selected_lower[interior]
+        from_upper = selected_upper[interior] - targets[interior]
+        width = selected_upper[interior] - selected_lower[interior]
+        slope = selected_discrimination[interior]
+        shape = selected_asymmetry[interior]
+        log_scaled = np.log(from_lower) - np.log(width)
+        near_upper = from_lower > from_upper
+        log_scaled[near_upper] = np.log1p(-from_upper[near_upper] / width[near_upper])
+        with np.errstate(over="ignore", under="ignore", divide="ignore"):
+            log_logistic = log_scaled / shape
+            log_complement = np.log(-np.expm1(log_logistic))
+            log_magnitude = np.log(-log_scaled) - np.log(shape)
+            log_complement = np.where(
+                log_logistic > -np.finfo(float).tiny, log_magnitude, log_complement
+            )
+            shift = log_logistic / slope
+            overflowed = np.isneginf(log_logistic)
+            if np.any(overflowed):
+                shift[overflowed] = -np.exp(
+                    log_magnitude[overflowed] - np.log(slope[overflowed])
+                )
+            shift -= log_complement / slope
+            result[interior] = selected_difficulty[interior] + shift
     return np.clip(result, lower_bound, upper_bound)
 
 
@@ -787,7 +845,7 @@ def gen_difficulty(
     if model.n_factors != 1:
         raise ValueError("gen_difficulty supports unidimensional models only")
 
-    indices, scalar_item, output_shape = _difficulty_item_indices(model, item_idx)
+    indices, scalar_item, output_shape = _item_indices(model, item_idx)
     targets = _difficulty_targets(target_prob, output_shape)
     lower_bound, upper_bound = _difficulty_theta_bounds(theta_range)
     if indices.size == 0:
