@@ -56,6 +56,7 @@ SUITE_ORDER = (
     "variational",
     "gvem-uncertainty",
     "variational-objective",
+    "variational-mstep",
 )
 
 
@@ -344,6 +345,21 @@ def bench_gvem_uncertainty(
     return results
 
 
+def _variational_state(
+    rng: np.random.Generator, n_persons: int, n_items: int, n_factors: int
+) -> tuple[np.ndarray, ...]:
+    """Prepare common correlated posterior states outside measured work."""
+    responses = rng.integers(0, 2, (n_persons, n_items))
+    responses[rng.random(responses.shape) < 0.1] = -1
+    loadings = rng.normal(scale=0.5, size=(n_items, n_factors))
+    intercepts = rng.normal(size=n_items)
+    mu = rng.normal(scale=0.5, size=(n_persons, n_factors))
+    root = rng.normal(scale=0.1, size=(n_persons, n_factors, n_factors))
+    sigma = root @ root.swapaxes(1, 2) + np.eye(n_factors) * 0.5
+    xi = rng.uniform(0.0, 3.0, size=responses.shape)
+    return responses, loadings, intercepts, mu, sigma, xi
+
+
 def bench_variational_objective(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
@@ -355,14 +371,9 @@ def bench_variational_objective(
     rng = np.random.default_rng(92)
     results = []
     for n_factors in (1, 3, 6):
-        responses = rng.integers(0, 2, (n_persons, n_items))
-        responses[rng.random(responses.shape) < 0.1] = -1
-        loadings = rng.normal(scale=0.5, size=(n_items, n_factors))
-        intercepts = rng.normal(size=n_items)
-        mu = rng.normal(scale=0.5, size=(n_persons, n_factors))
-        root = rng.normal(scale=0.1, size=(n_persons, n_factors, n_factors))
-        sigma = root @ root.swapaxes(1, 2) + np.eye(n_factors) * 0.5
-        xi = rng.uniform(0.0, 3.0, size=responses.shape)
+        responses, loadings, intercepts, mu, sigma, xi = _variational_state(
+            rng, n_persons, n_items, n_factors
+        )
         prior_mean = rng.normal(scale=0.2, size=n_factors)
         prior_cov = np.eye(n_factors) * 1.2 + 0.1
         model = TwoParameterLogistic(n_items, n_factors)
@@ -387,6 +398,53 @@ def bench_variational_objective(
                     f"variational_objective_{name}_{n_factors}d",
                     times,
                     _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_variational_mstep(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure NumPy item updates, including statistic accumulation and solves."""
+    from mirt.estimation.gvem import GVEMEstimator
+    from mirt.estimation.sparse_bayesian import SparseBayesianEstimator
+    from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
+
+    rng = np.random.default_rng(93)
+    results = []
+    for n_factors, fixed in ((1, False), (3, False), (6, False), (1, True)):
+        responses, loadings, intercepts, mu, sigma, xi = _variational_state(
+            rng, n_persons, n_items, n_factors
+        )
+        if fixed:
+            loadings.fill(1.0)
+        model_class = OneParameterLogistic if fixed else TwoParameterLogistic
+        model = model_class(n_items, n_factors)
+        gvem = GVEMEstimator(use_gpu=False)
+        sparse = SparseBayesianEstimator(k_max=n_factors)
+        sparse._fixed_loadings = fixed
+        gvem._mu = sparse._mu = mu
+        gvem._sigma = sparse._sigma = sigma
+        gvem._xi = sparse._xi = xi
+
+        def run_gvem() -> None:
+            gvem._slopes = loadings.copy()
+            gvem._intercepts = intercepts.copy()
+            gvem._m_step_python(model, responses)
+
+        def run_sparse() -> None:
+            sparse._loadings = loadings.copy()
+            sparse._intercepts = intercepts.copy()
+            sparse._gamma = np.full_like(loadings, 0.5)
+            sparse._m_step_ssl(responses)
+
+        label = "1pl" if fixed else f"2pl_{n_factors}d"
+        for name, run in (("gvem", run_gvem), ("sparse", run_sparse)):
+            times = _time(run, repeats=repeats, warmups=warmups)
+            results.append(
+                BenchResult(
+                    f"variational_mstep_{name}_{label}", times, _peak_traced_bytes(run)
                 )
             )
     return results
@@ -1648,6 +1706,8 @@ def run_suites(
         results.extend(
             bench_variational_objective(n_persons, n_items, repeats, warmups)
         )
+    if "variational-mstep" in suites:
+        results.extend(bench_variational_mstep(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1828,6 +1888,7 @@ def _validate_baseline_compatibility(
                 "gvem_standard_errors_",
                 "gvem_fit_",
                 "variational_objective_",
+                "variational_mstep_",
             )
         )
     )
