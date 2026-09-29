@@ -346,6 +346,7 @@ class TestBenchmarkCommand:
             "multidimensional-probability",
             "multidimensional-fit",
             "logistic-fit",
+            "weighted-em",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -377,7 +378,29 @@ class TestBenchmarkCommand:
             "multidimensional-probability",
             "multidimensional-fit",
             "logistic-fit",
+            "weighted-em",
         )
+
+    def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ["weighted-em"], n_persons=8, n_items=2, repeats=1, warmups=0
+        )
+        assert {result.name for result in results} == {
+            "weighted_e_step_2pl",
+            "weighted_e_step_mirt",
+            "weighted_e_step_grm",
+            "weighted_fit_2pl",
+            "weighted_fit_grm",
+        }
+        for result in results:
+            assert len(result.times) == 1
+            assert result.peak_traced_bytes > 0
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=8, items=2),
+                    _report(result, persons=9, items=2),
+                    max_regression_percent=5.0,
+                )
 
     def test_latent_density_suite_records_time_memory_and_checks_point_count(
         self,

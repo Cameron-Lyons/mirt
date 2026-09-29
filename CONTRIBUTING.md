@@ -276,6 +276,23 @@ retain their existing conventions. Traced peaks measure Python/NumPy temporary
 allocations, not process RSS or native allocations; the quadrature grid itself
 still grows with the number of latent dimensions.
 
+The `weighted-em` suite measures survey-weighted E-steps for 2PL, two-factor
+2PL, and five-category GRM models, plus five-iteration 2PL/GRM fits including
+standard errors. Simulated responses contain 10% missing data; survey weights
+range from 0.25 to 2.0. The two-factor E-step uses seven points per dimension, and the
+unidimensional workloads use 21 points. Input generation is excluded:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 RAYON_NUM_THREADS=8 uv run --no-sync python benchmarks/run_benchmarks.py --suite weighted-em --persons 1000 --items 30 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-weighted.json
+```
+
+Built-in models evaluate probabilities once per quadrature grid; custom models
+retain per-person likelihood calls. E-steps return log marginals internally so
+convergence and fit statistics remain meaningful for long tests. Traced memory
+covers Python/NumPy allocations, excluding native workspace and process RSS.
+Weighted standard errors share the core EM item-curvature implementation,
+including analytic built-in derivatives and numerical custom-model fallbacks.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

@@ -21,6 +21,7 @@ from scipy.optimize import minimize
 
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._patterns import supports_pattern_compression
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -96,8 +97,8 @@ class WeightedEMEstimator(EMEstimator):
 
     where w_i is the weight for person i and L_i is their marginal likelihood.
 
-    Standard errors computed under weighted estimation are design-based
-    and may require additional corrections for proper inference.
+    Standard errors use itemwise complete-data curvature with survey-weighted
+    posterior counts. They do not account for clustering or stratification.
     """
 
     def __init__(
@@ -174,11 +175,11 @@ class WeightedEMEstimator(EMEstimator):
         converged = False
 
         for iteration in range(self.max_iter):
-            posterior_weights, marginal_ll = self._e_step_weighted(
+            posterior_weights, log_marginal = self._e_step_weighted(
                 model, responses, prior_mean, prior_cov, weights
             )
 
-            current_ll = np.sum(weights * np.log(marginal_ll + 1e-300))
+            current_ll = float(weights @ log_marginal)
             self._convergence_history.append(current_ll)
 
             self._log_iteration(iteration, current_ll)
@@ -194,10 +195,10 @@ class WeightedEMEstimator(EMEstimator):
             self._m_step_weighted(model, responses, posterior_weights, weights)
 
         if not converged:
-            posterior_weights, marginal_ll = self._e_step_weighted(
+            posterior_weights, log_marginal = self._e_step_weighted(
                 model, responses, prior_mean, prior_cov, weights
             )
-            current_ll = float(np.sum(weights * np.log(marginal_ll + 1e-300)))
+            current_ll = float(weights @ log_marginal)
             self._convergence_history[-1] = current_ll
 
         model._is_fitted = True
@@ -231,31 +232,35 @@ class WeightedEMEstimator(EMEstimator):
         prior_cov: NDArray[np.float64],
         weights: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """E-step with survey weights."""
+        """Return individual posterior weights and per-person log marginals.
+
+        Survey weights enter the fit objective and expected counts, leaving each
+        person's posterior unchanged.
+        """
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
-        n_persons = responses.shape[0]
-        n_quad = len(quad_weights)
 
-        log_likelihoods = np.zeros((n_persons, n_quad))
-
-        for q in range(n_quad):
-            theta_q = np.tile(quad_points[q], (n_persons, 1))
-            log_likelihoods[:, q] = model.log_likelihood(responses, theta_q)
+        # The same exact-type check used for response compression identifies
+        # built-in, exchangeable likelihoods with owned batch outputs. Preserve
+        # custom person-specific likelihoods and their per-person theta inputs.
+        if supports_pattern_compression(model):
+            log_joint = model.log_likelihood_batch(responses, quad_points)
+        else:
+            n_persons = responses.shape[0]
+            log_joint = np.empty((n_persons, len(quad_weights)))
+            for q, point in enumerate(quad_points):
+                theta_q = np.tile(point, (n_persons, 1))
+                log_joint[:, q] = model.log_likelihood(responses, theta_q)
 
         log_prior_mass = gaussian_log_quadrature_mass(
             quad_points, quad_weights, prior_mean, prior_cov
         )
 
-        log_joint = log_likelihoods + log_prior_mass[None, :]
-
-        log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-        log_posterior = log_joint - log_marginal
-
-        posterior_weights = np.exp(log_posterior)
-        marginal_ll = np.exp(log_marginal.ravel())
-
-        return posterior_weights, marginal_ll
+        log_joint += log_prior_mass[None, :]
+        log_marginal = logsumexp(log_joint, axis=1)
+        log_joint -= log_marginal[:, None]
+        np.exp(log_joint, out=log_joint)
+        return log_joint, log_marginal
 
     def _m_step_weighted(
         self,
@@ -345,33 +350,10 @@ class WeightedEMEstimator(EMEstimator):
         posterior_weights: NDArray[np.float64],
         survey_weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
-        """Compute design-based standard errors."""
+        """Compute itemwise curvature standard errors using survey weights."""
 
-        standard_errors: dict[str, NDArray[np.float64]] = {}
-
-        for name, values in model.parameters.items():
-            if name == "discrimination" and model.model_name == "1PL":
-                standard_errors[name] = np.zeros_like(values)
-                continue
-
-            se = np.zeros_like(values)
-
-            for item_idx in range(model.n_items):
-                item_se = self._compute_item_se(
-                    model,
-                    item_idx,
-                    name,
-                    responses,
-                    posterior_weights * survey_weights[:, None],
-                )
-                if values.ndim == 1:
-                    se[item_idx] = item_se
-                else:
-                    se[item_idx] = item_se
-
-            standard_errors[name] = se
-
-        return standard_errors
+        weighted_posterior = posterior_weights * survey_weights[:, None]
+        return self._compute_standard_errors(model, responses, weighted_posterior)
 
 
 def compute_effective_sample_size(weights: NDArray[np.float64]) -> float:
