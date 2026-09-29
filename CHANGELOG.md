@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrays while preserving missing-data bounds, shifted priors, and each
   estimator's lower bound on local variational parameters. Small samples use
   one block without copying outputs. Added a `variational` timing and memory suite.
+- Shared the NumPy variational objective between GVEM and sparse Bayesian
+  estimation, bounding likelihood and Gaussian KL scratch space by respondent
+  blocks and reusing temporary arrays. Added a `variational-objective` benchmark
+  suite for timing and traced allocations on precomputed variational states.
 - Computed built-in GVEM standard errors directly from diagonal variational
   curvature at the default step size, avoiding full-objective finite differences
   and cancellation against parameter-independent terms. Curvature reductions

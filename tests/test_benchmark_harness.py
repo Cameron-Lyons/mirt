@@ -349,6 +349,7 @@ class TestBenchmarkCommand:
             "weighted-em",
             "variational",
             "gvem-uncertainty",
+            "variational-objective",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -383,6 +384,7 @@ class TestBenchmarkCommand:
             "weighted-em",
             "variational",
             "gvem-uncertainty",
+            "variational-objective",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -443,6 +445,26 @@ class TestBenchmarkCommand:
                     _report(result, persons=13),
                     max_regression_percent=5.0,
                 )
+
+    def test_variational_objective_suite_records_time_memory_and_checks_person_count(
+        self,
+    ) -> None:
+        results = benchmark.run_suites(
+            ("variational-objective",), n_persons=12, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"variational_objective_{name}_{n_factors}d"
+            for n_factors in (1, 3, 6)
+            for name in ("gvem", "sparse")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12),
+                _report(*results, persons=13),
+                max_regression_percent=20,
+            )
 
     def test_latent_density_suite_records_time_memory_and_checks_point_count(
         self,

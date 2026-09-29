@@ -17,6 +17,7 @@ from mirt.backends.rust.gvem import gvem_e_step as _rust_gvem_e_step
 from mirt.backends.rust.gvem import gvem_m_step as _rust_gvem_m_step
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
+from mirt.estimation._variational_objective import variational_elbo
 from mirt.estimation.base import BaseEstimator
 from mirt.exceptions import MirtValidationError
 
@@ -585,48 +586,17 @@ class GVEMEstimator(BaseEstimator):
         prior_cov: NDArray[np.float64],
     ) -> float:
         """Python fallback for ELBO computation."""
-        n_factors = model.n_factors
-
-        valid_mask = responses >= 0
-
-        lam = self._lambda(self._xi)
-        eta_mean = self._mu @ self._slopes.T + self._intercepts
-        eta_variance = np.einsum(
-            "jf,ifg,jg->ij",
+        return variational_elbo(
+            responses,
             self._slopes,
+            self._intercepts,
+            self._mu,
             self._sigma,
-            self._slopes,
-            optimize=True,
+            self._xi,
+            prior_mean,
+            prior_cov,
+            self._lambda,
         )
-        eta_second = eta_variance + eta_mean**2
-        likelihood_terms = (
-            -np.logaddexp(0.0, -self._xi)
-            + (responses - 0.5) * eta_mean
-            - 0.5 * self._xi
-            - lam * (eta_second - self._xi**2)
-        )
-        expected_log_likelihood = float(np.sum(likelihood_terms[valid_mask]))
-
-        prior_cov_inv = np.linalg.solve(prior_cov, np.eye(n_factors))
-        log_det_prior = float(np.linalg.slogdet(prior_cov)[1])
-        log_det_q = np.linalg.slogdet(self._sigma)[1]
-        diff = self._mu - prior_mean
-        kl_mean = 0.5 * np.einsum(
-            "if,fg,ig->i",
-            diff,
-            prior_cov_inv,
-            diff,
-            optimize=True,
-        )
-        kl_trace = 0.5 * np.einsum(
-            "fg,igf->i",
-            prior_cov_inv,
-            self._sigma,
-            optimize=True,
-        )
-        kl = kl_mean + kl_trace + 0.5 * (log_det_prior - log_det_q) - 0.5 * n_factors
-
-        return expected_log_likelihood - float(np.sum(kl))
 
     def _compute_standard_errors(
         self,

@@ -326,6 +326,22 @@ Curvature scratch space is bounded by row and factor counts, and missing items
 retain undefined standard errors. Traced peaks exclude input generation, native
 workspace, and process RSS.
 
+The `variational-objective` suite measures the shared NumPy logistic bound and
+Gaussian prior/entropy calculation for GVEM and sparse Bayesian estimation in
+one, three, and six dimensions. Inputs include correlated covariance matrices,
+shifted priors, and 10% missing responses. Variational state generation and fitting
+are excluded; both callers use NumPy regardless of the selected backend:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite variational-objective --persons 10000 --items 100 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-variational-objective.json
+```
+
+The objective processes respondent blocks sized by item and factor counts, with
+at least one whole respondent per block. Missing observations are excluded from
+the logistic bound, while every respondent contributes a Gaussian KL term. The
+sparse loading prior remains separate. Traced peaks cover Python/NumPy scratch
+allocations, excluding input generation, native workspace, and process RSS.
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.
