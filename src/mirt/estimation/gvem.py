@@ -45,6 +45,8 @@ class GVEMEstimator(BaseEstimator):
         Number of inner iterations for variational parameter updates per EM step.
     se_step_size : float
         Step size for numerical differentiation when computing standard errors.
+        At the default step size, built-in 1PL/2PL models use exact diagonal
+        curvature. Custom objectives and other step sizes use numerical differences.
 
     Notes
     -----
@@ -633,88 +635,58 @@ class GVEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         prior_cov: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
-        """Compute standard errors using numerical differentiation of ELBO."""
-        standard_errors: dict[str, NDArray[np.float64]] = {}
+        """Compute diagonal ELBO curvature with the variational state held fixed."""
+        from mirt.estimation._gvem_information import gvem_standard_errors
+        from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
+
         self._convert_to_slope_intercept(model)
-        center_elbo = self._compute_elbo(
-            model,
-            responses,
-            prior_mean,
-            prior_cov,
-        )
+        if (
+            type(self) is GVEMEstimator
+            and type(model) in (OneParameterLogistic, TwoParameterLogistic)
+            and self.se_step_size == 1e-5
+            and not any(
+                name in vars(self)
+                for name in (
+                    "_compute_elbo",
+                    "_compute_elbo_python",
+                    "_convert_to_slope_intercept",
+                    "_lambda",
+                )
+            )
+        ):
+            return gvem_standard_errors(
+                model, responses, self._mu, self._sigma, self._xi, self._lambda
+            )
 
+        standard_errors: dict[str, NDArray[np.float64]] = {}
+        center_elbo = self._compute_elbo(model, responses, prior_mean, prior_cov)
+        h = self.se_step_size
         for name, values in model.parameters.items():
-            if name == "discrimination" and model.model_name == "1PL":
-                standard_errors[name] = np.zeros_like(values)
-                continue
-
-            se = np.full_like(values, np.nan, dtype=np.float64)
-
-            h = self.se_step_size
-
-            if values.ndim == 1:
-                for item_idx in range(len(values)):
-                    original = float(values[item_idx])
-
-                    model._parameters[name][item_idx] = original + h
+            free = model.free_parameter_masks[name]
+            se = np.zeros_like(values, dtype=np.float64)
+            for index in np.ndindex(values.shape):
+                if not free[index]:
+                    continue
+                original = float(values[index])
+                try:
+                    model._parameters[name][index] = original + h
                     self._convert_to_slope_intercept(model)
                     elbo_plus = self._compute_elbo(
-                        model,
-                        responses,
-                        prior_mean,
-                        prior_cov,
+                        model, responses, prior_mean, prior_cov
                     )
 
-                    model._parameters[name][item_idx] = original - h
+                    model._parameters[name][index] = original - h
                     self._convert_to_slope_intercept(model)
                     elbo_minus = self._compute_elbo(
-                        model,
-                        responses,
-                        prior_mean,
-                        prior_cov,
+                        model, responses, prior_mean, prior_cov
                     )
-
-                    model._parameters[name][item_idx] = original
+                finally:
+                    model._parameters[name][index] = original
                     self._convert_to_slope_intercept(model)
 
-                    hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / (h**2)
-
-                    if hessian < 0:
-                        se[item_idx] = np.sqrt(-1.0 / hessian)
-
-            else:
-                for item_idx in range(values.shape[0]):
-                    for factor_idx in range(values.shape[1]):
-                        original = float(values[item_idx, factor_idx])
-
-                        model._parameters[name][item_idx, factor_idx] = original + h
-                        self._convert_to_slope_intercept(model)
-                        elbo_plus = self._compute_elbo(
-                            model,
-                            responses,
-                            prior_mean,
-                            prior_cov,
-                        )
-
-                        model._parameters[name][item_idx, factor_idx] = original - h
-                        self._convert_to_slope_intercept(model)
-                        elbo_minus = self._compute_elbo(
-                            model,
-                            responses,
-                            prior_mean,
-                            prior_cov,
-                        )
-
-                        model._parameters[name][item_idx, factor_idx] = original
-                        self._convert_to_slope_intercept(model)
-
-                        hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / (h**2)
-
-                        if hessian < 0:
-                            se[item_idx, factor_idx] = np.sqrt(-1.0 / hessian)
-
+                hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / h**2
+                se[index] = np.sqrt(-1.0 / hessian) if hessian < 0.0 else np.nan
             standard_errors[name] = se
-
         return standard_errors
 
     @property

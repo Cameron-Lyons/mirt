@@ -348,6 +348,7 @@ class TestBenchmarkCommand:
             "logistic-fit",
             "weighted-em",
             "variational",
+            "gvem-uncertainty",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -381,6 +382,7 @@ class TestBenchmarkCommand:
             "logistic-fit",
             "weighted-em",
             "variational",
+            "gvem-uncertainty",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -420,6 +422,25 @@ class TestBenchmarkCommand:
                 benchmark.compare_results(
                     _report(result, persons=20),
                     _report(result, persons=21),
+                    max_regression_percent=5.0,
+                )
+
+    def test_gvem_uncertainty_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ["gvem-uncertainty"], n_persons=12, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"gvem_{kind}_{dimensions}d"
+            for dimensions in (1, 3)
+            for kind in ("standard_errors", "fit")
+        ]
+        for result in results:
+            assert len(result.times) == 2
+            assert result.peak_traced_bytes > 0
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=12),
+                    _report(result, persons=13),
                     max_regression_percent=5.0,
                 )
 
