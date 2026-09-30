@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 from scipy.special import xlog1py, xlogy
 
 from mirt._logistic import _affine_logits, _logistic_probability
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.models.base import BaseItemModel
 
 _Objective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
@@ -31,19 +32,7 @@ def prepare_affine_objective(
     from mirt.models.bifactor import BifactorModel
     from mirt.models.multidimensional import MultidimensionalModel
 
-    if any(
-        name in vars(model)
-        for name in (
-            "probability",
-            "_logits",
-            "_curve_parameters",
-            "_ensure_theta_2d",
-            "set_parameters",
-            "set_item_parameter",
-            "_canonical_parameter_values",
-            "free_parameter_masks",
-        )
-    ):
+    if not uses_builtin_model_hooks(model):
         return None
 
     if type(model) is MultidimensionalModel:

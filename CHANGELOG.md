@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Preserved class-level and inherited model hooks in prepared item, BL,
+  uncertainty, native fitting, and response-compression paths. Shared original
+  hook checks are recorded at model definition time, including overrides made
+  before estimator imports. Polytomous likelihoods now respect public
+  probability overrides, and custom curves retain numerical fitting.
+
 ### Added
 - Optional diagonal complete-data standard errors for MCEM, QMCEM, and
   stochastic EM via `compute_standard_errors=True`, with configurable
@@ -18,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder errors and existing fitting costs.
 
 ### Changed
+- Consolidated built-in model eligibility checks across prepared and native
+  estimation paths, and reused prepared gradients for bifactor Monte Carlo
+  item uncertainty.
 - Reused fresh Monte Carlo E-step evidence for likelihood reporting, avoiding
   repeated draw evaluation and importance normalization before item updates.
   Released previous draws and weights before the next E-step, and transformed

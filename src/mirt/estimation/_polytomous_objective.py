@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 from scipy.special import xlogy
 
 from mirt._core import sigmoid
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.models.base import BaseItemModel
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
@@ -70,18 +71,9 @@ def prepare_polytomous_objective(
         PartialCreditModel: ("discrimination", "steps"),
         NominalResponseModel: ("slopes", "intercepts"),
     }
-    if tuple(model._parameters) != layouts.get(type(model)) or any(
-        name in vars(model)
-        for name in (
-            "probability",
-            "_category_probabilities",
-            "_ensure_theta_2d",
-            "set_parameters",
-            "set_item_parameter",
-            "_canonical_parameter_values",
-            "free_parameter_masks",
-        )
-    ):
+    if tuple(model._parameters) != layouts.get(
+        type(model)
+    ) or not uses_builtin_model_hooks(model):
         return None
 
     n_categories = model.n_categories[item_idx]

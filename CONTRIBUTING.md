@@ -108,6 +108,17 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+Prepared item and joint likelihoods, exact uncertainty, native fitting, and
+response compression require original built-in model hooks. A shared check
+compares instance attributes, class methods, and inherited definitions captured
+when models are defined, including changes made before estimator imports.
+Custom curves, setters, layouts, and joint likelihoods retain their public
+evaluation paths. Conditional item objectives only require unchanged item
+hooks; a joint likelihood override alone does not disable them. Polytomous
+single-person and batched likelihoods both follow public probability methods.
+These checks preserve lazy model imports and keep default numerical shortcuts
+available.
+
 The `qmcem-mstep` suite measures one complete QMCEM M-step on a precomputed
 256-point shared grid for 2PL, three-factor 2PL/MIRT, four-category GRM, and
 two-factor GPCM/NRM models with 10% missing responses:

@@ -30,6 +30,11 @@ from scipy.optimize import minimize
 from scipy.special import xlog1py, xlogy
 from scipy.stats import qmc
 
+from mirt._model_defaults import (
+    original_model_hook,
+    uses_builtin_model_hooks,
+    uses_original_model_hook,
+)
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._gaussian_kernel import gaussian_log_kernel
 from mirt.estimation._mc_likelihood import (
@@ -39,19 +44,7 @@ from mirt.estimation._mc_likelihood import (
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
-from mirt.models.dichotomous import (
-    FourParameterLogistic,
-    OneParameterLogistic,
-    ThreeParameterLogistic,
-    TwoParameterLogistic,
-)
-from mirt.models.multidimensional import MultidimensionalModel
-from mirt.models.polytomous import (
-    GeneralizedPartialCredit,
-    GradedResponseModel,
-    NominalResponseModel,
-    PartialCreditModel,
-)
+from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -537,7 +530,7 @@ class MCEMEstimator(BaseEstimator):
             and (
                 type(self) is not QMCEMEstimator
                 or (
-                    "log_likelihood_batch" not in vars(model)
+                    uses_original_model_hook(model, "log_likelihood_batch")
                     and type(model).log_likelihood_batch
                     in _DEFAULT_QMC_BATCH_LIKELIHOODS
                 )
@@ -815,11 +808,7 @@ class MCEMEstimator(BaseEstimator):
     @staticmethod
     def _uses_default_information_model(model: BaseItemModel) -> bool:
         """Keep changed public model curves and parameter hooks authoritative."""
-        methods = _DEFAULT_MC_INFORMATION_MODELS.get(type(model))
-        return methods is not None and all(
-            name not in vars(model) and getattr(type(model), name) is method
-            for name, method in methods.items()
-        )
+        return uses_builtin_model_hooks(model)
 
 
 class QMCEMEstimator(MCEMEstimator):
@@ -1198,38 +1187,8 @@ _DEFAULT_MC_ITEM_METHODS = {
 
 _DEFAULT_MC_SAMPLE_LIKELIHOODS = MCEMEstimator._sample_log_likelihoods
 
-_DEFAULT_MC_INFORMATION_MODELS = {
-    cls: {
-        name: getattr(cls, name)
-        for name in (
-            "probability",
-            "_category_probabilities",
-            "_evaluate_logistic",
-            "_curve_parameters",
-            "_logits",
-            "_ensure_theta_2d",
-            "set_parameters",
-            "set_item_parameter",
-            "_canonical_parameter_values",
-            "free_parameter_masks",
-        )
-        if hasattr(cls, name)
-    }
-    for cls in (
-        OneParameterLogistic,
-        TwoParameterLogistic,
-        ThreeParameterLogistic,
-        FourParameterLogistic,
-        MultidimensionalModel,
-        GradedResponseModel,
-        GeneralizedPartialCredit,
-        PartialCreditModel,
-        NominalResponseModel,
-    )
-}
-
 _DEFAULT_QMC_BATCH_LIKELIHOODS = {
-    cls.log_likelihood_batch
+    original_model_hook(cls, "log_likelihood_batch")
     for cls in (
         DichotomousItemModel,
         PolytomousItemModel,

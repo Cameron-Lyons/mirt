@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._affine_objective import prepare_affine_objective
 from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
@@ -196,50 +197,7 @@ def prepare_bl_objective(
     setter: _Setter,
 ) -> PreparedBLObjective | None:
     """Keep custom likelihoods, curves, and parameter layouts on their own path."""
-    from mirt.models.bifactor import BifactorModel
-    from mirt.models.dichotomous import (
-        FourParameterLogistic,
-        OneParameterLogistic,
-        ThreeParameterLogistic,
-        TwoParameterLogistic,
-    )
-    from mirt.models.multidimensional import MultidimensionalModel
-    from mirt.models.polytomous import (
-        GeneralizedPartialCredit,
-        GradedResponseModel,
-        NominalResponseModel,
-        PartialCreditModel,
-    )
-
-    if type(model) not in (
-        OneParameterLogistic,
-        TwoParameterLogistic,
-        ThreeParameterLogistic,
-        FourParameterLogistic,
-        GradedResponseModel,
-        GeneralizedPartialCredit,
-        PartialCreditModel,
-        NominalResponseModel,
-        MultidimensionalModel,
-        BifactorModel,
-    ) or any(
-        name in vars(model)
-        for name in (
-            "probability",
-            "log_likelihood",
-            "log_likelihood_batch",
-            "_category_probabilities",
-            "_validate_polytomous_responses",
-            "_evaluate_logistic",
-            "_logits",
-            "_curve_parameters",
-            "_ensure_theta_2d",
-            "set_parameters",
-            "set_item_parameter",
-            "_canonical_parameter_values",
-            "free_parameter_masks",
-        )
-    ):
+    if not uses_builtin_model_hooks(model, likelihood=True):
         return None
     if any(
         not info["shape"] or info["shape"][0] != model.n_items
