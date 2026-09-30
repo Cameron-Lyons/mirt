@@ -282,7 +282,7 @@ def test_weighted_e_step_preserves_custom_person_likelihood(override):
     np.testing.assert_allclose(actual[1], expected[1], atol=1e-14)
 
 
-def test_weighted_standard_errors_share_weighted_posterior(monkeypatch):
+def test_weighted_standard_errors_share_counts_without_copying_posterior(monkeypatch):
     class CustomModel(TwoParameterLogistic):
         pass
 
@@ -293,9 +293,13 @@ def test_weighted_standard_errors_share_weighted_posterior(monkeypatch):
     weights = np.array([0.0, 0.5, 2.0])
     seen = []
 
-    def item_se(model, item, name, data, weighted_posterior):
-        np.testing.assert_array_equal(weighted_posterior, posterior * weights[:, None])
-        seen.append(weighted_posterior)
+    def item_se(model, item, name, data, original_posterior, *, r_k, n_k_valid, r_kc):
+        assert original_posterior is posterior
+        weighted = posterior * weights[:, None]
+        np.testing.assert_allclose(r_k, responses[:, item] @ weighted)
+        np.testing.assert_allclose(n_k_valid, weighted.sum(axis=0))
+        assert r_kc is None
+        seen.append(r_k)
         return 0.5
 
     monkeypatch.setattr(estimator, "_compute_item_se", item_se)
@@ -303,7 +307,8 @@ def test_weighted_standard_errors_share_weighted_posterior(monkeypatch):
         CustomModel(2), responses, posterior, weights
     )
     assert len(seen) == 4
-    assert all(value is seen[0] for value in seen)
+    assert np.shares_memory(seen[0], seen[2])
+    assert np.shares_memory(seen[1], seen[3])
     np.testing.assert_array_equal(posterior, np.full((3, 5), 0.2))
     for value in result.values():
         np.testing.assert_array_equal(value, [0.5, 0.5])

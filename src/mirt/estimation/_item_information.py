@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt.estimation._em_context import EMFitContext
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -23,6 +24,9 @@ def item_standard_errors(
     weights: NDArray[np.float64],
     points: NDArray[np.float64],
     epsilon: float,
+    *,
+    person_weights: NDArray[np.float64] | None = None,
+    context: EMFitContext | None = None,
 ) -> dict[str, NDArray[np.float64]] | None:
     from mirt.models.dichotomous import (
         FourParameterLogistic,
@@ -54,6 +58,10 @@ def item_standard_errors(
     params = model.parameters
     result = {name: np.zeros_like(value) for name, value in params.items()}
     theta = points.ravel()
+    context = context or EMFitContext(responses)
+    correct = observed = None
+    if not model.is_polytomous:
+        correct, observed = context.expected_counts(weights, person_weights)
 
     def se(curvature):
         curvature = np.asarray(curvature, dtype=np.float64)
@@ -68,10 +76,9 @@ def item_standard_errors(
 
     for j in range(model.n_items):
         a = params["discrimination"][j]
-        response = responses[:, j]
         if not model.is_polytomous:
-            n = weights[response >= 0].sum(axis=0)
-            r = weights[response == 1].sum(axis=0)
+            n = observed[j]
+            r = correct[j]
             z = theta - params["difficulty"][j]
             s = sigmoid(a * z)
             c = params.get("guessing", np.zeros(model.n_items))[j]
@@ -95,7 +102,7 @@ def item_standard_errors(
             continue
 
         k = model.n_categories[j]
-        counts = np.column_stack([weights[response == c].sum(axis=0) for c in range(k)])
+        counts = context.expected_category_counts(j, k, weights, person_weights)
         p = model.probability(points, j)
         active = (p > epsilon) & (p < 1 - epsilon)
         effective = np.where(active, counts, 0.0)

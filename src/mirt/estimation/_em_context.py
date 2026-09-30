@@ -11,6 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 _MAX_COUNT_ENTRIES = 1_000_000
+_MAX_WEIGHTED_COUNT_ENTRIES = 131_072
 
 
 class EMFitContext(AbstractContextManager["EMFitContext"]):
@@ -45,24 +46,62 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         return self._observed
 
     def expected_counts(
-        self, posterior: NDArray[np.float64]
+        self,
+        posterior: NDArray[np.float64],
+        person_weights: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Accumulate all item counts with bounded floating-point scratch space."""
         n_persons, n_items = self.responses.shape
-        if 2 * self.responses.size <= _MAX_COUNT_ENTRIES:
+        if person_weights is None and 2 * self.responses.size <= _MAX_COUNT_ENTRIES:
             correct, observed = self.response_components(0, n_persons)
             return correct.T @ posterior, observed.T @ posterior
 
         correct_counts = np.zeros((n_items, posterior.shape[1]))
         observed_counts = np.zeros_like(correct_counts)
-        chunk_size = max(1, _MAX_COUNT_ENTRIES // (2 * n_items))
+        max_entries = _MAX_COUNT_ENTRIES
+        if person_weights is not None:
+            max_entries = min(max_entries, _MAX_WEIGHTED_COUNT_ENTRIES)
+        chunk_size = max(1, max_entries // (2 * n_items))
         for start in range(0, n_persons, chunk_size):
             stop = min(start + chunk_size, n_persons)
-            correct, observed = self.response_components(start, stop)
+            if person_weights is None:
+                correct, observed = self.response_components(start, stop)
+            else:
+                # Weight the narrow response blocks rather than copying the
+                # person-by-quadrature posterior, which grows exponentially
+                # with the number of factors. Own these small blocks so cached
+                # components and caller-owned weights stay unchanged.
+                data = self.responses[start:stop]
+                observed = (data >= 0).astype(np.float64)
+                observed *= person_weights[start:stop, None]
+                correct = data * observed
             weights = posterior[start:stop]
             correct_counts += correct.T @ weights
             observed_counts += observed.T @ weights
+            del correct, observed
         return correct_counts, observed_counts
+
+    def expected_category_counts(
+        self,
+        item_idx: int,
+        n_categories: int,
+        posterior: NDArray[np.float64],
+        person_weights: NDArray[np.float64] | None = None,
+    ) -> NDArray[np.float64]:
+        """Accumulate an item's category counts without posterior row copies."""
+        counts = np.zeros((posterior.shape[1], n_categories))
+        chunk_size = max(1, _MAX_COUNT_ENTRIES // n_categories)
+        categories = np.arange(n_categories)
+        n_persons = self.responses.shape[0]
+        for start in range(0, n_persons, chunk_size):
+            stop = min(start + chunk_size, n_persons)
+            indicators = (
+                self.responses[start:stop, item_idx, None] == categories
+            ).astype(np.float64)
+            if person_weights is not None:
+                indicators *= person_weights[start:stop, None]
+            counts += posterior[start:stop].T @ indicators
+        return counts
 
     def response_components(
         self, start: int, stop: int

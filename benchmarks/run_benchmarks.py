@@ -53,6 +53,7 @@ SUITE_ORDER = (
     "multidimensional-fit",
     "logistic-fit",
     "weighted-em",
+    "weighted-mstep",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -302,6 +303,54 @@ def bench_weighted_em(
                 peak_traced_bytes=_peak_traced_bytes(fit),
             )
         )
+    return results
+
+
+def bench_weighted_mstep(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure weighted item optimization and curvature on a fixed posterior."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.weighted import WeightedEMEstimator
+
+    rng = np.random.default_rng(84)
+    survey_weights = rng.uniform(0.25, 2.0, n_persons)
+    survey_weights[::11] = 0.0
+    results = []
+    for name, model in (
+        ("2pl", mirt.TwoParameterLogistic(n_items)),
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("grm", mirt.GradedResponseModel(n_items, n_categories=5)),
+        ("nrm", mirt.NominalResponseModel(n_items, n_categories=5)),
+    ):
+        categories = model.n_categories if model.is_polytomous else [2] * n_items
+        responses = np.column_stack([rng.integers(0, k, n_persons) for k in categories])
+        responses[rng.random(responses.shape) < 0.1] = -1
+        estimator = WeightedEMEstimator(n_quadpts=7 if model.n_factors > 1 else 21)
+        estimator._quadrature = GaussHermiteQuadrature(
+            estimator.n_quadpts, model.n_factors
+        )
+        posterior = rng.uniform(0.1, 1.0, (n_persons, len(estimator._quadrature.nodes)))
+        posterior /= posterior.sum(axis=1, keepdims=True)
+
+        def m_step():
+            estimator._m_step_weighted(
+                model.copy(), responses, posterior, survey_weights
+            )
+
+        def standard_errors():
+            return estimator._compute_weighted_standard_errors(
+                model, responses, posterior, survey_weights
+            )
+
+        for kind, run in (("mstep", m_step), ("standard_errors", standard_errors)):
+            results.append(
+                BenchResult(
+                    f"weighted_{kind}_{name}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    peak_traced_bytes=_peak_traced_bytes(run),
+                )
+            )
     return results
 
 
@@ -1740,6 +1789,8 @@ def run_suites(
         results.extend(bench_logistic_fit(n_persons, n_items, repeats, warmups))
     if "weighted-em" in suites:
         results.extend(bench_weighted_em(n_persons, n_items, repeats, warmups))
+    if "weighted-mstep" in suites:
+        results.extend(bench_weighted_mstep(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -1934,6 +1985,8 @@ def _validate_baseline_compatibility(
                 "variational_objective_",
                 "variational_mstep_",
                 "regularized_",
+                "weighted_mstep_",
+                "weighted_standard_errors_",
             )
         )
     )

@@ -621,6 +621,7 @@ class EMEstimator(BaseEstimator):
         valid_mask: NDArray[np.bool_] | None = None,
         r_k: NDArray[np.float64] | None = None,
         n_k_valid: NDArray[np.float64] | None = None,
+        r_kc: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Optimize item parameters and return optimal parameter vector."""
         item_responses = responses[:, item_idx]
@@ -631,15 +632,18 @@ class EMEstimator(BaseEstimator):
             n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
+        if not current_params.size or not np.any(n_k_valid):
+            return current_params
 
         if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k)
 
-            r_kc = np.zeros((n_quad, n_categories))
-            for c in range(n_categories):
-                cat_mask = valid_mask & (item_responses == c)
-                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
+            if r_kc is None:
+                r_kc = np.zeros((n_quad, n_categories))
+                for c in range(n_categories):
+                    cat_mask = valid_mask & (item_responses == c)
+                    r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
 
             eps = self.prob_epsilon
 
@@ -655,17 +659,20 @@ class EMEstimator(BaseEstimator):
 
                 return -ll
 
-            result = minimize(
-                neg_expected_log_likelihood_polytomous,
-                x0=current_params,
-                method="L-BFGS-B",
-                bounds=bounds,
-                options={
-                    "maxiter": self.item_optim_maxiter,
-                    "ftol": self.item_optim_ftol,
-                },
-            )
-            return result.x
+            try:
+                result = minimize(
+                    neg_expected_log_likelihood_polytomous,
+                    x0=current_params,
+                    method="L-BFGS-B",
+                    bounds=bounds,
+                    options={
+                        "maxiter": self.item_optim_maxiter,
+                        "ftol": self.item_optim_ftol,
+                    },
+                )
+                return result.x
+            finally:
+                self._set_item_params(model, item_idx, current_params)
 
         if r_k is None:
             r_k = np.sum(
@@ -703,16 +710,22 @@ class EMEstimator(BaseEstimator):
 
             objective = neg_expected_log_likelihood_dichotomous
 
-        result = minimize(
-            objective,
-            x0=current_params,
-            method="L-BFGS-B",
-            jac=analytic,
-            bounds=bounds,
-            options={"maxiter": self.item_optim_maxiter, "ftol": self.item_optim_ftol},
-        )
-
-        return result.x
+        try:
+            result = minimize(
+                objective,
+                x0=current_params,
+                method="L-BFGS-B",
+                jac=analytic,
+                bounds=bounds,
+                options={
+                    "maxiter": self.item_optim_maxiter,
+                    "ftol": self.item_optim_ftol,
+                },
+            )
+            return result.x
+        finally:
+            if not analytic:
+                self._set_item_params(model, item_idx, current_params)
 
     def _optimize_item(
         self,
@@ -775,9 +788,14 @@ class EMEstimator(BaseEstimator):
         model: BaseItemModel,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
+        *,
+        person_weights: NDArray[np.float64] | None = None,
     ) -> dict[str, NDArray[np.float64]]:
         from mirt.estimation._item_information import item_standard_errors
 
+        context = self._fit_context
+        if context is None or context.responses is not responses:
+            context = EMFitContext(responses)
         if self.se_step_size == 1e-5:
             analytic = item_standard_errors(
                 model,
@@ -785,12 +803,20 @@ class EMEstimator(BaseEstimator):
                 posterior_weights,
                 self._quadrature.nodes,
                 self.prob_epsilon,
+                person_weights=person_weights,
+                context=context,
             )
             if analytic is not None:
                 return analytic
         standard_errors: dict[str, NDArray[np.float64]] = {}
         params = model.parameters
         free_masks = model.free_parameter_masks
+        correct = observed = None
+        category_counts: dict[int, NDArray[np.float64]] = {}
+        if not model.is_polytomous:
+            correct, observed = context.expected_counts(
+                posterior_weights, person_weights
+            )
 
         for name, values in params.items():
             free_mask = free_masks[name]
@@ -801,8 +827,32 @@ class EMEstimator(BaseEstimator):
             se = np.zeros_like(values)
 
             for item_idx in range(model.n_items):
+                if not np.any(free_mask[item_idx]):
+                    continue
+                if model.is_polytomous:
+                    if item_idx not in category_counts:
+                        category_counts[item_idx] = context.expected_category_counts(
+                            item_idx,
+                            model.n_categories[item_idx],
+                            posterior_weights,
+                            person_weights,
+                        )
+                    counts = category_counts[item_idx]
+                    item_observed = counts.sum(axis=1)
+                    item_correct = None
+                else:
+                    counts = None
+                    item_observed = observed[item_idx]
+                    item_correct = correct[item_idx]
                 item_se = self._compute_item_se(
-                    model, item_idx, name, responses, posterior_weights
+                    model,
+                    item_idx,
+                    name,
+                    responses,
+                    posterior_weights,
+                    r_k=item_correct,
+                    n_k_valid=item_observed,
+                    r_kc=counts,
                 )
                 if values.ndim == 1:
                     se[item_idx] = item_se
@@ -821,6 +871,10 @@ class EMEstimator(BaseEstimator):
         param_name: str,
         responses: NDArray[np.int_],
         posterior_weights: NDArray[np.float64],
+        *,
+        r_k: NDArray[np.float64] | None = None,
+        n_k_valid: NDArray[np.float64] | None = None,
+        r_kc: NDArray[np.float64] | None = None,
     ) -> float | NDArray[np.float64]:
         quad_points = self._quadrature.nodes
         item_responses = responses[:, item_idx]
@@ -834,47 +888,48 @@ class EMEstimator(BaseEstimator):
             current = values[item_idx].copy()
             is_scalar = False
 
-        n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
+        if n_k_valid is None:
+            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
         eps = self.prob_epsilon
 
         if model.is_polytomous:
             n_categories = model._n_categories[item_idx]
             n_quad = len(n_k_valid)
-            r_kc = np.zeros((n_quad, n_categories))
-            for c in range(n_categories):
-                cat_mask = valid_mask & (item_responses == c)
-                r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
+            if r_kc is None:
+                r_kc = np.zeros((n_quad, n_categories))
+                for c in range(n_categories):
+                    cat_mask = valid_mask & (item_responses == c)
+                    r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
 
             def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
                 model.set_item_parameter(item_idx, param_name, param_val)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-
-                ll = float(np.sum(r_kc * np.log(probs)))
-
-                model.set_item_parameter(item_idx, param_name, current)
-                return ll
+                try:
+                    probs = model.probability(quad_points, item_idx)
+                    probs = np.clip(probs, eps, 1 - eps)
+                    return float(np.sum(r_kc * np.log(probs)))
+                finally:
+                    model.set_item_parameter(item_idx, param_name, current)
 
         else:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                axis=0,
-            )
+            if r_k is None:
+                r_k = np.sum(
+                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                    axis=0,
+                )
 
             def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
                 model.set_item_parameter(item_idx, param_name, param_val)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-
-                ll = float(
-                    np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
-                )
-
-                model.set_item_parameter(item_idx, param_name, current)
-                return ll
+                try:
+                    probs = model.probability(quad_points, item_idx)
+                    probs = np.clip(probs, eps, 1 - eps)
+                    return float(
+                        np.sum(
+                            r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs)
+                        )
+                    )
+                finally:
+                    model.set_item_parameter(item_idx, param_name, current)
 
         h = self.se_step_size
         ll_center = log_likelihood(current)
