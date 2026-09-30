@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Shared analytic item kernels with person-specific MCEM, QMCEM, and stochastic
+  sample fitting. Cached small observed sample blocks and streamed bounded
+  larger blocks without retaining full per-item sample copies. Preserved custom
+  models and item objectives on their numerical path. Added a `mcem-fit`
+  timing and traced-memory benchmark covering six model families.
 - Reused IRTree response preparation across E/M-steps and uncertainty, bounded
   node/row likelihood scratch space, and normalized owned likelihood buffers
   in place. Released previous posteriors before the next E-step and reused the

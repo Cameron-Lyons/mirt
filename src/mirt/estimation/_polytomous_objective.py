@@ -24,10 +24,13 @@ def _clipped_loss_and_counts(
     probabilities: NDArray[np.float64],
     counts: NDArray[np.float64],
     epsilon: float,
+    max_probability: float,
 ) -> tuple[float, NDArray[np.float64]]:
     """Keep only counts whose category curve has a nonzero clip derivative."""
-    active = (probabilities > epsilon) & (probabilities < 1.0 - epsilon)
-    loss = -float(np.sum(xlogy(counts, np.clip(probabilities, epsilon, 1.0 - epsilon))))
+    active = (probabilities > epsilon) & (probabilities < max_probability)
+    loss = -float(
+        np.sum(xlogy(counts, np.clip(probabilities, epsilon, max_probability)))
+    )
     return loss, np.where(active, counts, 0.0)
 
 
@@ -35,8 +38,11 @@ def _softmax_loss_and_residual(
     probabilities: NDArray[np.float64],
     counts: NDArray[np.float64],
     epsilon: float,
+    max_probability: float,
 ) -> tuple[float, NDArray[np.float64]]:
-    loss, effective = _clipped_loss_and_counts(probabilities, counts, epsilon)
+    loss, effective = _clipped_loss_and_counts(
+        probabilities, counts, epsilon, max_probability
+    )
     residual = probabilities * effective.sum(axis=1, keepdims=True) - effective
     return loss, residual
 
@@ -47,13 +53,17 @@ def prepare_polytomous_objective(
     theta: NDArray[np.float64],
     counts: NDArray[np.float64],
     epsilon: float,
+    *,
+    max_probability: float | None = None,
 ) -> _Objective | None:
     """Prepare a pure objective in the core estimator's free-parameter layout.
 
     Fixed PCM slopes, NRM reference categories, and padding do not enter the
     trial vector. Custom probability, parameter setters, or layouts retain
-    their model-based numerical objective.
+    their model-based numerical objective. ``max_probability`` preserves an
+    estimator's upper clipping convention; the default remains ``1-epsilon``.
     """
+    upper = 1.0 - epsilon if max_probability is None else max_probability
     layouts = {
         GradedResponseModel: ("discrimination", "thresholds"),
         GeneralizedPartialCredit: ("discrimination", "steps"),
@@ -87,7 +97,7 @@ def prepare_polytomous_objective(
             logits[:, 0] = 0.0
             logits[:, 1:] = theta @ slopes.T + params[n_slopes:]
             loss, residual = _softmax_loss_and_residual(
-                _stable_softmax(logits), counts, epsilon
+                _stable_softmax(logits), counts, epsilon, upper
             )
             gradient = np.empty_like(params)
             gradient[:n_slopes] = (residual[:, 1:].T @ theta).ravel()
@@ -119,7 +129,9 @@ def prepare_polytomous_objective(
             probabilities[:, 0] = 1.0 - cumulative[:, 0]
             probabilities[:, 1:-1] = cumulative[:, :-1] - cumulative[:, 1:]
             probabilities[:, -1] = cumulative[:, -1]
-            loss, effective = _clipped_loss_and_counts(probabilities, counts, epsilon)
+            loss, effective = _clipped_loss_and_counts(
+                probabilities, counts, epsilon, upper
+            )
             score = np.divide(
                 effective,
                 probabilities,
@@ -149,7 +161,7 @@ def prepare_polytomous_objective(
             points[:, None] - steps if unidimensional else (theta @ a)[:, None] - steps
         )
         loss, residual = _softmax_loss_and_residual(
-            _partial_credit_probabilities(scale * centered), counts, epsilon
+            _partial_credit_probabilities(scale * centered), counts, epsilon, upper
         )
         tails = np.cumsum(residual[:, :0:-1], axis=1)[:, ::-1]
         gradient = np.empty_like(params)
