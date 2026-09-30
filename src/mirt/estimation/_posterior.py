@@ -8,13 +8,14 @@ _MAX_NORMALIZATION_ELEMENTS = 1_000_000
 
 def normalize_log_posterior(
     log_joint: NDArray[np.float64],
-    log_prior_mass: NDArray[np.float64],
+    log_prior_mass: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Consume an owned likelihood buffer and return posterior weights/log marginals.
 
     Normalize shifted exponentials directly, so very large common log offsets
     cannot cancel the normalizing constant when constructing posterior weights.
     Row blocks bound reduction scratch space; the posterior reuses its input.
+    With no prior mass, normalize sample likelihood ratios directly.
     """
     log_marginal = np.empty(log_joint.shape[0], dtype=np.float64)
     block_size = max(1, _MAX_NORMALIZATION_ELEMENTS // log_joint.shape[1])
@@ -27,9 +28,12 @@ def normalize_log_posterior(
             # Center the likelihood before adding the prior, so small prior
             # differences survive a large common likelihood offset.
             block -= shift[:, None]
-            block += log_prior_mass[None, :]
-            joint_offset = np.max(block, axis=1)
-            block -= joint_offset[:, None]
+            if log_prior_mass is None:
+                joint_offset = np.zeros(stop - start)
+            else:
+                block += log_prior_mass[None, :]
+                joint_offset = np.max(block, axis=1)
+                block -= joint_offset[:, None]
             np.exp(block, out=block)
             total = block.sum(axis=1)
             block /= total[:, None]

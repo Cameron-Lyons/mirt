@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Aggregated QMCEM M-step counts on its shared ability grid, avoiding repeated
+  respondent/sample probability evaluation and sample-array copies during item
+  optimization. Reused analytic logistic, affine, and polytomous gradients and
+  shared bounded category-count accumulation while preserving custom curves,
+  missing responses, and loading constraints. Refreshed likelihoods directly on
+  the shared grid without expanding responses or samples. Added `qmcem-mstep`
+  and `qmcem-fit` timing and traced-memory benchmark suites.
 - Shared analytic item kernels with person-specific MCEM, QMCEM, and stochastic
   sample fitting. Cached small observed sample blocks and streamed bounded
   larger blocks without retaining full per-item sample copies. Preserved custom
@@ -182,6 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Preserved custom MCEM item callbacks when using a shared QMC grid. Normalized
+  importance weights after centering log likelihoods so large common offsets
+  retain unit posterior mass, with bounded scratch and protected borrowed inputs.
 - Preserved IRTree posterior normalization for large common log-likelihood
   offsets and protected borrowed custom likelihood buffers. Explicit node masks
   suppress stored decisions consistently in likelihoods and counts. IRTree

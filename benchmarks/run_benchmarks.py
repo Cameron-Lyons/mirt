@@ -64,6 +64,8 @@ SUITE_ORDER = (
     "variational-objective",
     "variational-mstep",
     "regularized",
+    "qmcem-mstep",
+    "qmcem-fit",
 )
 
 
@@ -789,6 +791,82 @@ def bench_variational_mstep(
             results.append(
                 BenchResult(
                     f"variational_mstep_{name}_{label}", times, _peak_traced_bytes(run)
+                )
+            )
+    return results
+
+
+def bench_qmcem_mstep(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure shared-grid item updates, including expected-count accumulation."""
+    return _bench_qmcem(n_persons, n_items, repeats, warmups, ("mstep",))
+
+
+def bench_qmcem_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure shared-grid likelihood refresh and complete two-iteration fits."""
+    return _bench_qmcem(n_persons, n_items, repeats, warmups, ("refresh", "fit"))
+
+
+def _bench_qmcem(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int,
+    stages: tuple[str, ...],
+) -> list[BenchResult]:
+    from mirt.estimation.mcem import QMCEMEstimator
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.multidimensional import MultidimensionalModel
+    from mirt.models.polytomous import GradedResponseModel
+
+    rng = np.random.default_rng(94)
+    models = (
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("2pl_3d", TwoParameterLogistic(n_items, n_factors=3)),
+        ("mirt_3d", MultidimensionalModel(n_items, n_factors=3)),
+        ("grm", GradedResponseModel(n_items, n_categories=4)),
+        (
+            "gpcm_2d",
+            mirt.GeneralizedPartialCredit(n_items, n_categories=4, n_factors=2),
+        ),
+        ("nrm_2d", mirt.NominalResponseModel(n_items, n_categories=4, n_factors=2)),
+    )
+    results = []
+    for label, template in models:
+        n_categories = 4 if template.is_polytomous else 2
+        responses = rng.integers(0, n_categories, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        estimator = QMCEMEstimator(n_samples=256, seed=94)
+        samples, weights = estimator._e_step_mc(
+            template,
+            responses,
+            np.zeros(template.n_factors),
+            np.eye(template.n_factors),
+            template.n_factors,
+        )
+        for values in (responses, samples, weights):
+            values.setflags(write=False)
+
+        for stage in stages:
+
+            def run() -> None:
+                if stage == "mstep":
+                    estimator._m_step_mc(template.copy(), responses, samples, weights)
+                elif stage == "refresh":
+                    estimator._sample_log_likelihoods(template, responses, samples)
+                else:
+                    QMCEMEstimator(n_samples=256, max_iter=2, seed=94).fit(
+                        template.copy(), responses
+                    )
+
+            results.append(
+                BenchResult(
+                    f"qmcem_{stage}_{label}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
                 )
             )
     return results
@@ -2107,6 +2185,10 @@ def run_suites(
         results.extend(bench_variational_mstep(n_persons, n_items, repeats, warmups))
     if "regularized" in suites:
         results.extend(bench_regularized(n_persons, n_items, repeats, warmups))
+    if "qmcem-mstep" in suites:
+        results.extend(bench_qmcem_mstep(n_persons, n_items, repeats, warmups))
+    if "qmcem-fit" in suites:
+        results.extend(bench_qmcem_fit(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -2296,6 +2378,7 @@ def _validate_baseline_compatibility(
                 "bl_",
                 "irtree_",
                 "mcem_",
+                "qmcem_",
             )
         )
     )
