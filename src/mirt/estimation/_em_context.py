@@ -11,7 +11,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 _MAX_COUNT_ENTRIES = 1_000_000
-_MAX_WEIGHTED_COUNT_ENTRIES = 131_072
+_MAX_DIRECT_COUNT_ENTRIES = 131_072
 
 
 class EMFitContext(AbstractContextManager["EMFitContext"]):
@@ -49,31 +49,37 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         self,
         posterior: NDArray[np.float64],
         person_weights: NDArray[np.float64] | None = None,
+        *,
+        cache_components: bool = True,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Accumulate all item counts with bounded floating-point scratch space."""
         n_persons, n_items = self.responses.shape
-        if person_weights is None and 2 * self.responses.size <= _MAX_COUNT_ENTRIES:
+        if (
+            person_weights is None
+            and cache_components
+            and 2 * self.responses.size <= _MAX_COUNT_ENTRIES
+        ):
             correct, observed = self.response_components(0, n_persons)
             return correct.T @ posterior, observed.T @ posterior
 
         correct_counts = np.zeros((n_items, posterior.shape[1]))
         observed_counts = np.zeros_like(correct_counts)
         max_entries = _MAX_COUNT_ENTRIES
-        if person_weights is not None:
-            max_entries = min(max_entries, _MAX_WEIGHTED_COUNT_ENTRIES)
+        if person_weights is not None or not cache_components:
+            max_entries = min(max_entries, _MAX_DIRECT_COUNT_ENTRIES)
         chunk_size = max(1, max_entries // (2 * n_items))
         for start in range(0, n_persons, chunk_size):
             stop = min(start + chunk_size, n_persons)
-            if person_weights is None:
+            if person_weights is None and cache_components:
                 correct, observed = self.response_components(start, stop)
             else:
-                # Weight the narrow response blocks rather than copying the
-                # person-by-quadrature posterior, which grows exponentially
-                # with the number of factors. Own these small blocks so cached
-                # components and caller-owned weights stay unchanged.
+                # Reduce through narrow, owned response blocks instead of
+                # copying the person-by-quadrature posterior. Cached components
+                # and caller-owned weights stay unchanged.
                 data = self.responses[start:stop]
                 observed = (data >= 0).astype(np.float64)
-                observed *= person_weights[start:stop, None]
+                if person_weights is not None:
+                    observed *= person_weights[start:stop, None]
                 correct = data * observed
             weights = posterior[start:stop]
             correct_counts += correct.T @ weights

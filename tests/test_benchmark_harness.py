@@ -349,6 +349,7 @@ class TestBenchmarkCommand:
             "weighted-em",
             "weighted-mstep",
             "polytomous-fit",
+            "item-curvature",
             "variational",
             "gvem-uncertainty",
             "variational-objective",
@@ -388,6 +389,7 @@ class TestBenchmarkCommand:
             "weighted-em",
             "weighted-mstep",
             "polytomous-fit",
+            "item-curvature",
             "variational",
             "gvem-uncertainty",
             "variational-objective",
@@ -451,6 +453,30 @@ class TestBenchmarkCommand:
                 "nrm_2d",
             )
             for kind in ("mstep", "fit", "weighted_fit")
+        ]
+        for result in results:
+            assert len(result.times) == 1
+            assert result.peak_traced_bytes > 0
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=8, items=2),
+                    _report(result, persons=9, items=2),
+                    max_regression_percent=5.0,
+                )
+
+    def test_item_curvature_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ["item-curvature"], n_persons=8, n_items=2, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            f"item_curvature_{model}_{method}_{jobs}workers"
+            for model in ("2pl_1d", "2pl_3d", "gpcm_1d", "grm_2d", "nrm_2d")
+            for method, jobs in (
+                ("central", 1),
+                ("forward", 1),
+                ("richardson", 1),
+                ("central", 2),
+            )
         ]
         for result in results:
             assert len(result.times) == 1

@@ -52,7 +52,19 @@ def item_standard_errors(
             GeneralizedPartialCredit,
             PartialCreditModel,
         )
-        or "probability" in vars(model)
+        or any(
+            name in vars(model)
+            for name in (
+                "probability",
+                "_category_probabilities",
+                "_evaluate_logistic",
+                "_ensure_theta_2d",
+                "set_parameters",
+                "set_item_parameter",
+                "_canonical_parameter_values",
+                "free_parameter_masks",
+            )
+        )
     ):
         return None
     params = model.parameters

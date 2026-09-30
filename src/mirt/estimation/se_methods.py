@@ -26,6 +26,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._em_context import EMFitContext
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -88,12 +89,18 @@ def _diagonal_item_standard_errors(
     h: float,
     *,
     scheme: Literal["central", "forward"],
+    free_mask: NDArray[np.bool_] | np.bool_ | bool | None = None,
 ) -> float | NDArray[np.float64]:
     """Perturb each item coordinate independently, preserving its array shape."""
+    mask = None if free_mask is None else np.asarray(free_mask, dtype=np.bool_)
+    if mask is not None and not np.any(mask):
+        return np.zeros_like(current) if isinstance(current, np.ndarray) else 0.0
     center = log_likelihood(current)
     if isinstance(current, np.ndarray):
-        standard_errors = np.empty_like(current)
+        standard_errors = np.zeros_like(current)
         for index in np.ndindex(current.shape):
+            if mask is not None and not mask[index]:
+                continue
 
             def at_offset(offset: float) -> float:
                 candidate = current.copy()
@@ -251,60 +258,91 @@ def _se_itemwise_numerical(
     n_jobs: int,
     *,
     scheme: Literal["central", "forward"],
+    richardson: bool = False,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute diagonal item-wise curvature without sharing mutable models."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor
+    from copy import deepcopy
 
-    se_dict = {}
+    from mirt.scoring._common import resolve_n_jobs
+
+    params = model.parameters
     free_masks = model.free_parameter_masks
+    result = {name: np.zeros_like(values) for name, values in params.items()}
+    workers = resolve_n_jobs(n_jobs)
+    names_by_item = {
+        item: tuple(name for name, mask in free_masks.items() if np.any(mask[item]))
+        for item in range(model.n_items)
+    }
+    items = [item for item, names in names_by_item.items() if names]
+    if not items:
+        return result
 
-    if n_jobs == -1:
-        n_jobs = os.cpu_count() or 1
-
-    for param_name, values in model.parameters.items():
-        free_mask = free_masks[param_name]
-        if not np.any(free_mask):
-            se_dict[param_name] = np.zeros_like(values)
-            continue
-
-        se = np.zeros_like(values)
-
-        def item_standard_error(
-            item_model: BaseItemModel,
-            item_idx: int,
-        ) -> float | NDArray[np.float64]:
-            return _compute_item_se_curvature(
-                item_model,
-                item_idx,
-                param_name,
-                responses,
-                quadrature,
-                posterior_weights,
-                h,
-                scheme=scheme,
+    with EMFitContext(responses) as context:
+        correct = observed = None
+        category_counts: dict[int, NDArray[np.float64]] = {}
+        if model.is_polytomous:
+            for item in items:
+                category_counts[item] = context.expected_category_counts(
+                    item, model.n_categories[item], posterior_weights
+                )
+        else:
+            correct, observed = context.expected_counts(
+                posterior_weights, cache_components=False
             )
 
-        if n_jobs == 1:
-            for item_idx in range(model.n_items):
-                se[item_idx] = item_standard_error(model, item_idx)
+        def compute_item(
+            item: int,
+        ) -> tuple[int, dict[str, float | NDArray[np.float64]]]:
+            # Preserve constructor state and bound instance methods as well as
+            # parameters. One isolated model serves all of this item's fields.
+            local = model if workers == 1 else deepcopy(model)
+            counts = category_counts.get(item)
+            item_correct = None if correct is None else correct[item]
+            item_observed = None if observed is None else observed[item]
+            item_result = {}
+            for name in names_by_item[item]:
+                first = _compute_item_se_curvature(
+                    local,
+                    item,
+                    name,
+                    responses,
+                    quadrature,
+                    posterior_weights,
+                    h,
+                    scheme=scheme,
+                    r_k=item_correct,
+                    n_k_valid=item_observed,
+                    r_kc=counts,
+                )
+                if richardson:
+                    second = _compute_item_se_curvature(
+                        local,
+                        item,
+                        name,
+                        responses,
+                        quadrature,
+                        posterior_weights,
+                        h / 2,
+                        scheme=scheme,
+                        r_k=item_correct,
+                        n_k_valid=item_observed,
+                        r_kc=counts,
+                    )
+                    first = (4 * second - first) / 3
+                item_result[name] = first
+            return item, item_result
+
+        if workers == 1 or len(items) == 1:
+            results = map(compute_item, items)
         else:
+            results = context.executor(min(workers, len(items))).map(
+                compute_item, items
+            )
+        for item, values in results:
+            for name, value in values.items():
+                result[name][item] = value
 
-            def compute_item(
-                item_idx: int,
-            ) -> tuple[int, float | NDArray[np.float64]]:
-                return item_idx, item_standard_error(model.copy(), item_idx)
-
-            with ThreadPoolExecutor(max_workers=min(n_jobs, model.n_items)) as executor:
-                results = list(executor.map(compute_item, range(model.n_items)))
-
-            for item_idx, item_se in results:
-                se[item_idx] = item_se
-
-        se[~free_mask] = 0.0
-        se_dict[param_name] = se
-
-    return se_dict
+    return result
 
 
 def _compute_item_se_curvature(
@@ -317,11 +355,13 @@ def _compute_item_se_curvature(
     h: float,
     *,
     scheme: Literal["central", "forward"],
+    r_k: NDArray[np.float64] | None = None,
+    n_k_valid: NDArray[np.float64] | None = None,
+    r_kc: NDArray[np.float64] | None = None,
+    epsilon: float = PROB_EPSILON,
 ) -> float | NDArray[np.float64]:
     """Compute a single item's diagonal finite-difference curvature."""
     quad_points = quadrature.nodes
-    item_responses = responses[:, item_idx]
-    valid_mask = item_responses >= 0
 
     values = model.parameters[param_name]
     if values.ndim == 1:
@@ -329,42 +369,48 @@ def _compute_item_se_curvature(
     else:
         current = values[item_idx].copy()
 
-    n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
-
     if model.is_polytomous:
-        n_categories = model._n_categories[item_idx]
-        n_quad = quad_points.shape[0]
-        r_kc = np.zeros((n_quad, n_categories))
-        for c in range(n_categories):
-            cat_mask = valid_mask & (item_responses == c)
-            r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
+        if r_kc is None:
+            r_kc = EMFitContext(responses).expected_category_counts(
+                item_idx, model.n_categories[item_idx], posterior_weights
+            )
 
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
             try:
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
+                probs = np.clip(probs, epsilon, 1 - epsilon)
                 return float(np.sum(r_kc * np.log(probs)))
             finally:
                 model.set_item_parameter(item_idx, param_name, current)
     else:
-        r_k = np.sum(
-            item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-            axis=0,
-        )
+        if r_k is None or n_k_valid is None:
+            correct, observed = EMFitContext(
+                responses[:, item_idx : item_idx + 1]
+            ).expected_counts(posterior_weights, cache_components=False)
+            if r_k is None:
+                r_k = correct[0]
+            if n_k_valid is None:
+                n_k_valid = observed[0]
 
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
             try:
                 probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
+                probs = np.clip(probs, epsilon, 1 - epsilon)
                 return float(
                     np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
                 )
             finally:
                 model.set_item_parameter(item_idx, param_name, current)
 
-    return _diagonal_item_standard_errors(log_likelihood, current, h, scheme=scheme)
+    return _diagonal_item_standard_errors(
+        log_likelihood,
+        current,
+        h,
+        scheme=scheme,
+        free_mask=model.free_parameter_masks[param_name][item_idx],
+    )
 
 
 def _se_numerical_forward(
@@ -399,18 +445,16 @@ def _se_richardson(
 
     Uses two step sizes and extrapolates for higher accuracy.
     """
-    se1 = _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h, n_jobs
+    return _se_itemwise_numerical(
+        model,
+        responses,
+        quadrature,
+        posterior_weights,
+        h,
+        n_jobs,
+        scheme="central",
+        richardson=True,
     )
-    se2 = _se_numerical_central(
-        model, responses, quadrature, posterior_weights, h / 2, n_jobs
-    )
-
-    se_dict = {}
-    for name in se1:
-        se_dict[name] = (4 * se2[name] - se1[name]) / 3
-
-    return se_dict
 
 
 def _se_louis(

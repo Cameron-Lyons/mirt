@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Shared numerical item curvature across EM and standalone standard errors.
+  Prepared bounded posterior counts once per uncertainty call, reused them
+  across Richardson step sizes, and used one worker pool for all item fields.
+  Fixed and padded coordinates avoid unnecessary probability trials. Added an
+  `item-curvature` timing and traced-memory benchmark suite.
 - Prepared analytic GRM, GPCM, PCM, and NRM item objectives for Python EM and
   survey-weighted EM, including multidimensional models. Category counts use
   bounded accumulation, and trial evaluation leaves model parameters intact.
@@ -160,6 +165,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Preserved custom model constructor state and bound instance probability
+  methods in parallel numerical uncertainty. Core EM uncertainty falls back
+  to numerical curvature for custom curve and parameter overrides.
 - Enabled item updates and access for category-by-factor parameter arrays,
   fixing multidimensional NRM fitting. Shared coordinate-wise numerical
   curvature now preserves tensor shapes in EM and standalone standard errors,

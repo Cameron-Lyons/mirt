@@ -24,7 +24,7 @@ from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.estimation.se_methods import _diagonal_item_standard_errors
+from mirt.estimation.se_methods import _compute_item_se_curvature
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -881,61 +881,19 @@ class EMEstimator(BaseEstimator):
         n_k_valid: NDArray[np.float64] | None = None,
         r_kc: NDArray[np.float64] | None = None,
     ) -> float | NDArray[np.float64]:
-        quad_points = self._quadrature.nodes
-        item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
-
-        values = model.parameters[param_name]
-        if values.ndim == 1:
-            current = float(values[item_idx])
-        else:
-            current = values[item_idx].copy()
-
-        if n_k_valid is None:
-            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
-
-        eps = self.prob_epsilon
-
-        if model.is_polytomous:
-            n_categories = model._n_categories[item_idx]
-            n_quad = len(n_k_valid)
-            if r_kc is None:
-                r_kc = np.zeros((n_quad, n_categories))
-                for c in range(n_categories):
-                    cat_mask = valid_mask & (item_responses == c)
-                    r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
-
-            def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
-                model.set_item_parameter(item_idx, param_name, param_val)
-                try:
-                    probs = model.probability(quad_points, item_idx)
-                    probs = np.clip(probs, eps, 1 - eps)
-                    return float(np.sum(r_kc * np.log(probs)))
-                finally:
-                    model.set_item_parameter(item_idx, param_name, current)
-
-        else:
-            if r_k is None:
-                r_k = np.sum(
-                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                    axis=0,
-                )
-
-            def log_likelihood(param_val: float | NDArray[np.float64]) -> float:
-                model.set_item_parameter(item_idx, param_name, param_val)
-                try:
-                    probs = model.probability(quad_points, item_idx)
-                    probs = np.clip(probs, eps, 1 - eps)
-                    return float(
-                        np.sum(
-                            r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs)
-                        )
-                    )
-                finally:
-                    model.set_item_parameter(item_idx, param_name, current)
-
-        return _diagonal_item_standard_errors(
-            log_likelihood, current, self.se_step_size, scheme="central"
+        return _compute_item_se_curvature(
+            model,
+            item_idx,
+            param_name,
+            responses,
+            self._quadrature,
+            posterior_weights,
+            self.se_step_size,
+            scheme="central",
+            r_k=r_k,
+            n_k_valid=n_k_valid,
+            r_kc=r_kc,
+            epsilon=self.prob_epsilon,
         )
 
     @staticmethod
