@@ -21,11 +21,11 @@ from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.backends.rust.estimation import em_iteration_3pl
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._em_context import EMFitContext
+from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import _valid_second_derivative
 from mirt.exceptions import MirtValidationError
-from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.estimation.latent_density import LatentDensity
@@ -408,11 +408,7 @@ class EMEstimator(BaseEstimator):
             and log_likelihoods.flags.writeable
         ):
             log_likelihoods = log_likelihoods.copy()
-        log_likelihoods += log_prior_mass[None, :]
-        log_marginal = logsumexp(log_likelihoods, axis=1)
-        log_likelihoods -= log_marginal[:, None]
-        np.exp(log_likelihoods, out=log_likelihoods)
-        return log_likelihoods, log_marginal
+        return normalize_log_posterior(log_likelihoods, log_prior_mass)
 
     def _compute_log_likelihoods(
         self,

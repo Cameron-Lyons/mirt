@@ -351,6 +351,7 @@ class TestBenchmarkCommand:
             "gvem-uncertainty",
             "variational-objective",
             "variational-mstep",
+            "regularized",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -387,6 +388,7 @@ class TestBenchmarkCommand:
             "gvem-uncertainty",
             "variational-objective",
             "variational-mstep",
+            "regularized",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -478,6 +480,25 @@ class TestBenchmarkCommand:
             for name in ("gvem", "sparse")
         ]
         assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12),
+                _report(*results, persons=13),
+                max_regression_percent=20,
+            )
+
+    def test_regularized_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ("regularized",), n_persons=12, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            f"regularized_{kind}_{factors}d_{missing}"
+            for factors in (2, 3)
+            for missing in ("complete", "missing")
+            for kind in ("e_step", "fit")
+        ]
+        assert all(len(result.times) == 1 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)
         with pytest.raises(ValueError, match="person count"):
             benchmark.compare_results(

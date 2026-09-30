@@ -50,12 +50,7 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         """Accumulate all item counts with bounded floating-point scratch space."""
         n_persons, n_items = self.responses.shape
         if 2 * self.responses.size <= _MAX_COUNT_ENTRIES:
-            if self._components is None:
-                self._components = (
-                    np.where(self.observed, self.responses, 0).astype(np.float64),
-                    self.observed.astype(np.float64),
-                )
-            correct, observed = self._components
+            correct, observed = self.response_components(0, n_persons)
             return correct.T @ posterior, observed.T @ posterior
 
         correct_counts = np.zeros((n_items, posterior.shape[1]))
@@ -63,14 +58,32 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         chunk_size = max(1, _MAX_COUNT_ENTRIES // (2 * n_items))
         for start in range(0, n_persons, chunk_size):
             stop = min(start + chunk_size, n_persons)
-            observed = self.observed[start:stop]
-            correct = np.where(observed, self.responses[start:stop], 0).astype(
-                np.float64
-            )
+            correct, observed = self.response_components(start, stop)
             weights = posterior[start:stop]
             correct_counts += correct.T @ weights
-            observed_counts += observed.astype(np.float64).T @ weights
+            observed_counts += observed.T @ weights
         return correct_counts, observed_counts
+
+    def response_components(
+        self, start: int, stop: int
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return prepared response values and observed indicators for a row block.
+
+        Small matrices are cached for repeated E/M-steps. Large matrices prepare
+        only the requested rows, including their missing-response mask.
+        """
+        if 2 * self.responses.size <= _MAX_COUNT_ENTRIES:
+            if self._components is None:
+                self._components = (
+                    np.where(self.observed, self.responses, 0).astype(np.float64),
+                    self.observed.astype(np.float64),
+                )
+            return self._components[0][start:stop], self._components[1][start:stop]
+        data = self.responses[start:stop]
+        observed = data >= 0
+        return np.where(observed, data, 0).astype(np.float64), observed.astype(
+            np.float64
+        )
 
     def executor(self, n_jobs: int) -> ThreadPoolExecutor:
         if self._executor is None:

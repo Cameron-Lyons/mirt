@@ -185,7 +185,7 @@ def test_regularized_mirt_refreshes_final_fit_statistics(monkeypatch):
     responses = np.array([[0], [0], [1], [1]], dtype=np.int_)
     estimator = RegularizedMIRTEstimator(n_factors=2, n_quadpts=3, max_iter=1, tol=1e9)
 
-    def force_m_step(_responses, _posterior, loadings, intercepts, _valid_masks):
+    def force_m_step(_responses, _posterior, loadings, intercepts):
         return loadings.copy(), intercepts + 2.0
 
     monkeypatch.setattr(estimator, "_m_step_penalized", force_m_step)
@@ -193,10 +193,10 @@ def test_regularized_mirt_refreshes_final_fit_statistics(monkeypatch):
 
     result = estimator.fit(responses)
     density = GaussianDensity(n_dimensions=2)
-    _posterior, marginal = estimator._e_step(
+    _posterior, log_marginal = estimator._e_step(
         responses, result.loadings, result.intercepts, density
     )
-    expected_ll = float(np.sum(np.log(marginal + 1e-300)))
+    expected_ll = float(log_marginal.sum())
     expected_penalized = expected_ll - estimator._compute_penalty(result.loadings)
 
     assert result.log_likelihood == pytest.approx(expected_ll)

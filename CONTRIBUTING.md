@@ -108,6 +108,21 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+The `regularized` suite measures E-steps and four-iteration fits with three
+coordinate-descent sweeps per M-step. It covers two factors with 15 quadrature
+points per factor and three factors with nine points, on complete responses
+and responses with 10% missing values:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite regularized --persons 5000 --items 50 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-regularized.json
+```
+
+Use `--backend rust` to exercise native coordinate descent. E-step timing
+excludes input creation, while complete fits include validation, preparation,
+and latent-density updates. Traced allocations include outputs and cached
+response components. Posterior normalization reuses its likelihood buffer;
+only the returned person-by-quadrature array grows with both dimensions.
+
 To compare response-pattern grouping on repeated and mostly distinct rows:
 
 ```bash
