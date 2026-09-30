@@ -31,6 +31,7 @@ from scipy.special import xlog1py, xlogy
 from scipy.stats import qmc
 
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._gaussian_kernel import gaussian_log_kernel
 from mirt.estimation._mc_likelihood import sampled_log_likelihoods
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
@@ -106,7 +107,12 @@ def _validated_prior(
         raise ValueError("prior_cov must contain only finite values")
     if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-12):
         raise ValueError("prior_cov must be symmetric")
-    covariance = (covariance + covariance.T) * 0.5
+    with np.errstate(over="ignore"):
+        symmetric = (covariance + covariance.T) * 0.5
+    overflow = ~np.isfinite(symmetric)
+    if np.any(overflow):
+        symmetric[overflow] = 0.5 * covariance[overflow] + 0.5 * covariance.T[overflow]
+    covariance = symmetric
     try:
         cholesky = np.linalg.cholesky(covariance)
     except np.linalg.LinAlgError as exc:
@@ -350,11 +356,7 @@ class MCEMEstimator(BaseEstimator):
         cholesky: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Evaluate a Gaussian prior up to its shared normalizing constant."""
-        centered = theta_samples - prior_mean
-        original_shape = centered.shape[:-1]
-        flattened = centered.reshape(-1, centered.shape[-1])
-        standardized = np.linalg.solve(cholesky, flattened.T).T
-        return (-0.5 * np.sum(standardized**2, axis=1)).reshape(original_shape)
+        return gaussian_log_kernel(theta_samples, prior_mean, cholesky)
 
     def _draw_posterior_samples(
         self,
@@ -368,27 +370,60 @@ class MCEMEstimator(BaseEstimator):
         n_persons = responses.shape[0]
         rng = self._random_generator()
         standard_normal = rng.standard_normal((n_persons, self.n_samples, n_factors))
-        current = prior_mean + np.einsum("ij,...j->...i", cholesky, standard_normal)
-        current_ll = self._sample_log_likelihoods(model, responses, current)
-        current_lp = self._gaussian_log_kernel(current, prior_mean, cholesky)
+        current = np.einsum("ij,...j->...i", cholesky, standard_normal)
+        current += prior_mean
+        del standard_normal
+        expected_shape = (n_persons, self.n_samples)
+        # Custom callbacks may return cached views or read-only buffers, or
+        # share scratch between likelihood and prior evaluation.
+        current_ll = np.array(
+            self._validated_log_likelihoods(
+                self._sample_log_likelihoods(model, responses, current), expected_shape
+            ),
+            copy=True,
+        )
+        current_lp = np.array(
+            self._gaussian_log_kernel(current, prior_mean, cholesky),
+            dtype=np.float64,
+            copy=True,
+        )
+        if current_lp.shape != expected_shape:
+            raise ValueError(f"Gaussian log kernel must have shape {expected_shape}")
 
         proposal_scale = 0.5
+        proposal_ll = np.empty(expected_shape)
         for _ in range(20):
             standard_proposal = rng.standard_normal(current.shape)
-            proposal = current + proposal_scale * np.einsum(
-                "ij,...j->...i", cholesky, standard_proposal
+            proposal = np.einsum("ij,...j->...i", cholesky, standard_proposal)
+            del standard_proposal
+            proposal *= proposal_scale
+            proposal += current
+            np.copyto(
+                proposal_ll,
+                self._validated_log_likelihoods(
+                    self._sample_log_likelihoods(model, responses, proposal),
+                    expected_shape,
+                ),
             )
-            proposal_ll = self._sample_log_likelihoods(model, responses, proposal)
-            proposal_lp = self._gaussian_log_kernel(proposal, prior_mean, cholesky)
-            log_acceptance = (proposal_ll + proposal_lp) - (current_ll + current_lp)
+            proposal_lp = np.asarray(
+                self._gaussian_log_kernel(proposal, prior_mean, cholesky),
+                dtype=np.float64,
+            )
+            if proposal_lp.shape != expected_shape:
+                raise ValueError(
+                    f"Gaussian log kernel must have shape {expected_shape}"
+                )
+            log_acceptance = proposal_ll - current_ll
+            log_acceptance += proposal_lp - current_lp
             uniforms = np.maximum(
                 rng.random((n_persons, self.n_samples)),
                 np.nextafter(0.0, 1.0),
             )
             accepted = np.log(uniforms) < log_acceptance
-            current[accepted] = proposal[accepted]
-            current_ll[accepted] = proposal_ll[accepted]
-            current_lp[accepted] = proposal_lp[accepted]
+            np.copyto(current, proposal, where=accepted[:, :, None])
+            np.copyto(current_ll, proposal_ll, where=accepted)
+            np.copyto(current_lp, proposal_lp, where=accepted)
+            del proposal, proposal_lp, log_acceptance, uniforms, accepted
 
         weights = np.full(
             (n_persons, self.n_samples),

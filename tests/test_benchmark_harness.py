@@ -572,9 +572,9 @@ class TestBenchmarkCommand:
         )
         assert [result.name for result in results] == [
             f"mcem_{model}_{method}_{stage}"
-            for model in ("2pl_3d", "grm_2d")
+            for model in ("2pl_3d", "grm_2d", "2pl_3d_correlated", "mirt_6d_correlated")
             for method in ("posterior", "stochastic")
-            for stage in ("e_step", "fit")
+            for stage in ("prior", "e_step", "fit")
         ]
         assert all(len(result.times) == 1 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)

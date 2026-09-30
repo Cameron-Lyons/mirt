@@ -455,18 +455,30 @@ allocations and exclude native workspace. This suite measures importance
 sampling MCEM.
 
 The `mcem-sampling` suite covers posterior MCEM with 64 draws per person and
-stochastic EM with five chains, using three-factor 2PL and two-factor GRM with
-10% missing responses:
+stochastic EM with five chains, using three-factor 2PL, two-factor GRM, and
+three-factor 2PL/six-factor MIRT with correlated priors and nonzero means.
+Responses have 10% missing values:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite mcem-sampling --persons 600 --items 6 --repeats 5 --warmups 1 --backend numpy --json /tmp/mirt-mcem-sampling.json
 ```
 
+Prior-kernel timing excludes input generation. Gaussian kernels stream owned
+point blocks, using diagonal scaling or triangular solves, and rescale only
+overflowing reductions to preserve representable tail kernels and tiny terms.
 E-step timing includes the initial prior draw and 20 Metropolis transitions;
 complete fits include two iterations, model copying, and all sampling and item
 updates. Each repetition resets the random generator to the same seed. Input
-generation is excluded. Draws, proposals, Gaussian-prior work, and likelihood
-outputs still grow with persons, samples, and factors.
+generation is excluded. Proposal construction reuses its owned transform
+buffer; temporary normals are released before likelihood/prior evaluation.
+Accepted cells copy directly into chain state. Initial likelihood and prior
+outputs are copied to protect borrowed custom callback buffers. Proposed
+likelihoods are saved in reusable storage before calling the prior, allowing
+callbacks to share scratch. Acceptance combines likelihood and prior differences
+separately, preserving prior ratios under large common likelihood offsets.
+Draws, proposals, and likelihood outputs
+still grow with persons, samples, and factors; Gaussian reduction scratch is
+bounded independently of draw count.
 
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the

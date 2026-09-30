@@ -659,13 +659,15 @@ def bench_mcem_fit(
 def bench_mcem_sampling(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Measure posterior MCEM/SEM E-steps and complete two-iteration fits."""
+    """Measure Gaussian prior kernels, posterior E-steps, and complete fits."""
     from mirt.estimation.mcem import MCEMEstimator, StochasticEMEstimator
 
     rng = np.random.default_rng(95)
     models = (
         ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
         ("grm_2d", mirt.GradedResponseModel(n_items, n_categories=4, n_factors=2)),
+        ("2pl_3d_correlated", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("mirt_6d_correlated", mirt.MultidimensionalModel(n_items, n_factors=6)),
     )
     results = []
     for label, template in models:
@@ -674,8 +676,24 @@ def bench_mcem_sampling(
         responses[rng.random(responses.shape) < 0.1] = -1
         responses.setflags(write=False)
         prior = np.zeros(template.n_factors)
-        cholesky = np.eye(template.n_factors)
+        covariance = np.eye(template.n_factors)
+        if label.endswith("correlated"):
+            prior = np.linspace(-0.3, 0.5, template.n_factors)
+            covariance = np.full(covariance.shape, 0.35)
+            np.fill_diagonal(covariance, np.linspace(0.75, 1.5, template.n_factors))
+        cholesky = np.linalg.cholesky(covariance)
+        for values in (prior, covariance, cholesky):
+            values.setflags(write=False)
         for method in ("posterior", "stochastic"):
+            n_samples = 64 if method == "posterior" else 5
+            kernel_samples = (
+                prior
+                + np.random.default_rng(96).normal(
+                    size=(n_persons, n_samples, template.n_factors)
+                )
+                @ cholesky.T
+            )
+            kernel_samples.setflags(write=False)
 
             def estimator():
                 if method == "posterior":
@@ -691,10 +709,21 @@ def bench_mcem_sampling(
                     template, responses, prior, cholesky, template.n_factors
                 )
 
-            def fit():
-                return estimator().fit(template.copy(), responses)
+            def prior_kernel():
+                return MCEMEstimator._gaussian_log_kernel(
+                    kernel_samples, prior, cholesky
+                )
 
-            for stage, run in (("e_step", e_step), ("fit", fit)):
+            def fit():
+                return estimator().fit(
+                    template.copy(), responses, prior_mean=prior, prior_cov=covariance
+                )
+
+            for stage, run in (
+                ("prior", prior_kernel),
+                ("e_step", e_step),
+                ("fit", fit),
+            ):
                 results.append(
                     BenchResult(
                         f"mcem_{label}_{method}_{stage}",
