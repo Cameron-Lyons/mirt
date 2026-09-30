@@ -31,6 +31,7 @@ from scipy.special import xlog1py, xlogy
 from scipy.stats import qmc
 
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._mc_likelihood import sampled_log_likelihoods
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.utils.numeric import logsumexp
@@ -151,6 +152,9 @@ class MCEMEstimator(BaseEstimator):
     gradients. Small item sample blocks are prepared once; larger draws
     stream bounded blocks without copying every observed person's samples.
     Custom models and item objectives retain numerical optimization.
+    Ordinary sampled likelihoods reduce bounded public probability blocks
+    against unexpanded responses. Custom likelihood and validation overrides
+    retain their model-based evaluation path.
     """
 
     _minimum_samples = 50
@@ -296,9 +300,13 @@ class MCEMEstimator(BaseEstimator):
         """Evaluate person-specific samples in memory-bounded batches."""
         n_persons = responses.shape[0]
         expected_shape = (n_persons, self.n_samples, model.n_factors)
-        samples = np.asarray(theta_samples, dtype=np.float64)
+        samples = np.asarray(theta_samples)
         if samples.shape != expected_shape:
             raise ValueError(f"theta_samples must have shape {expected_shape}")
+        prepared = sampled_log_likelihoods(model, responses, samples)
+        if prepared is not None:
+            return prepared
+        samples = np.asarray(samples, dtype=np.float64)
         if not np.all(np.isfinite(samples)):
             raise ValueError("theta_samples must contain only finite values")
 

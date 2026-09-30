@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Bounded person-specific Monte Carlo likelihood evaluation without repeating
+  response matrices. Reduced binary item curves against response blocks and
+  gathered ordinal categories from bounded item curves, preserving public
+  probability callbacks and custom likelihood/validation overrides. Converted
+  sample inputs only within bounded blocks. Extended `mcem-fit` with likelihood
+  refreshes and added an `mcem-sampling` benchmark for posterior MCEM and
+  stochastic EM.
 - Aggregated QMCEM M-step counts on its shared ability grid, avoiding repeated
   respondent/sample probability evaluation and sample-array copies during item
   optimization. Reused analytic logistic, affine, and polytomous gradients and
