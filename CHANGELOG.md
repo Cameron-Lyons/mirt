@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Accumulated survey-weighted binary and category counts in bounded blocks,
+  eliminating dense weighted posterior copies from optimization and standard
+  errors. Weighted EM now shares core item objectives and analytic gradients;
+  fixed items and items with no weighted observations retain their parameters.
+  Failed numerical trials restore parameter state. Added a `weighted-mstep`
+  timing and traced-memory benchmark suite.
 - Reused response preparation across regularized E/M-steps, bounded response
   and probability scratch space, and removed unused item masks. Shared in-place
   posterior normalization across ordinary, survey-weighted, and regularized EM.

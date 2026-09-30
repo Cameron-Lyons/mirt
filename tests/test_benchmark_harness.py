@@ -347,6 +347,7 @@ class TestBenchmarkCommand:
             "multidimensional-fit",
             "logistic-fit",
             "weighted-em",
+            "weighted-mstep",
             "variational",
             "gvem-uncertainty",
             "variational-objective",
@@ -384,6 +385,7 @@ class TestBenchmarkCommand:
             "multidimensional-fit",
             "logistic-fit",
             "weighted-em",
+            "weighted-mstep",
             "variational",
             "gvem-uncertainty",
             "variational-objective",
@@ -402,6 +404,25 @@ class TestBenchmarkCommand:
             "weighted_fit_2pl",
             "weighted_fit_grm",
         }
+        for result in results:
+            assert len(result.times) == 1
+            assert result.peak_traced_bytes > 0
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=8, items=2),
+                    _report(result, persons=9, items=2),
+                    max_regression_percent=5.0,
+                )
+
+    def test_weighted_mstep_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ["weighted-mstep"], n_persons=8, n_items=2, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            f"weighted_{kind}_{model}"
+            for model in ("2pl", "2pl_3d", "grm", "nrm")
+            for kind in ("mstep", "standard_errors")
+        ]
         for result in results:
             assert len(result.times) == 1
             assert result.peak_traced_bytes > 0

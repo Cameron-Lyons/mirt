@@ -17,10 +17,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import minimize
 
 from mirt._prior_mass import gaussian_log_quadrature_mass
-from mirt.constants import PROB_EPSILON
+from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._patterns import supports_pattern_compression
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.em import EMEstimator
@@ -142,9 +141,27 @@ class WeightedEMEstimator(EMEstimator):
         FitResult
             Fitted model with estimates and diagnostics
         """
+        responses = self._validate_responses(responses, model.n_items)
+        previous_context = self._fit_context
+        with EMFitContext(responses) as context:
+            self._fit_context = context
+            try:
+                return self._fit_weighted_prepared(
+                    model, responses, weights, prior_mean, prior_cov
+                )
+            finally:
+                self._fit_context = previous_context
+
+    def _fit_weighted_prepared(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        weights: NDArray[np.float64] | None,
+        prior_mean: NDArray[np.float64] | None,
+        prior_cov: NDArray[np.float64] | None,
+    ) -> FitResult:
         from mirt.results.fit_result import FitResult
 
-        responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
 
         if weights is None:
@@ -193,6 +210,7 @@ class WeightedEMEstimator(EMEstimator):
             prev_ll = current_ll
 
             self._m_step_weighted(model, responses, posterior_weights, weights)
+            del posterior_weights
 
         if not converged:
             posterior_weights, log_marginal = self._e_step_weighted(
@@ -265,79 +283,48 @@ class WeightedEMEstimator(EMEstimator):
         posterior_weights: NDArray[np.float64],
         survey_weights: NDArray[np.float64],
     ) -> None:
-        """M-step with survey weights incorporated."""
+        """Optimize items from bounded survey-weighted expected counts."""
         quad_points = self._quadrature.nodes
-        n_items = model.n_items
-
-        weighted_posterior = posterior_weights * survey_weights[:, None]
-        n_k = weighted_posterior.sum(axis=0)
-
-        for item_idx in range(n_items):
-            self._optimize_item_weighted(
-                model, item_idx, responses, weighted_posterior, quad_points, n_k
+        context = self._fit_context
+        if context is None or context.responses is not responses:
+            context = EMFitContext(responses)
+        correct = observed = None
+        if not model.is_polytomous:
+            correct, observed = context.expected_counts(
+                posterior_weights, survey_weights
             )
 
-    def _optimize_item_weighted(
-        self,
-        model: BaseItemModel,
-        item_idx: int,
-        responses: NDArray[np.int_],
-        weighted_posterior: NDArray[np.float64],
-        quad_points: NDArray[np.float64],
-        n_k: NDArray[np.float64],
-    ) -> None:
-        """Optimize item parameters using weighted expected counts."""
-        item_responses = responses[:, item_idx]
-        valid_mask = item_responses >= 0
-
-        n_k_valid = np.sum(weighted_posterior[valid_mask], axis=0)
-
-        current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
-
-        if model.is_polytomous:
-            n_categories = model._n_categories[item_idx]
-            n_quad = len(n_k)
-
-            r_kc = np.zeros((n_quad, n_categories))
-            for c in range(n_categories):
-                cat_mask = valid_mask & (item_responses == c)
-                r_kc[:, c] = np.sum(weighted_posterior[cat_mask, :], axis=0)
-
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_item_params(model, item_idx, params)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                ll = np.sum(r_kc * np.log(probs))
-
-                return -ll
-
-        else:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * weighted_posterior[valid_mask, :],
-                axis=0,
+        for item_idx in range(model.n_items):
+            params, _ = self._get_item_params_and_bounds(model, item_idx)
+            if not params.size:
+                continue
+            category_counts = None
+            if model.is_polytomous:
+                category_counts = context.expected_category_counts(
+                    item_idx,
+                    model.n_categories[item_idx],
+                    posterior_weights,
+                    survey_weights,
+                )
+                item_observed = category_counts.sum(axis=1)
+                item_correct = None
+            else:
+                item_observed = observed[item_idx]
+                item_correct = correct[item_idx]
+            if not np.any(item_observed):
+                continue
+            optimal = self._optimize_item_params(
+                model,
+                item_idx,
+                responses,
+                posterior_weights,
+                quad_points,
+                item_observed,
+                r_k=item_correct,
+                n_k_valid=item_observed,
+                r_kc=category_counts,
             )
-
-            def neg_expected_log_likelihood(params: NDArray[np.float64]) -> float:
-                self._set_item_params(model, item_idx, params)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                ll = np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
-
-                return -ll
-
-        result = minimize(
-            neg_expected_log_likelihood,
-            x0=current_params,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": 50, "ftol": 1e-6},
-        )
-
-        self._set_item_params(model, item_idx, result.x)
+            self._set_item_params(model, item_idx, optimal)
 
     def _compute_weighted_standard_errors(
         self,
@@ -348,8 +335,9 @@ class WeightedEMEstimator(EMEstimator):
     ) -> dict[str, NDArray[np.float64]]:
         """Compute itemwise curvature standard errors using survey weights."""
 
-        weighted_posterior = posterior_weights * survey_weights[:, None]
-        return self._compute_standard_errors(model, responses, weighted_posterior)
+        return self._compute_standard_errors(
+            model, responses, posterior_weights, person_weights=survey_weights
+        )
 
 
 def compute_effective_sample_size(weights: NDArray[np.float64]) -> float:

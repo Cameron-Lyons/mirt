@@ -308,6 +308,18 @@ covers Python/NumPy allocations, excluding native workspace and process RSS.
 Weighted standard errors share the core EM item-curvature implementation,
 including analytic built-in derivatives and numerical custom-model fallbacks.
 
+The `weighted-mstep` suite isolates item optimization and standard errors for
+2PL, three-factor 2PL, GRM, and NRM on a fixed posterior. Responses contain 10%
+missing data, and every eleventh survey weight is zero. It uses 21 quadrature
+points for unidimensional models and seven per dimension for three-factor 2PL.
+Input preparation is excluded; copying the model for each optimization is
+included. Weighted counts use bounded response blocks, without constructing a
+dense survey-weighted posterior:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite weighted-mstep --persons 5000 --items 20 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-weighted-mstep.json
+```
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing
