@@ -320,6 +320,24 @@ dense survey-weighted posterior:
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite weighted-mstep --persons 5000 --items 20 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-weighted-mstep.json
 ```
 
+The `polytomous-fit` suite measures M-steps and five-iteration ordinary and
+survey-weighted fits for GRM, GPCM, PCM, and NRM. GRM/GPCM/NRM include one and
+two factors; items cycle through two to five categories, with 10% missing
+responses. Unidimensional grids use 15 points and two-factor grids use seven
+per dimension. The suite forces the Python M-step for ordinary EM; supported
+unidimensional models otherwise retain their native optimizer. Ordinary fits
+omit standard errors, while weighted fits include them:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite polytomous-fit --persons 1000 --items 8 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-polytomous-fit.json
+```
+
+Input generation is excluded. Timing includes copying the model for M-steps;
+complete fits include validation and response preparation. Built-in category
+objectives compute likelihoods and gradients together without trial model
+updates. Custom probability methods and parameter layouts use numerical
+optimization. Traced memory covers Python/NumPy allocations.
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing

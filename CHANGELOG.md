@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Prepared analytic GRM, GPCM, PCM, and NRM item objectives for Python EM and
+  survey-weighted EM, including multidimensional models. Category counts use
+  bounded accumulation, and trial evaluation leaves model parameters intact.
+  Added a `polytomous-fit` timing and traced-memory benchmark suite.
 - Accumulated survey-weighted binary and category counts in bounded blocks,
   eliminating dense weighted posterior copies from optimization and standard
   errors. Weighted EM now shares core item objectives and analytic gradients;
@@ -156,6 +160,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Enabled item updates and access for category-by-factor parameter arrays,
+  fixing multidimensional NRM fitting. Shared coordinate-wise numerical
+  curvature now preserves tensor shapes in EM and standalone standard errors,
+  with parameter restoration when probability evaluation fails.
 - Kept regularized MIRT convergence, likelihoods, and fit statistics in log space
   so long tests do not underflow into a likelihood floor or falsely converge.
   Posterior weights preserve unit row sums and prior differences under large

@@ -54,6 +54,7 @@ SUITE_ORDER = (
     "logistic-fit",
     "weighted-em",
     "weighted-mstep",
+    "polytomous-fit",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -349,6 +350,70 @@ def bench_weighted_mstep(
                     f"weighted_{kind}_{name}",
                     _time(run, repeats=repeats, warmups=warmups),
                     peak_traced_bytes=_peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_polytomous_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure Python category-model optimization and five-iteration fits."""
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.weighted import WeightedEMEstimator
+
+    rng = np.random.default_rng(85)
+    categories = [2 + item % 4 for item in range(n_items)]
+    survey_weights = rng.uniform(0.25, 2.0, n_persons)
+    survey_weights[::11] = 0.0
+    results = []
+    for label, factory, factors in (
+        ("grm_1d", mirt.GradedResponseModel, 1),
+        ("grm_2d", mirt.GradedResponseModel, 2),
+        ("gpcm_1d", mirt.GeneralizedPartialCredit, 1),
+        ("gpcm_2d", mirt.GeneralizedPartialCredit, 2),
+        ("pcm_1d", mirt.PartialCreditModel, 1),
+        ("nrm_1d", mirt.NominalResponseModel, 1),
+        ("nrm_2d", mirt.NominalResponseModel, 2),
+    ):
+        model = factory(n_items, n_categories=categories, n_factors=factors)
+        responses = np.column_stack([rng.integers(0, k, n_persons) for k in categories])
+        responses[rng.random(responses.shape) < 0.1] = -1
+        n_quadpts = 15 if factors == 1 else 7
+        estimator = EMEstimator(n_quadpts=n_quadpts, use_rust=False, use_gpu=False)
+        estimator._quadrature = GaussHermiteQuadrature(n_quadpts, factors)
+        posterior = rng.uniform(0.1, 1.0, (n_persons, len(estimator._quadrature.nodes)))
+        posterior /= posterior.sum(axis=1, keepdims=True)
+
+        def mstep():
+            estimator._m_step(model.copy(), responses, posterior)
+
+        def fit():
+            return EMEstimator(
+                n_quadpts=n_quadpts,
+                max_iter=5,
+                tol=1e-12,
+                use_rust=False,
+                use_gpu=False,
+                compute_standard_errors=False,
+            ).fit(model.copy(), responses)
+
+        def weighted_fit():
+            return WeightedEMEstimator(n_quadpts=n_quadpts, max_iter=5, tol=1e-12).fit(
+                model.copy(), responses, weights=survey_weights
+            )
+
+        for kind, run in (
+            ("mstep", mstep),
+            ("fit", fit),
+            ("weighted_fit", weighted_fit),
+        ):
+            results.append(
+                BenchResult(
+                    f"polytomous_{kind}_{label}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
                 )
             )
     return results
@@ -1791,6 +1856,8 @@ def run_suites(
         results.extend(bench_weighted_em(n_persons, n_items, repeats, warmups))
     if "weighted-mstep" in suites:
         results.extend(bench_weighted_mstep(n_persons, n_items, repeats, warmups))
+    if "polytomous-fit" in suites:
+        results.extend(bench_polytomous_fit(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -1987,6 +2054,7 @@ def _validate_baseline_compatibility(
                 "regularized_",
                 "weighted_mstep_",
                 "weighted_standard_errors_",
+                "polytomous_",
             )
         )
     )
