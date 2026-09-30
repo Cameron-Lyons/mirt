@@ -643,7 +643,8 @@ class TestBenchmarkCommand:
             ("qmcem-mstep",), n_persons=12, n_items=3, repeats=2, warmups=1
         )
         assert [result.name for result in results] == [
-            f"qmcem_mstep_{label}" for label in ("2pl", "2pl_3d", "mirt_3d", "grm")
+            f"qmcem_mstep_{label}"
+            for label in ("2pl", "2pl_3d", "mirt_3d", "grm", "gpcm_2d", "nrm_2d")
         ]
         assert all(len(result.times) == 2 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)

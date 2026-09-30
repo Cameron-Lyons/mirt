@@ -75,6 +75,19 @@ def test_opposite_infinities_propagate_undefined_log_joint():
     assert np.isnan(marginal).all()
 
 
+@pytest.mark.parametrize("blocked", [False, True])
+def test_no_prior_normalization_reuses_owned_storage(monkeypatch, blocked):
+    values = np.random.default_rng(391).normal(-500, 100, (17, 11))
+    expected_log = logsumexp(values, axis=1)
+    expected = np.exp(values - expected_log[:, None])
+    if blocked:
+        monkeypatch.setattr(_posterior, "_MAX_NORMALIZATION_ELEMENTS", 13)
+    posterior, marginal = normalize_log_posterior(values)
+    assert posterior is values
+    np.testing.assert_allclose(posterior, expected, rtol=8e-14, atol=1e-15)
+    np.testing.assert_allclose(marginal, expected_log, atol=1e-13)
+
+
 @pytest.mark.parametrize("kind", ["ordinary", "weighted"])
 @pytest.mark.parametrize("offset", [-1e16, -1e100, 1e16, 1e100])
 def test_estimator_e_steps_preserve_prior_with_large_custom_likelihood_offset(

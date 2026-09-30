@@ -810,6 +810,11 @@ def bench_qmcem_mstep(
         ("2pl_3d", TwoParameterLogistic(n_items, n_factors=3)),
         ("mirt_3d", MultidimensionalModel(n_items, n_factors=3)),
         ("grm", GradedResponseModel(n_items, n_categories=4)),
+        (
+            "gpcm_2d",
+            mirt.GeneralizedPartialCredit(n_items, n_categories=4, n_factors=2),
+        ),
+        ("nrm_2d", mirt.NominalResponseModel(n_items, n_categories=4, n_factors=2)),
     )
     results = []
     for label, template in models:
@@ -824,6 +829,8 @@ def bench_qmcem_mstep(
             np.eye(template.n_factors),
             template.n_factors,
         )
+        for values in (responses, samples, weights):
+            values.setflags(write=False)
 
         def run() -> None:
             estimator._m_step_mc(template.copy(), responses, samples, weights)

@@ -1,7 +1,7 @@
 """Shared-grid QMCEM likelihoods, gradients, constraints, and failure recovery."""
 
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -127,6 +127,7 @@ def test_shared_objective_matches_expanded_public_likelihood(
         nonlocal calls
         item = calls
         calls += 1
+        assert jac
         params = x0 + 0.03
         if kind == "4pl":
             params[-1] = 0.96
@@ -319,6 +320,71 @@ def test_fully_fixed_items_skip_optimization(monkeypatch):
         pytest.fail("fixed items must skip optimization")
 
     monkeypatch.setattr(mcem_module, "minimize", unexpected)
+    from mirt.estimation._em_context import EMFitContext
+
+    monkeypatch.setattr(EMFitContext, "expected_counts", unexpected)
     QMCEMEstimator(n_samples=50)._m_step_mc(model, responses, samples, weights)
     for name, value in original.items():
         np.testing.assert_array_equal(model.parameters[name], value)
+
+
+@pytest.mark.parametrize("override", ["instance", "class", "subclass"])
+@pytest.mark.parametrize(
+    "method", ["_item_expected_log_likelihood", "_optimize_item_mc"]
+)
+def test_shared_grid_preserves_custom_estimator_callbacks(
+    override, method, monkeypatch
+):
+    model = TwoParameterLogistic(3)
+    responses, samples, weights = _state(model)
+    original = model.parameters
+    estimator = QMCEMEstimator(n_samples=50)
+    calls = []
+
+    def custom(self, model, item, *args):
+        calls.append(item)
+        return -42.0
+
+    if override == "instance":
+        setattr(estimator, method, MethodType(custom, estimator))
+    elif override == "class":
+        monkeypatch.setattr(MCEMEstimator, method, custom)
+    else:
+        cls = type("CustomQMC", (QMCEMEstimator,), {method: custom})
+        estimator = cls(n_samples=50)
+
+    def optimize(objective, *, x0, jac, **kwargs):
+        assert not jac and objective(x0) == 42.0
+        return SimpleNamespace(x=x0, fun=42.0)
+
+    monkeypatch.setattr(mcem_module, "minimize", optimize)
+    estimator._m_step_mc(model, responses, samples, weights)
+    assert calls == ([0, 1, 2] if method == "_optimize_item_mc" else [0, 1])
+    for name, values in original.items():
+        np.testing.assert_array_equal(model.parameters[name], values)
+
+
+@pytest.mark.parametrize("kind", ["grm", "gpcm", "pcm", "nrm"])
+def test_shared_category_objective_preserves_upper_clip_at_one(kind, monkeypatch):
+    model = _model(kind)
+    responses = np.full((2, 3), -1)
+    responses[:, 1] = 3
+    samples = np.broadcast_to(
+        np.full((50, model.n_factors), 1000.0), (2, 50, model.n_factors)
+    )
+    weights = np.full((2, 50), 0.02)
+    estimator = QMCEMEstimator(n_samples=50)
+
+    def optimize(objective, *, x0, jac, **kwargs):
+        assert jac
+        trial = x0.copy()
+        if kind == "nrm":
+            trial[:] = 0
+            trial[2] = 5
+        value, gradient = objective(trial)
+        assert value == 0.0
+        np.testing.assert_array_equal(gradient, np.zeros_like(trial))
+        return SimpleNamespace(x=x0, fun=value)
+
+    monkeypatch.setattr(mcem_module, "minimize", optimize)
+    estimator._m_step_mc(model, responses, samples, weights)

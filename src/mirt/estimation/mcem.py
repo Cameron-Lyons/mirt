@@ -31,6 +31,7 @@ from scipy.special import xlog1py, xlogy
 from scipy.stats import qmc
 
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.utils.numeric import logsumexp
 
@@ -329,9 +330,10 @@ class MCEMEstimator(BaseEstimator):
         log_likelihoods: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Normalize prior-sample likelihood ratios by person."""
-        log_normalizer = logsumexp(log_likelihoods, axis=1, keepdims=True)
-        weights = np.exp(log_likelihoods - log_normalizer)
-        return weights, log_normalizer
+        # Custom callers may supply views or cache a read-only likelihood array.
+        owned = np.array(log_likelihoods, dtype=np.float64, copy=True)
+        weights, normalizer = normalize_log_posterior(owned)
+        return weights, normalizer[:, None]
 
     @staticmethod
     def _gaussian_log_kernel(
@@ -673,7 +675,8 @@ class QMCEMEstimator(MCEMEstimator):
     because the quasi-random points fill the space more uniformly.
     Its shared ability grid also allows the M-step to aggregate expected
     response counts once, instead of evaluating each respondent's samples
-    during every optimizer trial. Built-in logistic models use analytic gradients.
+    during every optimizer trial. Built-in logistic, affine, and polytomous
+    models use analytic gradients.
 
     References
     ----------
@@ -762,8 +765,8 @@ class QMCEMEstimator(MCEMEstimator):
             raise ValueError("theta_samples has an incompatible shape")
         if weights.shape != (n_persons, self.n_samples):
             raise ValueError("weights has an incompatible shape")
-        if theta_samples.strides[0] != 0:
-            # Subclasses may supply independent draws instead of a broadcast grid.
+        if theta_samples.strides[0] != 0 or not self._uses_default_item_methods():
+            # Independent draws and custom item callbacks use the MC item path.
             super()._m_step_mc(model, responses, theta_samples, weights)
             return
 
@@ -773,11 +776,15 @@ class QMCEMEstimator(MCEMEstimator):
             if not np.all(np.isfinite(block)) or np.any(block < 0.0):
                 raise ValueError("weights must be finite and non-negative")
 
+        if not any(np.any(mask) for mask in model.free_parameter_masks.values()):
+            return
+
         theta = theta_samples[0]
+        context = EMFitContext(responses)
         if model.is_polytomous:
             correct = observed = None
         else:
-            correct, observed = EMFitContext(responses).expected_counts(weights)
+            correct, observed = context.expected_counts(weights)
 
         for item_idx in range(model.n_items):
             item_responses = responses[:, item_idx]
@@ -792,35 +799,42 @@ class QMCEMEstimator(MCEMEstimator):
             ]
             analytic = False
             if model.is_polytomous:
-                n_categories = model._n_categories[item_idx]
+                from mirt.estimation._polytomous_objective import (
+                    prepare_polytomous_objective,
+                )
+
+                n_categories = model.n_categories[item_idx]
                 if np.any(item_responses >= n_categories):
                     raise ValueError(
                         "model returned invalid item category probabilities"
                     )
-                counts = np.zeros((self.n_samples, n_categories))
-                categories = np.arange(n_categories)
-                row_block = max(1, _MAX_QMC_COUNT_ELEMENTS // n_categories)
-                for start in range(0, n_persons, row_block):
-                    stop = min(start + row_block, n_persons)
-                    indicators = (
-                        item_responses[start:stop, None] == categories
-                    ).astype(np.float64)
-                    counts += weights[start:stop].T @ indicators
+                counts = context.expected_category_counts(
+                    item_idx, n_categories, weights
+                )
+                prepared = prepare_polytomous_objective(
+                    model, item_idx, theta, counts, PROB_EPSILON, max_probability=1.0
+                )
+                analytic = prepared is not None
+                if prepared is not None:
+                    objective = prepared
+                else:
 
-                def objective(trial):
-                    self._set_item_params(model, item_idx, trial)
-                    probabilities = np.asarray(
-                        model.probability(theta, item_idx), dtype=np.float64
-                    )
-                    if probabilities.shape != counts.shape or not np.all(
-                        np.isfinite(probabilities)
-                    ):
-                        raise ValueError(
-                            "model returned invalid item category probabilities"
+                    def objective(trial):
+                        self._set_item_params(model, item_idx, trial)
+                        probabilities = np.asarray(
+                            model.probability(theta, item_idx), dtype=np.float64
                         )
-                    return -float(
-                        np.sum(xlogy(counts, np.clip(probabilities, PROB_EPSILON, 1.0)))
-                    )
+                        if probabilities.shape != counts.shape or not np.all(
+                            np.isfinite(probabilities)
+                        ):
+                            raise ValueError(
+                                "model returned invalid item category probabilities"
+                            )
+                        return -float(
+                            np.sum(
+                                xlogy(counts, np.clip(probabilities, PROB_EPSILON, 1.0))
+                            )
+                        )
 
             else:
                 from mirt.estimation._affine_objective import prepare_affine_objective
@@ -944,5 +958,6 @@ _DEFAULT_MC_ITEM_METHODS = {
         "_item_expected_log_likelihood",
         "_get_item_params_and_bounds",
         "_set_item_params",
+        "_optimize_item_mc",
     )
 }
