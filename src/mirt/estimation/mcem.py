@@ -20,6 +20,7 @@ References:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from numbers import Integral
 from typing import TYPE_CHECKING, Literal
 
@@ -142,6 +143,11 @@ class MCEMEstimator(BaseEstimator):
     The number of samples should increase as iterations progress to
     ensure convergence. This implementation uses a fixed number for
     simplicity.
+
+    Built-in logistic, affine, and polytomous items use shared analytic
+    gradients. Small item sample blocks are prepared once; larger draws
+    stream bounded blocks without copying every observed person's samples.
+    Custom models and item objectives retain numerical optimization.
     """
 
     _minimum_samples = 50
@@ -534,6 +540,24 @@ class MCEMEstimator(BaseEstimator):
         if current_params.size == 0:
             return
 
+        if self._uses_default_item_methods():
+            from mirt.estimation._mc_objective import prepare_mc_objective
+
+            prepared = prepare_mc_objective(
+                model,
+                item_idx,
+                item_responses,
+                theta_samples,
+                weights,
+                self.n_samples,
+                bounds,
+            )
+            if prepared is not None:
+                self._minimize_item_mc(
+                    model, item_idx, current_params, bounds, prepared, analytic=True
+                )
+                return
+
         valid_responses = item_responses[valid_mask]
         valid_theta = theta_samples[valid_mask]
         valid_weights = weights[valid_mask]
@@ -548,12 +572,40 @@ class MCEMEstimator(BaseEstimator):
                 valid_weights,
             )
 
+        self._minimize_item_mc(
+            model, item_idx, current_params, bounds, neg_expected_log_likelihood
+        )
+
+    def _uses_default_item_methods(self) -> bool:
+        return type(self) in (
+            MCEMEstimator,
+            QMCEMEstimator,
+            StochasticEMEstimator,
+        ) and all(
+            name not in vars(self) and getattr(type(self), name) is method
+            for name, method in _DEFAULT_MC_ITEM_METHODS.items()
+        )
+
+    def _minimize_item_mc(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+        current_params: NDArray[np.float64],
+        bounds: list[tuple[float, float]],
+        objective: Callable[
+            [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
+        ],
+        *,
+        analytic: bool = False,
+    ) -> None:
+        """Install a finite optimizer result, restoring the item after failures."""
         installed = False
         try:
             result = minimize(
-                neg_expected_log_likelihood,
+                objective,
                 x0=current_params,
                 method="L-BFGS-B",
+                jac=analytic,
                 bounds=bounds,
                 options={"maxiter": 50, "ftol": 1e-6},
             )
@@ -760,3 +812,13 @@ class StochasticEMEstimator(MCEMEstimator):
             L,
             n_factors,
         )
+
+
+_DEFAULT_MC_ITEM_METHODS = {
+    name: getattr(MCEMEstimator, name)
+    for name in (
+        "_item_expected_log_likelihood",
+        "_get_item_params_and_bounds",
+        "_set_item_params",
+    )
+}

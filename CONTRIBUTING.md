@@ -397,6 +397,26 @@ input creation and native workspace. Uncertainty retains each node's expected
 complete-data 2×2 information convention and leaves unvisited or singular nodes
 undefined.
 
+The `mcem-fit` suite measures a person-specific sample M-step and a complete
+two-iteration MCEM fit for three-factor 2PL/MIRT, 3PL, and two-factor GRM/GPCM/NRM
+models. Each person has 64 samples and 10% of responses are missing:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite mcem-fit --persons 600 --items 6 --repeats 5 --warmups 1 --backend numpy --json /tmp/mirt-mcem-fit.json
+```
+
+M-step inputs are fixed across runs. Both workloads include model copying;
+complete fits include parameter initialization, sampling, likelihood updates,
+and item optimization. Built-in item objectives prepare small observed blocks
+once and stream bounded blocks for larger draws. Custom models and estimator
+item objectives use the numerical probability path. Category probabilities
+retain MCEM's upper clip at one; binary probabilities clip at `1-epsilon`.
+Input creation is excluded from timing and memory tracing. Person-specific
+sample and weight inputs still scale with persons, samples, and factors, and
+the E-step has its own likelihood workspace. Traced peaks cover Python/NumPy
+allocations and exclude native workspace. This suite measures importance
+sampling MCEM; it does not measure QMC or Metropolis sampling.
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing

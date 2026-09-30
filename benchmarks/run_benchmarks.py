@@ -58,6 +58,7 @@ SUITE_ORDER = (
     "item-curvature",
     "bl-fit",
     "irtree-fit",
+    "mcem-fit",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -589,6 +590,57 @@ def bench_irtree_fit(
             results.append(
                 BenchResult(
                     f"irtree_{spec}_{stage}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_mcem_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure person-specific MC item updates and complete two-iteration fits."""
+    from mirt.estimation.mcem import MCEMEstimator
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    rng = np.random.default_rng(89)
+    results = []
+    models = (
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("3pl", mirt.ThreeParameterLogistic(n_items)),
+        ("grm_2d", mirt.GradedResponseModel(n_items, n_categories=4, n_factors=2)),
+        (
+            "gpcm_2d",
+            mirt.GeneralizedPartialCredit(n_items, n_categories=4, n_factors=2),
+        ),
+        ("nrm_2d", mirt.NominalResponseModel(n_items, n_categories=4, n_factors=2)),
+        ("mirt_3d", MultidimensionalModel(n_items, 3)),
+    )
+    for name, model in models:
+        categories = 4 if model.is_polytomous else 2
+        responses = rng.integers(0, categories, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        samples = rng.normal(size=(n_persons, 64, model.n_factors))
+        weights = rng.uniform(size=(n_persons, 64))
+        weights /= weights.sum(axis=1, keepdims=True)
+        for values in (responses, samples, weights):
+            values.setflags(write=False)
+
+        def m_step():
+            MCEMEstimator(n_samples=64)._m_step_mc(
+                model.copy(), responses, samples, weights
+            )
+
+        def fit():
+            return MCEMEstimator(n_samples=64, max_iter=2, seed=89).fit(
+                model.copy(), responses
+            )
+
+        for stage, run in (("mstep", m_step), ("fit", fit)):
+            results.append(
+                BenchResult(
+                    f"mcem_{name}_{stage}",
                     _time(run, repeats=repeats, warmups=warmups),
                     _peak_traced_bytes(run),
                 )
@@ -2041,6 +2093,8 @@ def run_suites(
         results.extend(bench_bl_fit(n_persons, n_items, repeats, warmups))
     if "irtree-fit" in suites:
         results.extend(bench_irtree_fit(n_persons, n_items, repeats, warmups))
+    if "mcem-fit" in suites:
+        results.extend(bench_mcem_fit(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -2241,6 +2295,7 @@ def _validate_baseline_compatibility(
                 "item_curvature_",
                 "bl_",
                 "irtree_",
+                "mcem_",
             )
         )
     )
