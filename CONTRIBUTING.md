@@ -338,6 +338,24 @@ objectives compute likelihoods and gradients together without trial model
 updates. Custom probability methods and parameter layouts use numerical
 optimization. Traced memory covers Python/NumPy allocations.
 
+The `item-curvature` suite measures standalone central, forward, and Richardson
+uncertainty with fixed posterior inputs. It covers unidimensional and
+three-factor 2PL, GPCM, and two-factor GRM/NRM, with 10% missing responses.
+Category counts cycle through two to five. Central differences also run with
+two workers; quadrature uses 21 points for one factor and seven per dimension
+otherwise. Counts are prepared once per call and shared across parameter fields
+and Richardson steps. Parallel workers retain custom model state and instance
+methods in one isolated model per item:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite item-curvature --persons 5000 --items 20 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-item-curvature.json
+```
+
+These methods compute diagonal complete-data curvature. The benchmark step is
+`1e-4`, and outputs preserve parameter shapes with zeros for fixed coordinates.
+Traced memory includes count preparation and worker models, while excluding
+input creation and native allocations. Posterior arrays remain read-only.
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing

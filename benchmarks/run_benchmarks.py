@@ -55,6 +55,7 @@ SUITE_ORDER = (
     "weighted-em",
     "weighted-mstep",
     "polytomous-fit",
+    "item-curvature",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -412,6 +413,66 @@ def bench_polytomous_fit(
             results.append(
                 BenchResult(
                     f"polytomous_{kind}_{label}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_item_curvature(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure numerical item uncertainty with fixed posterior inputs."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.se_methods import compute_se
+
+    rng = np.random.default_rng(86)
+    categories = [2 + item % 4 for item in range(n_items)]
+    results = []
+    for label, model in (
+        ("2pl_1d", mirt.TwoParameterLogistic(n_items)),
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("gpcm_1d", mirt.GeneralizedPartialCredit(n_items, n_categories=categories)),
+        (
+            "grm_2d",
+            mirt.GradedResponseModel(n_items, n_categories=categories, n_factors=2),
+        ),
+        (
+            "nrm_2d",
+            mirt.NominalResponseModel(n_items, n_categories=categories, n_factors=2),
+        ),
+    ):
+        counts = model.n_categories if model.is_polytomous else [2] * n_items
+        responses = np.column_stack([rng.integers(0, k, n_persons) for k in counts])
+        responses[rng.random(responses.shape) < 0.1] = -1
+        quadrature = GaussHermiteQuadrature(
+            21 if model.n_factors == 1 else 7, model.n_factors
+        )
+        posterior = rng.uniform(0.1, 1.0, (n_persons, len(quadrature.nodes)))
+        posterior /= posterior.sum(axis=1, keepdims=True)
+        posterior.setflags(write=False)
+        for method, jobs in (
+            ("central", 1),
+            ("forward", 1),
+            ("richardson", 1),
+            ("central", 2),
+        ):
+
+            def run():
+                return compute_se(
+                    model,
+                    responses,
+                    quadrature,
+                    posterior,
+                    method=method,
+                    step_size=1e-4,
+                    n_jobs=jobs,
+                )
+
+            results.append(
+                BenchResult(
+                    f"item_curvature_{label}_{method}_{jobs}workers",
                     _time(run, repeats=repeats, warmups=warmups),
                     _peak_traced_bytes(run),
                 )
@@ -1858,6 +1919,8 @@ def run_suites(
         results.extend(bench_weighted_mstep(n_persons, n_items, repeats, warmups))
     if "polytomous-fit" in suites:
         results.extend(bench_polytomous_fit(n_persons, n_items, repeats, warmups))
+    if "item-curvature" in suites:
+        results.extend(bench_item_curvature(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -2055,6 +2118,7 @@ def _validate_baseline_compatibility(
                 "weighted_mstep_",
                 "weighted_standard_errors_",
                 "polytomous_",
+                "item_curvature_",
             )
         )
     )
