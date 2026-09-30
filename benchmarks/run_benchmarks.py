@@ -36,6 +36,7 @@ SUITE_ORDER = (
     "model-fit",
     "cat",
     "kernels",
+    "gpu-likelihood",
     "optimization",
     "information",
     "latent-density",
@@ -255,6 +256,100 @@ def bench_scoring(
         "eap_scoring",
         _time(run, repeats=repeats, warmups=warmups),
     )
+
+
+def bench_gpu_likelihood(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Time actual tensor likelihoods on the preferred CUDA or CPU device."""
+    from mirt import _gpu_backend as backend
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+    if not backend.is_torch_available():
+        raise ValueError("gpu-likelihood requires the optional PyTorch dependency")
+    _, device = backend._load_torch_runtime()
+    rng = np.random.default_rng(986)
+    grid = GaussHermiteQuadrature(21)
+    results = []
+    for label, factory in (
+        ("1pl", mirt.OneParameterLogistic),
+        ("2pl", mirt.TwoParameterLogistic),
+        ("3pl", mirt.ThreeParameterLogistic),
+        ("mirt_3d", mirt.TwoParameterLogistic),
+        ("grm", mirt.GradedResponseModel),
+        ("grm_mixed", mirt.GradedResponseModel),
+        ("gpcm", mirt.GeneralizedPartialCredit),
+        ("gpcm_mixed", mirt.GeneralizedPartialCredit),
+        ("pcm_mixed", mirt.PartialCreditModel),
+    ):
+        categories = (
+            [2 + j % 4 for j in range(n_items)] if "mixed" in label else [5] * n_items
+        )
+        polytomous = label.startswith(("grm", "gpcm", "pcm"))
+        model = (
+            factory(n_items, n_categories=categories)
+            if polytomous
+            else factory(n_items, n_factors=3 if label == "mirt_3d" else 1)
+        )
+        data = np.column_stack(
+            [
+                rng.integers(0, count if polytomous else 2, n_persons)
+                for count in categories
+            ]
+        )
+        data[rng.random(data.shape) < 0.1] = -1
+        points = rng.normal(size=(21, 3)) if label == "mirt_3d" else grid.nodes[:, 0]
+        params = model.parameters
+        if polytomous:
+            kernel = (
+                backend.compute_log_likelihoods_grm_gpu
+                if label.startswith("grm")
+                else backend.compute_log_likelihoods_gpcm_gpu
+            )
+            args = (
+                data,
+                points,
+                params["discrimination"],
+                params["thresholds" if label.startswith("grm") else "steps"],
+            )
+            kwargs = {"n_categories": categories}
+        else:
+            kernel = getattr(
+                backend,
+                f"compute_log_likelihoods_{'mirt' if label == 'mirt_3d' else '3pl' if label == '3pl' else '2pl'}_gpu",
+            )
+            args = (data, points, params["discrimination"], params["difficulty"])
+            if label == "3pl":
+                args += (params["guessing"],)
+            kwargs = {}
+
+        def likelihood():
+            return kernel(*args, **kwargs)
+
+        results.append(
+            BenchResult(
+                f"gpu_likelihood_{device.type}_{label}",
+                _time(likelihood, repeats=repeats, warmups=warmups),
+            )
+        )
+        if label == "2pl":
+
+            def e_step():
+                return backend.e_step_complete_gpu(
+                    data,
+                    points,
+                    grid.weights,
+                    params["discrimination"],
+                    params["difficulty"],
+                )
+
+            results.append(
+                BenchResult(
+                    f"gpu_likelihood_{device.type}_complete_e_step",
+                    _time(e_step, repeats=repeats, warmups=warmups),
+                )
+            )
+    return results
 
 
 def bench_weighted_em(
@@ -2274,6 +2369,8 @@ def run_suites(
         results.append(bench_cat(n_items, repeats, warmups))
     if "kernels" in suites:
         results.extend(bench_kernels(n_persons, n_items, repeats, warmups))
+    if "gpu-likelihood" in suites:
+        results.extend(bench_gpu_likelihood(n_persons, n_items, repeats, warmups))
     if "optimization" in suites:
         results.extend(bench_optimization(n_persons, n_items, repeats, warmups))
     if "information" in suites:
@@ -2381,10 +2478,18 @@ def build_report(
     backend_info: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a versioned structured report from benchmark results."""
+    environment = environment_metadata(backend_info)
+    if "gpu-likelihood" in suites:
+        from mirt._gpu_backend import _load_torch_runtime
+
+        torch, device = _load_torch_runtime()
+        environment.update(
+            torch_version=str(torch.__version__), tensor_device=str(device)
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(UTC).isoformat(),
-        "environment": environment_metadata(backend_info),
+        "environment": environment,
         "configuration": {
             "suites": list(suites),
             "persons": n_persons,
@@ -2532,6 +2637,7 @@ def _validate_baseline_compatibility(
                 "irtree_",
                 "mcem_",
                 "qmcem_",
+                "gpu_likelihood_",
             )
         )
     )
@@ -2547,6 +2653,11 @@ def _validate_baseline_compatibility(
         "thread_settings"
     ] != current_environment.get("thread_settings"):
         raise ValueError("baseline thread settings do not match the current run")
+    if any(name.startswith("gpu_likelihood_") for name in current_names) and any(
+        baseline_environment.get(name) != current_environment.get(name)
+        for name in ("torch_version", "tensor_device")
+    ):
+        raise ValueError("baseline tensor runtime does not match the current run")
 
 
 def compare_results(

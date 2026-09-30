@@ -108,6 +108,20 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+The optional `gpu-likelihood` suite requires PyTorch and times real tensor
+likelihoods for 1PL, 2PL, 3PL, multidimensional 2PL, GRM, GPCM, and PCM, plus a
+complete 2PL E-step. Category cases include items with different category
+counts and 10% missing responses. It uses CUDA when available and otherwise
+CPU tensors; JSON reports include the tensor device and PyTorch version, and
+baseline comparisons require matching runtime metadata. It reports time only
+because Python allocation tracing does not measure tensor memory:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python benchmarks/run_benchmarks.py \
+  --suite gpu-likelihood --persons 2000 --items 40 --repeats 7 --warmups 2 \
+  --json tensor-likelihood.json
+```
+
 Prepared item and joint likelihoods, exact uncertainty, native fitting, and
 response compression require original built-in model hooks. A shared check
 compares instance attributes, class methods, and inherited definitions captured

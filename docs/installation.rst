@@ -60,6 +60,17 @@ For plotting and embedded report visualizations:
 
    pip install "mirt[plot]"
 
+For GPU acceleration and tensor likelihood benchmarks:
+
+.. code-block:: bash
+
+   pip install "mirt[gpu]"
+
+GPU EM supports unidimensional 1PL, 2PL, 3PL, GRM, GPCM, and PCM models.
+Category models can have different category counts for each item. Tensor
+functions also run on CPU when CUDA is unavailable; EM uses its ordinary
+CPU path in that case.
+
 For development:
 
 .. code-block:: bash

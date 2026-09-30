@@ -453,9 +453,20 @@ class EMEstimator(BaseEstimator):
         quad_points: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Compute log-likelihoods using GPU acceleration."""
+        from mirt.models.dichotomous import (
+            OneParameterLogistic,
+            ThreeParameterLogistic,
+            TwoParameterLogistic,
+        )
+        from mirt.models.polytomous import (
+            GeneralizedPartialCredit,
+            GradedResponseModel,
+            PartialCreditModel,
+        )
+
         params = model.parameters
 
-        if model.model_name == "2PL":
+        if type(model) in (OneParameterLogistic, TwoParameterLogistic):
             discrimination = params["discrimination"]
             difficulty = params["difficulty"]
             return compute_log_likelihoods_2pl_gpu(
@@ -465,7 +476,7 @@ class EMEstimator(BaseEstimator):
                 difficulty,
             )
 
-        if model.model_name == "3PL":
+        if type(model) is ThreeParameterLogistic:
             discrimination = params["discrimination"]
             difficulty = params["difficulty"]
             guessing = params["guessing"]
@@ -477,7 +488,7 @@ class EMEstimator(BaseEstimator):
                 guessing,
             )
 
-        if model.model_name == "GRM":
+        if type(model) is GradedResponseModel:
             discrimination = params["discrimination"]
             thresholds = params["thresholds"]
             return compute_log_likelihoods_grm_gpu(
@@ -485,16 +496,18 @@ class EMEstimator(BaseEstimator):
                 quad_points.ravel(),
                 discrimination,
                 thresholds,
+                n_categories=model.n_categories,
             )
 
-        if model.model_name == "GPCM":
+        if type(model) in (GeneralizedPartialCredit, PartialCreditModel):
             discrimination = params["discrimination"]
-            thresholds = params["thresholds"]
+            steps = params["steps"]
             return compute_log_likelihoods_gpcm_gpu(
                 responses,
                 quad_points.ravel(),
                 discrimination,
-                thresholds,
+                steps,
+                n_categories=model.n_categories,
             )
 
         if hasattr(model, "log_likelihood_batch"):
