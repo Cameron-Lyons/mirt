@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Bounded Gaussian prior solves and reductions during posterior MCEM and
+  stochastic EM. Used diagonal scaling or triangular solves for Cholesky
+  factors, reused proposal buffers, released temporary normal draws, and
+  updated accepted cells without copying accepted draw arrays. Extended the
+  `mcem-sampling` benchmarks with prior kernels and correlated priors.
 - Bounded person-specific Monte Carlo likelihood evaluation without repeating
   response matrices. Reduced binary item curves against response blocks and
   gathered ordinal categories from bounded item curves, preserving public
@@ -196,6 +201,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Preserved finite Gaussian log kernels near floating-point limits and finite
+  Cholesky factors for large prior covariances. Posterior acceptance now keeps
+  prior differences under huge common likelihood offsets. Cached and read-only
+  custom likelihood/prior outputs remain intact during chain updates, including
+  callbacks that share scratch storage.
 - Preserved custom MCEM item callbacks when using a shared QMC grid. Normalized
   importance weights after centering log likelihoods so large common offsets
   retain unit posterior mass, with bounded scratch and protected borrowed inputs.
