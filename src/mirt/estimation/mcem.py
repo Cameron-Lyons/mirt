@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
+from scipy.special import xlog1py, xlogy
 from scipy.stats import qmc
 
 from mirt.constants import PROB_EPSILON
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
 
 
 _MAX_LIKELIHOOD_ELEMENTS = 2_000_000
+_MAX_QMC_COUNT_ELEMENTS = 1_000_000
 
 
 def _positive_integer(value: int, name: str, minimum: int = 1) -> int:
@@ -669,6 +671,9 @@ class QMCEMEstimator(MCEMEstimator):
     -----
     QMCEM typically requires fewer samples than MCEM for the same accuracy
     because the quasi-random points fill the space more uniformly.
+    Its shared ability grid also allows the M-step to aggregate expected
+    response counts once, instead of evaluating each respondent's samples
+    during every optimizer trial. Built-in logistic models use analytic gradients.
 
     References
     ----------
@@ -741,6 +746,125 @@ class QMCEMEstimator(MCEMEstimator):
         weights, _ = self._normalized_importance_weights(log_likes)
 
         return theta_samples, weights
+
+    def _m_step_mc(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        theta_samples: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> None:
+        """Optimize shared-grid items from expected counts without expanding theta."""
+        from mirt.estimation._em_context import EMFitContext
+
+        n_persons = responses.shape[0]
+        if theta_samples.shape != (n_persons, self.n_samples, model.n_factors):
+            raise ValueError("theta_samples has an incompatible shape")
+        if weights.shape != (n_persons, self.n_samples):
+            raise ValueError("weights has an incompatible shape")
+        if theta_samples.strides[0] != 0:
+            # Subclasses may supply independent draws instead of a broadcast grid.
+            super()._m_step_mc(model, responses, theta_samples, weights)
+            return
+
+        row_block = max(1, _MAX_QMC_COUNT_ELEMENTS // self.n_samples)
+        for start in range(0, n_persons, row_block):
+            block = weights[start : start + row_block]
+            if not np.all(np.isfinite(block)) or np.any(block < 0.0):
+                raise ValueError("weights must be finite and non-negative")
+
+        theta = theta_samples[0]
+        if model.is_polytomous:
+            correct = observed = None
+        else:
+            correct, observed = EMFitContext(responses).expected_counts(weights)
+
+        for item_idx in range(model.n_items):
+            item_responses = responses[:, item_idx]
+            if not np.any(item_responses >= 0):
+                continue
+            params, bounds = self._get_item_params_and_bounds(model, item_idx)
+            if params.size == 0:
+                continue
+
+            objective: Callable[
+                [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
+            ]
+            analytic = False
+            if model.is_polytomous:
+                n_categories = model._n_categories[item_idx]
+                if np.any(item_responses >= n_categories):
+                    raise ValueError(
+                        "model returned invalid item category probabilities"
+                    )
+                counts = np.zeros((self.n_samples, n_categories))
+                categories = np.arange(n_categories)
+                row_block = max(1, _MAX_QMC_COUNT_ELEMENTS // n_categories)
+                for start in range(0, n_persons, row_block):
+                    stop = min(start + row_block, n_persons)
+                    indicators = (
+                        item_responses[start:stop, None] == categories
+                    ).astype(np.float64)
+                    counts += weights[start:stop].T @ indicators
+
+                def objective(trial):
+                    self._set_item_params(model, item_idx, trial)
+                    probabilities = np.asarray(
+                        model.probability(theta, item_idx), dtype=np.float64
+                    )
+                    if probabilities.shape != counts.shape or not np.all(
+                        np.isfinite(probabilities)
+                    ):
+                        raise ValueError(
+                            "model returned invalid item category probabilities"
+                        )
+                    return -float(
+                        np.sum(xlogy(counts, np.clip(probabilities, PROB_EPSILON, 1.0)))
+                    )
+
+            else:
+                from mirt.estimation._affine_objective import prepare_affine_objective
+                from mirt.estimation._dichotomous_objective import (
+                    prepare_dichotomous_objective,
+                )
+
+                n_k, r_k = observed[item_idx], correct[item_idx]
+                prepared = prepare_dichotomous_objective(
+                    model, item_idx, theta, n_k, r_k, PROB_EPSILON, bounds
+                )
+                if prepared is None:
+                    prepared = prepare_affine_objective(
+                        model, item_idx, theta, n_k, r_k, PROB_EPSILON, bounds
+                    )
+                analytic = prepared is not None
+                if prepared is not None:
+                    objective = prepared
+                else:
+
+                    def objective(trial):
+                        self._set_item_params(model, item_idx, trial)
+                        probabilities = np.asarray(
+                            model.probability(theta, item_idx), dtype=np.float64
+                        ).reshape(-1)
+                        if probabilities.shape != (self.n_samples,) or not np.all(
+                            np.isfinite(probabilities)
+                        ):
+                            raise ValueError(
+                                "model returned invalid item probabilities"
+                            )
+                        probabilities = np.clip(
+                            probabilities, PROB_EPSILON, 1.0 - PROB_EPSILON
+                        )
+                        return -float(
+                            np.sum(
+                                xlogy(r_k, probabilities)
+                                + xlog1py(n_k - r_k, -probabilities)
+                            )
+                        )
+
+            self._minimize_item_mc(
+                model, item_idx, params, bounds, objective, analytic=analytic
+            )
 
 
 class StochasticEMEstimator(MCEMEstimator):

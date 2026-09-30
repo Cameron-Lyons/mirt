@@ -108,6 +108,21 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+The `qmcem-mstep` suite measures one complete QMCEM M-step on a precomputed
+256-point shared grid for 2PL, three-factor 2PL/MIRT, and four-category GRM
+models with 10% missing responses:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite qmcem-mstep --persons 1000 --items 10 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-qmcem-mstep.json
+```
+
+Timing includes expected-count accumulation, item optimization, and copying the
+template model; sampling is excluded. Traced allocations exclude the response
+matrix, shared grid, and posterior weights created before measurement. Logistic
+objectives reuse the EM analytic gradients, while custom and ordinal curves
+evaluate only the shared grid during numerical optimization. Independent sample
+grids supplied by estimator subclasses retain the Monte Carlo update path.
+
 The `regularized` suite measures E-steps and four-iteration fits with three
 coordinate-descent sweeps per M-step. It covers two factors with 15 quadrature
 points per factor and three factors with nine points, on complete responses

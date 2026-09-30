@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Aggregated QMCEM M-step counts on its shared ability grid, avoiding repeated
+  respondent/sample probability evaluation and sample-array copies during item
+  optimization. Reused analytic logistic gradients and bounded category-count
+  accumulation while preserving custom curves, missing responses, and loading
+  constraints. Added a `qmcem-mstep` timing and traced-memory benchmark suite.
 - Shared analytic item kernels with person-specific MCEM, QMCEM, and stochastic
   sample fitting. Cached small observed sample blocks and streamed bounded
   larger blocks without retaining full per-item sample copies. Preserved custom

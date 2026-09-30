@@ -64,6 +64,7 @@ SUITE_ORDER = (
     "variational-objective",
     "variational-mstep",
     "regularized",
+    "qmcem-mstep",
 )
 
 
@@ -791,6 +792,49 @@ def bench_variational_mstep(
                     f"variational_mstep_{name}_{label}", times, _peak_traced_bytes(run)
                 )
             )
+    return results
+
+
+def bench_qmcem_mstep(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure shared-grid item updates, including expected-count accumulation."""
+    from mirt.estimation.mcem import QMCEMEstimator
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.multidimensional import MultidimensionalModel
+    from mirt.models.polytomous import GradedResponseModel
+
+    rng = np.random.default_rng(94)
+    models = (
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("2pl_3d", TwoParameterLogistic(n_items, n_factors=3)),
+        ("mirt_3d", MultidimensionalModel(n_items, n_factors=3)),
+        ("grm", GradedResponseModel(n_items, n_categories=4)),
+    )
+    results = []
+    for label, template in models:
+        n_categories = 4 if template.is_polytomous else 2
+        responses = rng.integers(0, n_categories, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        estimator = QMCEMEstimator(n_samples=256, seed=94)
+        samples, weights = estimator._e_step_mc(
+            template,
+            responses,
+            np.zeros(template.n_factors),
+            np.eye(template.n_factors),
+            template.n_factors,
+        )
+
+        def run() -> None:
+            estimator._m_step_mc(template.copy(), responses, samples, weights)
+
+        results.append(
+            BenchResult(
+                f"qmcem_mstep_{label}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
     return results
 
 
@@ -2107,6 +2151,8 @@ def run_suites(
         results.extend(bench_variational_mstep(n_persons, n_items, repeats, warmups))
     if "regularized" in suites:
         results.extend(bench_regularized(n_persons, n_items, repeats, warmups))
+    if "qmcem-mstep" in suites:
+        results.extend(bench_qmcem_mstep(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -2296,6 +2342,7 @@ def _validate_baseline_compatibility(
                 "bl_",
                 "irtree_",
                 "mcem_",
+                "qmcem_mstep_",
             )
         )
     )
