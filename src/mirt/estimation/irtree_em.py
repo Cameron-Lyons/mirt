@@ -10,13 +10,17 @@ from scipy.optimize import minimize
 from mirt._core import sigmoid
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._dichotomous_objective import prepare_logistic_objective
+from mirt.estimation._irtree_context import IRTreeFitContext
+from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtValidationError
-from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.models.irtree import IRTreeModel
+
+_MAX_IRTREE_SCRATCH_ENTRIES = 131_072
 
 
 @dataclass
@@ -159,6 +163,7 @@ class IRTreeEMEstimator(BaseEstimator):
         self.n_quadpts = int(n_quadpts)
         self.estimate_correlations = bool(estimate_correlations)
         self._quadrature: GaussHermiteQuadrature | None = None
+        self._fit_context: IRTreeFitContext | None = None
 
     def fit(
         self,
@@ -187,6 +192,25 @@ class IRTreeEMEstimator(BaseEstimator):
         if n_persons == 0:
             raise ValueError("responses must contain at least one person")
 
+        previous_context = self._fit_context
+        with IRTreeFitContext(pseudo_responses, valid_mask) as context:
+            self._fit_context = context
+            try:
+                return self._fit_prepared(
+                    model, pseudo_responses, trait_assignments, valid_mask
+                )
+            finally:
+                self._fit_context = previous_context
+
+    def _fit_prepared(
+        self,
+        model: IRTreeModel,
+        pseudo_responses: NDArray[np.int_],
+        trait_assignments: NDArray[np.int_],
+        valid_mask: NDArray[np.bool_],
+    ) -> IRTreeResult:
+        n_persons = pseudo_responses.shape[0]
+
         self._quadrature = GaussHermiteQuadrature(
             n_points=self.n_quadpts,
             n_dimensions=model.n_traits,
@@ -199,6 +223,7 @@ class IRTreeEMEstimator(BaseEstimator):
         prev_ll = -np.inf
         converged = False
         estimate_distribution = self.estimate_correlations and model.correlated_traits
+        posterior_weights: NDArray[np.float64] | None = None
 
         for iteration in range(self.max_iter):
             posterior_weights, log_marginal = self._e_step(
@@ -236,16 +261,21 @@ class IRTreeEMEstimator(BaseEstimator):
                 trait_mean, trait_cov = self._update_trait_distribution(
                     posterior_weights, trait_mean, trait_cov
                 )
+            posterior_weights = None
 
-        posterior_weights, log_marginal = self._e_step(
-            model,
-            pseudo_responses,
-            trait_assignments,
-            valid_mask,
-            trait_mean,
-            trait_cov,
-            return_log=True,
-        )
+        if not (converged and self._uses_default_method("_e_step")):
+            if converged:
+                posterior_weights = None
+            posterior_weights, log_marginal = self._e_step(
+                model,
+                pseudo_responses,
+                trait_assignments,
+                valid_mask,
+                trait_mean,
+                trait_cov,
+                return_log=True,
+            )
+        assert posterior_weights is not None
         current_ll = float(np.sum(log_marginal))
         if not converged:
             self._convergence_history.append(current_ll)
@@ -306,27 +336,54 @@ class IRTreeEMEstimator(BaseEstimator):
         """Compute posterior weights and person marginal likelihoods."""
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
-        log_likelihoods = self._compute_log_likelihoods(
-            model,
-            pseudo_responses,
-            trait_assignments,
-            valid_mask,
-            quad_points,
-        )
+        if self._uses_default_method("_compute_log_likelihoods"):
+            log_likelihoods = self._compute_log_likelihoods(
+                model,
+                pseudo_responses,
+                trait_assignments,
+                valid_mask,
+                quad_points,
+                context=self._response_context(pseudo_responses, valid_mask),
+            )
+        else:
+            log_likelihoods = np.array(
+                self._compute_log_likelihoods(
+                    model, pseudo_responses, trait_assignments, valid_mask, quad_points
+                ),
+                dtype=np.float64,
+                copy=True,
+            )
 
         log_prior_mass = gaussian_log_quadrature_mass(
             quad_points, quad_weights, trait_mean, trait_cov
         )
-        log_joint = log_likelihoods + log_prior_mass[None, :]
-
-        log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-        log_posterior = log_joint - log_marginal
-
-        posterior_weights = np.exp(log_posterior)
-        marginal = log_marginal.ravel()
+        posterior_weights, marginal = normalize_log_posterior(
+            log_likelihoods, log_prior_mass
+        )
         if not return_log:
             marginal = np.exp(marginal)
         return posterior_weights, marginal
+
+    def _uses_default_method(self, name: str) -> bool:
+        return (
+            type(self) is IRTreeEMEstimator
+            and name not in vars(self)
+            and getattr(IRTreeEMEstimator, name) is _DEFAULT_IRTREE_METHODS[name]
+        )
+
+    def _response_context(
+        self,
+        pseudo_responses: NDArray[np.int_],
+        valid_mask: NDArray[np.bool_],
+    ) -> IRTreeFitContext:
+        context = self._fit_context
+        if (
+            context is not None
+            and context.pseudo_responses is pseudo_responses
+            and context.valid_mask is valid_mask
+        ):
+            return context
+        return IRTreeFitContext(pseudo_responses, valid_mask)
 
     @staticmethod
     def _compute_log_likelihoods(
@@ -335,26 +392,37 @@ class IRTreeEMEstimator(BaseEstimator):
         trait_assignments: NDArray[np.int_],
         valid_mask: NDArray[np.bool_],
         theta: NDArray[np.float64],
+        *,
+        context: IRTreeFitContext | None = None,
     ) -> NDArray[np.float64]:
         """Compute all person-by-point log likelihoods with matrix products."""
         n_persons = pseudo_responses.shape[0]
-        responses_flat = pseudo_responses.reshape(n_persons, -1)
-        correct = (responses_flat == 1).astype(np.float64)
-        valid = valid_mask.reshape(n_persons, -1).astype(np.float64)
-
+        context = context or IRTreeFitContext(pseudo_responses, valid_mask)
         discrimination = model._parameters["discrimination"].reshape(-1)
         difficulty = model._parameters["difficulty"].reshape(-1)
         traits = trait_assignments.reshape(-1)
-        logits = discrimination[None, :] * (theta[:, traits] - difficulty[None, :])
-        probability = np.clip(
-            sigmoid(logits),
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
-        )
-        return (
-            correct @ np.log(probability).T
-            + (valid - correct) @ np.log1p(-probability).T
-        )
+        n_points = theta.shape[0]
+        likelihood = np.zeros((n_persons, n_points))
+        node_chunk = max(1, _MAX_IRTREE_SCRATCH_ENTRIES // max(1, n_points))
+        for first in range(0, discrimination.size, node_chunk):
+            last = min(first + node_chunk, discrimination.size)
+            logits = discrimination[None, first:last] * (
+                theta[:, traits[first:last]] - difficulty[None, first:last]
+            )
+            probability = np.clip(sigmoid(logits), PROB_EPSILON, 1.0 - PROB_EPSILON)
+            log_failure = np.log1p(-probability)
+            log_odds = np.log(probability) - log_failure
+            row_chunk = max(
+                1,
+                _MAX_IRTREE_SCRATCH_ENTRIES // max(n_points, 2 * (last - first)),
+            )
+            for start in range(0, n_persons, row_chunk):
+                stop = min(start + row_chunk, n_persons)
+                correct, observed = context.node_components(start, stop, first, last)
+                block = likelihood[start:stop]
+                block += correct @ log_odds.T
+                block += observed @ log_failure.T
+        return likelihood
 
     def _compute_log_likelihood_at_theta(
         self,
@@ -386,11 +454,19 @@ class IRTreeEMEstimator(BaseEstimator):
         quad_points = self._quadrature.nodes
         n_items = model.n_items
         max_nodes = pseudo_responses.shape[2]
-        expected_correct, expected_total = self._expected_counts(
-            pseudo_responses,
-            valid_mask,
-            posterior_weights,
-        )
+        if self._uses_default_method("_expected_counts"):
+            expected_correct, expected_total = self._expected_counts(
+                pseudo_responses,
+                valid_mask,
+                posterior_weights,
+                context=self._response_context(pseudo_responses, valid_mask),
+            )
+        else:
+            expected_correct, expected_total = self._expected_counts(
+                pseudo_responses,
+                valid_mask,
+                posterior_weights,
+            )
 
         for j in range(n_items):
             for node_idx in range(max_nodes):
@@ -405,34 +481,19 @@ class IRTreeEMEstimator(BaseEstimator):
                 current_a = model._parameters["discrimination"][j, node_idx]
                 current_b = model._parameters["difficulty"][j, node_idx]
 
-                def neg_expected_ll(
-                    params: NDArray[np.float64],
-                ) -> tuple[float, NDArray[np.float64]]:
-                    a, b = params
-                    centered = theta_values - b
-                    probability = np.clip(
-                        sigmoid(a * centered),
-                        PROB_EPSILON,
-                        1.0 - PROB_EPSILON,
-                    )
-                    expected_ll = np.sum(
-                        r_q * np.log(probability) + (n_q - r_q) * np.log1p(-probability)
-                    )
-                    residual = r_q - n_q * probability
-                    gradient = np.array(
-                        [
-                            -np.sum(residual * centered),
-                            a * np.sum(residual),
-                        ]
-                    )
-                    return -float(expected_ll), gradient
+                bounds = [(0.1, 5.0), (-6.0, 6.0)]
+                neg_expected_ll = prepare_logistic_objective(
+                    theta_values[:, None], n_q, r_q, PROB_EPSILON, bounds=bounds
+                )
+                if neg_expected_ll is None:
+                    raise RuntimeError("Unable to prepare IRTree node objective")
 
                 result = minimize(
                     neg_expected_ll,
                     x0=[current_a, current_b],
                     method="L-BFGS-B",
                     jac=True,
-                    bounds=[(0.1, 5.0), (-6.0, 6.0)],
+                    bounds=bounds,
                     options={"maxiter": 50},
                 )
 
@@ -445,18 +506,16 @@ class IRTreeEMEstimator(BaseEstimator):
         pseudo_responses: NDArray[np.int_],
         valid_mask: NDArray[np.bool_],
         posterior_weights: NDArray[np.float64],
+        *,
+        context: IRTreeFitContext | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Aggregate posterior-weighted correct and total node responses."""
-        n_persons, n_items, max_nodes = pseudo_responses.shape
-        correct = (pseudo_responses.reshape(n_persons, -1) == 1).astype(np.float64)
-        valid = valid_mask.reshape(n_persons, -1).astype(np.float64)
+        _, n_items, max_nodes = pseudo_responses.shape
+        context = context or IRTreeFitContext(pseudo_responses, valid_mask)
         n_points = posterior_weights.shape[1]
-        expected_correct = (correct.T @ posterior_weights).reshape(
-            n_items, max_nodes, n_points
-        )
-        expected_total = (valid.T @ posterior_weights).reshape(
-            n_items, max_nodes, n_points
-        )
+        correct, total = context.expected_counts(posterior_weights)
+        expected_correct = correct.reshape(n_items, max_nodes, n_points)
+        expected_total = total.reshape(n_items, max_nodes, n_points)
         return expected_correct, expected_total
 
     def _update_trait_distribution(
@@ -524,52 +583,48 @@ class IRTreeEMEstimator(BaseEstimator):
             "difficulty": np.full_like(model._parameters["difficulty"], np.nan),
         }
 
-        _, expected_total = self._expected_counts(
-            pseudo_responses,
-            valid_mask,
-            posterior_weights,
-        )
+        if self._uses_default_method("_expected_counts"):
+            expected_total = self._response_context(
+                pseudo_responses, valid_mask
+            ).expected_totals(posterior_weights)
+        else:
+            _, counts = self._expected_counts(
+                pseudo_responses, valid_mask, posterior_weights
+            )
+            expected_total = counts.reshape(-1, counts.shape[-1])
         quad_points = self._quadrature.nodes
-        n_items, max_nodes = model._parameters["discrimination"].shape
-
-        for item_idx in range(n_items):
-            for node_idx in range(max_nodes):
-                n_q = expected_total[item_idx, node_idx]
-                if not np.any(n_q > 0.0):
-                    continue
-
-                trait_idx = trait_assignments[item_idx, node_idx]
-                theta_values = quad_points[:, trait_idx]
-                discrimination = model._parameters["discrimination"][item_idx, node_idx]
-                difficulty = model._parameters["difficulty"][item_idx, node_idx]
-                centered = theta_values - difficulty
-                probability = np.clip(
-                    sigmoid(discrimination * centered),
-                    PROB_EPSILON,
-                    1.0 - PROB_EPSILON,
-                )
-                weight = n_q * probability * (1.0 - probability)
-                score_a = centered
-                score_b = -discrimination
-                information = np.array(
-                    [
-                        [
-                            np.sum(weight * np.square(score_a)),
-                            np.sum(weight * score_a * score_b),
-                        ],
-                        [
-                            np.sum(weight * score_a * score_b),
-                            np.sum(weight * np.square(score_b)),
-                        ],
-                    ]
-                )
-                if np.linalg.matrix_rank(information) < 2:
-                    continue
-                covariance = np.linalg.pinv(information, rcond=1e-10)
-                variance = np.diag(covariance)
-                if np.all(np.isfinite(variance)) and np.all(variance > 0.0):
-                    se["discrimination"][item_idx, node_idx] = np.sqrt(variance[0])
-                    se["difficulty"][item_idx, node_idx] = np.sqrt(variance[1])
+        slopes = model._parameters["discrimination"].reshape(-1)
+        difficulties = model._parameters["difficulty"].reshape(-1)
+        traits = trait_assignments.reshape(-1)
+        slope_se = se["discrimination"].reshape(-1)
+        difficulty_se = se["difficulty"].reshape(-1)
+        chunk_size = max(1, _MAX_IRTREE_SCRATCH_ENTRIES // len(quad_points))
+        for start in range(0, slopes.size, chunk_size):
+            stop = min(start + chunk_size, slopes.size)
+            centered = (
+                quad_points[:, traits[start:stop]] - difficulties[None, start:stop]
+            )
+            probability = np.clip(
+                sigmoid(slopes[None, start:stop] * centered),
+                PROB_EPSILON,
+                1.0 - PROB_EPSILON,
+            )
+            weight = expected_total[start:stop].T * probability * (1.0 - probability)
+            score_b = -slopes[start:stop]
+            information = np.empty((stop - start, 2, 2))
+            information[:, 0, 0] = np.sum(weight * np.square(centered), axis=0)
+            information[:, 0, 1] = np.sum(weight * centered * score_b, axis=0)
+            information[:, 1, 0] = information[:, 0, 1]
+            information[:, 1, 1] = np.sum(weight * np.square(score_b), axis=0)
+            selected = np.flatnonzero(np.linalg.matrix_rank(information) >= 2)
+            if not selected.size:
+                continue
+            covariance = np.linalg.pinv(information[selected], rcond=1e-10)
+            variance = np.diagonal(covariance, axis1=1, axis2=2)
+            finite = np.all(np.isfinite(variance) & (variance > 0.0), axis=1)
+            indices = start + selected[finite]
+            slope_se[indices] = np.sqrt(variance[finite, 0])
+            difficulty_se[indices] = np.sqrt(variance[finite, 1])
 
         return se
 
@@ -589,3 +644,9 @@ class IRTreeEMEstimator(BaseEstimator):
         std_outer = np.outer(std, std)
         std_outer[std_outer == 0] = 1
         return cov / std_outer
+
+
+_DEFAULT_IRTREE_METHODS = {
+    name: getattr(IRTreeEMEstimator, name)
+    for name in ("_e_step", "_compute_log_likelihoods", "_expected_counts")
+}

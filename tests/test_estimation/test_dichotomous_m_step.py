@@ -1,7 +1,7 @@
 """Check EM gradients against the public, clipped item likelihood."""
 
 from copy import deepcopy
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -206,7 +206,9 @@ def test_multidimensional_item_objective_recovers_finite_cancelled_logits(bounde
     )
 
 
-@pytest.mark.parametrize("change", ["subclass", "instance", "parameter_order"])
+@pytest.mark.parametrize(
+    "change", ["subclass", "instance", "parameter_order", "private_theta"]
+)
 def test_custom_dichotomous_models_use_their_public_probability(monkeypatch, change):
     class PowerModel(TwoParameterLogistic):
         def probability(self, theta, item_idx=None):
@@ -217,6 +219,12 @@ def test_custom_dichotomous_models_use_their_public_probability(monkeypatch, cha
         model.probability = lambda theta, item_idx=None: np.full(len(theta), 0.37)
     elif change == "parameter_order":
         model._parameters = dict(reversed(list(model._parameters.items())))
+    elif change == "private_theta":
+
+        def transform(self, theta):
+            return TwoParameterLogistic._ensure_theta_2d(self, theta) * 1.2 + 0.8
+
+        model._ensure_theta_2d = MethodType(transform, model)
     estimator = EMEstimator(use_rust=False, use_gpu=False)
     points = np.array([[-2.0], [-0.5], [1.0], [3.0]])
     responses = np.array([[0], [1], [-1]])

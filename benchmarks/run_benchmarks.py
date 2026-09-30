@@ -57,6 +57,7 @@ SUITE_ORDER = (
     "polytomous-fit",
     "item-curvature",
     "bl-fit",
+    "irtree-fit",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -530,6 +531,64 @@ def bench_bl_fit(
             results.append(
                 BenchResult(
                     f"bl_{label}_{stage}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_irtree_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure tree posteriors, node statistics, uncertainty, and complete fits."""
+    from mirt.estimation.irtree_em import IRTreeEMEstimator
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.models.irtree import IRTreeModel
+
+    rng = np.random.default_rng(88)
+    results = []
+    for spec in ("bockenholt", "extreme_midpoint", "direction_intensity"):
+        model = IRTreeModel(n_items, tree_spec=spec)
+        responses = rng.integers(0, 5, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        pseudo, traits, valid = model.expand_to_pseudo_items(responses)
+        estimator = IRTreeEMEstimator(n_quadpts=7, max_iter=5, tol=1e-8)
+        estimator._quadrature = GaussHermiteQuadrature(7, model.n_traits)
+        mean, covariance = np.zeros(model.n_traits), np.eye(model.n_traits)
+        posterior, _ = estimator._e_step(
+            model, pseudo, traits, valid, mean, covariance, return_log=True
+        )
+        for values in (pseudo, traits, valid, posterior):
+            values.setflags(write=False)
+
+        def e_step():
+            return estimator._e_step(
+                model, pseudo, traits, valid, mean, covariance, return_log=True
+            )
+
+        def counts():
+            return estimator._expected_counts(pseudo, valid, posterior)
+
+        def uncertainty():
+            return estimator._compute_standard_errors(
+                model, pseudo, traits, valid, posterior
+            )
+
+        def fit():
+            return IRTreeEMEstimator(n_quadpts=7, max_iter=5, tol=1e-8).fit(
+                model.copy(), responses
+            )
+
+        for stage, run in (
+            ("e_step", e_step),
+            ("counts", counts),
+            ("uncertainty", uncertainty),
+            ("fit", fit),
+        ):
+            results.append(
+                BenchResult(
+                    f"irtree_{spec}_{stage}",
                     _time(run, repeats=repeats, warmups=warmups),
                     _peak_traced_bytes(run),
                 )
@@ -1980,6 +2039,8 @@ def run_suites(
         results.extend(bench_item_curvature(n_persons, n_items, repeats, warmups))
     if "bl-fit" in suites:
         results.extend(bench_bl_fit(n_persons, n_items, repeats, warmups))
+    if "irtree-fit" in suites:
+        results.extend(bench_irtree_fit(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -2179,6 +2240,7 @@ def _validate_baseline_compatibility(
                 "polytomous_",
                 "item_curvature_",
                 "bl_",
+                "irtree_",
             )
         )
     )
