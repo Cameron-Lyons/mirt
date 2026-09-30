@@ -750,6 +750,35 @@ class QMCEMEstimator(MCEMEstimator):
 
         return theta_samples, weights
 
+    def _sample_log_likelihoods(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        theta_samples: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Refresh shared-grid likelihoods without respondent/sample expansion."""
+        if MCEMEstimator._sample_log_likelihoods is not _DEFAULT_MC_SAMPLE_LIKELIHOODS:
+            return super()._sample_log_likelihoods(model, responses, theta_samples)
+        n_persons = len(responses)
+        samples = np.asarray(theta_samples)
+        expected = (n_persons, self.n_samples, model.n_factors)
+        if samples.shape != expected:
+            raise ValueError(f"theta_samples must have shape {expected}")
+        if (
+            n_persons == 0
+            or samples.strides[0] != 0
+            or not hasattr(model, "log_likelihood_batch")
+        ):
+            return super()._sample_log_likelihoods(model, responses, theta_samples)
+        grid = np.asarray(samples[0], dtype=np.float64)
+        if not np.all(np.isfinite(grid)):
+            raise ValueError("theta_samples must contain only finite values")
+        values = self._validated_log_likelihoods(
+            model.log_likelihood_batch(responses, grid), (n_persons, self.n_samples)
+        )
+        # The MC sampler owns its output and may update accepted cells in place.
+        return np.array(values, dtype=np.float64, copy=True)
+
     def _m_step_mc(
         self,
         model: BaseItemModel,
@@ -961,3 +990,5 @@ _DEFAULT_MC_ITEM_METHODS = {
         "_optimize_item_mc",
     )
 }
+
+_DEFAULT_MC_SAMPLE_LIKELIHOODS = MCEMEstimator._sample_log_likelihoods

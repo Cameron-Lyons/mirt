@@ -1,5 +1,6 @@
 """Shared-grid QMCEM likelihoods, gradients, constraints, and failure recovery."""
 
+import tracemalloc
 from copy import deepcopy
 from types import MethodType, SimpleNamespace
 
@@ -388,3 +389,149 @@ def test_shared_category_objective_preserves_upper_clip_at_one(kind, monkeypatch
 
     monkeypatch.setattr(mcem_module, "minimize", optimize)
     estimator._m_step_mc(model, responses, samples, weights)
+
+
+@pytest.mark.parametrize(
+    "kind", ["1pl", "2pl_multi", "mirt", "bifactor", "grm", "gpcm", "pcm", "nrm"]
+)
+def test_shared_likelihood_refresh_matches_expansion_and_protects_borrowed_output(
+    kind, monkeypatch
+):
+    model = _model(kind)
+    responses, samples, _ = _state(model)
+    expected = MCEMEstimator(n_samples=50)._sample_log_likelihoods(
+        model, responses, samples
+    )
+    curve = model.log_likelihood_batch
+    cached, shapes = [], []
+
+    def batch(data, grid):
+        shapes.append((data.shape, grid.shape))
+        values = curve(data, grid)
+        values.setflags(write=False)
+        cached.append(values)
+        return values
+
+    def expanded(*args):
+        pytest.fail("shared refresh should use the original response matrix and grid")
+
+    monkeypatch.setattr(model, "log_likelihood_batch", batch)
+    monkeypatch.setattr(model, "log_likelihood", expanded)
+    actual = QMCEMEstimator(n_samples=50)._sample_log_likelihoods(
+        model, responses, samples
+    )
+    assert shapes == [(responses.shape, samples[0].shape)]
+    assert actual.flags.writeable and not np.shares_memory(actual, cached[0])
+    np.testing.assert_allclose(actual, expected, atol=1e-12)
+    actual[:] = 0
+    np.testing.assert_allclose(cached[0], expected, atol=1e-12)
+
+
+def test_independent_refresh_samples_keep_the_expanded_likelihood(monkeypatch):
+    model = _model("2pl_multi")
+    responses, samples, _ = _state(model)
+    samples = samples.copy()
+    expected = MCEMEstimator(n_samples=50)._sample_log_likelihoods(
+        model, responses, samples
+    )
+    likelihood = model.log_likelihood
+    sizes = []
+
+    def expanded(data, points):
+        sizes.append(len(points))
+        return likelihood(data, points)
+
+    def batch(*args):
+        pytest.fail("independent samples should use the expanded likelihood")
+
+    monkeypatch.setattr(model, "log_likelihood", expanded)
+    monkeypatch.setattr(model, "log_likelihood_batch", batch)
+    actual = QMCEMEstimator(n_samples=50)._sample_log_likelihoods(
+        model, responses, samples
+    )
+    assert sizes == [len(responses) * 50]
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_shared_refresh_preserves_custom_base_sample_callback(monkeypatch):
+    model = _model("2pl")
+    responses, samples, _ = _state(model)
+    cached = np.full((len(responses), 50), -42.0)
+    calls = []
+
+    def custom(self, *args):
+        calls.append(args)
+        return cached
+
+    monkeypatch.setattr(MCEMEstimator, "_sample_log_likelihoods", custom)
+    actual = QMCEMEstimator(n_samples=50)._sample_log_likelihoods(
+        model, responses, samples
+    )
+    assert actual is cached
+    assert len(calls) == 1 and calls[0][2] is samples
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    ["sample_shape", "nonfinite_sample", "likelihood_shape", "nonfinite_likelihood"],
+)
+def test_shared_refresh_validates_samples_and_batch_results(invalid, monkeypatch):
+    model = _model("2pl")
+    responses, samples, _ = _state(model)
+    if invalid == "sample_shape":
+        samples = samples[:, :-1]
+    elif invalid == "nonfinite_sample":
+        grid = samples[0].copy()
+        grid[0, 0] = np.nan
+        samples = np.broadcast_to(grid, samples.shape)
+    else:
+        values = np.zeros((len(responses), 49 if invalid == "likelihood_shape" else 50))
+        if invalid == "nonfinite_likelihood":
+            values[0, 0] = np.inf
+        monkeypatch.setattr(model, "log_likelihood_batch", lambda *args: values)
+    with pytest.raises(ValueError):
+        QMCEMEstimator(n_samples=50)._sample_log_likelihoods(model, responses, samples)
+
+
+def test_shared_refresh_peak_excludes_expanded_response_and_sample_tensors():
+    model = TwoParameterLogistic(3, n_factors=3)
+    responses = np.random.default_rng(721).integers(-1, 2, (2000, 3))
+    grid = np.random.default_rng(722).normal(size=(256, 3))
+    samples = np.broadcast_to(grid, (2000, 256, 3))
+    tracemalloc.start()
+    try:
+        values = QMCEMEstimator(n_samples=256)._sample_log_likelihoods(
+            model, responses, samples
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    # The public batch likelihood uses three output-sized matrices plus small
+    # response/item buffers, without the expanded person/sample/item tensors.
+    assert peak < 3.5 * values.nbytes
+    assert values.shape == (2000, 256) and np.isfinite(values).all()
+
+
+@pytest.mark.parametrize(
+    "kind", ["1pl", "2pl_multi", "mirt", "bifactor", "grm", "gpcm", "pcm", "nrm"]
+)
+def test_complete_fit_matches_expanded_likelihood_refresh(kind):
+    model = _model(kind)
+    responses, _, _ = _state(model)
+    actual = QMCEMEstimator(n_samples=50, max_iter=2, seed=724)
+    expanded = QMCEMEstimator(n_samples=50, max_iter=2, seed=724)
+    expanded._sample_log_likelihoods = MethodType(
+        MCEMEstimator._sample_log_likelihoods, expanded
+    )
+    result = actual.fit(model.copy(), responses)
+    reference = expanded.fit(model.copy(), responses)
+    np.testing.assert_allclose(
+        actual.convergence_history, expanded.convergence_history, rtol=1e-10, atol=1e-9
+    )
+    np.testing.assert_allclose(result.log_likelihood, reference.log_likelihood)
+    assert result.n_iterations == reference.n_iterations
+    assert result.converged == reference.converged
+    for name, values in result.model.parameters.items():
+        np.testing.assert_allclose(
+            values, reference.model.parameters[name], rtol=1e-7, atol=1e-7
+        )

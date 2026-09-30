@@ -359,6 +359,7 @@ class TestBenchmarkCommand:
             "variational-mstep",
             "regularized",
             "qmcem-mstep",
+            "qmcem-fit",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -403,6 +404,7 @@ class TestBenchmarkCommand:
             "variational-mstep",
             "regularized",
             "qmcem-mstep",
+            "qmcem-fit",
         )
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
@@ -647,6 +649,24 @@ class TestBenchmarkCommand:
             for label in ("2pl", "2pl_3d", "mirt_3d", "grm", "gpcm_2d", "nrm_2d")
         ]
         assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12),
+                _report(*results, persons=13),
+                max_regression_percent=20,
+            )
+
+    def test_qmcem_fit_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ("qmcem-fit",), n_persons=12, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            f"qmcem_{stage}_{label}"
+            for label in ("2pl", "2pl_3d", "mirt_3d", "grm", "gpcm_2d", "nrm_2d")
+            for stage in ("refresh", "fit")
+        ]
+        assert all(len(result.times) == 1 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)
         with pytest.raises(ValueError, match="person count"):
             benchmark.compare_results(

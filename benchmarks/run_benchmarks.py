@@ -65,6 +65,7 @@ SUITE_ORDER = (
     "variational-mstep",
     "regularized",
     "qmcem-mstep",
+    "qmcem-fit",
 )
 
 
@@ -799,6 +800,23 @@ def bench_qmcem_mstep(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
     """Measure shared-grid item updates, including expected-count accumulation."""
+    return _bench_qmcem(n_persons, n_items, repeats, warmups, ("mstep",))
+
+
+def bench_qmcem_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure shared-grid likelihood refresh and complete two-iteration fits."""
+    return _bench_qmcem(n_persons, n_items, repeats, warmups, ("refresh", "fit"))
+
+
+def _bench_qmcem(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int,
+    stages: tuple[str, ...],
+) -> list[BenchResult]:
     from mirt.estimation.mcem import QMCEMEstimator
     from mirt.models.dichotomous import TwoParameterLogistic
     from mirt.models.multidimensional import MultidimensionalModel
@@ -832,16 +850,25 @@ def bench_qmcem_mstep(
         for values in (responses, samples, weights):
             values.setflags(write=False)
 
-        def run() -> None:
-            estimator._m_step_mc(template.copy(), responses, samples, weights)
+        for stage in stages:
 
-        results.append(
-            BenchResult(
-                f"qmcem_mstep_{label}",
-                _time(run, repeats=repeats, warmups=warmups),
-                _peak_traced_bytes(run),
+            def run() -> None:
+                if stage == "mstep":
+                    estimator._m_step_mc(template.copy(), responses, samples, weights)
+                elif stage == "refresh":
+                    estimator._sample_log_likelihoods(template, responses, samples)
+                else:
+                    QMCEMEstimator(n_samples=256, max_iter=2, seed=94).fit(
+                        template.copy(), responses
+                    )
+
+            results.append(
+                BenchResult(
+                    f"qmcem_{stage}_{label}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
             )
-        )
     return results
 
 
@@ -2160,6 +2187,8 @@ def run_suites(
         results.extend(bench_regularized(n_persons, n_items, repeats, warmups))
     if "qmcem-mstep" in suites:
         results.extend(bench_qmcem_mstep(n_persons, n_items, repeats, warmups))
+    if "qmcem-fit" in suites:
+        results.extend(bench_qmcem_fit(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -2349,7 +2378,7 @@ def _validate_baseline_compatibility(
                 "bl_",
                 "irtree_",
                 "mcem_",
-                "qmcem_mstep_",
+                "qmcem_",
             )
         )
     )

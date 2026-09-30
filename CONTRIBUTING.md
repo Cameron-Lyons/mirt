@@ -127,6 +127,19 @@ one owned copy, preserving cached likelihood arrays and unit posterior mass for
 large common offsets. Grid, posterior, and count outputs still grow with their
 respective person/sample/item dimensions.
 
+The `qmcem-fit` suite uses the same six models and input generation to measure
+likelihood refresh and complete two-iteration fits:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite qmcem-fit --persons 1000 --items 10 --repeats 3 --warmups 1 --backend numpy --json /tmp/mirt-qmcem-fit.json
+```
+
+Refresh timing includes the owned likelihood output; fits include validation,
+sampling, likelihood refreshes, expected counts, optimization, and model copying.
+Shared samples use the public batch likelihood directly. Independent samples and
+custom sample callbacks retain the Monte Carlo evaluation path. Likelihood and
+posterior matrices still grow with the person and sample counts.
+
 The `regularized` suite measures E-steps and four-iteration fits with three
 coordinate-descent sweeps per M-step. It covers two factors with 15 quadrature
 points per factor and three factors with nine points, on complete responses

@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   respondent/sample probability evaluation and sample-array copies during item
   optimization. Reused analytic logistic, affine, and polytomous gradients and
   shared bounded category-count accumulation while preserving custom curves,
-  missing responses, and loading constraints. Added a `qmcem-mstep` timing and
-  traced-memory benchmark suite.
+  missing responses, and loading constraints. Refreshed likelihoods directly on
+  the shared grid without expanding responses or samples. Added `qmcem-mstep`
+  and `qmcem-fit` timing and traced-memory benchmark suites.
 - Shared analytic item kernels with person-specific MCEM, QMCEM, and stochastic
   sample fitting. Cached small observed sample blocks and streamed bounded
   larger blocks without retaining full per-item sample copies. Preserved custom
