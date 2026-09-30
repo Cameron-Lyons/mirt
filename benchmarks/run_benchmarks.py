@@ -66,6 +66,7 @@ SUITE_ORDER = (
     "regularized",
     "qmcem-mstep",
     "qmcem-fit",
+    "mcem-sampling",
 )
 
 
@@ -602,7 +603,7 @@ def bench_irtree_fit(
 def bench_mcem_fit(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Measure person-specific MC item updates and complete two-iteration fits."""
+    """Measure person-specific likelihoods, item updates, and complete fits."""
     from mirt.estimation.mcem import MCEMEstimator
     from mirt.models.multidimensional import MultidimensionalModel
 
@@ -634,12 +635,17 @@ def bench_mcem_fit(
                 model.copy(), responses, samples, weights
             )
 
+        def refresh():
+            return MCEMEstimator(n_samples=64)._sample_log_likelihoods(
+                model, responses, samples
+            )
+
         def fit():
             return MCEMEstimator(n_samples=64, max_iter=2, seed=89).fit(
                 model.copy(), responses
             )
 
-        for stage, run in (("mstep", m_step), ("fit", fit)):
+        for stage, run in (("refresh", refresh), ("mstep", m_step), ("fit", fit)):
             results.append(
                 BenchResult(
                     f"mcem_{name}_{stage}",
@@ -647,6 +653,55 @@ def bench_mcem_fit(
                     _peak_traced_bytes(run),
                 )
             )
+    return results
+
+
+def bench_mcem_sampling(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure posterior MCEM/SEM E-steps and complete two-iteration fits."""
+    from mirt.estimation.mcem import MCEMEstimator, StochasticEMEstimator
+
+    rng = np.random.default_rng(95)
+    models = (
+        ("2pl_3d", mirt.TwoParameterLogistic(n_items, n_factors=3)),
+        ("grm_2d", mirt.GradedResponseModel(n_items, n_categories=4, n_factors=2)),
+    )
+    results = []
+    for label, template in models:
+        categories = 4 if template.is_polytomous else 2
+        responses = rng.integers(0, categories, (n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        responses.setflags(write=False)
+        prior = np.zeros(template.n_factors)
+        cholesky = np.eye(template.n_factors)
+        for method in ("posterior", "stochastic"):
+
+            def estimator():
+                if method == "posterior":
+                    return MCEMEstimator(
+                        n_samples=64, max_iter=2, seed=95, importance_sampling=False
+                    )
+                return StochasticEMEstimator(n_chains=5, max_iter=2, seed=95)
+
+            def e_step():
+                sampler = estimator()
+                sampler._rng = np.random.default_rng(95)
+                return sampler._e_step_mc(
+                    template, responses, prior, cholesky, template.n_factors
+                )
+
+            def fit():
+                return estimator().fit(template.copy(), responses)
+
+            for stage, run in (("e_step", e_step), ("fit", fit)):
+                results.append(
+                    BenchResult(
+                        f"mcem_{label}_{method}_{stage}",
+                        _time(run, repeats=repeats, warmups=warmups),
+                        _peak_traced_bytes(run),
+                    )
+                )
     return results
 
 
@@ -2189,6 +2244,8 @@ def run_suites(
         results.extend(bench_qmcem_mstep(n_persons, n_items, repeats, warmups))
     if "qmcem-fit" in suites:
         results.extend(bench_qmcem_fit(n_persons, n_items, repeats, warmups))
+    if "mcem-sampling" in suites:
+        results.extend(bench_mcem_sampling(n_persons, n_items, repeats, warmups))
     return results
 
 
