@@ -230,13 +230,14 @@ class BaseItemModel(ABC):
     def get_item_parameters(
         self, item_idx: int
     ) -> dict[str, float | NDArray[np.float64]]:
+        """Return copies of item parameters and shared parameter arrays."""
         item_idx = self._validate_item_index(item_idx)
 
         result: dict[str, float | NDArray[np.float64]] = {}
         for name, values in self._parameters.items():
             if values.ndim == 1 and len(values) == self.n_items:
                 result[name] = float(values[item_idx])
-            elif values.ndim == 2 and values.shape[0] == self.n_items:
+            elif values.ndim >= 2 and values.shape[0] == self.n_items:
                 result[name] = values[item_idx].copy()
             else:
                 result[name] = values.copy()
@@ -253,7 +254,7 @@ class BaseItemModel(ABC):
         Args:
             item_idx: Index of the item (0-based).
             param_name: Name of the parameter to set.
-            value: New value for the parameter.
+            value: New scalar or array value for the item.
 
         Raises:
             IndexError: If item_idx is out of range.
@@ -269,10 +270,7 @@ class BaseItemModel(ABC):
             )
 
         current = self._parameters[param_name]
-        if not (
-            (current.ndim == 1 and len(current) == self.n_items)
-            or (current.ndim == 2 and current.shape[0] == self.n_items)
-        ):
+        if current.ndim < 1 or current.shape[0] != self.n_items:
             raise MirtValidationError(
                 f"Parameter {param_name} does not have per-item values",
                 parameter=param_name,

@@ -24,7 +24,7 @@ from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.estimation.se_methods import _valid_second_derivative
+from mirt.estimation.se_methods import _diagonal_item_standard_errors
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -628,87 +628,92 @@ class EMEstimator(BaseEstimator):
         if valid_mask is None:
             valid_mask = item_responses >= 0
 
-        if n_k_valid is None:
-            n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
-
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
-        if not current_params.size or not np.any(n_k_valid):
+        if not current_params.size:
             return current_params
 
-        if model.is_polytomous:
-            n_categories = model._n_categories[item_idx]
-            n_quad = len(n_k)
-
-            if r_kc is None:
-                r_kc = np.zeros((n_quad, n_categories))
-                for c in range(n_categories):
-                    cat_mask = valid_mask & (item_responses == c)
-                    r_kc[:, c] = np.sum(posterior_weights[cat_mask, :], axis=0)
-
-            eps = self.prob_epsilon
-
-            def neg_expected_log_likelihood_polytomous(
-                params: NDArray[np.float64],
-            ) -> float:
-                self._set_item_params(model, item_idx, params)
-
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-
-                ll = np.sum(xlogy(r_kc, probs))
-
-                return -ll
-
-            try:
-                result = minimize(
-                    neg_expected_log_likelihood_polytomous,
-                    x0=current_params,
-                    method="L-BFGS-B",
-                    bounds=bounds,
-                    options={
-                        "maxiter": self.item_optim_maxiter,
-                        "ftol": self.item_optim_ftol,
-                    },
-                )
-                return result.x
-            finally:
-                self._set_item_params(model, item_idx, current_params)
-
-        if r_k is None:
-            r_k = np.sum(
-                item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
-                axis=0,
-            )
-
-        from mirt.estimation._affine_objective import prepare_affine_objective
-        from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
-
-        prepared = prepare_dichotomous_objective(
-            model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
-        )
-        if prepared is None:
-            prepared = prepare_affine_objective(
-                model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
-            )
         objective: Callable[
             [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
         ]
+        if model.is_polytomous:
+            from mirt.estimation._polytomous_objective import (
+                prepare_polytomous_objective,
+            )
+
+            if r_kc is None:
+                context = self._fit_context
+                if context is None or context.responses is not responses:
+                    context = EMFitContext(responses)
+                r_kc = context.expected_category_counts(
+                    item_idx,
+                    model.n_categories[item_idx],
+                    posterior_weights,
+                    valid_mask,
+                )
+            if not np.any(r_kc):
+                return current_params
+            prepared = prepare_polytomous_objective(
+                model, item_idx, quad_points, r_kc, self.prob_epsilon
+            )
+            if prepared is None:
+
+                def polytomous_objective(params: NDArray[np.float64]) -> float:
+                    self._set_item_params(model, item_idx, params)
+                    probs = np.clip(
+                        model.probability(quad_points, item_idx),
+                        self.prob_epsilon,
+                        1 - self.prob_epsilon,
+                    )
+                    return -float(np.sum(xlogy(r_kc, probs)))
+
+                objective = polytomous_objective
+        else:
+            if n_k_valid is None:
+                n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
+            if not np.any(n_k_valid):
+                return current_params
+            if r_k is None:
+                r_k = np.sum(
+                    item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
+                    axis=0,
+                )
+
+            from mirt.estimation._affine_objective import prepare_affine_objective
+            from mirt.estimation._dichotomous_objective import (
+                prepare_dichotomous_objective,
+            )
+
+            prepared = prepare_dichotomous_objective(
+                model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
+            )
+            if prepared is None:
+                prepared = prepare_affine_objective(
+                    model,
+                    item_idx,
+                    quad_points,
+                    n_k_valid,
+                    r_k,
+                    self.prob_epsilon,
+                    bounds,
+                )
+            if prepared is None:
+
+                def dichotomous_objective(params: NDArray[np.float64]) -> float:
+                    self._set_item_params(model, item_idx, params)
+                    probs = np.clip(
+                        model.probability(quad_points, item_idx),
+                        self.prob_epsilon,
+                        1 - self.prob_epsilon,
+                    )
+                    return -float(
+                        np.sum(xlogy(r_k, probs) + xlog1py(n_k_valid - r_k, -probs))
+                    )
+
+                objective = dichotomous_objective
+
         analytic = prepared is not None
         if prepared is not None:
             objective = prepared
-        else:
-            eps = self.prob_epsilon
-
-            def neg_expected_log_likelihood_dichotomous(
-                params: NDArray[np.float64],
-            ) -> float:
-                self._set_item_params(model, item_idx, params)
-                probs = model.probability(quad_points, item_idx)
-                probs = np.clip(probs, eps, 1 - eps)
-                ll = np.sum(xlogy(r_k, probs) + xlog1py(n_k_valid - r_k, -probs))
-                return -ll
-
-            objective = neg_expected_log_likelihood_dichotomous
 
         try:
             result = minimize(
@@ -883,10 +888,8 @@ class EMEstimator(BaseEstimator):
         values = model.parameters[param_name]
         if values.ndim == 1:
             current = float(values[item_idx])
-            is_scalar = True
         else:
             current = values[item_idx].copy()
-            is_scalar = False
 
         if n_k_valid is None:
             n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
@@ -931,46 +934,9 @@ class EMEstimator(BaseEstimator):
                 finally:
                     model.set_item_parameter(item_idx, param_name, current)
 
-        h = self.se_step_size
-        ll_center = log_likelihood(current)
-        if is_scalar:
-            hessian = _valid_second_derivative(
-                lambda offset: log_likelihood(current + offset),
-                h,
-                scheme="central",
-                center=ll_center,
-            )
-
-            if hessian < 0:
-                se = np.sqrt(-1.0 / hessian)
-            else:
-                se = np.nan
-
-            return se
-        else:
-            n_params = len(current)
-            se = np.zeros(n_params)
-
-            for i in range(n_params):
-
-                def log_likelihood_at_offset(offset: float) -> float:
-                    candidate = current.copy()
-                    candidate[i] += offset
-                    return log_likelihood(candidate)
-
-                hessian = _valid_second_derivative(
-                    log_likelihood_at_offset,
-                    h,
-                    scheme="central",
-                    center=ll_center,
-                )
-
-                if hessian < 0:
-                    se[i] = np.sqrt(-1.0 / hessian)
-                else:
-                    se[i] = np.nan
-
-            return se
+        return _diagonal_item_standard_errors(
+            log_likelihood, current, self.se_step_size, scheme="central"
+        )
 
     @staticmethod
     def _log_multivariate_normal(

@@ -86,7 +86,7 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         item_idx: int,
         n_categories: int,
         posterior: NDArray[np.float64],
-        person_weights: NDArray[np.float64] | None = None,
+        person_weights: NDArray[np.float64] | NDArray[np.bool_] | None = None,
     ) -> NDArray[np.float64]:
         """Accumulate an item's category counts without posterior row copies."""
         counts = np.zeros((posterior.shape[1], n_categories))

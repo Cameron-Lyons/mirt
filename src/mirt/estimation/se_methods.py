@@ -82,6 +82,38 @@ def _valid_second_derivative(
     raise RuntimeError("Unable to construct a valid finite-difference stencil")
 
 
+def _diagonal_item_standard_errors(
+    log_likelihood: Callable[[float | NDArray[np.float64]], float],
+    current: float | NDArray[np.float64],
+    h: float,
+    *,
+    scheme: Literal["central", "forward"],
+) -> float | NDArray[np.float64]:
+    """Perturb each item coordinate independently, preserving its array shape."""
+    center = log_likelihood(current)
+    if isinstance(current, np.ndarray):
+        standard_errors = np.empty_like(current)
+        for index in np.ndindex(current.shape):
+
+            def at_offset(offset: float) -> float:
+                candidate = current.copy()
+                candidate[index] += offset
+                return log_likelihood(candidate)
+
+            curvature = _valid_second_derivative(
+                at_offset, h, scheme=scheme, center=center
+            )
+            standard_errors[index] = (
+                np.sqrt(-1.0 / curvature) if curvature < 0 else np.nan
+            )
+        return standard_errors
+
+    curvature = _valid_second_derivative(
+        lambda offset: log_likelihood(current + offset), h, scheme=scheme, center=center
+    )
+    return np.sqrt(-1.0 / curvature) if curvature < 0 else np.nan
+
+
 def compute_se(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -294,10 +326,8 @@ def _compute_item_se_curvature(
     values = model.parameters[param_name]
     if values.ndim == 1:
         current = float(values[item_idx])
-        is_scalar = True
     else:
         current = values[item_idx].copy()
-        is_scalar = False
 
     n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
 
@@ -311,11 +341,12 @@ def _compute_item_se_curvature(
 
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
-            probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-            ll = float(np.sum(r_kc * np.log(probs)))
-            model.set_item_parameter(item_idx, param_name, current)
-            return ll
+            try:
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
+                return float(np.sum(r_kc * np.log(probs)))
+            finally:
+                model.set_item_parameter(item_idx, param_name, current)
     else:
         r_k = np.sum(
             item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
@@ -324,41 +355,16 @@ def _compute_item_se_curvature(
 
         def log_likelihood(param_val):
             model.set_item_parameter(item_idx, param_name, param_val)
-            probs = model.probability(quad_points, item_idx)
-            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-            ll = float(
-                np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
-            )
-            model.set_item_parameter(item_idx, param_name, current)
-            return ll
+            try:
+                probs = model.probability(quad_points, item_idx)
+                probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
+                return float(
+                    np.sum(r_k * np.log(probs) + (n_k_valid - r_k) * np.log(1 - probs))
+                )
+            finally:
+                model.set_item_parameter(item_idx, param_name, current)
 
-    ll_center = log_likelihood(current)
-    if is_scalar:
-        hessian = _valid_second_derivative(
-            lambda offset: log_likelihood(current + offset),
-            h,
-            scheme=scheme,
-            center=ll_center,
-        )
-        return np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
-    else:
-        n_params = len(current)
-        se = np.zeros(n_params)
-        for i in range(n_params):
-
-            def log_likelihood_at_offset(offset: float) -> float:
-                candidate = current.copy()
-                candidate[i] += offset
-                return log_likelihood(candidate)
-
-            hessian = _valid_second_derivative(
-                log_likelihood_at_offset,
-                h,
-                scheme=scheme,
-                center=ll_center,
-            )
-            se[i] = np.sqrt(-1.0 / hessian) if hessian < 0 else np.nan
-        return se
+    return _diagonal_item_standard_errors(log_likelihood, current, h, scheme=scheme)
 
 
 def _se_numerical_forward(
