@@ -32,8 +32,6 @@ def prepare_dichotomous_objective(
         OneParameterLogistic,
         ThreeParameterLogistic,
         TwoParameterLogistic,
-        _multidimensional_logits,
-        _unidimensional_logits,
     )
 
     layouts = {
@@ -47,6 +45,7 @@ def prepare_dichotomous_objective(
         for name in (
             "probability",
             "_evaluate_logistic",
+            "_ensure_theta_2d",
             "set_parameters",
             "set_item_parameter",
             "_canonical_parameter_values",
@@ -55,14 +54,43 @@ def prepare_dichotomous_objective(
     ):
         return None
 
-    unidimensional = model.n_factors == 1
     fixed_slope = type(model) is OneParameterLogistic
-    n_slopes = 0 if fixed_slope else model.n_factors
-    has_guessing = "guessing" in model._parameters
-    has_upper = "upper" in model._parameters
     fixed_a = (
-        float(model._parameters["discrimination"][item_idx]) if fixed_slope else 1.0
+        float(model._parameters["discrimination"][item_idx]) if fixed_slope else None
     )
+    return prepare_logistic_objective(
+        theta,
+        observed,
+        correct,
+        epsilon,
+        fixed_a=fixed_a,
+        has_guessing="guessing" in model._parameters,
+        has_upper="upper" in model._parameters,
+        bounds=bounds,
+    )
+
+
+def prepare_logistic_objective(
+    theta: NDArray[np.float64],
+    observed: NDArray[np.float64],
+    correct: NDArray[np.float64],
+    epsilon: float,
+    *,
+    fixed_a: float | None = None,
+    has_guessing: bool = False,
+    has_upper: bool = False,
+    bounds: list[tuple[float, float]] | None = None,
+) -> _Objective | None:
+    """Prepare the shared clipped logistic kernel without a model adapter."""
+    from mirt.models.dichotomous import (
+        _multidimensional_logits,
+        _unidimensional_logits,
+    )
+
+    unidimensional = theta.shape[1] == 1
+    fixed_slope = fixed_a is not None
+    fixed_a = 1.0 if fixed_a is None else fixed_a
+    n_slopes = 0 if fixed_slope else theta.shape[1]
     points = theta[:, 0] if unidimensional else theta
     incorrect = observed - correct
     ordinary = False

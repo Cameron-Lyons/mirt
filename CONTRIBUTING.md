@@ -375,6 +375,28 @@ with sample and grid size. Traced memory covers Python/NumPy allocations.
 Custom models, likelihoods, and derivative-free methods use their numerical
 objective.
 
+The `irtree-fit` suite measures E-steps, node-count aggregation, expected
+complete-data uncertainty, and complete fits with up to five EM iterations.
+It covers the Bockenholt, extreme-midpoint, and direction-intensity trees with
+five response categories, 10% missing responses, and seven quadrature points
+per trait:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite irtree-fit --persons 1000 --items 8 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-irtree-fit.json
+```
+
+Stage timing excludes input creation and uses fixed posterior inputs for counts
+and uncertainty. Complete fits include model copying, pseudo-item expansion,
+response preparation, item and trait-distribution updates, scores, and standard
+errors. Small response components are cached within a fit; row and node blocks
+bound larger scratch arrays. Posterior normalization consumes owned likelihood
+storage and copies borrowed custom buffers. Previous posteriors are released
+before the next E-step. The posterior and count outputs still scale with sample,
+node, and grid sizes. Memory peaks measure Python/NumPy allocations, excluding
+input creation and native workspace. Uncertainty retains each node's expected
+complete-data 2×2 information convention and leaves unvisited or singular nodes
+undefined.
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing

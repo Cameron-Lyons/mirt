@@ -1,7 +1,8 @@
 """Analytic affine M-step gradients, clipping, constraints, and thread isolation."""
 
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
+from copy import deepcopy
+from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -10,8 +11,44 @@ from scipy.optimize import minimize
 from mirt.estimation import em as em_module
 from mirt.estimation._affine_objective import prepare_affine_objective
 from mirt.estimation.em import EMEstimator
+from mirt.models.base import BaseItemModel
 from mirt.models.bifactor import BifactorModel
 from mirt.models.multidimensional import MultidimensionalModel
+
+
+@pytest.mark.parametrize("kind", ["mirt", "bifactor"])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_private_theta_overrides_use_the_public_curve(monkeypatch, kind, parallel):
+    model = _model(kind)
+
+    def transform(self, theta):
+        return BaseItemModel._ensure_theta_2d(self, theta) * 1.2 + 0.4
+
+    model._ensure_theta_2d = MethodType(transform, model)
+    original = model.parameters
+    estimator = EMEstimator(use_rust=False, use_gpu=False)
+    theta = np.random.default_rng(915).normal(size=(4, model.n_factors))
+    responses = np.array([[0, 1, 0], [1, 1, 1], [-1, 0, 1]])
+    posterior = np.full((3, 4), 0.25)
+
+    def optimize(objective, x0, *, jac, **kwargs):
+        assert not jac
+        trial = x0 + 0.2
+        value = objective(trial)
+        local = deepcopy(model)
+        estimator._set_item_params(local, 0, trial)
+        p = np.clip(local.probability(theta, 0), 1e-10, 1 - 1e-10)
+        expected = -np.sum(0.25 * np.log(p) + 0.25 * np.log1p(-p))
+        np.testing.assert_allclose(value, expected, atol=1e-13)
+        return SimpleNamespace(x=trial)
+
+    monkeypatch.setattr(em_module, "minimize", optimize)
+    method = (
+        estimator._optimize_item_return if parallel else estimator._optimize_item_params
+    )
+    method(model, 0, responses, posterior, theta, posterior.sum(axis=0))
+    for name in original:
+        np.testing.assert_array_equal(model.parameters[name], original[name])
 
 
 def _model(kind):

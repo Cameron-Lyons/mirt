@@ -76,16 +76,27 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
                 # Reduce through narrow, owned response blocks instead of
                 # copying the person-by-quadrature posterior. Cached components
                 # and caller-owned weights stay unchanged.
-                data = self.responses[start:stop]
-                observed = (data >= 0).astype(np.float64)
-                if person_weights is not None:
-                    observed *= person_weights[start:stop, None]
-                correct = data * observed
+                correct, observed = self._uncached_response_components(
+                    start, stop, person_weights
+                )
             weights = posterior[start:stop]
             correct_counts += correct.T @ weights
             observed_counts += observed.T @ weights
             del correct, observed
         return correct_counts, observed_counts
+
+    def _uncached_response_components(
+        self,
+        start: int,
+        stop: int,
+        person_weights: NDArray[np.float64] | None = None,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Own a narrow response block, preserving model-specific observation masks."""
+        data = self.responses[start:stop]
+        observed = (data >= 0).astype(np.float64)
+        if person_weights is not None:
+            observed *= person_weights[start:stop, None]
+        return data * observed, observed
 
     def expected_category_counts(
         self,

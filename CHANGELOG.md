@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reused IRTree response preparation across E/M-steps and uncertainty, bounded
+  node/row likelihood scratch space, and normalized owned likelihood buffers
+  in place. Released previous posteriors before the next E-step and reused the
+  final posterior on convergence. Batched bounded node information matrices,
+  avoiding unused correct-count calculations during uncertainty. Shared the
+  clipped logistic objective with ordinary item fitting. Added an `irtree-fit`
+  timing and traced-memory benchmark suite.
 - Reused clipped item-gradient kernels for joint BL marginal optimization of
   built-in 1PL–4PL, GRM, GPCM, PCM, NRM, MIRT, and bifactor models. Shared
   response preparation with diagonal marginal curvature, bounded likelihood
@@ -170,6 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Preserved IRTree posterior normalization for large common log-likelihood
+  offsets and protected borrowed custom likelihood buffers. Explicit node masks
+  suppress stored decisions consistently in likelihoods and counts. IRTree
+  optimizer gradients now respect clipped tails. Custom theta overrides retain
+  numerical EM item objectives for logistic and affine models.
 - Restored BL parameters after failed numerical optimization or curvature
   trials, and skipped optimization for models with no free parameters.
 - Preserved custom model constructor state and bound instance probability

@@ -37,6 +37,7 @@ def prepare_affine_objective(
             "probability",
             "_logits",
             "_curve_parameters",
+            "_ensure_theta_2d",
             "set_parameters",
             "set_item_parameter",
             "_canonical_parameter_values",
