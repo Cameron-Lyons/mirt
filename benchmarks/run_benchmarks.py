@@ -57,6 +57,7 @@ SUITE_ORDER = (
     "gvem-uncertainty",
     "variational-objective",
     "variational-mstep",
+    "regularized",
 )
 
 
@@ -447,6 +448,47 @@ def bench_variational_mstep(
                     f"variational_mstep_{name}_{label}", times, _peak_traced_bytes(run)
                 )
             )
+    return results
+
+
+def bench_regularized(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure regularized E-steps and short complete fits with missing responses."""
+    from mirt.estimation.latent_density import GaussianDensity
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.regularized import RegularizedMIRTEstimator
+
+    rng = np.random.default_rng(95)
+    results = []
+    for n_factors, n_points in ((2, 15), (3, 9)):
+        loadings = rng.uniform(0.3, 1.2, (n_items, n_factors))
+        intercepts = rng.normal(size=n_items)
+        for missing in (False, True):
+            responses = rng.integers(0, 2, (n_persons, n_items))
+            if missing:
+                responses[rng.random(responses.shape) < 0.1] = -1
+            estimator = RegularizedMIRTEstimator(
+                n_factors=n_factors, n_quadpts=n_points, max_iter=4, cd_max_iter=3
+            )
+            estimator._quadrature = GaussHermiteQuadrature(n_points, n_factors)
+            density = GaussianDensity(n_dimensions=n_factors)
+
+            def e_step() -> object:
+                return estimator._e_step(responses, loadings, intercepts, density)
+
+            def fit() -> object:
+                return estimator.fit(responses)
+
+            label = f"{n_factors}d_{'missing' if missing else 'complete'}"
+            for name, run in (("e_step", e_step), ("fit", fit)):
+                results.append(
+                    BenchResult(
+                        f"regularized_{name}_{label}",
+                        _time(run, repeats=repeats, warmups=warmups),
+                        _peak_traced_bytes(run),
+                    )
+                )
     return results
 
 
@@ -1708,6 +1750,8 @@ def run_suites(
         )
     if "variational-mstep" in suites:
         results.extend(bench_variational_mstep(n_persons, n_items, repeats, warmups))
+    if "regularized" in suites:
+        results.extend(bench_regularized(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -1889,6 +1933,7 @@ def _validate_baseline_compatibility(
                 "gvem_fit_",
                 "variational_objective_",
                 "variational_mstep_",
+                "regularized_",
             )
         )
     )

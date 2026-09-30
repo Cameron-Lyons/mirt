@@ -8,11 +8,13 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt._logistic import _affine_probability
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+from mirt.estimation._em_context import EMFitContext
+from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtDataError
-from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.estimation.latent_density import LatentDensity
@@ -58,24 +60,6 @@ def _validate_real(
         qualifier = "greater than or equal to" if inclusive else "greater than"
         raise ValueError(f"{name} must be a finite real number {qualifier} {minimum}")
     return normalized
-
-
-def _binary_response_components(
-    responses: NDArray[np.int_],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return correct and observed indicator matrices for binary responses."""
-    correct = (responses == 1).astype(np.float64)
-    observed = (responses >= 0).astype(np.float64)
-    return correct, observed
-
-
-def _expected_item_counts(
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute expected correct and observed counts for all items."""
-    correct, observed = _binary_response_components(responses)
-    return correct.T @ posterior_weights, observed.T @ posterior_weights
 
 
 @dataclass
@@ -264,6 +248,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
         self.adaptive = bool(adaptive)
         self._quadrature: GaussHermiteQuadrature | None = None
         self._adaptive_weights: NDArray[np.float64] | None = None
+        self._fit_context: EMFitContext | None = None
 
     def _validated_binary_responses(
         self,
@@ -302,10 +287,24 @@ class RegularizedMIRTEstimator(BaseEstimator):
         RegularizedMIRTResult
             Fitted model with sparse loadings.
         """
+        responses = self._validated_binary_responses(responses)
+        previous_context = self._fit_context
+        with EMFitContext(responses) as context:
+            self._fit_context = context
+            try:
+                return self._fit_prepared(responses, lambda_val)
+            finally:
+                self._fit_context = previous_context
+
+    def _fit_prepared(
+        self,
+        responses: NDArray[np.int_],
+        lambda_val: float | None,
+    ) -> RegularizedMIRTResult:
+        """Fit using response preparation owned by the current call."""
         from mirt.estimation.latent_density import GaussianDensity
         from mirt.models.multidimensional import MultidimensionalModel
 
-        responses = self._validated_binary_responses(responses)
         n_persons, n_items = responses.shape
 
         if lambda_val is not None:
@@ -351,18 +350,16 @@ class RegularizedMIRTEstimator(BaseEstimator):
         else:
             self._adaptive_weights = np.ones_like(loadings)
 
-        valid_masks = [responses[:, j] >= 0 for j in range(n_items)]
-
         self._convergence_history = []
         prev_ll = -np.inf
         converged = False
 
         for iteration in range(self.max_iter):
-            posterior_weights, marginal_ll = self._e_step(
+            posterior_weights, log_marginal = self._e_step(
                 responses, loadings, intercepts, latent_density
             )
 
-            current_ll = np.sum(np.log(marginal_ll + 1e-300))
+            current_ll = float(log_marginal.sum())
             penalty_term = self._compute_penalty(loadings)
             penalized_ll = current_ll - penalty_term
 
@@ -378,16 +375,17 @@ class RegularizedMIRTEstimator(BaseEstimator):
             prev_ll = current_ll
 
             loadings, intercepts = self._m_step_penalized(
-                responses, posterior_weights, loadings, intercepts, valid_masks
+                responses, posterior_weights, loadings, intercepts
             )
 
             n_k = posterior_weights.sum(axis=0)
+            del posterior_weights
             latent_density.update(self._quadrature.nodes, n_k)
         else:
-            posterior_weights, marginal_ll = self._e_step(
+            posterior_weights, log_marginal = self._e_step(
                 responses, loadings, intercepts, latent_density
             )
-            current_ll = float(np.sum(np.log(marginal_ll + 1e-300)))
+            current_ll = float(log_marginal.sum())
             penalty_term = self._compute_penalty(loadings)
             penalized_ll = current_ll - penalty_term
             self._convergence_history.append(current_ll)
@@ -499,47 +497,50 @@ class RegularizedMIRTEstimator(BaseEstimator):
         intercepts: NDArray[np.float64],
         latent_density: LatentDensity,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Compute posterior weights via quadrature."""
+        """Return posterior weights and log marginals with bounded scratch space."""
         quad_points = self._quadrature.nodes
         quad_weights = self._quadrature.weights
         n_persons = responses.shape[0]
         n_items = responses.shape[1]
         n_quad = len(quad_weights)
 
-        correct, observed = _binary_response_components(responses)
-        incorrect = observed - correct
+        context = self._response_context(responses)
         chunk_size = max(
             1,
             min(
                 n_quad,
-                _MAX_ESTEP_TEMP_ENTRIES // max(1, n_persons + n_items),
+                _MAX_ESTEP_TEMP_ENTRIES // max(1, 2 * n_persons + 8 * n_items),
             ),
         )
-        log_likelihoods = np.empty((n_persons, n_quad), dtype=np.float64)
+        log_joint = np.empty((n_persons, n_quad), dtype=np.float64)
 
         for start in range(0, n_quad, chunk_size):
             stop = min(start + chunk_size, n_quad)
-            z = quad_points[start:stop] @ loadings.T + intercepts[None, :]
-            probabilities = sigmoid(z)
-            probabilities = np.clip(
-                probabilities,
-                PROB_EPSILON,
-                1 - PROB_EPSILON,
+            probabilities = _affine_probability(
+                quad_points[start:stop], loadings, intercepts
             )
-            log_likelihoods[:, start:stop] = (
-                correct @ np.log(probabilities).T
-                + incorrect @ np.log1p(-probabilities).T
+            np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON, out=probabilities)
+            log_correct = np.log(probabilities)
+            np.negative(probabilities, out=probabilities)
+            np.log1p(probabilities, out=probabilities)
+            row_block = max(
+                1, _MAX_ESTEP_TEMP_ENTRIES // max(1, 3 * n_items + 2 * (stop - start))
             )
+            for row in range(0, n_persons, row_block):
+                row_stop = min(row + row_block, n_persons)
+                correct, observed = context.response_components(row, row_stop)
+                target = log_joint[row:row_stop, start:stop]
+                np.matmul(correct, log_correct.T, out=target)
+                target += (observed - correct) @ probabilities.T
 
         log_prior_mass = latent_density.log_quadrature_mass(quad_points, quad_weights)
-        log_joint = log_likelihoods + log_prior_mass[None, :]
-        log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-        log_posterior = log_joint - log_marginal
+        return normalize_log_posterior(log_joint, log_prior_mass)
 
-        posterior_weights = np.exp(log_posterior)
-        marginal_ll = np.exp(log_marginal.ravel())
-
-        return posterior_weights, marginal_ll
+    def _response_context(self, responses: NDArray[np.int_]) -> EMFitContext:
+        """Reuse current-fit preparation and isolate independent private calls."""
+        if self._fit_context is not None and self._fit_context.responses is responses:
+            return self._fit_context
+        return EMFitContext(responses)
 
     def _m_step_penalized(
         self,
@@ -547,7 +548,6 @@ class RegularizedMIRTEstimator(BaseEstimator):
         posterior_weights: NDArray[np.float64],
         loadings: NDArray[np.float64],
         intercepts: NDArray[np.float64],
-        valid_masks: list[NDArray[np.bool_]],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """M-step with penalization via coordinate descent."""
         from mirt._backend_config import should_use_rust
@@ -556,7 +556,9 @@ class RegularizedMIRTEstimator(BaseEstimator):
         n_items = responses.shape[1]
         n_factors = self.n_factors
 
-        r_k_all, n_k_all = _expected_item_counts(responses, posterior_weights)
+        r_k_all, n_k_all = self._response_context(responses).expected_counts(
+            posterior_weights
+        )
 
         if should_use_rust():
             try:
@@ -697,7 +699,9 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
         quad_points = self._quadrature.nodes
 
-        r_k_all, n_k_all = _expected_item_counts(responses, posterior_weights)
+        r_k_all, n_k_all = self._response_context(responses).expected_counts(
+            posterior_weights
+        )
         probabilities = np.clip(
             sigmoid(intercepts),
             PROB_EPSILON,
@@ -716,24 +720,22 @@ class RegularizedMIRTEstimator(BaseEstimator):
         max_iter: int = 50,
     ) -> NDArray[np.float64]:
         """Fit unpenalized model for adaptive weights."""
-        valid_masks = [responses[:, j] >= 0 for j in range(responses.shape[1])]
-
-        for _ in range(max_iter):
-            posterior_weights, _ = self._e_step(
-                responses, loadings, intercepts, latent_density
-            )
-
-            original_lambda = self.penalty.lambda_val
-            self.penalty.lambda_val = 0.0
-            self._adaptive_weights = np.ones_like(loadings)
-
-            loadings, intercepts = self._m_step_penalized(
-                responses, posterior_weights, loadings, intercepts, valid_masks
-            )
-
+        original_lambda = self.penalty.lambda_val
+        original_weights = self._adaptive_weights
+        self.penalty.lambda_val = 0.0
+        self._adaptive_weights = np.ones_like(loadings)
+        try:
+            for _ in range(max_iter):
+                posterior_weights, _ = self._e_step(
+                    responses, loadings, intercepts, latent_density
+                )
+                loadings, intercepts = self._m_step_penalized(
+                    responses, posterior_weights, loadings, intercepts
+                )
+                n_k = posterior_weights.sum(axis=0)
+                del posterior_weights
+                latent_density.update(self._quadrature.nodes, n_k)
+            return loadings
+        finally:
             self.penalty.lambda_val = original_lambda
-
-            n_k = posterior_weights.sum(axis=0)
-            latent_density.update(self._quadrature.nodes, n_k)
-
-        return loadings
+            self._adaptive_weights = original_weights

@@ -22,9 +22,9 @@ from scipy.optimize import minimize
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._patterns import supports_pattern_compression
+from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -256,11 +256,7 @@ class WeightedEMEstimator(EMEstimator):
             quad_points, quad_weights, prior_mean, prior_cov
         )
 
-        log_joint += log_prior_mass[None, :]
-        log_marginal = logsumexp(log_joint, axis=1)
-        log_joint -= log_marginal[:, None]
-        np.exp(log_joint, out=log_joint)
-        return log_joint, log_marginal
+        return normalize_log_posterior(log_joint, log_prior_mass)
 
     def _m_step_weighted(
         self,

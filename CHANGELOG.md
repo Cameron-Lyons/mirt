@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reused response preparation across regularized E/M-steps, bounded response
+  and probability scratch space, and removed unused item masks. Shared in-place
+  posterior normalization across ordinary, survey-weighted, and regularized EM.
+  Added a `regularized` timing and traced-memory benchmark suite.
 - Prepared Python 1PL–4PL item objectives once per optimization and consolidated
   their likelihood and gradient calculations. Added a `logistic-fit` benchmark
   suite covering unidimensional models and multidimensional 2PL.
@@ -146,6 +150,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Kept regularized MIRT convergence, likelihoods, and fit statistics in log space
+  so long tests do not underflow into a likelihood floor or falsely converge.
+  Posterior weights preserve unit row sums and prior differences under large
+  common log-likelihood offsets. Failed adaptive warmstarts restore the penalty
+  and adaptive weights, and response preparation is released after each fit.
 - Matched Python 1PL–4PL EM gradients to the clipped likelihood, preserved small
   positive-tail derivatives, and avoided NaNs from zero counts at saturated
   probabilities. Custom binary models now retain their own probability functions

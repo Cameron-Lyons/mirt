@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 
 import mirt.estimation.regularized as regularized_module
+from mirt.estimation._em_context import EMFitContext
 from mirt.estimation.latent_density import GaussianDensity
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.regularized import (
     PenaltySpec,
     RegularizedMIRTEstimator,
-    _expected_item_counts,
 )
 from mirt.exceptions import MirtDataError
 from mirt.utils.numeric import logsumexp
@@ -47,11 +47,13 @@ def _slow_e_step(
     log_prior_mass = density.log_quadrature_mass(quad_points, quad_weights)
     log_joint = log_likelihoods + log_prior_mass[None, :]
     log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-    return np.exp(log_joint - log_marginal), np.exp(log_marginal.ravel())
+    return np.exp(log_joint - log_marginal), log_marginal.ravel()
 
 
+@pytest.mark.parametrize("blocked_preparation", [False, True])
 def test_vectorized_e_step_matches_reference_with_forced_chunks(
     monkeypatch: pytest.MonkeyPatch,
+    blocked_preparation: bool,
 ) -> None:
     rng = np.random.default_rng(314)
     estimator = RegularizedMIRTEstimator(n_factors=2, n_quadpts=7)
@@ -76,6 +78,14 @@ def test_vectorized_e_step_matches_reference_with_forced_chunks(
         density,
     )
     monkeypatch.setattr(regularized_module, "_MAX_ESTEP_TEMP_ENTRIES", 20)
+    if blocked_preparation:
+        from mirt.estimation import _em_context
+
+        monkeypatch.setattr(_em_context, "_MAX_COUNT_ENTRIES", 20)
+
+    responses.flags.writeable = loadings.flags.writeable = (
+        intercepts.flags.writeable
+    ) = False
 
     actual_posterior, actual_marginal = estimator._e_step(
         responses,
@@ -107,7 +117,7 @@ def test_vectorized_expected_counts_match_observed_item_reference() -> None:
     posterior = rng.random((23, 17))
     posterior /= posterior.sum(axis=1, keepdims=True)
 
-    actual_correct, actual_observed = _expected_item_counts(responses, posterior)
+    actual_correct, actual_observed = EMFitContext(responses).expected_counts(posterior)
     expected_correct = np.zeros_like(actual_correct)
     expected_observed = np.zeros_like(actual_observed)
     for item_idx in range(responses.shape[1]):
@@ -293,3 +303,126 @@ def test_fit_path_handles_zero_lambda_max_without_logarithmic_grid(
 
     assert len(results) == 3
     assert fitted_lambdas == [0.0, 0.0, 0.0]
+
+
+def test_long_fit_retains_log_likelihood_and_avoids_false_convergence(monkeypatch):
+    responses = np.tile([0, 1], (4, 800))
+    estimator = RegularizedMIRTEstimator(
+        n_factors=2, n_quadpts=3, max_iter=2, tol=1e-12, cd_max_iter=1
+    )
+    monkeypatch.setattr(GaussianDensity, "update", lambda *_args: None)
+
+    def move_intercepts(_responses, _posterior, loadings, intercepts):
+        return loadings.copy(), intercepts + 0.4
+
+    monkeypatch.setattr(estimator, "_m_step_penalized", move_intercepts)
+    result = estimator.fit(responses)
+    quadrature = estimator._quadrature
+    likelihoods = np.column_stack(
+        [
+            result.model.log_likelihood(responses, point[None])
+            for point in quadrature.nodes
+        ]
+    )
+    expected = float(logsumexp(likelihoods + np.log(quadrature.weights), axis=1).sum())
+    assert expected < -750 * len(responses)
+    assert result.log_likelihood == pytest.approx(expected, abs=1e-9)
+    assert result.penalized_ll == pytest.approx(
+        expected - estimator._compute_penalty(result.loadings)
+    )
+    assert result.aic == pytest.approx(-2 * expected + 2 * result.n_parameters)
+    assert result.bic == pytest.approx(
+        -2 * expected + result.n_parameters * np.log(len(responses))
+    )
+    assert not result.converged
+    assert result.n_iterations == 2
+    assert len(estimator.convergence_history) == 3
+    assert estimator.convergence_history[-1] == pytest.approx(expected)
+
+
+def test_fit_reuses_response_preparation_and_releases_it_between_calls(monkeypatch):
+    estimator = RegularizedMIRTEstimator(
+        n_quadpts=3, max_iter=2, cd_max_iter=1, tol=1e-12
+    )
+    original = estimator._e_step
+    contexts = []
+    component_ids = []
+
+    def record(*args):
+        result = original(*args)
+        context = estimator._fit_context
+        contexts.append(context)
+        component_ids.append(id(context._components))
+        return result
+
+    monkeypatch.setattr(estimator, "_e_step", record)
+    rng = np.random.default_rng(937)
+    first = rng.integers(-1, 2, (19, 5))
+    second = rng.integers(-1, 2, (13, 4))
+    estimator.fit(first)
+    assert contexts and contexts[0] is not None
+    assert all(context is contexts[0] for context in contexts)
+    assert len(set(component_ids)) == 1
+    assert estimator._fit_context is None
+    previous_context = contexts[0]
+    contexts.clear()
+    component_ids.clear()
+    result = estimator.fit(second)
+    assert all(context is contexts[0] for context in contexts)
+    assert contexts[0] is not previous_context
+    assert estimator._fit_context is None
+    expected = RegularizedMIRTEstimator(
+        n_quadpts=3, max_iter=2, cd_max_iter=1, tol=1e-12
+    ).fit(second)
+    assert result.log_likelihood == pytest.approx(expected.log_likelihood, abs=1e-12)
+    np.testing.assert_allclose(result.loadings, expected.loadings, atol=1e-12)
+
+
+@pytest.mark.parametrize("stage", ["e_step", "m_step", "density"])
+def test_failed_adaptive_warmstart_restores_penalty_weights_and_context(
+    monkeypatch, stage
+):
+    estimator = RegularizedMIRTEstimator(
+        lambda_val=0.37, adaptive=True, n_quadpts=3, max_iter=1, cd_max_iter=1
+    )
+    original_weights = np.full((3, 2), 2.0)
+    estimator._adaptive_weights = original_weights
+
+    def fail(*_args):
+        assert estimator.penalty.lambda_val == 0.0
+        np.testing.assert_array_equal(estimator._adaptive_weights, 1.0)
+        raise RuntimeError("warmstart failed")
+
+    if stage == "density":
+        monkeypatch.setattr(GaussianDensity, "update", fail)
+    else:
+        monkeypatch.setattr(
+            estimator, "_e_step" if stage == "e_step" else "_m_step_penalized", fail
+        )
+    with pytest.raises(RuntimeError, match="warmstart failed"):
+        estimator.fit(np.array([[0, 1, 0], [1, 0, 1]]))
+    assert estimator.penalty.lambda_val == 0.37
+    assert estimator._adaptive_weights is original_weights
+    assert estimator._fit_context is None
+
+
+@pytest.mark.parametrize("penalty", ["lasso", "ridge", "elastic_net"])
+def test_adaptive_fit_finishes_with_requested_regularization(penalty):
+    estimator = RegularizedMIRTEstimator(
+        penalty=penalty,
+        lambda_val=0.23,
+        adaptive=True,
+        n_quadpts=3,
+        max_iter=2,
+        cd_max_iter=1,
+    )
+    responses = np.random.default_rng(171).integers(-1, 2, (21, 4))
+    result = estimator.fit(responses)
+    assert result.lambda_val == 0.23
+    assert estimator.penalty.lambda_val == 0.23
+    assert np.isfinite(result.log_likelihood)
+    assert np.isfinite(estimator._adaptive_weights).all()
+    assert result.penalized_ll == pytest.approx(
+        result.log_likelihood - estimator._compute_penalty(result.loadings)
+    )
+    assert estimator._fit_context is None

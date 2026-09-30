@@ -94,7 +94,7 @@ def test_python_e_steps_retain_standard_prior_without_information() -> None:
 def test_multidimensional_python_e_steps_retain_standard_prior() -> None:
     regularized = RegularizedMIRTEstimator(n_factors=2, n_quadpts=7)
     regularized._quadrature = GaussHermiteQuadrature(n_points=7, n_dimensions=2)
-    posterior, marginal = regularized._e_step(
+    posterior, log_marginal = regularized._e_step(
         responses=np.array([[-1]], dtype=np.int_),
         loadings=np.ones((1, 2)),
         intercepts=np.zeros(1),
@@ -103,7 +103,7 @@ def test_multidimensional_python_e_steps_retain_standard_prior() -> None:
     np.testing.assert_allclose(
         posterior[0], regularized._quadrature.weights, atol=1e-14
     )
-    np.testing.assert_allclose(marginal, 1.0, atol=1e-14)
+    np.testing.assert_allclose(log_marginal, 0.0, atol=1e-14)
 
     model = IRTreeModel(n_items=1, tree_spec="direction_intensity")
     n_nodes = model.parameters["discrimination"].shape[1]
