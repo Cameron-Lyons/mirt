@@ -128,7 +128,8 @@ large common offsets. Grid, posterior, and count outputs still grow with their
 respective person/sample/item dimensions.
 
 The `qmcem-fit` suite uses the same six models and input generation to measure
-likelihood refresh and complete two-iteration fits:
+likelihood refresh, E-steps including likelihood reporting, and complete
+two-iteration fits:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite qmcem-fit --persons 1000 --items 10 --repeats 3 --warmups 1 --backend numpy --json /tmp/mirt-qmcem-fit.json
@@ -429,8 +430,9 @@ input creation and native workspace. Uncertainty retains each node's expected
 complete-data 2×2 information convention and leaves unvisited or singular nodes
 undefined.
 
-The `mcem-fit` suite measures person-specific likelihood refresh, an M-step,
-and a complete two-iteration MCEM fit for three-factor 2PL/MIRT, 3PL, and
+The `mcem-fit` suite measures person-specific likelihood refresh, an E-step
+including likelihood reporting, an M-step, and a complete two-iteration MCEM
+fit for three-factor 2PL/MIRT, 3PL, and
 two-factor GRM/GPCM/NRM models. Each person has 64 samples and 10% of responses
 are missing:
 
@@ -440,7 +442,13 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_
 
 Refresh and M-step inputs are fixed across runs. M-steps and fits include model
 copying; complete fits include parameter initialization, sampling, likelihood
-updates, and item optimization. Built-in item objectives prepare small observed blocks
+updates, and item optimization. Reported E-steps reset the random generator and
+use precomputed prior inputs. Ordinary MCEM, QMCEM, and stochastic fits reuse
+fresh E-step importance normalizers or accepted posterior likelihoods for their
+current likelihood report. They release previous draws and weights before the
+next E-step, and refresh the retained final draw after the last item update.
+Custom sampling, likelihood, normalization, and prior hooks retain separate
+evaluation. Built-in item objectives prepare small observed blocks
 once and stream bounded blocks for larger draws. Custom models and estimator
 item objectives use the numerical probability path. Category probabilities
 retain MCEM's upper clip at one; binary probabilities clip at `1-epsilon`.

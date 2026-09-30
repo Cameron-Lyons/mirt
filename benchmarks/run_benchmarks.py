@@ -600,10 +600,27 @@ def bench_irtree_fit(
     return results
 
 
+def _mc_e_step_and_report(estimator, model, responses, prior, factor):
+    """Measure the fitting E-step, with a compatible baseline reporting path."""
+    estimator._rng = np.random.default_rng(estimator.seed)
+    if hasattr(estimator, "_e_step_and_marginal_ll"):
+        return estimator._e_step_and_marginal_ll(
+            model, responses, prior, factor, model.n_factors
+        )
+    samples, weights = estimator._e_step_mc(
+        model, responses, prior, factor, model.n_factors
+    )
+    return (
+        samples,
+        weights,
+        estimator._estimate_marginal_ll(model, responses, samples, weights),
+    )
+
+
 def bench_mcem_fit(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Measure person-specific likelihoods, item updates, and complete fits."""
+    """Measure person-specific likelihoods, reported E-steps, updates, and fits."""
     from mirt.estimation.mcem import MCEMEstimator
     from mirt.models.multidimensional import MultidimensionalModel
 
@@ -627,8 +644,14 @@ def bench_mcem_fit(
         samples = rng.normal(size=(n_persons, 64, model.n_factors))
         weights = rng.uniform(size=(n_persons, 64))
         weights /= weights.sum(axis=1, keepdims=True)
-        for values in (responses, samples, weights):
+        prior, factor = np.zeros(model.n_factors), np.eye(model.n_factors)
+        for values in (responses, samples, weights, prior, factor):
             values.setflags(write=False)
+
+        def e_step():
+            return _mc_e_step_and_report(
+                MCEMEstimator(n_samples=64, seed=89), model, responses, prior, factor
+            )
 
         def m_step():
             MCEMEstimator(n_samples=64)._m_step_mc(
@@ -645,7 +668,12 @@ def bench_mcem_fit(
                 model.copy(), responses
             )
 
-        for stage, run in (("refresh", refresh), ("mstep", m_step), ("fit", fit)):
+        for stage, run in (
+            ("refresh", refresh),
+            ("e_step", e_step),
+            ("mstep", m_step),
+            ("fit", fit),
+        ):
             results.append(
                 BenchResult(
                     f"mcem_{name}_{stage}",
@@ -890,8 +918,10 @@ def bench_qmcem_mstep(
 def bench_qmcem_fit(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Measure shared-grid likelihood refresh and complete two-iteration fits."""
-    return _bench_qmcem(n_persons, n_items, repeats, warmups, ("refresh", "fit"))
+    """Measure shared-grid likelihoods, reported E-steps, and complete fits."""
+    return _bench_qmcem(
+        n_persons, n_items, repeats, warmups, ("refresh", "e_step", "fit")
+    )
 
 
 def _bench_qmcem(
@@ -931,7 +961,8 @@ def _bench_qmcem(
             np.eye(template.n_factors),
             template.n_factors,
         )
-        for values in (responses, samples, weights):
+        prior, factor = np.zeros(template.n_factors), np.eye(template.n_factors)
+        for values in (responses, samples, weights, prior, factor):
             values.setflags(write=False)
 
         for stage in stages:
@@ -941,6 +972,8 @@ def _bench_qmcem(
                     estimator._m_step_mc(template.copy(), responses, samples, weights)
                 elif stage == "refresh":
                     estimator._sample_log_likelihoods(template, responses, samples)
+                elif stage == "e_step":
+                    _mc_e_step_and_report(estimator, template, responses, prior, factor)
                 else:
                     QMCEMEstimator(n_samples=256, max_iter=2, seed=94).fit(
                         template.copy(), responses

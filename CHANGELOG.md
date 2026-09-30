@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reused fresh Monte Carlo E-step evidence for likelihood reporting, avoiding
+  repeated draw evaluation and importance normalization before item updates.
+  Released previous draws and weights before the next E-step, and transformed
+  importance draws in owned storage. Preserved custom estimator and model
+  likelihood/validation hooks. Added reported E-steps to `mcem-fit` and
+  `qmcem-fit` benchmarks.
 - Bounded Gaussian prior solves and reductions during posterior MCEM and
   stochastic EM. Used diagonal scaling or triangular solves for Cholesky
   factors, reused proposal buffers, released temporary normal draws, and
