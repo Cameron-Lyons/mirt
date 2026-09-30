@@ -668,10 +668,16 @@ def bench_mcem_fit(
                 model.copy(), responses
             )
 
+        def uncertainty():
+            return MCEMEstimator(
+                n_samples=64, compute_standard_errors=True
+            )._compute_standard_errors_mc(model.copy(), responses, samples, weights)
+
         for stage, run in (
             ("refresh", refresh),
             ("e_step", e_step),
             ("mstep", m_step),
+            ("uncertainty", uncertainty),
             ("fit", fit),
         ):
             results.append(
@@ -723,12 +729,24 @@ def bench_mcem_sampling(
             )
             kernel_samples.setflags(write=False)
 
-            def estimator():
+            uncertainty_weights = np.full((n_persons, n_samples), 1.0 / n_samples)
+            uncertainty_weights.setflags(write=False)
+
+            def estimator(compute_standard_errors=False):
                 if method == "posterior":
                     return MCEMEstimator(
-                        n_samples=64, max_iter=2, seed=95, importance_sampling=False
+                        n_samples=64,
+                        max_iter=2,
+                        seed=95,
+                        importance_sampling=False,
+                        compute_standard_errors=compute_standard_errors,
                     )
-                return StochasticEMEstimator(n_chains=5, max_iter=2, seed=95)
+                return StochasticEMEstimator(
+                    n_chains=5,
+                    max_iter=2,
+                    seed=95,
+                    compute_standard_errors=compute_standard_errors,
+                )
 
             def e_step():
                 sampler = estimator()
@@ -747,9 +765,15 @@ def bench_mcem_sampling(
                     template.copy(), responses, prior_mean=prior, prior_cov=covariance
                 )
 
+            def uncertainty():
+                return estimator(True)._compute_standard_errors_mc(
+                    template.copy(), responses, kernel_samples, uncertainty_weights
+                )
+
             for stage, run in (
                 ("prior", prior_kernel),
                 ("e_step", e_step),
+                ("uncertainty", uncertainty),
                 ("fit", fit),
             ):
                 results.append(
@@ -920,7 +944,11 @@ def bench_qmcem_fit(
 ) -> list[BenchResult]:
     """Measure shared-grid likelihoods, reported E-steps, and complete fits."""
     return _bench_qmcem(
-        n_persons, n_items, repeats, warmups, ("refresh", "e_step", "fit")
+        n_persons,
+        n_items,
+        repeats,
+        warmups,
+        ("refresh", "e_step", "uncertainty", "fit"),
     )
 
 
@@ -974,6 +1002,12 @@ def _bench_qmcem(
                     estimator._sample_log_likelihoods(template, responses, samples)
                 elif stage == "e_step":
                     _mc_e_step_and_report(estimator, template, responses, prior, factor)
+                elif stage == "uncertainty":
+                    QMCEMEstimator(
+                        n_samples=256, compute_standard_errors=True
+                    )._compute_standard_errors_mc(
+                        template.copy(), responses, samples, weights
+                    )
                 else:
                     QMCEMEstimator(n_samples=256, max_iter=2, seed=94).fit(
                         template.copy(), responses
