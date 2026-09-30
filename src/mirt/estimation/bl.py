@@ -12,12 +12,16 @@ Bock, R. D., & Lieberman, M. (1970). Fitting a response model for n
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize
 
+from mirt.estimation._bl_objective import prepare_bl_objective
+from mirt.estimation._em_context import EMFitContext
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
@@ -46,6 +50,9 @@ class BLEstimator(BaseEstimator):
         Print optimization progress.
     method : str
         Optimization method for scipy.optimize.minimize.
+        Built-in 1PL–4PL, GRM, GPCM, PCM, NRM, MIRT, and bifactor models
+        use analytic marginal gradients with L-BFGS-B, BFGS, CG, TNC, or
+        SLSQP. Custom models and likelihoods retain numerical optimization.
 
     Notes
     -----
@@ -96,9 +103,18 @@ class BLEstimator(BaseEstimator):
         FitResult
             Fitted model with parameter estimates and standard errors.
         """
+        responses = self._validate_responses(responses, model.n_items)
+        with EMFitContext(responses) as context:
+            return self._fit_prepared(model, responses, context)
+
+    def _fit_prepared(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        context: EMFitContext,
+    ) -> FitResult:
         from mirt.results.fit_result import FitResult
 
-        responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
 
         self._quadrature = GaussHermiteQuadrature(
@@ -110,6 +126,29 @@ class BLEstimator(BaseEstimator):
             model._initialize_parameters()
 
         initial_params, bounds, param_structure = self._flatten_parameters(model)
+        prepared = None
+        if (
+            type(self) is BLEstimator
+            and isinstance(self.method, str)
+            and self.method.lower() in ("l-bfgs-b", "bfgs", "cg", "tnc", "slsqp")
+            and not any(
+                name in vars(self)
+                for name in (
+                    "_flatten_parameters",
+                    "_unflatten_parameters",
+                    "_compute_marginal_log_likelihood",
+                )
+            )
+        ):
+            prepared = prepare_bl_objective(
+                model,
+                context,
+                self._quadrature.nodes,
+                np.log(self._quadrature.weights),
+                param_structure,
+                bounds,
+                self._unflatten_parameters,
+            )
 
         def neg_log_likelihood(params: NDArray[np.float64]) -> float:
             self._unflatten_parameters(model, params, param_structure)
@@ -117,18 +156,32 @@ class BLEstimator(BaseEstimator):
             return -ll
 
         def _verbose_callback(x: NDArray[np.float64]) -> None:
-            print(f"LL = {-neg_log_likelihood(x):.4f}")
+            value = neg_log_likelihood(x) if prepared is None else prepared.value(x)
+            print(f"LL = {-value:.4f}")
 
         callback = _verbose_callback if self.verbose else None
 
-        result = minimize(
-            neg_log_likelihood,
-            x0=initial_params,
-            method=self.method,
-            bounds=bounds,
-            options={"maxiter": self.max_iter, "ftol": self.tol},
-            callback=callback,
-        )
+        if initial_params.size:
+            try:
+                result = minimize(
+                    neg_log_likelihood if prepared is None else prepared,
+                    x0=initial_params,
+                    jac=prepared is not None,
+                    method=self.method,
+                    bounds=bounds,
+                    options={"maxiter": self.max_iter, "ftol": self.tol},
+                    callback=callback,
+                )
+            except BaseException:
+                self._unflatten_parameters(model, initial_params, param_structure)
+                raise
+        else:
+            result = SimpleNamespace(
+                x=initial_params,
+                fun=neg_log_likelihood(initial_params),
+                nit=0,
+                success=True,
+            )
 
         self._unflatten_parameters(model, result.x, param_structure)
         model._is_fitted = True
@@ -137,7 +190,18 @@ class BLEstimator(BaseEstimator):
         n_iterations = result.nit if hasattr(result, "nit") else 0
         converged = result.success
 
-        se = self._compute_standard_errors(model, responses, result.x, param_structure)
+        if prepared is None or "_compute_standard_errors" in vars(self):
+            se = self._compute_standard_errors(
+                model, responses, result.x, param_structure
+            )
+        else:
+            se = self._compute_standard_errors(
+                model,
+                responses,
+                result.x,
+                param_structure,
+                objective=prepared.value,
+            )
 
         n_params = len(result.x)
         aic = -2 * final_ll + 2 * n_params
@@ -260,36 +324,40 @@ class BLEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         params: NDArray[np.float64],
         structure: dict,
+        *,
+        objective: Callable[[NDArray[np.float64]], float] | None = None,
     ) -> dict[str, NDArray[np.float64]]:
         """Compute standard errors using numerical Hessian."""
         h = 1e-5
         n_params = len(params)
 
         def neg_ll(p):
+            if objective is not None:
+                return objective(p)
             self._unflatten_parameters(model, p, structure)
             return -self._compute_marginal_log_likelihood(model, responses)
 
         hessian_diag = np.zeros(n_params)
-        ll_center = neg_ll(params)
+        try:
+            ll_center = neg_ll(params)
 
-        for i in range(n_params):
-            params_plus = params.copy()
-            params_plus[i] += h
-            params_minus = params.copy()
-            params_minus[i] -= h
+            for i in range(n_params):
+                params_plus = params.copy()
+                params_plus[i] += h
+                params_minus = params.copy()
+                params_minus[i] -= h
 
-            ll_plus = neg_ll(params_plus)
-            ll_minus = neg_ll(params_minus)
+                ll_plus = neg_ll(params_plus)
+                ll_minus = neg_ll(params_minus)
 
-            hessian_diag[i] = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+                hessian_diag[i] = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
+        finally:
+            if objective is None:
+                self._unflatten_parameters(model, params, structure)
 
-        self._unflatten_parameters(model, params, structure)
-
-        se_flat = np.where(
-            hessian_diag > 0,
-            np.sqrt(1.0 / hessian_diag),
-            np.nan,
-        )
+        positive = hessian_diag > 0
+        se_flat = np.full(n_params, np.nan)
+        se_flat[positive] = np.sqrt(1.0 / hessian_diag[positive])
 
         se_dict = {}
         for name, info in structure.items():

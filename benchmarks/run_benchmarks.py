@@ -56,6 +56,7 @@ SUITE_ORDER = (
     "weighted-mstep",
     "polytomous-fit",
     "item-curvature",
+    "bl-fit",
     "variational",
     "gvem-uncertainty",
     "variational-objective",
@@ -473,6 +474,62 @@ def bench_item_curvature(
             results.append(
                 BenchResult(
                     f"item_curvature_{label}_{method}_{jobs}workers",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
+
+
+def bench_bl_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure joint BL optimization and complete fits including curvature."""
+    from mirt.estimation.bl import BLEstimator
+
+    rng = np.random.default_rng(87)
+    categories = [2 + item % 3 for item in range(n_items)]
+    results = []
+    for label, model in (
+        ("2pl_1d", mirt.TwoParameterLogistic(n_items)),
+        ("3pl_1d", mirt.ThreeParameterLogistic(n_items)),
+        ("2pl_2d", mirt.TwoParameterLogistic(n_items, n_factors=2)),
+        ("grm_1d", mirt.GradedResponseModel(n_items, n_categories=categories)),
+        ("gpcm_1d", mirt.GeneralizedPartialCredit(n_items, n_categories=categories)),
+        (
+            "nrm_2d",
+            mirt.NominalResponseModel(n_items, n_categories=categories, n_factors=2),
+        ),
+        ("mirt_2d", mirt.MultidimensionalModel(n_items, n_factors=2)),
+        (
+            "bifactor_3d",
+            mirt.BifactorModel(n_items, specific_factors=np.arange(n_items) % 2),
+        ),
+    ):
+        counts = model.n_categories if model.is_polytomous else [2] * n_items
+        responses = np.column_stack([rng.integers(0, k, n_persons) for k in counts])
+        responses[rng.random(responses.shape) < 0.1] = -1
+
+        def skip_curvature(fitted, data, params, structure):
+            return {
+                name: np.zeros_like(values)
+                for name, values in fitted.parameters.items()
+            }
+
+        for stage in ("optimize", "fit"):
+
+            def run():
+                estimator = BLEstimator(
+                    n_quadpts=21 if model.n_factors == 1 else 5,
+                    max_iter=5,
+                )
+                if stage == "optimize":
+                    estimator._compute_standard_errors = skip_curvature
+                return estimator.fit(model.copy(), responses)
+
+            results.append(
+                BenchResult(
+                    f"bl_{label}_{stage}",
                     _time(run, repeats=repeats, warmups=warmups),
                     _peak_traced_bytes(run),
                 )
@@ -1921,6 +1978,8 @@ def run_suites(
         results.extend(bench_polytomous_fit(n_persons, n_items, repeats, warmups))
     if "item-curvature" in suites:
         results.extend(bench_item_curvature(n_persons, n_items, repeats, warmups))
+    if "bl-fit" in suites:
+        results.extend(bench_bl_fit(n_persons, n_items, repeats, warmups))
     if "variational" in suites:
         results.extend(bench_variational(n_persons, n_items, repeats, warmups))
     if "gvem-uncertainty" in suites:
@@ -2119,6 +2178,7 @@ def _validate_baseline_compatibility(
                 "weighted_standard_errors_",
                 "polytomous_",
                 "item_curvature_",
+                "bl_",
             )
         )
     )

@@ -356,6 +356,25 @@ These methods compute diagonal complete-data curvature. The benchmark step is
 Traced memory includes count preparation and worker models, while excluding
 input creation and native allocations. Posterior arrays remain read-only.
 
+The `bl-fit` suite measures five-iteration joint BL optimization and complete
+fits, including diagonal marginal standard errors. It covers 2PL and 3PL,
+two-factor 2PL/MIRT/NRM, unidimensional GRM/GPCM, and three-factor bifactor
+models. Category counts cycle through two to four, with 10% missing responses.
+Quadrature uses 21 points for one factor and five per dimension otherwise:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite bl-fit --persons 1000 --items 8 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-bl-fit.json
+```
+
+Input creation is excluded; timing includes model copying, validation, and
+response preparation. Built-in joint gradients reuse the clipped item kernels
+and aggregate counts from the current posterior. Trial parameters remain in an
+isolated model, response preparation is reused for curvature, and row blocks
+bound likelihood scratch space. The person-by-quadrature output still scales
+with sample and grid size. Traced memory covers Python/NumPy allocations.
+Custom models, likelihoods, and derivative-free methods use their numerical
+objective.
+
 The `variational` suite measures the shared NumPy E-step used by GVEM and sparse
 Bayesian estimation in one, three, and six dimensions. Each call starts from the
 same local bound values and performs three inner iterations with 10% missing
