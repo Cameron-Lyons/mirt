@@ -16,6 +16,23 @@ _DEFAULT_THETA_VALIDATION = BaseItemModel._ensure_theta_2d
 _DEFAULT_CATEGORY_VALIDATION = PolytomousItemModel._validate_polytomous_responses
 
 
+def uses_default_sample_likelihood(model: BaseItemModel) -> bool:
+    """Whether the sampled likelihood uses the ordinary model validation path."""
+    if any(name in vars(model) for name in ("log_likelihood", "_ensure_theta_2d")):
+        return False
+    if type(model)._ensure_theta_2d is not _DEFAULT_THETA_VALIDATION:
+        return False
+    return (
+        isinstance(model, DichotomousItemModel)
+        and type(model).log_likelihood is _DEFAULT_BINARY_LIKELIHOOD
+    ) or (
+        isinstance(model, PolytomousItemModel)
+        and type(model).log_likelihood is _DEFAULT_CATEGORY_LIKELIHOOD
+        and "_validate_polytomous_responses" not in vars(model)
+        and type(model)._validate_polytomous_responses is _DEFAULT_CATEGORY_VALIDATION
+    )
+
+
 def sampled_log_likelihoods(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -27,15 +44,10 @@ def sampled_log_likelihoods(
     validation methods return ``None`` so their model-based evaluation remains
     authoritative. Only bounded point/response blocks are converted to floats.
     """
-    if any(name in vars(model) for name in ("log_likelihood", "_ensure_theta_2d")):
-        return None
-    if type(model)._ensure_theta_2d is not _DEFAULT_THETA_VALIDATION:
+    if not uses_default_sample_likelihood(model):
         return None
     category_model = None
-    if (
-        isinstance(model, DichotomousItemModel)
-        and type(model).log_likelihood is _DEFAULT_BINARY_LIKELIHOOD
-    ):
+    if isinstance(model, DichotomousItemModel):
         responses = np.asarray(responses)
         if responses.shape[1] != model.n_items:
             raise MirtDataError(
@@ -43,12 +55,7 @@ def sampled_log_likelihoods(
                 n_items=responses.shape[1],
             )
         width = model.n_items
-    elif (
-        isinstance(model, PolytomousItemModel)
-        and type(model).log_likelihood is _DEFAULT_CATEGORY_LIKELIHOOD
-        and "_validate_polytomous_responses" not in vars(model)
-        and type(model)._validate_polytomous_responses is _DEFAULT_CATEGORY_VALIDATION
-    ):
+    elif isinstance(model, PolytomousItemModel):
         category_model = model
         responses = model._validate_polytomous_responses(responses)
         width = max(model.n_categories)

@@ -32,9 +32,14 @@ from scipy.stats import qmc
 
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._gaussian_kernel import gaussian_log_kernel
-from mirt.estimation._mc_likelihood import sampled_log_likelihoods
+from mirt.estimation._mc_likelihood import (
+    sampled_log_likelihoods,
+    uses_default_sample_likelihood,
+)
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
+from mirt.models.base import DichotomousItemModel, PolytomousItemModel
+from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -232,12 +237,8 @@ class MCEMEstimator(BaseEstimator):
         converged = False
 
         for iteration in range(self.max_iter):
-            theta_samples, weights = self._e_step_mc(
+            theta_samples, weights, current_ll = self._e_step_and_marginal_ll(
                 model, responses, prior_mean, cholesky, n_factors
-            )
-
-            current_ll = self._estimate_marginal_ll(
-                model, responses, theta_samples, weights
             )
             self._convergence_history.append(current_ll)
 
@@ -252,6 +253,9 @@ class MCEMEstimator(BaseEstimator):
             prev_ll = current_ll
 
             self._m_step_mc(model, responses, theta_samples, weights)
+            if iteration + 1 < self.max_iter:
+                # Release the previous draw before allocating its replacement.
+                del theta_samples, weights
         else:
             current_ll, weights = self._refresh_mc_state(
                 model, responses, theta_samples, weights
@@ -367,6 +371,20 @@ class MCEMEstimator(BaseEstimator):
         n_factors: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Draw parallel Metropolis samples from every person posterior."""
+        samples, weights, _ = self._draw_posterior_state(
+            model, responses, prior_mean, cholesky, n_factors
+        )
+        return samples, weights
+
+    def _draw_posterior_state(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        cholesky: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return posterior draws, weights, and their final likelihood values."""
         n_persons = responses.shape[0]
         rng = self._random_generator()
         standard_normal = rng.standard_normal((n_persons, self.n_samples, n_factors))
@@ -430,7 +448,7 @@ class MCEMEstimator(BaseEstimator):
             1.0 / self.n_samples,
             dtype=np.float64,
         )
-        return current, weights
+        return current, weights, current_ll
 
     def _e_step_mc(
         self,
@@ -444,17 +462,82 @@ class MCEMEstimator(BaseEstimator):
 
         Returns theta samples and their importance weights for each person.
         """
-        n_persons = responses.shape[0]
         if not self.importance_sampling:
             return self._draw_posterior_samples(
                 model, responses, prior_mean, L, n_factors
             )
+        samples, weights, _ = self._e_step_mc_state(
+            model, responses, prior_mean, L, n_factors
+        )
+        return samples, weights
+
+    def _e_step_mc_state(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        L: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return draws, weights, and importance normalizers or posterior likelihoods."""
+        if not self.importance_sampling:
+            return self._draw_posterior_state(
+                model, responses, prior_mean, L, n_factors
+            )
+        n_persons = responses.shape[0]
         rng = self._random_generator()
         z = rng.standard_normal((n_persons, self.n_samples, n_factors))
-        theta_samples = prior_mean + np.einsum("ij,...j->...i", L, z)
+        theta_samples = np.einsum("ij,...j->...i", L, z)
+        theta_samples += prior_mean
+        del z
         log_likes = self._sample_log_likelihoods(model, responses, theta_samples)
-        weights, _ = self._normalized_importance_weights(log_likes)
-        return theta_samples, weights
+        weights, log_normalizer = self._normalized_importance_weights(log_likes)
+        return theta_samples, weights, log_normalizer
+
+    def _uses_default_sampling_methods(self, model: BaseItemModel) -> bool:
+        """Reuse E-step evidence only when existing sampling hooks are unchanged."""
+        methods = _DEFAULT_MC_STATE_METHODS.get(type(self))
+        return (
+            methods is not None
+            and uses_default_sample_likelihood(model)
+            and (
+                type(self) is not QMCEMEstimator
+                or (
+                    "log_likelihood_batch" not in vars(model)
+                    and type(model).log_likelihood_batch
+                    in _DEFAULT_QMC_BATCH_LIKELIHOODS
+                )
+            )
+            and MCEMEstimator._sample_log_likelihoods is _DEFAULT_MC_SAMPLE_LIKELIHOODS
+            and all(
+                name not in vars(self) and getattr(type(self), name) is method
+                for name, method in methods.items()
+            )
+        )
+
+    def _e_step_and_marginal_ll(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        cholesky: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
+        """Evaluate one E-step, reusing fresh evidence for ordinary fit reporting."""
+        if not self._uses_default_sampling_methods(model):
+            samples, weights = self._e_step_mc(
+                model, responses, prior_mean, cholesky, n_factors
+            )
+            marginal_ll = self._estimate_marginal_ll(model, responses, samples, weights)
+            return samples, weights, marginal_ll
+        samples, weights, evidence = self._e_step_mc_state(
+            model, responses, prior_mean, cholesky, n_factors
+        )
+        if self.importance_sampling:
+            log_marginal = evidence.ravel() - np.log(self.n_samples)
+        else:
+            log_marginal = -(logsumexp(-evidence, axis=1) - np.log(self.n_samples))
+        return samples, weights, float(np.sum(log_marginal))
 
     def _estimate_marginal_ll(
         self,
@@ -759,6 +842,20 @@ class QMCEMEstimator(MCEMEstimator):
         n_factors: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """E-step using Quasi-Monte Carlo sampling."""
+        samples, weights, _ = self._e_step_mc_state(
+            model, responses, prior_mean, L, n_factors
+        )
+        return samples, weights
+
+    def _e_step_mc_state(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        L: NDArray[np.float64],
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return shared QMC draws, weights, and their importance normalizers."""
         n_persons = responses.shape[0]
 
         if self.sequence == "sobol":
@@ -789,9 +886,9 @@ class QMCEMEstimator(MCEMEstimator):
             )
         else:
             log_likes = self._sample_log_likelihoods(model, responses, theta_samples)
-        weights, _ = self._normalized_importance_weights(log_likes)
+        weights, log_normalizer = self._normalized_importance_weights(log_likes)
 
-        return theta_samples, weights
+        return theta_samples, weights, log_normalizer
 
     def _sample_log_likelihoods(
         self,
@@ -1035,3 +1132,32 @@ _DEFAULT_MC_ITEM_METHODS = {
 }
 
 _DEFAULT_MC_SAMPLE_LIKELIHOODS = MCEMEstimator._sample_log_likelihoods
+
+_DEFAULT_QMC_BATCH_LIKELIHOODS = {
+    cls.log_likelihood_batch
+    for cls in (
+        DichotomousItemModel,
+        PolytomousItemModel,
+        GradedResponseModel,
+        GeneralizedPartialCredit,
+    )
+}
+
+_DEFAULT_MC_STATE_METHODS = {
+    cls: {
+        name: getattr(cls, name)
+        for name in (
+            "_e_step_mc",
+            "_e_step_mc_state",
+            "_draw_posterior_samples",
+            "_draw_posterior_state",
+            "_gaussian_log_kernel",
+            "_sample_log_likelihoods",
+            "_normalized_importance_weights",
+            "_validated_log_likelihoods",
+            "_estimate_marginal_ll",
+            "_refresh_mc_state",
+        )
+    }
+    for cls in (MCEMEstimator, QMCEMEstimator, StochasticEMEstimator)
+}
