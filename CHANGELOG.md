@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Reused clipped item-gradient kernels for joint BL marginal optimization of
+  built-in 1PL–4PL, GRM, GPCM, PCM, NRM, MIRT, and bifactor models. Shared
+  response preparation with diagonal marginal curvature, bounded likelihood
+  scratch space, and isolated trial model state. Added a `bl-fit` timing and
+  traced-memory benchmark suite. Custom likelihoods retain numerical optimization.
 - Shared numerical item curvature across EM and standalone standard errors.
   Prepared bounded posterior counts once per uncertainty call, reused them
   across Richardson step sizes, and used one worker pool for all item fields.
@@ -165,6 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed redundant marginal reductions when all coordinates are unique.
 
 ### Fixed
+- Restored BL parameters after failed numerical optimization or curvature
+  trials, and skipped optimization for models with no free parameters.
 - Preserved custom model constructor state and bound instance probability
   methods in parallel numerical uncertainty. Core EM uncertainty falls back
   to numerical curvature for custom curve and parameter overrides.
