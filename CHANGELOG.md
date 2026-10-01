@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history, available pool, or exposure state, allowing corrected submissions.
 - Matched native CAT simulation posteriors to the public EAP scorer's bounded
   binary probabilities, including saturated curves. Native dispatch preserves
-  customized model, selection, control, stopping, and engine methods.
+  customized model, selection, control, stopping, and engine methods. Native
+  results preserve configured stopping-rule priority and distinguish item-pool
+  exhaustion from a reached length cap.
 - Checked native response-buffer alignment before constructing Rust slices,
   normalized unaligned inputs in the Python grouping wrapper, and copied array
   dimensions before releasing the GIL.

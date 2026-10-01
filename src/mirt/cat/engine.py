@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -660,17 +661,28 @@ class CATEngine:
 
         theta_est, se_est, n_items, _, item_paths, response_paths = result
 
+        # Preserve authored rule priority and distinguish an exhausted pool
+        # from a configured maximum. Evaluating an isolated copy also leaves
+        # the engine's previous interactive stopping state intact.
+        stopping = deepcopy(self._stopping)
         results = []
         for i in range(len(theta_est)):
             count = int(n_items[i])
             items = np.asarray(item_paths[i, :count], dtype=np.int_).tolist()
             responses = np.asarray(response_paths[i, :count], dtype=np.int_)
-            if se_est[i] <= se_threshold and count >= min_items:
-                stopping_reason = f"SE threshold reached (SE <= {se_threshold})"
-            elif count >= max_items:
-                stopping_reason = f"Maximum items reached ({max_items})"
-            else:
-                stopping_reason = "Item bank exhausted"
+            stopping.reset()
+            state = CATState(
+                theta=float(theta_est[i]),
+                standard_error=float(se_est[i]),
+                items_administered=items,
+                responses=responses.tolist(),
+                n_items=count,
+            )
+            stopping_reason = (
+                stopping.get_reason()
+                if stopping.should_stop(state)
+                else "Item pool exhausted"
+            )
             results.append(
                 CATResult(
                     theta=float(theta_est[i]),
