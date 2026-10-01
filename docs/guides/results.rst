@@ -53,7 +53,7 @@ Diagnostic group refits use this mode by default.
 two-dimensional parameters through the configured pandas or polars backend.
 
 Monte Carlo item uncertainty
----------------------------
+----------------------------
 
 ``MCEMEstimator``, ``QMCEMEstimator``, and ``StochasticEMEstimator`` can estimate
 optional diagonal complete-data standard errors on the final draws and weights:
