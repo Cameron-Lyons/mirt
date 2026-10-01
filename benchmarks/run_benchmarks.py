@@ -36,6 +36,7 @@ SUITE_ORDER = (
     "model-fit",
     "cat",
     "kernels",
+    "binary-likelihood",
     "gpu-likelihood",
     "optimization",
     "information",
@@ -256,6 +257,75 @@ def bench_scoring(
         "eap_scoring",
         _time(run, repeats=repeats, warmups=warmups),
     )
+
+
+def bench_binary_likelihood(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure public binary likelihoods with matched, shared, and grid points."""
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.dichotomous import (
+        ComplementaryLogLog,
+        FiveParameterLogistic,
+        FourParameterLogistic,
+        NegativeLogLog,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+        UnipolarLogLogistic,
+    )
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    rng = np.random.default_rng(990)
+    responses = rng.integers(0, 2, (n_persons, n_items))
+    responses[rng.uniform(size=responses.shape) < 0.1] = -1
+    models = (
+        ("1pl", OneParameterLogistic(n_items)),
+        ("2pl", TwoParameterLogistic(n_items)),
+        ("3pl", ThreeParameterLogistic(n_items)),
+        ("4pl", FourParameterLogistic(n_items)),
+        ("5pl", FiveParameterLogistic(n_items)),
+        ("mirt", MultidimensionalModel(n_items, 3)),
+        ("bifactor", BifactorModel(n_items, np.arange(n_items) % 2)),
+        ("ull", UnipolarLogLogistic(n_items)),
+        ("cll", ComplementaryLogLog(n_items)),
+        ("nll", NegativeLogLog(n_items)),
+    )
+    results = []
+    for label, model in models:
+        parameters = model.parameters
+        if label == "1pl":
+            parameters.pop("discrimination")
+        for key in ("discrimination", "general_loadings", "specific_loadings"):
+            if key in parameters:
+                parameters[key] = rng.uniform(0.5, 2.0, parameters[key].shape)
+        for key in ("difficulty", "intercepts", "slopes"):
+            if key in parameters:
+                parameters[key] = rng.normal(size=parameters[key].shape)
+        if "guessing" in parameters:
+            parameters["guessing"] = np.full(n_items, 0.15)
+        if "upper" in parameters:
+            parameters["upper"] = np.full(n_items, 0.95)
+        if "asymmetry" in parameters:
+            parameters["asymmetry"] = rng.uniform(0.8, 1.5, n_items)
+        model.set_parameters(**parameters)
+        theta = rng.normal(size=(n_persons, model.n_factors))
+        shared = np.zeros((1, model.n_factors))
+        grid = rng.normal(size=(121, model.n_factors))
+        for stage, run in (
+            ("matched", lambda: model.log_likelihood(responses, theta)),
+            ("shared", lambda: model.log_likelihood(responses, shared)),
+            ("grid_21", lambda: model.log_likelihood_batch(responses, grid[:21])),
+            ("grid_121", lambda: model.log_likelihood_batch(responses, grid)),
+        ):
+            results.append(
+                BenchResult(
+                    f"binary_likelihood_{label}_{stage}",
+                    _time(run, repeats=repeats, warmups=warmups),
+                    _peak_traced_bytes(run),
+                )
+            )
+    return results
 
 
 def bench_gpu_likelihood(
@@ -2369,6 +2439,8 @@ def run_suites(
         results.append(bench_cat(n_items, repeats, warmups))
     if "kernels" in suites:
         results.extend(bench_kernels(n_persons, n_items, repeats, warmups))
+    if "binary-likelihood" in suites:
+        results.extend(bench_binary_likelihood(n_persons, n_items, repeats, warmups))
     if "gpu-likelihood" in suites:
         results.extend(bench_gpu_likelihood(n_persons, n_items, repeats, warmups))
     if "optimization" in suites:
@@ -2638,6 +2710,7 @@ def _validate_baseline_compatibility(
                 "mcem_",
                 "qmcem_",
                 "gpu_likelihood_",
+                "binary_likelihood_",
             )
         )
     )

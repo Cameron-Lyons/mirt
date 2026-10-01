@@ -7,11 +7,13 @@ from numpy.typing import NDArray
 
 from mirt._model_defaults import original_model_hook
 from mirt.constants import PROB_EPSILON
-from mirt.exceptions import MirtDataError
 from mirt.models.base import BaseItemModel, DichotomousItemModel, PolytomousItemModel
 
 _MAX_MC_LIKELIHOOD_ELEMENTS = 131_072
 _DEFAULT_BINARY_LIKELIHOOD = original_model_hook(DichotomousItemModel, "log_likelihood")
+_DEFAULT_BINARY_VALIDATION = original_model_hook(
+    DichotomousItemModel, "_validate_dichotomous_responses"
+)
 _DEFAULT_CATEGORY_LIKELIHOOD = original_model_hook(
     PolytomousItemModel, "log_likelihood"
 )
@@ -30,6 +32,8 @@ def uses_default_sample_likelihood(model: BaseItemModel) -> bool:
     return (
         isinstance(model, DichotomousItemModel)
         and type(model).log_likelihood is _DEFAULT_BINARY_LIKELIHOOD
+        and "_validate_dichotomous_responses" not in vars(model)
+        and type(model)._validate_dichotomous_responses is _DEFAULT_BINARY_VALIDATION
     ) or (
         isinstance(model, PolytomousItemModel)
         and type(model).log_likelihood is _DEFAULT_CATEGORY_LIKELIHOOD
@@ -53,12 +57,7 @@ def sampled_log_likelihoods(
         return None
     category_model = None
     if isinstance(model, DichotomousItemModel):
-        responses = np.asarray(responses)
-        if responses.shape[1] != model.n_items:
-            raise MirtDataError(
-                f"responses has {responses.shape[1]} items, expected {model.n_items}",
-                n_items=responses.shape[1],
-            )
+        responses = model._validate_dichotomous_responses(responses)
         width = model.n_items
     elif isinstance(model, PolytomousItemModel):
         category_model = model
@@ -131,10 +130,16 @@ def _binary_log_likelihoods(
         np.copyto(selected, 0.0, where=~observed[:, None, :])
         return selected.sum(axis=2)
     # Preserve the public curve's dtype and general response-value behavior.
+    if responses.dtype.kind == "u":
+        responses = responses.astype(
+            np.result_type(responses.dtype, probabilities.dtype), copy=False
+        )
     failure = np.log(1.0 - probabilities).reshape(*shape, model.n_items)
     np.log(probabilities, out=probabilities)
     success = probabilities.reshape(*shape, model.n_items)
     terms = success * responses[:, None, :]
+    if responses.dtype.kind == "b":
+        terms = terms.astype(np.result_type(np.int64, probabilities.dtype), copy=False)
     terms += failure * (1 - responses[:, None, :])
     np.copyto(terms, 0.0, where=~observed[:, None, :])
     return terms.sum(axis=2)

@@ -521,3 +521,81 @@ def test_original_likelihood_hooks_do_not_require_prepared_item_support():
     assert not uses_builtin_model_hooks(model)
     assert uses_original_model_hook(model, "log_likelihood_batch")
     assert QMCEMEstimator()._uses_default_sampling_methods(model)
+
+
+@pytest.mark.parametrize("binding", ["class", "instance"])
+@pytest.mark.parametrize("kind", ["2pl", "3pl", "mirt", "bifactor"])
+def test_binary_validation_override_controls_joint_and_sample_likelihoods(
+    kind, binding, monkeypatch
+):
+    model = _model(kind)
+    original = type(model)._validate_dichotomous_responses
+    calls = []
+
+    def validate(self, responses):
+        calls.append(len(responses))
+        values = original(self, responses)
+        return np.where(values >= 0, 1 - values, values)
+
+    if binding == "class":
+        monkeypatch.setattr(type(model), "_validate_dichotomous_responses", validate)
+    else:
+        monkeypatch.setattr(
+            model, "_validate_dichotomous_responses", validate.__get__(model)
+        )
+    data, quadrature, _ = _problem(model)
+    reversed_data = np.where(data >= 0, 1 - data, data)
+    probabilities = np.clip(
+        model.probability(quadrature.nodes), PROB_EPSILON, 1 - PROB_EPSILON
+    )
+    expected = np.where(
+        reversed_data[:, None, :] >= 0,
+        reversed_data[:, None, :] * np.log(probabilities)[None, :, :]
+        + (1 - reversed_data[:, None, :]) * np.log(1 - probabilities)[None, :, :],
+        0.0,
+    ).sum(axis=2)
+    assert not uses_builtin_model_hooks(model, likelihood=True)
+    assert uses_builtin_model_hooks(model)
+    assert not supports_pattern_compression(model)
+    assert _prepare_item(model, quadrature.nodes) is not None
+    for estimator in (MCEMEstimator(n_samples=50), QMCEMEstimator(n_samples=50)):
+        assert not estimator._uses_default_sampling_methods(model)
+        points = np.broadcast_to(quadrature.nodes[:1], (len(data), 50, model.n_factors))
+        calls.clear()
+        actual = estimator._sample_log_likelihoods(model, data, points)
+        np.testing.assert_allclose(
+            actual, np.broadcast_to(expected[:, :1], actual.shape), atol=1e-13
+        )
+        assert calls == [
+            len(data) if isinstance(estimator, QMCEMEstimator) else len(data) * 50
+        ]
+    monkeypatch.setattr(EMEstimator, "_should_use_gpu", property(lambda self: True))
+
+    def fail(*args):
+        pytest.fail("custom validation must run through the public likelihood")
+
+    monkeypatch.setattr(EMEstimator, "_compute_log_likelihoods_gpu", fail)
+    actual = EMEstimator()._compute_log_likelihoods(model, data, quadrature.nodes)
+    np.testing.assert_allclose(actual, expected, atol=1e-13)
+
+
+def test_binary_validation_is_recorded_before_model_and_estimator_imports():
+    script = """
+from mirt.models.base import DichotomousItemModel
+original = DichotomousItemModel._validate_dichotomous_responses
+DichotomousItemModel._validate_dichotomous_responses = lambda self, x: original(self, x)
+from mirt.models.dichotomous import TwoParameterLogistic
+from mirt._model_defaults import uses_builtin_model_hooks
+from mirt.estimation._mc_likelihood import uses_default_sample_likelihood
+from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator
+model = TwoParameterLogistic(1)
+assert not uses_builtin_model_hooks(model, likelihood=True)
+assert uses_builtin_model_hooks(model)
+assert not uses_default_sample_likelihood(model)
+assert not MCEMEstimator()._uses_default_sampling_methods(model)
+assert not QMCEMEstimator()._uses_default_sampling_methods(model)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
