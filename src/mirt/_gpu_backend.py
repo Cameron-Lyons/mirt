@@ -182,6 +182,18 @@ def to_numpy(tensor: Any) -> NDArray[np.float64]:
     return tensor.detach().cpu().numpy()
 
 
+def _aggregate_dichotomous_log_likelihoods(
+    torch: ModuleType, responses: Any, probabilities: Any
+) -> Any:
+    """Reduce binary curves without a person/grid/item likelihood tensor."""
+    observed = responses >= 0
+    coefficients = torch.where(observed, responses, 0.0)
+    log_likes = coefficients @ torch.log(probabilities).T
+    coefficients.neg_().add_(observed)
+    log_likes.addmm_(coefficients, torch.log1p(-probabilities).T)
+    return log_likes
+
+
 def compute_log_likelihoods_2pl_gpu(
     responses: NDArray[np.int_],
     quad_points: NDArray[np.float64],
@@ -216,22 +228,11 @@ def compute_log_likelihoods_2pl_gpu(
     a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
     b = torch.from_numpy(difficulty.astype(np.float64)).to(device)
 
-    z = a[None, None, :] * (theta[None, :, None] - b[None, None, :])
+    z = a[None, :] * (theta[:, None] - b[None, :])
     probs = torch.sigmoid(z)
     probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
 
-    valid = (resp >= 0).unsqueeze(1)
-    resp_exp = resp.unsqueeze(1)
-
-    log_p1 = torch.log(probs)
-    log_p0 = torch.log(1 - probs)
-
-    ll_correct = resp_exp * log_p1
-    ll_incorrect = (1 - resp_exp) * log_p0
-    ll_per_item = ll_correct + ll_incorrect
-
-    ll_per_item = torch.where(valid, ll_per_item, torch.zeros_like(ll_per_item))
-    log_likes = ll_per_item.sum(dim=2)
+    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
 
     return to_numpy(log_likes)
 
@@ -271,20 +272,12 @@ def compute_log_likelihoods_3pl_gpu(
     b = torch.from_numpy(difficulty.astype(np.float64)).to(device)
     c = torch.from_numpy(guessing.astype(np.float64)).to(device)
 
-    z = a[None, None, :] * (theta[None, :, None] - b[None, None, :])
+    z = a[None, :] * (theta[:, None] - b[None, :])
     p_star = torch.sigmoid(z)
-    probs = c[None, None, :] + (1 - c[None, None, :]) * p_star
+    probs = c[None, :] + (1 - c[None, :]) * p_star
     probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
 
-    valid = (resp >= 0).unsqueeze(1)
-    resp_exp = resp.unsqueeze(1)
-
-    log_p1 = torch.log(probs)
-    log_p0 = torch.log(1 - probs)
-
-    ll_per_item = resp_exp * log_p1 + (1 - resp_exp) * log_p0
-    ll_per_item = torch.where(valid, ll_per_item, torch.zeros_like(ll_per_item))
-    log_likes = ll_per_item.sum(dim=2)
+    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
 
     return to_numpy(log_likes)
 
@@ -326,18 +319,7 @@ def compute_log_likelihoods_mirt_gpu(
     probs = torch.sigmoid(z)
     probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
 
-    valid = resp >= 0
-    log_p1 = torch.log(probs)
-    log_p0 = torch.log(1 - probs)
-
-    ll_per_item = (
-        resp[:, None, :] * log_p1[None, :, :]
-        + (1 - resp[:, None, :]) * log_p0[None, :, :]
-    )
-    ll_per_item = torch.where(
-        valid[:, None, :], ll_per_item, torch.zeros_like(ll_per_item)
-    )
-    log_likes = ll_per_item.sum(dim=2)
+    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
 
     return to_numpy(log_likes)
 
@@ -387,16 +369,11 @@ def e_step_complete_gpu(
     a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
     b = torch.from_numpy(difficulty.astype(np.float64)).to(device)
 
-    z = a[None, None, :] * (theta[None, :, None] - b[None, None, :])
+    z = a[None, :] * (theta[:, None] - b[None, :])
     probs = torch.sigmoid(z)
     probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
 
-    valid = (resp >= 0).unsqueeze(1)
-    resp_exp = resp.unsqueeze(1)
-
-    ll_per_item = resp_exp * torch.log(probs) + (1 - resp_exp) * torch.log(1 - probs)
-    ll_per_item = torch.where(valid, ll_per_item, torch.zeros_like(ll_per_item))
-    log_likes = ll_per_item.sum(dim=2)
+    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
 
     log_reference = -0.5 * (np.log(2 * np.pi) + theta**2)
     log_target = (
@@ -712,8 +689,9 @@ def _validate_polytomous_likelihood_inputs(
     quad_points: NDArray[np.float64],
     discrimination: NDArray[np.float64],
     thresholds: NDArray[np.float64],
-) -> int:
-    """Validate shared polytomous likelihood inputs and return category count."""
+    n_categories: NDArray[np.int_] | list[int] | None = None,
+) -> NDArray[np.int_]:
+    """Validate shared inputs and return each item's active category count."""
     response_values = np.asarray(responses)
     point_values = np.asarray(quad_points)
     discrimination_values = np.asarray(discrimination)
@@ -732,6 +710,25 @@ def _validate_polytomous_likelihood_inputs(
         or threshold_values.shape[1] == 0
     ):
         raise ValueError("thresholds must have shape (n_items, n_categories - 1)")
+    max_categories = threshold_values.shape[1] + 1
+    counts = (
+        np.full(n_items, max_categories, dtype=np.int_)
+        if n_categories is None
+        else np.asarray(n_categories)
+    )
+    if (
+        counts.shape != (n_items,)
+        or counts.dtype.kind not in "iu"
+        or np.any(counts < 2)
+        or np.any(counts > max_categories)
+    ):
+        raise ValueError(
+            f"n_categories must contain {n_items} integer counts between "
+            f"2 and {max_categories}"
+        )
+    active_thresholds = np.arange(threshold_values.shape[1])[None, :] < (
+        counts[:, None] - 1
+    )
     if not np.all(np.isfinite(response_values)) or np.any(
         response_values != np.floor(response_values)
     ):
@@ -739,18 +736,19 @@ def _validate_polytomous_likelihood_inputs(
     if (
         not np.all(np.isfinite(point_values))
         or not np.all(np.isfinite(discrimination_values))
-        or not np.all(np.isfinite(threshold_values))
+        or not np.all(np.isfinite(threshold_values[active_thresholds]))
     ):
         raise ValueError("model parameters and quadrature points must be finite")
 
-    n_categories = threshold_values.shape[1] + 1
     observed = response_values >= 0
-    if np.any(response_values[observed] >= n_categories):
+    invalid = observed & (response_values >= counts[None, :])
+    if np.any(invalid):
+        item = int(np.flatnonzero(np.any(invalid, axis=0))[0])
         raise ValueError(
-            "responses must be negative for missing values or between "
-            f"0 and {n_categories - 1}"
+            f"responses for item {item} must be negative for missing values "
+            f"or between 0 and {counts[item] - 1}"
         )
-    return n_categories
+    return counts.astype(np.int_, copy=False)
 
 
 def _aggregate_polytomous_log_likelihoods(
@@ -778,6 +776,8 @@ def compute_log_likelihoods_grm_gpu(
     quad_points: NDArray[np.float64],
     discrimination: NDArray[np.float64],
     thresholds: NDArray[np.float64],
+    *,
+    n_categories: NDArray[np.int_] | list[int] | None = None,
 ) -> NDArray[np.float64]:
     """GPU-accelerated log-likelihood for Graded Response Model.
 
@@ -791,19 +791,25 @@ def compute_log_likelihoods_grm_gpu(
         Item discrimination parameters.
     thresholds : ndarray of shape (n_items, n_categories-1)
         Category threshold parameters.
+    n_categories : array_like of shape (n_items,), optional
+        Active category count for each item. Defaults to the full parameter
+        width for every item. Unused threshold padding is ignored.
 
     Returns
     -------
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    n_categories = _validate_polytomous_likelihood_inputs(
+    counts = _validate_polytomous_likelihood_inputs(
         responses,
         quad_points,
         discrimination,
         thresholds,
+        n_categories,
     )
-    if np.any(np.diff(thresholds, axis=1) <= 0.0):
+    threshold_values = np.asarray(thresholds)
+    adjacent = np.arange(threshold_values.shape[1] - 1)[None, :] < (counts[:, None] - 2)
+    if np.any(adjacent & (threshold_values[:, 1:] <= threshold_values[:, :-1])):
         raise ValueError("GRM thresholds must be strictly increasing within each item")
 
     torch, device = _load_torch_runtime()
@@ -814,6 +820,11 @@ def compute_log_likelihoods_grm_gpu(
 
     boundary_logits = a[None, :, None] * (theta[:, None, None] - b[None, :, :])
     boundary_probabilities = torch.sigmoid(boundary_logits)
+    if np.any(counts != b.shape[1] + 1):
+        active = torch.arange(b.shape[1], device=device)[None, :] < (
+            torch.as_tensor(counts, device=device)[:, None] - 1
+        )
+        boundary_probabilities.masked_fill_(~active[None, :, :], 0.0)
     shape = (theta.shape[0], responses.shape[1], 1)
     cumulative_probabilities = torch.cat(
         (
@@ -824,8 +835,7 @@ def compute_log_likelihoods_grm_gpu(
         dim=2,
     )
     category_probabilities = (
-        cumulative_probabilities[:, :, :n_categories]
-        - cumulative_probabilities[:, :, 1:]
+        cumulative_probabilities[:, :, :-1] - cumulative_probabilities[:, :, 1:]
     ).clamp(PROB_EPSILON, 1.0)
     log_likes = _aggregate_polytomous_log_likelihoods(
         torch,
@@ -840,6 +850,8 @@ def compute_log_likelihoods_gpcm_gpu(
     quad_points: NDArray[np.float64],
     discrimination: NDArray[np.float64],
     thresholds: NDArray[np.float64],
+    *,
+    n_categories: NDArray[np.int_] | list[int] | None = None,
 ) -> NDArray[np.float64]:
     """GPU-accelerated log-likelihood for Generalized Partial Credit Model.
 
@@ -853,17 +865,21 @@ def compute_log_likelihoods_gpcm_gpu(
         Item discrimination parameters.
     thresholds : ndarray of shape (n_items, n_categories-1)
         Step difficulty parameters.
+    n_categories : array_like of shape (n_items,), optional
+        Active category count for each item. Defaults to the full parameter
+        width for every item. Unused step padding is ignored.
 
     Returns
     -------
     ndarray of shape (n_persons, n_quad)
         Log-likelihoods.
     """
-    _validate_polytomous_likelihood_inputs(
+    counts = _validate_polytomous_likelihood_inputs(
         responses,
         quad_points,
         discrimination,
         thresholds,
+        n_categories,
     )
     torch, device = _load_torch_runtime()
     resp = torch.as_tensor(responses, device=device, dtype=torch.int64)
@@ -881,6 +897,12 @@ def compute_log_likelihoods_gpcm_gpu(
         (zero_logits, torch.cumsum(step_logits, dim=2)),
         dim=2,
     )
+    if np.any(counts != category_logits.shape[2]):
+        active = (
+            torch.arange(category_logits.shape[2], device=device)[None, :]
+            < (torch.as_tensor(counts, device=device)[:, None])
+        )
+        category_logits.masked_fill_(~active[None, :, :], -float("inf"))
     log_category_probabilities = torch.log_softmax(category_logits, dim=2).clamp_min(
         float(np.log(PROB_EPSILON))
     )

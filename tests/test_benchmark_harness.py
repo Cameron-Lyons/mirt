@@ -330,6 +330,7 @@ class TestBenchmarkCommand:
             "model-fit",
             "cat",
             "kernels",
+            "gpu-likelihood",
             "optimization",
             "information",
             "latent-density",
@@ -376,6 +377,7 @@ class TestBenchmarkCommand:
             "model-fit",
             "cat",
             "kernels",
+            "gpu-likelihood",
             "optimization",
             "information",
             "latent-density",
@@ -408,6 +410,61 @@ class TestBenchmarkCommand:
             "qmcem-fit",
             "mcem-sampling",
         )
+
+    def test_tensor_suite_requires_optional_runtime(self, monkeypatch):
+        from mirt import _gpu_backend
+
+        monkeypatch.setattr(_gpu_backend, "is_torch_available", lambda: False)
+        with pytest.raises(ValueError, match="optional PyTorch"):
+            benchmark.run_suites(
+                ("gpu-likelihood",), n_persons=8, n_items=2, repeats=1, warmups=0
+            )
+
+    def test_tensor_suite_records_device_and_checks_workload_compatibility(self):
+        from mirt import _gpu_backend
+
+        if not _gpu_backend.is_torch_available():
+            pytest.skip("PyTorch not installed")
+        torch, device = _gpu_backend._load_torch_runtime()
+        results = benchmark.run_suites(
+            ("gpu-likelihood",), n_persons=12, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"gpu_likelihood_{device.type}_{label}"
+            for label in (
+                "1pl",
+                "2pl",
+                "complete_e_step",
+                "3pl",
+                "mirt_3d",
+                "grm",
+                "grm_mixed",
+                "gpcm",
+                "gpcm_mixed",
+                "pcm_mixed",
+            )
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes is None for result in results)
+        report = benchmark.build_report(
+            results,
+            suites=("gpu-likelihood",),
+            n_persons=12,
+            n_items=4,
+            repeats=2,
+            warmups=1,
+            backend_info=_backend_info(),
+        )
+        assert report["environment"]["torch_version"] == str(torch.__version__)
+        assert report["environment"]["tensor_device"] == str(device)
+        other = json.loads(json.dumps(report))
+        other["configuration"]["persons"] = 13
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(report, other, max_regression_percent=5)
+        other["configuration"]["persons"] = 12
+        other["environment"]["torch_version"] = "different version"
+        with pytest.raises(ValueError, match="tensor runtime"):
+            benchmark.compare_results(report, other, max_regression_percent=5)
 
     def test_weighted_em_suite_records_time_memory_and_checks_person_count(self):
         results = benchmark.run_suites(
