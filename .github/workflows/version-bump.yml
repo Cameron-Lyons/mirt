@@ -7,10 +7,11 @@ on:
 
 jobs:
   bump-version:
-    if: github.event.pull_request.merged == true
+    if: github.event.pull_request.merged == true && !startsWith(github.event.pull_request.head.ref, 'release/version-bump-')
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -19,8 +20,9 @@ jobs:
 
       - name: Determine bump type
         id: bump-type
+        env:
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
         run: |
-          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
           if echo "$LABELS" | grep -q '"major"'; then
             echo "type=major" >> "$GITHUB_OUTPUT"
           elif echo "$LABELS" | grep -q '"minor"'; then
@@ -29,7 +31,22 @@ jobs:
             echo "type=patch" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Prepare version branch
+        id: branch
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          branch="release/version-bump-$PR_NUMBER"
+          echo "name=$branch" >> "$GITHUB_OUTPUT"
+          if git ls-remote --heads origin "refs/heads/$branch" | grep -q .; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            git switch -c "$branch"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Bump version
+        if: steps.branch.outputs.exists == 'false'
         id: version
         run: |
           VERSION_FILE="src/mirt/_version.py"
@@ -59,9 +76,34 @@ jobs:
           echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
+        if: steps.branch.outputs.exists == 'false'
+        env:
+          VERSION_BRANCH: ${{ steps.branch.outputs.name }}
+          OLD_VERSION: ${{ steps.version.outputs.old }}
+          NEW_VERSION: ${{ steps.version.outputs.new }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add src/mirt/_version.py
-          git commit -m "Bump version: ${{ steps.version.outputs.old }} → ${{ steps.version.outputs.new }}"
-          git push
+          git commit -m "Bump version: $OLD_VERSION → $NEW_VERSION"
+          git push origin "HEAD:refs/heads/$VERSION_BRANCH"
+
+      - name: Open version update for review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_BRANCH: ${{ steps.branch.outputs.name }}
+        run: |
+          existing=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$VERSION_BRANCH" --state all --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "Version update: $existing" >> "$GITHUB_STEP_SUMMARY"
+          elif gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$VERSION_BRANCH" \
+            --title "Update package version" \
+            --body "Automatic version update following a merged pull request." \
+            > "$RUNNER_TEMP/version-pr" 2> "$RUNNER_TEMP/version-pr-error"; then
+            cat "$RUNNER_TEMP/version-pr" >> "$GITHUB_STEP_SUMMARY"
+          elif grep -q 'GitHub Actions is not permitted to create or approve pull requests' "$RUNNER_TEMP/version-pr-error"; then
+            echo "Version update branch ready for review: https://github.com/$GITHUB_REPOSITORY/compare/main...$VERSION_BRANCH?expand=1" >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$RUNNER_TEMP/version-pr-error" >&2
+            exit 1
+          fi
