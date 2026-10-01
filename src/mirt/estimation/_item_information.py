@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.estimation._em_context import EMFitContext
 
 if TYPE_CHECKING:
@@ -52,19 +53,7 @@ def item_standard_errors(
             GeneralizedPartialCredit,
             PartialCreditModel,
         )
-        or any(
-            name in vars(model)
-            for name in (
-                "probability",
-                "_category_probabilities",
-                "_evaluate_logistic",
-                "_ensure_theta_2d",
-                "set_parameters",
-                "set_item_parameter",
-                "_canonical_parameter_values",
-                "free_parameter_masks",
-            )
-        )
+        or not uses_builtin_model_hooks(model)
     ):
         return None
     params = model.parameters

@@ -8,9 +8,11 @@ from mirt._logistic import (
     _item_information,
     _test_information,
 )
+from mirt._model_defaults import register_builtin_model as _register_builtin_model
 from mirt.models.base import DichotomousItemModel
 
 
+@_register_builtin_model
 class BifactorModel(DichotomousItemModel):
     """Bifactor model with one general and one specific loading per item.
 

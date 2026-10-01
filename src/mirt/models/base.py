@@ -4,12 +4,14 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import record_model_base as _record_model_base
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
 
 _DICHOTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
 
 
+@_record_model_base
 class BaseItemModel(ABC):
     model_name: str = "BaseModel"
     n_params_per_item: int = 0
@@ -332,6 +334,7 @@ class BaseItemModel(ABC):
         )
 
 
+@_record_model_base
 class DichotomousItemModel(BaseItemModel):
     def icc(
         self,
@@ -467,6 +470,7 @@ class DichotomousItemModel(BaseItemModel):
         return responses
 
 
+@_record_model_base
 class PolytomousItemModel(BaseItemModel):
     def __init__(
         self,
@@ -647,6 +651,7 @@ class PolytomousItemModel(BaseItemModel):
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         responses = self._validate_polytomous_responses(responses)
+        curve_theta = theta
         theta = self._ensure_theta_2d(theta)
         n_response_rows = responses.shape[0]
         n_theta_rows = theta.shape[0]
@@ -670,7 +675,7 @@ class PolytomousItemModel(BaseItemModel):
             if not np.any(valid):
                 continue
 
-            probabilities = self._category_probabilities(theta, item_idx)
+            probabilities = self.probability(curve_theta, item_idx)
             probabilities = np.broadcast_to(
                 probabilities, (n_rows, probabilities.shape[1])
             )
@@ -702,6 +707,7 @@ class PolytomousItemModel(BaseItemModel):
             Log-likelihood for each person at each theta point.
         """
         responses = self._validate_polytomous_responses(responses)
+        curve_theta = theta
         theta = self._ensure_theta_2d(theta)
         n_persons = responses.shape[0]
         n_theta = theta.shape[0]
@@ -709,7 +715,7 @@ class PolytomousItemModel(BaseItemModel):
         ll = np.zeros((n_persons, n_theta))
 
         for item_idx in range(self.n_items):
-            probs = self._category_probabilities(theta, item_idx)
+            probs = self.probability(curve_theta, item_idx)
             probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
             log_probs = np.log(probs)
 

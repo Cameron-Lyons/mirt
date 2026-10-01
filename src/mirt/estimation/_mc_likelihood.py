@@ -5,15 +5,20 @@ from collections.abc import Iterator
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import original_model_hook
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError
 from mirt.models.base import BaseItemModel, DichotomousItemModel, PolytomousItemModel
 
 _MAX_MC_LIKELIHOOD_ELEMENTS = 131_072
-_DEFAULT_BINARY_LIKELIHOOD = DichotomousItemModel.log_likelihood
-_DEFAULT_CATEGORY_LIKELIHOOD = PolytomousItemModel.log_likelihood
-_DEFAULT_THETA_VALIDATION = BaseItemModel._ensure_theta_2d
-_DEFAULT_CATEGORY_VALIDATION = PolytomousItemModel._validate_polytomous_responses
+_DEFAULT_BINARY_LIKELIHOOD = original_model_hook(DichotomousItemModel, "log_likelihood")
+_DEFAULT_CATEGORY_LIKELIHOOD = original_model_hook(
+    PolytomousItemModel, "log_likelihood"
+)
+_DEFAULT_THETA_VALIDATION = original_model_hook(BaseItemModel, "_ensure_theta_2d")
+_DEFAULT_CATEGORY_VALIDATION = original_model_hook(
+    PolytomousItemModel, "_validate_polytomous_responses"
+)
 
 
 def uses_default_sample_likelihood(model: BaseItemModel) -> bool:
@@ -150,7 +155,7 @@ def _category_log_likelihoods(
         observed = np.flatnonzero(decisions >= 0)
         if not observed.size:
             continue
-        probabilities = model._category_probabilities(points, item)
+        probabilities = model.probability(points, item)
         probabilities = np.broadcast_to(
             probabilities, (len(points), probabilities.shape[1])
         ).reshape(*shape, probabilities.shape[1])

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.backends.rust._helpers import _ensure_f64, _ensure_i32, mirt_rs, rust_enabled
 
 FALLBACK_MODE = "optional"
@@ -41,10 +42,7 @@ def try_polytomous_m_step(
     if (
         not rust_enabled()
         or model.n_factors != 1
-        or any(
-            name in vars(model)
-            for name in ("probability", "set_item_parameter", "set_parameters")
-        )
+        or not uses_builtin_model_hooks(model)
         or type(model)
         not in (GradedResponseModel, GeneralizedPartialCredit, PartialCreditModel)
     ):

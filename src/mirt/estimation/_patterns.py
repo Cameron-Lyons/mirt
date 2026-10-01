@@ -5,6 +5,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import uses_builtin_model_hooks
+
 
 def compress_responses(
     responses: NDArray[np.int_],
@@ -44,10 +46,7 @@ def supports_pattern_compression(model: object) -> bool:
         PartialCreditModel,
     )
 
-    return not any(
-        name in vars(model)
-        for name in ("probability", "log_likelihood", "log_likelihood_batch")
-    ) and type(model) in (
+    return uses_builtin_model_hooks(model, likelihood=True) and type(model) in (
         OneParameterLogistic,
         TwoParameterLogistic,
         ThreeParameterLogistic,

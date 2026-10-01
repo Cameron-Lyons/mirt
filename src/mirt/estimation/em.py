@@ -17,6 +17,7 @@ from mirt._gpu_backend import (
     compute_log_likelihoods_grm_gpu,
     is_gpu_available,
 )
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.backends.rust.estimation import em_iteration_3pl
 from mirt.constants import PROB_EPSILON
@@ -255,6 +256,7 @@ class EMEstimator(BaseEstimator):
             or not should_use_rust(self.use_rust)
             or self._should_use_gpu
             or type(model) is not ThreeParameterLogistic
+            or not uses_builtin_model_hooks(model, likelihood=True)
             or model.n_factors != 1
             or self.n_jobs != 1
             or self.prob_epsilon != PROB_EPSILON
@@ -417,7 +419,11 @@ class EMEstimator(BaseEstimator):
         quad_points: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Compute log-likelihoods, using GPU if available and appropriate."""
-        if self._should_use_gpu and model.n_factors == 1:
+        if (
+            self._should_use_gpu
+            and model.n_factors == 1
+            and uses_builtin_model_hooks(model, likelihood=True)
+        ):
             return self._compute_log_likelihoods_gpu(model, responses, quad_points)
 
         if hasattr(model, "log_likelihood_batch"):

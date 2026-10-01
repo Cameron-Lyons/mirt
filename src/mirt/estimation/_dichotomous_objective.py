@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 from scipy.special import xlog1py, xlogy
 
 from mirt._logistic import _logistic_probability
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.models.base import BaseItemModel
 
 _Objective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
@@ -40,18 +41,9 @@ def prepare_dichotomous_objective(
         ThreeParameterLogistic: ("discrimination", "difficulty", "guessing"),
         FourParameterLogistic: ("discrimination", "difficulty", "guessing", "upper"),
     }
-    if tuple(model._parameters) != layouts.get(type(model)) or any(
-        name in vars(model)
-        for name in (
-            "probability",
-            "_evaluate_logistic",
-            "_ensure_theta_2d",
-            "set_parameters",
-            "set_item_parameter",
-            "_canonical_parameter_values",
-            "free_parameter_masks",
-        )
-    ):
+    if tuple(model._parameters) != layouts.get(
+        type(model)
+    ) or not uses_builtin_model_hooks(model):
         return None
 
     fixed_slope = type(model) is OneParameterLogistic

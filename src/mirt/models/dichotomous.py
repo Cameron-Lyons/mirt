@@ -9,6 +9,8 @@ from mirt._logistic import (
     _scaled_information,
     _sigmoid_derivative,
 )
+from mirt._model_defaults import record_model_base as _record_model_base
+from mirt._model_defaults import register_builtin_model as _register_builtin_model
 from mirt.exceptions import MirtValidationError
 from mirt.models.base import DichotomousItemModel
 
@@ -543,6 +545,7 @@ def _five_pl_information(
     return information
 
 
+@_record_model_base
 class _ParameterizedDichotomousModel(DichotomousItemModel):
     """Shared parameter-domain validation for dichotomous response curves."""
 
@@ -754,6 +757,7 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
         return result
 
 
+@_register_builtin_model
 class TwoParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "2PL"
     n_params_per_item = 2
@@ -799,6 +803,7 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
         return self._evaluate_logistic(theta, item_idx, information=True)
 
 
+@_register_builtin_model
 class OneParameterLogistic(TwoParameterLogistic):
     model_name = "1PL"
     n_params_per_item = 1
@@ -854,6 +859,7 @@ class OneParameterLogistic(TwoParameterLogistic):
         super().set_item_parameter(item_idx, param_name, value)
 
 
+@_register_builtin_model
 class ThreeParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "3PL"
     n_params_per_item = 3
@@ -910,6 +916,7 @@ class ThreeParameterLogistic(_ParameterizedDichotomousModel):
         return self._evaluate_logistic(theta, item_idx, information=True)
 
 
+@_register_builtin_model
 class FourParameterLogistic(_ParameterizedDichotomousModel):
     model_name = "4PL"
     n_params_per_item = 4

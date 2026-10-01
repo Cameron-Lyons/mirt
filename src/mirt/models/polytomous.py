@@ -4,6 +4,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt._model_defaults import register_builtin_model as _register_builtin_model
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.backends.rust.polytomous import (
     compute_log_likelihoods_gpcm,
@@ -92,6 +94,7 @@ def _graded_information(
     return derivatives.sum(axis=1)
 
 
+@_register_builtin_model
 class GradedResponseModel(PolytomousItemModel):
     model_name = "GRM"
     supports_multidimensional = True
@@ -285,7 +288,7 @@ class GradedResponseModel(PolytomousItemModel):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        if RUST_AVAILABLE and self.n_factors == 1:
+        if RUST_AVAILABLE and self.n_factors == 1 and uses_builtin_model_hooks(self):
             responses = self._validate_polytomous_responses(responses)
             theta = self._ensure_theta_2d(theta)
             quad_points = theta.ravel() if theta.ndim == 2 else theta
@@ -298,6 +301,7 @@ class GradedResponseModel(PolytomousItemModel):
         return super().log_likelihood_batch(responses, theta)
 
 
+@_register_builtin_model
 class GeneralizedPartialCredit(PolytomousItemModel):
     model_name = "GPCM"
     supports_multidimensional = True
@@ -485,7 +489,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        if RUST_AVAILABLE and self.n_factors == 1:
+        if RUST_AVAILABLE and self.n_factors == 1 and uses_builtin_model_hooks(self):
             responses = self._validate_polytomous_responses(responses)
             theta = self._ensure_theta_2d(theta)
             quad_points = theta.ravel() if theta.ndim == 2 else theta
@@ -500,6 +504,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         return super().log_likelihood_batch(responses, theta)
 
 
+@_register_builtin_model
 class PartialCreditModel(GeneralizedPartialCredit):
     model_name = "PCM"
     supports_multidimensional = False
@@ -968,6 +973,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         return self
 
 
+@_register_builtin_model
 class NominalResponseModel(PolytomousItemModel):
     model_name = "NRM"
     supports_multidimensional = True
