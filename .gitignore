@@ -57,6 +57,7 @@ instance/
 .scrapy
 
 docs/_build/
+docs/api/generated/
 
 .pybuilder/
 target/

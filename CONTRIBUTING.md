@@ -607,6 +607,18 @@ calculations; GVEM retains its itemwise least-squares fallback for singular
 curvature. These workloads exercise NumPy on either backend selection. Traced
 peaks exclude input generation, native workspace, and process RSS.
 
+The ``adaptive-scoring`` suite measures EAP updates for a fixed history of up to
+15 administered items from a larger bank. It covers 1D and 2D 2PL plus 2D and 3D
+MIRT. Grids use 21 points in one dimension and 11 per factor otherwise. Timing
+includes curve evaluation and full covariance reduction; input creation, item
+selection, exposure/content control, and simulation are excluded. Repeats reuse
+the parameter-independent quadrature grid. Traced memory covers Python/NumPy
+allocations and excludes native workspace and process RSS:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite adaptive-scoring --items 200 --repeats 7 --warmups 2 --backend numpy --json /tmp/mirt-adaptive-scoring.json
+```
+
 ## Experimental APIs
 
 See README “API Stability”. Experimental surfaces (for example CDM helpers and some MCMC APIs) may change in minor releases. Prefer public wrappers over private `_rust_backend` symbols.

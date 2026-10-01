@@ -54,6 +54,30 @@ def test_grouping_preserves_full_width_codes_and_row_order(
     assert all(values.dtype == np.intp for values in (first, inverse, counts))
 
 
+@pytest.mark.parametrize("dtype", [np.int16, np.int32, np.int64])
+def test_grouping_normalizes_unaligned_buffers(grouping_backend: str, dtype) -> None:
+    responses = np.ndarray(
+        (3, 2),
+        dtype=dtype,
+        buffer=bytearray(6 * np.dtype(dtype).itemsize + 1),
+        offset=1,
+    )
+    bounds = np.iinfo(dtype)
+    responses[:] = [[bounds.max, 0], [bounds.min, 1], [bounds.max, 0]]
+    assert responses.flags.c_contiguous
+    assert not responses.flags.aligned
+    original = responses.copy()
+    responses.flags.writeable = False
+
+    first, inverse, counts = backend.response_pattern_indices(responses)
+
+    assert_array_equal(first, [0, 1])
+    assert_array_equal(inverse, [0, 1, 0])
+    assert_array_equal(counts, [2, 1])
+    assert_array_equal(responses[first][inverse], original)
+    assert_array_equal(responses, original)
+
+
 @pytest.mark.parametrize("shape", [(0, 3), (0, 0), (3, 0), (1, 1)])
 def test_empty_dimensions_and_single_row(grouping_backend: str, shape: tuple) -> None:
     responses = np.zeros(shape, dtype=np.int_)
@@ -127,4 +151,62 @@ def test_native_boundary_rejects_non_c_contiguous_input(layout: str):
         responses[:, ::2] if layout == "strided" else np.asfortranarray(responses)
     )
     with pytest.raises(ValueError, match="contiguous"):
+        mirt_rs.response_pattern_indices(responses)
+
+
+@pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension is unavailable")
+@pytest.mark.parametrize("dtype", [np.int16, np.int32, np.int64])
+def test_native_boundary_rejects_unaligned_input(dtype) -> None:
+    responses = np.ndarray(
+        (2, 2),
+        dtype=dtype,
+        buffer=bytearray(4 * np.dtype(dtype).itemsize + 1),
+        offset=1,
+    )
+    responses[:] = [[0, 1], [1, 0]]
+    assert responses.flags.c_contiguous
+    assert not responses.flags.aligned
+
+    with pytest.raises(ValueError, match="aligned"):
+        mirt_rs.response_pattern_indices(responses)
+
+
+@pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension is unavailable")
+@pytest.mark.parametrize("dtype", [np.int8, np.int16, np.int32, np.int64])
+@pytest.mark.parametrize("shape", [(0, 3), (0, 0), (3, 0), (4, 2)])
+def test_native_boundary_supports_signed_widths_and_readonly_input(dtype, shape):
+    responses = np.zeros(shape, dtype=dtype)
+    if shape == (4, 2):
+        responses[:] = [[0, 1], [1, 0], [0, 1], [1, 0]]
+    responses.flags.writeable = False
+
+    first, inverse, counts = mirt_rs.response_pattern_indices(responses)
+
+    assert_array_equal(responses[first][inverse], responses)
+    assert all(values.dtype == np.intp for values in (first, inverse, counts))
+    if shape == (4, 2):
+        assert_array_equal(first, [0, 1])
+        assert_array_equal(inverse, [0, 1, 0, 1])
+        assert_array_equal(counts, [2, 2])
+    else:
+        assert_array_equal(first, [] if shape[0] == 0 else [0])
+        assert_array_equal(counts, [] if shape[0] == 0 else [shape[0]])
+
+
+@pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension is unavailable")
+@pytest.mark.parametrize(
+    "responses",
+    [
+        [[0, 1], [1, 0]],
+        np.ones(3, dtype=np.int64),
+        np.ones((2, 3, 1), dtype=np.int64),
+        np.ones((2, 3), dtype=np.float64),
+        np.ones((2, 3), dtype=np.uint64),
+        np.ones((2, 3), dtype=np.bool_),
+        np.ones((2, 3), dtype=object),
+        np.ones((2, 3), dtype=np.dtype(np.int64).newbyteorder("S")),
+    ],
+)
+def test_native_boundary_rejects_unsupported_arrays(responses) -> None:
+    with pytest.raises(TypeError, match="two-dimensional signed integer"):
         mirt_rs.response_pattern_indices(responses)

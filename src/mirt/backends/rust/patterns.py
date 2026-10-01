@@ -42,7 +42,9 @@ def response_pattern_indices(
         if bounds.min <= minimum and maximum <= bounds.max:
             key_dtype = np.dtype(dtype)
             break
-    keys = np.ascontiguousarray(values, dtype=key_dtype)
+    # C-contiguity alone permits unaligned NumPy buffers. Native typed slices
+    # require alignment as well; np.require preserves safe arrays without copies.
+    keys = np.require(values, dtype=key_dtype, requirements=["C", "A"])
     if rust_enabled():
         return mirt_rs.response_pattern_indices(keys)
 

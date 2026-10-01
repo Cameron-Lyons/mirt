@@ -12,6 +12,23 @@ use rayon::prelude::*;
 
 use crate::utils::sigmoid;
 
+#[inline]
+fn item_logit(theta: f64, discrimination: f64, difficulty: f64) -> f64 {
+    let logit = discrimination * (theta - difficulty);
+    if !logit.is_finite()
+        && theta.is_finite()
+        && difficulty.is_finite()
+        && discrimination.abs() <= 1.0
+    {
+        // Finite inputs can have an overflowing difference while the scaled
+        // logit is representable. Match the NumPy model's exceptional path,
+        // retaining the ordinary centered expression for all other inputs.
+        discrimination * theta - discrimination * difficulty
+    } else {
+        logit
+    }
+}
+
 /// Haebara equating criterion - item-level curve matching.
 ///
 /// Computes sum of squared differences between item characteristic curves
@@ -47,8 +64,8 @@ pub fn haebara_criterion(
             (0..n_theta)
                 .map(|q| {
                     let theta = theta_grid[q];
-                    let p_old = sigmoid(disc_old[j] * (theta - diff_old[j]));
-                    let p_new = sigmoid(disc_trans * (theta - diff_trans));
+                    let p_old = sigmoid(item_logit(theta, disc_old[j], diff_old[j]));
+                    let p_new = sigmoid(item_logit(theta, disc_trans, diff_trans));
                     weights[q] * (p_old - p_new).powi(2)
                 })
                 .sum::<f64>()
@@ -89,8 +106,8 @@ pub fn area_between_iccs_batch<'py>(
             let diffs: Vec<f64> = (0..n_theta)
                 .map(|q| {
                     let theta = theta_grid[q];
-                    let p_old = sigmoid(disc_old[j] * (theta - diff_old[j]));
-                    let p_new = sigmoid(disc_trans * (theta - diff_trans));
+                    let p_old = sigmoid(item_logit(theta, disc_old[j], diff_old[j]));
+                    let p_new = sigmoid(item_logit(theta, disc_trans, diff_trans));
                     (p_old - p_new).abs()
                 })
                 .collect();
@@ -128,7 +145,7 @@ pub fn lord_wingersky_recursion<'py>(
             let theta = theta_grid[q];
 
             let probs: Vec<f64> = (0..n_items)
-                .map(|j| sigmoid(disc[j] * (theta - diff[j])))
+                .map(|j| sigmoid(item_logit(theta, disc[j], diff[j])))
                 .collect();
 
             let mut f_prev = vec![0.0; max_score + 1];
@@ -196,12 +213,12 @@ pub fn compute_tcc_pair<'py>(
             let mut tcc_new = 0.0;
 
             for j in 0..n_items {
-                let p_old = sigmoid(disc_old[j] * (theta - diff_old[j]));
+                let p_old = sigmoid(item_logit(theta, disc_old[j], diff_old[j]));
                 tcc_old += p_old;
 
                 let disc_trans = disc_new[j] / a;
                 let diff_trans = a * diff_new[j] + b;
-                let p_new = sigmoid(disc_trans * (theta - diff_trans));
+                let p_new = sigmoid(item_logit(theta, disc_trans, diff_trans));
                 tcc_new += p_new;
             }
 
@@ -286,7 +303,7 @@ pub fn expected_scores<'py>(
         .map(|q| {
             let theta = theta_grid[q];
             (0..n_items)
-                .map(|j| sigmoid(disc[j] * (theta - diff[j])))
+                .map(|j| sigmoid(item_logit(theta, disc[j], diff[j])))
                 .sum()
         })
         .collect();
@@ -316,4 +333,30 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(robust_z_drift, m)?)?;
     m.add_function(wrap_pyfunction!(expected_scores, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::item_logit;
+
+    #[test]
+    fn item_logit_preserves_ordinary_centered_expression() {
+        for (theta, discrimination, difficulty) in
+            [(0.3, 1.7, -0.8), (-4.0, 0.4, 1.3), (2.0, 3.2, 2.0)]
+        {
+            assert_eq!(
+                item_logit(theta, discrimination, difficulty),
+                discrimination * (theta - difficulty)
+            );
+        }
+    }
+
+    #[test]
+    fn item_logit_recovers_finite_values_after_centering_overflows() {
+        assert!((item_logit(1e308, 1e-308, -1e308) - 2.0).abs() < 1e-15);
+        assert!((item_logit(-1e308, 5e-309, 1e308) + 1.0).abs() < 1e-15);
+        assert_eq!(item_logit(1e308, 0.0, -1e308), 0.0);
+        assert_eq!(item_logit(1e308, 2.0, -1e308), f64::INFINITY);
+        assert_eq!(item_logit(-1e308, 2.0, 1e308), f64::NEG_INFINITY);
+    }
 }

@@ -8,6 +8,8 @@ from math import fsum, isclose, isfinite
 from numbers import Integral, Real
 from typing import Any
 
+from mirt.cat._native import register_native_defaults as _register_native_defaults
+
 
 def _validate_item_index(value: Any, *, name: str = "item index") -> int:
     """Return a non-negative integer item index."""
@@ -165,6 +167,7 @@ class ContentConstraint(ABC):
         return None
 
 
+@_register_native_defaults
 class NoContentConstraint(ContentConstraint):
     """No content constraints (all items eligible)."""
 

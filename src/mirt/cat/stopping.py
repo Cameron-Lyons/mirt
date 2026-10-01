@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from scipy.special import ndtri
 
+from mirt.cat._native import register_native_defaults as _register_native_defaults
+
 if TYPE_CHECKING:
     from mirt.cat.results import CATState
 
@@ -81,6 +83,7 @@ class StoppingRule(ABC):
         """Reset state before the rule is reused for another session."""
 
 
+@_register_native_defaults
 class StandardErrorStop(StoppingRule):
     """Stop when standard error falls below a threshold.
 
@@ -111,6 +114,7 @@ class StandardErrorStop(StoppingRule):
         self._triggered = False
 
 
+@_register_native_defaults
 class MaxItemsStop(StoppingRule):
     """Stop after a maximum number of items.
 
@@ -296,6 +300,7 @@ class ClassificationStop(StoppingRule):
         self._classification = None
 
 
+@_register_native_defaults
 class CombinedStop(StoppingRule):
     """Combine multiple stopping rules with logical operators.
 

@@ -47,6 +47,24 @@ general Python implementation so their operational semantics are preserved.
 Native results include the exact administered item and response sequences, making
 them fully compatible with ``CATResult`` serialization and downstream audits.
 
+Interactive response submission
+-------------------------------
+
+For a live test, disclose ``engine.select_next_item()`` and pass the observed
+category to ``engine.administer_item(response)``. Repeated selection returns the
+same pending item until a valid response is submitted. Responses must be finite
+integer categories within that item's range: 0 or 1 for binary items, or
+``0 .. n_categories[item] - 1`` for ordinal items. An invalid submission raises
+``ValueError`` and retains the pending item, response history, available pool,
+and ability state so the response can be corrected and retried.
+
+For independent built-in binary models, EAP updates reuse the Gauss-Hermite grid
+and evaluate only administered item curves in bounded blocks. The posterior is
+recomputed against current item parameters after every response, so parameter
+changes and resets do not reuse old likelihood evidence. Customized model
+probability or likelihood hooks retain the general scoring path. MCAT continues
+to retain the full posterior covariance.
+
 Portable results
 ----------------
 

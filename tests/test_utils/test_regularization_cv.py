@@ -1,5 +1,6 @@
 """Tests for regularized MIRT model selection."""
 
+from multiprocessing import get_context
 from types import SimpleNamespace
 
 import numpy as np
@@ -136,7 +137,11 @@ class TestHeldOutLikelihood:
 
 
 class TestCrossValidatedSelection:
-    def test_parallel_folds_match_serial_results(self, concordant_responses):
+    @pytest.mark.parametrize("backend", ["auto", "numpy"])
+    @pytest.mark.parametrize("explicit_context", [False, True])
+    def test_parallel_folds_match_serial_results(
+        self, concordant_responses, backend, explicit_context
+    ):
         common = {
             "responses": concordant_responses,
             "lambda_values": [0.3, 0.1],
@@ -147,8 +152,17 @@ class TestCrossValidatedSelection:
             "seed": 42,
         }
 
-        serial = cv_select_lambda(**common, n_jobs=1)
-        parallel = cv_select_lambda(**common, n_jobs=2)
+        previous_backend = mirt.get_backend()
+        mirt.set_backend(backend)
+        try:
+            serial = cv_select_lambda(**common, n_jobs=1)
+            parallel = cv_select_lambda(
+                **common,
+                n_jobs=2,
+                mp_context=get_context("spawn") if explicit_context else None,
+            )
+        finally:
+            mirt.set_backend(previous_backend)
 
         assert parallel.lambda_values == serial.lambda_values
         assert parallel.best_lambda == serial.best_lambda
@@ -156,6 +170,12 @@ class TestCrossValidatedSelection:
         np.testing.assert_allclose(parallel.mean_scores, serial.mean_scores)
         np.testing.assert_allclose(parallel.std_scores, serial.std_scores)
         np.testing.assert_allclose(parallel.mean_nonzero, serial.mean_nonzero)
+        np.testing.assert_allclose(
+            parallel.best_result.loadings, serial.best_result.loadings
+        )
+        np.testing.assert_allclose(
+            parallel.best_result.intercepts, serial.best_result.intercepts
+        )
 
     def test_selects_loading_structure_from_held_out_data(
         self, concordant_responses, monkeypatch
