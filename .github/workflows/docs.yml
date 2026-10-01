@@ -50,6 +50,21 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
+      - name: Check whether GitHub Pages is configured
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh api "repos/$GITHUB_REPOSITORY/pages" > "$RUNNER_TEMP/pages.json" 2> "$RUNNER_TEMP/pages-error"; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          elif grep -q 'HTTP 404' "$RUNNER_TEMP/pages-error"; then
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Documentation built successfully. Enable GitHub Pages with GitHub Actions as its source to deploy it." >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat "$RUNNER_TEMP/pages-error" >&2
+            exit 1
+          fi
       - name: Deploy to GitHub Pages
+        if: steps.pages.outputs.enabled == 'true'
         id: deployment
         uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

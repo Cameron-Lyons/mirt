@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Optional diagonal complete-data standard errors for MCEM, QMCEM, and
+  stochastic EM via `compute_standard_errors=True`, with configurable
+  `se_step_size`. Used exact polytomous diagonal curvature, bounded analytic
+  logistic gradients, and shared-grid counts, with numerical custom-objective
+  fallback, protected fitted parameters,
+  boundary-aware stencils, and zero errors for fixed coordinates. Added
+  uncertainty stages to the Monte Carlo benchmark suites. Defaults retain
+  placeholder errors and existing fitting costs.
+
 ### Changed
 - Reused fresh Monte Carlo E-step evidence for likelihood reporting, avoiding
   repeated draw evaluation and importance normalization before item updates.

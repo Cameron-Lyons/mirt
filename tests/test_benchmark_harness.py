@@ -554,7 +554,7 @@ class TestBenchmarkCommand:
         assert [result.name for result in results] == [
             f"mcem_{model}_{stage}"
             for model in ("2pl_3d", "3pl", "grm_2d", "gpcm_2d", "nrm_2d", "mirt_3d")
-            for stage in ("refresh", "e_step", "mstep", "fit")
+            for stage in ("refresh", "e_step", "mstep", "uncertainty", "fit")
         ]
         for result in results:
             assert len(result.times) == 1
@@ -574,7 +574,7 @@ class TestBenchmarkCommand:
             f"mcem_{model}_{method}_{stage}"
             for model in ("2pl_3d", "grm_2d", "2pl_3d_correlated", "mirt_6d_correlated")
             for method in ("posterior", "stochastic")
-            for stage in ("prior", "e_step", "fit")
+            for stage in ("prior", "e_step", "uncertainty", "fit")
         ]
         assert all(len(result.times) == 1 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)
@@ -685,7 +685,7 @@ class TestBenchmarkCommand:
         assert [result.name for result in results] == [
             f"qmcem_{stage}_{label}"
             for label in ("2pl", "2pl_3d", "mirt_3d", "grm", "gpcm_2d", "nrm_2d")
-            for stage in ("refresh", "e_step", "fit")
+            for stage in ("refresh", "e_step", "uncertainty", "fit")
         ]
         assert all(len(result.times) == 1 for result in results)
         assert all(result.peak_traced_bytes > 0 for result in results)

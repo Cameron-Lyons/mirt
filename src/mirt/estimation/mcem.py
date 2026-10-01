@@ -21,7 +21,7 @@ References:
 from __future__ import annotations
 
 from collections.abc import Callable
-from numbers import Integral
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -39,7 +39,19 @@ from mirt.estimation._mc_likelihood import (
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
-from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
+from mirt.models.dichotomous import (
+    FourParameterLogistic,
+    OneParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
+)
+from mirt.models.multidimensional import MultidimensionalModel
+from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
+    GradedResponseModel,
+    NominalResponseModel,
+    PartialCreditModel,
+)
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -166,6 +178,15 @@ class MCEMEstimator(BaseEstimator):
     Ordinary sampled likelihoods reduce bounded public probability blocks
     against unexpanded responses. Custom likelihood and validation overrides
     retain their model-based evaluation path.
+
+    Set ``compute_standard_errors=True`` to estimate approximate diagonal
+    complete-data standard errors with the final draws and weights held fixed.
+    This excludes missing information, parameter covariances, and sampling
+    uncertainty. Built-in polytomous items use exact diagonal curvature;
+    logistic and affine items differentiate prepared gradients.
+    ``se_step_size`` controls finite differences (default 1e-5) and does not
+    affect exact polytomous curvature.
+    Standard errors remain disabled by default to preserve sampling costs.
     """
 
     _minimum_samples = 50
@@ -178,6 +199,8 @@ class MCEMEstimator(BaseEstimator):
         verbose: bool = False,
         seed: int | None = None,
         importance_sampling: bool = True,
+        compute_standard_errors: bool = False,
+        se_step_size: float = 1e-5,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -186,6 +209,17 @@ class MCEMEstimator(BaseEstimator):
         )
         self.seed = _seed_value(seed)
         self.importance_sampling = _boolean(importance_sampling, "importance_sampling")
+        self.compute_standard_errors = _boolean(
+            compute_standard_errors, "compute_standard_errors"
+        )
+        if (
+            isinstance(se_step_size, (bool, np.bool_))
+            or not isinstance(se_step_size, Real)
+            or not np.isfinite(se_step_size)
+            or se_step_size <= 0.0
+        ):
+            raise ValueError("se_step_size must be a finite positive number")
+        self.se_step_size: float = float(se_step_size)
         self._rng: np.random.Generator | None = None
 
     def _random_generator(self) -> np.random.Generator:
@@ -759,7 +793,13 @@ class MCEMEstimator(BaseEstimator):
         theta_samples: NDArray[np.float64],
         weights: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
-        """Return placeholders for standard errors not yet estimated by MCEM."""
+        """Optionally estimate diagonal complete-data curvature on the final draw."""
+        if self.compute_standard_errors:
+            from mirt.estimation._mc_information import mc_standard_errors
+
+            return mc_standard_errors(
+                self, model, responses, theta_samples, weights, self.se_step_size
+            )
         standard_errors: dict[str, NDArray[np.float64]] = {}
 
         for name, values in model.parameters.items():
@@ -771,6 +811,15 @@ class MCEMEstimator(BaseEstimator):
             standard_errors[name] = se
 
         return standard_errors
+
+    @staticmethod
+    def _uses_default_information_model(model: BaseItemModel) -> bool:
+        """Keep changed public model curves and parameter hooks authoritative."""
+        methods = _DEFAULT_MC_INFORMATION_MODELS.get(type(model))
+        return methods is not None and all(
+            name not in vars(model) and getattr(type(model), name) is method
+            for name, method in methods.items()
+        )
 
 
 class QMCEMEstimator(MCEMEstimator):
@@ -794,6 +843,10 @@ class QMCEMEstimator(MCEMEstimator):
         Random seed for scrambling.
     sequence : str
         Type of low-discrepancy sequence: "sobol" or "halton".
+    compute_standard_errors : bool
+        Estimate approximate diagonal complete-data standard errors. Default False.
+    se_step_size : float
+        Positive finite differentiation step for standard errors. Default 1e-5.
 
     Notes
     -----
@@ -818,6 +871,8 @@ class QMCEMEstimator(MCEMEstimator):
         verbose: bool = False,
         seed: int | None = None,
         sequence: Literal["sobol", "halton"] = "sobol",
+        compute_standard_errors: bool = False,
+        se_step_size: float = 1e-5,
     ) -> None:
         super().__init__(
             n_samples=n_samples,
@@ -826,6 +881,8 @@ class QMCEMEstimator(MCEMEstimator):
             verbose=verbose,
             seed=seed,
             importance_sampling=True,
+            compute_standard_errors=compute_standard_errors,
+            se_step_size=se_step_size,
         )
 
         if sequence not in ("sobol", "halton"):
@@ -1069,6 +1126,10 @@ class StochasticEMEstimator(MCEMEstimator):
         Random seed.
     n_chains : int
         Number of independent chains to average over.
+    compute_standard_errors : bool
+        Estimate approximate diagonal complete-data standard errors. Default False.
+    se_step_size : float
+        Positive finite differentiation step for standard errors. Default 1e-5.
 
     Notes
     -----
@@ -1092,6 +1153,8 @@ class StochasticEMEstimator(MCEMEstimator):
         verbose: bool = False,
         seed: int | None = None,
         n_chains: int = 5,
+        compute_standard_errors: bool = False,
+        se_step_size: float = 1e-5,
     ) -> None:
         super().__init__(
             n_samples=n_chains,
@@ -1100,6 +1163,8 @@ class StochasticEMEstimator(MCEMEstimator):
             verbose=verbose,
             seed=seed,
             importance_sampling=False,
+            compute_standard_errors=compute_standard_errors,
+            se_step_size=se_step_size,
         )
         self.n_chains = self.n_samples
 
@@ -1132,6 +1197,36 @@ _DEFAULT_MC_ITEM_METHODS = {
 }
 
 _DEFAULT_MC_SAMPLE_LIKELIHOODS = MCEMEstimator._sample_log_likelihoods
+
+_DEFAULT_MC_INFORMATION_MODELS = {
+    cls: {
+        name: getattr(cls, name)
+        for name in (
+            "probability",
+            "_category_probabilities",
+            "_evaluate_logistic",
+            "_curve_parameters",
+            "_logits",
+            "_ensure_theta_2d",
+            "set_parameters",
+            "set_item_parameter",
+            "_canonical_parameter_values",
+            "free_parameter_masks",
+        )
+        if hasattr(cls, name)
+    }
+    for cls in (
+        OneParameterLogistic,
+        TwoParameterLogistic,
+        ThreeParameterLogistic,
+        FourParameterLogistic,
+        MultidimensionalModel,
+        GradedResponseModel,
+        GeneralizedPartialCredit,
+        PartialCreditModel,
+        NominalResponseModel,
+    )
+}
 
 _DEFAULT_QMC_BATCH_LIKELIHOODS = {
     cls.log_likelihood_batch

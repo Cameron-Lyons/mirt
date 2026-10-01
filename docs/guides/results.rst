@@ -52,6 +52,38 @@ Diagnostic group refits use this mode by default.
 ``coef()`` and ``coef_with_se()`` methods remain available for item-aligned one- and
 two-dimensional parameters through the configured pandas or polars backend.
 
+Monte Carlo item uncertainty
+----------------------------
+
+``MCEMEstimator``, ``QMCEMEstimator``, and ``StochasticEMEstimator`` can estimate
+optional diagonal complete-data standard errors on the final draws and weights:
+
+.. code-block:: python
+
+   from mirt import TwoParameterLogistic
+   from mirt.estimation import MCEMEstimator
+
+   result = MCEMEstimator(
+       n_samples=256,
+       seed=42,
+       compute_standard_errors=True,
+       se_step_size=1e-5,
+   ).fit(TwoParameterLogistic(responses.shape[1]), responses)
+
+   print(result.standard_errors["difficulty"])
+
+Draws and weights remain fixed during differentiation. This approximation
+excludes missing information, covariance between parameters, and Monte Carlo
+sampling error. Built-in polytomous items use exact diagonal curvature, while
+logistic and affine items use prepared item gradients. Custom item objectives
+use numerical likelihood curvature. Fixed coordinates receive
+zero errors; unobserved items and undefined curvature receive ``NaN``.
+
+The option defaults to ``False``, retaining placeholder errors and the existing
+fitting cost. Enabling it preserves the fitted parameters, likelihood, random
+draws, and convergence history. ``se_step_size`` must be finite and positive;
+it controls finite differences and does not affect exact polytomous curvature.
+
 Portable model exports
 ----------------------
 

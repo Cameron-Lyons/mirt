@@ -128,8 +128,8 @@ large common offsets. Grid, posterior, and count outputs still grow with their
 respective person/sample/item dimensions.
 
 The `qmcem-fit` suite uses the same six models and input generation to measure
-likelihood refresh, E-steps including likelihood reporting, and complete
-two-iteration fits:
+likelihood refresh, E-steps including likelihood reporting, optional item
+uncertainty, and complete two-iteration fits:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite qmcem-fit --persons 1000 --items 10 --repeats 3 --warmups 1 --backend numpy --json /tmp/mirt-qmcem-fit.json
@@ -431,9 +431,9 @@ complete-data 2×2 information convention and leaves unvisited or singular nodes
 undefined.
 
 The `mcem-fit` suite measures person-specific likelihood refresh, an E-step
-including likelihood reporting, an M-step, and a complete two-iteration MCEM
-fit for three-factor 2PL/MIRT, 3PL, and
-two-factor GRM/GPCM/NRM models. Each person has 64 samples and 10% of responses
+including likelihood reporting, an M-step, optional item uncertainty, and a
+complete two-iteration MCEM fit for three-factor 2PL/MIRT, 3PL, and two-factor
+GRM/GPCM/NRM models. Each person has 64 samples and 10% of responses
 are missing:
 
 ```bash
@@ -462,10 +462,25 @@ methods use the existing Monte Carlo model path. Traced peaks cover Python/NumPy
 allocations and exclude native workspace. This suite measures importance
 sampling MCEM.
 
+Uncertainty stages enable `compute_standard_errors=True` on fixed draws and
+weights. Built-in polytomous items use exact diagonal curvature; logistic and
+affine items differentiate prepared analytic gradients. Both use bounded
+person-specific blocks or shared-grid expected counts. Polytomous curvature
+leaves the model untouched; gradient trials restore it after each evaluation.
+Custom item objectives use numerical likelihood curvature with their
+observed-person inputs. These are diagonal complete-data
+approximations with draws and weights held fixed; they exclude missing
+information, covariance between parameters, and sampling uncertainty. Fixed
+coordinates have zero errors; unobserved items and undefined curvature retain
+NaN errors. `se_step_size` controls finite differences, and does not affect exact
+polytomous curvature. Ordinary fits retain the default disabled mode and
+placeholder errors.
+
 The `mcem-sampling` suite covers posterior MCEM with 64 draws per person and
 stochastic EM with five chains, using three-factor 2PL, two-factor GRM, and
 three-factor 2PL/six-factor MIRT with correlated priors and nonzero means.
-Responses have 10% missing values:
+It also measures opt-in uncertainty on precomputed Gaussian draws with uniform
+weights. Responses have 10% missing values:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 uv run --no-sync python benchmarks/run_benchmarks.py --suite mcem-sampling --persons 600 --items 6 --repeats 5 --warmups 1 --backend numpy --json /tmp/mirt-mcem-sampling.json
