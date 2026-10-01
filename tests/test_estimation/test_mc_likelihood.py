@@ -186,6 +186,7 @@ def test_probability_callbacks_receive_only_bounded_points(kind, monkeypatch):
         ("2pl", "log_likelihood"),
         ("grm", "log_likelihood"),
         ("2pl", "_ensure_theta_2d"),
+        ("2pl", "_validate_dichotomous_responses"),
         ("grm", "_ensure_theta_2d"),
         ("grm", "_validate_polytomous_responses"),
     ],

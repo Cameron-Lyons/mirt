@@ -108,6 +108,18 @@ make docs
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
 
+The `binary-likelihood` suite measures public single-person and batched
+likelihoods across ten binary model families with 10% missing responses.
+It covers matched ability points, one shared ability point, and grids of
+21 and 121 points. Inputs and parameters are prepared outside timing, and
+each workload records a separate peak of Python/NumPy allocations:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python benchmarks/run_benchmarks.py \
+  --suite binary-likelihood --persons 5000 --items 60 --repeats 7 --warmups 2 \
+  --backend numpy --json binary-likelihood.json
+```
+
 The optional `gpu-likelihood` suite requires PyTorch and times real tensor
 likelihoods for 1PL, 2PL, 3PL, multidimensional 2PL, GRM, GPCM, and PCM, plus a
 complete 2PL E-step. Category cases include items with different category
@@ -130,6 +142,8 @@ Custom curves, setters, layouts, and joint likelihoods retain their public
 evaluation paths. Conditional item objectives only require unchanged item
 hooks; a joint likelihood override alone does not disable them. Polytomous
 single-person and batched likelihoods both follow public probability methods.
+Binary likelihoods also preserve original ability points and custom response
+validation, with constant curves broadcast across the requested grid.
 These checks preserve lazy model imports and keep default numerical shortcuts
 available.
 

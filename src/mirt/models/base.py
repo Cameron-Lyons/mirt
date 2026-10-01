@@ -9,6 +9,36 @@ from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
 
 _DICHOTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
+_DICHOTOMOUS_MAX_LIKELIHOOD_VALUES = 131_072
+
+
+def _dichotomous_batch_fallback(
+    responses: NDArray[np.int_], probabilities: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Keep exceptional curves and large response values on bounded item sums."""
+    n_persons, n_items = responses.shape
+    n_points = len(probabilities)
+    result = np.zeros((n_persons, n_points), dtype=np.float64)
+    dtype = np.result_type(responses.dtype, probabilities.dtype)
+    for item in range(n_items):
+        for first in range(0, n_points, _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES):
+            last = min(first + _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES, n_points)
+            correct = np.log(probabilities[first:last, item])
+            incorrect = np.log(1.0 - probabilities[first:last, item])
+            row_chunk = max(1, _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES // (last - first))
+            for start in range(0, n_persons, row_chunk):
+                stop = min(start + row_chunk, n_persons)
+                values = np.array(
+                    responses[start:stop, item, None], dtype=dtype, copy=True
+                )
+                observed = values >= 0
+                np.copyto(values, 0.0, where=~observed)
+                terms = values * correct
+                np.subtract(observed, values, out=values)
+                terms += values * incorrect
+                np.copyto(terms, 0.0, where=~observed)
+                result[start:stop, first:last] += terms
+    return result
 
 
 @_record_model_base
@@ -336,6 +366,20 @@ class BaseItemModel(ABC):
 
 @_record_model_base
 class DichotomousItemModel(BaseItemModel):
+    def _validate_dichotomous_responses(self, responses: NDArray[np.int_]) -> NDArray:
+        """Require a numeric response matrix without changing its value semantics."""
+        responses = np.asarray(responses)
+        if responses.ndim != 2:
+            raise MirtDataError(f"responses must be 2D, got {responses.ndim}D")
+        if responses.shape[1] != self.n_items:
+            raise MirtDataError(
+                f"responses has {responses.shape[1]} items, expected {self.n_items}",
+                n_items=responses.shape[1],
+            )
+        if responses.dtype.kind not in "biuf":
+            raise MirtDataError("responses must contain numeric values")
+        return responses
+
     def icc(
         self,
         theta: NDArray[np.float64],
@@ -349,24 +393,31 @@ class DichotomousItemModel(BaseItemModel):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        responses = np.asarray(responses)
+        responses = self._validate_dichotomous_responses(responses)
+        curve_theta = theta
         theta = self._ensure_theta_2d(theta)
 
-        if responses.shape[1] != self.n_items:
+        if (
+            responses.shape[0] != theta.shape[0]
+            and responses.shape[0] != 1
+            and theta.shape[0] != 1
+        ):
             raise MirtDataError(
-                f"responses has {responses.shape[1]} items, expected {self.n_items}",
-                n_items=responses.shape[1],
+                "responses and theta must have matching row counts or a single row"
             )
 
-        p = self.probability(theta)
+        p = np.broadcast_to(self.probability(curve_theta), (len(theta), self.n_items))
         p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
 
         valid = responses >= 0
-        ll = np.where(
-            valid,
-            responses * np.log(p) + (1 - responses) * np.log(1 - p),
-            0.0,
-        )
+        values = responses
+        if responses.dtype.kind == "u":
+            values = responses.astype(np.result_type(responses.dtype, p.dtype))
+        ll = values * np.log(p)
+        if values.dtype.kind == "b":
+            ll = ll.astype(np.result_type(np.int64, p.dtype), copy=False)
+        ll += (1 - values) * np.log(1.0 - p)
+        np.copyto(ll, 0.0, where=~valid)
 
         return ll.sum(axis=1)
 
@@ -389,21 +440,40 @@ class DichotomousItemModel(BaseItemModel):
         ndarray of shape (n_persons, n_theta)
             Log-likelihood for each person at each theta point.
         """
-        responses = np.asarray(responses)
+        responses = self._validate_dichotomous_responses(responses)
+        curve_theta = theta
         theta = self._ensure_theta_2d(theta)
 
-        p = self.probability(theta)
+        p = np.broadcast_to(self.probability(curve_theta), (len(theta), self.n_items))
         p = np.clip(p, PROB_EPSILON, 1.0 - PROB_EPSILON)
         log_p = np.log(p)
         log_1_minus_p = np.log1p(-p)
 
         valid = responses >= 0
-        response_values = np.where(valid, responses, 0).astype(np.float64, copy=False)
-        observed = valid.astype(np.float64)
-
-        return (
-            response_values @ log_p.T + (observed - response_values) @ log_1_minus_p.T
-        )
+        if (
+            not np.all(np.isfinite(log_p))
+            or not np.all(np.isfinite(log_1_minus_p))
+            or (
+                responses.dtype.kind == "f"
+                and np.max(responses, initial=0.0, where=valid)
+                > np.finfo(np.float64).max / (-np.log(PROB_EPSILON) * self.n_items)
+            )
+        ):
+            return _dichotomous_batch_fallback(responses, p)
+        response_values = np.array(responses, dtype=np.float64, copy=True)
+        np.copyto(response_values, 0.0, where=~valid)
+        result = response_values @ log_p.T
+        np.subtract(valid, response_values, out=response_values)
+        # Bound the second product while accumulating into the owned result.
+        for first in range(0, len(theta), _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES):
+            last = min(first + _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES, len(theta))
+            row_chunk = max(1, _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES // (last - first))
+            for start in range(0, len(responses), row_chunk):
+                stop = min(start + row_chunk, len(responses))
+                result[start:stop, first:last] += (
+                    response_values[start:stop] @ log_1_minus_p[first:last].T
+                )
+        return result
 
     def expected_score(
         self,

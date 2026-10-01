@@ -26,6 +26,7 @@ _KERNEL_HOOKS = (
 _LIKELIHOOD_HOOKS = (
     "log_likelihood",
     "log_likelihood_batch",
+    "_validate_dichotomous_responses",
     "_validate_polytomous_responses",
 )
 _DEFAULT_HOOKS: dict[type, tuple[tuple[tuple[str, type, Any], ...], ...]] = {}
