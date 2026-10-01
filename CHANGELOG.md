@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Made binary likelihood validation consistent for numeric response matrices,
+  prevented unsigned subtraction overflow, and evaluated public probability
+  curves at the original ability points. Batched likelihoods now broadcast
+  constant curves correctly and preserve missing-item masking and finite
+  per-item cancellation with very large responses. Custom binary validation
+  remains authoritative in prepared and Monte Carlo likelihood paths, and
+  boolean responses preserve custom float32 curve arithmetic.
 - Fixed GPU EM dispatch for GPCM step parameters and ignored inactive padding
   in GRM/GPCM likelihoods with item-specific category counts. Used exact model
   types for dispatch, preserving customized display names.
@@ -31,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder errors and existing fitting costs.
 
 ### Changed
+- Reused binary likelihood response coefficients and result buffers to reduce
+  temporary NumPy allocations. Exceptional curves and large responses use
+  bounded item sums. Added a `binary-likelihood` timing and memory suite for
+  matched, shared, and grid evaluations across ten binary model families.
 - Reduced 2PL, 3PL, multidimensional, and complete GPU E-step likelihoods with
   shared matrix operations, avoiding person/grid/item intermediate tensors
   while preserving missing and general numeric responses.

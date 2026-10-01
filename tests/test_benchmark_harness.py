@@ -330,6 +330,7 @@ class TestBenchmarkCommand:
             "model-fit",
             "cat",
             "kernels",
+            "binary-likelihood",
             "gpu-likelihood",
             "optimization",
             "information",
@@ -377,6 +378,7 @@ class TestBenchmarkCommand:
             "model-fit",
             "cat",
             "kernels",
+            "binary-likelihood",
             "gpu-likelihood",
             "optimization",
             "information",
@@ -410,6 +412,42 @@ class TestBenchmarkCommand:
             "qmcem-fit",
             "mcem-sampling",
         )
+
+    def test_binary_likelihood_suite_records_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ("binary-likelihood",), n_persons=12, n_items=4, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            f"binary_likelihood_{kind}_{stage}"
+            for kind in (
+                "1pl",
+                "2pl",
+                "3pl",
+                "4pl",
+                "5pl",
+                "mirt",
+                "bifactor",
+                "ull",
+                "cll",
+                "nll",
+            )
+            for stage in ("matched", "shared", "grid_21", "grid_121")
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        report = benchmark.build_report(
+            results,
+            suites=("binary-likelihood",),
+            n_persons=12,
+            n_items=4,
+            repeats=2,
+            warmups=1,
+            backend_info=_backend_info(),
+        )
+        other = json.loads(json.dumps(report))
+        other["configuration"]["persons"] = 13
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(report, other, max_regression_percent=5)
 
     def test_tensor_suite_requires_optional_runtime(self, monkeypatch):
         from mirt import _gpu_backend
