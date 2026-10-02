@@ -148,23 +148,22 @@ def prepare_polytomous_objective(
     ) -> tuple[float, NDArray[np.float64]]:
         a = np.ones(1) if fixed_slope else params[:n_slopes]
         steps = params[n_slopes:]
-        scale = a[0] if unidimensional else np.linalg.norm(a)
-        centered = (
-            points[:, None] - steps if unidimensional else (theta @ a)[:, None] - steps
+        scale = a.sum()
+        centered = points[:, None] - steps if unidimensional else None
+        increments = (
+            a[0] * centered if unidimensional else (theta @ a)[:, None] - scale * steps
         )
         loss, residual = _softmax_loss_and_residual(
-            _partial_credit_probabilities(scale * centered), counts, epsilon, upper
+            _partial_credit_probabilities(increments), counts, epsilon, upper
         )
         tails = np.cumsum(residual[:, :0:-1], axis=1)[:, ::-1]
         gradient = np.empty_like(params)
         if n_slopes:
-            centered_score = np.sum(tails * centered)
             if unidimensional:
-                gradient[0] = centered_score
+                gradient[0] = np.sum(tails * centered)
             else:
-                direction = a / scale if scale > 0.0 else np.zeros_like(a)
-                gradient[:n_slopes] = (
-                    scale * (theta.T @ tails.sum(axis=1)) + direction * centered_score
+                gradient[:n_slopes] = theta.T @ tails.sum(axis=1) - np.sum(
+                    tails * steps
                 )
         gradient[n_slopes:] = -scale * tails.sum(axis=0)
         return loss, gradient

@@ -24,6 +24,20 @@ Quick start
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
 
+Interactive responses
+---------------------
+
+For a live test, disclose ``engine.select_next_item()`` and pass the observed
+category to ``engine.administer_item(response)``. Repeated selection returns the
+same pending item until a valid response is submitted.
+
+``administer_item`` accepts integer-valued numeric responses in the selected
+item's category range: 0 or 1 for a binary item, and 0 through
+``n_categories[item] - 1`` for an ordinal item. Invalid responses raise
+``ValueError`` and preserve the pending item, response history, ability estimate,
+and administration/exposure counts, so the caller can submit a corrected answer.
+Both CAT and MCAT enforce this contract.
+
 Batch simulation
 ----------------
 
@@ -47,16 +61,14 @@ general Python implementation so their operational semantics are preserved.
 Native results include the exact administered item and response sequences, making
 them fully compatible with ``CATResult`` serialization and downstream audits.
 
-Interactive response submission
--------------------------------
+Simulation methods validate finite abilities, array dimensions, and positive
+integer replication counts before changing the active session. Conditional
+diagnostics accumulate bias, MSE, and average test length as sessions finish,
+without storing every replicated estimate. Their working storage depends on the
+number of factors rather than the number of replications.
 
-For a live test, disclose ``engine.select_next_item()`` and pass the observed
-category to ``engine.administer_item(response)``. Repeated selection returns the
-same pending item until a valid response is submitted. Responses must be finite
-integer categories within that item's range: 0 or 1 for binary items, or
-``0 .. n_categories[item] - 1`` for ordinal items. An invalid submission raises
-``ValueError`` and retains the pending item, response history, available pool,
-and ability state so the response can be corrected and retried.
+Ability updates
+---------------
 
 For independent built-in binary models, EAP updates reuse the Gauss-Hermite grid
 and evaluate only administered item curves in bounded blocks. The posterior is
@@ -151,6 +163,9 @@ Use :class:`~mirt.cat.content.ContentConstraint` / blueprints and exposure
 controllers (Sympson–Hetter, randomesque, progressive) for operational CAT.
 Progressive control randomizes early selections within an information window
 and increasingly favors item information as the configured test limit nears.
+The first interactive session is included in exposure reports automatically.
+Resetting before any item selection reuses the unused session; resetting after
+selection starts a new examinee.
 
 Fixed-form assembly
 -------------------

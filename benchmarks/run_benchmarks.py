@@ -27,6 +27,7 @@ SUITE_ORDER = (
     "fit",
     "scoring",
     "posterior",
+    "score-equating",
     "bayesian",
     "patterns",
     "data",
@@ -1982,6 +1983,51 @@ def bench_information(
     return BenchResult("marginal_information", times, peak_traced_bytes=peak)
 
 
+def bench_score_equating(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure marginal sum-score recursion; persons sets the theta-grid size."""
+    from mirt.equating import lord_wingersky_recursion
+
+    theta = np.linspace(-4.0, 4.0, n_persons)
+    weights = np.exp(-0.5 * theta**2)
+    discrimination = np.linspace(0.7, 1.5, n_items)
+    difficulty = np.linspace(-2.0, 2.0, n_items)
+    category_counts = 2 + np.arange(n_items) % 3
+    results = []
+    for name, model_type in (
+        ("2pl", mirt.TwoParameterLogistic),
+        ("3pl", mirt.ThreeParameterLogistic),
+        ("grm", mirt.GradedResponseModel),
+        ("gpcm", mirt.GeneralizedPartialCredit),
+    ):
+        if name in ("grm", "gpcm"):
+            model = model_type(n_items, n_categories=category_counts)
+            key = "thresholds" if name == "grm" else "steps"
+            model.set_parameters(
+                discrimination=discrimination,
+                **{key: difficulty[:, None] + np.array([-0.8, 0.0, 0.8])},
+            )
+        else:
+            model = model_type(n_items)
+            model.set_parameters(discrimination=discrimination, difficulty=difficulty)
+
+        def run(model=model):
+            return lord_wingersky_recursion(model, theta, weights)
+
+        results.append(
+            BenchResult(
+                f"score_equating_{name}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
 def bench_posterior(
     n_persons: int,
     n_items: int,
@@ -2468,6 +2514,8 @@ def run_suites(
         results.append(bench_scoring(n_persons, n_items, repeats, warmups))
     if "posterior" in suites:
         results.extend(bench_posterior(n_persons, n_items, repeats, warmups))
+    if "score-equating" in suites:
+        results.extend(bench_score_equating(n_persons, n_items, repeats, warmups))
     if "bayesian" in suites:
         results.extend(bench_bayesian(n_persons, n_items, repeats, warmups))
     if "patterns" in suites:
@@ -2760,6 +2808,7 @@ def _validate_baseline_compatibility(
                 "qmcem_",
                 "gpu_likelihood_",
                 "binary_likelihood_",
+                "score_equating_",
             )
         )
     )

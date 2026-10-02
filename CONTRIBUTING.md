@@ -18,18 +18,18 @@ Optional extras: `.[docs]`, `.[plot]`, `.[pandas]`, `.[polars]`, `.[gpu]`.
 ## Python checks
 
 ```bash
-uv run --no-sync ruff format src tests benchmarks
-uv run --no-sync ruff check src tests benchmarks
+uv run --no-sync ruff format src tests benchmarks .github/scripts
+uv run --no-sync ruff check src tests benchmarks .github/scripts
 
-uv run mypy src/mirt --ignore-missing-imports
+uv run --no-sync mypy src/mirt --ignore-missing-imports
 
-uv run pytest
+uv run --no-sync pytest
 
-uv run pytest -m slow
-uv run pytest -m performance
+uv run --no-sync pytest -m slow
+uv run --no-sync pytest -m performance
 ```
 
-Convenience targets: `make lint`, `make fmt`, `make test`, `make test-slow`, `make bench`, `make develop`.
+Convenience targets: `make lint`, `make fmt`, `make test`, `make test-slow`, `make test-performance`, `make bench`, `make develop`.
 
 ## Rust backend contract
 
@@ -56,8 +56,10 @@ Or: `make test-rust` / `make fmt`.
 
 ## CI checks
 
-CI installs dependencies from `uv.lock` and builds one release wheel with
-`Cargo.lock` enforced. The same ABI3 wheel is tested on Python 3.11–3.14 and used
+CI installs dependencies from `uv.lock`, packages a source distribution, and
+builds one release wheel from its extracted contents with `Cargo.lock` enforced.
+This checks that the source distribution contains everything needed to build
+and run the package. The same ABI3 wheel is tested on Python 3.11–3.14 and used
 for all performance checks and the slow suite. Native jobs explicitly require
 the extension to load. A separate job runs the full non-slow, non-performance
 suite from source without the extension. Workflow syntax, lint, and type checks
@@ -74,7 +76,11 @@ To reproduce wheel testing in a clean environment:
 
 ```bash
 uv sync --locked --no-install-project --extra dev --extra plot
-uv run --no-sync maturin build --release --locked --out dist
+uv run --no-sync maturin sdist --out dist
+sdist_dir=$(mktemp -d)
+tar -xzf dist/*.tar.gz -C "$sdist_dir" --strip-components=1
+UV_PROJECT_ENVIRONMENT="$PWD/.venv" uv run --directory "$sdist_dir" --no-sync \
+  maturin build --release --locked --out "$PWD/dist"
 uv pip install --no-deps --no-index dist/*.whl
 uv run --no-sync pytest -m 'not slow and not performance' --cov=mirt
 ```
@@ -98,6 +104,22 @@ Test reports and scoring/posterior benchmarks are retained as workflow artifacts
 
 Workflow syntax is checked by a pinned, checksum-verified actionlint release.
 Run `actionlint` to validate workflow changes locally.
+
+Release builds also enforce `Cargo.lock`. The full non-slow, non-performance
+suite runs against every published wheel architecture: Linux x86_64 and ARM64,
+Windows x64, and macOS Intel and Apple Silicon. Linux x86_64 wheels additionally
+run on every supported Python version. The uploaded source distribution is
+rebuilt and tested separately, and publication requires both wheel and source
+distribution validation to pass. Release test reports are retained for review.
+Automatic version-update PRs synchronize the runtime version, Cargo package
+metadata, and the root Cargo lock entry. Their helper validates all versions
+before editing and preserves an unversioned dynamic project entry in `uv.lock`.
+
+Python security checks export every runtime and optional dependency from
+`uv.lock` to a temporary PEP 751 lockfile and audit it with pinned pip-audit
+2.10.1. This covers versions selected for other supported Python versions and
+platforms, without installing the optional GPU stack. The audit fails on known
+vulnerabilities or collection failures and retains its input and JSON findings.
 
 ## Documentation
 

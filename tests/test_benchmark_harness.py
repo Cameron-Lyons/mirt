@@ -336,6 +336,7 @@ class TestBenchmarkCommand:
             "fit",
             "scoring",
             "posterior",
+            "score-equating",
             "bayesian",
             "patterns",
             "data",
@@ -385,6 +386,7 @@ class TestBenchmarkCommand:
             "fit",
             "scoring",
             "posterior",
+            "score-equating",
             "bayesian",
             "patterns",
             "data",
@@ -1219,6 +1221,25 @@ class TestBenchmarkCommand:
             "posterior_highest_density",
         ]
         assert results[0].median > 0.0
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=10),
+                _report(*results, persons=20),
+                max_regression_percent=20.0,
+            )
+
+    def test_score_equating_suite_records_time_memory_and_grid_size(self) -> None:
+        results = benchmark.run_suites(
+            ("score-equating",), n_persons=10, n_items=3, repeats=2, warmups=1
+        )
+        assert [result.name for result in results] == [
+            "score_equating_2pl",
+            "score_equating_3pl",
+            "score_equating_grm",
+            "score_equating_gpcm",
+        ]
+        assert all(len(result.times) == 2 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
         with pytest.raises(ValueError, match="person count"):
             benchmark.compare_results(
                 _report(*results, persons=10),

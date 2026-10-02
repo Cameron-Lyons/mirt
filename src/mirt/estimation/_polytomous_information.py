@@ -96,7 +96,7 @@ def polytomous_item_curvature(
             result["thresholds"][: categories - 1][invalid] = np.nan
         return result
 
-    scale = a[0] if model.n_factors == 1 else np.linalg.norm(a)
+    scale = a.sum()
     tails = np.cumsum(probability[:, :0:-1], axis=1)[:, ::-1]
     result["steps"][: categories - 1] = scale**2 * np.sum(
         total[:, None] * tails * (1.0 - tails), axis=0
@@ -106,27 +106,10 @@ def polytomous_item_curvature(
 
     category = np.arange(categories)
     offsets = np.r_[0.0, np.cumsum(parameters["steps"][item, : categories - 1])]
-    if model.n_factors == 1:
-        features = theta * category - offsets
+    for factor in range(model.n_factors):
+        features = theta[:, factor, None] * category - offsets
         mean = np.sum(probability * features, axis=1)
-        result["discrimination"][...] = np.sum(
+        result["discrimination"].reshape(-1)[factor] = np.sum(
             total * np.sum(probability * (features - mean[:, None]) ** 2, axis=1)
         )
-        return result
-
-    if scale == 0.0:
-        # The norm in multidimensional GPCM logits is not differentiable here.
-        result["discrimination"][...] = np.nan
-        return result
-    centered = (theta @ a)[:, None] * category - offsets
-    residual = probability * total[:, None] - effective
-    for factor in range(model.n_factors):
-        direction = a[factor] / scale
-        projected = theta[:, factor, None] * category
-        first = direction * centered + scale * projected
-        second = (1.0 - direction**2) / scale * centered + 2.0 * direction * projected
-        mean = np.sum(probability * first, axis=1)
-        result["discrimination"][factor] = np.sum(
-            total * np.sum(probability * (first - mean[:, None]) ** 2, axis=1)
-        ) + np.sum(residual * second)
     return result

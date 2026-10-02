@@ -8,11 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Corrected linked true-score equating to invert the calibration transform
-  `theta_old = A * theta_new + B`. Native observed-score recursion now preserves
-  custom probability hooks and uses exact compatible model types.
-- Rejected invalid CAT/MCAT responses before changing the pending item, response
-  history, available pool, or exposure state, allowing corrected submissions.
+- Corrected score equating to invert the documented new-to-reference linking
+  transformation. Equivalent calibrations now yield identical true-score
+  tables. Compiled score recursion respects overridden model curves and exact
+  model types.
+- Corrected multidimensional GPCM adjacent logits to
+  `theta @ a - sum(a) * step`, matching centered-threshold simulation and the
+  two-category 2PL reduction. Updated fitting gradients and uncertainty
+  curvature consistently. Previously fitted multidimensional GPCM parameters
+  should be recalibrated. Stabilized GPCM, PCM, and RSM information at saturated
+  response probabilities.
+- Rejected invalid CAT/MCAT response categories before mutating administration
+  state. A corrected response can still answer the pending item. Simulation
+  inputs are validated before resetting an active session.
+- Counted initial interactive CAT/MCAT exposure sessions correctly, without
+  counting unused resets as additional examinees.
 - Matched native CAT simulation posteriors to the public EAP scorer's bounded
   binary probabilities, including saturated curves. Native dispatch preserves
   customized model, selection, control, stopping, and engine methods. Native
@@ -42,8 +52,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probability overrides, and custom curves retain numerical fitting.
 
 ### Added
-- Added `linking_result` to observed-score equating, evaluating both forms under
-  the same reference population after converting abilities to the new scale.
+- Linked observed-score equating with reference-population probability masses
+  and configurable theta batching. Added exact item and test Fisher information
+  matrices for GPCM and PCM, including their use by MCAT selection.
+- Independent mathematical and end-to-end regressions for equivalent
+  calibrations, exhaustive response-pattern distributions, multidimensional
+  parameter recovery, simulation frequencies, Fisher matrices, and CAT session
+  recovery after invalid inputs.
+- A `score-equating` benchmark suite reporting timing and traced allocation
+  peaks for dichotomous and heterogeneous ordinal forms.
 - Added optional `mp_context` to cross-validation and regularization selection
   so callers can choose their multiprocessing context without global changes.
 - Added an `adaptive-scoring` timing and traced-memory benchmark suite for
@@ -61,6 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder errors and existing fitting costs.
 
 ### Changed
+- Bounded score-recursion memory with theta batches and reused contiguous work
+  buffers. Streamed CAT/MCAT conditional-error moments instead of retaining
+  every simulated estimate.
+- CI builds its tested wheel from the source distribution. Release validation
+  tests rebuilt source distributions and every published wheel architecture,
+  including Intel macOS and Python 3.14, using locked dependencies and the full
+  regular test suite. Local Make targets preserve the installed package with
+  `uv run --no-sync`.
+- Python security checks audit all locked dependencies across optional extras
+  and platform markers, retain their findings, and fail on collection errors.
+  Updated locked urllib3 to 2.8.0 and replaced yanked NumPy 2.4.0 with 2.4.6.
+- Automatic version bumps synchronize the runtime module, Cargo manifest, and
+  versioned package lock entries, refusing inconsistent inputs before edits.
 - Reused adaptive EAP quadrature grids and evaluated only administered item
   curves for independent built-in binary models, with bounded probability and
   covariance scratch space. Current parameters are reevaluated on each update;

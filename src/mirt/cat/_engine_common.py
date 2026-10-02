@@ -19,12 +19,15 @@ def configure_exposure_control(
     *,
     seed: int | None,
 ) -> ExposureControl:
-    """Normalize exposure-control configuration."""
+    """Normalize exposure control and open the engine's initial session."""
     if exposure_control is None:
-        return NoExposureControl()
-    if isinstance(exposure_control, str):
-        return create_exposure_control(exposure_control, seed=seed)
-    return exposure_control
+        control = NoExposureControl()
+    elif isinstance(exposure_control, str):
+        control = create_exposure_control(exposure_control, seed=seed)
+    else:
+        control = exposure_control
+    control.reset()
+    return control
 
 
 def configure_content_constraint(
@@ -34,6 +37,31 @@ def configure_content_constraint(
     if content_constraint is None:
         return NoContentConstraint()
     return content_constraint
+
+
+def validate_replications(n_replications: int) -> int:
+    """Validate a replication count before any simulation changes session state."""
+    if (
+        isinstance(n_replications, (bool, np.bool_))
+        or not isinstance(n_replications, (int, np.integer))
+        or n_replications < 1
+    ):
+        raise ValueError("n_replications must be a positive integer")
+    return int(n_replications)
+
+
+def validate_simulation_values(values: Any, *, name: str) -> np.ndarray:
+    """Return finite real ability values without silently casting complex inputs."""
+    try:
+        raw = np.asarray(values)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must contain numeric values") from exc
+    if raw.dtype.kind not in "biuf":
+        raise ValueError(f"{name} must contain real numeric values")
+    result = np.asarray(raw, dtype=np.float64)
+    if not np.all(np.isfinite(result)):
+        raise ValueError(f"{name} must contain only finite values")
+    return result
 
 
 def initialize_common_engine(
@@ -56,6 +84,7 @@ def initialize_common_engine(
     engine.theta_bounds = theta_bounds
     engine.seed = seed
     engine.rng = np.random.default_rng(seed)
+    engine._exposure_session_used = False
 
 
 def reset_session_state(
@@ -75,7 +104,12 @@ def reset_session_state(
     if hasattr(engine, "_pending_item"):
         delattr(engine, "_pending_item")
 
-    engine._exposure.reset()
+    # Construction already opens the first exposure session. Resetting before
+    # any item was selected reuses that unused session, including the initial
+    # reset performed by run_simulation. This prevents phantom examinees.
+    if engine._exposure_session_used:
+        engine._exposure.reset()
+    engine._exposure_session_used = False
     engine._content.reset()
 
     if hasattr(engine._stopping, "reset"):
@@ -85,20 +119,41 @@ def reset_session_state(
 def get_pending_item(engine: Any) -> int:
     """Select an item once and retain it until a response is recorded."""
     if not hasattr(engine, "_pending_item"):
+        # A selection attempt may change exposure-control eligibility state,
+        # even when a downstream constraint rejects the item pool.
+        engine._exposure_session_used = True
         engine._pending_item = engine._select_next_item()
 
     return int(engine._pending_item)
 
 
-def consume_pending_item(engine: Any) -> int:
-    """Pop the pending item if present, else select one."""
+def consume_pending_item(engine: Any, response: int) -> tuple[int, int]:
+    """Validate a response before consuming its selected item.
+
+    Integer-valued numeric scalars are accepted, including NumPy scalars.
+    A rejected response leaves the pending item available for a corrected
+    answer and does not count an item as administered or exposed.
+    """
+    response_code = _normalize_response_code(response)
+
+    if response_code < 0:
+        raise ValueError("response must be a non-negative category code")
+    if (
+        not engine.model.is_polytomous
+        and response_code > 1
+        and not hasattr(engine, "_pending_item")
+    ):
+        raise ValueError("dichotomous response must be 0 or 1")
+
     item_idx = get_pending_item(engine)
+    response_code = validate_item_response(engine, item_idx, response_code)
+
     delattr(engine, "_pending_item")
-    return item_idx
+    return item_idx, response_code
 
 
-def validate_item_response(engine: Any, item_idx: int, response: Any) -> int:
-    """Validate a response before consuming the disclosed item or updating state."""
+def _normalize_response_code(response: Any) -> int:
+    """Normalize a numeric scalar without truncating fractional category codes."""
     try:
         value = np.asarray(response)
     except (TypeError, ValueError) as exc:
@@ -107,7 +162,12 @@ def validate_item_response(engine: Any, item_idx: int, response: Any) -> int:
         raise ValueError("response must be a finite integer category")
     if value.dtype.kind == "f" and (not np.isfinite(value) or value != np.floor(value)):
         raise ValueError("response must be a finite integer category")
-    category = int(value)
+    return int(value)
+
+
+def validate_item_response(engine: Any, item_idx: int, response: Any) -> int:
+    """Validate a response before consuming the disclosed item or updating state."""
+    category = _normalize_response_code(response)
     n_categories = (
         int(engine.model.n_categories[item_idx]) if engine.model.is_polytomous else 2
     )
@@ -155,6 +215,34 @@ def run_simulation_loop(
         engine.administer_item(response)
 
     return engine.get_result()
+
+
+def simulate_error_moments(
+    engine: Any,
+    true_theta: Any,
+    *,
+    n_replications: int,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Accumulate conditional errors without retaining replicated estimates.
+
+    Welford's recurrence computes each factor's mean and centered second
+    moment, keeping the MSE stable when estimates have a large common offset.
+    Working storage depends on the number of factors rather than replications.
+    """
+    theta = np.asarray(true_theta, dtype=np.float64)
+    mean_error = np.zeros_like(theta)
+    centered_sum_squares = np.zeros_like(theta)
+    mean_items = 0.0
+    for count in range(1, n_replications + 1):
+        result = engine.run_simulation(true_theta)
+        error = np.asarray(result.theta, dtype=np.float64) - theta
+        delta = error - mean_error
+        mean_error += delta / count
+        centered_sum_squares += delta * (error - mean_error)
+        mean_items += (result.n_items_administered - mean_items) / count
+
+    mse = centered_sum_squares / n_replications + mean_error**2
+    return mean_error, mse, mean_items
 
 
 def record_item_administration(

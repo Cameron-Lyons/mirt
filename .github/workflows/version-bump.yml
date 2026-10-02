@@ -48,32 +48,9 @@ jobs:
       - name: Bump version
         if: steps.branch.outputs.exists == 'false'
         id: version
-        run: |
-          VERSION_FILE="src/mirt/_version.py"
-          CURRENT=$(grep -oP '__version__ = "\K[^"]+' "$VERSION_FILE")
-
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-
-          case "${{ steps.bump-type.outputs.type }}" in
-            major)
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
-              PATCH=0
-              ;;
-            minor)
-              MINOR=$((MINOR + 1))
-              PATCH=0
-              ;;
-            patch)
-              PATCH=$((PATCH + 1))
-              ;;
-          esac
-
-          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
-          echo "__version__ = \"$NEW_VERSION\"" > "$VERSION_FILE"
-
-          echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
-          echo "new=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+        env:
+          BUMP_PART: ${{ steps.bump-type.outputs.type }}
+        run: python3 .github/scripts/bump_version.py "$BUMP_PART" >> "$GITHUB_OUTPUT"
 
       - name: Commit and push
         if: steps.branch.outputs.exists == 'false'
@@ -84,7 +61,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add src/mirt/_version.py
+          git add src/mirt/_version.py Cargo.toml Cargo.lock uv.lock
           git commit -m "Bump version: $OLD_VERSION → $NEW_VERSION"
           git push origin "HEAD:refs/heads/$VERSION_BRANCH"
 

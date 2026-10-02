@@ -237,14 +237,15 @@ def test_exact_polytomous_curvature_streams_bounded_blocks(kind, monkeypatch):
         assert np.isfinite(errors[name][mask]).all()
 
 
-def test_multidimensional_partial_credit_zero_slopes_have_undefined_curvature():
+def test_multidimensional_partial_credit_zero_slopes_keep_slope_information():
     model = _model("gpcm")
     model.set_parameters(discrimination=np.zeros_like(model.discrimination))
     responses, samples, weights = _inputs(model)
     errors = MCEMEstimator(
         n_samples=50, compute_standard_errors=True
     )._compute_standard_errors_mc(model, responses, samples, weights)
-    assert np.isnan(errors["discrimination"]).all()
+    assert np.isfinite(errors["discrimination"]).all()
+    assert (errors["discrimination"] > 0).all()
     assert np.isnan(errors["steps"][model.free_parameter_masks["steps"]]).all()
 
 

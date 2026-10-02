@@ -19,7 +19,9 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
-    validate_item_response,
+    simulate_error_moments,
+    validate_replications,
+    validate_simulation_values,
 )
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
@@ -42,6 +44,23 @@ from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+
+def _validate_batch_controls(
+    true_thetas: NDArray[np.float64],
+    n_replications: int,
+    *,
+    n_factors: int,
+) -> tuple[NDArray[np.float64], int]:
+    """Validate an entire diagnostic request before running any sessions."""
+    thetas = validate_simulation_values(true_thetas, name="true_thetas")
+    if thetas.ndim == 1:
+        thetas = thetas.reshape(1, -1)
+    if thetas.ndim != 2 or thetas.shape[1] != n_factors:
+        raise ValueError(f"true_thetas must have shape (n_examinees, {n_factors})")
+    if thetas.shape[0] == 0:
+        raise ValueError("true_thetas must be non-empty")
+    return np.ascontiguousarray(thetas), validate_replications(n_replications)
 
 
 class MCATEngine:
@@ -196,7 +215,11 @@ class MCATEngine:
         self._stopping_reason = ""
 
     def reset(self) -> None:
-        """Reset the engine for a new examinee."""
+        """Reset the engine for a new examinee.
+
+        Resetting an unused session reuses its exposure count. Once item
+        selection begins, a reset opens and counts a new exposure session.
+        """
         self._current_theta = self.initial_theta.copy()
         self._current_covariance = self.initial_covariance.copy()
         reset_session_state(
@@ -306,13 +329,15 @@ class MCATEngine:
         ------
         RuntimeError
             If the MCAT session is already complete.
+        ValueError
+            If the response is not an integer-valued numeric scalar in the
+            selected item's category range. The selected item remains pending
+            so a corrected response can be submitted.
         """
         if self._is_complete:
             raise RuntimeError("MCAT session is already complete")
 
-        item_idx = get_pending_item(self)
-        response = validate_item_response(self, item_idx, response)
-        consume_pending_item(self)
+        item_idx, response = consume_pending_item(self, response)
 
         theta_arr = self._current_theta.reshape(1, -1)
         record_item_administration(
@@ -420,9 +445,7 @@ class MCATEngine:
         MCATResult
             Result of the simulated MCAT session.
         """
-        self.reset()
-
-        true_theta = np.asarray(true_theta)
+        true_theta = validate_simulation_values(true_theta, name="true_theta")
         if true_theta.shape != (self.n_factors,):
             raise ValueError(
                 f"true_theta must have shape ({self.n_factors},), "
@@ -433,7 +456,6 @@ class MCATEngine:
             self,
             true_theta,
             response_generator=response_generator,
-            reset=False,
         )
 
     def _generate_response(self, item_idx: int, true_theta: NDArray[np.float64]) -> int:
@@ -483,15 +505,9 @@ class MCATEngine:
         list[MCATResult]
             List of MCAT results for all simulations.
         """
-        true_thetas = np.asarray(true_thetas)
-        if true_thetas.ndim == 1:
-            true_thetas = true_thetas.reshape(1, -1)
-
-        if true_thetas.shape[1] != self.n_factors:
-            raise ValueError(
-                f"true_thetas must have {self.n_factors} columns, "
-                f"got {true_thetas.shape[1]}"
-            )
+        true_thetas, n_replications = _validate_batch_controls(
+            true_thetas, n_replications, n_factors=self.n_factors
+        )
 
         results = []
         for theta in true_thetas:
@@ -524,9 +540,9 @@ class MCATEngine:
             - 'mse': MSE for each dimension at each theta point
             - 'avg_items': Average number of items at each theta point
         """
-        true_thetas = np.asarray(true_thetas)
-        if true_thetas.ndim == 1:
-            true_thetas = true_thetas.reshape(1, -1)
+        true_thetas, n_replications = _validate_batch_controls(
+            true_thetas, n_replications, n_factors=self.n_factors
+        )
 
         n_points = true_thetas.shape[0]
         bias = np.zeros((n_points, self.n_factors))
@@ -534,18 +550,9 @@ class MCATEngine:
         avg_items = np.zeros(n_points)
 
         for i, true_theta in enumerate(true_thetas):
-            estimates = []
-            n_items_list = []
-
-            for _ in range(n_replications):
-                result = self.run_simulation(true_theta)
-                estimates.append(result.theta)
-                n_items_list.append(result.n_items_administered)
-
-            estimates = np.array(estimates)
-            bias[i] = np.mean(estimates, axis=0) - true_theta
-            mse[i] = np.mean((estimates - true_theta) ** 2, axis=0)
-            avg_items[i] = np.mean(n_items_list)
+            bias[i], mse[i], avg_items[i] = simulate_error_moments(
+                self, true_theta, n_replications=n_replications
+            )
 
         return {
             "true_thetas": true_thetas,
