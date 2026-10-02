@@ -95,6 +95,13 @@ class _OrdinalLogitModel(PolytomousItemModel):
         """Threshold matrix, padded to the largest category count."""
         return self._parameters["thresholds"]
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        counts = np.asarray(self._n_categories)[:, None] - 1
+        masks["thresholds"] &= np.arange(self.max_categories - 1) < counts
+        return self._apply_free_parameter_restrictions(masks)
+
     def thresholds_for_item(self, item_idx: int) -> NDArray[np.float64]:
         """Return only the active thresholds for one item."""
         item_idx = self._validate_item_idx(item_idx)

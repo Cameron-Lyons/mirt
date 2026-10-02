@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Self
 
 import numpy as np
@@ -87,6 +88,7 @@ class BaseItemModel(ABC):
             )
 
         self._parameters: dict[str, NDArray[np.float64]] = {}
+        self._free_parameter_restrictions: dict[str, NDArray[np.bool_]] = {}
         self._is_fitted: bool = False
         self._initialize_parameters()
 
@@ -206,10 +208,74 @@ class BaseItemModel(ABC):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         """Boolean masks identifying statistically free stored parameters."""
-        return {
-            name: np.ones(values.shape, dtype=np.bool_)
-            for name, values in self._parameters.items()
+        return self._apply_free_parameter_restrictions(
+            {
+                name: np.ones(values.shape, dtype=np.bool_)
+                for name, values in self._parameters.items()
+            }
+        )
+
+    def _apply_free_parameter_restrictions(
+        self, masks: dict[str, NDArray[np.bool_]]
+    ) -> dict[str, NDArray[np.bool_]]:
+        """Apply explicit restrictions after model-family identification masks."""
+        for name, restricted in self._free_parameter_restrictions.items():
+            masks[name] &= restricted
+        return masks
+
+    def _copy_parameter_restrictions_to(self, model: "BaseItemModel") -> None:
+        """Preserve explicit masks without sharing mutable arrays with a copy."""
+        if not self._free_parameter_restrictions:
+            return
+        model._free_parameter_restrictions = {
+            name: mask.copy()
+            for name, mask in self._free_parameter_restrictions.items()
         }
+
+    def set_free_parameter_masks(
+        self, masks: Mapping[str, NDArray[np.bool_]] | None
+    ) -> Self:
+        """Restrict statistically free coordinates without changing parameter values.
+
+        Boolean arrays must match the stored parameter shapes and cannot free
+        model-family constraints such as category padding, reference-category
+        coefficients, or 1PL discriminations. Unspecified parameters keep their
+        family masks. Passing ``None`` clears these additional restrictions.
+        Estimators and diagnostics that consume ``free_parameter_masks`` use
+        the resulting masks; this method itself does not constrain setters.
+        """
+        if masks is None:
+            self._free_parameter_restrictions = {}
+            return self
+        if not isinstance(masks, Mapping):
+            raise MirtValidationError("masks must be a mapping", parameter="masks")
+        previous = self._free_parameter_restrictions
+        self._free_parameter_restrictions = {}
+        try:
+            intrinsic = self.free_parameter_masks
+        finally:
+            self._free_parameter_restrictions = previous
+        validated = {}
+        for name, values in masks.items():
+            if name not in intrinsic:
+                raise MirtValidationError(
+                    f"Unknown parameter: {name}", parameter="masks"
+                )
+            mask = np.asarray(values)
+            if mask.dtype != np.bool_ or mask.shape != intrinsic[name].shape:
+                raise MirtValidationError(
+                    f"Mask for {name} must be Boolean with shape {intrinsic[name].shape}",
+                    parameter="masks",
+                )
+            if np.any(mask & ~intrinsic[name]):
+                raise MirtValidationError(
+                    f"Mask for {name} cannot free model-family fixed parameters",
+                    parameter="masks",
+                )
+            if not np.array_equal(mask, intrinsic[name]):
+                validated[name] = mask.copy()
+        self._free_parameter_restrictions = validated
+        return self
 
     def _canonical_parameter_values(
         self,
@@ -218,6 +284,19 @@ class BaseItemModel(ABC):
     ) -> NDArray[np.float64]:
         """Return an identified full-storage representation for estimation."""
         return np.asarray(values, dtype=np.float64).copy()
+
+    def _expand_parameter_standard_errors(
+        self,
+        name: str,
+        errors: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Expand independent-coordinate errors to dependent stored parameters.
+
+        Input and output have the full parameter-storage shape. The default
+        preserves values; families with derived coordinates can propagate
+        their uncertainty without treating those coordinates as free.
+        """
+        return np.asarray(errors, dtype=np.float64).copy()
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         validated: dict[str, NDArray[np.float64]] = {}
@@ -351,6 +430,7 @@ class BaseItemModel(ABC):
             item_names=self.item_names.copy(),
         )
         new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
+        self._copy_parameter_restrictions_to(new_model)
         new_model._is_fitted = self._is_fitted
         return new_model
 
@@ -588,6 +668,7 @@ class PolytomousItemModel(BaseItemModel):
             item_names=self.item_names.copy(),
         )
         new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
+        self._copy_parameter_restrictions_to(new_model)
         new_model._is_fitted = self._is_fitted
         return new_model
 

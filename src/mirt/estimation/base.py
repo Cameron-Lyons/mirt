@@ -14,6 +14,25 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 
+def _initialize_free_parameters(model: BaseItemModel) -> None:
+    """Reset starting values while preserving fixed independent coordinates."""
+    original = {
+        name: model._canonical_parameter_values(name, values)
+        for name, values in model.parameters.items()
+    }
+    masks = model.free_parameter_masks
+    model._initialize_parameters()
+    updates = {}
+    for name, values in model.parameters.items():
+        initial = values.copy()
+        np.copyto(values, original[name], where=~masks[name])
+        values = model._canonical_parameter_values(name, values)
+        if not np.array_equal(values, initial, equal_nan=True):
+            updates[name] = values
+    if updates:
+        model.set_parameters(**updates)
+
+
 class BaseEstimator(ABC):
     def __init__(
         self,
@@ -153,8 +172,7 @@ class BaseEstimator(ABC):
             if values.ndim == 0 or values.shape[0] != model.n_items:
                 continue
 
-            canonical = model._canonical_parameter_values(name, values)
-            item_values = np.asarray(canonical[item_idx]).copy()
+            item_values = np.asarray(values[item_idx]).copy()
             item_flat = item_values.reshape(-1)
             item_mask = np.asarray(free_masks[name][item_idx], dtype=np.bool_).reshape(
                 -1
@@ -162,11 +180,10 @@ class BaseEstimator(ABC):
             n_free = int(np.count_nonzero(item_mask))
             item_flat[item_mask] = params[idx : idx + n_free]
 
-            value: float | NDArray[np.float64]
-            if item_values.ndim == 0:
-                value = float(item_flat[0])
-            else:
-                value = item_flat.reshape(item_values.shape)
+            values[item_idx] = item_flat.reshape(item_values.shape)
+            canonical = model._canonical_parameter_values(name, values)
+            row = np.asarray(canonical[item_idx])
+            value: float | NDArray[np.float64] = float(row) if row.ndim == 0 else row
             model.set_item_parameter(item_idx, name, value)
             idx += n_free
 

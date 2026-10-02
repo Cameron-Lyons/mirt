@@ -397,7 +397,9 @@ def oblique_procrustes_rotation(
     atb = source.T @ target
     orthogonal_transform = orthogonal_scale * orthogonal
     if gamma == 1.0:
-        transform = linalg.solve(ata, atb, assume_a="pos", check_finite=False)
+        # Normal equations square the condition number and can lose an
+        # identifiable factor when anchor slopes are nearly collinear.
+        transform, _, _, _ = linalg.lstsq(source, target, check_finite=False)
     else:
         matrix_scale = max(float(np.trace(ata) / ata.shape[0]), np.finfo(float).tiny)
         ridge = ((1.0 - gamma) / gamma) * matrix_scale

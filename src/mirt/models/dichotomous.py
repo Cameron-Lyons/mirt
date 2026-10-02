@@ -827,7 +827,7 @@ class OneParameterLogistic(TwoParameterLogistic):
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
         masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
         self,

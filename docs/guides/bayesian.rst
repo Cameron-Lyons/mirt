@@ -116,6 +116,7 @@ WAIC or PSIS-LOO. Choose the aggregation level according to the predictive unit:
        responses,
        result.chains,
        by="person",
+       batch_size=512,
    )
    print(waic(person_log_lik).summary())
    print(psis_loo(person_log_lik).summary())
@@ -125,7 +126,16 @@ missing cells. ``by="observed"`` omits missing cells, producing the most compact
 matrix when each observed response is the predictive unit. Exact unidimensional
 2PL models evaluate fixed or sampled item parameters and abilities through a
 batched native implementation when available, with a memory-bounded NumPy fallback.
-Other model families retain the general probability-based implementation.
+Other built-in families evaluate curves in respondent blocks bounded by their
+item and category counts. ``batch_size`` sets the maximum respondents per block
+for either backend. The returned matrix still scales with posterior draws and
+the number of predictive units. Fixed abilities and item parameters use broadcast
+views instead of dense copies across posterior draws.
+
+Customized 2PL curves follow their public probability methods. Custom models use
+the complete respondent matrix by default to preserve callback context; an explicit
+``batch_size`` opts into block evaluation. Model parameters and supplied chains
+are preserved, including when a custom curve raises an exception.
 
 Posterior predictive suites
 ---------------------------

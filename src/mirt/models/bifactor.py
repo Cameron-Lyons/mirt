@@ -282,4 +282,5 @@ class BifactorModel(DichotomousItemModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model

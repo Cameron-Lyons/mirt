@@ -266,12 +266,18 @@ def test_synchronization_skips_fixed_and_padded_components() -> None:
     assert second_actual[0, 1] == -99.0
 
 
-def test_synchronization_batches_updates_per_parameter(
+def test_synchronization_batches_changed_shared_values_per_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = MultigroupModel(TwoParameterLogistic(100), 3)
     model.set_shared_parameter("discrimination")
     model.set_shared_parameter("difficulty")
+    for group, slope, difficulty in zip(
+        model.group_models, [1.0, 1.4, 2.2], [-1.0, 0.0, 2.0], strict=True
+    ):
+        group.set_parameters(
+            discrimination=np.full(100, slope), difficulty=np.full(100, difficulty)
+        )
     call_counts = [0, 0, 0]
 
     for group_idx, group_model in enumerate(model.group_models):
@@ -290,7 +296,12 @@ def test_synchronization_batches_updates_per_parameter(
 
     model.synchronize_shared_parameters()
 
-    assert call_counts == [2, 2, 2]
+    assert call_counts == [1, 1, 1]
+    for group in model.group_models:
+        np.testing.assert_allclose(
+            group.parameters["discrimination"], np.mean([1, 1.4, 2.2])
+        )
+        np.testing.assert_allclose(group.parameters["difficulty"], 1 / 3)
 
 
 def test_copy_shared_to_all_updates_only_selected_items() -> None:
@@ -335,9 +346,9 @@ def test_end_to_end_fit_reports_correct_information_criteria() -> None:
     )
 
     assert result.model.n_parameters == 4
-    assert result.n_parameters == 6
-    assert result.aic == pytest.approx(-2 * result.log_likelihood + 12)
-    assert result.bic == pytest.approx(-2 * result.log_likelihood + np.log(8) * 6)
+    assert result.n_parameters == 4
+    assert result.aic == pytest.approx(-2 * result.log_likelihood + 8)
+    assert result.bic == pytest.approx(-2 * result.log_likelihood + np.log(8) * 4)
 
 
 def test_single_and_combined_coefficient_tables(dataframe_backend: str) -> None:

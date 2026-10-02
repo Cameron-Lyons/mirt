@@ -594,6 +594,8 @@ def purify_anchors(
     max_iterations: int = 10,
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_theta: int = 61,
+    weights: NDArray[np.float64] | None = None,
+    robust: bool = False,
 ) -> tuple[list[int], list[int], list[int]]:
     """Iteratively remove drifting items from anchor set.
 
@@ -619,16 +621,42 @@ def purify_anchors(
         Range for curve matching.
     n_theta : int
         Number of theta points.
+    weights : NDArray[np.float64] | None
+        Population weights used in every curve-matching iteration.
+    robust : bool
+        Use medians and robust scale estimates for moment linking.
 
     Returns
     -------
     tuple[list[int], list[int], list[int]]
         Purified anchors (old, new) and list of removed indices.
     """
-    from mirt.equating.linking import link
+    from mirt.equating.linking import (
+        _LINKING_METHODS,
+        _validate_anchor_pairs,
+        _validate_curve_grid,
+        link,
+    )
 
-    current_old = list(anchors_old)
-    current_new = list(anchors_new)
+    if method not in _LINKING_METHODS:
+        raise ValueError(f"Unknown linking method: {method}")
+    current_old, current_new = _validate_anchor_pairs(
+        model_old, model_new, anchors_old, anchors_new
+    )
+    _, weights = _validate_curve_grid(theta_range, n_theta, weights)
+    if not np.isfinite(threshold) or threshold <= 0.0:
+        raise ValueError("threshold must be finite and positive")
+    for name, value, minimum in (
+        ("min_anchors", min_anchors, 2),
+        ("max_iterations", max_iterations, 1),
+    ):
+        if (
+            isinstance(value, (bool, np.bool_))
+            or not isinstance(value, (int, np.integer))
+            or value < minimum
+        ):
+            raise ValueError(f"{name} must be an integer of at least {minimum}")
+
     removed = []
 
     for _ in range(max_iterations):
@@ -643,6 +671,8 @@ def purify_anchors(
             method=method,
             theta_range=theta_range,
             n_theta=n_theta,
+            weights=weights,
+            robust=robust,
             compute_diagnostics=True,
         )
 

@@ -332,6 +332,12 @@ class TestletModel(DichotomousItemModel):
         return self._parameters["testlet_variances"].copy()
 
     @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["testlet_loadings"] &= self._testlet_membership >= 0
+        return self._apply_free_parameter_restrictions(masks)
+
+    @property
     def n_quadpts(self) -> int:
         """Number of standard-normal quadrature points."""
         return self._n_quadpts
@@ -775,6 +781,7 @@ class TestletModel(DichotomousItemModel):
                 new_model._parameters[name] = values.copy()
             new_model._is_fitted = self._is_fitted
 
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -878,6 +885,51 @@ class BifactorTestletModel(TestletModel):
     @property
     def constrain_testlet_loadings(self) -> bool:
         return self._constrain_loadings
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        if self._constrain_loadings:
+            masks["testlet_loadings"].fill(False)
+            for label in self._unique_testlets:
+                first = self.get_testlet_items(int(label))[0]
+                masks["testlet_loadings"][first] = True
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "testlet_loadings" and self._constrain_loadings:
+            for label in self._unique_testlets:
+                items = self.get_testlet_items(int(label))
+                canonical[items] = canonical[items[0]]
+        return canonical
+
+    def _expand_parameter_standard_errors(
+        self, name: str, errors: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        expanded = super()._expand_parameter_standard_errors(name, errors)
+        if name == "testlet_loadings" and self._constrain_loadings:
+            for label in self._unique_testlets:
+                items = self.get_testlet_items(int(label))
+                expanded[items] = expanded[items[0]]
+        return expanded
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        if self._constrain_loadings and "testlet_loadings" in params:
+            values = np.asarray(params["testlet_loadings"], dtype=np.float64)
+            if values.shape == (self.n_items,):
+                for label in self._unique_testlets:
+                    items = self.get_testlet_items(int(label))
+                    if not np.allclose(
+                        values[items], values[items[0]], rtol=0.0, atol=1e-12
+                    ):
+                        raise MirtValidationError(
+                            "constrained testlet loadings must use one common value per testlet",
+                            parameter="testlet_loadings",
+                        )
+        return super().set_parameters(**params)
 
     @property
     def general_loadings(self) -> NDArray[np.float64]:
@@ -985,6 +1037,7 @@ class BifactorTestletModel(TestletModel):
                 new_model._parameters[name] = values.copy()
             new_model._is_fitted = self._is_fitted
 
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -1410,6 +1463,7 @@ class RandomTestletEffectsModel(TestletModel):
                 new_model._parameters[name] = values.copy()
             new_model._is_fitted = self._is_fitted
 
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 

@@ -71,7 +71,7 @@ class MultidimensionalModel(DichotomousItemModel):
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
         masks["slopes"] &= self._loading_pattern != 0.0
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _curve_parameters(
         self, item_idx: int | None
@@ -198,5 +198,6 @@ class MultidimensionalModel(DichotomousItemModel):
         model._parameters = {
             name: values.copy() for name, values in self._parameters.items()
         }
+        self._copy_parameter_restrictions_to(model)
         model._is_fitted = self._is_fitted
         return model

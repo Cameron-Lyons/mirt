@@ -262,6 +262,14 @@ class CustomItemModel(BaseItemModel):
         }
 
     @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        for name, (lower, upper) in self.item_type.par_bounds.items():
+            if lower == upper:
+                masks[name].fill(False)
+        return self._apply_free_parameter_restrictions(masks)
+
+    @property
     def is_polytomous(self) -> bool:
         return self.item_type.n_categories > 2
 
@@ -775,6 +783,7 @@ class CustomItemModel(BaseItemModel):
             name: value.copy() for name, value in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 

@@ -44,12 +44,22 @@ class TestM2:
         centered = compute_m2(model, responses, theta=np.zeros(4))
         high_ability = compute_m2(model, responses, theta=np.full(4, 2.0))
 
-        assert centered["M2"] == pytest.approx(0.25)
+        # With fixed zero abilities the nuisance tangent contains only the
+        # three item means. The remaining three pair associations are tested.
+        assert centered["M2"] == pytest.approx(4.0)
         assert high_ability["M2"] > centered["M2"]
 
     def test_polytomous_collapsed_score_moments(self):
-        model = GradedResponseModel(n_items=3, n_categories=4)
-        responses = np.array([[0, 1, 2], [1, 2, 3], [2, 3, 0], [3, 0, 1]], dtype=int)
+        model = GradedResponseModel(n_items=6, n_categories=3)
+        responses = np.array(
+            [
+                [0, 1, 2, 0, 1, 2],
+                [1, 2, 0, 2, 0, 1],
+                [2, 0, 1, 1, 2, 0],
+                [0, 0, 1, 2, 1, 2],
+            ],
+            dtype=int,
+        )
 
         result = compute_m2(model, responses, theta=np.linspace(-1.5, 1.5, 4))
         quadrature_result = compute_m2(model, responses, n_quadpts=9)
@@ -170,21 +180,13 @@ class TestFitIndices:
             equal_nan=True,
         )
 
-    def test_probability_matrix_is_evaluated_once(self, monkeypatch):
+    def test_fit_indices_do_not_mutate_model_parameters(self):
         model = TwoParameterLogistic(n_items=4)
         responses = np.array([[0, 1, 0, 1], [1, 0, 1, 0], [1, 1, 0, 0], [0, 0, 1, 1]])
-        original_probability = model.probability
-        calls: list[int | None] = []
-
-        def counted_probability(theta, item_idx=None):
-            calls.append(item_idx)
-            return original_probability(theta, item_idx)
-
-        monkeypatch.setattr(model, "probability", counted_probability)
-
+        original = model.parameters
         compute_fit_indices(model, responses, theta=np.linspace(-1.0, 1.0, 4))
-
-        assert calls == [None]
+        for name, values in original.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
 
     def test_rmsea_interval_is_ordered_and_contains_estimate(self):
         estimate = _compute_rmsea(10.2, 1, 4)

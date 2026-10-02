@@ -63,6 +63,14 @@ For polytomous items (Likert scales, etc.):
    result = mirt.fit_mirt(responses, model="GRM", n_categories=3)
    print(result.summary())
 
+For items with different response scales, pass one category count per item,
+such as ``n_categories=[2, 3, 4]`` for a three-item response matrix. Omitting
+``n_categories`` infers each item's count separately from its largest observed
+code, with a minimum of two. Explicit counts retain categories absent from the
+sample and are required for wholly unobserved items. A scalar count applies
+to every item. GRM EM calibration constrains adjacent thresholds to remain
+ordered, including free thresholds next to fixed ones.
+
 Scoring
 -------
 
@@ -132,3 +140,137 @@ Evaluate model fit with various diagnostics:
    )
    print(item_stats.head())
    print(person_stats.head())
+
+Conditional S-X2 item fit
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``S_X2`` compares item category counts within each exact total-score group.
+Expected proportions follow the `Orlando--Thissen derivation
+<https://doi.org/10.1177/01466216000241003>`_: for item :math:`j`, category
+:math:`k` and total score :math:`s`,
+
+.. math::
+
+   E_{jsk} =
+   \frac{\int P_j(k\mid\theta)\,P(S_{-j}=s-k\mid\theta)\,f(\theta)\,d\theta}
+        {\int P(S=s\mid\theta)\,f(\theta)\,d\theta}.
+
+Score recursion integrates these probabilities without scoring each respondent.
+The Pearson statistic uses observed counts and :math:`N_s E_{jsk}`. The legacy
+``n_groups`` argument is deprecated and ignored; exact scores define the groups.
+
+Binary items pool sparse adjacent score rows. Ordinal items follow
+`Kang and Chen's generalized S-X2
+<https://files.eric.ed.gov/fulltext/ED510479.pdf>`_: exclude zero and perfect
+total scores, pool incomplete tail score rows, then combine sparse adjacent
+response categories within each row. ``min_expected=1.0`` is the default;
+zero disables sparse-cell pooling. When two adjacent groups are eligible,
+pooling chooses the one with the smaller expected count. Category counts may
+differ across items; category scores must be consecutive integers starting at
+zero.
+
+The ``df`` column counts retained category contrasts minus the number of
+estimated parameters for that item. Fixed parameters and padded ordinal
+thresholds are excluded using the model's free parameter masks. Supply
+``item_parameter_counts`` explicitly for models with shared parameters, including
+RSM, GRSM, explanatory item-feature models, and testlet models. A global array
+whose length happens to equal the item count still requires this explicit
+allocation. For externally known item parameters, supply one zero per item.
+Nonpositive degrees of freedom appear as ``df=0`` and ``p_value=NaN``; a
+remaining expected cell below the requested minimum also gives ``NaN``.
+An ordinal item whose maximum score exceeds the remaining test's maximum
+has no full-category score group and returns ``S_X2=NaN``, ``df=0``.
+
+By default, S-X2 integrates over independent standard-normal factors with 41
+quadrature points per factor and assumes conditionally independent items.
+``MixtureIRT`` and ``HigherOrderCDM`` need joint integration over their shared
+latent classes or mastery patterns and are rejected. Testlet and bifactor
+models remain conditionally independent when all their factors are specified;
+the quadrature distribution must match those factors, including testlet
+variances. Full-factor testlet curves use the supplied testlet-factor values;
+they do not rescale those values using the model's stored testlet variances.
+S-X2 therefore needs explicit quadrature masses for that full-factor
+distribution when it differs from independent standard normals.
+Fitted nonstandard factor distributions are not selected
+automatically.
+For a different fitted latent distribution,
+supply both its grid and nonnegative probability masses:
+
+.. code-block:: python
+
+   item_stats = mirt.itemfit(
+       result,
+       responses,
+       statistics=["S_X2"],
+       quadrature_points=latent_grid,
+       quadrature_weights=latent_masses,
+       p_adjust="holm",
+   )
+
+Weights are normalized automatically. Person abilities supplied to
+``compute_itemfit`` affect infit/outfit; S-X2 always integrates the latent
+distribution. Complete responses are required for S-X2. ``na_rm=True``
+explicitly removes persons with any negative or NaN response from S-X2.
+Infit/outfit continue using available responses under the negative missing-code
+convention. Complete-case inference pertains to the retained sample; its latent
+distribution must remain appropriate. Out-of-range categories, noninteger codes,
+invalid model probabilities, and observed scores with zero model probability
+raise descriptive errors.
+
+Overall model fit
+~~~~~~~~~~~~~~~~~
+
+For overall fit, use the fitted item model directly:
+
+.. code-block:: python
+
+   overall = mirt.compute_fit_indices(result.model, responses, n_quadpts=31)
+   print(overall)
+
+``compute_m2()`` tests binary items with M2 and ordinal items with the collapsed
+M2* statistic. Both use first-order scores and pairwise score products, their
+model-implied sampling covariance, and a projection that removes estimated
+parameter directions. This follows `Maydeu-Olivares and Joe (2006)
+<https://doi.org/10.1007/s11336-005-1295-9>`_ and `Cai and Hansen (2013)
+<https://doi.org/10.1111/j.2044-8317.2012.02050.x>`_. The ordinal statistic assumes
+the category codes 0, 1, ... have meaningful order and spacing; it does not test
+every category-specific univariate and bivariate margin.
+
+The default null model has independent standard normal latent factors and
+conditionally independent item responses. ``MixtureIRT`` and ``HigherOrderCDM``
+are not supported: averaging their shared latent classes or mastery patterns
+before forming joint moments would violate this assumption. For testlet and
+bifactor models, integration conditions on all factors, and the stated
+standard-normal distribution must match the intended null for every factor.
+Full-factor testlet curves do not apply the stored testlet variances; those
+variances enter the separate one-dimensional marginalized model methods.
+Default M2 quadrature does not automatically select that marginalized
+distribution.
+Increase ``n_quadpts`` and check
+stability for steep item curves. If ``theta`` is supplied, it defines a fixed
+person ability design, with conditional expectations and covariance for each
+person. Ability estimates obtained from the same responses do not satisfy that
+fixed-design assumption, so their chi-square p-values are not calibrated by
+this calculation.
+
+Negative response codes and NaNs are missing. Available-case item and pair
+moments retain their own observation counts; the covariance also retains
+overlap between moments. With quadrature, validity requires missingness
+independent of the responses and latent abilities. With a fixed ability
+design, observation masks may depend on that design, but not on the random
+responses after conditioning on it. Response-dependent missingness requires
+an explicit missingness model.
+
+Degrees of freedom use the numerical ranks of the covariance and free
+parameter tangent. Too few observable moments, especially with short ordinal
+tests, can leave zero testable dimensions: ``M2``, its p-value, and inferential
+fit indices then return NaN. SRMSR remains available as a descriptive score
+correlation residual. Deterministic moments are removed from the stochastic
+rank; an observed response impossible under the model yields an infinite
+statistic when testable dimensions remain. CFI and TLI use a covariance-weighted
+independence baseline with estimated item means. Chi-square calibration is
+asymptotic and assumes regular, consistent parameter estimation.
+
+Probability and response calculations run in bounded blocks. The dense
+moment covariance itself requires space proportional to the fourth power of
+the item count; this is a computational consideration for very long tests.

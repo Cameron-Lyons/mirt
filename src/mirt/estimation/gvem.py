@@ -649,7 +649,7 @@ class GVEMEstimator(BaseEstimator):
 
                 hessian = (elbo_plus - 2 * center_elbo + elbo_minus) / h**2
                 se[index] = np.sqrt(-1.0 / hessian) if hessian < 0.0 else np.nan
-            standard_errors[name] = se
+            standard_errors[name] = model._expand_parameter_standard_errors(name, se)
         return standard_errors
 
     @property

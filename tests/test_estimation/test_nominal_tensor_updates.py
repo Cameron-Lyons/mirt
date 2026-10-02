@@ -31,11 +31,16 @@ def test_tensor_item_parameters_roundtrip_without_aliasing(factors):
     model = NominalResponseModel(2, n_categories=[2, 4], n_factors=factors)
     original = model.slopes.copy()
     values = np.arange(4 * factors, dtype=float).reshape(4, factors) / 10
-    expected = values.copy()
+    expected = np.zeros_like(values)
+    expected[:2] = values[:2] - values[0]
+    theta = np.random.default_rng(413).normal(size=(13, factors))
+    logits = theta @ values[:2].T + model.intercepts[0, :2]
+    expected_probability = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
     model.set_item_parameter(0, "slopes", values)
     values.fill(99.0)
     actual = model.get_item_parameters(0)
     np.testing.assert_array_equal(actual["slopes"], expected)
+    np.testing.assert_allclose(model.probability(theta, 0), expected_probability)
     np.testing.assert_array_equal(model.slopes[1], original[1])
     actual["slopes"].fill(-99.0)
     np.testing.assert_array_equal(model.slopes[0], expected)

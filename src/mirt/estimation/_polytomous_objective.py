@@ -71,9 +71,11 @@ def prepare_polytomous_objective(
         PartialCreditModel: ("discrimination", "steps"),
         NominalResponseModel: ("slopes", "intercepts"),
     }
-    if tuple(model._parameters) != layouts.get(
-        type(model)
-    ) or not uses_builtin_model_hooks(model):
+    if (
+        tuple(model._parameters) != layouts.get(type(model))
+        or not uses_builtin_model_hooks(model)
+        or model._free_parameter_restrictions
+    ):
         return None
 
     n_categories = model.n_categories[item_idx]

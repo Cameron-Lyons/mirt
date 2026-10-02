@@ -137,6 +137,14 @@ class _NoisyGateCDM(BaseCDM):
         """Correct-response probabilities for nonmastered item profiles."""
         return self._parameters["guess"]
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        # With no required attributes both noisy gates always classify an
+        # item as mastered, so its nonmastered probability is unused.
+        masks["guess"] &= np.any(self._q_matrix, axis=1)
+        return self._apply_free_parameter_restrictions(masks)
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         slip = np.asarray(params.get("slip", self.slip), dtype=np.float64)
         guess = np.asarray(params.get("guess", self.guess), dtype=np.float64)
@@ -353,6 +361,7 @@ class _NoisyGateCDM(BaseCDM):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 

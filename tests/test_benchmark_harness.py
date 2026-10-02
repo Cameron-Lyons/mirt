@@ -338,6 +338,8 @@ class TestBenchmarkCommand:
             "posterior",
             "score-equating",
             "bayesian",
+            "pointwise",
+            "multigroup-fit",
             "patterns",
             "data",
             "diagnostics",
@@ -388,6 +390,8 @@ class TestBenchmarkCommand:
             "posterior",
             "score-equating",
             "bayesian",
+            "pointwise",
+            "multigroup-fit",
             "patterns",
             "data",
             "diagnostics",
@@ -1150,6 +1154,42 @@ class TestBenchmarkCommand:
                     _report(result, persons=6),
                     _report(result, persons=12),
                     max_regression_percent=20.0,
+                )
+
+    def test_pointwise_suite_records_memory_and_rejects_mismatched_sizes(self) -> None:
+        results = benchmark.run_suites(
+            ("pointwise",), n_persons=6, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            "pointwise_2pl",
+            "pointwise_3pl",
+            "pointwise_grm",
+        ]
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=6),
+                    _report(result, persons=12),
+                    max_regression_percent=20,
+                )
+
+    def test_multigroup_suite_records_memory_and_rejects_mismatched_sizes(self):
+        results = benchmark.run_suites(
+            ("multigroup-fit",), n_persons=8, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            "multigroup_fit_metric",
+            "multigroup_fit_scalar",
+            "multigroup_fit_fixed",
+        ]
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        for result in results:
+            with pytest.raises(ValueError, match="person count"):
+                benchmark.compare_results(
+                    _report(result, persons=8),
+                    _report(result, persons=16),
+                    max_regression_percent=20,
                 )
 
     def test_diagnostics_suite_records_time_and_memory(self) -> None:

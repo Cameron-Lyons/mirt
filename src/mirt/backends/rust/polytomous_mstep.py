@@ -43,6 +43,7 @@ def try_polytomous_m_step(
         not rust_enabled()
         or model.n_factors != 1
         or not uses_builtin_model_hooks(model)
+        or model._free_parameter_restrictions
         or type(model)
         not in (GradedResponseModel, GeneralizedPartialCredit, PartialCreditModel)
     ):

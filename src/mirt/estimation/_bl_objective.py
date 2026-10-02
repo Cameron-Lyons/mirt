@@ -197,7 +197,10 @@ def prepare_bl_objective(
     setter: _Setter,
 ) -> PreparedBLObjective | None:
     """Keep custom likelihoods, curves, and parameter layouts on their own path."""
-    if not uses_builtin_model_hooks(model, likelihood=True):
+    if (
+        not uses_builtin_model_hooks(model, likelihood=True)
+        or model._free_parameter_restrictions
+    ):
         return None
     if any(
         not info["shape"] or info["shape"][0] != model.n_items

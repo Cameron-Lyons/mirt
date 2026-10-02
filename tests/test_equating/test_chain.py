@@ -438,7 +438,7 @@ class TestConcurrentLink:
             monkeypatch.setattr(model, "probability", counted_probability)
 
         def evaluate_once(function, x0, **kwargs):
-            return SimpleNamespace(x=x0, fun=function(x0))
+            return SimpleNamespace(x=x0, fun=function(x0), success=True)
 
         monkeypatch.setattr(optimize, "minimize", evaluate_once)
         anchor_matrices = [
@@ -469,7 +469,7 @@ class TestConcurrentLink:
             monkeypatch.setattr(model, "probability", counted_probability)
 
         def evaluate_once(function, x0, **kwargs):
-            return SimpleNamespace(x=x0, fun=function(x0))
+            return SimpleNamespace(x=x0, fun=function(x0), success=True)
 
         monkeypatch.setattr(optimize, "minimize", evaluate_once)
 
@@ -497,7 +497,7 @@ class TestConcurrentLink:
         def capture_loss(function, x0, **kwargs):
             loss = function(x0)
             losses.append(loss)
-            return SimpleNamespace(x=x0, fun=loss)
+            return SimpleNamespace(x=x0, fun=loss, success=True)
 
         monkeypatch.setattr(optimize, "minimize", capture_loss)
         pairs = [[[(0, 0), (1, 1)]]]
@@ -515,6 +515,10 @@ class TestConcurrentLink:
             ({"n_theta": 1}, "at least 2"),
             ({"max_iter": 0}, "positive"),
             ({"tol": 0.0}, "positive"),
+            ({"reference_index": -1}, "Invalid reference_index"),
+            ({"reference_index": 3}, "Invalid reference_index"),
+            ({"reference_index": True}, "must be an integer"),
+            ({"reference_index": 1.5}, "must be an integer"),
         ],
     )
     def test_invalid_configuration_is_rejected(self, linked_models, kwargs, message):
