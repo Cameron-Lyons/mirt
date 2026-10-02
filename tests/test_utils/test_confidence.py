@@ -307,7 +307,7 @@ class TestDeltaMethod:
         )
 
     @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
-    def test_near_roundoff_negative_eigenvalue_has_zero_null_direction_error(
+    def test_near_roundoff_negative_eigenvalue_has_negligible_null_direction_error(
         self, scale
     ):
         covariance = scale * np.array([[1.0, 1.0 + 1e-15], [1.0 + 1e-15, 1.0]])
@@ -317,7 +317,15 @@ class TestDeltaMethod:
             lambda values: values[0] - values[1],
             gradient_func=lambda _values: [1.0, -1.0],
         )
-        assert standard_error == 0.0
+        # A fused BLAS multiply/subtract can leave a roundoff residual even
+        # when the two factor rows are equal. Bound it in standard-error units
+        # so neither small nor large covariance scales hide a real error.
+        np.testing.assert_allclose(
+            standard_error / np.sqrt(scale),
+            0.0,
+            rtol=0.0,
+            atol=8.0 * np.finfo(np.float64).eps,
+        )
 
     def test_large_variance_cannot_hide_negative_marginal_variance(self):
         with pytest.raises(MirtValidationError, match="positive semidefinite"):
