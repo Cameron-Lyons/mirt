@@ -24,6 +24,16 @@ Quick start
    result = engine.run_simulation(true_theta=0.5)
    print(result.theta, result.standard_error, result.n_items_administered)
 
+Interactive responses
+---------------------
+
+``administer_item`` accepts integer-valued numeric responses in the selected
+item's category range: 0 or 1 for a binary item, and 0 through
+``n_categories[item] - 1`` for an ordinal item. Invalid responses raise
+``ValueError`` and preserve the pending item, response history, ability estimate,
+and administration/exposure counts, so the caller can submit a corrected answer.
+Both CAT and MCAT enforce this contract.
+
 Batch simulation
 ----------------
 
@@ -46,6 +56,12 @@ length, and no content or exposure constraints. Other configurations retain the
 general Python implementation so their operational semantics are preserved.
 Native results include the exact administered item and response sequences, making
 them fully compatible with ``CATResult`` serialization and downstream audits.
+
+Simulation methods validate finite abilities, array dimensions, and positive
+integer replication counts before changing the active session. Conditional
+diagnostics accumulate bias, MSE, and average test length as sessions finish,
+without storing every replicated estimate. Their working storage depends on the
+number of factors rather than the number of replications.
 
 Portable results
 ----------------
@@ -133,6 +149,9 @@ Use :class:`~mirt.cat.content.ContentConstraint` / blueprints and exposure
 controllers (Sympson–Hetter, randomesque, progressive) for operational CAT.
 Progressive control randomizes early selections within an information window
 and increasingly favors item information as the configured test limit nears.
+The first interactive session is included in exposure reports automatically.
+Resetting before any item selection reuses the unused session; resetting after
+selection starts a new examinee.
 
 Fixed-form assembly
 -------------------

@@ -23,6 +23,9 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
+    simulate_error_moments,
+    validate_replications,
+    validate_simulation_values,
 )
 from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
@@ -56,23 +59,13 @@ def _validate_batch_controls(
     use_rust: bool,
 ) -> tuple[NDArray[np.float64], int, bool]:
     """Validate controls shared by unidimensional batch diagnostics."""
-    try:
-        thetas = np.asarray(true_thetas, dtype=np.float64).ravel()
-    except (TypeError, ValueError) as exc:
-        raise ValueError("true_thetas must contain numeric values") from exc
+    thetas = validate_simulation_values(true_thetas, name="true_thetas").ravel()
     if thetas.size == 0:
         raise ValueError("true_thetas must be non-empty")
-    if not np.all(np.isfinite(thetas)):
-        raise ValueError("true_thetas must contain only finite values")
-    if (
-        isinstance(n_replications, (bool, np.bool_))
-        or not isinstance(n_replications, (int, np.integer))
-        or n_replications < 1
-    ):
-        raise ValueError("n_replications must be a positive integer")
+    n_replications = validate_replications(n_replications)
     if not isinstance(use_rust, (bool, np.bool_)):
         raise ValueError("use_rust must be boolean")
-    return np.ascontiguousarray(thetas), int(n_replications), bool(use_rust)
+    return np.ascontiguousarray(thetas), n_replications, bool(use_rust)
 
 
 class CATEngine:
@@ -200,7 +193,11 @@ class CATEngine:
         self._stopping_reason = ""
 
     def reset(self) -> None:
-        """Reset the engine for a new examinee."""
+        """Reset the engine for a new examinee.
+
+        Resetting an unused session reuses its exposure count. Once item
+        selection begins, a reset opens and counts a new exposure session.
+        """
         self._current_theta = self.initial_theta
         self._current_se = float("inf")
         reset_session_state(
@@ -310,12 +307,14 @@ class CATEngine:
         RuntimeError
             If the CAT session is already complete.
         ValueError
-            If no item has been selected to administer.
+            If the response is not an integer-valued numeric scalar in the
+            selected item's category range. The selected item remains pending
+            so a corrected response can be submitted.
         """
         if self._is_complete:
             raise RuntimeError("CAT session is already complete")
 
-        item_idx = consume_pending_item(self)
+        item_idx, response = consume_pending_item(self, response)
 
         theta_arr = np.array([[self._current_theta]])
         record_item_administration(
@@ -426,9 +425,13 @@ class CATEngine:
         CATResult
             Result of the simulated CAT session.
         """
+        theta = validate_simulation_values(true_theta, name="true_theta")
+        if theta.ndim != 0:
+            raise ValueError("true_theta must be a finite scalar")
+
         return run_simulation_loop(
             self,
-            float(true_theta),
+            float(theta),
             response_generator=response_generator,
         )
 
@@ -700,20 +703,12 @@ class CATEngine:
         avg_items = np.zeros(len(thetas))
 
         for i, true_theta in enumerate(thetas):
-            estimates = []
-            n_items_list = []
-            for _ in range(n_replications):
-                result = self.run_simulation(float(true_theta))
-                estimates.append(result.theta)
-                n_items_list.append(result.n_items_administered)
-
-            estimates = np.array(estimates)
-            bias = np.mean(estimates) - true_theta
-            mse = np.mean((estimates - true_theta) ** 2)
-
+            bias, mse, mean_items = simulate_error_moments(
+                self, float(true_theta), n_replications=n_replications
+            )
             biases[i] = bias
             mses[i] = mse
-            avg_items[i] = np.mean(n_items_list)
+            avg_items[i] = mean_items
 
         return thetas, biases, mses, avg_items
 

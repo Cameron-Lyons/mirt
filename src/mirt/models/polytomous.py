@@ -64,6 +64,13 @@ def _partial_credit_probabilities(
     return _stable_softmax(logits)
 
 
+def _score_variance(probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Retain small tail contributions when the expected score is saturated."""
+    categories = np.arange(probabilities.shape[-1])
+    mean = probabilities @ categories
+    return np.sum(probabilities * (categories - mean[:, None]) ** 2, axis=1)
+
+
 def _graded_information(
     probabilities: NDArray[np.float64],
     discrimination: float,
@@ -303,6 +310,15 @@ class GradedResponseModel(PolytomousItemModel):
 
 @_register_builtin_model
 class GeneralizedPartialCredit(PolytomousItemModel):
+    """Generalized partial credit model with centered step thresholds.
+
+    Adjacent categories have log odds ``a * (theta - step)`` in one
+    dimension and ``a @ theta - sum(a) * step`` in multiple dimensions.
+    Each factor loading therefore remains the slope with respect to that
+    factor. A two-category item reduces to the centered-threshold 2PL, and
+    adding factors with zero loadings preserves the original response curve.
+    """
+
     model_name = "GPCM"
     supports_multidimensional = True
 
@@ -380,9 +396,8 @@ class GeneralizedPartialCredit(PolytomousItemModel):
             increments = a_item * (theta.ravel()[:, None] - steps[None, :])
         else:
             a_item = a[item_idx]
-            scale = np.sqrt(np.sum(a_item**2))
             projected_theta = np.dot(theta, a_item)
-            increments = scale * (projected_theta[:, None] - steps[None, :])
+            increments = projected_theta[:, None] - np.sum(a_item) * steps[None, :]
 
         return _partial_credit_probabilities(increments)
 
@@ -416,10 +431,11 @@ class GeneralizedPartialCredit(PolytomousItemModel):
                     theta[:, 0, None, None] - active_steps[None, :, :]
                 )
             else:
-                scale = np.linalg.norm(active_discrimination, axis=1)
                 projected_theta = theta @ active_discrimination.T
-                increments = scale[None, :, None] * (
-                    projected_theta[:, :, None] - active_steps[None, :, :]
+                threshold_scale = np.sum(active_discrimination, axis=1)
+                increments = (
+                    projected_theta[:, :, None]
+                    - (threshold_scale[:, None] * active_steps)[None, :, :]
                 )
 
             probabilities[:, item_indices, :n_categories] = (
@@ -449,13 +465,15 @@ class GeneralizedPartialCredit(PolytomousItemModel):
                     theta_2d[selected, 0, None] - active_steps
                 )
             else:
-                scale = np.linalg.norm(active_discrimination, axis=1)
                 projected = np.einsum(
                     "ij,ij->i",
                     theta_2d[selected],
                     active_discrimination,
                 )
-                increments = scale[:, None] * (projected[:, None] - active_steps)
+                threshold_scale = np.sum(active_discrimination, axis=1)
+                increments = (
+                    projected[:, None] - threshold_scale[:, None] * active_steps
+                )
             result[selected, :n_categories] = _partial_credit_probabilities(increments)
 
         return result
@@ -465,24 +483,40 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]:
-        n_cat = self._n_categories[item_idx]
-
         a = self._parameters["discrimination"]
         if self.n_factors == 1:
-            a_val = a[item_idx]
+            slope_squared = a[item_idx] ** 2
         else:
-            a_val = np.sqrt(np.sum(a[item_idx] ** 2))
+            slope_squared = np.dot(a[item_idx], a[item_idx])
+        return slope_squared * _score_variance(self.probability(theta, item_idx))
 
-        probs = self.probability(theta, item_idx)
+    def item_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return exact Fisher matrices of shape ``(n_persons, n_factors, n_factors)``.
 
-        categories = np.arange(n_cat)
-        expected = np.sum(probs * categories, axis=1)
+        The adjacent logits share the slope vector, so each matrix is the
+        conditional score variance times the outer product of that vector.
+        The scalar ``information`` method returns the trace of this matrix.
+        """
+        item_idx = self._validate_item_index(item_idx)
+        theta = self._ensure_theta_2d(theta)
+        slope = np.asarray(self._parameters["discrimination"][item_idx]).reshape(-1)
+        variance = _score_variance(self.probability(theta, item_idx))
+        return variance[:, None, None] * np.outer(slope, slope)
 
-        expected_sq = np.sum(probs * (categories**2), axis=1)
-
-        variance = expected_sq - expected**2
-
-        return (a_val**2) * variance
+    def test_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Sum item Fisher matrices across conditionally independent items."""
+        theta = self._ensure_theta_2d(theta)
+        information = np.zeros((len(theta), self.n_factors, self.n_factors))
+        for item_idx in range(self.n_items):
+            information += self.item_information_matrix(theta, item_idx)
+        return information
 
     def log_likelihood_batch(
         self,
@@ -733,15 +767,7 @@ class RatingScaleModel(PolytomousItemModel):
 
         Uses the variance of the item score as the information.
         """
-        n_cat = self._n_cats
-        probs = self.probability(theta, item_idx)
-
-        categories = np.arange(n_cat)
-        expected = np.sum(probs * categories, axis=1)
-        expected_sq = np.sum(probs * (categories**2), axis=1)
-        variance = expected_sq - expected**2
-
-        return variance
+        return _score_variance(self.probability(theta, item_idx))
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "RatingScaleModel":
         """Set model parameters.

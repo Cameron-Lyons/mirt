@@ -61,9 +61,9 @@ jobs:
           python-version: "3.14"
           extras: dev
       - name: Run ruff check
-        run: uv run --no-sync ruff check src/ tests/ benchmarks/
+        run: uv run --no-sync ruff check src/ tests/ benchmarks/ .github/scripts/
       - name: Run ruff format check
-        run: uv run --no-sync ruff format --check src/ tests/ benchmarks/
+        run: uv run --no-sync ruff format --check src/ tests/ benchmarks/ .github/scripts/
 
   typecheck:
     runs-on: ubuntu-latest
@@ -101,8 +101,15 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      - name: Build release wheel with locked Rust dependencies
-        run: uv run --no-sync maturin build --release --locked --out dist
+      - name: Build release wheel from the source distribution
+        env:
+          UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.venv
+        run: |
+          uv run --no-sync maturin sdist --out dist
+          mkdir "$RUNNER_TEMP/sdist"
+          tar -xzf dist/*.tar.gz -C "$RUNNER_TEMP/sdist" --strip-components=1
+          uv run --directory "$RUNNER_TEMP/sdist" --no-sync maturin build \
+            --release --locked --out "$GITHUB_WORKSPACE/dist"
       - name: Upload wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
         with:
@@ -133,8 +140,8 @@ jobs:
           path: dist
       - name: Install wheel without resolving dependencies
         run: uv pip install --no-deps --no-index dist/*.whl
-      - name: Require the Rust extension
-        run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
+      - name: Require the native backend and matching package versions
+        run: uv run --no-sync python -c "import mirt; from importlib.metadata import version; from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE; assert version('mirt') == mirt.__version__, 'Distribution and runtime versions must match'"
       - name: Run tests against the installed wheel
         run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --cov=mirt --cov-report=xml --cov-report=term-missing --junitxml=test-results.xml
       - name: Upload test reports
@@ -199,18 +206,18 @@ jobs:
           path: dist
       - name: Install wheel without resolving dependencies
         run: uv pip install --no-deps --no-index dist/*.whl
-      - name: Require the Rust extension
-        run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
+      - name: Require the native backend and matching package versions
+        run: uv run --no-sync python -c "import mirt; from importlib.metadata import version; from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE; assert version('mirt') == mirt.__version__, 'Distribution and runtime versions must match'"
       - name: Run every performance regression check
         env:
           MIRT_IMPORT_THRESHOLD_SECONDS: "2.5"
           MIRT_FIT_THRESHOLD_SECONDS: "12.0"
           MIRT_SCORE_THRESHOLD_SECONDS: "4.0"
         run: uv run --no-sync pytest tests/ -m performance
-      - name: Record scoring and posterior benchmarks
+      - name: Record scoring, posterior, and score-equating benchmarks
         run: |
           uv run --no-sync python benchmarks/run_benchmarks.py \
-            --suite scoring --suite posterior --backend rust --persons 2000 --items 30 \
+            --suite scoring --suite posterior --suite score-equating --backend rust --persons 2000 --items 30 \
             --repeats 3 --warmups 1 --json benchmark-report.json
       - name: Upload benchmark report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
@@ -240,8 +247,8 @@ jobs:
           path: dist
       - name: Install wheel without resolving dependencies
         run: uv pip install --no-deps --no-index dist/*.whl
-      - name: Require the Rust extension
-        run: uv run --no-sync python -c "from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE"
+      - name: Require the native backend and matching package versions
+        run: uv run --no-sync python -c "import mirt; from importlib.metadata import version; from mirt import mirt_rs; from mirt._rust_backend import RUST_AVAILABLE; assert RUST_AVAILABLE; assert version('mirt') == mirt.__version__, 'Distribution and runtime versions must match'"
       - name: Run slow tests
         run: uv run --no-sync pytest tests/ -m slow
 

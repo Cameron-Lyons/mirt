@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.backends.rust.equating import (
     observed_score_distribution_2pl as _rust_observed_score_distribution_2pl,
 )
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
 
 _PROBABILITY_TOLERANCE = 1e-10
 _SMOOTHING_METHODS = ("none", "loglinear", "kernel")
+_RECURSION_CHUNK_ELEMENTS = 262_144
 
 
 @dataclass
@@ -70,7 +72,8 @@ def true_score_equating(
     model_new : BaseItemModel
         New form model (on same scale or after linking).
     linking_result : LinkingResult | None
-        Linking constants if new model is on different scale.
+        Constants mapping new-scale abilities to the old/reference scale:
+        ``theta_old = A * theta_new + B``.
     theta_range : tuple[float, float]
         Range of theta for score mapping.
     n_theta : int
@@ -94,19 +97,8 @@ def true_score_equating(
 
     theta_grid = np.linspace(lower, upper, n_theta)
     expected_old = _compute_expected_scores(model_old, theta_grid, old_item_indices)
-    expected_new = _compute_expected_scores(model_new, theta_grid, new_item_indices)
-
-    if linking_result is not None:
-        A = float(linking_result.constants.A)
-        B = float(linking_result.constants.B)
-        if not np.isfinite(A) or A <= 0.0:
-            raise ValueError("linking_result.constants.A must be finite and positive")
-        if not np.isfinite(B):
-            raise ValueError("linking_result.constants.B must be finite")
-        theta_transformed = A * theta_grid + B
-        expected_new = _compute_expected_scores(
-            model_new, theta_transformed, new_item_indices
-        )
+    theta_new = _new_scale_theta(theta_grid, linking_result)
+    expected_new = _compute_expected_scores(model_new, theta_new, new_item_indices)
 
     _validate_expected_score_curve(expected_old, "model_old")
     _validate_expected_score_curve(expected_new, "model_new")
@@ -134,6 +126,9 @@ def observed_score_equating(
     items_old: list[int] | None = None,
     items_new: list[int] | None = None,
     smoothing: Literal["none", "loglinear", "kernel"] = "none",
+    *,
+    linking_result: LinkingResult | None = None,
+    batch_size: int | None = None,
 ) -> ScoreEquatingResult:
     """Perform IRT observed score equating.
 
@@ -158,6 +153,13 @@ def observed_score_equating(
         Subset of items for new form.
     smoothing : {"none", "loglinear", "kernel"}
         Score-distribution smoothing applied before equipercentile inversion.
+    linking_result : LinkingResult | None
+        Constants mapping new-scale abilities to the old/reference scale:
+        ``theta_old = A * theta_new + B``. The grid and its probability masses
+        describe the reference population on the old scale.
+    batch_size : int | None
+        Maximum theta points evaluated together. None chooses a bounded size
+        from the form lengths and category counts.
 
     Returns
     -------
@@ -182,12 +184,13 @@ def observed_score_equating(
     theta_distribution = _validate_weights(
         theta_distribution, len(theta_grid), "theta_distribution"
     )
+    theta_new = _new_scale_theta(theta_grid, linking_result)
 
     score_dist_old = lord_wingersky_recursion(
-        model_old, theta_grid, theta_distribution, items_old
+        model_old, theta_grid, theta_distribution, items_old, batch_size=batch_size
     )
     score_dist_new = lord_wingersky_recursion(
-        model_new, theta_grid, theta_distribution, items_new
+        model_new, theta_new, theta_distribution, items_new, batch_size=batch_size
     )
 
     new_scores = equipercentile_equating(
@@ -210,6 +213,8 @@ def lord_wingersky_recursion(
     theta_grid: NDArray[np.float64],
     theta_weights: NDArray[np.float64],
     items: list[int] | None = None,
+    *,
+    batch_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Compute observed score distribution using Lord-Wingersky recursion.
 
@@ -226,6 +231,10 @@ def lord_wingersky_recursion(
         Weights for theta integration (e.g., prior distribution).
     items : list[int] | None
         Subset of items. None = all items.
+    batch_size : int | None
+        Maximum theta points evaluated together. None chooses a bounded size
+        from the form length and category counts. Only the marginal score
+        distribution is retained across batches.
 
     Returns
     -------
@@ -236,29 +245,82 @@ def lord_wingersky_recursion(
     theta_grid = _validate_vector(theta_grid, "theta_grid")
     weights = _validate_weights(theta_weights, len(theta_grid), "theta_weights")
     item_indices = _resolve_items(model, items, "items")
-    native_distribution = _native_score_distribution(
-        model, theta_grid, weights, item_indices
-    )
-    if native_distribution is not None:
-        return native_distribution
+    width = _maximum_score(model, item_indices) + 1
+    if batch_size is None:
+        categories = int(np.max(model.n_categories)) if model.is_polytomous else 2
+        elements_per_point = 3 * width + model.n_items * categories
+        batch_size = max(1, _RECURSION_CHUNK_ELEMENTS // elements_per_point)
+    else:
+        batch_size = _validate_count(batch_size, "batch_size", minimum=1)
 
-    item_probabilities = _item_score_probabilities(model, theta_grid, item_indices)
-
-    conditional = np.ones((len(theta_grid), 1), dtype=np.float64)
-    for probabilities in item_probabilities:
-        current_width = conditional.shape[1]
-        n_categories = probabilities.shape[1]
-        updated = np.zeros(
-            (len(theta_grid), current_width + n_categories - 1),
-            dtype=np.float64,
+    marginal = np.zeros(width, dtype=np.float64)
+    for start in range(0, len(theta_grid), batch_size):
+        stop = min(start + batch_size, len(theta_grid))
+        theta_batch = theta_grid[start:stop]
+        weights_batch = weights[start:stop]
+        distribution = _native_score_distribution(
+            model, theta_batch, weights_batch, item_indices
         )
-        for score in range(n_categories):
-            updated[:, score : score + current_width] += (
-                conditional * probabilities[:, score, None]
+        if distribution is None:
+            distribution = _numpy_score_distribution(
+                model, theta_batch, weights_batch, item_indices, width
             )
-        conditional = updated
+        marginal += distribution
+    return _normalize_score_distribution(marginal)
 
-    return _normalize_score_distribution(weights @ conditional)
+
+def _numpy_score_distribution(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    item_indices: NDArray[np.intp],
+    width: int,
+) -> NDArray[np.float64]:
+    """Convolve item probabilities using reusable bounded work buffers."""
+    item_probabilities = _item_score_probabilities(model, theta, item_indices)
+    # Score-major storage keeps the growing active region contiguous.
+    current = np.empty((width, len(theta)), dtype=np.float64)
+    updated = np.empty_like(current)
+    workspace = np.empty_like(current)
+    current[0] = 1.0
+    current_width = 1
+    for probabilities in item_probabilities:
+        n_categories = probabilities.shape[1]
+        next_width = current_width + n_categories - 1
+        updated[:next_width] = 0.0
+        conditional = current[:current_width]
+        work = workspace[:current_width]
+        for score in range(n_categories):
+            np.multiply(conditional, probabilities[:, score], out=work)
+            target = updated[score : score + current_width]
+            np.add(target, work, out=target)
+        current, updated = updated, current
+        current_width = next_width
+    return current @ weights
+
+
+def _new_scale_theta(
+    theta: NDArray[np.float64], linking_result: LinkingResult | None
+) -> NDArray[np.float64]:
+    """Evaluate the same abilities on the new calibration's scale."""
+    if linking_result is None:
+        return theta
+    A = float(linking_result.constants.A)
+    B = float(linking_result.constants.B)
+    if not np.isfinite(A) or A <= 0.0:
+        raise ValueError("linking_result.constants.A must be finite and positive")
+    if not np.isfinite(B):
+        raise ValueError("linking_result.constants.B must be finite")
+    with np.errstate(over="ignore", invalid="ignore"):
+        transformed = (theta - B) / A
+        invalid = ~np.isfinite(transformed)
+        if A >= 1.0 and np.any(invalid):
+            # Scale before subtracting only when the ordinary subtraction
+            # overflowed. This retains its cancellation precision elsewhere.
+            transformed[invalid] = theta[invalid] / A - B / A
+    if not np.all(np.isfinite(transformed)):
+        raise ValueError("linking_result produces non-finite new-scale abilities")
+    return transformed
 
 
 def _normalize_score_distribution(
@@ -279,7 +341,11 @@ def _native_score_distribution(
     item_indices: NDArray[np.intp],
 ) -> NDArray[np.float64] | None:
     """Use the compiled 1PL/2PL recursion when the model is compatible."""
-    if model.is_polytomous or model.model_name not in {"1PL", "2PL"}:
+    from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
+
+    if type(model) not in (OneParameterLogistic, TwoParameterLogistic) or not (
+        uses_builtin_model_hooks(model)
+    ):
         return None
 
     parameters = model.parameters
@@ -301,7 +367,7 @@ def _native_score_distribution(
             f"native score distribution has shape {conditional.shape}, "
             f"expected {expected_shape}"
         )
-    return _normalize_score_distribution(weights @ conditional)
+    return weights @ conditional
 
 
 def equipercentile_equating(
