@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.cat._native import register_native_defaults as _register_native_defaults
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -154,6 +156,7 @@ class ExposureControl(ABC):
         return None
 
 
+@_register_native_defaults
 class NoExposureControl(ExposureControl):
     """No exposure control (all items eligible).
 

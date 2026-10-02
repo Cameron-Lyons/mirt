@@ -38,7 +38,7 @@ def record_model_base(cls: type[_Model]) -> type[_Model]:
     """Retain base definitions even if they change before a concrete import."""
     _BASE_HOOKS[cls] = {
         name: vars(cls)[name]
-        for name in _KERNEL_HOOKS + _LIKELIHOOD_HOOKS
+        for name in _KERNEL_HOOKS + _LIKELIHOOD_HOOKS + ("information",)
         if name in vars(cls)
     }
     return cls

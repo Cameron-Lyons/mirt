@@ -77,7 +77,7 @@ def test_cat_symbol_resolution_is_cached_and_scoped() -> None:
         "deferred_before_access": True,
         "cached": True,
         "same_symbol": True,
-        "cat_submodules": ["mirt.cat.content"],
+        "cat_submodules": ["mirt.cat._native", "mirt.cat.content"],
         "numpy_loaded": False,
         "scipy_loaded": False,
     }

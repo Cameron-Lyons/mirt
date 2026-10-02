@@ -17,6 +17,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 if TYPE_CHECKING:
+    from multiprocessing.context import BaseContext
+
     from mirt.results.fit_result import FitResult
     from mirt.results.score_result import ScoreResult
 
@@ -996,6 +998,7 @@ def cross_validate(
     verbose: bool = False,
     return_models: bool = False,
     n_jobs: int = 1,
+    mp_context: BaseContext | None = None,
 ) -> CVResult:
     """Perform cross-validation for an IRT model.
 
@@ -1028,6 +1031,12 @@ def cross_validate(
         Number of process workers for fold fitting. Use -1 for all CPUs.
         Process startup has overhead, so ``n_jobs=1`` is preferable for
         very small or fast fits.
+    mp_context : multiprocessing.context.BaseContext, optional
+        Context for process workers. The default uses ``spawn`` and preserves
+        the configured mirt backend. Supply ``multiprocessing.get_context(...)``
+        to choose another start method. This does not change the global start
+        method. Process execution requires an importable main module; protect
+        calls in scripts with ``if __name__ == "__main__":``.
 
     Returns
     -------
@@ -1048,7 +1057,8 @@ def cross_validate(
     >>> print(cv_result.summary())
     """
     import os
-    from concurrent.futures import ProcessPoolExecutor
+
+    from mirt.utils._parallel import _process_pool
 
     responses = np.asarray(responses)
     if responses.ndim != 2 or responses.shape[0] < 2 or responses.shape[1] == 0:
@@ -1083,7 +1093,7 @@ def cross_validate(
 
     splits = _validated_splits(splitter, responses)
     n_folds = len(splits)
-    tasks = [
+    tasks = (
         _CVFoldTask(
             fold_idx=fold_idx,
             train_responses=responses[train_idx],
@@ -1095,10 +1105,10 @@ def cross_validate(
             tol=tol,
         )
         for fold_idx, (train_idx, _) in enumerate(splits)
-    ]
+    )
 
     if n_jobs > 1 and n_folds > 1:
-        with ProcessPoolExecutor(max_workers=min(n_jobs, n_folds)) as executor:
+        with _process_pool(min(n_jobs, n_folds), mp_context) as executor:
             results_list = list(executor.map(_fit_cv_fold, tasks))
 
         results_list.sort(key=lambda x: x[0])

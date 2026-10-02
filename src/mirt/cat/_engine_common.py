@@ -97,6 +97,27 @@ def consume_pending_item(engine: Any) -> int:
     return item_idx
 
 
+def validate_item_response(engine: Any, item_idx: int, response: Any) -> int:
+    """Validate a response before consuming the disclosed item or updating state."""
+    try:
+        value = np.asarray(response)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("response must be a finite integer category") from exc
+    if value.ndim != 0 or value.dtype.kind not in "biuf":
+        raise ValueError("response must be a finite integer category")
+    if value.dtype.kind == "f" and (not np.isfinite(value) or value != np.floor(value)):
+        raise ValueError("response must be a finite integer category")
+    category = int(value)
+    n_categories = (
+        int(engine.model.n_categories[item_idx]) if engine.model.is_polytomous else 2
+    )
+    if not 0 <= category < n_categories:
+        raise ValueError(
+            f"response for item {item_idx} must be between 0 and {n_categories - 1}"
+        )
+    return category
+
+
 def finalize_administered_item(engine: Any, state: Any) -> None:
     """Update completion state after administering one item."""
     if engine._stopping.should_stop(state):

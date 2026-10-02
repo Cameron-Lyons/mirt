@@ -1,11 +1,13 @@
 """Tests for cross-validation module."""
 
+from multiprocessing import get_context
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
 
+import mirt
 from mirt.utils.cv import (
     AbilityRMSEScorer,
     AICScorer,
@@ -507,7 +509,9 @@ class TestCrossValidate:
         probabilities = 1.0 / (1.0 + np.exp(-(theta[:, None] - difficulty)))
         return (rng.random(probabilities.shape) < probabilities).astype(int)
 
-    def test_parallel_matches_sequential_results(self):
+    @pytest.mark.parametrize("backend", ["auto", "numpy"])
+    @pytest.mark.parametrize("explicit_context", [False, True])
+    def test_parallel_matches_sequential_results(self, backend, explicit_context):
         responses = self._small_responses()
         common = {
             "model_type": "1PL",
@@ -522,8 +526,17 @@ class TestCrossValidate:
             "return_models": True,
         }
 
-        sequential = cross_validate(**common, n_jobs=1)
-        parallel = cross_validate(**common, n_jobs=2)
+        previous_backend = mirt.get_backend()
+        mirt.set_backend(backend)
+        try:
+            sequential = cross_validate(**common, n_jobs=1)
+            parallel = cross_validate(
+                **common,
+                n_jobs=2,
+                mp_context=get_context("spawn") if explicit_context else None,
+            )
+        finally:
+            mirt.set_backend(previous_backend)
 
         assert parallel.n_folds == 2
         assert parallel.fold_results is not None
@@ -536,6 +549,14 @@ class TestCrossValidate:
             parallel.scores["ability_rmse"],
             sequential.scores["ability_rmse"],
         )
+        for actual, expected in zip(
+            parallel.fold_results, sequential.fold_results, strict=True
+        ):
+            for name, value in actual.model.parameters.items():
+                assert_allclose(value, expected.model.parameters[name])
+            assert actual.n_iterations == expected.n_iterations
+            assert actual.converged == expected.converged
+            assert actual.log_likelihood == pytest.approx(expected.log_likelihood)
 
     def test_shares_ability_estimates_across_scorers(self, monkeypatch):
         responses = self._small_responses()

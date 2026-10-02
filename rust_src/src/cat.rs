@@ -7,7 +7,8 @@ use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
 use crate::utils::{
-    compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior, sigmoid,
+    EPSILON, compute_eap_with_se, fisher_info_2pl_items, log_sigmoid, normalize_log_posterior,
+    sigmoid,
 };
 
 /// Item parameters for 2PL model
@@ -161,7 +162,6 @@ fn cat_simulate_single(
     rng: &mut StdRng,
 ) -> (f64, f64, usize, Vec<i32>, Vec<i32>) {
     let n_items = items.discrimination.len();
-    let n_quad = quad.points.len();
 
     let mut available: Vec<bool> = vec![true; n_items];
     let mut administered: Vec<i32> = Vec::with_capacity(stopping.max_items);
@@ -169,6 +169,7 @@ fn cat_simulate_single(
 
     let mut current_theta = 0.0;
     let mut current_se = f64::INFINITY;
+    let mut log_posterior: Vec<f64> = quad.weights.iter().map(|weight| weight.ln()).collect();
 
     for step in 0..stopping.max_items {
         let mut best_item: i32 = -1;
@@ -206,25 +207,17 @@ fn cat_simulate_single(
         administered.push(best_item);
         responses.push(response);
 
-        let mut log_likes = vec![0.0; n_quad];
-        for (log_like, &theta) in log_likes.iter_mut().zip(quad.points.iter()) {
-            let mut ll = 0.0;
-            for (i, &item) in administered.iter().enumerate() {
-                let j = item as usize;
-                let r = responses[i];
-                let z = items.discrimination[j] * (theta - items.difficulty[j]);
-                if r == 1 {
-                    ll += log_sigmoid(z);
-                } else {
-                    ll += log_sigmoid(-z);
-                }
-            }
-            *log_like = ll;
+        // Only the new response adds evidence. Match the public EAP scorer's
+        // bounded Bernoulli probabilities, including saturated response curves.
+        for (log_mass, &theta) in log_posterior.iter_mut().zip(quad.points.iter()) {
+            let z = items.discrimination[item_idx] * (theta - items.difficulty[item_idx]);
+            let probability = sigmoid(z).clamp(EPSILON, 1.0 - EPSILON);
+            *log_mass += if response == 1 {
+                probability.ln()
+            } else {
+                (-probability).ln_1p()
+            };
         }
-
-        let log_posterior: Vec<f64> = (0..n_quad)
-            .map(|q| log_likes[q] + quad.weights[q].ln())
-            .collect();
 
         let posterior = normalize_log_posterior(&log_posterior);
         (current_theta, current_se) = compute_eap_with_se(&posterior, quad.points);

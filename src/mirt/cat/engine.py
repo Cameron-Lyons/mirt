@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._backend_config import should_use_rust
+from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
 from mirt.backends.rust.cat import cat_conditional_mse as rust_cat_conditional_mse
 from mirt.backends.rust.cat import (
     cat_simulate_batch_full as rust_cat_simulate_batch_full,
@@ -23,7 +26,10 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
+    validate_item_response,
 )
+from mirt.cat._native import register_native_defaults as _register_native_defaults
+from mirt.cat._native import uses_native_defaults
 from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
@@ -75,6 +81,7 @@ def _validate_batch_controls(
     return np.ascontiguousarray(thetas), int(n_replications), bool(use_rust)
 
 
+@_register_native_defaults
 class CATEngine:
     """Engine for computerized adaptive testing.
 
@@ -315,7 +322,9 @@ class CATEngine:
         if self._is_complete:
             raise RuntimeError("CAT session is already complete")
 
-        item_idx = consume_pending_item(self)
+        item_idx = get_pending_item(self)
+        response = validate_item_response(self, item_idx, response)
+        consume_pending_item(self)
 
         theta_arr = np.array([[self._current_theta]])
         record_item_administration(
@@ -337,6 +346,15 @@ class CATEngine:
     def _update_theta(self) -> None:
         """Update ability estimate based on administered items."""
         try:
+            if self.scoring_method == "EAP":
+                from mirt.cat._eap import score_binary_eap
+
+                moments = score_binary_eap(self)
+                if moments is not None:
+                    theta, covariance = moments
+                    self._current_theta = float(theta[0])
+                    self._current_se = float(np.sqrt(covariance[0, 0]))
+                    return
             result = score_administered_responses(
                 self,
                 bounds=self.theta_bounds,
@@ -501,15 +519,29 @@ class CATEngine:
 
     def _can_use_rust_simulation(self) -> bool:
         """Check if Rust simulation can be used."""
-        if not isinstance(self._selection, MaxFisherInformation):
+        from mirt.models import OneParameterLogistic, TwoParameterLogistic
+
+        if not uses_native_defaults(self, CATEngine) or not uses_native_defaults(
+            self._selection, MaxFisherInformation
+        ):
             return False
         if self.scoring_method != "EAP" or self.initial_theta != 0.0:
             return False
-        if not isinstance(self._exposure, NoExposureControl) or not isinstance(
-            self._content, NoContentConstraint
+        if (
+            isinstance(self.n_quadpts, (bool, np.bool_))
+            or not isinstance(self.n_quadpts, (int, np.integer))
+            or self.n_quadpts < 5
         ):
             return False
-        if getattr(self.model, "model_name", None) not in {"1PL", "2PL"}:
+        if not uses_native_defaults(
+            self._exposure, NoExposureControl
+        ) or not uses_native_defaults(self._content, NoContentConstraint):
+            return False
+        if type(self.model) not in (OneParameterLogistic, TwoParameterLogistic):
+            return False
+        if not uses_builtin_model_hooks(
+            self.model, likelihood=True
+        ) or not uses_original_model_hook(self.model, "information"):
             return False
 
         params = self.model.parameters
@@ -534,7 +566,9 @@ class CATEngine:
 
     def _native_stopping_parameters(self) -> tuple[float, int, int] | None:
         """Translate supported stopping rules into native controls."""
-        if isinstance(self._stopping, CombinedStop):
+        if type(self._stopping) is CombinedStop:
+            if not uses_native_defaults(self._stopping, CombinedStop):
+                return None
             if self._stopping.operator != "or":
                 return None
             rules = self._stopping.rules
@@ -543,14 +577,33 @@ class CATEngine:
             rules = [self._stopping]
             min_items = 1
 
+        if isinstance(min_items, (bool, np.bool_)) or not isinstance(
+            min_items, Integral
+        ):
+            return None
         se_threshold: float | None = None
         max_items = self.model.n_items
         for rule in rules:
-            if isinstance(rule, StandardErrorStop):
+            if uses_native_defaults(rule, StandardErrorStop):
                 if se_threshold is not None:
                     return None
-                se_threshold = float(rule.threshold)
-            elif isinstance(rule, MaxItemsStop):
+                if isinstance(rule.threshold, (bool, np.bool_)) or not isinstance(
+                    rule.threshold, Real
+                ):
+                    return None
+                try:
+                    se_threshold = float(rule.threshold)
+                except (ValueError, OverflowError):
+                    return None
+                if not np.isfinite(se_threshold) or se_threshold <= 0.0:
+                    return None
+            elif uses_native_defaults(rule, MaxItemsStop):
+                if (
+                    isinstance(rule.max_items, (bool, np.bool_))
+                    or not isinstance(rule.max_items, Integral)
+                    or rule.max_items < 1
+                ):
+                    return None
                 max_items = min(max_items, int(rule.max_items))
             else:
                 return None
@@ -608,17 +661,28 @@ class CATEngine:
 
         theta_est, se_est, n_items, _, item_paths, response_paths = result
 
+        # Preserve authored rule priority and distinguish an exhausted pool
+        # from a configured maximum. Evaluating an isolated copy also leaves
+        # the engine's previous interactive stopping state intact.
+        stopping = deepcopy(self._stopping)
         results = []
         for i in range(len(theta_est)):
             count = int(n_items[i])
             items = np.asarray(item_paths[i, :count], dtype=np.int_).tolist()
             responses = np.asarray(response_paths[i, :count], dtype=np.int_)
-            if se_est[i] <= se_threshold and count >= min_items:
-                stopping_reason = f"SE threshold reached (SE <= {se_threshold})"
-            elif count >= max_items:
-                stopping_reason = f"Maximum items reached ({max_items})"
-            else:
-                stopping_reason = "Item bank exhausted"
+            stopping.reset()
+            state = CATState(
+                theta=float(theta_est[i]),
+                standard_error=float(se_est[i]),
+                items_administered=items,
+                responses=responses.tolist(),
+                n_items=count,
+            )
+            stopping_reason = (
+                stopping.get_reason()
+                if stopping.should_stop(state)
+                else "Item pool exhausted"
+            )
             results.append(
                 CATResult(
                     theta=float(theta_est[i]),

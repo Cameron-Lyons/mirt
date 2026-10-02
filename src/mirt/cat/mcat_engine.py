@@ -19,6 +19,7 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
+    validate_item_response,
 )
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import (
@@ -309,7 +310,9 @@ class MCATEngine:
         if self._is_complete:
             raise RuntimeError("MCAT session is already complete")
 
-        item_idx = consume_pending_item(self)
+        item_idx = get_pending_item(self)
+        response = validate_item_response(self, item_idx, response)
+        consume_pending_item(self)
 
         theta_arr = self._current_theta.reshape(1, -1)
         record_item_administration(
@@ -333,18 +336,23 @@ class MCATEngine:
         """Update ability estimates based on administered items."""
         try:
             if self.scoring_method == "EAP":
+                from mirt.cat._eap import score_binary_eap
                 from mirt.scoring import ability_posterior
 
-                posterior = ability_posterior(
-                    self.model,
-                    build_administered_response_matrix(self),
-                    n_quadpts=self.n_quadpts,
-                )
-                theta = posterior.mean.ravel()
-                centered_points = posterior.points - theta
-                covariance = centered_points.T @ (
-                    posterior.weights[0, :, None] * centered_points
-                )
+                moments = score_binary_eap(self)
+                if moments is not None:
+                    theta, covariance = moments
+                else:
+                    posterior = ability_posterior(
+                        self.model,
+                        build_administered_response_matrix(self),
+                        n_quadpts=self.n_quadpts,
+                    )
+                    theta = posterior.mean.ravel()
+                    centered_points = posterior.points - theta
+                    covariance = centered_points.T @ (
+                        posterior.weights[0, :, None] * centered_points
+                    )
             else:
                 result = score_administered_responses(self)
                 theta = result.theta.ravel()
