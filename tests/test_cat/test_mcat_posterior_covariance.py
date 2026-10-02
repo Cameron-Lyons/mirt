@@ -91,7 +91,7 @@ def test_failed_covariance_update_preserves_previous_state(monkeypatch):
     def fail(*args, **kwargs):
         raise ValueError("posterior unavailable")
 
-    monkeypatch.setattr("mirt.scoring.ability_posterior", fail)
+    monkeypatch.setattr("mirt.cat._eap.score_binary_eap", fail)
     engine._update_theta()
 
     assert_allclose(engine._current_theta, original_theta)
@@ -102,15 +102,19 @@ def test_failed_covariance_update_preserves_previous_state(monkeypatch):
 def test_covariance_update_evaluates_responses_once(monkeypatch, method):
     model = _model()
     engine = MCATEngine(model, scoring_method=method, min_items=2, max_items=2)
-    # Instrument the public scoring entry point, not each optimizer evaluation.
-    name = "ability_posterior" if method == "EAP" else "fscores"
-    original = ability_posterior if method == "EAP" else fscores
+    # Instrument one scoring update, not each optimizer or item evaluation.
+    from mirt.cat._eap import score_binary_eap
+
+    target = (
+        "mirt.cat._eap.score_binary_eap" if method == "EAP" else "mirt.scoring.fscores"
+    )
+    original = score_binary_eap if method == "EAP" else fscores
     calls = []
 
     def capture(*args, **kwargs):
         calls.append(1)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(f"mirt.scoring.{name}", capture)
+    monkeypatch.setattr(target, capture)
     engine.administer_item(1)
     assert len(calls) == 1

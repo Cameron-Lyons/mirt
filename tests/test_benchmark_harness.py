@@ -303,6 +303,21 @@ class TestBenchmarkComparisons:
 
 
 class TestBenchmarkCommand:
+    def test_adaptive_scoring_suite_runs_real_updates_with_memory_measurements(
+        self,
+    ) -> None:
+        results = benchmark.run_suites(
+            ("adaptive-scoring",), n_persons=1, n_items=3, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            "adaptive_eap_2pl_1d",
+            "adaptive_eap_2pl_2d",
+            "adaptive_eap_mirt_2d",
+            "adaptive_eap_mirt_3d",
+        ]
+        assert all(result.median > 0 for result in results)
+        assert all(result.peak_traced_bytes > 0 for result in results)
+
     @pytest.mark.parametrize("suite", ["kernels", "optimization", "information"])
     def test_new_suites_run_and_enforce_person_count(self, suite: str) -> None:
         results = benchmark.run_suites(
@@ -330,6 +345,7 @@ class TestBenchmarkCommand:
             "fit-statistics",
             "model-fit",
             "cat",
+            "adaptive-scoring",
             "kernels",
             "binary-likelihood",
             "gpu-likelihood",
@@ -379,6 +395,7 @@ class TestBenchmarkCommand:
             "fit-statistics",
             "model-fit",
             "cat",
+            "adaptive-scoring",
             "kernels",
             "binary-likelihood",
             "gpu-likelihood",

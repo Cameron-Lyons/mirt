@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.constants import PROB_EPSILON
 
 if TYPE_CHECKING:
@@ -112,6 +113,7 @@ class ItemSelectionStrategy(ABC):
         return 0.0
 
 
+@_register_native_defaults
 class MaxFisherInformation(ItemSelectionStrategy):
     """Maximum Fisher Information (MFI) item selection.
 

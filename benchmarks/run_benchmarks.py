@@ -36,6 +36,7 @@ SUITE_ORDER = (
     "fit-statistics",
     "model-fit",
     "cat",
+    "adaptive-scoring",
     "kernels",
     "binary-likelihood",
     "gpu-likelihood",
@@ -2330,6 +2331,52 @@ def bench_model_fit(
     return results
 
 
+def bench_adaptive_scoring(
+    n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure fixed-history adaptive EAP updates, excluding item selection."""
+    from mirt.cat import MCATEngine
+    from mirt.models import MultidimensionalModel, TwoParameterLogistic
+
+    results = []
+    rng = np.random.default_rng(44)
+    for cls, n_factors in (
+        (TwoParameterLogistic, 1),
+        (TwoParameterLogistic, 2),
+        (MultidimensionalModel, 2),
+        (MultidimensionalModel, 3),
+    ):
+        model = cls(n_items=n_items, n_factors=n_factors)
+        slopes = rng.uniform(0.3, 1.8, (n_items, n_factors))
+        if cls is MultidimensionalModel:
+            model.set_parameters(slopes=slopes, intercepts=rng.normal(size=n_items))
+        else:
+            model.set_parameters(
+                discrimination=slopes[:, 0] if n_factors == 1 else slopes,
+                difficulty=rng.normal(size=n_items),
+            )
+        model._is_fitted = True
+        engine_cls = CATEngine if n_factors == 1 else MCATEngine
+        engine = engine_cls(model, n_quadpts=21 if n_factors == 1 else 11)
+        # Keep one respondent and a short administered history even for large
+        # banks. Probability evaluation and covariance reduction are timed.
+        engine._items_administered = np.linspace(
+            0, n_items - 1, min(15, n_items), dtype=int
+        ).tolist()
+        engine._responses = [
+            item % 2 for item in range(len(engine._items_administered))
+        ]
+        run = engine._update_theta
+        results.append(
+            BenchResult(
+                f"adaptive_eap_{model.model_name.lower()}_{n_factors}d",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
 def bench_cat(
     n_items: int,
     repeats: int,
@@ -2485,6 +2532,8 @@ def run_suites(
         results.extend(bench_model_fit(n_persons, n_items, repeats, warmups))
     if "cat" in suites:
         results.append(bench_cat(n_items, repeats, warmups))
+    if "adaptive-scoring" in suites:
+        results.extend(bench_adaptive_scoring(n_items, repeats, warmups))
     if "kernels" in suites:
         results.extend(bench_kernels(n_persons, n_items, repeats, warmups))
     if "binary-likelihood" in suites:

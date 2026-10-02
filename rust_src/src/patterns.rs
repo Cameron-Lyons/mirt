@@ -3,7 +3,7 @@
 use std::collections::{HashMap, hash_map::Entry};
 use std::hash::Hash;
 
-use numpy::{Element, IntoPyArray, PyArray1, PyReadonlyArray2};
+use numpy::{Element, IntoPyArray, PyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 
@@ -43,12 +43,18 @@ fn group_array<'py, T: Element + Eq + Hash + Sync>(
     py: Python<'py>,
     responses: PyReadonlyArray2<'py, T>,
 ) -> PyResult<PyPatternIndices<'py>> {
-    let values = responses.as_array();
-    let shape = values.dim();
-    let rows = values
+    if !responses.is_c_contiguous() {
+        return Err(PyValueError::new_err("responses must be C-contiguous"));
+    }
+    let (n_persons, n_items) = (responses.shape()[0], responses.shape()[1]);
+    // Check alignment before creating a typed slice. An ndarray view assumes
+    // aligned pointers even when NumPy exposes an unaligned contiguous buffer.
+    let rows = responses
         .as_slice()
-        .ok_or_else(|| PyValueError::new_err("responses must be C-contiguous"))?;
-    let (first, inverse, counts) = py.detach(|| group_rows(rows, shape.0, shape.1));
+        .map_err(|_| PyValueError::new_err("responses must be C-contiguous and aligned"))?;
+    // NumPy shape metadata can change while detached even for read-only data.
+    // Retain owned dimensions rather than borrowing that metadata across it.
+    let (first, inverse, counts) = py.detach(|| group_rows(rows, n_persons, n_items));
     Ok((
         first.into_pyarray(py),
         inverse.into_pyarray(py),
@@ -57,7 +63,7 @@ fn group_array<'py, T: Element + Eq + Hash + Sync>(
 }
 
 /// Return first row indices, inverse indices, and counts in first-appearance order.
-/// Input must be a C-contiguous signed integer matrix with normalized missing values.
+/// Input must be an aligned, C-contiguous signed integer matrix with normalized missing values.
 #[pyfunction]
 pub fn response_pattern_indices<'py>(
     py: Python<'py>,
@@ -86,6 +92,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::group_rows;
+    use std::hash::{Hash, Hasher};
 
     #[test]
     fn preserves_order_and_full_width_values() {
@@ -102,6 +109,24 @@ mod tests {
         assert_eq!(
             group_rows::<i8>(&[], 3, 0),
             (vec![0], vec![0, 0, 0], vec![3])
+        );
+    }
+
+    #[test]
+    fn compares_complete_rows_on_hash_collision() {
+        #[derive(PartialEq, Eq)]
+        struct CollidingValue(i8);
+
+        impl Hash for CollidingValue {
+            fn hash<H: Hasher>(&self, state: &mut H) {
+                0.hash(state);
+            }
+        }
+
+        let rows = [1, 2, 1, 3, 1, 2].map(CollidingValue);
+        assert_eq!(
+            group_rows(&rows, 3, 2),
+            (vec![0, 1], vec![0, 1, 0], vec![2, 1])
         );
     }
 }

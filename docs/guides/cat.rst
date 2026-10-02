@@ -27,6 +27,10 @@ Quick start
 Interactive responses
 ---------------------
 
+For a live test, disclose ``engine.select_next_item()`` and pass the observed
+category to ``engine.administer_item(response)``. Repeated selection returns the
+same pending item until a valid response is submitted.
+
 ``administer_item`` accepts integer-valued numeric responses in the selected
 item's category range: 0 or 1 for a binary item, and 0 through
 ``n_categories[item] - 1`` for an ordinal item. Invalid responses raise
@@ -62,6 +66,16 @@ integer replication counts before changing the active session. Conditional
 diagnostics accumulate bias, MSE, and average test length as sessions finish,
 without storing every replicated estimate. Their working storage depends on the
 number of factors rather than the number of replications.
+
+Ability updates
+---------------
+
+For independent built-in binary models, EAP updates reuse the Gauss-Hermite grid
+and evaluate only administered item curves in bounded blocks. The posterior is
+recomputed against current item parameters after every response, so parameter
+changes and resets do not reuse old likelihood evidence. Customized model
+probability or likelihood hooks retain the general scoring path. MCAT continues
+to retain the full posterior covariance.
 
 Portable results
 ----------------

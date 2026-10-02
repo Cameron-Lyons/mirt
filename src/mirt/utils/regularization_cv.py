@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -15,6 +15,9 @@ from mirt.estimation.regularized import RegularizedMIRTEstimator, RegularizedMIR
 from mirt.exceptions import MirtDataError, MirtEstimationError, MirtValidationError
 from mirt.utils.data import validate_responses
 from mirt.utils.numeric import logsumexp
+
+if TYPE_CHECKING:
+    from multiprocessing.context import BaseContext
 
 Penalty = Literal["lasso", "ridge", "elastic_net"]
 CVCriterion = Literal["log_likelihood", "bic", "ebic"]
@@ -158,6 +161,7 @@ def cv_select_lambda(
     verbose: bool = False,
     seed: int | None = None,
     n_jobs: int = 1,
+    mp_context: BaseContext | None = None,
 ) -> RegularizationCVResult:
     """Select regularization strength with person-level cross-validation.
 
@@ -166,6 +170,12 @@ def cv_select_lambda(
     higher-is-better orientation; BIC and EBIC are negated and normalized by
     the held-out fold size. Independent folds can run in separate processes
     with ``n_jobs``; use ``-1`` for all available CPUs.
+
+    Workers use ``spawn`` by default and preserve the configured mirt backend.
+    Supply ``mp_context=multiprocessing.get_context(...)`` to select another
+    start method without changing the global one. Process execution requires
+    an importable main module; protect calls in scripts with
+    ``if __name__ == "__main__":``.
     """
     responses = _validate_regularization_inputs(
         responses,
@@ -253,9 +263,9 @@ def cv_select_lambda(
         resolved_jobs = os.cpu_count() or 1
 
     if resolved_jobs > 1 and n_folds > 1:
-        from concurrent.futures import ProcessPoolExecutor
+        from mirt.utils._parallel import _process_pool
 
-        with ProcessPoolExecutor(max_workers=min(resolved_jobs, n_folds)) as executor:
+        with _process_pool(min(resolved_jobs, n_folds), mp_context) as executor:
             fold_results = list(executor.map(_evaluate_regularization_fold, tasks))
     else:
         fold_results = []

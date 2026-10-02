@@ -134,30 +134,48 @@ def consume_pending_item(engine: Any, response: int) -> tuple[int, int]:
     A rejected response leaves the pending item available for a corrected
     answer and does not count an item as administered or exposed.
     """
-    if isinstance(response, (int, np.integer, bool, np.bool_)):
-        response_code = int(response)
-    elif isinstance(response, (float, np.floating)):
-        if not np.isfinite(response) or response != np.floor(response):
-            raise ValueError("response must be a finite integer category code")
-        response_code = int(response)
-    else:
-        raise ValueError("response must be a finite integer category code")
+    response_code = _normalize_response_code(response)
 
     if response_code < 0:
         raise ValueError("response must be a non-negative category code")
-    if not engine.model.is_polytomous and response_code > 1:
+    if (
+        not engine.model.is_polytomous
+        and response_code > 1
+        and not hasattr(engine, "_pending_item")
+    ):
         raise ValueError("dichotomous response must be 0 or 1")
 
     item_idx = get_pending_item(engine)
-    if engine.model.is_polytomous:
-        n_categories = engine.model.n_categories[item_idx]
-        if response_code >= n_categories:
-            raise ValueError(
-                f"response for item {item_idx} must be between 0 and {n_categories - 1}"
-            )
+    response_code = validate_item_response(engine, item_idx, response_code)
 
     delattr(engine, "_pending_item")
     return item_idx, response_code
+
+
+def _normalize_response_code(response: Any) -> int:
+    """Normalize a numeric scalar without truncating fractional category codes."""
+    try:
+        value = np.asarray(response)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("response must be a finite integer category") from exc
+    if value.ndim != 0 or value.dtype.kind not in "biuf":
+        raise ValueError("response must be a finite integer category")
+    if value.dtype.kind == "f" and (not np.isfinite(value) or value != np.floor(value)):
+        raise ValueError("response must be a finite integer category")
+    return int(value)
+
+
+def validate_item_response(engine: Any, item_idx: int, response: Any) -> int:
+    """Validate a response before consuming the disclosed item or updating state."""
+    category = _normalize_response_code(response)
+    n_categories = (
+        int(engine.model.n_categories[item_idx]) if engine.model.is_polytomous else 2
+    )
+    if not 0 <= category < n_categories:
+        raise ValueError(
+            f"response for item {item_idx} must be between 0 and {n_categories - 1}"
+        )
+    return category
 
 
 def finalize_administered_item(engine: Any, state: Any) -> None:

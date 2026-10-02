@@ -23,6 +23,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inputs are validated before resetting an active session.
 - Counted initial interactive CAT/MCAT exposure sessions correctly, without
   counting unused resets as additional examinees.
+- Matched native CAT simulation posteriors to the public EAP scorer's bounded
+  binary probabilities, including saturated curves. Native dispatch preserves
+  customized model, selection, control, stopping, and engine methods. Native
+  results preserve configured stopping-rule priority and distinguish item-pool
+  exhaustion from a reached length cap.
+- Checked native response-buffer alignment before constructing Rust slices,
+  normalized unaligned inputs in the Python grouping wrapper, and copied array
+  dimensions before releasing the GIL.
+- Preserved finite native equating logits when ability/difficulty subtraction
+  overflows before multiplication by a small item discrimination.
+- Preserved the selected backend in cross-validation worker processes and used
+  portable spawned workers by default, avoiding dependence on forkserver sockets.
 - Made binary likelihood validation consistent for numeric response matrices,
   prevented unsigned subtraction overflow, and evaluated public probability
   curves at the original ability points. Batched likelihoods now broadcast
@@ -49,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recovery after invalid inputs.
 - A `score-equating` benchmark suite reporting timing and traced allocation
   peaks for dichotomous and heterogeneous ordinal forms.
+- Added optional `mp_context` to cross-validation and regularization selection
+  so callers can choose their multiprocessing context without global changes.
+- Added an `adaptive-scoring` timing and traced-memory benchmark suite for
+  fixed-history CAT/MCAT scoring across one to three dimensions.
 - Enabled existing tensor likelihood kernels for 1PL and PCM estimation, and
   added optional per-item `n_categories` metadata to GRM/GPCM GPU kernels.
   Added a `gpu-likelihood` benchmark suite with device and runtime metadata.
@@ -75,6 +91,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Updated locked urllib3 to 2.8.0 and replaced yanked NumPy 2.4.0 with 2.4.6.
 - Automatic version bumps synchronize the runtime module, Cargo manifest, and
   versioned package lock entries, refusing inconsistent inputs before edits.
+- Reused adaptive EAP quadrature grids and evaluated only administered item
+  curves for independent built-in binary models, with bounded probability and
+  covariance scratch space. Current parameters are reevaluated on each update;
+  custom models retain general scoring. Native simulation now adds each new
+  response's likelihood once rather than reevaluating the entire history.
+- Removed redundant new-form curve evaluation during linked true-score equating
+  and prepared serial cross-validation training folds lazily.
 - Reused binary likelihood response coefficients and result buffers to reduce
   temporary NumPy allocations. Exceptional curves and large responses use
   bounded item sums. Added a `binary-likelihood` timing and memory suite for

@@ -72,8 +72,9 @@ def true_score_equating(
     model_new : BaseItemModel
         New form model (on same scale or after linking).
     linking_result : LinkingResult | None
-        Constants mapping new-scale abilities to the old/reference scale:
-        ``theta_old = A * theta_new + B``.
+        Constants mapping new abilities onto the old/reference scale as
+        ``theta_old = A * theta_new + B``. The new form is evaluated at
+        ``(theta_old - B) / A``.
     theta_range : tuple[float, float]
         Range of theta for score mapping.
     n_theta : int
@@ -96,8 +97,8 @@ def true_score_equating(
     new_item_indices = _resolve_items(model_new, items_new, "items_new")
 
     theta_grid = np.linspace(lower, upper, n_theta)
-    expected_old = _compute_expected_scores(model_old, theta_grid, old_item_indices)
     theta_new = _new_scale_theta(theta_grid, linking_result)
+    expected_old = _compute_expected_scores(model_old, theta_grid, old_item_indices)
     expected_new = _compute_expected_scores(model_new, theta_new, new_item_indices)
 
     _validate_expected_score_curve(expected_old, "model_old")
@@ -126,8 +127,8 @@ def observed_score_equating(
     items_old: list[int] | None = None,
     items_new: list[int] | None = None,
     smoothing: Literal["none", "loglinear", "kernel"] = "none",
-    *,
     linking_result: LinkingResult | None = None,
+    *,
     batch_size: int | None = None,
 ) -> ScoreEquatingResult:
     """Perform IRT observed score equating.
@@ -142,7 +143,8 @@ def observed_score_equating(
     model_new : BaseItemModel
         New form model.
     theta_distribution : NDArray | None
-        Prior distribution of theta. Default: standard normal.
+        Probability masses at each point on the old/reference theta scale.
+        Default: weights proportional to standard normal density.
     theta_grid : NDArray | None
         Grid of theta values for integration.
     n_theta : int
@@ -154,9 +156,9 @@ def observed_score_equating(
     smoothing : {"none", "loglinear", "kernel"}
         Score-distribution smoothing applied before equipercentile inversion.
     linking_result : LinkingResult | None
-        Constants mapping new-scale abilities to the old/reference scale:
-        ``theta_old = A * theta_new + B``. The grid and its probability masses
-        describe the reference population on the old scale.
+        Constants mapping new abilities onto the old/reference scale as
+        ``theta_old = A * theta_new + B``. The same reference population weights
+        are used for both forms, evaluating the new form at ``(theta_old - B) / A``.
     batch_size : int | None
         Maximum theta points evaluated together. None chooses a bounded size
         from the form lengths and category counts.
@@ -319,7 +321,9 @@ def _new_scale_theta(
             # overflowed. This retains its cancellation precision elsewhere.
             transformed[invalid] = theta[invalid] / A - B / A
     if not np.all(np.isfinite(transformed)):
-        raise ValueError("linking_result produces non-finite new-scale abilities")
+        raise ValueError(
+            "linking_result produces non-finite theta values on the new scale"
+        )
     return transformed
 
 
@@ -343,9 +347,10 @@ def _native_score_distribution(
     """Use the compiled 1PL/2PL recursion when the model is compatible."""
     from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
 
-    if type(model) not in (OneParameterLogistic, TwoParameterLogistic) or not (
-        uses_builtin_model_hooks(model)
-    ):
+    if type(model) not in (
+        OneParameterLogistic,
+        TwoParameterLogistic,
+    ) or not uses_builtin_model_hooks(model):
         return None
 
     parameters = model.parameters

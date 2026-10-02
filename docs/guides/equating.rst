@@ -50,15 +50,30 @@ equating accept this result and evaluate the new form at
        theta_grid=theta,
        theta_distribution=population_mass,
        batch_size=32,
+       smoothing="kernel",
    )
 
+True-score equating inverts the old form's expected score curve over
+``theta_range`` and evaluates the new form at the corresponding ability.
+Scores outside the curve's finite lookup range use the nearest theta endpoint;
+widen ``theta_range`` when more extreme ability values are needed.
+
+Observed-score equating integrates conditional score probabilities with
+Lord–Wingersky recursion, then matches score-distribution percentile midpoints.
+The default population uses normal-density weights on the reference grid.
 For observed equating, ``theta_distribution`` supplies probability masses on
 the reference-scale grid. These same masses weight both forms; transforming
-the grid does not change them. Dichotomous asymptotes and item-specific ordinal
-category counts are supported. Score recursion evaluates bounded theta batches
+the grid does not change them. Custom grids can be unevenly spaced; supply
+appropriate integration weights when approximating a continuous distribution.
+Dichotomous asymptotes, item-specific ordinal category counts, and item subsets
+are supported. Score recursion evaluates bounded theta batches
 and retains only the marginal score distribution across batches. Omit
 ``batch_size`` to choose a memory bound from the form size. Custom probability
 curves use the Python path even when Rust is installed.
+
+Use ``smoothing="none"`` for the original score distributions,
+``"loglinear"`` for a polynomial fit to log probabilities, or ``"kernel"``
+for Gaussian smoothing before percentile matching.
 
 The ``score-equating`` benchmark suite records timing and peak Python/NumPy
 allocations for 2PL, 3PL, GRM, and GPCM recursion. For this suite, ``--persons``

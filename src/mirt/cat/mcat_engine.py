@@ -361,18 +361,23 @@ class MCATEngine:
         """Update ability estimates based on administered items."""
         try:
             if self.scoring_method == "EAP":
+                from mirt.cat._eap import score_binary_eap
                 from mirt.scoring import ability_posterior
 
-                posterior = ability_posterior(
-                    self.model,
-                    build_administered_response_matrix(self),
-                    n_quadpts=self.n_quadpts,
-                )
-                theta = posterior.mean.ravel()
-                centered_points = posterior.points - theta
-                covariance = centered_points.T @ (
-                    posterior.weights[0, :, None] * centered_points
-                )
+                moments = score_binary_eap(self)
+                if moments is not None:
+                    theta, covariance = moments
+                else:
+                    posterior = ability_posterior(
+                        self.model,
+                        build_administered_response_matrix(self),
+                        n_quadpts=self.n_quadpts,
+                    )
+                    theta = posterior.mean.ravel()
+                    centered_points = posterior.points - theta
+                    covariance = centered_points.T @ (
+                        posterior.weights[0, :, None] * centered_points
+                    )
             else:
                 result = score_administered_responses(self)
                 theta = result.theta.ravel()
