@@ -19,6 +19,7 @@ from numpy.typing import ArrayLike, NDArray
 from mirt.cat.assembly import (
     FormAssemblyResult,
     _information_matrix,
+    _prepare_item_bundles,
     _validate_blueprint,
     _validate_costs,
     _validate_enemy_pairs,
@@ -177,6 +178,7 @@ def assemble_parallel_forms(
     required_items: Collection[int] | None = None,
     excluded_items: Collection[int] | None = None,
     enemy_pairs: Collection[tuple[int, int]] | None = None,
+    item_bundles: Collection[Collection[int]] | None = None,
     item_costs: ArrayLike | None = None,
     max_cost: float | None = None,
     max_item_usage: int = 1,
@@ -220,6 +222,11 @@ def assemble_parallel_forms(
         Items removed from the candidate pool.
     enemy_pairs : collection of tuple[int, int], optional
         Item pairs that may not appear together on any form.
+    item_bundles : collection of collections of int, optional
+        All-or-none item sets on every form. Overlapping bundles are merged.
+        Required members make the whole bundle a shared anchor, exempt from
+        ``max_item_usage`` and included in pairwise overlap counts. An
+        unavailable member makes the entire bundle unavailable.
     item_costs : array-like, optional
         Non-negative cost for every model item.
     max_cost : float, optional
@@ -275,6 +282,7 @@ def assemble_parallel_forms(
     if not required <= candidates:
         raise ValueError("required_items must be included in candidate_items")
     candidates.difference_update(excluded)
+    bundles = _prepare_item_bundles(item_bundles, pool_size, candidates, required)
     size = _validate_form_size(form_size, len(candidates))
     if len(required) > size:
         raise ValueError("form_size cannot be smaller than required_items")
@@ -296,8 +304,9 @@ def assemble_parallel_forms(
         int(item_idx): position
         for position, item_idx in enumerate(candidate_indices.tolist())
     }
-    information = _information_matrix(model, theta_values, pool_size)
-    candidate_information = information[:, candidate_indices]
+    candidate_information = _information_matrix(
+        model, theta_values, pool_size, candidate_indices
+    )
     n_candidates = int(candidate_indices.size)
     n_selection = form_count * n_candidates
     form_pairs = list(combinations(range(form_count), 2))
@@ -346,6 +355,17 @@ def assemble_parallel_forms(
             size,
             size,
         )
+        for bundle in bundles:
+            first = selection_column(form_idx, item_positions[bundle[0]])
+            for item_idx in bundle[1:]:
+                add_constraint(
+                    [
+                        (first, 1.0),
+                        (selection_column(form_idx, item_positions[item_idx]), -1.0),
+                    ],
+                    0.0,
+                    0.0,
+                )
         if content is not None:
             for area in content.areas:
                 add_constraint(
@@ -516,7 +536,10 @@ def assemble_parallel_forms(
         raise RuntimeError("parallel form assembly returned an invalid item count")
 
     information_by_form = np.stack(
-        [np.sum(information[:, selected], axis=1) for selected in selected_by_form]
+        [
+            np.sum(candidate_information[:, selected_mask[form_idx]], axis=1)
+            for form_idx in range(form_count)
+        ]
     )
     weighted_information = information_by_form @ weights
     if targets is None:

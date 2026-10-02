@@ -174,6 +174,12 @@ Use :func:`~mirt.cat.assembly.assemble_form` to build a fixed form from a
 calibrated item pool. The mixed-integer optimizer can maximize weighted test
 information or match a target information curve while enforcing content-area
 limits, required and excluded items, enemy pairs, and a cost budget.
+Both fixed and parallel assembly accept ``item_bundles`` for all-or-none
+selection of items sharing a passage, stimulus, or other common material.
+Overlapping bundles form one connected bundle. Requiring any member requires
+all members; excluding a member, or leaving it outside ``candidate_items``,
+makes the whole bundle unavailable. A required bundle with an unavailable
+member is rejected before optimization.
 
 .. code-block:: python
 
@@ -190,6 +196,7 @@ limits, required and excluded items, enemy pairs, and a cost budget.
        theta=np.linspace(-2.0, 2.0, 21),
        blueprint=blueprint,
        enemy_pairs={(1, 2), (11, 12)},
+       item_bundles=[{3, 4}, {13, 14}],
    )
    print(assembly.selected_items)
    print(assembly.summary())
@@ -202,6 +209,8 @@ multiple forms simultaneously. The default max-min objective balances weighted
 information across forms and assigns each non-anchor item to at most one form.
 Common required items act as shared anchors; item reuse and pairwise overlap can
 be relaxed explicitly when the pool is too small for disjoint forms.
+Required bundles are shared anchors in their entirety, exempt from
+``max_item_usage``; every member counts toward ``max_pairwise_overlap``.
 
 .. code-block:: python
 

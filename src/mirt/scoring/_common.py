@@ -57,7 +57,7 @@ def resolve_prior_distribution(
     prior_mean: NDArray[np.float64] | None,
     prior_cov: NDArray[np.float64] | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return prior mean/covariance defaults for scoring."""
+    """Resolve and validate a finite, nondegenerate normal scoring prior."""
     if prior_mean is None:
         mean = np.zeros(n_factors, dtype=np.float64)
     else:
@@ -67,6 +67,28 @@ def resolve_prior_distribution(
         cov = np.eye(n_factors, dtype=np.float64)
     else:
         cov = np.asarray(prior_cov, dtype=np.float64)
+
+    if mean.shape != (n_factors,):
+        raise ValueError(f"prior_mean must have shape ({n_factors},)")
+    if not np.all(np.isfinite(mean)):
+        raise ValueError("prior_mean must contain only finite values")
+    if cov.shape != (n_factors, n_factors):
+        raise ValueError(f"prior_cov must have shape ({n_factors}, {n_factors})")
+    if not np.all(np.isfinite(cov)):
+        raise ValueError("prior_cov must contain only finite values")
+    if not np.allclose(cov, cov.T, rtol=1e-12, atol=0.0):
+        raise ValueError("prior_cov must be symmetric")
+    # Make negligible roundoff symmetric before Cholesky: LAPACK otherwise uses
+    # only the lower triangle, whereas MAP would invert the entire matrix.
+    # Difference-based averaging preserves equal subnormal variances that
+    # would be rounded to zero if each diagonal entry were halved first.
+    cov = cov + 0.5 * (cov.T - cov)
+    lower = np.tril_indices(n_factors, k=-1)
+    cov[lower] = cov.T[lower]
+    try:
+        np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError("prior_cov must be positive definite") from exc
 
     return mean, cov
 

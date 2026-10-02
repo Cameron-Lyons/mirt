@@ -52,7 +52,9 @@ def generate_plausible_values(
         Positive number of plausible values to generate per person
     method : str
         Generation method:
-        - 'posterior': Direct sampling from posterior using quadrature
+
+        - 'posterior': Sampling quadrature nodes according to their posterior
+          mass. Increase ``n_quadpts`` for a finer posterior approximation.
         - 'mcmc': MCMC sampling (slower but more flexible)
     n_quadpts : int
         Positive number of quadrature points (for posterior method)
@@ -186,15 +188,14 @@ def _generate_pv_posterior(
     nodes = quad.nodes
     weights = quad.weights
 
-    # Draw in the historical order before batching the deterministic likelihood
-    # work. This keeps seeded results independent of chunk_size.
-    uniforms = np.empty((n_persons, n_plausible), dtype=np.float64)
+    # Generate draws before batching likelihood work so the seeded stream is
+    # independent of chunk_size. Quadrature nodes already represent posterior
+    # uncertainty; adding noise would inflate its variance.
+    uniforms = rng.random((n_plausible, n_persons)).T
     pvs = np.empty((n_persons, n_factors, n_plausible), dtype=np.float64)
-    for p in range(n_plausible):
-        uniforms[:, p] = rng.random(n_persons)
-        pvs[:, :, p] = rng.normal(0, 0.3, size=(n_persons, n_factors))
 
-    log_weights = np.log(weights + 1e-300)
+    log_weights = np.full_like(weights, -np.inf)
+    np.log(weights, out=log_weights, where=weights > 0.0)
     n_nodes = nodes.shape[0]
     for start in range(0, n_persons, chunk_size):
         stop = min(start + chunk_size, n_persons)
@@ -222,7 +223,7 @@ def _generate_pv_posterior(
         cumulative = np.cumsum(posterior, axis=1)
         cumulative[:, -1] = 1.0
         indices = _inverse_cdf_rows(cumulative, uniforms[start:stop])
-        pvs[start:stop] += np.moveaxis(nodes[indices], 1, 2)
+        pvs[start:stop] = np.moveaxis(nodes[indices], 1, 2)
 
     return pvs
 
@@ -231,20 +232,12 @@ def _inverse_cdf_rows(
     cumulative: NDArray[np.float64],
     uniforms: NDArray[np.float64],
 ) -> NDArray[np.intp]:
-    """Search independent row CDFs without a rows-by-draws-by-nodes array."""
-    n_rows, n_nodes = cumulative.shape
-    if uniforms.shape[0] != n_rows:
-        raise ValueError("uniform draws must align with cumulative rows")
+    """Search strict categorical CDFs without perturbing row probabilities."""
+    from mirt.backends.rust.posterior import row_searchsorted
 
-    # Separate adjacent row CDFs with a unit gap before flattening them into a
-    # single monotonic sequence. The gap also handles an exact uniform draw of
-    # zero without matching the preceding row's terminal probability.
-    row_offsets = (2.0 * np.arange(n_rows, dtype=np.float64))[:, None]
-    shifted_cdf = (cumulative + row_offsets).ravel()
-    shifted_uniforms = (uniforms + row_offsets).ravel()
-    flat_indices = np.searchsorted(shifted_cdf, shifted_uniforms, side="left")
-    row_starts = (np.arange(n_rows, dtype=np.intp) * n_nodes)[:, None]
-    return flat_indices.reshape(uniforms.shape) - row_starts
+    if uniforms.shape[0] != cumulative.shape[0]:
+        raise ValueError("uniform draws must align with cumulative rows")
+    return row_searchsorted(cumulative, uniforms, side="right")
 
 
 def _paired_log_density(

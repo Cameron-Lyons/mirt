@@ -8,6 +8,7 @@ This module provides methods for handling missing responses:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
@@ -21,12 +22,14 @@ from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 LARGE_DF = 1e10
 _PAIRWISE_CHUNK_ELEMENTS = 1_000_000
 _MODEL_DRAW_TARGET_ELEMENTS = 2_000_000
 _IMPUTATION_METHODS = ("mean", "median", "mode", "random", "EM", "multiple")
 ImputationMethod = Literal["mean", "median", "mode", "random", "EM", "multiple"]
+ImputationModelName = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 
 
 def _prepare_response_matrix(
@@ -175,10 +178,11 @@ def _draw_model_responses_by_item(
 def impute_responses(
     responses: NDArray[np.int_],
     method: ImputationMethod = "EM",
-    model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] | None = None,
+    model: ImputationModelName | BaseItemModel | FitResult | None = None,
     n_imputations: int = 5,
     missing_code: int = -1,
     seed: int | None = None,
+    n_quadpts: int = 21,
 ) -> NDArray[np.int_] | list[NDArray[np.int_]]:
     """Impute missing responses in a response matrix.
 
@@ -194,19 +198,37 @@ def impute_responses(
         - 'random': Random draw from item distribution
         - 'EM': Model-based imputation using IRT
         - 'multiple': Multiple imputation (returns list)
-    model : str, optional
-        IRT model to use for EM imputation (default: '2PL')
+    model : str, BaseItemModel or FitResult, optional
+        IRT model for model-based imputation (default: '2PL'). A model name
+        estimates item parameters from the responses. A fitted model or fit
+        result reuses its calibration, including multiple latent dimensions
+        and declared ordinal categories.
     n_imputations : int
         Number of imputations for multiple imputation
     missing_code : int
         Code used to indicate missing values (default: -1)
     seed : int, optional
         Random seed for reproducibility
+    n_quadpts : int, default=21
+        Positive number of quadrature points per latent dimension for multiple
+        imputation. Increase it to refine the joint posterior approximation.
+        The joint grid contains ``n_quadpts ** n_factors`` nodes, so choose
+        fewer points for high-dimensional calibrations.
 
     Returns
     -------
     NDArray or list of NDArray
         Imputed response matrix (or list for multiple imputation)
+
+    Notes
+    -----
+    Multiple imputation draws jointly from each person's ability posterior
+    conditional on observed responses, then draws the missing item responses.
+    Item parameters remain fixed at the supplied or estimated calibration, so
+    these imputations account for ability and response uncertainty conditional
+    on item parameters. They do not incorporate calibration uncertainty.
+    If estimation of a named model fails, empirical item draws are returned
+    with a warning.
     """
     if method not in _IMPUTATION_METHODS:
         raise MirtValidationError(
@@ -226,6 +248,17 @@ def impute_responses(
             value=n_imputations,
         )
 
+    if method == "multiple" and (
+        not isinstance(n_quadpts, (int, np.integer))
+        or isinstance(n_quadpts, (bool, np.bool_))
+        or n_quadpts < 1
+    ):
+        raise MirtValidationError(
+            "n_quadpts must be a positive integer",
+            parameter="n_quadpts",
+            value=n_quadpts,
+        )
+
     rng = np.random.default_rng(seed)
     responses = _prepare_response_matrix(responses, missing_code).copy()
 
@@ -236,8 +269,54 @@ def impute_responses(
             return [responses.copy() for _ in range(n_imputations)]
         return responses
 
+    if method in ("EM", "multiple"):
+        from mirt.models.base import BaseItemModel
+        from mirt.results.fit_result import FitResult
+
+        if isinstance(model, FitResult):
+            model = model.model
+        if model is None:
+            model = "2PL"
+        if isinstance(model, BaseItemModel):
+            if not model.is_fitted:
+                raise MirtValidationError("Imputation requires a fitted model")
+            if model.n_items != responses.shape[1]:
+                raise MirtDataError(
+                    "The fitted model must match the number of response items"
+                )
+            observed = ~missing_mask
+            if model.is_polytomous:
+                invalid = observed & (
+                    responses >= np.asarray(model.n_categories)[None, :]
+                )
+                if np.any(invalid):
+                    raise MirtDataError(
+                        "Observed responses exceed the fitted model's item categories"
+                    )
+            elif np.any(responses[observed] > 1):
+                raise MirtDataError("Dichotomous responses must be coded as 0 or 1")
+        elif not isinstance(model, str) or model not in (
+            "1PL",
+            "2PL",
+            "3PL",
+            "4PL",
+            "GRM",
+            "GPCM",
+            "PCM",
+            "NRM",
+        ):
+            raise MirtValidationError(
+                "Unknown imputation model", parameter="model", value=model
+            )
+        elif model not in ("GRM", "GPCM", "PCM", "NRM") and np.any(
+            responses[~missing_mask] > 1
+        ):
+            raise MirtDataError("Dichotomous responses must be coded as 0 or 1")
+
     all_missing_items = np.flatnonzero(missing_mask.all(axis=0))
-    if all_missing_items.size:
+    if all_missing_items.size and (
+        method not in ("EM", "multiple") or isinstance(model, str)
+    ):
         raise MirtDataError(
             "Cannot impute items with no observed responses",
             item_indices=all_missing_items.tolist(),
@@ -256,13 +335,13 @@ def impute_responses(
         return _impute_random(responses, missing_mask, rng)
 
     if method == "EM":
-        if model is None:
-            model = "2PL"
+        assert model is not None
         return _impute_em(responses, missing_mask, model, rng)
 
-    if model is None:
-        model = "2PL"
-    return _impute_multiple(responses, missing_mask, model, n_imputations, rng)
+    assert model is not None
+    return _impute_multiple(
+        responses, missing_mask, model, n_imputations, rng, n_quadpts
+    )
 
 
 def _impute_mean(
@@ -383,12 +462,25 @@ def _impute_random(
 def _impute_em(
     responses: NDArray[np.int_],
     missing_mask: NDArray[np.bool_],
-    model: str,
+    model: str | BaseItemModel,
     rng: np.random.Generator,
 ) -> NDArray[np.int_]:
     """Model-based imputation using EM algorithm."""
     from mirt import fit_mirt
     from mirt.scoring import fscores
+
+    if not isinstance(model, str):
+        observed_responses = np.where(missing_mask, -1, responses)
+        scores = fscores(model, observed_responses, method="EAP")
+        imputed = responses.copy()
+        _draw_model_responses(
+            imputed,
+            missing_mask,
+            model,
+            scores.theta.reshape(responses.shape[0], model.n_factors),
+            rng,
+        )
+        return imputed
 
     imputed = responses.copy()
     imputed = _impute_mode(responses, missing_mask)
@@ -420,56 +512,87 @@ def _impute_em(
 def _impute_multiple(
     responses: NDArray[np.int_],
     missing_mask: NDArray[np.bool_],
-    model: str,
+    model: str | BaseItemModel,
     n_imputations: int,
     rng: np.random.Generator,
+    n_quadpts: int,
 ) -> list[NDArray[np.int_]]:
-    """Multiple imputation using proper imputation."""
+    """Draw conditional on observed responses and fixed item parameters."""
     from mirt import fit_mirt
-    from mirt.scoring import fscores
 
-    n_persons = responses.shape[0]
     imputations: list[NDArray[np.int_]] = []
-
-    initial = _impute_mode(responses, missing_mask)
+    observed_responses = np.where(missing_mask, -1, responses)
+    missing_people = np.flatnonzero(np.any(missing_mask, axis=1))
 
     try:
-        result = fit_mirt(initial, model=model, verbose=False)
-        scores = fscores(result.model, initial, method="EAP")
+        fitted_model = (
+            fit_mirt(
+                observed_responses,
+                model=model,
+                n_quadpts=n_quadpts,
+                verbose=False,
+                compute_standard_errors=False,
+            ).model
+            if isinstance(model, str)
+            else model
+        )
+        ability_draws = _posterior_ability_draws(
+            fitted_model,
+            observed_responses[missing_people],
+            n_imputations,
+            n_quadpts,
+            rng,
+        )
     except (
         ValueError,
         RuntimeError,
         ArithmeticError,
         FloatingPointError,
         np.linalg.LinAlgError,
-    ):
+    ) as exc:
+        if not isinstance(model, str):
+            raise
+        warnings.warn(
+            f"Model-based multiple imputation failed; using empirical item distributions: {exc}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
         return [
             _impute_random(responses, missing_mask, rng) for _ in range(n_imputations)
         ]
 
-    theta_mean = scores.theta
-    theta_se = scores.standard_error
-
-    for _ in range(n_imputations):
+    for draw in range(n_imputations):
         imputed = responses.copy()
-
-        if theta_mean.ndim == 1:
-            theta_draw = theta_mean + rng.standard_normal(n_persons) * theta_se
-            theta_draw = theta_draw.reshape(-1, 1)
-        else:
-            theta_draw = theta_mean + rng.standard_normal(theta_mean.shape) * theta_se
-
+        theta = np.zeros((responses.shape[0], fitted_model.n_factors), dtype=np.float64)
+        theta[missing_people] = ability_draws[:, :, draw]
         _draw_model_responses(
             imputed,
             missing_mask,
-            result.model,
-            theta_draw,
+            fitted_model,
+            theta,
             rng,
         )
 
         imputations.append(imputed)
 
     return imputations
+
+
+def _posterior_ability_draws(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    n_imputations: int,
+    n_quadpts: int,
+    rng: np.random.Generator,
+) -> NDArray[np.float64]:
+    """Sample joint posterior nodes with bounded likelihood row storage."""
+    from mirt.utils.plausible import _generate_pv_posterior
+
+    n_nodes = int(n_quadpts) ** model.n_factors
+    chunk_size = max(1, _MODEL_DRAW_TARGET_ELEMENTS // n_nodes)
+    return _generate_pv_posterior(
+        model, responses, n_imputations, n_quadpts, rng, chunk_size
+    )
 
 
 def analyze_missing(

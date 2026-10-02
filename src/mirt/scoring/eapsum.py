@@ -52,15 +52,23 @@ class EAPSumScorer:
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
     ) -> None:
-        if n_quadpts < 5:
+        if (
+            isinstance(n_quadpts, (bool, np.bool_))
+            or not isinstance(n_quadpts, (int, np.integer))
+            or n_quadpts < 5
+        ):
             raise ValueError("n_quadpts should be at least 5")
 
-        self.n_quadpts = n_quadpts
+        self.n_quadpts = int(n_quadpts)
         self.prior_mean = (
-            None if prior_mean is None else np.asarray(prior_mean, dtype=np.float64)
+            None
+            if prior_mean is None
+            else np.array(prior_mean, dtype=np.float64, copy=True)
         )
         self.prior_cov = (
-            None if prior_cov is None else np.asarray(prior_cov, dtype=np.float64)
+            None
+            if prior_cov is None
+            else np.array(prior_cov, dtype=np.float64, copy=True)
         )
         self._lookup_tables: dict[tuple[int, ...], dict] = {}
         self._lookup_values: dict[
@@ -420,6 +428,10 @@ class EAPSumScorer:
         dict
             Dictionary mapping sum scores to theta estimates and SEs
         """
+        if not model.is_fitted:
+            raise ValueError("Model must be fitted before scoring")
+        if model.n_factors > 1:
+            raise ValueError("EAPsum only supports unidimensional models")
         return self._build_lookup_table(model)
 
     def clear_cache(self) -> None:

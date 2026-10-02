@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Removed unconditional noise from quadrature plausible values so posterior
+  variance and joint factor distributions match their probability masses.
+  Native sampling preserves exact zero prior masses and seeded reproducibility.
+- Validated normal scoring priors consistently, rejecting nonfinite, asymmetric,
+  and nonpositive-definite covariance matrices instead of silently changing
+  their distributions. Sum-score lookup now validates fitted unidimensional
+  models and retains owned prior inputs.
+- Made delta-method covariance validation and standard-error propagation
+  respect parameter units, including very small variances, singular covariance,
+  and mixed magnitudes, without squaring representable errors into overflow.
+- Corrected BCa bias ranks for tied statistics and acceleration scaling, and
+  used the complete leave-one-person-out jackknife instead of a hidden
+  20-person approximation. Unsuccessful jackknives report missing intervals.
+- Required release filenames and archive metadata directories to agree with
+  the published package/version, preventing stale or mislabeled artifacts
+  from passing the publication gate.
+- Preserved custom batch information and reused item-callback scratch buffers
+  safely during form assembly.
+- Conditioned multiple-imputation ability draws on observed responses and
+  preserved joint factor dependence instead of scoring artificially filled
+  responses. Discrete posterior sampling skips zero-mass nodes at CDF boundaries.
 - Counted independent coefficients across cognitive-diagnosis, explanatory,
   ordinal-process, custom, testlet, unfolding, nonparametric, and mixture models,
   excluding design metadata, inactive padding, fixed bounds, and dependent storage.
@@ -84,6 +105,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probability overrides, and custom curves retain numerical fitting.
 
 ### Added
+- All-or-none ``item_bundles`` in fixed and parallel form assembly, including
+  overlapping bundles, propagated required anchors, excluded-member handling,
+  and joint content, security, cost, usage, and overlap constraints. Added
+  independent exhaustive-search optimum checks and sparse-pool allocation gates.
+- Independent numerical-integration and quadrature reference tests for scoring priors,
+  posterior sampling moments, and BCa intervals, alongside archive identity
+  failures exercised through the actual release-validator CLI.
+- Fitted-model and fit-result inputs plus configurable quadrature resolution for
+  imputation, supporting existing multidimensional and heterogeneous ordinal
+  calibrations and completely missing items with a supplied calibration.
 - True fixed-anchor and floating-anchor vertical calibration with physical-item
   maps, unequal forms, joint item/population estimation, native calibrated
   models, posterior scores, and constrained population-mean ordering.
@@ -125,6 +156,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder errors and existing fitting costs.
 
 ### Changed
+- Reused repeated response-pattern likelihoods when retaining ability
+  posteriors, with bounded expansion scratch space and respondent-order outputs.
+  Sparse built-in assembly pools evaluate only eligible item curves; dense
+  pools retain vectorized evaluation and custom callbacks remain authoritative.
+- Streamed mergeable BCa jackknife moments instead of retaining every omitted
+  person's full score vector. Limited BLAS/OpenMP thread pools during CI and
+  release tests to avoid nested parallelism and unstable performance comparisons.
 - Bounded respondent/item/category scratch space in Bayesian likelihoods and
   reused fixed or sampled posterior inputs through broadcast and strided views.
   Native SIBTEST shares matching totals and accumulates score strata in one

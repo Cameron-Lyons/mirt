@@ -203,10 +203,10 @@ class EAPScorer:
     ) -> AbilityPosteriorResult:
         """Return normalized ability distributions on the EAP quadrature grid.
 
-        Unlike :meth:`score`, this method intentionally retains one probability
-        per respondent and grid point. Likelihood evaluation remains batched,
-        but callers should account for the returned ``n_persons * n_points``
-        array when choosing ``n_quadpts`` for multidimensional models.
+        Repeated response patterns reuse likelihood evaluations. This method
+        retains one probability per respondent and grid point; callers should
+        account for the returned ``n_persons * n_points`` array when choosing
+        ``n_quadpts`` for multidimensional models.
         """
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
@@ -228,22 +228,40 @@ class EAPScorer:
         )
         log_marginal = np.empty(n_persons, dtype=np.float64)
         if n_persons:
+            patterns, inverse = _eap_response_patterns(responses)
+            n_patterns = patterns.shape[0]
             log_weights = np.log(quad_weights + 1e-300)
             batch_size = self._resolve_batch_size(
                 n_patterns=n_persons,
                 n_items=model.n_items,
                 n_quad=quad_points.shape[0],
             )
-            for start in range(0, n_persons, batch_size):
-                stop = min(start + batch_size, n_persons)
+            if n_patterns < n_persons:
+                # Group respondent indices once. Expansion is also batched so a
+                # common pattern cannot allocate another full posterior matrix.
+                grouped_rows = np.argsort(inverse, kind="stable")
+                offsets = np.concatenate(
+                    ([0], np.cumsum(np.bincount(inverse, minlength=n_patterns)))
+                )
+            for start in range(0, n_patterns, batch_size):
+                stop = min(start + batch_size, n_patterns)
                 batch_weights, batch_log_marginal = self._posterior_batch(
                     model,
-                    responses[start:stop],
+                    patterns[start:stop],
                     quad_points,
                     log_weights,
                 )
-                posterior_weights[start:stop] = batch_weights
-                log_marginal[start:stop] = batch_log_marginal
+                if n_patterns == n_persons:
+                    posterior_weights[start:stop] = batch_weights
+                    log_marginal[start:stop] = batch_log_marginal
+                else:
+                    for row_start in range(offsets[start], offsets[stop], batch_size):
+                        rows = grouped_rows[
+                            row_start : min(row_start + batch_size, offsets[stop])
+                        ]
+                        pattern_indices = inverse[rows] - start
+                        posterior_weights[rows] = batch_weights[pattern_indices]
+                        log_marginal[rows] = batch_log_marginal[pattern_indices]
 
         return AbilityPosteriorResult._from_owned_arrays(
             points=quad_points,

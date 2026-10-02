@@ -251,6 +251,157 @@ class TestScoreIntervals:
 
 
 class TestDeltaMethod:
+    @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
+    @pytest.mark.parametrize("analytic_gradient", [False, True])
+    def test_linear_standard_error_scales_with_covariance(
+        self, scale, analytic_gradient
+    ):
+        # Independent factor oracle: C = L L', so Var(3X - 2Y) is
+        # ||L' [3, -2]||² = ||[2, -4]||² = 20.
+        covariance = scale * np.array([[1.0, 0.5], [0.5, 4.25]])
+        gradient = np.array([3.0, -2.0])
+        transformed, standard_error = delta_method(
+            [1.0, -2.0],
+            covariance,
+            lambda values: 3.0 * values[0] - 2.0 * values[1],
+            gradient_func=(lambda _values: gradient) if analytic_gradient else None,
+        )
+        assert transformed == 7.0
+        np.testing.assert_allclose(
+            standard_error,
+            np.sqrt(20.0) * np.sqrt(scale),
+            rtol=1e-9,
+            atol=0.0,
+        )
+
+    @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
+    @pytest.mark.parametrize(
+        "covariance",
+        [np.array([[-1.0]]), np.array([[1.0, 2.0], [2.0, 1.0]])],
+    )
+    def test_negative_covariance_is_rejected_independently_of_scale(
+        self, scale, covariance
+    ):
+        with pytest.raises(MirtValidationError, match="positive semidefinite"):
+            delta_method(np.ones(len(covariance)), scale * covariance, np.sum)
+
+    @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
+    def test_covariance_symmetry_is_checked_relative_to_its_scale(self, scale):
+        covariance = scale * np.array([[1.0, 0.3], [0.2, 1.0]])
+        with pytest.raises(MirtValidationError, match="symmetric"):
+            delta_method([1.0, 2.0], covariance, np.sum)
+
+    @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
+    def test_symmetric_roundoff_and_singular_covariance_preserve_uncertainty(
+        self, scale
+    ):
+        covariance = scale * np.array([[1.0, 1.0], [1.0 + 1e-15, 1.0]])
+        _, standard_error = delta_method(
+            [0.0, 0.0],
+            covariance,
+            np.sum,
+            gradient_func=lambda _values: [1.0, 1.0],
+        )
+        np.testing.assert_allclose(
+            standard_error, 2.0 * np.sqrt(scale), rtol=1e-14, atol=0.0
+        )
+
+    @pytest.mark.parametrize("scale", [1e-250, 1.0, 1e250])
+    def test_near_roundoff_negative_eigenvalue_has_zero_null_direction_error(
+        self, scale
+    ):
+        covariance = scale * np.array([[1.0, 1.0 + 1e-15], [1.0 + 1e-15, 1.0]])
+        _, standard_error = delta_method(
+            [0.0, 0.0],
+            covariance,
+            lambda values: values[0] - values[1],
+            gradient_func=lambda _values: [1.0, -1.0],
+        )
+        assert standard_error == 0.0
+
+    def test_large_variance_cannot_hide_negative_marginal_variance(self):
+        with pytest.raises(MirtValidationError, match="positive semidefinite"):
+            delta_method([0.0, 0.0], np.diag([1e250, -1e-250]), np.sum)
+
+    def test_large_variance_cannot_hide_asymmetric_small_coordinate_block(self):
+        covariance = np.array(
+            [
+                [1e250, 0.0, 0.0],
+                [0.0, 1e-250, 0.2e-250],
+                [0.0, 0.1e-250, 1e-250],
+            ]
+        )
+        with pytest.raises(MirtValidationError, match="symmetric"):
+            delta_method([0.0, 0.0, 0.0], covariance, np.sum)
+
+    @pytest.mark.parametrize(
+        ("covariance", "gradient", "expected_error"),
+        [(1e250, 1e100, 1e225), (1e-250, 1e-100, 1e-225)],
+    )
+    def test_extreme_standard_error_avoids_intermediate_variance_overflow(
+        self, covariance, gradient, expected_error
+    ):
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            _, standard_error = delta_method(
+                [0.0],
+                [[covariance]],
+                lambda values: gradient * values[0],
+                gradient_func=lambda _values: [gradient],
+            )
+        np.testing.assert_allclose(standard_error, expected_error, rtol=1e-14, atol=0.0)
+
+    def test_large_singular_covariance_avoids_overflow_while_symmetrizing(self):
+        with np.errstate(over="raise", invalid="raise", divide="raise"):
+            _, standard_error = delta_method(
+                [0.0, 0.0],
+                np.full((2, 2), 1e308),
+                np.sum,
+                gradient_func=lambda _values: [1.0, 1.0],
+            )
+        assert standard_error == pytest.approx(2e154, rel=1e-14)
+
+    @pytest.mark.parametrize("covariance", [1e-250, np.nextafter(0.0, 1.0)])
+    def test_zero_variance_large_gradient_cannot_hide_small_uncertainty(
+        self, covariance
+    ):
+        _, standard_error = delta_method(
+            [0.0, 0.0],
+            np.diag([0.0, covariance]),
+            lambda values: 1e308 * values[0] + values[1],
+            gradient_func=lambda _values: [1e308, 1.0],
+        )
+        np.testing.assert_allclose(
+            standard_error, np.sqrt(covariance), rtol=1e-14, atol=0.0
+        )
+
+    @pytest.mark.parametrize(
+        ("gradient", "expected_error"),
+        [([0.0, 1.0], 1e-125), ([1e-125, -1e125], 1.0)],
+    )
+    def test_parameter_scales_do_not_erase_small_positive_variance(
+        self, gradient, expected_error
+    ):
+        # After changing units, the covariance is [[1, .5], [.5, 1]].
+        # The scaled contrast therefore has variance 1 + 1 - 2*.5 = 1.
+        covariance = np.array([[1e250, 0.5], [0.5, 1e-250]])
+        _, standard_error = delta_method(
+            [0.0, 0.0],
+            covariance,
+            lambda values: np.dot(gradient, values),
+            gradient_func=lambda _values: gradient,
+        )
+        np.testing.assert_allclose(standard_error, expected_error, rtol=1e-14, atol=0.0)
+
+    @pytest.mark.parametrize("covariance", [np.zeros((2, 2)), np.ones((2, 2))])
+    def test_zero_covariance_and_exact_singular_null_direction(self, covariance):
+        _, standard_error = delta_method(
+            [1.0, 2.0],
+            covariance,
+            lambda values: values[0] - values[1],
+            gradient_func=lambda _values: [1.0, -1.0],
+        )
+        assert standard_error == 0.0
+
     def test_matches_analytic_gradient(self):
         estimates = np.array([2.0, 3.0])
         covariance = np.array([[0.04, 0.01], [0.01, 0.09]])
@@ -331,6 +482,11 @@ class TestDeltaMethod:
     def test_rejects_invalid_covariance(self, vcov, match):
         with pytest.raises(MirtValidationError, match=match):
             delta_method([1.0, 2.0], vcov, np.sum)
+
+    def test_zero_variance_cannot_hide_nonzero_covariance_in_other_units(self):
+        covariance = np.array([[1e250, 1e-250], [1e-250, 0.0]])
+        with pytest.raises(MirtValidationError, match="semidefinite"):
+            delta_method([1.0, 2.0], covariance, np.sum)
 
     @pytest.mark.parametrize(
         ("estimates", "transform", "eps", "match"),

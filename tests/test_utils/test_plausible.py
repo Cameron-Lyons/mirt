@@ -12,6 +12,38 @@ from mirt import (
 from mirt.utils.plausible import _inverse_cdf_rows
 
 
+def _continuous_posterior_moments(likelihood):
+    """Adaptive integration of a likelihood times a standard-normal prior."""
+    from scipy.integrate import quad
+
+    def density(point):
+        return likelihood(point) * np.exp(-0.5 * point**2)
+
+    mass = quad(density, -12.0, 12.0, epsabs=1e-12)[0]
+    mean = quad(lambda point: point * density(point), -12.0, 12.0, epsabs=1e-12)[0]
+    mean /= mass
+    variance = (
+        quad(lambda point: (point - mean) ** 2 * density(point), -12.0, 12.0)[0] / mass
+    )
+    fourth_moment = (
+        quad(lambda point: (point - mean) ** 4 * density(point), -12.0, 12.0)[0] / mass
+    )
+    return mean, variance, fourth_moment
+
+
+def _assert_sample_moments(draws, likelihood):
+    mean, variance, fourth_moment = _continuous_posterior_moments(likelihood)
+    # Six Monte Carlo standard errors distinguish sampler error from sampling
+    # variation. References use adaptive integration rather than model scoring
+    # or the quadrature grid sampled by the implementation.
+    assert np.mean(draws) == pytest.approx(
+        mean, abs=6.0 * np.sqrt(variance / draws.size)
+    )
+    assert np.var(draws, ddof=1) == pytest.approx(
+        variance, abs=6.0 * np.sqrt((fourth_moment - variance**2) / draws.size)
+    )
+
+
 class TestGeneratePlausibleValues:
     """Tests for plausible value generation."""
 
@@ -156,6 +188,87 @@ class TestGeneratePlausibleValues:
         np.testing.assert_array_equal(actual, expected)
         assert batch_sizes == [6, 6, 5]
 
+    def test_posterior_samples_match_independently_integrated_binary_posterior(self):
+        from scipy.special import expit
+
+        from mirt.models import TwoParameterLogistic
+
+        slopes = np.array([1.1, 0.8, 1.4, 1.0, 0.9, 1.3])
+        locations = np.array([-1.3, -0.6, 0.1, 0.8, 1.2, -0.2])
+        responses = np.array([[1, 1, 0, 1, -1, 0]])
+        model = TwoParameterLogistic(n_items=slopes.size)
+        model.set_parameters(discrimination=slopes, difficulty=locations)
+        model._is_fitted = True
+
+        def likelihood(point):
+            probabilities = expit(slopes * (point - locations))
+            return (
+                probabilities[0]
+                * probabilities[1]
+                * (1.0 - probabilities[2])
+                * probabilities[3]
+                * (1.0 - probabilities[5])
+            )
+
+        draws = generate_plausible_values(
+            model, responses, n_plausible=50_000, n_quadpts=101, seed=741
+        )[0, 0]
+
+        _assert_sample_moments(draws, likelihood)
+
+    def test_posterior_samples_match_independently_integrated_ordinal_posterior(self):
+        from scipy.special import expit
+
+        from mirt.models import GradedResponseModel
+
+        slopes = np.array([1.2, 0.9, 1.5])
+        boundaries = np.array([[-1.0, 0.7], [-0.8, 1.2], [-1.4, 0.4]])
+        model = GradedResponseModel(n_items=3, n_categories=3)
+        model.set_parameters(discrimination=slopes, thresholds=boundaries)
+        model._is_fitted = True
+
+        def likelihood(point):
+            cumulative = expit(slopes[:, None] * (point - boundaries))
+            return (
+                (cumulative[0, 0] - cumulative[0, 1])
+                * cumulative[1, 1]
+                * (1.0 - cumulative[2, 0])
+            )
+
+        draws = generate_plausible_values(
+            model,
+            np.array([[1, 2, 0]]),
+            n_plausible=50_000,
+            n_quadpts=101,
+            seed=912,
+        )[0, 0]
+
+        _assert_sample_moments(draws, likelihood)
+
+    @pytest.mark.parametrize("n_factors", [1, 2])
+    def test_missing_response_posterior_preserves_standard_normal_prior(
+        self, n_factors
+    ):
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        from mirt.models import TwoParameterLogistic
+
+        model = TwoParameterLogistic(n_items=3, n_factors=n_factors)
+        model._is_fitted = True
+        draws = generate_plausible_values(
+            model,
+            -np.ones((1, 3), dtype=int),
+            n_plausible=50_000,
+            n_quadpts=21,
+            seed=27,
+        )[0]
+
+        nodes = GaussHermiteQuadrature(21).nodes[:, 0]
+        assert np.isin(draws, nodes).all()
+        np.testing.assert_allclose(draws.mean(axis=1), 0.0, atol=0.03)
+        np.testing.assert_allclose(
+            np.atleast_2d(np.cov(draws)), np.eye(n_factors), atol=0.03
+        )
+
     def test_posterior_rejects_malformed_batch_likelihood(
         self,
         fitted_2pl_model,
@@ -196,13 +309,30 @@ class TestGeneratePlausibleValues:
             ]
         )
         expected = np.sum(
-            uniforms[:, :, None] > cumulative[:, None, :],
+            uniforms[:, :, None] >= cumulative[:, None, :],
             axis=2,
         )
 
         actual = _inverse_cdf_rows(cumulative, uniforms)
 
         np.testing.assert_array_equal(actual, expected)
+
+    @pytest.mark.parametrize("native", [False, True])
+    def test_inverse_cdf_does_not_draw_zero_mass_or_shift_tiny_probabilities(
+        self, monkeypatch, native
+    ):
+        from mirt.backends.rust import posterior
+        from mirt.backends.rust._helpers import RUST_AVAILABLE
+
+        if native and not RUST_AVAILABLE:
+            pytest.skip("native backend is unavailable")
+        monkeypatch.setattr(posterior, "rust_enabled", lambda: native)
+        cumulative = np.tile([0.0, 1e-20, 0.5, 1.0], (3, 1))
+        uniforms = np.tile([0.0, 0.5e-20, 1e-20, 0.5, np.nextafter(1.0, 0.0)], (3, 1))
+
+        actual = _inverse_cdf_rows(cumulative, uniforms)
+
+        np.testing.assert_array_equal(actual, np.tile([1, 1, 2, 3, 3], (3, 1)))
 
     def test_generate_pv_mcmc(self, fitted_2pl_model_small):
         """Test MCMC sampling method."""

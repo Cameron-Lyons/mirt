@@ -247,10 +247,15 @@ def generate_plausible_values_posterior(
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
     n_plausible: int = 5,
-    jitter_sd: float = 0.3,
+    jitter_sd: float = 0.0,
     seed: int | None = None,
 ) -> NDArray[np.float64]:
-    """Generate plausible values using posterior sampling."""
+    """Sample quadrature nodes from the 2PL posterior.
+
+    The default draws preserve the quadrature posterior variance. An explicit
+    positive ``jitter_sd`` adds Gaussian smoothing, increasing that variance
+    by ``jitter_sd ** 2``.
+    """
     responses, discrimination, difficulty = _validate_2pl_inputs(
         responses, discrimination, difficulty
     )
@@ -272,7 +277,8 @@ def generate_plausible_values_posterior(
         )
 
     rng = np.random.default_rng(seed)
-    log_weights = np.log(quad_weights + 1e-300)
+    log_weights = np.full_like(quad_weights, -np.inf)
+    np.log(quad_weights, out=log_weights, where=quad_weights > 0.0)
     posterior = _binary_log_likelihood_grid(
         responses, quad_points, discrimination, difficulty
     )

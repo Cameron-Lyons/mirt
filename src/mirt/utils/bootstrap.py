@@ -9,7 +9,7 @@ This module provides nonparametric bootstrap procedures for:
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -47,8 +47,126 @@ class _StatisticFitTask:
     responses: NDArray[np.int_]
     statistic: Literal["parameters", "theta"] | Callable[..., Any]
     sample_indices: list[NDArray[np.int64]] | None = None
+    omitted_indices: list[int] | None = None
     resample_rng_state: dict[str, Any] | None = None
     n_resamples: int = 0
+    statistic_shapes: dict[str, tuple[int, ...]] | None = None
+
+
+@dataclass(slots=True)
+class _JackknifeMoments:
+    """Mergeable central moments using scaled differences from a fixed origin.
+
+    Normalizing before powers keeps acceleration independent of statistic
+    units. Subtracting the origin first preserves differences at large offsets;
+    only coordinates whose subtraction overflows use a scaled subtraction.
+    Storage depends on statistic shape, never on the number of omitted people.
+    """
+
+    count: int
+    reference: NDArray[np.float64]
+    scale: NDArray[np.float64]
+    mean: NDArray[np.float64]
+    m2: NDArray[np.float64]
+    m3: NDArray[np.float64]
+
+    @classmethod
+    def from_value(cls, value: NDArray[np.float64]) -> _JackknifeMoments:
+        value = np.asarray(value, dtype=np.float64)
+        return cls(1, value.copy(), *(np.zeros_like(value) for _ in range(4)))
+
+    def _normalized_difference(
+        self, value: NDArray[np.float64], other_scale: NDArray[np.float64]
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        with np.errstate(over="ignore", invalid="ignore"):
+            difference = value - self.reference
+        overflow = ~np.isfinite(difference)
+        distance = np.where(
+            overflow,
+            np.maximum(np.abs(value), np.abs(self.reference)),
+            np.abs(difference),
+        )
+        scale = np.maximum(np.maximum(self.scale, other_scale), distance)
+        normalized = np.divide(
+            difference,
+            scale,
+            out=np.zeros_like(difference),
+            where=(scale > 0.0) & ~overflow,
+        )
+        if np.any(overflow):
+            # Applying this fallback only to overflowing coordinates prevents
+            # one extreme parameter from losing precision in another parameter.
+            normalized = np.where(
+                overflow,
+                np.divide(value, scale, out=np.zeros_like(value), where=scale > 0.0)
+                - np.divide(
+                    self.reference,
+                    scale,
+                    out=np.zeros_like(value),
+                    where=scale > 0.0,
+                ),
+                normalized,
+            )
+        return normalized, scale
+
+    def add(self, value: NDArray[np.float64]) -> None:
+        """Accumulate one statistic without retaining the input array."""
+        normalized, scale = self._normalized_difference(value, self.scale)
+        ratio = np.divide(
+            self.scale, scale, out=np.zeros_like(scale), where=scale > 0.0
+        )
+        self.mean *= ratio
+        self.m2 *= ratio**2
+        self.m3 *= ratio**3
+        self.scale = scale
+
+        previous_count = self.count
+        self.count += 1
+        delta = normalized - self.mean
+        mean_delta = delta / self.count
+        term = delta * mean_delta * previous_count
+        self.m3 += term * mean_delta * (self.count - 2) - 3 * mean_delta * self.m2
+        self.m2 += term
+        self.mean += mean_delta
+
+    def merge(self, other: _JackknifeMoments) -> None:
+        """Combine worker summaries in deterministic task order."""
+        origin_difference, scale = self._normalized_difference(
+            other.reference, other.scale
+        )
+        left_ratio = np.divide(
+            self.scale, scale, out=np.zeros_like(scale), where=scale > 0.0
+        )
+        right_ratio = np.divide(
+            other.scale, scale, out=np.zeros_like(scale), where=scale > 0.0
+        )
+        left_mean = self.mean * left_ratio
+        right_mean = origin_difference + other.mean * right_ratio
+        left_m2, right_m2 = self.m2 * left_ratio**2, other.m2 * right_ratio**2
+        left_m3, right_m3 = self.m3 * left_ratio**3, other.m3 * right_ratio**3
+        delta = right_mean - left_mean
+        left_count, right_count = self.count, other.count
+        count = left_count + right_count
+        cross_weight = left_count * right_count / count
+        self.m3 = (
+            left_m3
+            + right_m3
+            + delta**3 * cross_weight * (left_count - right_count) / count
+            + 3 * delta * (left_count * right_m2 - right_count * left_m2) / count
+        )
+        self.m2 = left_m2 + right_m2 + delta**2 * cross_weight
+        self.mean = left_mean + delta * right_count / count
+        self.scale = scale
+        self.count = count
+
+    def acceleration(self) -> NDArray[np.float64]:
+        denominator = 6 * np.maximum(self.m2, 0.0) ** 1.5
+        return np.divide(
+            -self.m3,
+            denominator,
+            out=np.zeros_like(self.m3),
+            where=denominator > 0.0,
+        )
 
 
 @dataclass(slots=True)
@@ -162,9 +280,15 @@ def _resample_rng_chunks(
 
 
 def _iter_sample_indices(task: _StatisticFitTask) -> Iterator[NDArray[np.int64]]:
-    """Yield explicit or generated sample indices for one worker task."""
+    """Yield explicit, jackknife, or generated indices for one worker task."""
     if task.sample_indices is not None:
         yield from task.sample_indices
+        return
+
+    if task.omitted_indices is not None:
+        all_indices = np.arange(task.responses.shape[0], dtype=np.int64)
+        for omitted in task.omitted_indices:
+            yield np.delete(all_indices, omitted)
         return
 
     if task.resample_rng_state is None:
@@ -289,9 +413,15 @@ def _fit_statistic_task(
     task: _StatisticFitTask,
 ) -> list[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
     """Fit one worker chunk and extract each requested statistic."""
+    return list(_iter_statistic_fits(task))
+
+
+def _iter_statistic_fits(
+    task: _StatisticFitTask,
+) -> Iterator[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
+    """Yield fit results so jackknife statistics can be reduced immediately."""
     from mirt.estimation.em import EMEstimator
 
-    task_results: list[tuple[dict[str, NDArray[np.float64]] | None, str | None]] = []
     for indices in _iter_sample_indices(task):
         fit_responses = task.responses[indices]
         boot_model = _prepare_bootstrap_model(
@@ -319,10 +449,31 @@ def _fit_statistic_task(
                 values_by_name = _as_statistic_mapping(
                     task.statistic(result.model, fit_responses)
                 )
-            task_results.append((values_by_name, None))
+            yield values_by_name, None
         except _BOOTSTRAP_EXCEPTIONS as exc:
-            task_results.append((None, f"{type(exc).__name__}: {exc}"))
-    return task_results
+            yield None, f"{type(exc).__name__}: {exc}"
+
+
+def _fit_jackknife_task(task: _StatisticFitTask) -> dict[str, _JackknifeMoments]:
+    """Return fixed-size moments, rather than all leave-one-out statistics."""
+    assert task.statistic_shapes is not None
+    summaries: dict[str, _JackknifeMoments] = {}
+    for values_by_name, error in _iter_statistic_fits(task):
+        if error is not None:
+            continue
+        assert values_by_name is not None
+        for name, values in values_by_name.items():
+            if (
+                name not in task.statistic_shapes
+                or values.shape != task.statistic_shapes[name]
+                or not np.all(np.isfinite(values))
+            ):
+                continue
+            if name in summaries:
+                summaries[name].add(values)
+            else:
+                summaries[name] = _JackknifeMoments.from_value(values)
+    return summaries
 
 
 def _elementwise_percentile(
@@ -353,26 +504,31 @@ def _elementwise_percentile(
 def _bca_interval(
     samples: NDArray[np.float64],
     original: NDArray[np.float64],
-    jackknife: list[NDArray[np.float64]],
+    jackknife: Iterable[NDArray[np.float64]],
     alpha: float,
+    *,
+    acceleration: NDArray[np.float64] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     from scipy import stats
 
-    prop_below = np.mean(samples < original, axis=0)
-    z0 = stats.norm.ppf(np.clip(prop_below, 0.001, 0.999))
+    # Mid-ranks handle discrete statistics without treating ties as bias.
+    percentile = np.mean(samples < original, axis=0) + 0.5 * np.mean(
+        samples == original, axis=0
+    )
+    half_replicate = 0.5 / samples.shape[0]
+    z0 = stats.norm.ppf(np.clip(percentile, half_replicate, 1 - half_replicate))
 
-    acceleration = np.zeros_like(original, dtype=np.float64)
-    if len(jackknife) >= 3:
-        jack_stacked = np.stack(jackknife, axis=0)
-        jack_mean = jack_stacked.mean(axis=0)
-        jack_diff = jack_mean - jack_stacked
-        numerator = np.sum(jack_diff**3, axis=0)
-        denominator = 6 * np.sum(jack_diff**2, axis=0) ** 1.5
-        acceleration = np.divide(
-            numerator,
-            denominator,
-            out=np.zeros_like(numerator),
-            where=denominator > PROB_EPSILON,
+    if acceleration is None:
+        summary = None
+        for values in jackknife:
+            if summary is None:
+                summary = _JackknifeMoments.from_value(values)
+            else:
+                summary.add(values)
+        acceleration = (
+            np.zeros_like(original, dtype=np.float64)
+            if summary is None
+            else summary.acceleration()
         )
 
     z_lower = stats.norm.ppf(alpha / 2)
@@ -381,12 +537,8 @@ def _bca_interval(
     def adjusted_quantile(z_alpha: float) -> NDArray[np.float64]:
         numerator = z0 + z_alpha
         denominator = 1 - acceleration * numerator
-        denominator = np.where(
-            np.abs(denominator) < PROB_EPSILON,
-            np.copysign(PROB_EPSILON, denominator),
-            denominator,
-        )
-        return np.clip(stats.norm.cdf(z0 + numerator / denominator), 0.001, 0.999)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            return stats.norm.cdf(z0 + numerator / denominator)
 
     lower = _elementwise_percentile(samples, adjusted_quantile(z_lower))
     upper = _elementwise_percentile(samples, adjusted_quantile(z_upper))
@@ -734,6 +886,11 @@ def bootstrap_ci(
     retain the general Python implementation. Parallel custom models and
     statistic callables must be picklable; define them at module scope. Seeded
     results are deterministic and retain input order across worker counts.
+    BCa acceleration uses the full leave-one-person-out jackknife. It requires
+    one additional fit per person; process workers share those fits. Jackknife
+    samples are generated lazily, and workers reduce jackknife statistics into
+    fixed-size central moments. The jackknife uses storage proportional to
+    workers times statistic size, including when scoring every person's theta.
     """
     from mirt.results.fit_result import FitResult
 
@@ -750,6 +907,8 @@ def bootstrap_ci(
     rng = np.random.default_rng(seed)
     responses = validate_responses(responses, n_items=original_model.n_items)
     n_persons = responses.shape[0]
+    if method == "BCa" and n_persons < 2:
+        raise MirtValidationError("BCa intervals require at least two people")
 
     original_estimates: dict[str, NDArray[np.float64]] = {}
     if statistic == "parameters":
@@ -822,18 +981,10 @@ def bootstrap_ci(
                 ):
                     boot_estimates[name].append(values)
 
-    jackknife_estimates: dict[str, list[NDArray[np.float64]]] = {
-        name: [] for name in original_estimates
-    }
+    jackknife_summaries: dict[str, _JackknifeMoments] = {}
     if method == "BCa" and any(
         len(estimates) >= 10 for estimates in boot_estimates.values()
     ):
-        max_jack = min(20, n_persons)
-        jack_indices = rng.choice(n_persons, size=max_jack, replace=False).tolist()
-        all_indices = np.arange(n_persons, dtype=np.int64)
-        jackknife_sample_indices = [
-            np.delete(all_indices, index) for index in jack_indices
-        ]
         jackknife_tasks = [
             _StatisticFitTask(
                 model=original_model,
@@ -842,28 +993,24 @@ def bootstrap_ci(
                 max_iter=max_iter,
                 responses=responses,
                 statistic=statistic,
-                sample_indices=index_chunk,
+                omitted_indices=index_chunk,
+                statistic_shapes={
+                    name: values.shape for name, values in original_estimates.items()
+                },
             )
-            for index_chunk in _chunk_values(jackknife_sample_indices, n_jobs)
+            for index_chunk in _chunk_values(list(range(n_persons)), n_jobs)
         ]
         jackknife_chunk_results = _run_bootstrap_tasks(
-            _fit_statistic_task,
+            _fit_jackknife_task,
             jackknife_tasks,
             n_jobs,
         )
-        jackknife_results = [
-            result for chunk in jackknife_chunk_results for result in chunk
-        ]
-        for values_by_name, error in jackknife_results:
-            if error is not None:
-                continue
-            assert values_by_name is not None
-            for name, values in values_by_name.items():
-                if (
-                    name in jackknife_estimates
-                    and values.shape == original_estimates[name].shape
-                ):
-                    jackknife_estimates[name].append(values)
+        for chunk_summary in jackknife_chunk_results:
+            for name, summary in chunk_summary.items():
+                if name in jackknife_summaries:
+                    jackknife_summaries[name].merge(summary)
+                else:
+                    jackknife_summaries[name] = summary
 
     ci_results: dict[str, tuple[NDArray[np.float64], NDArray[np.float64]]] = {}
 
@@ -879,6 +1026,22 @@ def bootstrap_ci(
         stacked = np.stack(estimates, axis=0)
         original = original_estimates[name]
 
+        if method == "BCa" and (
+            name not in jackknife_summaries
+            or jackknife_summaries[name].count != n_persons
+        ):
+            warnings.warn(
+                f"BCa interval for {name!r} could not be computed: "
+                "the full jackknife did not succeed",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            ci_results[name] = (
+                np.full_like(original, np.nan, dtype=np.float64),
+                np.full_like(original, np.nan, dtype=np.float64),
+            )
+            continue
+
         if method == "percentile":
             lower = np.percentile(stacked, 100 * alpha / 2, axis=0)
             upper = np.percentile(stacked, 100 * (1 - alpha / 2), axis=0)
@@ -893,8 +1056,9 @@ def bootstrap_ci(
             lower, upper = _bca_interval(
                 stacked,
                 original,
-                jackknife_estimates[name],
+                (),
                 alpha,
+                acceleration=jackknife_summaries[name].acceleration(),
             )
 
         ci_results[name] = (lower.astype(np.float64), upper.astype(np.float64))

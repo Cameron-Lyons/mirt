@@ -35,7 +35,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Stopping rules: SE threshold, max items, classification
 - Exposure control: Sympson-Hetter, randomesque, progressive
 - Content balancing: Blueprint constraints
-- Fixed and parallel form assembly: Exact optimization with content, security, cost, reuse, and overlap constraints
+- Fixed and parallel form assembly: Exact optimization with content, security, cost, item bundles, reuse, and overlap constraints
 - **MCAT**: Multidimensional CAT with D-optimality and trace criteria
 
 ### Diagnostics & DIF
@@ -53,7 +53,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Multiple group analysis with invariance testing
 - Bootstrap standard errors and confidence intervals
 - Plausible values for population inference
-- Missing data imputation
+- Missing data imputation with calibrated-model reuse and joint posterior ability draws
 - Built-in sample datasets
 - Plotting (ICC, information, Wright maps, DIF)
 - DataFrame output (pandas or polars)

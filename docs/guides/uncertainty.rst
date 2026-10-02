@@ -1,5 +1,5 @@
-Parameter Uncertainty
-=====================
+Uncertainty and Missing Responses
+=================================
 
 Parameter draws can propagate item-calibration uncertainty into score curves.
 The workflow uses NumPy arrays throughout and does not require a dataframe or
@@ -100,3 +100,55 @@ returned score draws.
        item_indices=[0, 3, 7, 11],
        chunk_size=250,
    )
+
+Ability uncertainty and missing responses
+-----------------------------------------
+
+``generate_plausible_values`` draws from each respondent's joint ability
+posterior. With ``method="posterior"``, draws are quadrature nodes selected
+according to their posterior mass. Increase ``n_quadpts`` for a finer grid;
+the sampler preserves factor dependence and introduces no additional noise.
+Normal scoring priors must have finite means and symmetric, positive-definite
+covariance matrices.
+
+.. code-block:: python
+
+   plausible = mirt.generate_plausible_values(
+       result,
+       responses,
+       n_plausible=10,
+       n_quadpts=49,
+       seed=42,
+   )
+
+For multiple imputation, pass a fitted model or fit result to reuse the item
+calibration. Missing responses are sampled conditional on the observed cells,
+using joint posterior ability draws before drawing response categories. This
+also works for multidimensional and heterogeneous ordinal calibrations.
+
+.. code-block:: python
+
+   completed = mirt.impute_responses(
+       responses,
+       method="multiple",
+       model=result,
+       n_imputations=10,
+       n_quadpts=21,
+       seed=42,
+   )
+
+Observed cells remain unchanged. These imputations include ability and response
+uncertainty conditional on fixed item parameters; calibration uncertainty is
+not sampled. When a model name is supplied, its calibration uses the original
+observed responses. Failed named-model calibration warns before falling back
+to empirical item draws.
+
+Bootstrap confidence intervals
+------------------------------
+
+``bootstrap_ci(..., method="BCa")`` uses bias ranks that account for ties and
+a complete leave-one-person-out jackknife for acceleration. It requires one
+additional model fit per person. Set ``n_jobs`` to distribute those fits across
+processes. Jackknife samples are generated lazily and their moments accumulated
+without retaining all respondent-level score vectors. A failed jackknife
+produces missing intervals and a warning rather than an approximate BCa result.

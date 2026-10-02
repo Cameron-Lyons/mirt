@@ -155,10 +155,11 @@ def _validate_weights(
         raise ValueError(f"theta_weights must have shape {(n_theta,)}")
     if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
         raise ValueError("theta_weights must be finite and non-negative")
-    total = float(np.sum(weights))
-    if total <= 0.0:
+    scale = float(np.max(weights))
+    if scale <= 0.0:
         raise ValueError("theta_weights must have positive mass")
-    return np.asarray(weights / total, dtype=np.float64)
+    scaled = weights / scale
+    return np.asarray(scaled / np.sum(scaled), dtype=np.float64)
 
 
 def _validate_target(
@@ -235,18 +236,44 @@ def _information_matrix(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     pool_size: int,
+    item_indices: NDArray[np.intp] | None = None,
 ) -> NDArray[np.float64]:
-    """Evaluate a validated theta-by-item information matrix."""
+    """Evaluate sparse candidate subsets itemwise and dense pools in bulk."""
+    from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
+
     theta_matrix = theta[:, None]
-    raw = np.asarray(model.information(theta_matrix), dtype=np.float64)
-    expected_shape = (theta.size, pool_size)
+    indices = np.arange(pool_size) if item_indices is None else item_indices
+    expected_shape = (theta.size, indices.size)
+    use_bulk = (
+        indices.size == pool_size
+        or (indices.size > 64 and indices.size * 4 > pool_size)
+        or not uses_builtin_model_hooks(model)
+        or not uses_original_model_hook(model, "information")
+    )
+    raw = (
+        np.asarray(model.information(theta_matrix), dtype=np.float64)
+        if use_bulk
+        else np.empty((0, 0))
+    )
+    if use_bulk:
+        if raw.shape != (theta.size, pool_size):
+            raw = np.empty((0, 0))
+        elif indices.size != pool_size:
+            raw = raw[:, indices]
     if raw.shape != expected_shape:
-        raw = np.column_stack(
-            [
-                np.asarray(model.information(theta_matrix, item_idx=item_idx))
-                for item_idx in range(pool_size)
-            ]
-        ).astype(np.float64, copy=False)
+        raw = np.empty(expected_shape, dtype=np.float64)
+        for position, item_idx in enumerate(indices):
+            curve = np.asarray(
+                model.information(theta_matrix, item_idx=int(item_idx)),
+                dtype=np.float64,
+            )
+            if curve.shape not in {(theta.size,), (theta.size, 1)}:
+                raise ValueError(
+                    f"model item information has shape {curve.shape}, "
+                    f"expected {(theta.size,)}"
+                )
+            # A callback may return the same scratch buffer on every item call.
+            raw[:, position] = curve.reshape(-1)
     if raw.shape != expected_shape:
         raise ValueError(
             f"model information has shape {raw.shape}, expected {expected_shape}"
@@ -256,6 +283,58 @@ def _information_matrix(
     if np.any(raw < -1e-12):
         raise ValueError("model information must be non-negative")
     return np.clip(raw, 0.0, None)
+
+
+def _prepare_item_bundles(
+    item_bundles: Collection[Collection[int]] | None,
+    pool_size: int,
+    candidates: set[int],
+    required: set[int],
+) -> list[tuple[int, ...]]:
+    """Merge overlapping bundles and propagate eligibility and required anchors."""
+    if item_bundles is None:
+        return []
+    if isinstance(item_bundles, (str, bytes)):
+        raise ValueError("item_bundles must contain collections of item indices")
+    try:
+        bundles = list(item_bundles)
+    except TypeError as exc:
+        raise ValueError(
+            "item_bundles must contain collections of item indices"
+        ) from exc
+
+    parents: dict[int, int] = {}
+
+    def find(item: int) -> int:
+        while parents[item] != item:
+            parents[item] = parents[parents[item]]
+            item = parents[item]
+        return item
+
+    for bundle in bundles:
+        members = sorted(_validate_item_set(bundle, pool_size, "item_bundles"))
+        if len(members) < 2:
+            raise ValueError("each item bundle must contain at least two items")
+        for item in members:
+            parents.setdefault(item, item)
+        root = find(members[0])
+        for item in members[1:]:
+            parents[find(item)] = root
+
+    components: dict[int, set[int]] = {}
+    for item in parents:
+        components.setdefault(find(item), set()).add(item)
+    eligible: list[tuple[int, ...]] = []
+    for members in components.values():
+        if not members <= candidates:
+            if members & required:
+                raise ValueError("a required item bundle contains an unavailable item")
+            candidates.difference_update(members)
+        else:
+            if members & required:
+                required.update(members)
+            eligible.append(tuple(sorted(members)))
+    return sorted(eligible)
 
 
 def _validate_blueprint(
@@ -287,6 +366,7 @@ def assemble_form(
     required_items: Collection[int] | None = None,
     excluded_items: Collection[int] | None = None,
     enemy_pairs: Collection[tuple[int, int]] | None = None,
+    item_bundles: Collection[Collection[int]] | None = None,
     item_costs: ArrayLike | None = None,
     max_cost: float | None = None,
     solver_options: Mapping[str, bool | int | float] | None = None,
@@ -321,6 +401,10 @@ def assemble_form(
         Items removed from the candidate pool.
     enemy_pairs : collection of tuple[int, int], optional
         Item pairs that may not appear in the same form.
+    item_bundles : collection of collections of int, optional
+        All-or-none item sets, for example items sharing a reading passage.
+        Overlapping bundles are merged. Requiring a member requires the whole
+        bundle; an unavailable member makes the whole bundle unavailable.
     item_costs : array-like, optional
         Non-negative cost for every model item.
     max_cost : float, optional
@@ -375,6 +459,7 @@ def assemble_form(
     if not required <= candidates:
         raise ValueError("required_items must be included in candidate_items")
     candidates.difference_update(excluded)
+    bundles = _prepare_item_bundles(item_bundles, pool_size, candidates, required)
     size = _validate_form_size(form_size, len(candidates))
     if len(required) > size:
         raise ValueError("form_size cannot be smaller than required_items")
@@ -384,8 +469,9 @@ def assemble_form(
         int(item_idx): position
         for position, item_idx in enumerate(candidate_indices.tolist())
     }
-    information = _information_matrix(model, theta_values, pool_size)
-    candidate_information = information[:, candidate_indices]
+    candidate_information = _information_matrix(
+        model, theta_values, pool_size, candidate_indices
+    )
     n_candidates = candidate_indices.size
     n_deviations = theta_values.size if target is not None else 0
     n_variables = n_candidates + n_deviations
@@ -414,6 +500,11 @@ def assemble_form(
         upper_bounds.append(float(upper))
 
     add_constraint([(position, 1.0) for position in range(n_candidates)], size, size)
+
+    for bundle in bundles:
+        first = item_positions[bundle[0]]
+        for item_idx in bundle[1:]:
+            add_constraint([(first, 1.0), (item_positions[item_idx], -1.0)], 0.0, 0.0)
 
     if content is not None:
         for area in content.areas:
@@ -516,7 +607,7 @@ def assemble_form(
     selected_items = candidate_indices[selected_positions]
     if selected_items.size != size:
         raise RuntimeError("form assembly returned an invalid item count")
-    assembled_information = np.sum(information[:, selected_items], axis=1)
+    assembled_information = np.sum(candidate_information[:, selected_positions], axis=1)
     if target is None:
         objective_value = float(weights @ assembled_information)
     else:
