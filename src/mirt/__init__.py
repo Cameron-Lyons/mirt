@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
@@ -18,7 +19,7 @@ def fit_mirt(
     data: NDArray[np.int_],
     model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
     n_factors: int = 1,
-    n_categories: int | None = None,
+    n_categories: int | Sequence[int] | None = None,
     estimation: Literal["EM", "MHRM", "MCMC", "Gibbs"] = "EM",
     n_quadpts: int = 21,
     max_iter: int = 500,
@@ -54,9 +55,10 @@ def fit_mirt(
 
     n_factors : int, default=1
         Number of latent factors for multidimensional models.
-    n_categories : int, optional
-        Number of response categories for polytomous models.
-        If None, inferred from data.
+    n_categories : int or sequence of int, optional
+        Category count for all polytomous items, or one count per item.
+        If None, each item's count is inferred from its largest observed code,
+        with a minimum of two. Wholly unobserved items require explicit counts.
     estimation : {"EM", "MHRM", "MCMC", "Gibbs"}, default="EM"
         Estimation method. "MCMC" and "Gibbs" are aliases for Gibbs sampling;
         results are returned as a FitResult with posterior-mean parameters and
@@ -162,24 +164,47 @@ def fit_mirt(
 
     if is_polytomous:
         if n_categories is None:
-            observed = data[data >= 0]
-            if observed.size == 0:
+            maxima = data.max(axis=0)
+            if np.any(maxima < 0):
                 raise MirtValidationError(
-                    "n_categories is required when all responses are missing",
+                    "n_categories is required for items with no observed responses",
                     parameter="n_categories",
-                    expected=">= 2",
+                    expected="one category count per item, each >= 2",
                 )
-            n_categories = int(observed.max()) + 1
-        if n_categories < 2:
+            n_categories = np.maximum(maxima + 1, 2).tolist()
+        try:
+            counts = np.asarray(n_categories)
+        except (TypeError, ValueError) as exc:
             raise MirtValidationError(
-                "n_categories must be at least 2",
+                "n_categories must be an integer or one integer count per item",
+                parameter="n_categories",
+                value=n_categories,
+            ) from exc
+        if counts.ndim > 1 or (counts.ndim == 1 and counts.size != n_items):
+            raise MirtValidationError(
+                f"n_categories must be a scalar or have shape ({n_items},)",
+                parameter="n_categories",
+                value=n_categories,
+            )
+        if counts.dtype.kind not in "iu":
+            raise MirtValidationError(
+                "n_categories must contain integer category counts",
+                parameter="n_categories",
+                value=n_categories,
+            )
+        if np.any(counts < 2):
+            raise MirtValidationError(
+                "n_categories must be at least 2 for each item",
                 parameter="n_categories",
                 value=n_categories,
                 expected=">= 2",
             )
-        if np.any(data[data >= 0] >= n_categories):
+        # Preserve a declared scalar; sequences and inferred per-item counts
+        # are normalized to Python integers for the model constructors.
+        n_categories = int(counts) if counts.ndim == 0 else counts.tolist()
+        if np.any(data >= counts):
             raise MirtDataError(
-                "polytomous response codes must be below n_categories",
+                "polytomous response codes must be below n_categories for each item",
                 n_persons=n_persons,
                 n_items=n_items,
             )
@@ -383,8 +408,15 @@ def itemfit(
     result: FitResult,
     responses: NDArray[np.int_] | None = None,
     statistics: list[str] | None = None,
-    n_groups: int = 10,
+    n_groups: int | None = None,
     p_adjust: Literal["bonferroni", "holm", "fdr_bh", "none"] = "none",
+    *,
+    min_expected: float = 1.0,
+    n_quadpts: int = 41,
+    quadrature_points: NDArray[np.float64] | None = None,
+    quadrature_weights: NDArray[np.float64] | None = None,
+    item_parameter_counts: NDArray[np.int_] | None = None,
+    na_rm: bool = False,
 ) -> Any:
     """Compute item fit statistics for a fitted IRT model.
 
@@ -397,8 +429,7 @@ def itemfit(
     result : FitResult
         A fitted IRT model result from fit_mirt().
     responses : ndarray of shape (n_persons, n_items), optional
-        Response data used for fit calculation. If None, uses the data
-        from model fitting.
+        Response data used for fit calculation. Required for all statistics.
     statistics : list of str, optional
         Fit statistics to compute. Options include:
 
@@ -408,19 +439,34 @@ def itemfit(
         - "S_X2": Orlando-Thissen S-X2 statistic
 
         Default is ["infit", "outfit"].
-    n_groups : int
-        Number of observed-score groups used for S-X2. Must be at least 2.
-        Default is 10.
+    n_groups : int, optional
+        Deprecated and ignored by S-X2, which conditions on exact total scores.
     p_adjust : {"bonferroni", "holm", "fdr_bh", "none"}, default="none"
         Multiple-testing adjustment across item-level S-X2 p-values. When an
         adjustment is requested, the result includes a
         ``p_value_adjusted`` column while retaining the raw ``p_value``.
+    min_expected : float, default=1.0
+        Minimum expected S-X2 cell count for adjacent score/category pooling.
+        Zero disables sparse-cell pooling.
+    n_quadpts : int, default=41
+        Standard-normal quadrature points per model factor for S-X2.
+    quadrature_points, quadrature_weights : ndarray, optional
+        Explicit latent grid and nonnegative probability masses for S-X2.
+        Supply both to test a different fitted latent distribution.
+    item_parameter_counts : ndarray, optional
+        Estimated parameter counts per item for S-X2 degrees of freedom.
+        Defaults to the model's free parameter masks; supply zeros when item
+        parameters are externally known, or counts for shared parameters.
+    na_rm : bool, default=False
+        Exclude incomplete persons from S-X2. Otherwise S-X2 requires complete
+        responses. Mean-square statistics always use available responses.
 
     Returns
     -------
     DataFrame
         Item fit statistics with items as rows and statistics as columns.
-        Includes fit statistic values and standardized z-scores.
+        S-X2 includes ``df`` and ``p_value``. An unestimable chi-square test
+        has ``p_value=NaN``; nonpositive degrees of freedom are reported as zero.
 
     Examples
     --------
@@ -443,6 +489,12 @@ def itemfit(
         statistics,
         n_groups=n_groups,
         p_adjust=p_adjust,
+        min_expected=min_expected,
+        n_quadpts=n_quadpts,
+        quadrature_points=quadrature_points,
+        quadrature_weights=quadrature_weights,
+        item_parameter_counts=item_parameter_counts,
+        na_rm=na_rm,
     )
 
     return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")

@@ -25,7 +25,7 @@ def test_compute_s_x2_exposes_requested_adjustment(
     model = fitted_2pl_model.model
     responses = dichotomous_responses["responses"]
 
-    result = compute_s_x2(model, responses, n_groups=5, p_adjust=method)
+    result = compute_s_x2(model, responses, p_adjust=method)
 
     assert_allclose(
         result["p_value_adjusted"],
@@ -45,7 +45,6 @@ def test_compute_itemfit_applies_adjustment_to_s_x2_only(
         model,
         responses,
         statistics=["infit", "outfit", "S_X2"],
-        n_groups=5,
         p_adjust="holm",
     )
 
@@ -63,12 +62,11 @@ def test_default_result_shape_remains_unchanged(
     model = fitted_2pl_model.model
     responses = dichotomous_responses["responses"]
 
-    direct = compute_s_x2(model, responses, n_groups=5)
+    direct = compute_s_x2(model, responses)
     combined = compute_itemfit(
         model,
         responses,
         statistics=["S_X2"],
-        n_groups=5,
     )
 
     assert set(direct) == {"S_X2", "df", "p_value"}
@@ -85,7 +83,6 @@ def test_top_level_itemfit_forwards_adjustment(
         fitted_2pl_model,
         responses,
         statistics=["S_X2"],
-        n_groups=5,
         p_adjust="fdr_bh",
     )
 

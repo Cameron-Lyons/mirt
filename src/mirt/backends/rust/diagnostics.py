@@ -155,9 +155,13 @@ def _prepare_pointwise_loglik_inputs(
 
     return (
         np.ascontiguousarray(response_values),
-        np.ascontiguousarray(discrimination_values),
-        np.ascontiguousarray(difficulty_values),
-        np.ascontiguousarray(theta_values),
+        discrimination_values
+        if discrimination_values.flags.aligned
+        else discrimination_values.copy(),
+        difficulty_values
+        if difficulty_values.flags.aligned
+        else difficulty_values.copy(),
+        theta_values if theta_values.flags.aligned else theta_values.copy(),
         aggregation_code,
     )
 
@@ -172,42 +176,51 @@ def _pointwise_loglik_2pl_numpy(
     """Compute 2PL pointwise log likelihood one posterior sample at a time."""
     n_samples = discrimination_chain.shape[0]
     n_persons, n_items = responses.shape
-    observed = responses >= 0
-    correct = responses == 1
     if aggregation_code == 0:
         output_width = n_persons
     elif aggregation_code == 1:
         output_width = n_persons * n_items
     else:
-        output_width = int(np.count_nonzero(observed))
+        output_width = int(np.count_nonzero(responses >= 0))
     result = np.empty((n_samples, output_width), dtype=np.float64)
+    chunk_size = _entry_chunk_size(n_persons, n_items)
     for sample in range(n_samples):
-        probabilities = np.asarray(
-            sigmoid(
-                discrimination_chain[sample, None, :]
-                * (theta_chain[sample, :, None] - difficulty_chain[sample, None, :])
-            ),
-            dtype=np.float64,
-        )
-        np.clip(
-            probabilities,
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
-            out=probabilities,
-        )
-        values = np.where(
-            correct,
-            np.log(probabilities),
-            np.log1p(-probabilities),
-        )
-        values[~observed] = 0.0
+        offset = 0
+        for start in range(0, n_persons, chunk_size):
+            stop = min(start + chunk_size, n_persons)
+            response_chunk = responses[start:stop]
+            probabilities = np.asarray(
+                sigmoid(
+                    discrimination_chain[sample, None, :]
+                    * (
+                        theta_chain[sample, start:stop, None]
+                        - difficulty_chain[sample, None, :]
+                    )
+                ),
+                dtype=np.float64,
+            )
+            np.clip(
+                probabilities,
+                PROB_EPSILON,
+                1.0 - PROB_EPSILON,
+                out=probabilities,
+            )
+            values = np.where(
+                response_chunk == 1,
+                np.log(probabilities),
+                np.log1p(-probabilities),
+            )
+            observed = response_chunk >= 0
+            values[~observed] = 0.0
 
-        if aggregation_code == 0:
-            result[sample] = np.sum(values, axis=1)
-        elif aggregation_code == 1:
-            result[sample] = values.ravel()
-        else:
-            result[sample] = values[observed]
+            if aggregation_code == 0:
+                output_values = np.sum(values, axis=1)
+            elif aggregation_code == 1:
+                output_values = values.ravel()
+            else:
+                output_values = values[observed]
+            result[sample, offset : offset + output_values.size] = output_values
+            offset += output_values.size
 
     return result
 
@@ -458,7 +471,43 @@ def sibtest_compute_beta(
     focal_scores: NDArray[np.int_],
     suspect_items: NDArray[np.int_],
 ) -> tuple[float, float, NDArray[np.float64], NDArray[np.float64]]:
-    """Compute SIBTEST beta statistic."""
+    """Compute uncorrected SIBTEST beta, SE, effects, and pooled cell counts."""
+    from mirt.diagnostics.sibtest import (
+        _stratum_statistics,
+        _validate_item_indices,
+        _validate_response_data,
+    )
+
+    ref_data = _validate_response_data(ref_data)
+    focal_data = _validate_response_data(focal_data)
+    if (
+        ref_data.shape[1] != focal_data.shape[1]
+        or min(ref_data.shape[0], focal_data.shape[0]) < 2
+    ):
+        raise ValueError(
+            "SIBTEST groups must have matching items and at least two persons"
+        )
+    suspect_items = _validate_item_indices(
+        suspect_items, name="suspect_items", n_items=ref_data.shape[1]
+    )
+    score_vectors = []
+    for name, scores, n_persons in (
+        ("ref_scores", ref_scores, ref_data.shape[0]),
+        ("focal_scores", focal_scores, focal_data.shape[0]),
+    ):
+        values = np.asarray(scores)
+        if (
+            values.shape != (n_persons,)
+            or values.dtype.kind not in "iu"
+            or np.any(values < 0)
+        ):
+            raise ValueError(f"{name} must contain one nonnegative integer per person")
+        score_vectors.append(values)
+    # Dense score codes keep the NumPy accumulator bounded even if callers
+    # supply widely separated integer matching-score labels.
+    _, score_codes = np.unique(np.concatenate(score_vectors), return_inverse=True)
+    ref_scores = score_codes[: ref_data.shape[0]]
+    focal_scores = score_codes[ref_data.shape[0] :]
     if rust_enabled():
         return mirt_rs.sibtest_compute_beta(
             ref_data.astype(np.int32),
@@ -468,36 +517,20 @@ def sibtest_compute_beta(
             suspect_items.astype(np.int32),
         )
 
-    all_scores = np.concatenate([ref_scores, focal_scores])
-    unique_scores = np.unique(all_scores)
-
-    beta_k = []
-    n_k = []
-
-    for k in unique_scores:
-        ref_at_k = ref_data[ref_scores == k]
-        focal_at_k = focal_data[focal_scores == k]
-
-        n_ref_k = len(ref_at_k)
-        n_focal_k = len(focal_at_k)
-
-        if n_ref_k > 0 and n_focal_k > 0:
-            mean_ref_k = ref_at_k[:, suspect_items].sum(axis=1).mean()
-            mean_focal_k = focal_at_k[:, suspect_items].sum(axis=1).mean()
-            beta_k.append(mean_ref_k - mean_focal_k)
-            n_k.append(2 * n_ref_k * n_focal_k / (n_ref_k + n_focal_k))
-
-    if not beta_k:
+    strata = _stratum_statistics(
+        ref_data[:, suspect_items].sum(axis=1),
+        focal_data[:, suspect_items].sum(axis=1),
+        ref_scores,
+        focal_scores,
+    )
+    eligible = (strata.ref_counts >= 2) & (strata.focal_counts >= 2)
+    if not np.any(eligible):
         return np.nan, np.nan, np.array([]), np.array([])
-
-    beta_k = np.array(beta_k)
-    n_k = np.array(n_k)
-    beta = np.sum(n_k * beta_k) / np.sum(n_k)
-
-    weighted_var = np.sum(n_k * (beta_k - beta) ** 2) / np.sum(n_k)
-    n_total = len(ref_scores) + len(focal_scores)
-    se = np.sqrt(weighted_var / n_total)
-
+    beta_k = (strata.ref_means - strata.focal_means)[eligible]
+    n_k = (strata.ref_counts + strata.focal_counts)[eligible].astype(np.float64)
+    weights = n_k / n_k.sum()
+    beta = float(np.dot(weights, beta_k))
+    se = float(np.sqrt(np.dot(weights**2, strata.sampling_variances[eligible])))
     return beta, se, beta_k, n_k
 
 
@@ -506,59 +539,35 @@ def sibtest_all_items(
     groups: NDArray[np.int_],
     anchor_items: NDArray[np.int_] | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """Run SIBTEST for all items in parallel."""
+    """Run uncorrected SIBTEST across items with complete binary responses."""
+    from mirt.diagnostics.sibtest import (
+        _split_validated_groups,
+        _validate_groups,
+        _validate_item_indices,
+        _validate_response_data,
+        sibtest_items,
+    )
+
+    data = _validate_response_data(data)
+    groups = _validate_groups(groups, data.shape[0])
+    _, _, _, focal_mask = _split_validated_groups(data, groups)
+    if data.shape[1] < 2:
+        raise ValueError("SIBTEST requires at least two items")
+    if anchor_items is not None:
+        anchor_items = _validate_item_indices(
+            anchor_items, name="anchor_items", n_items=data.shape[1]
+        )
     if rust_enabled():
         return mirt_rs.sibtest_all_items(
             data.astype(np.int32),
-            groups.astype(np.int32),
+            focal_mask.astype(np.int32),
             anchor_items.astype(np.int32) if anchor_items is not None else None,
         )
 
-    from scipy import stats
-
-    n_items = data.shape[1]
-    unique_groups = np.unique(groups)
-    ref_group, focal_group = unique_groups[0], unique_groups[1]
-
-    ref_mask = groups == ref_group
-    focal_mask = groups == focal_group
-
-    betas = np.zeros(n_items)
-    zs = np.zeros(n_items)
-    p_values = np.zeros(n_items)
-
-    for i in range(n_items):
-        if anchor_items is None:
-            matching = [j for j in range(n_items) if j != i]
-        else:
-            matching = [j for j in anchor_items if j != i]
-
-        if not matching:
-            betas[i] = np.nan
-            zs[i] = np.nan
-            p_values[i] = np.nan
-            continue
-
-        ref_scores = data[ref_mask][:, matching].sum(axis=1)
-        focal_scores = data[focal_mask][:, matching].sum(axis=1)
-
-        beta, se, _, _ = sibtest_compute_beta(
-            data[ref_mask],
-            data[focal_mask],
-            ref_scores,
-            focal_scores,
-            np.array([i]),
-        )
-
-        betas[i] = beta
-        if se > PROB_EPSILON:
-            zs[i] = beta / se
-            p_values[i] = 2 * (1 - stats.norm.cdf(abs(zs[i])))
-        else:
-            zs[i] = np.nan
-            p_values[i] = np.nan
-
-    return betas, zs, p_values
+    result = sibtest_items(
+        data, groups, anchor_items=anchor_items, correction=False, p_adjust="none"
+    )
+    return result["beta"], result["z"], result["p_value"]
 
 
 def compute_standardized_residuals(

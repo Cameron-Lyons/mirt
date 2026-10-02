@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import minimize
+from scipy.optimize import LinearConstraint, minimize
 from scipy.special import xlog1py, xlogy
 
 from mirt._backend_config import should_use_rust
@@ -23,15 +23,69 @@ from mirt.backends.rust.estimation import em_iteration_3pl
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._posterior import normalize_log_posterior
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import BaseEstimator, _initialize_free_parameters
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import _compute_item_se_curvature
-from mirt.exceptions import MirtValidationError
+from mirt.exceptions import MirtEstimationError, MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.estimation.latent_density import LatentDensity
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+
+
+def _graded_threshold_constraint(
+    model: BaseItemModel, item_idx: int, n_parameters: int
+) -> LinearConstraint | None:
+    """Keep adjacent GRM thresholds ordered in the estimator's free layout.
+
+    Fixed thresholds contribute constants, while padded threshold storage is
+    excluded. A small positive gap for movable thresholds keeps roundoff and
+    numerical derivative probes from creating negative category probabilities.
+    """
+    from mirt.models.polytomous import GradedResponseModel
+
+    if not isinstance(model, GradedResponseModel):
+        return None
+    n_thresholds = model.n_categories[item_idx] - 1
+    if n_thresholds < 2:
+        return None
+    free_masks = model.free_parameter_masks
+    offset = 0
+    positions = {}
+    values = None
+    for name, array in model.parameters.items():
+        if array.ndim == 0 or array.shape[0] != model.n_items:
+            continue
+        mask = np.asarray(free_masks[name][item_idx]).reshape(-1)
+        indices = np.flatnonzero(mask)
+        if name == "thresholds":
+            values = np.asarray(array[item_idx]).reshape(-1)[:n_thresholds]
+            positions = {
+                int(index): offset + column for column, index in enumerate(indices)
+            }
+        offset += len(indices)
+    if values is None:
+        return None
+    rows = []
+    lower = []
+    for first in range(n_thresholds - 1):
+        row = np.zeros(n_parameters)
+        fixed_difference = 0.0
+        for index, sign in ((first, -1.0), (first + 1, 1.0)):
+            if index in positions:
+                row[positions[index]] = sign
+            else:
+                fixed_difference += sign * values[index]
+        if not np.any(row):
+            if fixed_difference < 0:
+                raise MirtValidationError("fixed GRM thresholds must be ordered")
+            continue
+        rows.append(row)
+        lower.append(1e-6 - fixed_difference)
+    return (
+        LinearConstraint(np.asarray(rows), np.asarray(lower), np.inf) if rows else None
+    )
 
 
 class EMEstimator(BaseEstimator):
@@ -128,7 +182,7 @@ class EMEstimator(BaseEstimator):
             self._latent_density = self._latent_density_spec
 
         if not model._is_fitted:
-            model._initialize_parameters()
+            _initialize_free_parameters(model)
 
         builtin = supports_pattern_compression(model)
         with EMFitContext(
@@ -257,6 +311,7 @@ class EMEstimator(BaseEstimator):
             or self._should_use_gpu
             or type(model) is not ThreeParameterLogistic
             or not uses_builtin_model_hooks(model, likelihood=True)
+            or model._free_parameter_restrictions
             or model.n_factors != 1
             or self.n_jobs != 1
             or self.prob_epsilon != PROB_EPSILON
@@ -734,18 +789,28 @@ class EMEstimator(BaseEstimator):
         if prepared is not None:
             objective = prepared
 
+        constraint = _graded_threshold_constraint(model, item_idx, current_params.size)
+        constrained = {"constraints": (constraint,)} if constraint is not None else {}
         try:
             result = minimize(
                 objective,
                 x0=current_params,
-                method="L-BFGS-B",
+                method="SLSQP" if constraint is not None else "L-BFGS-B",
                 jac=analytic,
                 bounds=bounds,
                 options={
                     "maxiter": self.item_optim_maxiter,
                     "ftol": self.item_optim_ftol,
                 },
+                **constrained,
             )
+            if constraint is not None and (
+                not np.all(np.isfinite(result.x))
+                or np.any(constraint.A @ result.x < constraint.lb - 1e-8)
+            ):
+                raise MirtEstimationError(
+                    f"GRM item {item_idx} optimization did not preserve threshold ordering"
+                )
             return result.x
         finally:
             if not analytic:
@@ -845,7 +910,9 @@ class EMEstimator(BaseEstimator):
         for name, values in params.items():
             free_mask = free_masks[name]
             if not np.any(free_mask):
-                standard_errors[name] = np.zeros_like(values)
+                standard_errors[name] = model._expand_parameter_standard_errors(
+                    name, np.zeros_like(values)
+                )
                 continue
 
             se = np.zeros_like(values)
@@ -884,7 +951,7 @@ class EMEstimator(BaseEstimator):
                     se[item_idx] = item_se
 
             se[~free_mask] = 0.0
-            standard_errors[name] = se
+            standard_errors[name] = model._expand_parameter_standard_errors(name, se)
 
         return standard_errors
 

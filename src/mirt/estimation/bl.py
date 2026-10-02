@@ -22,7 +22,7 @@ from scipy.optimize import minimize
 
 from mirt.estimation._bl_objective import prepare_bl_objective
 from mirt.estimation._em_context import EMFitContext
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import BaseEstimator, _initialize_free_parameters
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.utils.numeric import logsumexp
 
@@ -123,7 +123,7 @@ class BLEstimator(BaseEstimator):
         )
 
         if not model._is_fitted:
-            model._initialize_parameters()
+            _initialize_free_parameters(model)
 
         initial_params, bounds, param_structure = self._flatten_parameters(model)
         prepared = None
@@ -316,7 +316,9 @@ class BLEstimator(BaseEstimator):
             flat_params = params[info["start_idx"] : info["end_idx"]]
             values = info["template"].copy().ravel()
             values[info["free_indices"]] = flat_params
-            model._parameters[name] = values.reshape(info["shape"])
+            model._parameters[name] = model._canonical_parameter_values(
+                name, values.reshape(info["shape"])
+            )
 
     def _compute_standard_errors(
         self,
@@ -364,6 +366,6 @@ class BLEstimator(BaseEstimator):
             se_values = se_flat[info["start_idx"] : info["end_idx"]]
             full_se = np.zeros(info["shape"], dtype=np.float64)
             full_se.ravel()[info["free_indices"]] = se_values
-            se_dict[name] = full_se
+            se_dict[name] = model._expand_parameter_standard_errors(name, full_se)
 
         return se_dict

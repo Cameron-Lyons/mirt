@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.constants import PROB_EPSILON
 from mirt.utils.numeric import logsumexp
 
@@ -136,7 +137,7 @@ def _apply_parameter_sample(
 ) -> None:
     """Apply one posterior parameter sample to a model."""
     for name, chain in parameter_chains.items():
-        value = np.asarray(chain[sample_idx], dtype=np.float64)
+        value = np.array(chain[sample_idx], dtype=np.float64, copy=True)
         if name in model._parameters:
             model._parameters[name] = value
         attribute_name = f"_{name}"
@@ -178,7 +179,11 @@ def _supports_batched_pointwise_2pl(model: BaseItemModel) -> bool:
     """Return whether a model has the exact batched 2PL contract."""
     from mirt.models.dichotomous import TwoParameterLogistic
 
-    return type(model) is TwoParameterLogistic and model.n_factors == 1
+    return (
+        type(model) is TwoParameterLogistic
+        and model.n_factors == 1
+        and uses_builtin_model_hooks(model)
+    )
 
 
 def _batched_2pl_pointwise_inputs(
@@ -193,7 +198,7 @@ def _batched_2pl_pointwise_inputs(
     NDArray[np.float64],
     NDArray[np.float64],
 ]:
-    """Materialize fixed or sampled values for the batched 2PL backend."""
+    """Resolve fixed or sampled values using views for the batched 2PL backend."""
     discrimination = parameter_chains.get("discrimination")
     if discrimination is None:
         discrimination = np.broadcast_to(
@@ -207,15 +212,27 @@ def _batched_2pl_pointwise_inputs(
             (n_samples, model.n_items),
         )
 
-    theta = np.empty((n_samples, n_persons), dtype=np.float64)
-    for sample_idx in range(n_samples):
-        theta[sample_idx] = _theta_for_sample(
-            chains,
-            sample_idx=sample_idx,
-            n_samples=n_samples,
-            n_persons=n_persons,
-            n_factors=1,
-        )[:, 0]
+    theta_chain = chains.get("theta")
+    if theta_chain is None:
+        theta = np.broadcast_to(np.array(0.0), (n_samples, n_persons))
+    else:
+        theta_values = np.asarray(theta_chain, dtype=np.float64)
+        if theta_values.shape == (n_samples, n_persons, 1):
+            theta = theta_values[..., 0]
+        elif theta_values.shape == (n_samples, n_persons) and theta_values.shape != (
+            n_persons,
+            1,
+        ):
+            theta = theta_values
+        else:
+            fixed_theta = _theta_for_sample(
+                chains,
+                sample_idx=0,
+                n_samples=n_samples,
+                n_persons=n_persons,
+                n_factors=1,
+            )[:, 0]
+            theta = np.broadcast_to(fixed_theta, (n_samples, n_persons))
     return discrimination, difficulty, theta
 
 
@@ -233,24 +250,25 @@ def _validate_response_matrix(
         )
 
     is_boolean = np.issubdtype(values.dtype, np.bool_)
-    if not is_boolean and not np.issubdtype(values.dtype, np.number):
+    if values.dtype.kind not in "biuf":
         raise ValueError("responses must contain finite integer category codes")
     if not is_boolean and (
         not np.all(np.isfinite(values)) or not np.all(values == np.floor(values))
     ):
         raise ValueError("responses must contain finite integer category codes")
 
-    integer_values = values.astype(np.int64, copy=False)
-    observed = integer_values >= 0
+    observed = values >= 0
     if model.is_polytomous:
         category_limits = np.asarray(model.n_categories, dtype=np.int64)[None, :]
-        invalid = observed & (integer_values >= category_limits)
+        invalid = observed & (values >= category_limits)
     else:
-        invalid = observed & (integer_values > 1)
+        invalid = observed & (values > 1)
     if np.any(invalid):
         raise ValueError("responses contain categories unsupported by the model")
 
-    return integer_values
+    if values.dtype.kind in "biu":
+        return values.astype(np.int64, copy=False)
+    return np.where(observed, values, -1).astype(np.int64, copy=False)
 
 
 def _pointwise_log_likelihood(
@@ -996,6 +1014,7 @@ def posterior_predictive_checks(
     }
     observed = responses >= 0
     parameter_names = set(parameter_chains)
+    builtin_curves = uses_builtin_model_hooks(model)
 
     with _preserve_model_state(model, parameter_names):
         for rep_idx, sample_idx in enumerate(sample_indices):
@@ -1010,6 +1029,8 @@ def posterior_predictive_checks(
                 )
             else:
                 theta = rng.standard_normal((n_persons, model.n_factors))
+            if not builtin_curves:
+                theta = theta.copy()
             replicated = _simulate_response_matrix(model, theta, rng)
             replicated = np.where(observed, replicated, -1)
             for name, statistic in statistics.items():
@@ -1211,6 +1232,8 @@ def compute_pointwise_log_lik(
     responses: NDArray[np.int_],
     chains: dict[str, NDArray[np.float64]],
     by: Literal["person", "observation", "observed"] = "person",
+    *,
+    batch_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Compute pointwise log-likelihood from MCMC chains.
 
@@ -1226,6 +1249,10 @@ def compute_pointwise_log_lik(
         Aggregation level. ``'observation'`` preserves the flattened response
         layout and assigns zero to missing cells. ``'observed'`` returns only
         non-missing person-item cells, which is convenient for WAIC or PSIS-LOO.
+    batch_size : int, optional
+        Maximum respondents per probability evaluation. Built-in models choose
+        a bounded default from the item and category counts. Custom models use
+        the full respondent matrix by default, preserving their callback context.
 
     Returns
     -------
@@ -1241,6 +1268,12 @@ def compute_pointwise_log_lik(
     """
     if by not in {"person", "observation", "observed"}:
         raise ValueError("by must be 'person', 'observation', or 'observed'")
+    if batch_size is not None and (
+        not isinstance(batch_size, (int, np.integer))
+        or isinstance(batch_size, (bool, np.bool_))
+        or batch_size <= 0
+    ):
+        raise ValueError("batch_size must be a positive integer")
 
     responses = _validate_response_matrix(responses, model)
     n_persons, n_items = responses.shape
@@ -1250,7 +1283,8 @@ def compute_pointwise_log_lik(
         n_persons=n_persons,
     )
 
-    if _supports_batched_pointwise_2pl(model):
+    batched_2pl = _supports_batched_pointwise_2pl(model)
+    if batched_2pl:
         from mirt.backends.rust.diagnostics import compute_pointwise_loglik_2pl
 
         discrimination, difficulty, theta = _batched_2pl_pointwise_inputs(
@@ -1260,13 +1294,14 @@ def compute_pointwise_log_lik(
             n_samples=n_samples,
             n_persons=n_persons,
         )
-        return compute_pointwise_loglik_2pl(
-            responses,
-            discrimination,
-            difficulty,
-            theta,
-            aggregation=by,
-        )
+        if batch_size is None:
+            return compute_pointwise_loglik_2pl(
+                responses,
+                discrimination,
+                difficulty,
+                theta,
+                aggregation=by,
+            )
 
     if by == "person":
         log_lik = np.zeros((n_samples, n_persons), dtype=np.float64)
@@ -1275,8 +1310,31 @@ def compute_pointwise_log_lik(
     else:
         log_lik = np.zeros((n_samples, int(np.sum(responses >= 0))), dtype=np.float64)
 
+    builtin_curves = uses_builtin_model_hooks(model)
+    if batch_size is None:
+        category_width = max(model.n_categories) if model.is_polytomous else 1
+        batch_size = (
+            max(1, _LOG_LIKELIHOOD_CHUNK_ELEMENTS // max(1, n_items * category_width))
+            if builtin_curves
+            else max(1, n_persons)
+        )
+
+    if batched_2pl:
+        offset = 0
+        for start in range(0, n_persons, batch_size):
+            stop = min(start + batch_size, n_persons)
+            block = compute_pointwise_loglik_2pl(
+                responses[start:stop],
+                discrimination,
+                difficulty,
+                theta[:, start:stop],
+                aggregation=by,
+            )
+            log_lik[:, offset : offset + block.shape[1]] = block
+            offset += block.shape[1]
+        return log_lik
+
     parameter_names = set(parameter_chains)
-    observed = responses >= 0
     with _preserve_model_state(model, parameter_names):
         for sample_idx in range(n_samples):
             _apply_parameter_sample(model, parameter_chains, sample_idx)
@@ -1287,13 +1345,24 @@ def compute_pointwise_log_lik(
                 n_persons=n_persons,
                 n_factors=model.n_factors,
             )
-            pointwise = _pointwise_log_likelihood(model, responses, theta)
+            offset = 0
+            for start in range(0, n_persons, batch_size):
+                stop = min(start + batch_size, n_persons)
+                response_block = responses[start:stop]
+                theta_block = theta[start:stop]
+                if not builtin_curves:
+                    theta_block = theta_block.copy()
+                pointwise = _pointwise_log_likelihood(
+                    model, response_block, theta_block
+                )
 
-            if by == "person":
-                log_lik[sample_idx] = pointwise.sum(axis=1)
-            elif by == "observation":
-                log_lik[sample_idx] = pointwise.ravel()
-            else:
-                log_lik[sample_idx] = pointwise[observed]
+                if by == "person":
+                    values = pointwise.sum(axis=1)
+                elif by == "observation":
+                    values = pointwise.ravel()
+                else:
+                    values = pointwise[response_block >= 0]
+                log_lik[sample_idx, offset : offset + values.size] = values
+                offset += values.size
 
     return log_lik

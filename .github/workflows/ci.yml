@@ -214,10 +214,10 @@ jobs:
           MIRT_FIT_THRESHOLD_SECONDS: "12.0"
           MIRT_SCORE_THRESHOLD_SECONDS: "4.0"
         run: uv run --no-sync pytest tests/ -m performance
-      - name: Record scoring, posterior, and score-equating benchmarks
+      - name: Record scoring, posterior, equating, likelihood, and multigroup benchmarks
         run: |
           uv run --no-sync python benchmarks/run_benchmarks.py \
-            --suite scoring --suite posterior --suite score-equating --backend rust --persons 2000 --items 30 \
+            --suite scoring --suite posterior --suite score-equating --suite pointwise --suite multigroup-fit --backend rust --persons 2000 --items 30 \
             --repeats 3 --warmups 1 --json benchmark-report.json
       - name: Upload benchmark report
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
@@ -226,6 +226,37 @@ jobs:
           path: benchmark-report.json
           if-no-files-found: error
           retention-days: 30
+
+  tensor:
+    name: PyTorch CPU parity
+    needs: [workflow-lint, lint, typecheck]
+    # The locked macOS PyTorch wheel includes the CPU runtime without CUDA libraries.
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python
+        with:
+          python-version: "3.14"
+          extras: "dev gpu"
+      - name: Require the CPU tensor runtime
+        run: uv run --no-sync python -c "import torch; from mirt._gpu_backend import is_torch_available, GPU_DEVICE; from mirt._rust_backend import RUST_AVAILABLE; assert is_torch_available(); assert GPU_DEVICE.type == 'cpu'; assert not torch.cuda.is_available(); assert not RUST_AVAILABLE"
+      - name: Compare tensor likelihoods, posterior updates, and fitted models
+        run: uv run --no-sync pytest tests/test_gpu/ -m 'not slow and not performance' -rs --junitxml=test-results-tensor.xml
+      - name: Upload tensor parity report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        with:
+          name: test-reports-tensor
+          path: test-results-tensor.xml
+          if-no-files-found: error
+          retention-days: 14
 
   slow-tests:
     name: Slow Test Suite
@@ -255,7 +286,7 @@ jobs:
   complete:
     name: CI complete
     if: always()
-    needs: [workflow-lint, lint, typecheck, build-wheel, test, numpy, performance, slow-tests]
+    needs: [workflow-lint, lint, typecheck, build-wheel, test, numpy, tensor, performance, slow-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

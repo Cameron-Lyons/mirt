@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
     from mirt.equating.linking import LinkingResult
     from mirt.models.base import BaseItemModel
+    from mirt.multigroup.latent import GroupLatentDistribution
+    from mirt.multigroup.results import MultigroupFitResult
+    from mirt.results.score_result import ScoreResult
 
 
 _VERTICAL_METHODS = frozenset(
@@ -80,22 +83,44 @@ class VerticalScaleResult:
     ----------
     grade_transformations : dict[str | int, tuple[float, float]]
         Linear transformation constants (A, B) for each grade to the
-        common vertical scale.
+        common vertical scale. Empty for anchor calibration, where refitted
+        parameters cannot be represented by affine original-score maps.
     grade_means : dict[str | int, float]
-        Mean ability estimate for each grade on the common scale.
+        Grade population means for anchor calibration, or means of linked
+        person estimates for chain and concurrent linking.
     grade_sds : dict[str | int, float]
-        Standard deviation of ability estimates for each grade.
+        Grade population standard deviations for anchor calibration, or
+        standard deviations of linked person estimates for linking.
     linking_results : list[LinkingResult]
         Detailed linking results for each adjacent grade pair.
     monotonicity_violations : list[tuple]
-        List of (grade1, grade2) pairs where monotonicity was violated
-        before correction.
+        Adjacent grade pairs with decreasing means. Linking retains pairs
+        detected before correction; unconstrained anchor calibration reports
+        violations in the fitted population means.
     growth_curve : NDArray[np.float64]
         Mean ability by grade level.
     method : str
         Vertical scaling method used.
     reference_grade : int
         Index of the grade that defines the common scale.
+    calibrated_models : dict[str | int, BaseItemModel]
+        Models in the original item order for each grade, fitted jointly on
+        the common scale by fixed- or floating-anchor calibration.
+    scores : dict[str | int, ScoreResult]
+        EAP person scores under each fitted grade distribution.
+    latent_distributions : dict[str | int, GroupLatentDistribution]
+        Estimated grade population distributions; the reference has mean
+        zero and variance one.
+    calibration_result : MultigroupFitResult | None
+        Joint calibration diagnostics and fitted global-item model.
+    item_maps : dict[str | int, NDArray[np.int_]]
+        Original grade item positions mapped to physical-item columns in
+        the joint calibration model.
+    free_parameter_masks : dict[str | int, dict[str, NDArray[np.bool_]]]
+        Effective local item-parameter masks for joint calibration, excluding
+        fixed anchors and structural padding. The same masks are attached to
+        the calibrated models for constrained-fit parameter counts and
+        diagnostics.
     """
 
     grade_transformations: dict[str | int, tuple[float, float]]
@@ -106,6 +131,16 @@ class VerticalScaleResult:
     growth_curve: NDArray[np.float64]
     method: str
     reference_grade: int = 0
+    calibrated_models: dict[str | int, BaseItemModel] = field(default_factory=dict)
+    scores: dict[str | int, ScoreResult] = field(default_factory=dict)
+    latent_distributions: dict[str | int, GroupLatentDistribution] = field(
+        default_factory=dict
+    )
+    calibration_result: MultigroupFitResult | None = None
+    item_maps: dict[str | int, NDArray[np.int_]] = field(default_factory=dict)
+    free_parameter_masks: dict[str | int, dict[str, NDArray[np.bool_]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass
@@ -151,6 +186,9 @@ def vertical_scale(
     linking_method: str = "stocking_lord",
     reference_grade: int = 0,
     enforce_monotonicity: bool = True,
+    n_quadpts: int = 31,
+    max_iter: int = 500,
+    tol: float = 1e-4,
 ) -> VerticalScaleResult:
     """Create a vertical scale linking multiple grade levels.
 
@@ -163,27 +201,45 @@ def vertical_scale(
     grade_data : list[GradeData]
         Data for each grade level, ordered from lowest to highest grade.
     models : list[BaseItemModel] | None
-        Pre-fitted IRT models for each grade. If None, 2PL models are
-        fitted to each grade's data.
+        Pre-fitted IRT models for each grade. If None, linking modes fit
+        separate 2PL models, while anchor modes calibrate a joint 2PL model.
+        Fixed-anchor calibration uses the reference model's anchor values;
+        it fits that reference model first when models are omitted. Anchor
+        calibration accepts one common built-in unidimensional model family:
+        1PL, 2PL, 3PL, 4PL, GRM, GPCM, PCM, or NRM. Grade forms may differ in
+        width and item order; shared polytomous items must have matching
+        category counts.
     method : str
         Vertical scaling method:
         - "chain": Sequential pairwise linking (default)
-        - "concurrent": Joint calibration with anchor constraints
-        - "fixed_anchor": Anchors fixed to reference grade values
-        - "floating_anchor": Anchors free but constrained equal
+        - "concurrent": Simultaneous curve matching across grade calibrations
+        - "fixed_anchor": Joint response calibration with reference anchors fixed
+        - "floating_anchor": Joint response calibration with shared anchors estimated
     linking_method : str
-        Method for pairwise linking (used with chain method).
+        Method for pairwise linking. Concurrent scaling supports
+        ``"stocking_lord"``, ``"tcc"``, and ``"haebara"``. Anchor calibration
+        estimates parameters from responses and does not use this linker.
     reference_grade : int
         Index of grade to use as reference (scale origin). Default is 0
         (lowest grade).
     enforce_monotonicity : bool
-        If True, ensure grade means are strictly increasing.
+        Anchor calibration constrains population means to be nondecreasing
+        during density estimation, preserving the identified reference mean.
+        Chain and concurrent linking adjust grade locations after fitting to
+        make person-score means strictly increasing.
+    n_quadpts : int
+        Quadrature points for fixed- and floating-anchor calibration.
+    max_iter : int
+        Maximum joint calibration EM iterations.
+    tol : float
+        Joint calibration log-likelihood convergence tolerance.
 
     Returns
     -------
     VerticalScaleResult
-        Vertical scaling results including transformations, means, and
-        growth curve.
+        Transformations, means, and growth curve for linking; calibrated
+        models, population distributions, and person scores for anchor
+        calibration. Anchor calibration has no affine grade transformations.
 
     Raises
     ------
@@ -209,6 +265,20 @@ def vertical_scale(
     )
     reference_grade = int(reference_grade)
 
+    if method in ("fixed_anchor", "floating_anchor"):
+        from mirt.equating._vertical_calibration import calibrate_vertical_scale
+
+        return calibrate_vertical_scale(
+            grade_data,
+            models,
+            method,
+            reference_grade,
+            enforce_monotonicity=enforce_monotonicity,
+            n_quadpts=n_quadpts,
+            max_iter=max_iter,
+            tol=tol,
+        )
+
     grade_models = _fit_grade_models(grade_data, models)
 
     if method == "chain":
@@ -224,23 +294,6 @@ def vertical_scale(
             grade_models,
             linking_method,
             reference_grade,
-        )
-    elif method in ("fixed_anchor", "floating_anchor"):
-        result = _chain_vertical_scale(
-            grade_data,
-            grade_models,
-            linking_method,
-            reference_grade,
-        )
-        result = VerticalScaleResult(
-            grade_transformations=result.grade_transformations,
-            grade_means=result.grade_means,
-            grade_sds=result.grade_sds,
-            linking_results=result.linking_results,
-            monotonicity_violations=result.monotonicity_violations,
-            growth_curve=result.growth_curve,
-            method=method,
-            reference_grade=reference_grade,
         )
 
     if enforce_monotonicity:
@@ -323,15 +376,33 @@ def vertical_scale_summary(result: VerticalScaleResult) -> str:
         "",
         "Grade Statistics:",
         "-" * 40,
-        f"{'Grade':<15} {'Mean':>10} {'SD':>10} {'A':>8} {'B':>8}",
+        (
+            f"{'Grade':<15} {'Mean':>10} {'SD':>10} {'A':>8} {'B':>8}"
+            if result.grade_transformations
+            else f"{'Grade':<15} {'Mean':>10} {'SD':>10}"
+        ),
         "-" * 40,
     ]
 
     for label in result.grade_means:
         mean = result.grade_means[label]
         sd = result.grade_sds[label]
-        A, B = result.grade_transformations[label]
-        lines.append(f"{str(label):<15} {mean:>10.3f} {sd:>10.3f} {A:>8.3f} {B:>8.3f}")
+        line = f"{str(label):<15} {mean:>10.3f} {sd:>10.3f}"
+        if result.grade_transformations:
+            A, B = result.grade_transformations[label]
+            line += f" {A:>8.3f} {B:>8.3f}"
+        lines.append(line)
+
+    if result.calibration_result is not None:
+        lines.extend(
+            [
+                "",
+                "Joint Anchor Calibration:",
+                f"Physical items: {result.calibration_result.model.n_items}",
+                f"Log-likelihood: {result.calibration_result.log_likelihood:.4f}",
+                f"EM iterations: {result.calibration_result.n_iterations}",
+            ]
+        )
 
     lines.extend(
         [
@@ -349,7 +420,7 @@ def vertical_scale_summary(result: VerticalScaleResult) -> str:
         lines.extend(
             [
                 "",
-                "Monotonicity Violations (corrected):",
+                "Monotonicity Violations:",
             ]
         )
         for v1, v2 in result.monotonicity_violations:
@@ -423,6 +494,12 @@ def _validate_vertical_inputs(
         raise ValueError(f"Unknown vertical scaling method: {method}")
     if linking_method not in _LINKING_METHODS:
         raise ValueError(f"Unknown linking method: {linking_method}")
+    if method == "concurrent" and linking_method not in {
+        "stocking_lord",
+        "tcc",
+        "haebara",
+    }:
+        raise ValueError("Concurrent vertical scaling requires a curve-matching linker")
     if len(grade_data) < 2:
         raise ValueError(
             f"Vertical scaling requires at least 2 grades, got {len(grade_data)}"
@@ -636,6 +713,20 @@ def _chain_vertical_scale(
     final_A = [a / ref_A for a in cumulative_A]
     final_B = [(b - ref_B) / ref_A for b in cumulative_B]
 
+    return _vertical_scale_result(
+        grade_models, final_A, final_B, linking_results, "chain", reference_grade
+    )
+
+
+def _vertical_scale_result(
+    grade_models: list[_GradeModelInfo],
+    final_A: list[float],
+    final_B: list[float],
+    linking_results: list[LinkingResult],
+    method: str,
+    reference_grade: int,
+) -> VerticalScaleResult:
+    """Summarize scores under the estimated common-scale transformations."""
     grade_transformations = {}
     grade_means = {}
     grade_sds = {}
@@ -657,7 +748,7 @@ def _chain_vertical_scale(
         linking_results=linking_results,
         monotonicity_violations=[],
         growth_curve=growth_curve,
-        method="chain",
+        method=method,
         reference_grade=reference_grade,
     )
 
@@ -668,24 +759,93 @@ def _concurrent_vertical_scale(
     linking_method: str,
     reference_grade: int,
 ) -> VerticalScaleResult:
-    """Perform concurrent vertical scaling.
-
-    This implementation uses the connected adjacent-grade anchor structure
-    to place every form on the selected reference scale.
-    """
-    chain_result = _chain_vertical_scale(
-        grade_data, grade_models, linking_method, reference_grade
+    """Match all grade curves jointly on a common reference grid."""
+    from mirt.equating.chain import concurrent_link
+    from mirt.equating.linking import (
+        LinkingConstants,
+        LinkingResult,
+        _compute_anchor_diagnostics,
+        _compute_fit_statistics,
+        _extract_link_parameters,
+        _validate_curve_grid,
     )
 
-    return VerticalScaleResult(
-        grade_transformations=chain_result.grade_transformations,
-        grade_means=chain_result.grade_means,
-        grade_sds=chain_result.grade_sds,
-        linking_results=chain_result.linking_results,
-        monotonicity_violations=chain_result.monotonicity_violations,
-        growth_curve=chain_result.growth_curve,
-        method="concurrent",
-        reference_grade=reference_grade,
+    pairs = [
+        _resolve_anchor_pair(lower, upper)
+        for lower, upper in zip(grade_data[:-1], grade_data[1:], strict=True)
+    ]
+    anchor_matrices = [
+        [list(zip(anchors_lower, anchors_upper, strict=True))]
+        for anchors_lower, anchors_upper in pairs
+    ]
+    transformations = concurrent_link(
+        [gm.model for gm in grade_models],
+        anchor_matrices,
+        method=linking_method,
+        max_iter=500,
+        tol=1e-12,
+        reference_index=reference_grade,
+    )
+    reference_A, reference_B = transformations[reference_grade]
+    final_A = [A / reference_A for A, _ in transformations]
+    final_B = [(B - reference_B) / reference_A for _, B in transformations]
+
+    theta_grid, weights = _validate_curve_grid((-4.0, 4.0), 61, None)
+    linking_results = []
+    for index, (anchors_lower, anchors_upper) in enumerate(pairs):
+        model_lower = grade_models[index].model
+        model_upper = grade_models[index + 1].model
+        disc_old, diff_old, lower_old, upper_old = _extract_link_parameters(
+            model_lower, anchors_lower, "lower"
+        )
+        disc_new, diff_new, lower_new, upper_new = _extract_link_parameters(
+            model_upper, anchors_upper, "upper"
+        )
+        # Recover the upper -> lower map implied by the joint common metric.
+        A = final_A[index + 1] / final_A[index]
+        B = (final_B[index + 1] - final_B[index]) / final_A[index]
+        linking_results.append(
+            LinkingResult(
+                constants=LinkingConstants(A, B, method=linking_method),
+                anchor_items=anchors_lower,
+                anchor_diagnostics=_compute_anchor_diagnostics(
+                    disc_old,
+                    diff_old,
+                    disc_new,
+                    diff_new,
+                    A,
+                    B,
+                    anchors_lower,
+                    theta_grid,
+                    lower_old,
+                    upper_old,
+                    lower_new,
+                    upper_new,
+                ),
+                fit_statistics=_compute_fit_statistics(
+                    disc_old,
+                    diff_old,
+                    disc_new,
+                    diff_new,
+                    A,
+                    B,
+                    theta_grid,
+                    weights,
+                    lower_old,
+                    upper_old,
+                    lower_new,
+                    upper_new,
+                ),
+                convergence_info={
+                    "method": linking_method,
+                    "success": True,
+                    "concurrent": True,
+                },
+            )
+        )
+
+    return _vertical_scale_result(
+        grade_models, final_A, final_B, linking_results, "concurrent", reference_grade
     )
 
 

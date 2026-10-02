@@ -342,7 +342,10 @@ def _se_itemwise_numerical(
             for name, value in values.items():
                 result[name][item] = value
 
-    return result
+    return {
+        name: model._expand_parameter_standard_errors(name, errors)
+        for name, errors in result.items()
+    }
 
 
 def _compute_item_se_curvature(
@@ -369,6 +372,15 @@ def _compute_item_se_curvature(
     else:
         current = values[item_idx].copy()
 
+    def set_parameter(param_val):
+        candidate = values.copy()
+        candidate[item_idx] = param_val
+        canonical = model._canonical_parameter_values(param_name, candidate)
+        row = np.asarray(canonical[item_idx])
+        model.set_item_parameter(
+            item_idx, param_name, float(row) if row.ndim == 0 else row
+        )
+
     if model.is_polytomous:
         if r_kc is None:
             r_kc = EMFitContext(responses).expected_category_counts(
@@ -376,7 +388,7 @@ def _compute_item_se_curvature(
             )
 
         def log_likelihood(param_val):
-            model.set_item_parameter(item_idx, param_name, param_val)
+            set_parameter(param_val)
             try:
                 probs = model.probability(quad_points, item_idx)
                 probs = np.clip(probs, epsilon, 1 - epsilon)
@@ -394,7 +406,7 @@ def _compute_item_se_curvature(
                 n_k_valid = observed[0]
 
         def log_likelihood(param_val):
-            model.set_item_parameter(item_idx, param_name, param_val)
+            set_parameter(param_val)
             try:
                 probs = model.probability(quad_points, item_idx)
                 probs = np.clip(probs, epsilon, 1 - epsilon)
@@ -631,6 +643,6 @@ def _se_fisher(
                 )
 
         se[~free_mask] = 0.0
-        se_dict[param_name] = se
+        se_dict[param_name] = model._expand_parameter_standard_errors(param_name, se)
 
     return se_dict

@@ -285,8 +285,11 @@ def link(
             upper_old=working_upper_old,
             lower_new=working_lower_new,
             upper_new=working_upper_new,
+            weights=weights,
+            robust=robust,
         )
-        mask = np.array([i in working_anchors_old for i in anchors_old])
+        retained_anchors = set(working_anchors_old)
+        mask = np.array([i in retained_anchors for i in anchors_old])
         working_disc_old = disc_old[mask]
         working_diff_old = diff_old[mask]
         working_disc_new = disc_new[mask]
@@ -379,6 +382,7 @@ def link(
             working_lower_new,
             working_upper_new,
             random_state,
+            weights,
         )
 
     anchor_diagnostics: AnchorDiagnostics | None = None
@@ -1256,6 +1260,7 @@ def _bootstrap_linking_se(
     lower_new: NDArray[np.float64] | None = None,
     upper_new: NDArray[np.float64] | None = None,
     random_state: int | np.random.Generator | None = None,
+    weights: NDArray[np.float64] | None = None,
 ) -> tuple[float, float]:
     """Compute bootstrap standard errors for linking constants."""
     rng = np.random.default_rng(random_state)
@@ -1292,9 +1297,7 @@ def _bootstrap_linking_se(
     A_samples = np.zeros(n_bootstrap)
     B_samples = np.zeros(n_bootstrap)
 
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    weights = stats.norm.pdf(theta_grid)
-    weights = weights / np.sum(weights)
+    theta_grid, weights = _validate_curve_grid(theta_range, n_theta, weights)
 
     for b in range(n_bootstrap):
         idx = rng.choice(n_items, size=n_items, replace=True)
@@ -1358,11 +1361,11 @@ def _purify_anchors_iterative(
     upper_old: NDArray[np.float64] | None = None,
     lower_new: NDArray[np.float64] | None = None,
     upper_new: NDArray[np.float64] | None = None,
+    weights: NDArray[np.float64] | None = None,
+    robust: bool = False,
 ) -> tuple[list[int], list[int], list[int]]:
     """Iteratively purify anchor set by removing drifting items."""
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
-    weights = stats.norm.pdf(theta_grid)
-    weights = weights / np.sum(weights)
+    theta_grid, weights = _validate_curve_grid(theta_range, n_theta, weights)
 
     n_items = len(disc_old)
     if lower_old is None:
@@ -1382,7 +1385,8 @@ def _purify_anchors_iterative(
         if len(current_old) <= min_anchors:
             break
 
-        mask = [i in current_old for i in anchors_old]
+        current_set = set(current_old)
+        mask = [i in current_set for i in anchors_old]
         d_old = disc_old[mask]
         b_old = diff_old[mask]
         d_new = disc_new[mask]
@@ -1393,9 +1397,9 @@ def _purify_anchors_iterative(
         u_new = upper_new[mask]
 
         if method == "mean_sigma":
-            A, B, _ = _mean_sigma_link(d_old, b_old, d_new, b_new, False)
+            A, B, _ = _mean_sigma_link(d_old, b_old, d_new, b_new, robust)
         elif method == "mean_mean":
-            A, B, _ = _mean_mean_link(d_old, b_old, d_new, b_new, False)
+            A, B, _ = _mean_mean_link(d_old, b_old, d_new, b_new, robust)
         elif method in ("stocking_lord", "tcc"):
             A, B, _ = _stocking_lord_link(
                 d_old,
@@ -1422,8 +1426,13 @@ def _purify_anchors_iterative(
                 l_new,
                 u_new,
             )
+        elif method == "bisector":
+            A, B, _ = _bisector_link(d_old, b_old, d_new, b_new)
+        elif method == "orthogonal":
+            A, B, _ = _orthogonal_link(d_old, b_old, d_new, b_new)
         else:
-            A, B, _ = _mean_sigma_link(d_old, b_old, d_new, b_new, False)
+            raise ValueError(f"Unknown linking method: {method}")
+        A, B = _validate_linking_constants(A, B, method)
 
         d_new_trans = d_new / A
         b_new_trans = A * b_new + B

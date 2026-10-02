@@ -12,9 +12,19 @@ from mirt.backends.rust.polytomous import (
     compute_log_likelihoods_grm,
 )
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
 from mirt.models.base import PolytomousItemModel
 
 _MAX_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+
+
+def _identify_rating_scale_origin(
+    parameters: dict[str, NDArray[np.float64]],
+) -> None:
+    """Fix the first shared threshold while preserving every item boundary."""
+    offset = float(parameters["thresholds"][0])
+    parameters["difficulty"] += offset
+    parameters["thresholds"] -= offset
 
 
 def _category_count_chunks(
@@ -136,7 +146,7 @@ class GradedResponseModel(PolytomousItemModel):
         for item_idx, n_categories in enumerate(self._n_categories):
             threshold_mask[item_idx, : n_categories - 1] = True
         masks["thresholds"] = threshold_mask
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
         self,
@@ -352,7 +362,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         for item_idx, n_categories in enumerate(self._n_categories):
             step_mask[item_idx, : n_categories - 1] = True
         masks["steps"] = step_mask
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
         self,
@@ -570,7 +580,7 @@ class PartialCreditModel(GeneralizedPartialCredit):
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
         masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
         self,
@@ -659,6 +669,7 @@ class RatingScaleModel(PolytomousItemModel):
 
         n_thresholds = self._n_cats - 1
         self._parameters["thresholds"] = np.linspace(-1, 1, n_thresholds)
+        _identify_rating_scale_origin(self._parameters)
 
     @property
     def difficulty(self) -> NDArray[np.float64]:
@@ -669,6 +680,20 @@ class RatingScaleModel(PolytomousItemModel):
     def thresholds(self) -> NDArray[np.float64]:
         """Shared step threshold parameters."""
         return self._parameters["thresholds"]
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["thresholds"][0] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "thresholds":
+            canonical -= canonical[0]
+        return canonical
 
     def category_probability(
         self,
@@ -770,7 +795,7 @@ class RatingScaleModel(PolytomousItemModel):
         return _score_variance(self.probability(theta, item_idx))
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "RatingScaleModel":
-        """Set model parameters.
+        """Set model parameters, preserving curves with the first threshold zero.
 
         Parameters
         ----------
@@ -783,18 +808,36 @@ class RatingScaleModel(PolytomousItemModel):
         -------
         self
         """
+        candidates = {name: values.copy() for name, values in self._parameters.items()}
         for name, values in params.items():
-            if name not in self._parameters:
+            if name not in candidates:
                 raise ValueError(f"Unknown parameter: {name}")
-            values = np.asarray(values)
+            values = np.array(values, dtype=np.float64, copy=True)
             if name == "difficulty" and values.shape != (self.n_items,):
                 raise ValueError(f"difficulty must have shape ({self.n_items},)")
             if name == "thresholds" and values.shape != (self._n_cats - 1,):
                 raise ValueError(f"thresholds must have shape ({self._n_cats - 1},)")
-            self._parameters[name] = values
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{name} must contain finite values")
+            candidates[name] = values
+
+        _identify_rating_scale_origin(candidates)
+        if not all(np.all(np.isfinite(values)) for values in candidates.values()):
+            raise ValueError("identified rating-scale parameters must be finite")
+        self._parameters = candidates
 
         self._is_fitted = True
         return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        if param_name == "thresholds":
+            raise MirtValidationError("thresholds are shared; use set_parameters")
+        super().set_item_parameter(item_idx, param_name, value)
 
 
 class GradedRatingScaleModel(PolytomousItemModel):
@@ -865,6 +908,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         self._parameters["difficulty"] = np.zeros(self.n_items)
         n_thresholds = self._n_cats - 1
         self._parameters["thresholds"] = np.linspace(-2, 2, n_thresholds)
+        _identify_rating_scale_origin(self._parameters)
 
     @property
     def discrimination(self) -> float:
@@ -880,6 +924,20 @@ class GradedRatingScaleModel(PolytomousItemModel):
     def thresholds(self) -> NDArray[np.float64]:
         """Shared category threshold parameters."""
         return self._parameters["thresholds"]
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["thresholds"][0] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "thresholds":
+            canonical -= canonical[0]
+        return canonical
 
     def cumulative_probability(
         self,
@@ -982,21 +1040,48 @@ class GradedRatingScaleModel(PolytomousItemModel):
         difficulty: NDArray[np.float64] | None = None,
         thresholds: NDArray[np.float64] | None = None,
     ) -> "GradedRatingScaleModel":
+        """Set parameters atomically, absorbing the first threshold into location."""
+        candidates = {name: values.copy() for name, values in self._parameters.items()}
         if discrimination is not None:
-            self._parameters["discrimination"] = np.array([float(discrimination)])
+            values = np.asarray(discrimination, dtype=np.float64)
+            if values.size != 1 or values.ndim > 1:
+                raise ValueError("discrimination must be a positive scalar")
+            scalar = float(values.item())
+            if not np.isfinite(scalar) or scalar <= 0.0:
+                raise ValueError("discrimination must be a finite positive scalar")
+            candidates["discrimination"] = np.array([scalar])
         if difficulty is not None:
-            difficulty = np.asarray(difficulty)
+            difficulty = np.array(difficulty, dtype=np.float64, copy=True)
             if difficulty.shape != (self.n_items,):
                 raise ValueError(f"difficulty must have shape ({self.n_items},)")
-            self._parameters["difficulty"] = difficulty
+            if not np.all(np.isfinite(difficulty)):
+                raise ValueError("difficulty must contain finite values")
+            candidates["difficulty"] = difficulty
         if thresholds is not None:
-            thresholds = np.asarray(thresholds)
+            thresholds = np.array(thresholds, dtype=np.float64, copy=True)
             if thresholds.shape != (self._n_cats - 1,):
                 raise ValueError(f"thresholds must have shape ({self._n_cats - 1},)")
-            self._parameters["thresholds"] = thresholds
+            if not np.all(np.isfinite(thresholds)) or np.any(np.diff(thresholds) < 0.0):
+                raise ValueError("thresholds must be finite and nondecreasing")
+            candidates["thresholds"] = thresholds
+
+        _identify_rating_scale_origin(candidates)
+        if not all(np.all(np.isfinite(values)) for values in candidates.values()):
+            raise ValueError("identified rating-scale parameters must be finite")
+        self._parameters = candidates
 
         self._is_fitted = True
         return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        if param_name in {"thresholds", "discrimination"}:
+            raise MirtValidationError(f"{param_name} is shared; use set_parameters")
+        super().set_item_parameter(item_idx, param_name, value)
 
 
 @_register_builtin_model
@@ -1043,7 +1128,7 @@ class NominalResponseModel(PolytomousItemModel):
             intercept_mask[item_idx, 1:n_categories] = True
         masks["slopes"] = slope_mask
         masks["intercepts"] = intercept_mask
-        return masks
+        return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
         self,
@@ -1059,6 +1144,30 @@ class NominalResponseModel(PolytomousItemModel):
             canonical[item_idx, :n_categories] -= reference
             canonical[item_idx, n_categories:] = 0.0
         return canonical
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> "NominalResponseModel":
+        """Store probability-equivalent category contrasts with reference zero."""
+        converted = {}
+        for name, values in params.items():
+            if name not in self._parameters:
+                raise MirtValidationError(f"Unknown parameter: {name}", parameter=name)
+            array = np.array(values, dtype=np.float64, copy=True)
+            if array.shape != self._parameters[name].shape:
+                raise MirtValidationError(
+                    f"Shape mismatch for {name}: expected {self._parameters[name].shape}",
+                    parameter=name,
+                )
+            if not np.all(np.isfinite(array)):
+                raise MirtValidationError(
+                    f"{name} must contain finite values", parameter=name
+                )
+            canonical = self._canonical_parameter_values(name, array)
+            if not np.all(np.isfinite(canonical)):
+                raise MirtValidationError(
+                    f"Identified {name} must contain finite values", parameter=name
+                )
+            converted[name] = canonical
+        return super().set_parameters(**converted)
 
     def category_probability(
         self,

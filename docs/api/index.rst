@@ -105,6 +105,7 @@ Diagnostics
    compute_dtf
    compute_drf
    sibtest
+   sibtest_items
    diagnostics.compute_itemfit
    diagnostics.compute_s_x2
    diagnostics.compute_ld_statistics

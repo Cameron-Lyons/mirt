@@ -232,7 +232,10 @@ def mc_standard_errors(
             restore,
         ).items():
             result[name][item] = values
-    return result
+    return {
+        name: model._expand_parameter_standard_errors(name, errors)
+        for name, errors in result.items()
+    }
 
 
 def _polytomous_curvature(model, item, decisions, samples, weights, context):

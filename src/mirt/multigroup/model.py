@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+import copy
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -105,6 +106,7 @@ class MultigroupModel:
 
         self._base_model_class = base_model.__class__
         self._is_polytomous = base_model.is_polytomous
+        self._fixed_item_parameters: dict[str, dict[int, NDArray[np.float64]]] = {}
 
     @property
     def group_models(self) -> list[BaseItemModel]:
@@ -258,6 +260,155 @@ class MultigroupModel:
         link.shared_items.update(validated)
         link.free_items -= validated
 
+    def fix_item_parameters(
+        self,
+        parameters: Mapping[str, Mapping[int, float | NDArray[np.float64]]],
+    ) -> None:
+        """Fix specified item parameter blocks to the same values in every group.
+
+        The outer keys are stored parameter names; inner keys are item indices.
+        A value must have the shape of that parameter's item block (a scalar
+        for a one-dimensional parameter array). Values are copied and validated
+        before any model is changed. Repeated calls add or replace fixed blocks.
+        """
+        if not isinstance(parameters, Mapping):
+            raise TypeError("fixed parameters must be a mapping")
+        candidate = {
+            name: {item: value.copy() for item, value in items.items()}
+            for name, items in self._fixed_item_parameters.items()
+        }
+        template = self._group_models[0].parameters
+        for name, items in parameters.items():
+            if name not in self._parameter_links:
+                raise ValueError(f"Unknown parameter: {name}")
+            if not isinstance(items, Mapping):
+                raise TypeError(f"fixed {name} values must be an item-index mapping")
+            for item, value in items.items():
+                validated = self._validate_parameter_items(name, [item]).pop()
+                row = np.array(value, dtype=np.float64, copy=True)
+                expected = template[name][validated].shape
+                if row.shape != expected or not np.all(np.isfinite(row)):
+                    raise ValueError(
+                        f"fixed {name}[{validated}] must be finite with shape {expected}"
+                    )
+                candidate.setdefault(name, {})[validated] = row
+
+        # Public setters may validate ordering, identification, or model-specific
+        # constraints. Check all group contexts before changing the originals.
+        validated_parameters = []
+        for group_model in self._group_models:
+            trial = copy.deepcopy(group_model)
+            original = trial.parameters
+            updates = {}
+            for name, items in candidate.items():
+                values = original[name].copy()
+                for item, value in items.items():
+                    values[item] = value
+                if not np.array_equal(values, original[name]):
+                    updates[name] = values
+            trial.set_parameters(**updates)
+            for name, items in candidate.items():
+                for item, value in items.items():
+                    if not np.array_equal(trial.parameters[name][item], value):
+                        raise ValueError(
+                            f"fixed {name}[{item}] conflicts with model identification"
+                        )
+            validated_parameters.append(trial.parameters)
+        for group_model, values in zip(
+            self._group_models, validated_parameters, strict=True
+        ):
+            current = group_model.parameters
+            group_model.set_parameters(
+                **{
+                    name: value
+                    for name, value in values.items()
+                    if not np.array_equal(value, current[name])
+                }
+            )
+        self._fixed_item_parameters = candidate
+
+    @property
+    def fixed_item_parameters(self) -> dict[str, dict[int, NDArray[np.float64]]]:
+        """Return independent copies of the configured fixed parameter blocks."""
+        return {
+            name: {item: value.copy() for item, value in items.items()}
+            for name, items in self._fixed_item_parameters.items()
+        }
+
+    def _raw_free_parameter_masks(self, group_idx: int) -> dict[str, NDArray[np.bool_]]:
+        masks = {
+            name: np.asarray(mask, dtype=np.bool_).copy()
+            for name, mask in self.get_group_model(
+                group_idx
+            ).free_parameter_masks.items()
+        }
+        for name, items in self._fixed_item_parameters.items():
+            for item in items:
+                masks[name][item] = False
+        return masks
+
+    def _shared_coordinate_mask(self, param_name: str) -> NDArray[np.bool_]:
+        shape = self._group_models[0].parameters[param_name].shape
+        shared = np.zeros(shape, dtype=np.bool_)
+        if self._parameter_links[param_name].is_shared:
+            if self._parameter_is_item_major(param_name):
+                shared[self.get_shared_items(param_name)] = True
+            else:
+                shared[...] = True
+        return shared
+
+    def _explicit_fixed_parameter_masks(
+        self, group_idx: int
+    ) -> dict[str, NDArray[np.bool_]]:
+        group = self.get_group_model(group_idx)
+        fixed = {
+            name: np.zeros(value.shape, dtype=np.bool_)
+            for name, value in group.parameters.items()
+        }
+        if group._free_parameter_restrictions:
+            intrinsic = group.copy().set_free_parameter_masks(None).free_parameter_masks
+            for name, restriction in group._free_parameter_restrictions.items():
+                fixed[name] = intrinsic[name] & ~restriction
+        for name, items in self._fixed_item_parameters.items():
+            for item in items:
+                fixed[name][item] = True
+        return fixed
+
+    def effective_free_parameter_masks(
+        self, group_idx: int
+    ) -> dict[str, NDArray[np.bool_]]:
+        """Account for structural, explicit, and shared fixed coordinates.
+
+        A shared coordinate is known when it is fixed in any group. Such a
+        coordinate contributes no fitted parameter in the remaining groups.
+        Synchronization propagates that known value to all linked groups.
+        """
+        masks = self._raw_free_parameter_masks(group_idx)
+        fixed_masks = [
+            self._explicit_fixed_parameter_masks(g) for g in range(self.n_groups)
+        ]
+        for name in masks:
+            if self._parameter_links[name].is_shared:
+                known = np.logical_or.reduce([group[name] for group in fixed_masks])
+                masks[name] &= ~(known & self._shared_coordinate_mask(name))
+        return masks
+
+    def enforce_fixed_parameters(self) -> None:
+        """Restore fixed values after initialization or synchronization."""
+        if not self._fixed_item_parameters:
+            return
+        for group_model in self._group_models:
+            updates = {}
+            current = group_model.parameters
+            for name, items in self._fixed_item_parameters.items():
+                values = current[name]
+                original = values.copy()
+                for item, value in items.items():
+                    values[item] = value
+                if not np.array_equal(values, original):
+                    updates[name] = values
+            group_model.set_parameters(**updates)
+
     def set_group_specific_parameter(
         self,
         param_name: str,
@@ -342,53 +493,43 @@ class MultigroupModel:
         ]
 
     def synchronize_shared_parameters(self) -> None:
-        """Synchronize shared parameters across groups.
+        """Synchronize free shared values and propagate known shared values.
 
-        Takes the mean of shared parameters across groups and sets all
-        groups to that value.
+        Free coordinates use their group mean. A coordinate fixed in any
+        group keeps that exact value in every linked group; inconsistent
+        fixed values are rejected before changing shared parameter arrays.
         """
-        for param_name, link in self._parameter_links.items():
+        self.enforce_fixed_parameters()
+        group_parameters = [group.parameters for group in self._group_models]
+        group_masks = [self._raw_free_parameter_masks(g) for g in range(self.n_groups)]
+        fixed_masks = [
+            self._explicit_fixed_parameter_masks(g) for g in range(self.n_groups)
+        ]
+        updates: list[dict[str, NDArray[np.float64]]] = [{} for _ in self._group_models]
+        for name, link in self._parameter_links.items():
             if not link.is_shared:
                 continue
-
-            stacked_values = np.stack(
-                [
-                    group_model.parameters[param_name]
-                    for group_model in self._group_models
-                ]
-            )
-            stacked_masks = np.stack(
-                [
-                    np.asarray(
-                        group_model.free_parameter_masks[param_name], dtype=np.bool_
-                    )
-                    for group_model in self._group_models
-                ]
-            )
-            active_counts = np.count_nonzero(stacked_masks, axis=0)
-            shared_mask = active_counts > 0
-            if self._parameter_is_item_major(param_name):
-                item_mask = np.zeros(self.n_items, dtype=np.bool_)
-                item_mask[self.get_shared_items(param_name)] = True
-                item_mask = item_mask.reshape(
-                    (self.n_items,) + (1,) * (shared_mask.ndim - 1)
-                )
-                shared_mask &= item_mask
-            if not np.any(shared_mask):
+            shared = self._shared_coordinate_mask(name)
+            if not np.any(shared):
                 continue
-
-            shared_mean = np.divide(
-                np.sum(stacked_values, axis=0, where=stacked_masks),
-                active_counts,
-                out=np.zeros_like(stacked_values[0]),
-                where=active_counts > 0,
-            )
-            for group_model, values in zip(
-                self._group_models, stacked_values, strict=True
-            ):
-                updated = values.copy()
-                np.copyto(updated, shared_mean, where=shared_mask)
-                group_model.set_parameters(**{param_name: updated})
+            values = np.stack([parameters[name] for parameters in group_parameters])
+            masks = np.stack([mask[name] for mask in group_masks])
+            fixed = np.stack([mask[name] for mask in fixed_masks])
+            has_fixed = np.any(fixed, axis=0)
+            shared &= np.any(masks, axis=0) | has_fixed
+            first_fixed = np.argmax(fixed, axis=0)
+            fixed_values = np.take_along_axis(values, first_fixed[None, ...], axis=0)[0]
+            if np.any(fixed & shared & (values != fixed_values)):
+                raise ValueError(f"Shared {name} has incompatible fixed group values")
+            target = np.where(has_fixed, fixed_values, values.mean(axis=0))
+            for g, current in enumerate(values):
+                updated = current.copy()
+                np.copyto(updated, target, where=shared)
+                if not np.array_equal(updated, current):
+                    updates[g][name] = updated
+        for group, update in zip(self._group_models, updates, strict=True):
+            if update:
+                group.set_parameters(**update)
 
     def copy_shared_to_all(self, source_group: int = 0) -> None:
         """Copy shared parameters from source group to all groups.
@@ -408,7 +549,7 @@ class MultigroupModel:
 
             source_values = source_params[param_name]
             source_mask = np.asarray(
-                self._group_models[source_group].free_parameter_masks[param_name],
+                self.effective_free_parameter_masks(source_group)[param_name],
                 dtype=np.bool_,
             )
             if self._parameter_is_item_major(param_name):
@@ -427,6 +568,7 @@ class MultigroupModel:
                 target_values = self._group_models[g].parameters[param_name]
                 np.copyto(target_values, source_values, where=source_mask)
                 self._group_models[g].set_parameters(**{param_name: target_values})
+        self.synchronize_shared_parameters()
 
     @property
     def n_parameters(self) -> int:
@@ -435,8 +577,8 @@ class MultigroupModel:
 
         for param_name in self.parameter_names:
             masks = [
-                np.asarray(group_model.free_parameter_masks[param_name], dtype=np.bool_)
-                for group_model in self._group_models
+                self.effective_free_parameter_masks(group_idx)[param_name]
+                for group_idx in range(self.n_groups)
             ]
             expected_shape = masks[0].shape
             if any(mask.shape != expected_shape for mask in masks[1:]):

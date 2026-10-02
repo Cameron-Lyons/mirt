@@ -64,7 +64,18 @@ for all performance checks and the slow suite. Native jobs explicitly require
 the extension to load. A separate job runs the full non-slow, non-performance
 suite from source without the extension. Workflow syntax, lint, and type checks
 run before wheel builds and tests; lint and type checking do not build the
-project. Test environments include plotting support.
+project. Core test environments include plotting support.
+
+A required CPU PyTorch job installs the locked `dev` and `gpu` extras on
+macOS ARM64, whose PyTorch wheel does not require the Linux CUDA libraries.
+It runs all tensor likelihood, posterior, GVEM, and fit parity tests against
+NumPy references. The job requires a working CPU tensor runtime; only the
+explicit CUDA hardware test skips, and its reason appears in the test report.
+To run those tests locally after installing the GPU extra:
+
+```bash
+uv run --no-sync pytest tests/test_gpu -m 'not slow and not performance' -rs
+```
 
 Every native matrix job enforces a 90% coverage floor. Installed-wheel paths
 are mapped back to `src/mirt` so coverage artifacts and pull-request annotations
@@ -99,8 +110,10 @@ Slow tests run weekly and can also be enabled through the CI workflow's manual
 is unexpectedly skipped; it can be selected as a required branch-protection
 check. The existing `Rust checks (Cargo.toml)` check covers formatting, Clippy,
 and Rust tests separately; documentation and security retain separate checks.
+Documentation builds run for pull requests, merge queues, and manual dispatches.
 Pull-request updates cancel superseded runs, and jobs have explicit time limits.
-Test reports and scoring/posterior benchmarks are retained as workflow artifacts.
+Test reports and scoring, posterior, equating, and pointwise-likelihood benchmarks
+are retained as workflow artifacts.
 
 Workflow syntax is checked by a pinned, checksum-verified actionlint release.
 Run `actionlint` to validate workflow changes locally.
@@ -111,6 +124,19 @@ Windows x64, and macOS Intel and Apple Silicon. Linux x86_64 wheels additionally
 run on every supported Python version. The uploaded source distribution is
 rebuilt and tested separately, and publication requires both wheel and source
 distribution validation to pass. Release test reports are retained for review.
+An additional prerequisite checks the actual metadata inside every wheel and
+source distribution. Package names and versions must agree with the release
+tag, or with `Cargo.toml` for an untagged build. Missing source distributions,
+stale artifacts, ambiguous metadata, and unexpected publish inputs fail before
+the PyPI publication environment is entered. The checker normalizes PEP 440
+pre, post, and dev releases, including Cargo spellings such as `v1.2.3-rc.1`,
+while requiring three release components and rejecting PyPI local versions.
+To check collected artifacts with the locked development dependencies:
+
+```bash
+uv run --no-sync python .github/scripts/check_release_artifacts.py dist --tag v1.2.3
+```
+
 Automatic version-update PRs synchronize the runtime version, Cargo package
 metadata, and the root Cargo lock entry. Their helper validates all versions
 before editing and preserves an unversioned dynamic project entry in `uv.lock`.
@@ -129,6 +155,18 @@ make docs
 ```
 
 User guides live under `docs/guides/`; runnable scripts under `examples/`. Timing harness: `make bench`.
+
+The `multigroup-fit` suite times ten EM updates for three simulated populations
+of `--persons` respondents each. It covers metric constraints with distinct
+group item contexts, pooled scalar constraints, and fixed anchors. Each run
+starts from a fresh model and records timing and peak traced allocations.
+CI records this suite with the scoring and posterior-likelihood benchmarks.
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 python benchmarks/run_benchmarks.py \
+  --suite multigroup-fit --persons 2000 --items 30 --repeats 3 --warmups 1 \
+  --backend rust --json multigroup-fit.json
+```
 
 The `binary-likelihood` suite measures public single-person and batched
 likelihoods across ten binary model families with 10% missing responses.

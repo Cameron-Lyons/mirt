@@ -32,7 +32,7 @@ def prepare_affine_objective(
     from mirt.models.bifactor import BifactorModel
     from mirt.models.multidimensional import MultidimensionalModel
 
-    if not uses_builtin_model_hooks(model):
+    if not uses_builtin_model_hooks(model) or model._free_parameter_restrictions:
         return None
 
     if type(model) is MultidimensionalModel:

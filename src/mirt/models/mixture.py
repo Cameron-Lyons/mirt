@@ -40,6 +40,8 @@ class MixtureIRT(BaseItemModel):
     Each respondent belongs to one class for the complete response pattern.
     Classes have distinct 1PL, 2PL, or 3PL item parameters and share a
     standard-normal latent ability distribution during marginal fitting.
+    Only ``n_classes - 1`` mixing proportions are independent; the first
+    proportion is reconstructed from the others during generic unpacking.
     """
 
     model_name = "MixtureIRT"
@@ -99,13 +101,42 @@ class MixtureIRT(BaseItemModel):
 
     @property
     def convergence_info(self) -> dict[str, object] | None:
-        """Return fitting diagnostics, including the likelihood history."""
+        """Return likelihood history, free parameter count, AIC, and BIC."""
         if self._convergence_info is None:
             return None
         result = self._convergence_info.copy()
         history = result.get("log_likelihood_history")
         if isinstance(history, np.ndarray):
             result["log_likelihood_history"] = history.copy()
+        return result
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = {
+            name: np.ones(values.shape, dtype=np.bool_)
+            for name, values in self._parameters.items()
+        }
+        masks["class_proportions"][0] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        result = super()._canonical_parameter_values(name, values)
+        if name == "class_proportions":
+            result[0] = 1.0 - np.sum(result[1:])
+            tolerance = np.finfo(np.float64).eps * self.n_classes
+            if (
+                not np.all(np.isfinite(result))
+                or np.any(result[1:] < 0.0)
+                or result[0] < -tolerance
+            ):
+                raise MirtValidationError(
+                    "Independent class proportions must be non-negative and sum to at most 1",
+                    parameter=name,
+                    value=values,
+                )
+            result[0] = max(result[0], 0.0)
         return result
 
     def _initialize_parameters(self) -> None:
@@ -730,6 +761,7 @@ class MixtureIRT(BaseItemModel):
         new_model._is_fitted = self._is_fitted
         if self._convergence_info is not None:
             new_model._convergence_info = self.convergence_info
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -747,6 +779,8 @@ def fit_mixture_irt(
     The E-step computes the joint posterior over respondent class and
     quadrature point in log space. The M-step updates class proportions and
     every free item parameter with aggregated expected response counts.
+    This function creates a new model and uses its own fitting controls;
+    additional BaseItemModel parameter restrictions are not inputs to it.
     """
     _validate_fit_options(max_iter, tol, n_quadpts)
     raw_responses = np.asarray(responses)
@@ -807,6 +841,9 @@ def fit_mixture_irt(
         "n_iterations": n_iterations,
         "log_likelihood": current_ll,
         "log_likelihood_history": np.asarray(history, dtype=np.float64),
+        "n_parameters": model.n_parameters,
+        "aic": -2.0 * current_ll + 2.0 * model.n_parameters,
+        "bic": -2.0 * current_ll + np.log(values.shape[0]) * model.n_parameters,
     }
     return model, class_posteriors
 

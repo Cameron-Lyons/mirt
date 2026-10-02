@@ -29,6 +29,8 @@ SUITE_ORDER = (
     "posterior",
     "score-equating",
     "bayesian",
+    "pointwise",
+    "multigroup-fit",
     "patterns",
     "data",
     "diagnostics",
@@ -2147,6 +2149,101 @@ def bench_bayesian(
     return results
 
 
+def bench_pointwise(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Measure posterior likelihood preparation, including its required output."""
+    from mirt.diagnostics.bayesian import compute_pointwise_log_lik
+    from mirt.models import GradedResponseModel, ThreeParameterLogistic
+
+    rng = np.random.default_rng(7863)
+    results = []
+    for kind in ("2pl", "3pl", "grm"):
+        if kind == "grm":
+            category_counts = [2 + item % 4 for item in range(n_items)]
+            model = GradedResponseModel(n_items, category_counts)
+            responses = rng.integers(0, category_counts, size=(n_persons, n_items))
+        else:
+            model = (
+                mirt.TwoParameterLogistic(n_items)
+                if kind == "2pl"
+                else ThreeParameterLogistic(n_items)
+            )
+            responses = rng.integers(0, 2, size=(n_persons, n_items))
+        responses[rng.random(responses.shape) < 0.1] = -1
+        # Fixed abilities exercise broadcasting without a dense sample/person copy.
+        chains = {
+            "log_likelihood": np.zeros(32),
+            "theta": rng.normal(size=(n_persons, 1)),
+            "discrimination": rng.uniform(0.6, 1.8, size=(32, n_items)),
+        }
+
+        def run():
+            return compute_pointwise_log_lik(model, responses, chains, by="person")
+
+        results.append(
+            BenchResult(
+                f"pointwise_{kind}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
+def bench_multigroup_fit(
+    n_persons: int,
+    n_items: int,
+    repeats: int,
+    warmups: int = 0,
+) -> list[BenchResult]:
+    """Time pooled, distinct-context, and fixed-anchor multigroup updates."""
+    from mirt.multigroup import MultigroupEMEstimator, MultigroupModel
+
+    rng = np.random.default_rng(9641)
+    generating = mirt.TwoParameterLogistic(n_items)
+    generating.set_parameters(
+        discrimination=rng.uniform(0.7, 1.6, n_items),
+        difficulty=np.linspace(-2, 2, n_items),
+    )
+    responses = [
+        generating.simulate(
+            theta=rng.normal(mean, 1, (n_persons, 1)), seed=9642 + group
+        )
+        for group, mean in enumerate((0.0, 0.3, 0.7))
+    ]
+    for response in responses:
+        response[rng.random(response.shape) < 0.05] = -1
+    parameters = generating.parameters
+    fixed = {
+        name: {item: value[item] for item in range(min(2, n_items))}
+        for name, value in parameters.items()
+    }
+    results = []
+    for case in ("metric", "scalar", "fixed"):
+
+        def run():
+            bank = MultigroupModel(mirt.TwoParameterLogistic(n_items), 3)
+            return MultigroupEMEstimator(n_quadpts=21, max_iter=10).fit(
+                bank,
+                responses,
+                invariance="metric" if case == "metric" else "scalar",
+                fixed_parameters=fixed if case == "fixed" else None,
+            )
+
+        results.append(
+            BenchResult(
+                f"multigroup_fit_{case}",
+                _time(run, repeats=repeats, warmups=warmups),
+                _peak_traced_bytes(run),
+            )
+        )
+    return results
+
+
 def bench_diagnostics(
     n_persons: int,
     n_items: int,
@@ -2270,6 +2367,12 @@ def bench_fit_statistics(
     ):
         responses = rng.integers(0, categories, size=(n_persons, n_items))
         responses[rng.random(responses.shape) < 0.15] = -1
+        # Retain complete cases for the conditional score statistic even for
+        # long forms, while mean squares still exercise incomplete responses.
+        complete_rows = max(1, n_persons // 4)
+        responses[:complete_rows] = rng.integers(
+            0, categories, size=(complete_rows, n_items)
+        )
 
         def run_personfit():
             return compute_personfit(model, responses, theta, p_adjust="fdr_bh")
@@ -2285,6 +2388,7 @@ def bench_fit_statistics(
                 responses,
                 theta=theta,
                 statistics=["infit", "outfit", "S_X2"],
+                na_rm=True,
                 p_adjust="fdr_bh",
             )
 
@@ -2518,6 +2622,10 @@ def run_suites(
         results.extend(bench_score_equating(n_persons, n_items, repeats, warmups))
     if "bayesian" in suites:
         results.extend(bench_bayesian(n_persons, n_items, repeats, warmups))
+    if "pointwise" in suites:
+        results.extend(bench_pointwise(n_persons, n_items, repeats, warmups))
+    if "multigroup-fit" in suites:
+        results.extend(bench_multigroup_fit(n_persons, n_items, repeats, warmups))
     if "patterns" in suites:
         results.extend(bench_patterns(n_persons, n_items, repeats, warmups))
     if "data" in suites:
@@ -2735,6 +2843,12 @@ def _validate_baseline_compatibility(
         "waic",
         "psis_normal",
         "psis_heavy_tail",
+        "pointwise_2pl",
+        "pointwise_3pl",
+        "pointwise_grm",
+        "multigroup_fit_metric",
+        "multigroup_fit_scalar",
+        "multigroup_fit_fixed",
         "patterns_repeated",
         "patterns_distinct",
         "pairwise_available",

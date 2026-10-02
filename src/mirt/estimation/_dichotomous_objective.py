@@ -41,9 +41,11 @@ def prepare_dichotomous_objective(
         ThreeParameterLogistic: ("discrimination", "difficulty", "guessing"),
         FourParameterLogistic: ("discrimination", "difficulty", "guessing", "upper"),
     }
-    if tuple(model._parameters) != layouts.get(
-        type(model)
-    ) or not uses_builtin_model_hooks(model):
+    if (
+        tuple(model._parameters) != layouts.get(type(model))
+        or not uses_builtin_model_hooks(model)
+        or model._free_parameter_restrictions
+    ):
         return None
 
     fixed_slope = type(model) is OneParameterLogistic

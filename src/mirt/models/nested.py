@@ -90,6 +90,10 @@ class TwoPLNestedLogit(PolytomousItemModel):
         self._correct = raw_correct
         super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
         self._correct = self._validate_correct_responses(raw_correct)
+        for name in ("distractor_slopes", "distractor_intercepts"):
+            self._parameters[name] = self._canonical_parameter_values(
+                name, self._parameters[name]
+            )
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items, dtype=np.float64)
@@ -126,6 +130,34 @@ class TwoPLNestedLogit(PolytomousItemModel):
     def distractor_intercepts(self) -> NDArray[np.float64]:
         """Conditional nominal intercepts, padded to the maximum category count."""
         return self._parameters["distractor_intercepts"]
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        for name in ("distractor_slopes", "distractor_intercepts"):
+            active = np.zeros_like(self._parameters[name], dtype=np.bool_)
+            for item, (n_categories, correct) in enumerate(
+                zip(self._n_categories, self._correct, strict=True)
+            ):
+                reference = 0 if correct != 0 else 1
+                active[item, :n_categories] = True
+                active[item, [correct, reference]] = False
+            masks[name] = active
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name in {"distractor_slopes", "distractor_intercepts"}:
+            for item, (n_categories, correct) in enumerate(
+                zip(self._n_categories, self._correct, strict=True)
+            ):
+                reference = 0 if correct != 0 else 1
+                canonical[item, :n_categories] -= canonical[item, reference]
+                canonical[item, correct] = 0.0
+                canonical[item, n_categories:] = 0.0
+        return canonical
 
     @property
     def correct_response(self) -> list[int]:
@@ -260,8 +292,9 @@ class TwoPLNestedLogit(PolytomousItemModel):
                     value=array.shape,
                     expected=str(expected_shape),
                 )
-            candidates[name] = array
-            converted[name] = array
+            canonical = self._canonical_parameter_values(name, array)
+            candidates[name] = canonical
+            converted[name] = canonical
         self._validate_parameter_values(candidates)
         return super().set_parameters(**converted)
 
@@ -636,6 +669,7 @@ class TwoPLNestedLogit(PolytomousItemModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 

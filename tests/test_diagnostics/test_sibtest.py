@@ -206,8 +206,12 @@ class TestSIBTESTItems:
                 suspect_items=[item_index],
                 matching_items=matching,
             )
-            assert result["beta"][item_index] == pytest.approx(individual["beta"])
-            assert result["beta_se"][item_index] == pytest.approx(individual["beta_se"])
+            assert result["beta"][item_index] == pytest.approx(
+                individual["beta"], nan_ok=True
+            )
+            assert result["beta_se"][item_index] == pytest.approx(
+                individual["beta_se"], nan_ok=True
+            )
 
     @pytest.mark.parametrize(
         ("method", "expected"),

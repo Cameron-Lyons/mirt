@@ -339,6 +339,29 @@ class GDINA(BaseCDM):
         """Delta parameters for each item."""
         return [d.copy() for d in self._delta_params]
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Count item coefficients, excluding padding and model-design metadata."""
+        masks = super().free_parameter_masks
+        delta_mask = np.zeros_like(self._parameters["delta"], dtype=np.bool_)
+        for item, model_type in enumerate(self._reduced_models):
+            n_required = int(np.count_nonzero(self._q_matrix[item]))
+            if model_type == "saturated":
+                n_coefficients = 2**n_required
+            elif model_type in {"DINA", "DINO"}:
+                n_coefficients = 2
+            else:
+                n_coefficients = n_required + 1
+            delta_mask[item, :n_coefficients] = True
+            if n_required == 0 and model_type == "DINA":
+                delta_mask[item, 0] = False
+            elif n_required == 0 and model_type == "DINO":
+                delta_mask[item, 1] = False
+        masks["delta"] = delta_mask
+        masks["delta_n_params"].fill(False)
+        masks["reduced_model_code"].fill(False)
+        return self._apply_free_parameter_restrictions(masks)
+
     def set_delta_parameters(self, item_idx: int, delta: NDArray[np.float64]) -> Self:
         """Set delta parameters for an item."""
         delta = np.asarray(delta, dtype=np.float64)
@@ -1279,6 +1302,7 @@ class GDINA(BaseCDM):
         new_model._is_fitted = self._is_fitted
         new_model._sync_parameter_cache()
 
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -1694,6 +1718,7 @@ class HigherOrderCDM(BaseCDM):
         new_model._is_fitted = self._is_fitted
         new_model._sync_parameter_cache()
 
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 

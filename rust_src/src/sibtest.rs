@@ -1,14 +1,81 @@
-//! SIBTEST (Simultaneous Item Bias Test) functions.
+//! Pooled score-stratum SIBTEST effects and within-stratum sampling errors.
+
+use std::collections::BTreeMap;
 
 use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::utils::{EPSILON, normal_sf};
 
-/// Compute SIBTEST beta statistic
+#[derive(Default)]
+struct ScoreMoments {
+    count: usize,
+    sum: f64,
+    squares: f64,
+}
+
+impl ScoreMoments {
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        self.sum += value;
+        self.squares += value * value;
+    }
+
+    fn mean(&self) -> f64 {
+        self.sum / self.count as f64
+    }
+
+    fn mean_variance(&self) -> f64 {
+        let centered = (self.squares - self.sum * self.mean()).max(0.0);
+        centered / (self.count * (self.count - 1)) as f64
+    }
+}
+
+fn conditional_effects(
+    reference: impl Iterator<Item = (i32, f64)>,
+    focal: impl Iterator<Item = (i32, f64)>,
+) -> (f64, f64, Vec<f64>, Vec<f64>) {
+    let mut strata: BTreeMap<i32, (ScoreMoments, ScoreMoments)> = BTreeMap::new();
+    for (score, suspect) in reference {
+        strata.entry(score).or_default().0.add(suspect);
+    }
+    for (score, suspect) in focal {
+        strata.entry(score).or_default().1.add(suspect);
+    }
+    let mut differences = Vec::new();
+    let mut counts = Vec::new();
+    let mut sampling_variances = Vec::new();
+    for (reference, focal) in strata.into_values() {
+        if reference.count < 2 || focal.count < 2 {
+            continue;
+        }
+        differences.push(reference.mean() - focal.mean());
+        counts.push((reference.count + focal.count) as f64);
+        sampling_variances.push(reference.mean_variance() + focal.mean_variance());
+    }
+    if differences.is_empty() {
+        return (f64::NAN, f64::NAN, differences, counts);
+    }
+    let total: f64 = counts.iter().sum();
+    let beta = differences
+        .iter()
+        .zip(&counts)
+        .map(|(difference, count)| difference * (count / total))
+        .sum();
+    let variance: f64 = sampling_variances
+        .iter()
+        .zip(&counts)
+        .map(|(variance, count)| variance * (count / total).powi(2))
+        .sum();
+    (beta, variance.sqrt(), differences, counts)
+}
+
+/// Compute uncorrected SIBTEST beta, SE, conditional differences, pooled counts.
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 pub fn sibtest_compute_beta<'py>(
     py: Python<'py>,
     ref_data: PyReadonlyArray2<i32>,
@@ -16,119 +83,74 @@ pub fn sibtest_compute_beta<'py>(
     ref_scores: PyReadonlyArray1<i32>,
     focal_scores: PyReadonlyArray1<i32>,
     suspect_items: PyReadonlyArray1<i32>,
-) -> (
+) -> PyResult<(
     f64,
     f64,
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
-) {
+)> {
     let ref_data = ref_data.as_array();
     let focal_data = focal_data.as_array();
     let ref_scores = ref_scores.as_array();
     let focal_scores = focal_scores.as_array();
     let suspect_items = suspect_items.as_array();
-
-    let all_scores: Vec<i32> = ref_scores
-        .iter()
-        .chain(focal_scores.iter())
-        .cloned()
-        .collect();
-    let mut unique_scores: Vec<i32> = all_scores.clone();
-    unique_scores.sort();
-    unique_scores.dedup();
-
-    let suspect_vec: Vec<usize> = suspect_items.iter().map(|&x| x as usize).collect();
-
-    let results: Vec<(f64, f64)> = unique_scores
-        .par_iter()
-        .map(|&k| {
-            let ref_at_k: Vec<usize> = ref_scores
-                .iter()
-                .enumerate()
-                .filter(|&(_, &s)| s == k)
-                .map(|(i, _)| i)
-                .collect();
-
-            let focal_at_k: Vec<usize> = focal_scores
-                .iter()
-                .enumerate()
-                .filter(|&(_, &s)| s == k)
-                .map(|(i, _)| i)
-                .collect();
-
-            let n_ref_k = ref_at_k.len();
-            let n_focal_k = focal_at_k.len();
-
-            if n_ref_k == 0 || n_focal_k == 0 {
-                return (f64::NAN, 0.0);
-            }
-
-            let mean_ref_k: f64 = ref_at_k
-                .iter()
-                .map(|&i| {
-                    suspect_vec
-                        .iter()
-                        .map(|&j| ref_data[[i, j]] as f64)
-                        .sum::<f64>()
-                })
-                .sum::<f64>()
-                / n_ref_k as f64;
-
-            let mean_focal_k: f64 = focal_at_k
-                .iter()
-                .map(|&i| {
-                    suspect_vec
-                        .iter()
-                        .map(|&j| focal_data[[i, j]] as f64)
-                        .sum::<f64>()
-                })
-                .sum::<f64>()
-                / n_focal_k as f64;
-
-            let beta_k = mean_ref_k - mean_focal_k;
-            let weight = 2.0 * n_ref_k as f64 * n_focal_k as f64 / (n_ref_k + n_focal_k) as f64;
-
-            (beta_k, weight)
-        })
-        .collect();
-
-    let valid: Vec<(f64, f64)> = results.into_iter().filter(|(b, _)| !b.is_nan()).collect();
-
-    if valid.is_empty() {
-        return (
-            f64::NAN,
-            f64::NAN,
-            Array1::zeros(0).to_pyarray(py),
-            Array1::zeros(0).to_pyarray(py),
-        );
+    if ref_data.nrows() != ref_scores.len()
+        || focal_data.nrows() != focal_scores.len()
+        || ref_data.ncols() != focal_data.ncols()
+        || ref_data.nrows() < 2
+        || focal_data.nrows() < 2
+        || suspect_items.is_empty()
+        || suspect_items
+            .iter()
+            .any(|&item| item < 0 || item as usize >= ref_data.ncols())
+        || ref_scores
+            .iter()
+            .chain(focal_scores.iter())
+            .any(|&score| score < 0)
+    {
+        return Err(PyValueError::new_err(
+            "invalid SIBTEST group shapes, scores, or suspect indices",
+        ));
     }
-
-    let beta_k_arr: Array1<f64> = Array1::from(valid.iter().map(|(b, _)| *b).collect::<Vec<_>>());
-    let n_k_arr: Array1<f64> = Array1::from(valid.iter().map(|(_, n)| *n).collect::<Vec<_>>());
-
-    let total_weight: f64 = n_k_arr.sum();
-    let beta: f64 = beta_k_arr
+    if ref_data
         .iter()
-        .zip(n_k_arr.iter())
-        .map(|(&b, &n)| b * n)
-        .sum::<f64>()
-        / total_weight;
-
-    let weighted_mean = beta;
-    let weighted_var: f64 = beta_k_arr
-        .iter()
-        .zip(n_k_arr.iter())
-        .map(|(&b, &n)| n * (b - weighted_mean).powi(2))
-        .sum::<f64>()
-        / total_weight;
-
-    let n_total = (ref_scores.len() + focal_scores.len()) as f64;
-    let se = (weighted_var / n_total).sqrt();
-
-    (beta, se, beta_k_arr.to_pyarray(py), n_k_arr.to_pyarray(py))
+        .chain(focal_data.iter())
+        .any(|&value| value != 0 && value != 1)
+    {
+        return Err(PyValueError::new_err(
+            "SIBTEST responses must be complete and binary",
+        ));
+    }
+    let suspect: Vec<usize> = suspect_items.iter().map(|&item| item as usize).collect();
+    let (beta, se, differences, counts) = conditional_effects(
+        ref_scores.iter().enumerate().map(|(person, &score)| {
+            (
+                score,
+                suspect
+                    .iter()
+                    .map(|&item| ref_data[[person, item]] as f64)
+                    .sum(),
+            )
+        }),
+        focal_scores.iter().enumerate().map(|(person, &score)| {
+            (
+                score,
+                suspect
+                    .iter()
+                    .map(|&item| focal_data[[person, item]] as f64)
+                    .sum(),
+            )
+        }),
+    );
+    Ok((
+        beta,
+        se,
+        Array1::from(differences).to_pyarray(py),
+        Array1::from(counts).to_pyarray(py),
+    ))
 }
 
-/// Compute SIBTEST for all items
+/// Run uncorrected SIBTEST across items with shared matching totals.
 #[pyfunction]
 #[allow(clippy::type_complexity)]
 pub fn sibtest_all_items<'py>(
@@ -136,169 +158,141 @@ pub fn sibtest_all_items<'py>(
     data: PyReadonlyArray2<i32>,
     groups: PyReadonlyArray1<i32>,
     anchor_items: Option<PyReadonlyArray1<i32>>,
-) -> (
+) -> PyResult<(
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
     Bound<'py, PyArray1<f64>>,
-) {
+)> {
     let data = data.as_array();
     let groups = groups.as_array();
-
     let n_items = data.ncols();
-
-    let mut unique_groups: Vec<i32> = groups.iter().cloned().collect();
-    unique_groups.sort();
+    if data.nrows() != groups.len() || data.nrows() == 0 || n_items < 2 {
+        return Err(PyValueError::new_err(
+            "invalid SIBTEST response or group shape",
+        ));
+    }
+    if data.iter().any(|&value| value != 0 && value != 1) {
+        return Err(PyValueError::new_err(
+            "SIBTEST responses must be complete and binary",
+        ));
+    }
+    let mut unique_groups: Vec<i32> = groups.iter().copied().collect();
+    unique_groups.sort_unstable();
     unique_groups.dedup();
-    let ref_group = unique_groups[0];
-    let focal_group = unique_groups[1];
-
-    let ref_mask: Vec<bool> = groups.iter().map(|&g| g == ref_group).collect();
-    let focal_mask: Vec<bool> = groups.iter().map(|&g| g == focal_group).collect();
-
-    let anchor_set: Option<Vec<usize>> =
-        anchor_items.map(|a| a.as_array().iter().map(|&x| x as usize).collect());
-
+    if unique_groups.len() != 2 {
+        return Err(PyValueError::new_err("SIBTEST requires exactly two groups"));
+    }
+    let reference: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(person, &group)| (group == unique_groups[0]).then_some(person))
+        .collect();
+    let focal: Vec<usize> = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(person, &group)| (group == unique_groups[1]).then_some(person))
+        .collect();
+    if reference.len() < 2 || focal.len() < 2 {
+        return Err(PyValueError::new_err(
+            "each SIBTEST group requires at least two persons",
+        ));
+    }
+    let anchors: Vec<usize> = match anchor_items {
+        Some(items) => {
+            let items = items.as_array();
+            if items.is_empty()
+                || items
+                    .iter()
+                    .any(|&item| item < 0 || item as usize >= n_items)
+            {
+                return Err(PyValueError::new_err("invalid SIBTEST anchor indices"));
+            }
+            items.iter().map(|&item| item as usize).collect()
+        }
+        None => (0..n_items).collect(),
+    };
+    let mut anchor_membership = vec![false; n_items];
+    for &item in &anchors {
+        if anchor_membership[item] {
+            return Err(PyValueError::new_err(
+                "SIBTEST anchors must not contain duplicates",
+            ));
+        }
+        anchor_membership[item] = true;
+    }
+    let matching_totals: Vec<i32> = data
+        .rows()
+        .into_iter()
+        .map(|row| anchors.iter().map(|&item| row[item]).sum())
+        .collect();
     let results: Vec<(f64, f64, f64)> = (0..n_items)
         .into_par_iter()
-        .map(|item_idx| {
-            let matching: Vec<usize> = match &anchor_set {
-                Some(anchors) => anchors
-                    .iter()
-                    .filter(|&&j| j != item_idx)
-                    .cloned()
-                    .collect(),
-                None => (0..n_items).filter(|&j| j != item_idx).collect(),
+        .map(|item| {
+            if anchors.len() == 1 && anchor_membership[item] {
+                return (f64::NAN, f64::NAN, f64::NAN);
+            }
+            let conditional = |&person: &usize| {
+                let response = data[[person, item]];
+                let score =
+                    matching_totals[person] - if anchor_membership[item] { response } else { 0 };
+                (score, response as f64)
             };
-
-            if matching.is_empty() {
-                return (f64::NAN, f64::NAN, f64::NAN);
-            }
-
-            let ref_scores: Vec<i32> = ref_mask
-                .iter()
-                .enumerate()
-                .filter(|&(_, &is_ref)| is_ref)
-                .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
-                .collect();
-
-            let focal_scores: Vec<i32> = focal_mask
-                .iter()
-                .enumerate()
-                .filter(|&(_, &is_focal)| is_focal)
-                .map(|(i, _)| matching.iter().map(|&j| data[[i, j]]).sum())
-                .collect();
-
-            let all_scores: Vec<i32> = ref_scores
-                .iter()
-                .chain(focal_scores.iter())
-                .cloned()
-                .collect();
-            let mut unique_scores = all_scores.clone();
-            unique_scores.sort();
-            unique_scores.dedup();
-
-            let ref_data: Vec<Vec<i32>> = ref_mask
-                .iter()
-                .enumerate()
-                .filter(|&(_, &is_ref)| is_ref)
-                .map(|(i, _)| data.row(i).to_vec())
-                .collect();
-
-            let focal_data: Vec<Vec<i32>> = focal_mask
-                .iter()
-                .enumerate()
-                .filter(|&(_, &is_focal)| is_focal)
-                .map(|(i, _)| data.row(i).to_vec())
-                .collect();
-
-            let mut beta_k_vec = Vec::new();
-            let mut n_k_vec = Vec::new();
-
-            for &k in &unique_scores {
-                let ref_at_k: Vec<usize> = ref_scores
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &s)| s == k)
-                    .map(|(i, _)| i)
-                    .collect();
-
-                let focal_at_k: Vec<usize> = focal_scores
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &s)| s == k)
-                    .map(|(i, _)| i)
-                    .collect();
-
-                let n_ref_k = ref_at_k.len();
-                let n_focal_k = focal_at_k.len();
-
-                if n_ref_k > 0 && n_focal_k > 0 {
-                    let mean_ref: f64 = ref_at_k
-                        .iter()
-                        .map(|&i| ref_data[i][item_idx] as f64)
-                        .sum::<f64>()
-                        / n_ref_k as f64;
-                    let mean_focal: f64 = focal_at_k
-                        .iter()
-                        .map(|&i| focal_data[i][item_idx] as f64)
-                        .sum::<f64>()
-                        / n_focal_k as f64;
-
-                    beta_k_vec.push(mean_ref - mean_focal);
-                    n_k_vec.push(
-                        2.0 * n_ref_k as f64 * n_focal_k as f64 / (n_ref_k + n_focal_k) as f64,
-                    );
-                }
-            }
-
-            if beta_k_vec.is_empty() {
-                return (f64::NAN, f64::NAN, f64::NAN);
-            }
-
-            let total_weight: f64 = n_k_vec.iter().sum();
-            let beta: f64 = beta_k_vec
-                .iter()
-                .zip(n_k_vec.iter())
-                .map(|(&b, &n)| b * n)
-                .sum::<f64>()
-                / total_weight;
-
-            let weighted_var: f64 = beta_k_vec
-                .iter()
-                .zip(n_k_vec.iter())
-                .map(|(&b, &n)| n * (b - beta).powi(2))
-                .sum::<f64>()
-                / total_weight;
-
-            let n_total = (ref_scores.len() + focal_scores.len()) as f64;
-            let se = (weighted_var / n_total).sqrt();
-
+            let (beta, se, _, _) = conditional_effects(
+                reference.iter().map(conditional),
+                focal.iter().map(conditional),
+            );
             let z = if se > EPSILON { beta / se } else { f64::NAN };
-            let p_value = if z.is_nan() {
+            let p = if z.is_nan() {
                 f64::NAN
             } else {
                 2.0 * normal_sf(z.abs())
             };
-
-            (beta, z, p_value)
+            (beta, z, p)
         })
         .collect();
-
-    let betas: Array1<f64> = Array1::from(results.iter().map(|(b, _, _)| *b).collect::<Vec<_>>());
-    let zs: Array1<f64> = Array1::from(results.iter().map(|(_, z, _)| *z).collect::<Vec<_>>());
-    let p_values: Array1<f64> =
-        Array1::from(results.iter().map(|(_, _, p)| *p).collect::<Vec<_>>());
-
-    (
-        betas.to_pyarray(py),
-        zs.to_pyarray(py),
-        p_values.to_pyarray(py),
-    )
+    Ok((
+        Array1::from_iter(results.iter().map(|&(beta, _, _)| beta)).to_pyarray(py),
+        Array1::from_iter(results.iter().map(|&(_, z, _)| z)).to_pyarray(py),
+        Array1::from_iter(results.iter().map(|&(_, _, p)| p)).to_pyarray(py),
+    ))
 }
 
-/// Register SIBTEST functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sibtest_compute_beta, m)?)?;
     m.add_function(wrap_pyfunction!(sibtest_all_items, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::conditional_effects;
+
+    #[test]
+    fn constant_conditional_effect_has_positive_sampling_error() {
+        let reference: Vec<_> = (0..3)
+            .flat_map(|score| {
+                (0..100).map(move |person| (score, if person < 70 { 1.0 } else { 0.0 }))
+            })
+            .collect();
+        let focal: Vec<_> = (0..3)
+            .flat_map(|score| {
+                (0..100).map(move |person| (score, if person < 50 { 1.0 } else { 0.0 }))
+            })
+            .collect();
+        let (beta, se, _, counts) = conditional_effects(reference.into_iter(), focal.into_iter());
+        assert!((beta - 0.2).abs() < 1e-12);
+        let expected_variance: f64 = (0.7 * 0.3 + 0.5 * 0.5) / (99.0 * 3.0);
+        assert!((se - expected_variance.sqrt()).abs() < 1e-12);
+        assert_eq!(counts, vec![200.0; 3]);
+    }
+
+    #[test]
+    fn empty_common_sample_is_unestimable() {
+        let (beta, se, differences, counts) = conditional_effects(
+            [(0, 0.0), (0, 1.0)].into_iter(),
+            [(1, 0.0), (1, 1.0)].into_iter(),
+        );
+        assert!(beta.is_nan() && se.is_nan());
+        assert!(differences.is_empty() && counts.is_empty());
+    }
 }

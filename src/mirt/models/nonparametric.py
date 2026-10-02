@@ -11,7 +11,7 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 from scipy.interpolate import BSpline
-from scipy.special import comb, expit
+from scipy.special import comb, expit, logsumexp
 
 from mirt._smoothing import smooth_response_curves
 from mirt.constants import PROB_EPSILON
@@ -124,9 +124,16 @@ def _validate_curve_bounds(parameters: dict[str, NDArray[np.float64]]) -> None:
 
 def _relative_positive(log_values: NDArray[np.float64]) -> NDArray[np.float64]:
     """Exponentiate log values after removing an unidentified row scale."""
-    centered = log_values - np.max(log_values, axis=1, keepdims=True)
+    with np.errstate(over="ignore"):
+        centered = log_values - np.max(log_values, axis=1, keepdims=True)
     centered = np.maximum(centered, np.log(np.nextafter(0.0, 1.0)))
     return np.exp(centered)
+
+
+def _identified_log_weights(log_values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Choose a finite first-weight gauge without changing relative weights."""
+    logs = np.log(_relative_positive(log_values))
+    return logs - logs[:, :1]
 
 
 def _fisher_information(
@@ -143,6 +150,8 @@ class MonotonicSplineModel(DichotomousItemModel):
     The basis functions are exact normalized integrals of B-splines over
     ``[-4, 4]``. Positive item weights therefore produce nondecreasing curves.
     Values outside that interval use the corresponding saturated endpoint.
+    The first log weight is stored as zero: only weight ratios are identified.
+    There are ``n_knots + degree + 2`` free parameters per item.
     """
 
     model_name = "MonotonicSpline"
@@ -214,9 +223,26 @@ class MonotonicSplineModel(DichotomousItemModel):
     def upper(self) -> NDArray[np.float64]:
         return self._parameters["upper"].copy()
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = {
+            name: np.ones(values.shape, dtype=np.bool_)
+            for name, values in self._parameters.items()
+        }
+        masks["log_weights"][:, 0] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if name == "log_weights":
+            return _identified_log_weights(values)
+        return super()._canonical_parameter_values(name, values)
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         updated = _parameter_update(self._parameters, params)
         _validate_curve_bounds(updated)
+        updated["log_weights"] = _identified_log_weights(updated["log_weights"])
         self._parameters = updated
         return self
 
@@ -318,6 +344,7 @@ class MonotonicSplineModel(DichotomousItemModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -326,6 +353,10 @@ class MonotonicPolynomialModel(DichotomousItemModel):
 
     Positive increments are accumulated into ordered Bernstein coefficients.
     Ordered coefficients and a positive scale guarantee nondecreasing curves.
+    Setters preserve the supplied response curves while choosing identified
+    storage: the first log increment and ``lower`` are zero. A nonzero supplied
+    ``lower`` is absorbed into the Bernstein increments, which already specify
+    the lower endpoint. There are ``degree + 3`` free parameters per item.
     """
 
     model_name = "MonotonicPolynomial"
@@ -378,17 +409,51 @@ class MonotonicPolynomialModel(DichotomousItemModel):
 
     @property
     def lower(self) -> NDArray[np.float64]:
+        """Zero gauge; the curve's lower endpoint is ``upper * coefficients[:, 0]``."""
         return self._parameters["lower"].copy()
 
     @property
     def upper(self) -> NDArray[np.float64]:
         return self._parameters["upper"].copy()
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = {
+            name: np.ones(values.shape, dtype=np.bool_)
+            for name, values in self._parameters.items()
+        }
+        masks["log_coefficients"][:, 0] = False
+        masks["lower"][:] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if name == "log_coefficients":
+            return _identified_log_weights(values)
+        if name == "lower":
+            return np.zeros_like(values, dtype=np.float64)
+        return super()._canonical_parameter_values(name, values)
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         updated = _parameter_update(self._parameters, params)
         _validate_curve_bounds(updated)
         if np.any(updated["scale"] <= 0):
             raise ValueError("scale must be positive for every item")
+        logs = np.log(_relative_positive(updated["log_coefficients"]))
+        lower = updated["lower"]
+        nonzero = lower > 0.0
+        if np.any(nonzero):
+            upper = updated["upper"][nonzero]
+            normalized = logs[nonzero] - logsumexp(logs[nonzero], axis=1, keepdims=True)
+            log_remainder = np.log(upper - lower[nonzero]) - np.log(upper)
+            normalized += log_remainder[:, None]
+            normalized[:, 0] = np.logaddexp(
+                np.log(lower[nonzero]) - np.log(upper), normalized[:, 0]
+            )
+            logs[nonzero] = normalized
+        updated["log_coefficients"] = _identified_log_weights(logs)
+        updated["lower"] = np.zeros_like(lower)
         self._parameters = updated
         return self
 
@@ -589,6 +654,7 @@ class MonotonicPolynomialModel(DichotomousItemModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -856,4 +922,5 @@ class KernelSmoothingModel(DichotomousItemModel):
         new_model._calibration_counts = self._calibration_counts.copy()
         new_model._calibration_weight_sums = self._calibration_weight_sums.copy()
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model

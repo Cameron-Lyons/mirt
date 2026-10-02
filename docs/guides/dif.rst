@@ -74,6 +74,54 @@ preserving seeded results; the serial default is ``n_jobs=1``, and ``-1``
 uses all available CPU cores. The same option is available on
 :func:`mirt.reliability_invariance`.
 
+SIBTEST inference
+-----------------
+
+:func:`mirt.sibtest` compares complete binary responses within matching-score
+strata. Its uniform effect ``beta`` is a pooled-population weighted average of
+reference-minus-focal suspect scores. ``beta_se`` uses the within-group
+sampling variances in each stratum. ``correction=True`` applies the
+Shealy–Stout true-score regression correction using each group's KR-20
+matching-subtest reliability and neighboring conditional suspect-score means.
+
+.. code-block:: python
+
+   result = mirt.sibtest(
+       data,
+       groups,
+       suspect_items=[2],
+       matching_items=[0, 1, 3, 4, 5, 6, 7],
+       focal_group="focal",
+       min_cell_size=5,
+       method="crossing",
+   )
+   print(result["beta"], result["chi2"], result["df"], result["p_value"])
+
+The ``"crossing"`` method estimates a crossing location by weighted regression
+of conditional score differences. Following `Chalmers (2018)
+<https://doi.org/10.1007/s11336-017-9583-8>`_, ``chi2`` sums the squared
+standardized effects from the two regions. ``df`` is two when both regions
+are estimable and one when a single region is estimable. The reported crossing
+effect is an absolute score-area difference; its ``z`` is descriptive, and
+``p_value`` comes from the chi-square test. ``crossing_point`` and ``n_strata``
+report the estimated location and number of retained score strata.
+
+``min_cell_size`` requires at least that many persons in each group at a
+matching score; its default is two, the minimum needed to estimate sampling
+variance. Larger minima exclude sparse cells. Corrected analysis also needs
+at least two matching items, positive matching reliability in both groups,
+and observed neighboring scores for the regression slopes. Missing responses
+are rejected. Unestimable tests return ``NaN`` p-values and zero degrees of
+freedom, so they are never flagged as significant.
+
+:func:`mirt.sibtest_items` shares matching-score totals and reliability moments
+across items and returns the same inference fields as arrays. Its
+``p_adjust`` option supports ``"none"``, ``"bonferroni"``, ``"holm"``, and
+``"fdr_bh"``. Both APIs accept ``focal_group``; reversing it reverses the
+uniform effect while preserving its two-sided p-value. The original correction
+and standard-error formulation is described by `Shealy and Stout (1993)
+<https://doi.org/10.1007/BF02294572>`_.
+
 Related utilities
 -----------------
 

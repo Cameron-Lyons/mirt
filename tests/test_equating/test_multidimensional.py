@@ -103,6 +103,42 @@ class TestOrthogonalProcrustes:
 
 
 class TestObliqueProcrustes:
+    def test_nearly_collinear_anchors_recover_held_out_items(self):
+        """Small anchor residuals must not conceal an inaccurate linking matrix."""
+        rng = np.random.default_rng(112)
+        first = rng.normal(size=8)
+        anchors = np.column_stack([first, first + 1e-7 * rng.normal(size=8)])
+        source_slopes = np.vstack([anchors, [0.4, -1.2], [-0.9, 0.2]])
+        transform = np.array([[1.2, 0.3], [-0.2, 0.85]])
+        target_slopes = source_slopes @ transform
+        intercepts = np.linspace(-0.7, 0.7, 10)
+        source = make_model(source_slopes, intercepts)
+        target = make_model(target_slopes, intercepts)
+
+        fitted = link_mirt(
+            target,
+            source,
+            list(range(8)),
+            list(range(8)),
+            rotation="oblique",
+            gamma=1.0,
+            translation=False,
+        )
+
+        np.testing.assert_allclose(
+            fitted.scaling * fitted.rotation_matrix, transform, atol=1e-8
+        )
+        np.testing.assert_allclose(
+            fitted.transformed_loadings, target_slopes, atol=1e-8
+        )
+        linked = transform_mirt_parameters(
+            source, fitted.rotation_matrix, fitted.translation, fitted.scaling
+        )
+        theta = np.array([[-1.3, 0.7], [0.2, -1.2], [1.5, 0.6]])
+        np.testing.assert_allclose(
+            linked.probability(theta), target.probability(theta), atol=1e-8
+        )
+
     def test_recovers_general_linear_transformation(self):
         transform = np.array([[1.2, 0.35], [-0.15, 0.75]])
         target = SOURCE_SLOPES @ transform

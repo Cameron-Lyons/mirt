@@ -18,6 +18,7 @@ _KERNEL_HOOKS = (
     "_canonical_parameter_values",
     "_validate_parameter_state",
     "free_parameter_masks",
+    "_apply_free_parameter_restrictions",
     "slopes",
     "intercepts",
     "general_loadings",

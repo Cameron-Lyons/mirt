@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Counted independent coefficients across cognitive-diagnosis, explanatory,
+  ordinal-process, custom, testlet, unfolding, nonparametric, and mixture models,
+  excluding design metadata, inactive padding, fixed bounds, and dependent storage.
+  Every item-model copy preserves additional fixed-parameter masks.
+- Canonicalized rating-scale shared thresholds by storing the first threshold
+  as zero and absorbing its raw value into item locations. Nominal and nested
+  distractor setters now store reference-category contrasts. Response
+  probabilities are preserved, while returned parameter arrays use the identified
+  representation. Declared common testlet loadings are enforced by generic setters.
+- Replaced M2/M2* and S-X2 approximations with covariance-weighted nuisance
+  projection and exact conditional score-category probabilities. Degrees of
+  freedom respect parameter masks and unestimable inference is explicit.
+- Identified multigroup latent distributions from the remaining invariance
+  anchors, retained fixed coordinates through initialization and optimization,
+  and enforced graded-response threshold order around fixed neighbors.
+- Aligned longitudinal drift by declared physical item identities and used
+  signed reference-scale difficulty changes to classify drift direction.
+- Inferred ordinal category counts per item and accepted explicit heterogeneous
+  category metadata in the public fitting API.
+- Corrected chain-link transformation directions and preserved requested
+  weighting, robust estimation, and linking methods during anchor purification
+  and bootstrap uncertainty. Concurrent linking now rejects failed optimization
+  and uses the selected reference metric; oblique multidimensional linking uses
+  direct least squares for nearly collinear anchor loadings.
+- Corrected SIBTEST sampling uncertainty, pooled score-stratum weighting, and
+  true-score regression correction. Crossing inference uses estimated crossing
+  regions with chi-square tests instead of an effect-dependent standard error.
+  Unestimable strata and degenerate groups report missing inference explicitly.
+- Preserved customized and inherited 2PL curves in Bayesian pointwise
+  likelihood preparation. Rejected response codes before integer conversion
+  can overflow, and protected supplied parameter chains during failed custom
+  curve evaluations.
 - Corrected score equating to invert the documented new-to-reference linking
   transformation. Equivalent calibrations now yield identical true-score
   tables. Compiled score recursion respects overridden model curves and exact
@@ -52,6 +84,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   probability overrides, and custom curves retain numerical fitting.
 
 ### Added
+- True fixed-anchor and floating-anchor vertical calibration with physical-item
+  maps, unequal forms, joint item/population estimation, native calibrated
+  models, posterior scores, and constrained population-mean ordering.
+- Native parameter-mask restrictions, preserved across model copies and used
+  by EM estimation and diagnostic nuisance counts. Shared fixed coordinates
+  retain their exact values across linked groups.
+- Actual simultaneous curve matching for concurrent vertical scaling, with
+  selectable reference grade and diagnostics based on the final joint solution.
+- Optional respondent ``batch_size`` for Bayesian pointwise likelihoods and a
+  ``pointwise`` timing/memory suite for 2PL, 3PL, and heterogeneous GRM models.
+- SIBTEST minimum stratum sizes, explicit focal-group selection, crossing
+  location, chi-square statistics, degrees of freedom, and retained stratum
+  counts. Added analytical and repeated-simulation inference regressions.
+- Required CPU PyTorch parity checks and release artifact version validation
+  before publication. Documentation checks now include merge queues.
 - Linked observed-score equating with reference-population probability masses
   and configurable theta batching. Added exact item and test Fisher information
   matrices for GPCM and PCM, including their use by MCAT selection.
@@ -78,6 +125,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   placeholder errors and existing fitting costs.
 
 ### Changed
+- Bounded respondent/item/category scratch space in Bayesian likelihoods and
+  reused fixed or sampled posterior inputs through broadcast and strided views.
+  Native SIBTEST shares matching totals and accumulates score strata in one
+  pass instead of repeatedly scanning and copying group response matrices.
 - Bounded score-recursion memory with theta batches and reused contiguous work
   buffers. Streamed CAT/MCAT conditional-error moments instead of retaining
   every simulated estimate.

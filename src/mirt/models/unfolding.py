@@ -23,6 +23,20 @@ _LOG_MAX_FLOAT = float(np.log(np.finfo(np.float64).max))
 _MAX_GGUM_PROBABILITY_CHUNK_ENTRIES = 1_000_000
 
 
+def _ggum_subjective_thresholds(
+    independent: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Construct zero-centered symmetric thresholds from independent values."""
+    return np.concatenate(
+        (
+            independent,
+            np.zeros((*independent.shape[:-1], 1), dtype=np.float64),
+            -independent[..., ::-1],
+        ),
+        axis=-1,
+    )
+
+
 def _ggum_category_chunks(
     category_counts: list[int],
     n_persons: int,
@@ -170,6 +184,11 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
     fixed to zero, and the remaining subjective thresholds are symmetric:
     ``tau_z = -tau_(M-z+1)``.
 
+    Each item has ``n_categories + 1`` independent parameters: discrimination,
+    location, and ``n_categories - 1`` first-half thresholds. The center,
+    reflected thresholds, and category padding are derived storage, excluded
+    from ``free_parameter_masks`` and ``n_parameters``.
+
     Parameters
     ----------
     n_items : int
@@ -255,6 +274,45 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         self._parameters["thresholds"] = thresholds
 
     @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Identify independent thresholds rather than reflected storage."""
+        masks = {
+            "discrimination": np.ones(self.n_items, dtype=np.bool_),
+            "location": np.ones(self.n_items, dtype=np.bool_),
+            "thresholds": np.zeros(self.thresholds.shape, dtype=np.bool_),
+        }
+        for item, categories in enumerate(self._n_categories):
+            masks["thresholds"][item, : categories - 1] = True
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        """Reconstruct dependent threshold storage after coordinate updates."""
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "thresholds":
+            for item, categories in enumerate(self._n_categories):
+                independent = canonical[item, : categories - 1].copy()
+                canonical[item] = 0.0
+                canonical[item, : 2 * categories - 1] = _ggum_subjective_thresholds(
+                    independent
+                )
+        return canonical
+
+    def _expand_parameter_standard_errors(
+        self, name: str, errors: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        """Reflect threshold uncertainty while keeping center and padding zero."""
+        expanded = super()._expand_parameter_standard_errors(name, errors)
+        if name == "thresholds":
+            for item, categories in enumerate(self._n_categories):
+                c = categories - 1
+                independent = np.abs(expanded[item, :c]).copy()
+                expanded[item, c:] = 0.0
+                expanded[item, c + 1 : 2 * c + 1] = independent[::-1]
+        return expanded
+
+    @property
     def discrimination(self) -> NDArray[np.float64]:
         """Discrimination parameters (alpha)."""
         return self._parameters["discrimination"]
@@ -332,7 +390,9 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         categories = np.arange(n_categories, dtype=np.float64)
         complements = m - categories
 
-        thresholds = self._parameters["thresholds"][item_idx, :m]
+        thresholds = _ggum_subjective_thresholds(
+            self._parameters["thresholds"][item_idx, :c]
+        )
         alpha = self._parameters["discrimination"][item_idx]
         location = self._parameters["location"][item_idx]
 
@@ -403,7 +463,9 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         m = 2 * c + 1
         categories = np.arange(n_categories, dtype=np.intp)
         complements = m - categories
-        thresholds = self._parameters["thresholds"][item_indices, :m]
+        thresholds = _ggum_subjective_thresholds(
+            self._parameters["thresholds"][item_indices, :c]
+        )
         discrimination = self._parameters["discrimination"][item_indices]
         location = self._parameters["location"][item_indices]
 
@@ -740,6 +802,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -1018,6 +1081,7 @@ class IdealPointModel(_UnfoldingDichotomousModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -1027,6 +1091,10 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
     ``P(X=1 | theta) = 1 / (1 + cosh(z))`` with
     ``z = a * (theta-delta) - gamma``. ``gamma`` shifts the response peak,
     whose location is ``delta + gamma/a``.
+
+    Estimation holds the supplied ``gamma`` fixed as an identification gauge:
+    varying ``a`` and ``delta`` spans the same two-parameter response-curve
+    family. Public setters can still choose any finite gauge value.
     """
 
     model_name = "HCM"
@@ -1036,6 +1104,17 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         self._parameters["discrimination"] = np.ones(self.n_items, dtype=np.float64)
         self._parameters["location"] = np.zeros(self.n_items, dtype=np.float64)
         self._parameters["asymmetry"] = np.zeros(self.n_items, dtype=np.float64)
+
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        """Estimate two identified curve coefficients per item."""
+        return self._apply_free_parameter_restrictions(
+            {
+                "discrimination": np.ones(self.n_items, dtype=np.bool_),
+                "location": np.ones(self.n_items, dtype=np.bool_),
+                "asymmetry": np.zeros(self.n_items, dtype=np.bool_),
+            }
+        )
 
     @property
     def discrimination(self) -> NDArray[np.float64]:
@@ -1156,4 +1235,5 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
             name: values.copy() for name, values in self._parameters.items()
         }
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model

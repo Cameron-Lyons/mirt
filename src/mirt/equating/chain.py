@@ -33,9 +33,17 @@ class ChainLinkingResult:
     pairwise_results : list[LinkingResult]
         Results from each pairwise linking.
     drift_accumulation : NDArray[np.float64] | None
-        Accumulated drift statistics.
+        Pairwise robust z-statistics, with one column per physical anchor item
+        and NaN where that item is absent from an adjacent link.
     reference_index : int
         Index of reference time point.
+    drift_item_ids : list[tuple[int, int]] | None
+        Identity of each drift column as its earliest (time index, item index).
+        Identities follow the supplied anchor correspondences across forms.
+    drift_difficulty_changes : NDArray[np.float64] | None
+        Later-minus-earlier difficulty changes on the reference metric,
+        aligned with ``drift_accumulation``. These describe residual change
+        after linking, rather than unadjusted differences between forms.
     """
 
     cumulative_A: list[float]
@@ -43,6 +51,8 @@ class ChainLinkingResult:
     pairwise_results: list[LinkingResult]
     drift_accumulation: NDArray[np.float64] | None
     reference_index: int
+    drift_item_ids: list[tuple[int, int]] | None = None
+    drift_difficulty_changes: NDArray[np.float64] | None = None
 
 
 @dataclass
@@ -236,16 +246,24 @@ def chain_link(
         )
         pairwise_results.append(result)
 
-    pairwise_A = [r.constants.A for r in pairwise_results]
-    pairwise_B = [r.constants.B for r in pairwise_results]
+    # link(left, right) maps right coordinates onto the left metric.
+    # accumulate_constants accepts the forward (left -> right) maps.
+    pairwise_A = [1.0 / r.constants.A for r in pairwise_results]
+    pairwise_B = [-r.constants.B / r.constants.A for r in pairwise_results]
 
     cumulative_A, cumulative_B = accumulate_constants(
         pairwise_A, pairwise_B, reference_index
     )
 
     drift_accumulation = None
+    drift_item_ids = None
+    drift_difficulty_changes = None
     if compute_drift:
-        drift_accumulation = _compute_drift_accumulation(pairwise_results)
+        drift_accumulation, drift_item_ids, drift_difficulty_changes = (
+            _compute_drift_accumulation(
+                pairwise_results, anchor_item_pairs, cumulative_A
+            )
+        )
 
     return ChainLinkingResult(
         cumulative_A=cumulative_A,
@@ -253,6 +271,8 @@ def chain_link(
         pairwise_results=pairwise_results,
         drift_accumulation=drift_accumulation,
         reference_index=reference_index,
+        drift_item_ids=drift_item_ids,
+        drift_difficulty_changes=drift_difficulty_changes,
     )
 
 
@@ -263,8 +283,12 @@ def accumulate_constants(
 ) -> tuple[list[float], list[float]]:
     """Accumulate pairwise constants to reference scale.
 
-    For transformations A_t, B_t from time t to t+1:
-        theta_ref = A_cum * theta_t + B_cum
+    The inputs describe forward coordinate maps:
+    ``theta_{t+1} = pairwise_A[t] * theta_t + pairwise_B[t]``.
+    The returned constants map each time point onto the reference metric:
+    ``theta_ref = cumulative_A[t] * theta_t + cumulative_B[t]``.
+    Constants returned by :func:`link` describe the opposite direction and
+    must be inverted before passing them to this function.
 
     Parameters
     ----------
@@ -321,27 +345,53 @@ def accumulate_constants(
 
 def _compute_drift_accumulation(
     pairwise_results: list[LinkingResult],
-) -> NDArray[np.float64]:
-    """Compute accumulated drift across time points."""
-    n_pairs = len(pairwise_results)
+    anchor_item_pairs: list[tuple[list[int], list[int]]],
+    cumulative_A: list[float],
+) -> tuple[NDArray[np.float64], list[tuple[int, int]], NDArray[np.float64]]:
+    """Align adjacent-link diagnostics using physical anchor correspondences."""
+    parents: dict[tuple[int, int], tuple[int, int]] = {}
 
-    max_anchors = max(
-        (
-            len(result.anchor_diagnostics.robust_z)
-            for result in pairwise_results
-            if result.anchor_diagnostics is not None
-        ),
-        default=0,
-    )
+    def find(node: tuple[int, int]) -> tuple[int, int]:
+        parents.setdefault(node, node)
+        if parents[node] != node:
+            parents[node] = find(parents[node])
+        return parents[node]
 
-    drift_matrix = np.full((n_pairs, max_anchors), np.nan, dtype=np.float64)
+    for t, (left_items, right_items) in enumerate(anchor_item_pairs):
+        for left_item, right_item in zip(left_items, right_items, strict=True):
+            left_root = find((t, int(left_item)))
+            right_root = find((t + 1, int(right_item)))
+            # The earliest occurrence supplies a stable, order-independent ID.
+            parents[max(left_root, right_root)] = min(left_root, right_root)
+
+    item_ids = sorted({find(node) for node in parents})
+    columns = {identity: column for column, identity in enumerate(item_ids)}
+    shape = (len(pairwise_results), len(item_ids))
+    drift_matrix = np.full(shape, np.nan, dtype=np.float64)
+    difficulty_changes = np.full(shape, np.nan, dtype=np.float64)
 
     for t, result in enumerate(pairwise_results):
-        if result.anchor_diagnostics is not None:
-            n_anchors = len(result.anchor_diagnostics.robust_z)
-            drift_matrix[t, :n_anchors] = result.anchor_diagnostics.robust_z
+        diagnostics = result.anchor_diagnostics
+        if diagnostics is None:
+            continue
+        indices = diagnostics.item_indices
+        z_scores = np.asarray(diagnostics.robust_z, dtype=np.float64)
+        signed_b = np.asarray(diagnostics.signed_diff_b, dtype=np.float64)
+        if (
+            len(set(indices)) != len(indices)
+            or not set(indices).issubset(anchor_item_pairs[t][0])
+            or z_scores.shape != (len(indices),)
+            or signed_b.shape != (len(indices),)
+        ):
+            raise ValueError("Pairwise anchor diagnostics do not match anchor items")
+        for index, z_score, difference in zip(indices, z_scores, signed_b, strict=True):
+            column = columns[find((t, int(index)))]
+            drift_matrix[t, column] = z_score
+            # Pair diagnostics use earlier - transformed later. Multiplication
+            # by the earlier form's slope puts the opposite change on reference.
+            difficulty_changes[t, column] = -cumulative_A[t] * difference
 
-    return drift_matrix
+    return drift_matrix, item_ids, difficulty_changes
 
 
 def transform_to_reference(
@@ -615,6 +665,7 @@ def concurrent_link(
     n_theta: int = 61,
     max_iter: int = 50,
     tol: float = 1e-4,
+    reference_index: int = 0,
 ) -> list[tuple[float, float]]:
     """Perform concurrent (simultaneous) linking of multiple forms.
 
@@ -639,6 +690,9 @@ def concurrent_link(
         Maximum iterations.
     tol : float
         Convergence tolerance.
+    reference_index : int
+        Model that defines the common metric and theta-weighting grid.
+        Its transformation is fixed at ``(1, 0)``.
 
     Returns
     -------
@@ -650,6 +704,12 @@ def concurrent_link(
     n_models = len(models)
     if n_models < 2:
         raise ValueError("concurrent linking requires at least two models")
+    if isinstance(reference_index, (bool, np.bool_)) or not isinstance(
+        reference_index, (int, np.integer)
+    ):
+        raise ValueError("reference_index must be an integer")
+    if reference_index < 0 or reference_index >= n_models:
+        raise ValueError(f"Invalid reference_index: {reference_index}")
     if method not in _CONCURRENT_METHODS:
         supported = ", ".join(sorted(_CONCURRENT_METHODS))
         raise ValueError(
@@ -675,26 +735,26 @@ def concurrent_link(
     weights = np.exp(-0.5 * theta_grid**2)
     weights = weights / np.sum(weights)
     n_free_models = n_models - 1
+    free_indices = [index for index in range(n_models) if index != reference_index]
+    # The reference metric never changes during optimization.
+    reference_curves = _expected_item_score_curves(
+        models[reference_index], theta_grid[:, None], selected_items[reference_index]
+    )
 
     def criterion(params: NDArray[np.float64]) -> float:
-        slopes = np.concatenate(([1.0], np.exp(params[:n_free_models])))
-        intercepts = np.concatenate(([0.0], params[n_free_models:]))
+        slopes = np.ones(n_models, dtype=np.float64)
+        intercepts = np.zeros(n_models, dtype=np.float64)
+        slopes[free_indices] = np.exp(params[:n_free_models])
+        intercepts[free_indices] = params[n_free_models:]
 
         total_loss = 0.0
-        score_curves = [
-            _expected_item_score_curves(
-                model,
-                ((theta_grid - intercept) / slope)[:, None],
-                indices,
+        score_curves = [reference_curves] * n_models
+        for index in free_indices:
+            score_curves[index] = _expected_item_score_curves(
+                models[index],
+                ((theta_grid - intercepts[index]) / slopes[index])[:, None],
+                selected_items[index],
             )
-            for model, slope, intercept, indices in zip(
-                models,
-                slopes,
-                intercepts,
-                selected_items,
-                strict=True,
-            )
-        ]
 
         for left_model, right_model, anchors_left, anchors_right in relations:
             left_curves = score_curves[left_model].expected[:, anchors_left]
@@ -738,9 +798,13 @@ def concurrent_link(
 
     if not np.all(np.isfinite(result.x)) or not np.isfinite(result.fun):
         raise RuntimeError("concurrent linking failed to find a finite solution")
+    if not result.success:
+        raise RuntimeError(f"concurrent linking failed to converge: {result.message}")
 
-    slopes = [1.0, *np.exp(result.x[:n_free_models]).tolist()]
-    intercepts = [0.0, *result.x[n_free_models:].tolist()]
+    slopes = np.ones(n_models, dtype=np.float64)
+    intercepts = np.zeros(n_models, dtype=np.float64)
+    slopes[free_indices] = np.exp(result.x[:n_free_models])
+    intercepts[free_indices] = result.x[n_free_models:]
 
     return [
         (float(slope), float(intercept))
@@ -790,7 +854,7 @@ def chain_linking_summary(result: ChainLinkingResult) -> str:
     lines.append("-" * 50)
 
     for t, pr in enumerate(result.pairwise_results):
-        lines.append(f"Time {t} -> {t + 1}:")
+        lines.append(f"Time {t + 1} -> {t}:")
         lines.append(f"  A = {pr.constants.A:.4f}, B = {pr.constants.B:.4f}")
         lines.append(f"  Method: {pr.constants.method}")
 
@@ -824,7 +888,13 @@ def detect_longitudinal_drift(
     chain_result: ChainLinkingResult,
     threshold: float = 2.5,
 ) -> dict[str, list]:
-    """Detect items with consistent drift across time points.
+    """Detect repeatedly flagged physical anchors and signed difficulty change.
+
+    An item must occur in at least two adjacent links and exceed the threshold
+    in at least half its observed links. Direction describes its residual
+    difficulty change after placing both forms on the reference metric.
+    Robust z-statistics quantify unusual discrepancy magnitude; their signs
+    do not describe a parameter increasing or decreasing.
 
     Parameters
     ----------
@@ -836,16 +906,48 @@ def detect_longitudinal_drift(
     Returns
     -------
     dict[str, list]
-        Dictionary with consistently drifting items and patterns.
+        ``consistently_flagged`` contains drift-matrix column indices.
+        ``flagged_item_ids`` gives the corresponding earliest (time, item)
+        identities, or None for legacy results without identity metadata.
+        ``drift_direction`` contains "increasing" for nonnegative difficulty
+        changes with at least one positive change, "decreasing" for the
+        converse, and "variable" for mixed signs or zero change. Results
+        without at least two signed changes have direction "unknown".
     """
-    if chain_result.drift_accumulation is None:
-        return {"consistently_flagged": [], "drift_direction": []}
+    if (
+        isinstance(threshold, (bool, np.bool_))
+        or not isinstance(threshold, (int, float, np.integer, np.floating))
+        or not np.isfinite(threshold)
+        or threshold <= 0
+    ):
+        raise ValueError("threshold must be finite and positive")
 
-    drift = chain_result.drift_accumulation
-    n_pairs, n_items = drift.shape
+    if chain_result.drift_accumulation is None:
+        return {
+            "consistently_flagged": [],
+            "drift_direction": [],
+            "flagged_item_ids": [],
+        }
+
+    drift = np.asarray(chain_result.drift_accumulation, dtype=np.float64)
+    if drift.ndim != 2:
+        raise ValueError("drift_accumulation must be a two-dimensional matrix")
+    n_items = drift.shape[1]
+    item_ids = chain_result.drift_item_ids
+    if item_ids is not None and len(item_ids) != n_items:
+        raise ValueError("drift_item_ids must match drift_accumulation columns")
+    changes = chain_result.drift_difficulty_changes
+    if changes is not None:
+        changes = np.asarray(changes, dtype=np.float64)
+        if changes.shape != drift.shape or np.any(np.isinf(changes)):
+            raise ValueError(
+                "drift_difficulty_changes must match drift_accumulation and "
+                "contain finite values or NaN"
+            )
 
     consistently_flagged = []
     drift_direction = []
+    flagged_item_ids = []
 
     for j in range(n_items):
         item_drift = drift[:, j]
@@ -859,11 +961,20 @@ def detect_longitudinal_drift(
 
         if n_flagged >= np.sum(valid) / 2:
             consistently_flagged.append(j)
+            flagged_item_ids.append(None if item_ids is None else item_ids[j])
 
-            mean_dir = np.mean(valid_drift)
-            if mean_dir > 0.5:
+            signed_changes = (
+                np.array([], dtype=np.float64)
+                if changes is None
+                else changes[valid & np.isfinite(changes[:, j]), j]
+            )
+            positive = signed_changes > 1e-10
+            negative = signed_changes < -1e-10
+            if signed_changes.size < 2:
+                drift_direction.append("unknown")
+            elif np.any(positive) and not np.any(negative):
                 drift_direction.append("increasing")
-            elif mean_dir < -0.5:
+            elif np.any(negative) and not np.any(positive):
                 drift_direction.append("decreasing")
             else:
                 drift_direction.append("variable")
@@ -871,4 +982,5 @@ def detect_longitudinal_drift(
     return {
         "consistently_flagged": consistently_flagged,
         "drift_direction": drift_direction,
+        "flagged_item_ids": flagged_item_ids,
     }

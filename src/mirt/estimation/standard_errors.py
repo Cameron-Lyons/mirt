@@ -209,7 +209,9 @@ def _set_flat_parameters(
         size = layout.free_indices.size
         values = layout.template.copy().ravel()
         values[layout.free_indices] = params_flat[offset : offset + size]
-        model._parameters[name] = values.reshape(layout.shape)
+        model._parameters[name] = model._canonical_parameter_values(
+            name, values.reshape(layout.shape)
+        )
         offset += size
 
 
@@ -223,7 +225,7 @@ def _restore_parameters(
 def _unflatten_se(
     se_flat: NDArray[np.float64],
     layouts: dict[str, _ParameterLayout],
-    _model: BaseItemModel | None = None,
+    model: BaseItemModel | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Restore standard errors to the model's stored parameter shapes."""
     result: dict[str, NDArray[np.float64]] = {}
@@ -232,7 +234,11 @@ def _unflatten_se(
         size = layout.free_indices.size
         values = np.zeros(layout.shape, dtype=np.float64)
         values.ravel()[layout.free_indices] = se_flat[offset : offset + size]
-        result[name] = values
+        result[name] = (
+            values
+            if model is None
+            else model._expand_parameter_standard_errors(name, values)
+        )
         offset += size
     return result
 
@@ -350,9 +356,10 @@ def _finite_difference_scores(
 def _se_from_information(
     information: NDArray[np.float64],
     layouts: dict[str, _ParameterLayout],
+    model: BaseItemModel | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     if information.size == 0:
-        return _unflatten_se(np.empty(0, dtype=np.float64), layouts)
+        return _unflatten_se(np.empty(0, dtype=np.float64), layouts, model)
     information = (information + information.T) / 2.0
     try:
         covariance = np.linalg.inv(information)
@@ -362,7 +369,7 @@ def _se_from_information(
     se = np.full(variances.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(variances) & (variances >= 0.0)
     se[valid] = np.sqrt(variances[valid])
-    return _unflatten_se(se, layouts)
+    return _unflatten_se(se, layouts, model)
 
 
 def compute_observed_information(
@@ -402,7 +409,7 @@ def compute_crossprod_se(
     scores, layouts = _finite_difference_scores(
         model, response_array, quadrature, mass, step
     )
-    return _se_from_information(scores.T @ scores, layouts)
+    return _se_from_information(scores.T @ scores, layouts, model)
 
 
 def compute_sandwich_se(
@@ -454,7 +461,7 @@ def compute_sandwich_se(
     se = np.full(variances.shape, np.nan, dtype=np.float64)
     valid = np.isfinite(variances) & (variances >= 0.0)
     se[valid] = np.sqrt(variances[valid])
-    return _unflatten_se(se, layouts)
+    return _unflatten_se(se, layouts, model)
 
 
 def compute_oakes_se(
@@ -477,7 +484,7 @@ def compute_oakes_se(
         mass,
         _validate_step_size(h),
     )
-    return _se_from_information(information, layouts)
+    return _se_from_information(information, layouts, model)
 
 
 def compute_sem_se(

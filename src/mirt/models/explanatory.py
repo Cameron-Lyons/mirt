@@ -266,6 +266,30 @@ class LLTM(DichotomousItemModel):
         return self._parameters["feature_weights"].copy()
 
     @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["feature_weights"] &= np.any(self._item_features != 0.0, axis=0)
+        if self._constrain_discrimination:
+            masks["discrimination"][1:] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "discrimination" and self._constrain_discrimination:
+            canonical[:] = canonical[0]
+        return canonical
+
+    def _expand_parameter_standard_errors(
+        self, name: str, errors: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        expanded = super()._expand_parameter_standard_errors(name, errors)
+        if name == "discrimination" and self._constrain_discrimination:
+            expanded[:] = expanded[0]
+        return expanded
+
+    @property
     def discrimination(self) -> NDArray[np.float64]:
         return self._parameters["discrimination"].copy()
 
@@ -375,6 +399,7 @@ class LLTM(DichotomousItemModel):
         )
         new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -672,6 +697,30 @@ class ExplanatoryIRT(DichotomousItemModel):
         return self._parameters["feature_weights"].copy()
 
     @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["feature_weights"] &= np.any(self._item_features != 0.0, axis=0)
+        if self._constrain_discrimination:
+            masks["discrimination"][1:] = False
+        return self._apply_free_parameter_restrictions(masks)
+
+    def _canonical_parameter_values(
+        self, name: str, values: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        canonical = super()._canonical_parameter_values(name, values)
+        if name == "discrimination" and self._constrain_discrimination:
+            canonical[:] = canonical[0]
+        return canonical
+
+    def _expand_parameter_standard_errors(
+        self, name: str, errors: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        expanded = super()._expand_parameter_standard_errors(name, errors)
+        if name == "discrimination" and self._constrain_discrimination:
+            expanded[:] = expanded[0]
+        return expanded
+
+    @property
     def regression_weights(self) -> NDArray[np.float64]:
         return self._latent_regression.regression_weights
 
@@ -927,6 +976,7 @@ class ExplanatoryIRT(DichotomousItemModel):
         new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
         new_model._latent_regression = self._latent_regression.copy()
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
 
 
@@ -957,6 +1007,12 @@ class RaschLLTM(LLTM):
         self._parameters["feature_weights"] = np.zeros(self._n_features)
         self._parameters["discrimination"] = np.ones(self.n_items)
 
+    @property
+    def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
+        masks = super().free_parameter_masks
+        masks["discrimination"].fill(False)
+        return self._apply_free_parameter_restrictions(masks)
+
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
         if "discrimination" in params:
             raise ValueError("Cannot set discrimination in RaschLLTM (fixed to 1)")
@@ -974,4 +1030,5 @@ class RaschLLTM(LLTM):
             "feature_weights"
         ].copy()
         new_model._is_fitted = self._is_fitted
+        self._copy_parameter_restrictions_to(new_model)
         return new_model
