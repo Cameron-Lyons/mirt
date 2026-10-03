@@ -61,7 +61,13 @@ def _reference_expected_margins(
     return univariate, bivariate
 
 
-def test_posterior_sampler_matches_discrete_posterior(numpy_fallback: None) -> None:
+@pytest.mark.parametrize("native", [False, True])
+def test_posterior_sampler_matches_discrete_posterior(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    if native and not RUST_AVAILABLE:
+        pytest.skip("native backend is unavailable")
+    monkeypatch.setattr(plausible, "rust_enabled", lambda: native)
     responses = np.array([[1, 1, 0, -1]], dtype=np.int32)
     points = np.array([-1.5, -0.25, 0.75, 2.0])
     weights = np.array([0.15, 0.35, 0.4, 0.1])
@@ -88,10 +94,89 @@ def test_posterior_sampler_matches_discrete_posterior(numpy_fallback: None) -> N
     assert_allclose(actual, expected, atol=0.015)
 
 
-def test_posterior_sampler_is_reproducible_and_handles_missingness(
-    numpy_fallback: None,
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("native", [False, True])
+def test_posterior_sampler_preserves_grid_mass_by_default(
+    monkeypatch: pytest.MonkeyPatch, native: bool
 ) -> None:
+    if native and not RUST_AVAILABLE:
+        pytest.skip("native backend is unavailable")
+    monkeypatch.setattr(plausible, "rust_enabled", lambda: native)
+    points = np.array([-1.5, -0.5, 0.5, 1.5])
+    weights = np.array([0.1, 0.2, 0.4, 0.3])
+
+    draws = plausible.generate_plausible_values_posterior(
+        np.array([[-1]], dtype=np.int32),
+        points,
+        weights,
+        np.ones(1),
+        np.zeros(1),
+        n_plausible=50_000,
+        seed=18,
+    )[0]
+
+    assert np.isin(draws, points).all()
+    assert_allclose([(draws == point).mean() for point in points], weights, atol=0.015)
+    expected_mean = np.dot(points, weights)
+    expected_variance = np.dot((points - expected_mean) ** 2, weights)
+    assert draws.mean() == pytest.approx(expected_mean, abs=0.03)
+    assert draws.var() == pytest.approx(expected_variance, abs=0.025)
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("weight_scale", [1.0, 1e-200, 1e-320])
+def test_posterior_sampler_never_adds_mass_to_zero_prior_weights(
+    monkeypatch: pytest.MonkeyPatch, native: bool, weight_scale: float
+) -> None:
+    if native and not RUST_AVAILABLE:
+        pytest.skip("native backend is unavailable")
+    monkeypatch.setattr(plausible, "rust_enabled", lambda: native)
+    points = np.array([-4.0, -1.0, 1.0])
+    weights = np.array([0.0, weight_scale, 2.0 * weight_scale])
+
+    with np.errstate(divide="raise", invalid="raise", over="raise"):
+        draws = plausible.generate_plausible_values_posterior(
+            np.array([[-1]], dtype=np.int32),
+            points,
+            weights,
+            np.ones(1),
+            np.zeros(1),
+            n_plausible=10_000,
+            seed=714,
+        )[0]
+
+    assert np.isin(draws, points[1:]).all()
+    assert (draws == points[1]).mean() == pytest.approx(1.0 / 3.0, abs=0.02)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_explicit_posterior_smoothing_adds_requested_variance(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    if native and not RUST_AVAILABLE:
+        pytest.skip("native backend is unavailable")
+    monkeypatch.setattr(plausible, "rust_enabled", lambda: native)
+    draws = plausible.generate_plausible_values_posterior(
+        np.array([[-1]], dtype=np.int32),
+        np.array([2.0]),
+        np.array([1.0]),
+        np.ones(1),
+        np.zeros(1),
+        n_plausible=20_000,
+        jitter_sd=0.4,
+        seed=515,
+    )[0]
+
+    assert draws.mean() == pytest.approx(2.0, abs=0.02)
+    assert draws.var() == pytest.approx(0.4**2, abs=0.008)
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_posterior_sampler_is_reproducible_and_handles_missingness(
+    monkeypatch: pytest.MonkeyPatch, native: bool
+) -> None:
+    if native and not RUST_AVAILABLE:
+        pytest.skip("native backend is unavailable")
+    monkeypatch.setattr(plausible, "rust_enabled", lambda: native)
     monkeypatch.setattr(plausible, "_entry_chunk_size", lambda *_: 1)
     responses = np.array([[1, -1, 0], [-9, -1, -4]], dtype=np.int32)
     points = np.array([-1.0, 0.0, 1.0])

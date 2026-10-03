@@ -11,6 +11,7 @@ import zipfile
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 
 SCRIPT = (
     Path(__file__).resolve().parents[1] / ".github/scripts/check_release_artifacts.py"
@@ -22,11 +23,19 @@ def metadata(version="1.2.3", name="mirt"):
     return f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n".encode()
 
 
-def wheel(directory, platform, contents=None, *, duplicate=False):
-    path = directory / f"mirt-1.2.3-cp311-abi3-{platform}.whl"
+def wheel(
+    directory,
+    platform,
+    contents=None,
+    *,
+    duplicate=False,
+    version="1.2.3",
+    metadata_directory=None,
+):
+    path = directory / f"mirt-{version}-cp311-abi3-{platform}.whl"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr(
-            "mirt-1.2.3.dist-info/METADATA",
+            f"{metadata_directory or f'mirt-{version}'}.dist-info/METADATA",
             metadata() if contents is None else contents,
         )
         archive.writestr("mirt/__init__.py", "__version__ = '1.2.3'")
@@ -35,11 +44,13 @@ def wheel(directory, platform, contents=None, *, duplicate=False):
     return path
 
 
-def sdist(directory, contents=None, *, symlink=False):
-    path = directory / "mirt-1.2.3.tar.gz"
+def sdist(
+    directory, contents=None, *, symlink=False, version="1.2.3", metadata_directory=None
+):
+    path = directory / f"mirt-{version}.tar.gz"
     payload = metadata() if contents is None else contents
     with tarfile.open(path, "w:gz") as archive:
-        entry = tarfile.TarInfo("mirt-1.2.3/PKG-INFO")
+        entry = tarfile.TarInfo(f"{metadata_directory or f'mirt-{version}'}/PKG-INFO")
         if symlink:
             entry.type = tarfile.SYMTYPE
             entry.linkname = "/etc/passwd"
@@ -106,9 +117,11 @@ def test_untagged_builds_check_the_version_in_the_project_manifest(release):
 
 
 def test_untagged_cargo_prerelease_normalizes_to_python_metadata(release):
+    for path in release.iterdir():
+        path.unlink()
     for platform in ("manylinux2014_x86_64", "win_amd64", "macosx_11_0_arm64"):
-        wheel(release, platform, metadata("1.2.3rc1"))
-    sdist(release, metadata("1.2.3rc1"))
+        wheel(release, platform, metadata("1.2.3rc1"), version="1.2.3rc1")
+    sdist(release, metadata("1.2.3rc1"), version="1.2.3rc1")
     project = release.with_name(release.name + "-project")
     project.mkdir()
     (project / "Cargo.toml").write_text(
@@ -161,9 +174,12 @@ def test_wrong_or_malformed_tag_blocks_publication(release, tag):
 def test_pep440_and_cargo_prerelease_tags_match_normalized_metadata(
     release, tag, version
 ):
+    for path in release.iterdir():
+        path.unlink()
+    filename_version = str(Version(version))
     for platform in ("manylinux2014_x86_64", "win_amd64", "macosx_11_0_arm64"):
-        wheel(release, platform, metadata(version))
-    sdist(release, metadata(version))
+        wheel(release, platform, metadata(version), version=filename_version)
+    sdist(release, metadata(version), version=filename_version)
     assert len(validate_release(release, tag)) == 4
 
 
@@ -181,13 +197,15 @@ def test_pep440_and_cargo_prerelease_tags_match_normalized_metadata(
 def test_stale_prerelease_or_final_metadata_blocks_publication(
     release, archive, tag, matching, stale
 ):
+    for path in release.iterdir():
+        path.unlink()
     for platform in ("manylinux2014_x86_64", "win_amd64", "macosx_11_0_arm64"):
-        wheel(release, platform, metadata(matching))
-    sdist(release, metadata(matching))
+        wheel(release, platform, metadata(matching), version=matching)
+    sdist(release, metadata(matching), version=matching)
     if archive == "wheel":
-        wheel(release, "win_amd64", metadata(stale))
+        wheel(release, "win_amd64", metadata(stale), version=matching)
     else:
-        sdist(release, metadata(stale))
+        sdist(release, metadata(stale), version=matching)
     with pytest.raises(ValueError, match="does not match"):
         validate_release(release, tag)
 
@@ -195,6 +213,52 @@ def test_stale_prerelease_or_final_metadata_blocks_publication(
 def test_local_version_artifact_cannot_match_a_public_release(release):
     wheel(release, "win_amd64", metadata("1.2.3+local"))
     with pytest.raises(ValueError, match="does not match"):
+        validate_release(release, "v1.2.3")
+
+
+@pytest.mark.parametrize(
+    ("original", "renamed"),
+    [
+        ("mirt-1.2.3-cp311-abi3-win_amd64.whl", "mirt-1.2.2-cp311-abi3-win_amd64.whl"),
+        ("mirt-1.2.3-cp311-abi3-win_amd64.whl", "other-1.2.3-cp311-abi3-win_amd64.whl"),
+        ("mirt-1.2.3-cp311-abi3-win_amd64.whl", "mirt-1.2.3.whl"),
+        ("mirt-1.2.3.tar.gz", "mirt-1.2.2.tar.gz"),
+        ("mirt-1.2.3.tar.gz", "other-1.2.3.tar.gz"),
+        ("mirt-1.2.3.tar.gz", "mirt.tar.gz"),
+    ],
+)
+def test_matching_metadata_cannot_hide_an_invalid_artifact_filename(
+    release, original, renamed
+):
+    (release / original).rename(release / renamed)
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), str(release), "--tag", "v1.2.3"],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 2
+    assert "Traceback" not in completed.stderr
+
+
+def test_valid_wheel_build_and_compressed_compatibility_tags_are_accepted(release):
+    (release / "mirt-1.2.3-cp311-abi3-manylinux2014_x86_64.whl").rename(
+        release
+        / "mirt-1.2.3-7local-cp311.cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+    )
+    assert len(validate_release(release, "v1.2.3")) == 4
+
+
+@pytest.mark.parametrize("archive", ["wheel", "sdist"])
+@pytest.mark.parametrize("metadata_directory", ["mirt-1.2.2", "other-1.2.3", "mirt"])
+def test_metadata_directory_must_identify_the_same_release(
+    release, archive, metadata_directory
+):
+    if archive == "wheel":
+        wheel(release, "win_amd64", metadata_directory=metadata_directory)
+    else:
+        sdist(release, metadata_directory=metadata_directory)
+    with pytest.raises(ValueError):
         validate_release(release, "v1.2.3")
 
 

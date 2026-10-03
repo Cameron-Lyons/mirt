@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 use rand::{prelude::*, rngs::StdRng};
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, NormalSampler, log_likelihood_2pl_single};
+use crate::utils::{NormalSampler, log_likelihood_2pl_single};
 
 /// Generate plausible values using posterior sampling
 #[pyfunction]
@@ -36,7 +36,7 @@ pub fn generate_plausible_values_posterior<'py>(
     let quad_vec: Vec<f64> = quad_points.to_vec();
     let weight_vec: Vec<f64> = quad_weights.to_vec();
 
-    let log_weights: Vec<f64> = weight_vec.iter().map(|&w| (w + EPSILON).ln()).collect();
+    let log_weights: Vec<f64> = weight_vec.iter().map(|&w| w.ln()).collect();
 
     let pvs: Vec<Vec<f64>> = (0..n_persons)
         .into_par_iter()
@@ -78,7 +78,11 @@ pub fn generate_plausible_values_posterior<'py>(
                             break;
                         }
                     }
-                    quad_vec[idx] + normal.sample(&mut rng)
+                    if jitter_sd > 0.0 {
+                        quad_vec[idx] + normal.sample(&mut rng)
+                    } else {
+                        quad_vec[idx]
+                    }
                 })
                 .collect()
         })

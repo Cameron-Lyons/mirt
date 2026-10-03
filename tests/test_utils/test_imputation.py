@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 import mirt
-import mirt.scoring as scoring_module
 import mirt.utils.imputation as imputation_module
 from mirt import analyze_missing, averageMI, impute_responses, listwise_deletion
 from mirt.exceptions import MirtDataError, MirtValidationError
@@ -214,10 +213,11 @@ class TestImputeResponses:
 
     def test_multiple_imputation_reuses_fit_and_batches_each_copy(self, monkeypatch):
         responses = np.array([[-1, 0], [1, -1], [0, 1]])
-        calls = {"fit": 0, "score": 0, "probability": 0}
+        calls = {"fit": 0, "posterior": 0, "probability": 0}
 
         class FakeModel:
             is_polytomous = False
+            n_factors = 1
 
             def probability_pairs(self, theta, item_indices):
                 calls["probability"] += 1
@@ -227,17 +227,19 @@ class TestImputeResponses:
 
         def fake_fit(*args, **kwargs):
             calls["fit"] += 1
+            np.testing.assert_array_equal(args[0], responses)
+            assert kwargs["compute_standard_errors"] is False
             return SimpleNamespace(model=fake_model)
 
-        def fake_scores(*args, **kwargs):
-            calls["score"] += 1
-            return SimpleNamespace(
-                theta=np.zeros(len(responses)),
-                standard_error=np.full(len(responses), 0.1),
-            )
+        def fake_posterior(model, observed, n_imputations, n_quadpts, rng):
+            calls["posterior"] += 1
+            np.testing.assert_array_equal(observed, responses[:2])
+            return np.zeros((len(observed), 1, n_imputations))
 
         monkeypatch.setattr(mirt, "fit_mirt", fake_fit)
-        monkeypatch.setattr(scoring_module, "fscores", fake_scores)
+        monkeypatch.setattr(
+            imputation_module, "_posterior_ability_draws", fake_posterior
+        )
 
         imputations = impute_responses(
             responses,
@@ -246,7 +248,7 @@ class TestImputeResponses:
             seed=42,
         )
 
-        assert calls == {"fit": 1, "score": 1, "probability": 4}
+        assert calls == {"fit": 1, "posterior": 1, "probability": 4}
         assert len(imputations) == 4
         assert all(np.all(imputation >= 0) for imputation in imputations)
 
@@ -258,6 +260,7 @@ class TestImputeResponses:
 
         class FakeModel:
             is_polytomous = False
+            n_factors = 1
 
             def probability(self, theta, item=None):
                 calls.append(item)
@@ -271,11 +274,10 @@ class TestImputeResponses:
             lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
         )
         monkeypatch.setattr(
-            scoring_module,
-            "fscores",
-            lambda *args, **kwargs: SimpleNamespace(
-                theta=np.zeros(len(responses)),
-                standard_error=np.full(len(responses), 0.1),
+            imputation_module,
+            "_posterior_ability_draws",
+            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+                (len(observed), 1, n_imputations)
             ),
         )
 
@@ -297,6 +299,7 @@ class TestImputeResponses:
 
         class FakeModel:
             is_polytomous = False
+            n_factors = 1
 
             def probability_pairs(self, theta, item_indices):
                 batch_sizes.append(len(theta))
@@ -309,11 +312,10 @@ class TestImputeResponses:
             lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
         )
         monkeypatch.setattr(
-            scoring_module,
-            "fscores",
-            lambda *args, **kwargs: SimpleNamespace(
-                theta=np.zeros(len(responses)),
-                standard_error=np.full(len(responses), 0.1),
+            imputation_module,
+            "_posterior_ability_draws",
+            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+                (len(observed), 1, n_imputations)
             ),
         )
 
@@ -340,6 +342,7 @@ class TestImputeResponses:
         class FakeModel:
             is_polytomous = True
             n_categories = [3, 3, 3]
+            n_factors = 1
 
             def probability_pairs(self, theta, item_indices):
                 nonlocal calls
@@ -354,11 +357,10 @@ class TestImputeResponses:
             lambda *args, **kwargs: SimpleNamespace(model=FakeModel()),
         )
         monkeypatch.setattr(
-            scoring_module,
-            "fscores",
-            lambda *args, **kwargs: SimpleNamespace(
-                theta=np.zeros(len(responses)),
-                standard_error=np.full(len(responses), 0.1),
+            imputation_module,
+            "_posterior_ability_draws",
+            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+                (len(observed), 1, n_imputations)
             ),
         )
 
@@ -374,7 +376,9 @@ class TestImputeResponses:
         for imputed in imputations:
             np.testing.assert_array_equal(imputed[responses == -1], 2)
 
-    def test_multiple_imputation_falls_back_when_scoring_fails(self, monkeypatch):
+    def test_multiple_imputation_warns_and_falls_back_when_posterior_fails(
+        self, monkeypatch
+    ):
         responses = np.array([[-1, 0], [1, -1], [0, 1]])
 
         monkeypatch.setattr(
@@ -383,20 +387,309 @@ class TestImputeResponses:
             lambda *args, **kwargs: SimpleNamespace(model=object()),
         )
 
-        def fail_scoring(*args, **kwargs):
-            raise RuntimeError("scoring failed")
+        def fail_posterior(*args, **kwargs):
+            raise RuntimeError("posterior failed")
 
-        monkeypatch.setattr(scoring_module, "fscores", fail_scoring)
-
-        imputations = impute_responses(
-            responses,
-            method="multiple",
-            n_imputations=3,
-            seed=42,
+        monkeypatch.setattr(
+            imputation_module, "_posterior_ability_draws", fail_posterior
         )
+
+        with pytest.warns(RuntimeWarning, match="empirical item distributions"):
+            imputations = impute_responses(
+                responses,
+                method="multiple",
+                n_imputations=3,
+                seed=42,
+            )
 
         assert len(imputations) == 3
         assert all(np.all(imputation >= 0) for imputation in imputations)
+
+    def test_named_model_calibration_and_posterior_receive_only_observed_responses(
+        self, monkeypatch
+    ):
+        from mirt.models import TwoParameterLogistic
+
+        responses = np.array([[1, 99], [0, 1], [99, 0]])
+        observed = np.array([[1, -1], [0, 1], [-1, 0]])
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        fit_calls = []
+        posterior_calls = []
+        original_likelihood = model.log_likelihood_batch
+
+        def calibrated(data, **kwargs):
+            fit_calls.append(data.copy())
+            return SimpleNamespace(model=model)
+
+        def likelihood(data, points):
+            posterior_calls.append(data.copy())
+            return original_likelihood(data, points)
+
+        monkeypatch.setattr(mirt, "fit_mirt", calibrated)
+        monkeypatch.setattr(model, "log_likelihood_batch", likelihood)
+        imputations = impute_responses(
+            responses, method="multiple", n_imputations=3, missing_code=99, seed=11
+        )
+
+        assert len(fit_calls) == 1
+        np.testing.assert_array_equal(fit_calls[0], observed)
+        np.testing.assert_array_equal(np.concatenate(posterior_calls), observed[[0, 2]])
+        for imputed in imputations:
+            np.testing.assert_array_equal(
+                imputed[responses != 99], responses[responses != 99]
+            )
+        np.testing.assert_array_equal(responses, [[1, 99], [0, 1], [99, 0]])
+
+    def test_multiple_imputation_matches_independent_conditional_predictive_integrals(
+        self,
+    ):
+        from scipy.integrate import quad
+        from scipy.special import expit
+
+        from mirt.models import TwoParameterLogistic
+
+        slopes = np.array([1.4, 1.1, 1.6])
+        locations = np.array([-0.5, 0.2, 0.8])
+        model = TwoParameterLogistic(3)
+        model.set_parameters(discrimination=slopes, difficulty=locations)
+        model._is_fitted = True
+        responses = np.tile([1, -1, -1], (2000, 1))
+        responses.flags.writeable = False
+
+        def posterior_kernel(point):
+            return expit(slopes[0] * (point - locations[0])) * np.exp(-0.5 * point**2)
+
+        def predictive(point, items):
+            return np.prod(expit(slopes[items] * (point - locations[items])))
+
+        mass = quad(posterior_kernel, -12.0, 12.0)[0]
+        expected = [
+            quad(
+                lambda point: posterior_kernel(point) * predictive(point, items),
+                -12.0,
+                12.0,
+            )[0]
+            / mass
+            for items in ([1], [2], [1, 2])
+        ]
+        draws = np.asarray(
+            impute_responses(
+                responses,
+                method="multiple",
+                model=model,
+                n_imputations=20,
+                n_quadpts=81,
+                seed=1035,
+            )
+        )
+        samples = draws[:, :, 1:].reshape(-1, 2)
+        actual = [
+            samples[:, 0].mean(),
+            samples[:, 1].mean(),
+            np.all(samples == 1, axis=1).mean(),
+        ]
+
+        np.testing.assert_allclose(actual, expected, atol=0.015)
+        np.testing.assert_array_equal(draws[:, :, 0], 1)
+        np.testing.assert_array_equal(responses, np.tile([1, -1, -1], (2000, 1)))
+
+    def test_multiple_imputation_preserves_dependence_between_latent_factors(self):
+        from numpy.polynomial.hermite import hermgauss
+        from scipy.special import expit
+
+        from mirt.models import TwoParameterLogistic
+
+        slope = 3.0
+        model = TwoParameterLogistic(3, n_factors=2)
+        model.set_parameters(
+            discrimination=np.array([[slope, slope], [slope, 0.0], [0.0, slope]]),
+            difficulty=np.zeros(3),
+        )
+        model._is_fitted = True
+        responses = np.tile([1, -1, -1], (2000, 1))
+        nodes, weights = hermgauss(61)
+        first, second = np.meshgrid(
+            nodes * np.sqrt(2.0), nodes * np.sqrt(2.0), indexing="ij"
+        )
+        posterior = (
+            weights[:, None] * weights[None, :] * expit(slope * (first + second))
+        )
+        posterior /= posterior.sum()
+        first_probability = expit(slope * first)
+        second_probability = expit(slope * second)
+        expected_means = [
+            (posterior * probability).sum()
+            for probability in (first_probability, second_probability)
+        ]
+        expected_joint = (posterior * first_probability * second_probability).sum()
+        expected_covariance = expected_joint - np.prod(expected_means)
+
+        draws = np.asarray(
+            impute_responses(
+                responses,
+                method="multiple",
+                model=model,
+                n_imputations=20,
+                n_quadpts=61,
+                seed=987,
+            )
+        )
+        samples = draws[:, :, 1:].reshape(-1, 2)
+        actual_joint = np.all(samples == 1, axis=1).mean()
+        actual_covariance = actual_joint - np.prod(samples.mean(axis=0))
+
+        np.testing.assert_allclose(samples.mean(axis=0), expected_means, atol=0.015)
+        assert actual_joint == pytest.approx(expected_joint, abs=0.015)
+        assert actual_covariance == pytest.approx(expected_covariance, abs=0.012)
+        assert actual_covariance < -0.02
+
+    def test_calibrated_model_and_fit_result_reuse_item_parameters(self, monkeypatch):
+        from mirt.models import TwoParameterLogistic
+        from mirt.results import FitResult
+
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        result = FitResult(
+            model=model,
+            log_likelihood=0.0,
+            n_iterations=0,
+            converged=True,
+            standard_errors={},
+            aic=0.0,
+            bic=0.0,
+        )
+
+        def unexpected_fit(*args, **kwargs):
+            raise AssertionError("a supplied calibration must not be re-estimated")
+
+        monkeypatch.setattr(mirt, "fit_mirt", unexpected_fit)
+        responses = np.array([[0, -1], [1, -1], [-1, -1]])
+        before = {name: values.copy() for name, values in model.parameters.items()}
+        first = impute_responses(
+            responses, method="multiple", model=model, n_imputations=3, seed=813
+        )
+        second = impute_responses(
+            responses, method="multiple", model=result, n_imputations=3, seed=813
+        )
+
+        np.testing.assert_array_equal(first, second)
+        for name, values in before.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
+        assert np.isin(first, [0, 1]).all()
+
+    def test_calibrated_ordinal_model_respects_item_categories(self):
+        from mirt.models import GradedResponseModel
+
+        model = GradedResponseModel(2, n_categories=[3, 4])
+        model._is_fitted = True
+        responses = np.array([[0, -1], [2, 3], [-1, -1]])
+
+        draws = np.asarray(
+            impute_responses(
+                responses, method="multiple", model=model, n_imputations=10, seed=451
+            )
+        )
+
+        assert np.all((draws >= 0) & (draws < np.array([3, 4])))
+        np.testing.assert_array_equal(draws[:, 1], np.tile([2, 3], (10, 1)))
+
+    def test_calibrated_model_supports_single_model_based_imputation(self):
+        from mirt.models import TwoParameterLogistic
+
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+        responses = np.array([[0, -1], [1, -1], [-1, -1]])
+
+        first = impute_responses(responses, method="EM", model=model, seed=185)
+        second = impute_responses(responses, method="EM", model=model, seed=185)
+
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(first[:2, 0], responses[:2, 0])
+        assert np.isin(first, [0, 1]).all()
+
+    @pytest.mark.parametrize("n_quadpts", [0, -1, 1.5, True])
+    def test_multiple_imputation_validates_posterior_resolution(self, n_quadpts):
+        with pytest.raises(MirtValidationError, match="n_quadpts"):
+            impute_responses(
+                np.array([[0, -1], [1, 1]]), method="multiple", n_quadpts=n_quadpts
+            )
+
+    def test_model_based_imputation_rejects_unfitted_or_incompatible_calibrations(self):
+        from mirt.models import TwoParameterLogistic
+
+        model = TwoParameterLogistic(2)
+        with pytest.raises(MirtValidationError, match="fitted model"):
+            impute_responses(
+                np.array([[0, -1], [1, 1]]), method="multiple", model=model
+            )
+        model._is_fitted = True
+        with pytest.raises(MirtDataError, match="number of response items"):
+            impute_responses(
+                np.array([[0, -1, 1], [1, 1, 1]]), method="multiple", model=model
+            )
+        with pytest.raises(MirtValidationError, match="Unknown imputation model"):
+            impute_responses(
+                np.array([[0, -1], [1, 1]]), method="multiple", model="unknown"
+            )
+
+    def test_calibrated_model_does_not_fall_back_when_posterior_fails(
+        self, monkeypatch
+    ):
+        from mirt.models import TwoParameterLogistic
+
+        model = TwoParameterLogistic(2)
+        model._is_fitted = True
+
+        def failed_posterior(*args, **kwargs):
+            raise RuntimeError("posterior failed")
+
+        monkeypatch.setattr(
+            imputation_module, "_posterior_ability_draws", failed_posterior
+        )
+        with pytest.raises(RuntimeError, match="posterior failed"):
+            impute_responses(
+                np.array([[0, -1], [1, 1]]), method="multiple", model=model
+            )
+
+    def test_calibration_failure_returns_warned_empirical_draws(self, monkeypatch):
+        responses = np.array([[-1, 1], [0, -1], [1, 0]])
+
+        def failed_fit(*args, **kwargs):
+            raise RuntimeError("calibration failed")
+
+        monkeypatch.setattr(mirt, "fit_mirt", failed_fit)
+        with pytest.warns(RuntimeWarning, match="calibration failed"):
+            draws = np.asarray(
+                impute_responses(responses, method="multiple", n_imputations=4, seed=21)
+            )
+
+        assert np.isin(draws, [0, 1]).all()
+        for draw in draws:
+            np.testing.assert_array_equal(
+                draw[responses >= 0], responses[responses >= 0]
+            )
+
+    @pytest.mark.parametrize(
+        "model_name", ["2PL", "calibrated_binary", "calibrated_ordinal"]
+    )
+    def test_model_based_imputation_validates_observed_categories(self, model_name):
+        from mirt.models import GradedResponseModel, TwoParameterLogistic
+
+        if model_name == "2PL":
+            model = model_name
+            responses = np.array([[2, -1], [0, 1]])
+        elif model_name == "calibrated_binary":
+            model = TwoParameterLogistic(2)
+            model._is_fitted = True
+            responses = np.array([[2, -1], [0, 1]])
+        else:
+            model = GradedResponseModel(2, n_categories=[3, 4])
+            model._is_fitted = True
+            responses = np.array([[3, -1], [0, 1]])
+
+        with pytest.raises(MirtDataError):
+            impute_responses(responses, method="multiple", model=model)
 
 
 class TestAnalyzeMissing:

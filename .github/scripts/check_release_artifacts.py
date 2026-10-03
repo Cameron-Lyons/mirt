@@ -11,6 +11,7 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 
+from packaging.utils import parse_sdist_filename, parse_wheel_filename
 from packaging.version import Version
 
 
@@ -31,7 +32,16 @@ def _release_version(tag: str) -> Version:
     return version
 
 
-def _metadata(path: Path) -> bytes:
+def _require_archive_identity(path: Path, directory: str, version: Version) -> None:
+    name, archive_version = parse_sdist_filename(directory + ".tar.gz")
+    if name != "mirt" or archive_version != version:
+        raise ValueError(
+            f"{path.name}: metadata directory {directory!r} "
+            f"does not match package mirt {str(version)!r}"
+        )
+
+
+def _metadata(path: Path, version: Version) -> bytes:
     if path.suffix == ".whl":
         with zipfile.ZipFile(path) as archive:
             entries = [
@@ -41,6 +51,8 @@ def _metadata(path: Path) -> bytes:
             ]
             if len(entries) != 1:
                 raise ValueError(f"{path.name}: expected exactly one wheel METADATA")
+            directory = entries[0].split("/", 1)[0].removesuffix(".dist-info")
+            _require_archive_identity(path, directory, version)
             return archive.read(entries[0])
 
     with tarfile.open(path, "r:gz") as archive:
@@ -51,6 +63,7 @@ def _metadata(path: Path) -> bytes:
         ]
         if len(entries) != 1 or not entries[0].isfile():
             raise ValueError(f"{path.name}: expected exactly one sdist PKG-INFO file")
+        _require_archive_identity(path, entries[0].name.split("/", 1)[0], version)
         stream = archive.extractfile(entries[0])
         if stream is None:
             raise ValueError(f"{path.name}: could not read sdist PKG-INFO")
@@ -72,7 +85,17 @@ def validate_release(directory: Path, tag: str) -> list[Path]:
         raise ValueError("Release directory contains unsupported files")
 
     for path in paths:
-        metadata = BytesParser(policy=policy.default).parsebytes(_metadata(path))
+        if path.suffix == ".whl":
+            name, version, _, _ = parse_wheel_filename(path.name)
+        else:
+            name, version = parse_sdist_filename(path.name)
+        if name != "mirt" or version != release_version:
+            raise ValueError(
+                f"{path.name}: artifact filename does not match {tag!r} for package mirt"
+            )
+        metadata = BytesParser(policy=policy.default).parsebytes(
+            _metadata(path, release_version)
+        )
         names = metadata.get_all("Name", [])
         versions = metadata.get_all("Version", [])
         if names != ["mirt"]:

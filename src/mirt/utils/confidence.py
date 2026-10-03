@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from math import frexp, ldexp
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -347,7 +348,9 @@ def delta_method(
         Transformed estimate and its delta-method standard error.
     """
     estimate_values = _as_finite_vector(estimates, "estimates")
-    covariance = _validate_covariance(vcov, estimate_values.size)
+    correlation_factor, parameter_errors = _validate_covariance(
+        vcov, estimate_values.size
+    )
     if not callable(transform_func):
         raise MirtValidationError(
             "transform_func must be callable",
@@ -366,15 +369,29 @@ def delta_method(
             )
         gradient = _evaluate_gradient(gradient_func, estimate_values)
 
-    variance = float(gradient @ covariance @ gradient)
-    scale = max(1.0, float(np.max(np.abs(covariance))))
-    if variance < -1e-10 * scale:
-        raise MirtEstimationError(
-            "delta-method variance is negative",
-            variance=variance,
-        )
-    standard_error = np.sqrt(max(variance, 0.0))
-    return transformed, float(standard_error)
+    contributing = (gradient != 0.0) & (parameter_errors > 0.0)
+    if not np.any(contributing):
+        return transformed, 0.0
+    # Weight each derivative by its parameter standard error before choosing
+    # a common binary scale. Zero-variance directions cannot hide uncertainty
+    # in other coordinates, and neither variance squares nor intermediate
+    # derivative/error products need to be representable as ordinary floats.
+    gradient_mantissa, gradient_exponent = np.frexp(gradient[contributing])
+    error_mantissa, error_exponent = np.frexp(parameter_errors[contributing])
+    exponents = gradient_exponent + error_exponent
+    common_exponent = int(np.max(exponents))
+    weighted = np.zeros_like(gradient)
+    weighted[contributing] = np.ldexp(
+        gradient_mantissa * error_mantissa, exponents - common_exponent
+    )
+    projected = correlation_factor.T @ weighted
+    normalized_error = float(np.hypot.reduce(projected))
+    mantissa, exponent = frexp(normalized_error)
+    try:
+        standard_error = ldexp(mantissa, exponent + common_exponent)
+    except OverflowError:
+        standard_error = np.inf
+    return transformed, standard_error
 
 
 def _numerical_gradient(
@@ -682,7 +699,10 @@ def _as_finite_vector(values: ArrayLike, parameter: str) -> NDArray[np.float64]:
     return result
 
 
-def _validate_covariance(vcov: ArrayLike, size: int) -> NDArray[np.float64]:
+def _validate_covariance(
+    vcov: ArrayLike, size: int
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return a correlation square root and parameter standard errors."""
     try:
         covariance = np.asarray(vcov, dtype=np.float64)
     except (TypeError, ValueError) as exc:
@@ -702,20 +722,61 @@ def _validate_covariance(vcov: ArrayLike, size: int) -> NDArray[np.float64]:
             "vcov must contain only finite values",
             parameter="vcov",
         )
-    if not np.allclose(covariance, covariance.T, rtol=1e-10, atol=1e-12):
+    scale = float(np.max(np.abs(covariance)))
+    normalized = covariance / scale if scale > 0.0 else covariance
+    roundoff = 32.0 * np.finfo(np.float64).eps * size
+    if not np.allclose(normalized, normalized.T, rtol=0.0, atol=roundoff):
         raise MirtValidationError(
             "vcov must be symmetric",
             parameter="vcov",
         )
-    eigenvalues = np.linalg.eigvalsh(covariance)
-    scale = max(1.0, float(np.max(np.abs(covariance))))
-    if float(eigenvalues.min()) < -1e-10 * scale:
+    diagonal = np.diag(covariance)
+    positive = diagonal > 0.0
+    if np.any(diagonal < 0.0) or np.any(covariance[~positive] != 0.0):
+        raise MirtValidationError(
+            "vcov must be positive semidefinite",
+            parameter="vcov",
+        )
+    errors = np.sqrt(np.maximum(diagonal, 0.0))
+    if not np.any(positive):
+        return np.empty((size, 0)), errors
+
+    # Coordinate scaling retains small positive variances when another
+    # parameter's variance is hundreds of orders of magnitude larger.
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        correlation = covariance[np.ix_(positive, positive)] / errors[positive, None]
+        correlation /= errors[None, positive]
+    if not np.all(np.isfinite(correlation)):
+        raise MirtValidationError(
+            "vcov must be positive semidefinite",
+            parameter="vcov",
+        )
+    if not np.allclose(correlation, correlation.T, rtol=0.0, atol=roundoff):
+        raise MirtValidationError(
+            "vcov must be symmetric",
+            parameter="vcov",
+        )
+    if np.any(np.abs(correlation) > 1.0 + roundoff):
+        raise MirtValidationError(
+            "vcov must be positive semidefinite",
+            parameter="vcov",
+        )
+    np.fill_diagonal(correlation, 1.0)
+    # Average only bounded correlation entries, preserving original positive
+    # variances, including subnormal values, without overflowing large inputs.
+    correlation = 0.5 * (correlation + correlation.T)
+    eigenvalues, eigenvectors = np.linalg.eigh(correlation)
+    if float(eigenvalues.min()) < -roundoff * float(np.max(np.abs(eigenvalues))):
         raise MirtValidationError(
             "vcov must be positive semidefinite",
             parameter="vcov",
             value=float(eigenvalues.min()),
         )
-    return covariance
+    # Tolerated negative eigenvalues represent roundoff in a singular PSD
+    # matrix. Clipping them here also prevents spurious negative variances.
+    factor = np.zeros((size, eigenvalues.size))
+    factor[positive] = eigenvectors * np.sqrt(np.maximum(eigenvalues, 0.0))
+    return factor, errors
 
 
 def _evaluate_transform(

@@ -30,6 +30,9 @@ env:
   CARGO_TERM_COLOR: always
   MPLBACKEND: Agg
   PYTHONHASHSEED: "0"
+  OMP_NUM_THREADS: "1"
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
 
 jobs:
   workflow-lint:
@@ -235,8 +238,6 @@ jobs:
     timeout-minutes: 15
     env:
       PYTHONPATH: ${{ github.workspace }}/src
-      OMP_NUM_THREADS: "1"
-      OPENBLAS_NUM_THREADS: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

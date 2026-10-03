@@ -1,5 +1,7 @@
 """Tests for bootstrap standard errors and confidence intervals."""
 
+import pickle
+from decimal import Decimal, localcontext
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,10 +15,189 @@ from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.dichotomous import FourParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 from mirt.utils.bootstrap import (
+    _bca_interval,
     _elementwise_percentile,
+    _fit_jackknife_task,
+    _iter_sample_indices,
+    _JackknifeMoments,
     _resample_rng_chunks,
     _simulate_model_responses,
+    _StatisticFitTask,
 )
+
+
+def _response_mean_statistic(model, sample):
+    """A picklable statistic for real process-worker ordering checks."""
+    return {"mean": sample.mean(axis=0)}
+
+
+def _decimal_jackknife_acceleration(values):
+    """Independent central moments with enough precision for extreme offsets."""
+    flat = values.reshape(len(values), -1)
+    result = []
+    with localcontext() as context:
+        context.prec = 80
+        for column in flat.T:
+            decimals = [Decimal(float(value)) for value in column]
+            mean = sum(decimals) / len(decimals)
+            differences = [mean - value for value in decimals]
+            m2 = sum(value**2 for value in differences)
+            m3 = sum(value**3 for value in differences)
+            result.append(float(m3 / (6 * m2.sqrt() ** 3)) if m2 else 0.0)
+    return np.array(result).reshape(values.shape[1:])
+
+
+@pytest.mark.parametrize("chunk_sizes", [[17], [1] * 17, [2, 5, 4, 6]])
+def test_streamed_jackknife_moments_match_decimal_reference(chunk_sizes):
+    offsets = np.array([0, 1, 2, 3, 4, 5, 10, 40, 8, 7, 19, 10, -1, 30, 1, 3, 2])
+    values = np.column_stack(
+        [
+            [-1e308] * 8 + [1e308] * 9,
+            1e100 + offsets * np.spacing(1e100),
+            offsets * -1e-150,
+            np.full(17, 42.0),
+        ]
+    ).reshape(17, 2, 2)
+    reference = _decimal_jackknife_acceleration(values)
+    merged = None
+    start = 0
+    with np.errstate(over="raise", invalid="raise", divide="raise"):
+        for size in chunk_sizes:
+            summary = _JackknifeMoments.from_value(values[start])
+            for row in values[start + 1 : start + size]:
+                summary.add(row)
+            if merged is None:
+                merged = summary
+            else:
+                merged.merge(summary)
+            start += size
+        acceleration = merged.acceleration()
+    assert merged.count == len(values)
+    np.testing.assert_allclose(acceleration, reference, rtol=2e-13, atol=1e-15)
+
+
+def test_jackknife_worker_returns_fixed_size_theta_summaries(monkeypatch):
+    n_persons = 4096
+    responses = np.tile(np.array([[0], [1]]), (n_persons // 2, 1))
+    model = TwoParameterLogistic(n_items=1)
+
+    def fake_fit(self, fitted_model, sample):
+        fitted_model._parameters["difficulty"][0] = sample.sum()
+        return SimpleNamespace(model=fitted_model)
+
+    def fake_scores(fitted_model, original_responses, method):
+        scores = (np.arange(len(original_responses)) + 1) * fitted_model._parameters[
+            "difficulty"
+        ][0]
+        return SimpleNamespace(theta=scores.astype(float))
+
+    monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+    monkeypatch.setattr("mirt.scoring.fscores", fake_scores)
+    result_sizes = []
+    for n_omitted in [8, 2048]:
+        task = _StatisticFitTask(
+            model=model,
+            original_params=model.parameters,
+            warm_start=True,
+            max_iter=1,
+            responses=responses,
+            statistic="theta",
+            omitted_indices=list(range(n_omitted)),
+            statistic_shapes={"theta": (n_persons,)},
+        )
+        summary = _fit_jackknife_task(task)
+        assert summary["theta"].count == n_omitted
+        np.testing.assert_allclose(summary["theta"].acceleration(), 0.0, atol=1e-14)
+        serialized_size = len(pickle.dumps(summary))
+        # Five arrays per statistic plus bounded dataclass/pickle metadata;
+        # retaining n_omitted theta vectors would exceed this by orders of magnitude.
+        assert serialized_size < 5 * n_persons * 8 + 2048
+        result_sizes.append(serialized_size)
+    assert abs(result_sizes[1] - result_sizes[0]) < 64
+
+
+def test_jackknife_sample_indices_are_generated_only_when_consumed(monkeypatch):
+    responses = np.tile([[0], [1]], (8, 1))
+    model = TwoParameterLogistic(n_items=1)
+    task = _StatisticFitTask(
+        model=model,
+        original_params=model.parameters,
+        warm_start=True,
+        max_iter=1,
+        responses=responses,
+        statistic="parameters",
+        omitted_indices=list(range(len(responses))),
+    )
+    original_delete = np.delete
+    calls = []
+
+    def capture(indices, omitted):
+        calls.append(omitted)
+        return original_delete(indices, omitted)
+
+    monkeypatch.setattr(np, "delete", capture)
+    iterator = _iter_sample_indices(task)
+    assert calls == []
+    first = next(iterator)
+    assert calls == [0]
+    np.testing.assert_array_equal(first, np.arange(1, len(responses)))
+    next(iterator)
+    assert calls == [0, 1]
+
+
+@pytest.mark.parametrize("alpha", [0.05, 0.0001])
+@pytest.mark.parametrize("scale", [1e-150, 1e-9, 1.0, 1e150])
+def test_bca_interval_matches_scipy_and_is_independent_of_statistic_units(alpha, scale):
+    from scipy.stats import bootstrap
+
+    data = np.array([0.1, 0.2, 0.3, 0.7, 0.9, 1.0, 1.1, 1.4, 2.0, 2.5, 3.0, 5.0, 9.0])
+    rng = np.random.default_rng(221)
+    samples = np.array(
+        [data[rng.integers(0, data.size, size=data.size)].mean() for _ in range(4000)]
+    )
+    jackknife = [
+        np.asarray(np.delete(data, row).mean() * scale) for row in range(data.size)
+    ]
+    reference = bootstrap(
+        (data,),
+        np.mean,
+        n_resamples=len(samples),
+        confidence_level=1.0 - alpha,
+        method="BCa",
+        random_state=np.random.default_rng(221),
+    ).confidence_interval
+
+    with np.errstate(over="raise", divide="raise", invalid="raise"):
+        lower, upper = _bca_interval(
+            samples * scale, np.asarray(data.mean() * scale), jackknife, alpha
+        )
+
+    np.testing.assert_allclose(
+        np.array([lower, upper]) / scale, [reference.low, reference.high], rtol=1e-12
+    )
+
+
+def test_bca_interval_matches_scipy_for_a_discrete_statistic_with_ties():
+    from scipy.stats import bootstrap
+
+    data = np.array([0.0] * 23 + [1.0] * 8)
+    rng = np.random.default_rng(221)
+    samples = np.array(
+        [data[rng.integers(0, data.size, size=data.size)].mean() for _ in range(4000)]
+    )
+    jackknife = [np.asarray(np.delete(data, row).mean()) for row in range(data.size)]
+    reference = bootstrap(
+        (data,),
+        np.mean,
+        n_resamples=len(samples),
+        random_state=np.random.default_rng(221),
+    ).confidence_interval
+
+    lower, upper = _bca_interval(samples, np.asarray(data.mean()), jackknife, 0.05)
+
+    np.testing.assert_allclose(
+        [lower, upper], [reference.low, reference.high], rtol=1e-12
+    )
 
 
 def test_elementwise_percentile_matches_independent_numpy_quantiles():
@@ -432,6 +613,85 @@ class TestBootstrapCI:
             assert upper.shape == model.parameters[name].shape
             assert np.all(np.isfinite(lower))
             assert np.all(np.isfinite(upper))
+
+    def test_bca_uses_every_person_in_the_jackknife_and_matches_scipy(
+        self, monkeypatch
+    ):
+        from scipy.stats import bootstrap
+
+        model = TwoParameterLogistic(n_items=1)
+        responses = np.array([0] * 23 + [1] * 8).reshape(-1, 1)
+        jackknife_sizes = []
+
+        def fake_fit(self, fitted_model, sample):
+            if len(sample) < len(responses):
+                jackknife_sizes.append(len(sample))
+            return SimpleNamespace(model=fitted_model)
+
+        monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+        intervals = bootstrap_ci(
+            model,
+            responses,
+            n_bootstrap=4000,
+            statistic=lambda model, data: {"mean": data.mean(axis=0)},
+            method="BCa",
+            seed=221,
+        )
+        reference = bootstrap(
+            (responses[:, 0],),
+            np.mean,
+            n_resamples=4000,
+            random_state=np.random.default_rng(221),
+        ).confidence_interval
+
+        assert jackknife_sizes == [len(responses) - 1] * len(responses)
+        np.testing.assert_allclose(
+            [intervals["mean"][0][0], intervals["mean"][1][0]],
+            [reference.low, reference.high],
+            rtol=1e-12,
+        )
+
+    def test_bca_requires_all_jackknife_fits_to_succeed(self, monkeypatch):
+        model = TwoParameterLogistic(n_items=1)
+        responses = np.array([[0], [1], [1], [0]])
+
+        def fake_fit(self, fitted_model, sample):
+            if len(sample) < len(responses):
+                raise RuntimeError("jackknife failed")
+            return SimpleNamespace(model=fitted_model)
+
+        monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+        with pytest.warns(RuntimeWarning, match="full jackknife"):
+            intervals = bootstrap_ci(
+                model,
+                responses,
+                n_bootstrap=10,
+                statistic=lambda model, data: {"mean": data.mean(axis=0)},
+                method="BCa",
+                seed=71,
+            )
+
+        assert np.isnan(intervals["mean"]).all()
+
+    def test_bca_requires_more_than_one_person(self):
+        with pytest.raises(MirtValidationError, match="at least two people"):
+            bootstrap_ci(TwoParameterLogistic(1), np.array([[1]]), method="BCa")
+
+    def test_bca_process_workers_match_serial_streaming_acceleration(self):
+        model = TwoParameterLogistic(n_items=2)
+        responses = np.array([[0, 0], [0, 1], [1, 0], [1, 1], [1, 1], [1, 0], [0, 1]])
+        options = {
+            "n_bootstrap": 32,
+            "statistic": _response_mean_statistic,
+            "method": "BCa",
+            "seed": 391,
+        }
+        serial = bootstrap_ci(model, responses, n_jobs=1, **options)
+        parallel = bootstrap_ci(model, responses, n_jobs=2, **options)
+        for name in serial:
+            np.testing.assert_allclose(
+                parallel[name], serial[name], rtol=0.0, atol=1e-14
+            )
 
     def test_2pl_percentile_ci_uses_native_parallel_samples(self, monkeypatch):
         """Parameter confidence intervals consume native bootstrap draws."""

@@ -114,6 +114,8 @@ Documentation builds run for pull requests, merge queues, and manual dispatches.
 Pull-request updates cancel superseded runs, and jobs have explicit time limits.
 Test reports and scoring, posterior, equating, and pointwise-likelihood benchmarks
 are retained as workflow artifacts.
+CI and release validation limit BLAS/OpenMP thread pools to one thread, avoiding
+oversubscription with Rust and process workers and stabilizing comparisons.
 
 Workflow syntax is checked by a pinned, checksum-verified actionlint release.
 Run `actionlint` to validate workflow changes locally.
@@ -131,6 +133,9 @@ stale artifacts, ambiguous metadata, and unexpected publish inputs fail before
 the PyPI publication environment is entered. The checker normalizes PEP 440
 pre, post, and dev releases, including Cargo spellings such as `v1.2.3-rc.1`,
 while requiring three release components and rejecting PyPI local versions.
+Artifact filenames and the wheel `.dist-info` or source-distribution root
+directory must also identify that same package and version. Release tests
+exercise these failures through the validator's command-line entry point.
 To check collected artifacts with the locked development dependencies:
 
 ```bash
