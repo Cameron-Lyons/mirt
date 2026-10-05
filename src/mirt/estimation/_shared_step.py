@@ -919,28 +919,52 @@ def optimize_tied_items(
         else np.sqrt(_diagonal_curvature(parts, indices, initial, low, high))
     )
 
-    def scaled(vector: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
-        value, gradient = objective(vector / scale)
-        return value, gradient / scale
+    def optimize(scaling: NDArray[np.float64]) -> tuple[NDArray[np.float64], bool]:
+        def scaled(vector: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
+            value, gradient = objective(vector / scaling)
+            return value, gradient / scaling
 
-    result = minimize(
-        scaled,
-        x0=initial * scale,
-        method="SLSQP" if constraint is not None else "L-BFGS-B",
-        jac=True,
-        bounds=list(zip(low * scale, high * scale, strict=True)),
-        options={"maxiter": max_iter, "ftol": ftol},
-        constraints=()
-        if constraint is None
-        else (LinearConstraint(constraint.A / scale, constraint.lb, np.inf),),
-    )
-    candidate = result.x / scale
-    # The M-step must not lower the expected complete-data log-likelihood.
-    if not (
-        np.all(np.isfinite(candidate))
-        and (constraint is None or _satisfies(constraint, candidate))
-        and objective(candidate)[0] <= reference
+        result = minimize(
+            scaled,
+            x0=initial * scaling,
+            method="SLSQP" if constraint is not None else "L-BFGS-B",
+            jac=True,
+            bounds=list(zip(low * scaling, high * scaling, strict=True)),
+            options={"maxiter": max_iter, "ftol": ftol},
+            constraints=()
+            if constraint is None
+            else (LinearConstraint(constraint.A / scaling, constraint.lb, np.inf),),
+        )
+        return result.x / scaling, bool(result.success)
+
+    def feasible_value(candidate: NDArray[np.float64]) -> float:
+        if not (
+            np.all(np.isfinite(candidate))
+            and (constraint is None or _satisfies(constraint, candidate))
+        ):
+            return np.inf
+        value = objective(candidate)[0]
+        return value if np.isfinite(value) else np.inf
+
+    candidate, success = optimize(scale)
+    candidate_value = feasible_value(candidate)
+    if constraint is not None and (
+        not success
+        or not np.isfinite(candidate_value)
+        or np.any(constraint.A @ candidate - constraint.lb <= 1e-8)
     ):
+        # SLSQP can collapse a category and report convergence after its
+        # clipped probability loses its gradient. Tiny rounding differences
+        # determine whether it finds this plateau. Restart from the original
+        # ordered point with one common curvature scale, keeping whichever
+        # feasible endpoint has the better objective. Empty categories can
+        # still attain their minimum gap when that is the actual optimum.
+        retry, _ = optimize(np.full(size, np.max(scale)))
+        retry_value = feasible_value(retry)
+        if retry_value < candidate_value:
+            candidate, candidate_value = retry, retry_value
+    # The M-step must not lower the expected complete-data log-likelihood.
+    if not np.isfinite(candidate_value) or candidate_value > reference:
         if not projected:
             return None
         candidate = initial

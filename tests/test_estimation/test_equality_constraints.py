@@ -5,14 +5,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
-from scipy.optimize import minimize
+from scipy.optimize import OptimizeResult, minimize
 
 import mirt
 from mirt.estimation._acceleration import FreeItemParameters
+from mirt.estimation._graded_order import graded_threshold_constraint
 from mirt.estimation._item_information import item_standard_errors
 from mirt.estimation._shared_step import (
     EqualityGroup,
     TiedCoordinates,
+    TiedItemObjective,
+    optimize_tied_items,
     resolve_equality_constraints,
     validate_equality_constraints,
 )
@@ -217,7 +220,31 @@ def test_starting_values_of_a_group_are_averaged(binary) -> None:
     )
 
 
-def test_disordered_starting_thresholds_do_not_stall_the_joint_step() -> None:
+@pytest.mark.parametrize("use_rust", [False, True])
+@pytest.mark.parametrize("round_objectives", [False, True])
+def test_disordered_starting_thresholds_do_not_stall_the_joint_step(
+    monkeypatch, use_rust, round_objectives
+) -> None:
+    if round_objectives:
+        original = EMEstimator._item_objective
+        weights = 1.0 + np.random.default_rng(35).normal(size=2) * 1e-14
+
+        def rounded(self, model, item, *args, **kwargs):
+            start, bounds, objective, analytic = original(
+                self, model, item, *args, **kwargs
+            )
+            if item >= len(weights) or objective is None or not analytic:
+                return start, bounds, objective, analytic
+
+            def perturbed(vector):
+                value, gradient = objective(vector)
+                return weights[item] * value, weights[item] * gradient
+
+            return start, bounds, perturbed, analytic
+
+        # Backend rounding must not make SLSQP accept a collapsed category.
+        monkeypatch.setattr(EMEstimator, "_item_objective", rounded)
+
     rng = np.random.default_rng(3)
     thresholds = np.array(
         [[-2.5, -2.3, -2.0], [1.8, 2.0, 2.4], [-0.5, 0.0, 0.5], [-1.0, 0.0, 1.0]]
@@ -233,21 +260,87 @@ def test_disordered_starting_thresholds_do_not_stall_the_joint_step() -> None:
     start[:2] = [[6.0, -6.0, -6.0], [6.0, -6.0, -0.2]]
 
     model = GradedResponseModel(4, n_categories=4)
-    EMEstimator(constraints=constraints, max_iter=1, compute_standard_errors=False).fit(
-        model, responses, start={"thresholds": start}
-    )
+    EMEstimator(
+        constraints=constraints,
+        max_iter=1,
+        compute_standard_errors=False,
+        use_rust=use_rust,
+    ).fit(model, responses, start={"thresholds": start})
     # The first M-step already orders the tied items.
     estimate = model.parameters["thresholds"]
     assert np.all(np.diff(estimate, axis=1) > 0)
     assert estimate[0, 0] == estimate[1, 0]
 
-    result = EMEstimator(constraints=constraints).fit(
+    result = EMEstimator(constraints=constraints, use_rust=use_rust).fit(
         GradedResponseModel(4, n_categories=4),
         responses,
         start={"thresholds": start},
     )
-    reference = mirt.fit_mirt(responses, "GRM", constraints=constraints)
+    reference = mirt.fit_mirt(
+        responses, "GRM", constraints=constraints, use_rust=use_rust
+    )
+    assert result.converged and reference.converged
     assert result.log_likelihood == pytest.approx(reference.log_likelihood, abs=1e-3)
+
+
+@pytest.mark.parametrize("first_outcome", ["success", "failure", "nonfinite"])
+def test_tied_step_recovers_from_a_collapsed_optimizer_endpoint(
+    monkeypatch, first_outcome
+) -> None:
+    import mirt.estimation._shared_step as shared_step
+
+    model = GradedResponseModel(2, n_categories=4).set_parameters(
+        thresholds=np.tile([-3.0, 0.0, 3.0], (2, 1))
+    )
+    tied = resolve_equality_constraints([("thresholds", [0, 1], 0)], model)
+    assert tied is not None
+    target = np.array([1.0, -1.0, 0.0, 1.0])
+
+    def objective(vector):
+        delta = vector - target
+        if first_outcome == "nonfinite" and np.all(np.abs(vector[1:]) < 1e-5):
+            return np.nan, delta
+        return float(0.5 * np.sum(delta**2)), delta
+
+    estimator = EMEstimator()
+    parts = []
+    for item in range(model.n_items):
+        start, bounds = estimator._get_item_params_and_bounds(model, item)
+        parts.append(
+            TiedItemObjective(
+                item,
+                start,
+                bounds,
+                objective,
+                graded_threshold_constraint(model, item, start.size),
+            )
+        )
+    original = shared_step.minimize
+    first = True
+
+    def collapse_once(*args, **kwargs):
+        nonlocal first
+        if not first:
+            return original(*args, **kwargs)
+        first = False
+        constraint = kwargs["constraints"][0]
+        collapsed = kwargs["x0"].copy()
+        movable = np.any(constraint.A != 0.0, axis=0)
+        # Return an ordered but collapsed candidate, just as SLSQP can on a
+        # clipped category's flat objective, including a false success flag.
+        collapsed[movable] = np.linalg.lstsq(
+            constraint.A[:, movable], constraint.lb, rcond=None
+        )[0]
+        return OptimizeResult(x=collapsed, success=first_outcome != "failure")
+
+    monkeypatch.setattr(shared_step, "minimize", collapse_once)
+    result = optimize_tied_items(model, tied, parts, max_iter=50, ftol=1e-10)
+
+    assert result is not None
+    for estimate in result:
+        assert objective(estimate)[0] < 1e-9
+        assert np.all(np.diff(estimate[1:]) > 0.0)
+    assert result[0][1] == result[1][1]
 
 
 def test_numerical_item_objectives_match_the_analytic_fit(binary) -> None:

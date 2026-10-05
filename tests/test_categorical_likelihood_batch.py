@@ -166,11 +166,16 @@ def test_base_batch_likelihood_matches_item_loop_exactly(
     theta = _theta_grid(model.n_factors, n_points)
     responses = _responses(model.n_categories, 40, seed=5)
 
-    actual = model.log_likelihood_batch(responses, theta)
+    actual = PolytomousItemModel.log_likelihood_batch(model, responses, theta)
     expected = _old_base_batch(model, responses, theta)
 
     np.testing.assert_array_equal(actual, expected)
     np.testing.assert_array_equal(actual[0], 0.0)
+
+    # Native sigmoid evaluation can differ from NumPy by a few floating-point ulps.
+    dispatched = model.log_likelihood_batch(responses, theta)
+    np.testing.assert_allclose(dispatched, expected, rtol=1e-14, atol=1e-14)
+    np.testing.assert_array_equal(dispatched[0], 0.0)
 
 
 @pytest.mark.parametrize("factory", BASE_FACTORIES[:4])

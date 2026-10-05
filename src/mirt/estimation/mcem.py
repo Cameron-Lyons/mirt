@@ -956,7 +956,12 @@ class MCEMEstimator(BaseEstimator):
                 method="L-BFGS-B",
                 jac=analytic,
                 bounds=bounds,
-                options={"maxiter": 50, "ftol": 1e-6},
+                options={
+                    "maxiter": 50,
+                    # Loose relative-loss convergence leaves GRM slopes
+                    # unstable; the next E-step magnifies those differences.
+                    "ftol": 1e-10 if type(model) is GradedResponseModel else 1e-6,
+                },
             )
             candidate = np.asarray(result.x, dtype=np.float64)
             if (

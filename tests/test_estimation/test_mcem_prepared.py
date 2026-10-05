@@ -323,6 +323,38 @@ def test_complete_fit_matches_numerical_item_updates(cls, kind):
         )
 
 
+@pytest.mark.parametrize("analytic", [False, True])
+def test_graded_item_update_reaches_stationary_sampled_objective(analytic):
+    model, responses, _, _, _ = _problem("grm", persons=17)
+    estimator = MCEMEstimator(n_samples=50, seed=819)
+    estimator._rng = np.random.default_rng(estimator.seed)
+    theta, weights = estimator._e_step_mc(
+        model,
+        responses,
+        np.zeros(model.n_factors),
+        np.eye(model.n_factors),
+        model.n_factors,
+    )
+    _, bounds = estimator._get_item_params_and_bounds(model, 0)
+    objective = prepare_mc_objective(
+        model, 0, responses[:, 0], theta, weights, estimator.n_samples, bounds
+    )
+    if not analytic:
+        estimator._item_expected_log_likelihood = MethodType(
+            MCEMEstimator._item_expected_log_likelihood, estimator
+        )
+
+    estimator._optimize_item_mc(model, 0, responses, theta, weights)
+
+    fitted, _ = estimator._get_item_params_and_bounds(model, 0)
+    _, gradient = objective(fitted)
+    lower, upper = np.asarray(bounds).T
+    # A bound's outward derivative does not prevent constrained stationarity.
+    gradient[(fitted == lower) & (gradient > 0.0)] = 0.0
+    gradient[(fitted == upper) & (gradient < 0.0)] = 0.0
+    assert np.max(np.abs(gradient)) < 2e-5
+
+
 def test_large_sample_objective_uses_bounded_scratch(monkeypatch):
     import tracemalloc
 
