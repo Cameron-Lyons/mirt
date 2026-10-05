@@ -3,7 +3,8 @@
 This module provides flexible prior specifications for item parameters,
 supporting both informative and weakly informative priors. Pass them to
 ``EMEstimator(item_priors=...)`` or ``fit_mirt(priors=...)`` for Bayes modal
-estimation; ``grad_log_pdf`` supplies the derivatives its M-steps use.
+estimation; ``grad_log_pdf`` supplies the derivatives its M-steps use and
+``hess_log_pdf`` the prior curvature its standard errors include.
 
 Supported distributions:
 - Normal / Truncated Normal
@@ -26,6 +27,8 @@ from scipy import special, stats
 
 _LOG_TWO_PI = float(np.log(2.0 * np.pi))
 _GRADIENT_STEP = 1e-6
+# Step for differencing gradients, which may themselves be differenced.
+_HESSIAN_STEP = 1e-4
 
 
 def _finite_scalar(value: float, name: str) -> float:
@@ -94,6 +97,20 @@ class Prior(ABC):
                 2.0 * step
             )
 
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Compute the second derivative of the log density at x.
+
+        The built-in priors return analytic values, with ``NaN`` outside
+        their support. This fallback for custom subclasses uses central
+        differences of :meth:`grad_log_pdf`.
+        """
+        values = _float_values(x)
+        step = _HESSIAN_STEP * np.maximum(1.0, np.abs(values))
+        with np.errstate(invalid="ignore"):
+            return (
+                self.grad_log_pdf(values + step) - self.grad_log_pdf(values - step)
+            ) / (2.0 * step)
+
     @abstractmethod
     def sample(
         self,
@@ -154,6 +171,11 @@ class NormalPrior(Prior):
         values = _float_values(x)
         with np.errstate(over="ignore", invalid="ignore"):
             return (self._mu - values) / (self._sigma * self._sigma)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = np.full(values.shape, -1.0 / (self._sigma * self._sigma))
+        return np.where(np.isnan(values), np.nan, curvature)
 
     def sample(
         self,
@@ -226,6 +248,12 @@ class TruncatedNormalPrior(Prior):
             gradient = (mu - values) / (sigma * sigma)
         return np.where(in_support, gradient, np.nan)
 
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        sigma = float(self.sigma)
+        in_support = (values >= float(self.lower)) & (values <= float(self.upper))
+        return np.where(in_support, -1.0 / (sigma * sigma), np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -293,6 +321,14 @@ class LogNormalPrior(Prior):
             gradient = -(1.0 + standardized) / values
         return np.where(values > 0.0, gradient, np.nan)
 
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        variance = self._sigma * self._sigma
+        with np.errstate(divide="ignore", invalid="ignore"):
+            standardized = (np.log(values) - self._mu) / variance
+            curvature = (1.0 + standardized - 1.0 / variance) / (values * values)
+        return np.where(values > 0.0, curvature, np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -358,6 +394,14 @@ class BetaPrior(Prior):
         in_support = (values >= 0.0) & (values <= 1.0)
         return np.where(in_support, gradient, np.nan)
 
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = -_ratio(self._alpha - 1.0, values * values) - _ratio(
+            self._beta - 1.0, (1.0 - values) ** 2
+        )
+        in_support = (values >= 0.0) & (values <= 1.0)
+        return np.where(in_support, curvature, np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -410,6 +454,11 @@ class UniformPrior(Prior):
         )
 
     def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        in_support = (values >= self._lower) & (values <= self._upper)
+        return np.where(in_support, 0.0, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         values = _float_values(x)
         in_support = (values >= self._lower) & (values <= self._upper)
         return np.where(in_support, 0.0, np.nan)
@@ -478,6 +527,12 @@ class GammaPrior(Prior):
         gradient = _ratio(self._shape - 1.0, values) - self._rate
         in_support = (values >= 0.0) & np.isfinite(values)
         return np.where(in_support, gradient, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = -_ratio(self._shape - 1.0, values * values)
+        in_support = (values >= 0.0) & np.isfinite(values)
+        return np.where(in_support, curvature, np.nan)
 
     def sample(
         self,

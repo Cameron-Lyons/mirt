@@ -346,14 +346,17 @@ def ability_posterior(
     returned by :func:`mirt.fit_mirt`. ``n_quadpts`` is the number of grid
     points per latent dimension; by default it is 49 for one or two factors,
     21 for three, 9 for four, 7 for five, and 5 for six or more.
+    ``prior_cov`` defaults to the ``latent_covariance`` of a ``FitResult``
+    when it has one, and to the identity otherwise.
     """
     from mirt.results.fit_result import FitResult
 
-    model = (
-        model_or_result.model
-        if isinstance(model_or_result, FitResult)
-        else model_or_result
-    )
+    if isinstance(model_or_result, FitResult):
+        model = model_or_result.model
+        if prior_cov is None:
+            prior_cov = model_or_result.latent_covariance
+    else:
+        model = model_or_result
     scorer = EAPScorer(
         n_quadpts=n_quadpts,
         prior_mean=prior_mean,

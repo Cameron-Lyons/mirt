@@ -11,12 +11,15 @@ powered by a Rust backend for computational efficiency.
    installation
    quickstart
    guides/estimation
+   guides/model_syntax
+   guides/mixed_format
    guides/cat
    guides/dynamic
    guides/response_time
    guides/explanatory
    guides/multilevel
    guides/irtree
+   guides/mfrm
    guides/information
    guides/dif
    guides/plotting

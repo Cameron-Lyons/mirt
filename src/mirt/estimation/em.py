@@ -34,6 +34,7 @@ from mirt.estimation.base import (
     BaseEstimator,
     StartValues,
     _apply_starting_values,
+    _free_shared_parameters,
     _parameter_bounds,
     _validate_start,
 )
@@ -52,6 +53,8 @@ if TYPE_CHECKING:
 # sums, so looser values can stop with parameter errors near 1e-3, and the
 # resulting noisy M-steps slow EM and defeat extrapolation.
 _PRECISE_ITEM_FTOL = 1e-10
+# Product quadrature grids beyond this many nodes trigger a warning.
+_LARGE_GRID_NODES = 1_000_000
 _ACCELERATIONS = ("none", "squarem")
 # SQUAREM grows the maximum step length by this factor after a successful
 # step at the maximum and shrinks it after a rejected one.
@@ -71,6 +74,46 @@ def _weight_posterior(
 ) -> NDArray[np.float64]:
     """Scale compressed-pattern posteriors by their pattern frequencies."""
     return posterior if frequencies is None else posterior * frequencies[:, None]
+
+
+def _warn_large_grid(model: BaseItemModel, n_quadpts: int) -> None:
+    """Warn before building a product quadrature grid of over a million nodes."""
+    # Python integers keep NumPy integer point counts from overflowing.
+    n_nodes = int(n_quadpts) ** int(model.n_factors)
+    if n_nodes <= _LARGE_GRID_NODES:
+        return
+    from mirt.models.bifactor import BifactorModel
+
+    advice = (
+        "mirt.bfactor or BifactorEMEstimator integrates bifactor models exactly "
+        "on two-dimensional grids"
+        if isinstance(model, BifactorModel)
+        else "reduce n_quadpts or the number of factors"
+    )
+    warnings.warn(
+        f"EM quadrature over {model.n_factors} factors with {n_quadpts} points "
+        f"each needs {n_nodes:,} nodes, which is slow and memory intensive; "
+        f"{advice}",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+
+
+def _add_prior_curvature(
+    errors: NDArray[np.float64], curvature: NDArray[np.float64] | None
+) -> NDArray[np.float64]:
+    """Add a prior's negative curvature to diagonal curvature standard errors.
+
+    Coordinates without likelihood curvature (``NaN`` errors) keep only the
+    prior's.
+    """
+    if curvature is None or not np.any(curvature):
+        return errors
+    with np.errstate(divide="ignore", invalid="ignore"):
+        information = np.where(np.isfinite(errors) & (errors > 0), errors**-2.0, 0.0)
+        total = information + curvature
+        combined = np.where(total > 0, 1.0 / np.sqrt(total), np.nan)
+    return np.where(curvature != 0, combined, errors)
 
 
 def _graded_threshold_constraint(
@@ -94,7 +137,7 @@ def _graded_threshold_constraint(
     positions = {}
     values = None
     for name, array in model.parameters.items():
-        if array.ndim == 0 or array.shape[0] != model.n_items:
+        if not model._item_indexed(name):
             continue
         mask = np.asarray(free_masks[name][item_idx]).reshape(-1)
         indices = np.flatnonzero(mask)
@@ -129,6 +172,11 @@ def _graded_threshold_constraint(
 
 class EMEstimator(BaseEstimator):
     """Marginal maximum likelihood estimation by the EM algorithm.
+
+    Each M-step optimizes the item parameters item by item. Parameters shared
+    by all items, such as the common thresholds of the rating scale models,
+    are then optimized jointly with the item parameters held fixed, which
+    keeps every iteration a monotone conditional maximization step.
 
     Parameters
     ----------
@@ -178,11 +226,12 @@ default="auto"
         misspecification-robust covariance. ``"complete_data"`` is itemwise
         complete-data curvature, which omits the information lost to the
         unobserved latent trait and understates uncertainty. ``"auto"`` uses
-        ``"oakes"`` for unidimensional built-in 1PL-4PL, GRM, GPCM and PCM
-        models and ``"complete_data"`` otherwise; ``FitResult.se_method``
-        records the estimator used. The latent density is treated as fixed,
-        and coordinates at an optimizer bound (for example a guessing
-        parameter of 0) are held fixed with ``NaN`` standard errors. The
+        ``"oakes"`` for unidimensional built-in 1PL-4PL, GRM, GPCM, PCM, RSM
+        and GRSM models and ``"complete_data"`` otherwise;
+        ``FitResult.se_method`` records the estimator used. The latent
+        density is treated as fixed, and coordinates at an optimizer bound
+        (for example a guessing parameter of 0) are held fixed with ``NaN``
+        standard errors. The
         matrix methods cost O(N Q P^2) for N response patterns, Q nodes and
         P parameters; models outside the built-in item families fall back to
         O(P^2) marginal likelihood evaluations.
@@ -212,9 +261,13 @@ default="auto"
         coordinates, and convergence is judged on the log-posterior, which is
         recorded in ``convergence_history`` and reported as
         ``FitResult.log_posterior``. ``log_likelihood``, AIC and BIC remain
-        likelihood-based, and standard errors ignore the prior curvature.
-        Priors bypass the fused native 3PL iteration, the batched Newton
-        logistic M-step and the native polytomous M-step.
+        likelihood-based. Standard errors include the prior: its negative
+        second derivative is added to the observed information (to the score
+        cross-product for ``"crossprod"`` and to each coordinate's curvature
+        for ``"complete_data"``), so they describe the curvature of the
+        log-posterior at the mode. Parameters shared by all items take no
+        priors. Priors bypass the fused native 3PL iteration, the batched
+        Newton logistic M-step and the native polytomous M-step.
 
     References
     ----------
@@ -226,6 +279,8 @@ default="auto"
     for accelerating the convergence of any EM algorithm. *Scandinavian
     Journal of Statistics*, 35(2), 335-353.
     """
+
+    _estimates_shared_parameters = True
 
     def __init__(
         self,
@@ -339,6 +394,7 @@ default="auto"
 
         start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
+        _warn_large_grid(model, self.n_quadpts)
         self._quadrature = GaussHermiteQuadrature(
             n_points=self.n_quadpts,
             n_dimensions=model.n_factors,
@@ -1004,6 +1060,35 @@ default="auto"
             for item_idx, optimal_params in results:
                 self._set_item_params(model, item_idx, optimal_params)
 
+        if _free_shared_parameters(model):
+            from mirt.estimation._shared_step import binary_category_counts
+
+            self._m_step_shared(
+                model,
+                category_counts
+                if model.is_polytomous
+                else binary_category_counts(correct, observed),
+            )
+
+    def _m_step_shared(
+        self, model: BaseItemModel, counts: list[NDArray[np.float64]]
+    ) -> None:
+        """Update parameters shared by all items with item parameters fixed.
+
+        ``counts`` holds each item's expected ``(n_points, n_categories)``
+        category counts; a dichotomous item has incorrect and correct columns.
+        """
+        from mirt.estimation._shared_step import optimize_shared_parameters
+
+        optimize_shared_parameters(
+            model,
+            self._quadrature.nodes,
+            counts,
+            epsilon=self.prob_epsilon,
+            max_iter=self.item_optim_maxiter,
+            ftol=self._item_optim_ftol(precise=True),
+        )
+
     def _item_optim_ftol(self, precise: bool = False) -> float:
         """Return the relative item-optimizer tolerance for this M-step."""
         if precise or self._precise_m_steps:
@@ -1377,9 +1462,17 @@ default="auto"
             frequencies=frequencies,
             h=self.se_step_size,
             bounds=lambda name: _parameter_bounds(model, name),
+            prior_information=self._prior_information(model),
         )
         self._se_details = (method, estimate.covariance)
         return estimate.standard_errors
+
+    def _prior_information(
+        self, model: BaseItemModel
+    ) -> dict[str, NDArray[np.float64]] | None:
+        """Return the item log-prior's negative curvature, or None without priors."""
+        penalty = self._prior_penalty
+        return None if penalty is None else penalty.information(model)
 
     def _complete_data_standard_errors(
         self,
@@ -1389,9 +1482,17 @@ default="auto"
         *,
         person_weights: NDArray[np.float64] | None = None,
     ) -> dict[str, NDArray[np.float64]]:
-        """Itemwise diagonal curvature of the expected complete-data likelihood."""
-        from mirt.estimation._item_information import item_standard_errors
+        """Itemwise diagonal curvature of the expected complete-data likelihood.
 
+        Parameters shared by all items are differenced in the expected
+        log-likelihood summed over items. Item priors add their curvature to
+        each free coordinate's.
+        """
+        from mirt.estimation._item_information import item_standard_errors
+        from mirt.estimation._shared_step import binary_category_counts
+        from mirt.estimation.se_methods import shared_parameter_standard_errors
+
+        prior = self._prior_information(model) or {}
         context = self._fit_context
         if context is None or context.responses is not responses:
             context = EMFitContext(responses)
@@ -1406,7 +1507,10 @@ default="auto"
                 context=context,
             )
             if analytic is not None:
-                return analytic
+                return {
+                    name: _add_prior_curvature(errors, prior.get(name))
+                    for name, errors in analytic.items()
+                }
         standard_errors: dict[str, NDArray[np.float64]] = {}
         params = model.parameters
         free_masks = model.free_parameter_masks
@@ -1417,9 +1521,19 @@ default="auto"
                 posterior_weights, person_weights
             )
 
+        def item_category_counts(item_idx: int) -> NDArray[np.float64]:
+            if item_idx not in category_counts:
+                category_counts[item_idx] = context.expected_category_counts(
+                    item_idx,
+                    model.n_categories[item_idx],
+                    posterior_weights,
+                    person_weights,
+                )
+            return category_counts[item_idx]
+
         for name, values in params.items():
             free_mask = free_masks[name]
-            if not np.any(free_mask):
+            if not np.any(free_mask) or name in model._shared_parameters:
                 standard_errors[name] = model._expand_parameter_standard_errors(
                     name, np.zeros_like(values)
                 )
@@ -1431,14 +1545,7 @@ default="auto"
                 if not np.any(free_mask[item_idx]):
                     continue
                 if model.is_polytomous:
-                    if item_idx not in category_counts:
-                        category_counts[item_idx] = context.expected_category_counts(
-                            item_idx,
-                            model.n_categories[item_idx],
-                            posterior_weights,
-                            person_weights,
-                        )
-                    counts = category_counts[item_idx]
+                    counts = item_category_counts(item_idx)
                     item_observed = counts.sum(axis=1)
                     item_correct = None
                 else:
@@ -1458,8 +1565,28 @@ default="auto"
                 se[item_idx] = item_se
 
             se[~free_mask] = 0.0
-            standard_errors[name] = model._expand_parameter_standard_errors(name, se)
+            standard_errors[name] = model._expand_parameter_standard_errors(
+                name, _add_prior_curvature(se, prior.get(name))
+            )
 
+        if _free_shared_parameters(model):
+            shared_counts = (
+                [item_category_counts(item) for item in range(model.n_items)]
+                if model.is_polytomous
+                else binary_category_counts(correct, observed)
+            )
+            shared = shared_parameter_standard_errors(
+                model,
+                self._quadrature.nodes,
+                shared_counts,
+                self.se_step_size,
+                epsilon=self.prob_epsilon,
+                exact=self.se_step_size == 1e-5,
+            )
+            for name, errors in shared.items():
+                standard_errors[name] = model._expand_parameter_standard_errors(
+                    name, errors
+                )
         return standard_errors
 
     def _compute_item_se(

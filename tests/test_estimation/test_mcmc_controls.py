@@ -126,17 +126,60 @@ def test_native_mhrm_tracks_numpy_mhrm_and_em(gain_sequence: str) -> None:
             use_rust=use_rust,
         ).fit(TwoParameterLogistic(10), responses)
         results[use_rust] = result
-        estimates[use_rust] = result.model.parameters["difficulty"]
-    em_difficulty = mirt.fit_mirt(responses, "2PL").model.parameters["difficulty"]
+        estimates[use_rust] = result.model.parameters
+    em = mirt.fit_mirt(responses, "2PL").model.parameters
 
-    native_difficulty = estimates[True]
-    assert np.corrcoef(native_difficulty, estimates[False])[0, 1] > 0.98
-    assert np.max(np.abs(native_difficulty - estimates[False])) < 0.3
-    assert np.corrcoef(native_difficulty, true_difficulty)[0, 1] > 0.98
-    assert np.corrcoef(native_difficulty, em_difficulty)[0, 1] > 0.98
+    # The kernels run the same algorithm on different random streams.
+    native, numpy = estimates[True], estimates[False]
+    for name, tolerance in (("difficulty", 0.1), ("discrimination", 0.2)):
+        assert np.max(np.abs(native[name] - numpy[name])) < tolerance
+        assert np.max(np.abs(native[name] - em[name])) < tolerance
+    assert np.corrcoef(native["difficulty"], true_difficulty)[0, 1] > 0.98
     # Both backends score the fit at MAP abilities, so information criteria
     # agree; the final ability draw would sit several percent lower.
     assert results[True].log_likelihood == pytest.approx(
         results[False].log_likelihood, rel=0.01
     )
     assert results[True].aic == pytest.approx(results[False].aic, rel=0.01)
+
+
+def _em_and_mhrm(use_rust: bool, seed: int):
+    responses, _ = _recovery_data()
+    em = mirt.fit_mirt(responses, "2PL").model.parameters
+    # fit_mirt(estimation="MHRM") runs 500 cycles with 125 burn-in cycles.
+    mhrm = MHRMEstimator(n_cycles=500, burnin=125, seed=seed, use_rust=use_rust)
+    return em, mhrm.fit(TwoParameterLogistic(10), responses).model.parameters
+
+
+@pytest.mark.parametrize(
+    "use_rust", [pytest.param(True, marks=native), pytest.param(False)]
+)
+def test_default_mhrm_schedule_matches_em_without_shrinkage(use_rust: bool) -> None:
+    em, mhrm = _em_and_mhrm(use_rust, seed=3)
+
+    # Unpreconditioned 1/(cycle+1) steps left difficulties ~0.6x of EM's range.
+    assert np.ptp(mhrm["difficulty"]) / np.ptp(em["difficulty"]) == pytest.approx(
+        1.0, abs=0.05
+    )
+    assert np.max(np.abs(mhrm["difficulty"] - em["difficulty"])) < 0.1
+    assert np.max(np.abs(mhrm["discrimination"] - em["discrimination"])) < 0.25
+
+
+@native
+def test_default_fit_mirt_mhrm_is_not_shrunk(monkeypatch) -> None:
+    responses, _ = _recovery_data()
+    em = mirt.fit_mirt(responses, "2PL").model.parameters["difficulty"]
+    schedules = []
+    fit = MHRMEstimator.fit
+
+    def seeded_fit(self, model, data, **kwargs):
+        # fit_mirt draws a fresh seed; pin it so the test is deterministic.
+        schedules.append((self.n_cycles, self.burnin))
+        self.seed = 7
+        return fit(self, model, data, **kwargs)
+
+    monkeypatch.setattr(MHRMEstimator, "fit", seeded_fit)
+    mhrm = mirt.fit_mirt(responses, "2PL", estimation="MHRM").model.parameters
+    assert schedules == [(500, 125)]
+    assert np.ptp(mhrm["difficulty"]) / np.ptp(em) > 0.9
+    assert np.max(np.abs(mhrm["difficulty"] - em)) < 0.15

@@ -1,5 +1,5 @@
 from abc import abstractmethod
-from typing import Self
+from collections.abc import Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,10 +12,9 @@ from mirt._logistic import (
 from mirt._model_defaults import record_model_base as _record_model_base
 from mirt._model_defaults import register_builtin_model as _register_builtin_model
 from mirt.exceptions import MirtValidationError
-from mirt.models.base import DichotomousItemModel
+from mirt.models.base import DichotomousItemModel, _AtomicParameterState
 
 _MAX_DOUBLE_EXP_INPUT = 50.0
-_FIVE_PL_CURVE_CHUNK_ELEMENTS = 262_144
 _UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS = 262_144
 _LOGISTIC_CURVE_CHUNK_ELEMENTS = 262_144
 
@@ -545,11 +544,46 @@ def _five_pl_information(
     return information
 
 
+def _evaluate_row_blocks(
+    evaluate: Callable[
+        [NDArray[np.float64], NDArray[np.intp] | None], NDArray[np.float64]
+    ],
+    points: NDArray[np.float64],
+    item_indices: NDArray[np.intp] | None,
+    shape: tuple[int, ...],
+    rows_per_block: int,
+) -> NDArray[np.float64]:
+    """Evaluate long batches in row blocks so temporaries stay bounded."""
+    if points.shape[0] <= rows_per_block:
+        return evaluate(points, item_indices)
+    result = np.empty(shape)
+    for start in range(0, points.shape[0], rows_per_block):
+        rows = slice(start, start + rows_per_block)
+        result[rows] = evaluate(
+            points[rows], None if item_indices is None else item_indices[rows]
+        )
+    return result
+
+
 @_record_model_base
-class _ParameterizedDichotomousModel(DichotomousItemModel):
-    """Shared parameter-domain validation for dichotomous response curves."""
+class _ParameterizedDichotomousModel(_AtomicParameterState, DichotomousItemModel):
+    """Shared parameter domains and curve dispatch for dichotomous models.
+
+    ``probability``, ``probability_pairs`` and ``information`` call the
+    evaluator named by ``_curve_evaluator``. It is looked up on the instance
+    at call time, so replaced evaluators are always honored.
+    """
 
     _requires_positive_discrimination = False
+    _curve_evaluator = "_evaluate_logistic"
+
+    @property
+    def discrimination(self) -> NDArray[np.float64]:
+        return self._parameters["discrimination"]
+
+    @property
+    def difficulty(self) -> NDArray[np.float64]:
+        return self._parameters["difficulty"]
 
     def _validate_parameter_state(
         self,
@@ -608,75 +642,28 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
                 expected="> 0",
             )
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
-        """Set parameters atomically after validating the complete model state."""
-        candidate = {name: values.copy() for name, values in self._parameters.items()}
-        for name, value in params.items():
-            if name not in candidate:
-                valid_params = ", ".join(candidate)
-                raise MirtValidationError(
-                    f"Unknown parameter: {name}. Valid parameters: {valid_params}",
-                    parameter=name,
-                    expected=valid_params,
-                )
-
-            value_array = np.asarray(value, dtype=np.float64)
-            expected_shape = candidate[name].shape
-            if value_array.shape != expected_shape:
-                raise MirtValidationError(
-                    f"Shape mismatch for {name}: expected {expected_shape}, "
-                    f"got {value_array.shape}",
-                    parameter=name,
-                    value=value_array.shape,
-                    expected=str(expected_shape),
-                )
-            candidate[name] = value_array.copy()
-
-        self._validate_parameter_state(candidate)
-        self._parameters = candidate
-        return self
-
-    def set_item_parameter(
+    def probability(
         self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        """Set one item parameter while preserving the model's domain."""
-        item_idx = self._validate_item_idx(item_idx)
-        if param_name not in self._parameters:
-            valid_params = ", ".join(self._parameters)
-            raise MirtValidationError(
-                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}",
-                parameter=param_name,
-                expected=valid_params,
-            )
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        return getattr(self, self._curve_evaluator)(theta, item_idx)
 
-        current = self._parameters[param_name]
-        value_array = np.asarray(value, dtype=np.float64)
-        expected_shape = current.shape[1:]
-        if value_array.shape != expected_shape:
-            expected = "scalar" if not expected_shape else str(expected_shape)
-            raise MirtValidationError(
-                f"{param_name} for one item must have shape {expected}",
-                parameter=param_name,
-                value=value_array.shape,
-                expected=expected,
-            )
+    def probability_pairs(
+        self,
+        theta: NDArray[np.float64],
+        item_indices: NDArray[np.int_],
+    ) -> NDArray[np.float64]:
+        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
+        theta, indices = self._prepare_probability_pairs(theta, item_indices)
+        return getattr(self, self._curve_evaluator)(theta, None, item_indices=indices)
 
-        updated = current.copy()
-        updated[item_idx] = value_array
-        self.set_parameters(**{param_name: updated})
-
-    def _validate_item_idx(self, item_idx: int) -> int:
-        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-            item_idx, (int, np.integer)
-        ):
-            raise IndexError("item_idx must be an integer")
-        item_idx = int(item_idx)
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return item_idx
+    def information(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int | None = None,
+    ) -> NDArray[np.float64]:
+        return getattr(self, self._curve_evaluator)(theta, item_idx, information=True)
 
     def _evaluate_logistic(
         self,
@@ -697,6 +684,7 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
         width = self.n_items if all_items else 1
         shape = (theta.shape[0], self.n_items) if all_items else (theta.shape[0],)
         if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
             slope, location = slope[item_idx], location[item_idx]
             if guessing is not None:
                 guessing = guessing[item_idx]
@@ -746,15 +734,9 @@ class _ParameterizedDichotomousModel(DichotomousItemModel):
         rows_per_block = max(
             1, _LOGISTIC_CURVE_CHUNK_ELEMENTS // max(width, self.n_factors)
         )
-        if theta.shape[0] <= rows_per_block:
-            return evaluate(theta, item_indices)
-        result = np.empty(shape)
-        for start in range(0, theta.shape[0], rows_per_block):
-            rows = slice(start, start + rows_per_block)
-            result[rows] = evaluate(
-                theta[rows], None if item_indices is None else item_indices[rows]
-            )
-        return result
+        return _evaluate_row_blocks(
+            evaluate, theta, item_indices, shape, rows_per_block
+        )
 
 
 @_register_builtin_model
@@ -771,53 +753,12 @@ class TwoParameterLogistic(_ParameterizedDichotomousModel):
 
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
-        theta, indices = self._prepare_probability_pairs(theta, item_indices)
-        return self._evaluate_logistic(theta, None, item_indices=indices)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx, information=True)
-
 
 @_register_builtin_model
 class OneParameterLogistic(TwoParameterLogistic):
     model_name = "1PL"
     n_params_per_item = 1
     supports_multidimensional = False
-
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("1PL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
@@ -851,7 +792,7 @@ class OneParameterLogistic(TwoParameterLogistic):
         value: float | NDArray[np.float64],
     ) -> None:
         if param_name == "discrimination":
-            self._validate_item_idx(item_idx)
+            self._validate_item_index(item_idx)
             value_array = np.asarray(value, dtype=np.float64)
             if value_array.ndim == 0 and float(value_array) == 1.0:
                 return
@@ -865,55 +806,14 @@ class ThreeParameterLogistic(_ParameterizedDichotomousModel):
     n_params_per_item = 3
     supports_multidimensional = False
 
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("3PL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
         self._parameters["guessing"] = np.full(self.n_items, 0.2)
 
     @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
-    @property
     def guessing(self) -> NDArray[np.float64]:
         return self._parameters["guessing"]
-
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
-        theta, indices = self._prepare_probability_pairs(theta, item_indices)
-        return self._evaluate_logistic(theta, None, item_indices=indices)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx, information=True)
 
 
 @_register_builtin_model
@@ -922,29 +822,11 @@ class FourParameterLogistic(_ParameterizedDichotomousModel):
     n_params_per_item = 4
     supports_multidimensional = False
 
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("4PL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
-
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
         self._parameters["guessing"] = np.full(self.n_items, 0.2)
         self._parameters["upper"] = np.ones(self.n_items)
-
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
 
     @property
     def guessing(self) -> NDArray[np.float64]:
@@ -954,29 +836,6 @@ class FourParameterLogistic(_ParameterizedDichotomousModel):
     def upper(self) -> NDArray[np.float64]:
         return self._parameters["upper"]
 
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
-        theta, indices = self._prepare_probability_pairs(theta, item_indices)
-        return self._evaluate_logistic(theta, None, item_indices=indices)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_logistic(theta, item_idx, information=True)
-
 
 Rasch = OneParameterLogistic
 
@@ -984,42 +843,26 @@ ThreeParameterLogisticUpper = FourParameterLogistic
 
 
 class _UnidimensionalCurveModel(_ParameterizedDichotomousModel):
-    """Shared bounded evaluation for two-parameter unidimensional curves."""
+    """Shared bounded evaluation for unidimensional non-logistic curves.
+
+    ``_evaluate_block`` receives the stored parameters named by
+    ``_curve_parameter_names`` as positional arrays, in that order.
+    """
 
     n_params_per_item = 2
     supports_multidimensional = False
-
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError(
-                f"{self.model_name} model only supports unidimensional analysis"
-            )
-        super().__init__(n_items, n_factors=1, item_names=item_names)
+    _curve_evaluator = "_evaluate_curve"
+    _curve_parameter_names: tuple[str, ...] = ("discrimination", "difficulty")
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
         self._parameters["difficulty"] = np.zeros(self.n_items)
 
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
-
     @abstractmethod
     def _evaluate_block(
         self,
         theta: NDArray[np.float64],
-        discrimination: NDArray[np.float64],
-        difficulty: NDArray[np.float64],
-        *,
+        *parameters: NDArray[np.float64],
         information: bool,
         item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]: ...
@@ -1033,64 +876,27 @@ class _UnidimensionalCurveModel(_ParameterizedDichotomousModel):
         item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        slope = self._parameters["discrimination"]
-        location = self._parameters["difficulty"]
-        if item_indices is not None:
-            points = theta[:, 0]
-            shape = (theta.shape[0],)
-            width = 1
-        elif item_idx is None:
-            points = theta[:, 0, None]
-            shape = (theta.shape[0], self.n_items)
-            width = self.n_items
-        else:
-            points = theta[:, 0]
-            slope, location = slope[item_idx], location[item_idx]
-            shape = (theta.shape[0],)
-            width = 1
-        rows_per_block = max(1, _UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS // width)
-        if theta.shape[0] <= rows_per_block:
+        parameters = [self._parameters[name] for name in self._curve_parameter_names]
+        all_items = item_idx is None and item_indices is None
+        width = self.n_items if all_items else 1
+        shape = (theta.shape[0], self.n_items) if all_items else (theta.shape[0],)
+        points = theta[:, 0, None] if all_items else theta[:, 0]
+        if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
+            parameters = [values[item_idx] for values in parameters]
+
+        def evaluate(
+            rows: NDArray[np.float64],
+            selected: NDArray[np.intp] | None,
+        ) -> NDArray[np.float64]:
             return self._evaluate_block(
-                points,
-                slope,
-                location,
-                information=information,
-                item_indices=item_indices,
+                rows, *parameters, information=information, item_indices=selected
             )
-        result = np.empty(shape)
-        for start in range(0, theta.shape[0], rows_per_block):
-            rows = slice(start, start + rows_per_block)
-            result[rows] = self._evaluate_block(
-                points[rows],
-                slope,
-                location,
-                information=information,
-                item_indices=None if item_indices is None else item_indices[rows],
-            )
-        return result
 
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_curve(theta, item_idx)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
-        theta, indices = self._prepare_probability_pairs(theta, item_indices)
-        return self._evaluate_curve(theta, None, item_indices=indices)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_curve(theta, item_idx, information=True)
+        rows_per_block = max(1, _UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS // width)
+        return _evaluate_row_blocks(
+            evaluate, points, item_indices, shape, rows_per_block
+        )
 
 
 class UnipolarLogLogistic(_UnidimensionalCurveModel):
@@ -1130,22 +936,16 @@ class UnipolarLogLogistic(_UnidimensionalCurveModel):
     def _evaluate_block(
         self,
         theta: NDArray[np.float64],
-        discrimination: NDArray[np.float64],
-        difficulty: NDArray[np.float64],
-        *,
+        *parameters: NDArray[np.float64],
         information: bool,
         item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]:
         return _unipolar_curve(
-            theta,
-            discrimination,
-            difficulty,
-            information=information,
-            item_indices=item_indices,
+            theta, *parameters, information=information, item_indices=item_indices
         )
 
 
-class FiveParameterLogistic(_ParameterizedDichotomousModel):
+class FiveParameterLogistic(_UnidimensionalCurveModel):
     """Five-Parameter Logistic (5PL) model with asymmetric curves.
 
     The 5PL model extends the 4PL with an asymmetry parameter that allows
@@ -1188,32 +988,19 @@ class FiveParameterLogistic(_ParameterizedDichotomousModel):
 
     model_name = "5PL"
     n_params_per_item = 5
-    supports_multidimensional = False
-
-    def __init__(
-        self,
-        n_items: int,
-        n_factors: int = 1,
-        item_names: list[str] | None = None,
-    ) -> None:
-        if n_factors != 1:
-            raise ValueError("5PL model only supports unidimensional analysis")
-        super().__init__(n_items, n_factors=1, item_names=item_names)
+    _curve_parameter_names = (
+        "discrimination",
+        "difficulty",
+        "guessing",
+        "upper",
+        "asymmetry",
+    )
 
     def _initialize_parameters(self) -> None:
-        self._parameters["discrimination"] = np.ones(self.n_items)
-        self._parameters["difficulty"] = np.zeros(self.n_items)
+        super()._initialize_parameters()
         self._parameters["guessing"] = np.full(self.n_items, 0.2)
         self._parameters["upper"] = np.ones(self.n_items)
         self._parameters["asymmetry"] = np.ones(self.n_items)
-
-    @property
-    def discrimination(self) -> NDArray[np.float64]:
-        return self._parameters["discrimination"]
-
-    @property
-    def difficulty(self) -> NDArray[np.float64]:
-        return self._parameters["difficulty"]
 
     @property
     def guessing(self) -> NDArray[np.float64]:
@@ -1227,76 +1014,16 @@ class FiveParameterLogistic(_ParameterizedDichotomousModel):
     def asymmetry(self) -> NDArray[np.float64]:
         return self._parameters["asymmetry"]
 
-    def _evaluate_curve(
+    def _evaluate_block(
         self,
         theta: NDArray[np.float64],
-        item_idx: int | None,
-        *,
-        information: bool = False,
+        *parameters: NDArray[np.float64],
+        information: bool,
         item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]:
-        theta = self._ensure_theta_2d(theta)
-        parameters = [
-            self._parameters[name]
-            for name in (
-                "discrimination",
-                "difficulty",
-                "guessing",
-                "upper",
-                "asymmetry",
-            )
-        ]
-        if item_indices is not None:
-            points = theta[:, 0]
-            shape = (theta.shape[0],)
-            width = 1
-        elif item_idx is None:
-            points = theta[:, 0, None]
-            shape = (theta.shape[0], self.n_items)
-            width = self.n_items
-        else:
-            points = theta[:, 0]
-            parameters = [parameter[item_idx] for parameter in parameters]
-            shape = (theta.shape[0],)
-            width = 1
-        rows_per_block = max(1, _FIVE_PL_CURVE_CHUNK_ELEMENTS // width)
-        if theta.shape[0] <= rows_per_block:
-            return _five_pl_curve(
-                points, *parameters, information=information, item_indices=item_indices
-            )
-        result = np.empty(shape)
-        for start in range(0, theta.shape[0], rows_per_block):
-            rows = slice(start, start + rows_per_block)
-            result[rows] = _five_pl_curve(
-                points[rows],
-                *parameters,
-                information=information,
-                item_indices=None if item_indices is None else item_indices[rows],
-            )
-        return result
-
-    def probability(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_curve(theta, item_idx)
-
-    def probability_pairs(
-        self,
-        theta: NDArray[np.float64],
-        item_indices: NDArray[np.int_],
-    ) -> NDArray[np.float64]:
-        """Evaluate aligned respondent-item pairs in bounded vectorized batches."""
-        theta, indices = self._prepare_probability_pairs(theta, item_indices)
-        return self._evaluate_curve(theta, None, item_indices=indices)
-
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        return self._evaluate_curve(theta, item_idx, information=True)
+        return _five_pl_curve(
+            theta, *parameters, information=information, item_indices=item_indices
+        )
 
 
 class _DoubleExponentialModel(_UnidimensionalCurveModel):
@@ -1307,16 +1034,13 @@ class _DoubleExponentialModel(_UnidimensionalCurveModel):
     def _evaluate_block(
         self,
         theta: NDArray[np.float64],
-        discrimination: NDArray[np.float64],
-        difficulty: NDArray[np.float64],
-        *,
+        *parameters: NDArray[np.float64],
         information: bool,
         item_indices: NDArray[np.intp] | None = None,
     ) -> NDArray[np.float64]:
         return _double_exponential_curve(
             theta,
-            discrimination,
-            difficulty,
+            *parameters,
             negative=self._negative_loglog,
             information=information,
             item_indices=item_indices,

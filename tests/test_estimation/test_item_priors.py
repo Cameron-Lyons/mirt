@@ -303,3 +303,123 @@ def test_squarem_reaches_the_same_posterior_mode():
         np.testing.assert_allclose(
             accelerated.model.parameters[name], values, atol=2e-3
         )
+
+
+@pytest.mark.parametrize(("prior", "points"), _PRIORS_AND_POINTS)
+def test_hess_log_pdf_matches_central_differences(prior, points):
+    x = np.asarray(points)
+    step = 1e-5
+    numerical = (prior.grad_log_pdf(x + step) - prior.grad_log_pdf(x - step)) / (
+        2 * step
+    )
+    np.testing.assert_allclose(prior.hess_log_pdf(x), numerical, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("prior", "outside"),
+    [
+        (TruncatedNormalPrior(0.0, 1.0, lower=0.0, upper=1.0), [-0.1, 1.1]),
+        (LogNormalPrior(), [-1.0, 0.0]),
+        (BetaPrior(2.0, 3.0), [-0.1, 1.1]),
+        (UniformPrior(0.0, 1.0), [-0.1, 1.1]),
+        (GammaPrior(2.0, 1.0), [-1.0]),
+    ],
+)
+def test_hess_log_pdf_is_nan_outside_support(prior, outside):
+    assert np.all(np.isnan(prior.hess_log_pdf(np.asarray(outside))))
+
+
+_SE_PRIORS = {
+    "discrimination": LogNormalPrior(0.0, 0.3),
+    "difficulty": NormalPrior(0.0, 0.8),
+}
+
+
+def _map_fit(responses, se_method):
+    estimator = EMEstimator(
+        n_quadpts=15,
+        tol=1e-10,
+        item_optim_ftol=1e-13,
+        item_priors=_SE_PRIORS,
+        se_method=se_method,
+    )
+    return estimator.fit(TwoParameterLogistic(5), responses)
+
+
+def test_bayes_modal_errors_invert_the_log_posterior_hessian():
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _finite_difference_information,
+        _flatten_parameters,
+    )
+
+    responses = mirt.simdata("2PL", n_persons=300, n_items=5, seed=21)
+    result = _map_fit(responses, "oakes")
+    model = result.model
+    quadrature = GaussHermiteQuadrature(15)
+    mass = quadrature.weights / quadrature.weights.sum()
+    likelihood, _ = _finite_difference_information(
+        model, responses, quadrature, mass, 1e-4
+    )
+    values, layouts = _flatten_parameters(model)
+    # Second differences of the log-prior, independent of hess_log_pdf.
+    step = 1e-4
+    prior = np.empty_like(values)
+    offset = 0
+    for name, layout in layouts.items():
+        size = layout.free_indices.size
+        x = values[offset : offset + size]
+        log_pdf = _SE_PRIORS[name].log_pdf
+        prior[offset : offset + size] = (
+            -(log_pdf(x + step) - 2 * log_pdf(x) + log_pdf(x - step)) / step**2
+        )
+        offset += size
+    covariance = np.linalg.inv(likelihood + np.diag(prior))
+    np.testing.assert_allclose(result.vcov, covariance, rtol=1e-4, atol=1e-8)
+    expected = np.sqrt(np.diag(covariance))
+    np.testing.assert_allclose(
+        np.concatenate([result.standard_errors[name] for name in layouts]),
+        expected,
+        rtol=1e-4,
+    )
+    # The prior's curvature matters at this sample size.
+    likelihood_only = np.sqrt(np.diag(np.linalg.inv(likelihood)))
+    assert np.all(expected < likelihood_only * 0.999)
+
+
+def test_prior_curvature_enters_crossprod_and_complete_data_errors():
+    from mirt.estimation._item_information import item_standard_errors
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _information_and_meat,
+        _posterior_from_model,
+    )
+
+    responses = mirt.simdata("2PL", n_persons=300, n_items=5, seed=22)
+    crossprod = _map_fit(responses, "crossprod")
+    complete = _map_fit(responses, "complete_data")
+    model = crossprod.model
+    for name, values in model.parameters.items():
+        np.testing.assert_allclose(complete.model.parameters[name], values, atol=1e-8)
+    curvature = ItemPriorPenalty(_SE_PRIORS).information(model)
+
+    quadrature = GaussHermiteQuadrature(15)
+    mass = quadrature.weights / quadrature.weights.sum()
+    _, meat, layouts = _information_and_meat(
+        model, responses, quadrature, mass, 1e-5, observed=False
+    )
+    prior = np.concatenate([curvature[name] for name in layouts])
+    np.testing.assert_allclose(
+        crossprod.vcov, np.linalg.inv(meat + np.diag(prior)), rtol=1e-6, atol=1e-10
+    )
+
+    posterior = _posterior_from_model(model, responses, quadrature)
+    likelihood = item_standard_errors(
+        model, responses, posterior, quadrature.nodes, 1e-10
+    )
+    for name, errors in likelihood.items():
+        np.testing.assert_allclose(
+            complete.standard_errors[name],
+            1.0 / np.sqrt(errors**-2.0 + curvature[name]),
+            rtol=1e-6,
+        )

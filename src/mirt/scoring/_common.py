@@ -256,10 +256,16 @@ def supports_row_batched_scoring(model: BaseItemModel) -> bool:
     per-pattern path, because they need not treat theta rows independently.
     """
     from mirt._model_defaults import uses_original_model_hook
+    from mirt.models.mixed_format import MixedItemModel
 
     namespace = getattr(model, "__dict__", None)
     if namespace is None or any(
         name in namespace for name in ("probability", "log_likelihood", "information")
+    ):
+        return False
+    # A mixed-format likelihood sums its components' likelihoods.
+    if isinstance(model, MixedItemModel) and not all(
+        map(supports_row_batched_scoring, model.component_models)
     ):
         return False
     return uses_original_model_hook(model, "log_likelihood")

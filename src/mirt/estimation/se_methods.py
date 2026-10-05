@@ -4,15 +4,17 @@ This module provides multiple methods for computing standard errors:
 
 - Numerical, central, forward and Richardson: itemwise finite differences of
   the expected complete-data log-likelihood (diagonal complete-data curvature,
-  which ignores the missing information and understates uncertainty)
+  which ignores the missing information and understates uncertainty).
+  Parameters shared by all items, such as rating-scale thresholds, are
+  differenced in the expected log-likelihood summed over items.
 - Louis, Oakes and SEM: the observed information of the marginal likelihood
 - Crossprod: the outer product of marginal person scores
 - Sandwich: observed information bread around the score cross-product
 - Fisher: the marginal expected information, by response-pattern enumeration
 
-Built-in item models whose parameters each belong to one item compute the
-marginal information and scores exactly (Louis, 1982); other models use
-central differences of the marginal log-likelihood.
+Built-in item models whose parameters each belong to one item, or to all
+items, compute the marginal information and scores exactly (Louis, 1982);
+other models use central differences of the marginal log-likelihood.
 
 References
 ----------
@@ -25,7 +27,7 @@ Oakes, D. (1999). Direct calculation of the information matrix via the EM
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -284,19 +286,24 @@ def _se_itemwise_numerical(
     free_masks = model.free_parameter_masks
     result = {name: np.zeros_like(values) for name, values in params.items()}
     workers = resolve_n_jobs(n_jobs)
+    shared = any(np.any(free_masks[name]) for name in model._shared_parameters)
     names_by_item = {
-        item: tuple(name for name, mask in free_masks.items() if np.any(mask[item]))
+        item: tuple(
+            name
+            for name, mask in free_masks.items()
+            if name not in model._shared_parameters and np.any(mask[item])
+        )
         for item in range(model.n_items)
     }
     items = [item for item, names in names_by_item.items() if names]
-    if not items:
+    if not items and not shared:
         return result
 
     with EMFitContext(responses) as context:
         correct = observed = None
         category_counts: dict[int, NDArray[np.float64]] = {}
         if model.is_polytomous:
-            for item in items:
+            for item in range(model.n_items) if shared else items:
                 category_counts[item] = context.expected_category_counts(
                     item, model.n_categories[item], posterior_weights
                 )
@@ -304,6 +311,23 @@ def _se_itemwise_numerical(
             correct, observed = context.expected_counts(
                 posterior_weights, cache_components=False
             )
+        if shared:
+            from mirt.estimation._shared_step import binary_category_counts
+
+            counts = (
+                [category_counts[item] for item in range(model.n_items)]
+                if model.is_polytomous
+                else binary_category_counts(correct, observed)
+            )
+            for step in (h, h / 2) if richardson else (h,):
+                errors = shared_parameter_standard_errors(
+                    model, quadrature.nodes, counts, step, scheme=scheme
+                )
+                for name, values in errors.items():
+                    # Richardson combines the full and half steps.
+                    result[name] = (
+                        values if step == h else (4 * values - result[name]) / 3
+                    )
 
         def compute_item(
             item: int,
@@ -347,7 +371,7 @@ def _se_itemwise_numerical(
                 item_result[name] = first
             return item, item_result
 
-        if workers == 1 or len(items) == 1:
+        if workers == 1 or len(items) <= 1:
             results = map(compute_item, items)
         else:
             results = context.executor(min(workers, len(items))).map(
@@ -361,6 +385,96 @@ def _se_itemwise_numerical(
         name: model._expand_parameter_standard_errors(name, errors)
         for name, errors in result.items()
     }
+
+
+def shared_parameter_standard_errors(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    counts: Sequence[NDArray[np.float64]],
+    h: float,
+    *,
+    scheme: Literal["central", "forward"] = "central",
+    epsilon: float = PROB_EPSILON,
+    exact: bool = False,
+) -> dict[str, NDArray[np.float64]]:
+    """Diagonal complete-data curvature of parameters shared by all items.
+
+    Each free shared coordinate is differenced in the expected complete-data
+    log-likelihood summed over items, matching the itemwise convention for
+    item parameters.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted model. Its parameters are restored before returning.
+    nodes : ndarray of shape (n_points, n_factors)
+        Quadrature nodes.
+    counts : sequence of ndarray
+        Each item's expected ``(n_points, n_categories)`` counts; a binary
+        item has incorrect and correct columns.
+    h : float
+        Finite-difference step.
+    scheme : {"central", "forward"}, default="central"
+        Difference stencil.
+    epsilon : float, optional
+        Probability clipping bound.
+    exact : bool, default=False
+        Use closed-form second derivatives when the model has them, in place
+        of differences with ``h`` and ``scheme``.
+
+    Returns
+    -------
+    dict
+        Standard errors of each shared parameter, zero at fixed coordinates.
+    """
+    from mirt.estimation._louis_information import (
+        has_analytic_item_derivatives,
+        item_terms,
+    )
+    from mirt.estimation._shared_step import SharedParameters, _numerical_objective
+    from mirt.estimation.standard_errors import _flatten_parameters
+
+    layout = SharedParameters(model)
+    result = {
+        name: np.zeros_like(model._parameters[name])
+        for name in model._shared_parameters
+    }
+    if not layout.size:
+        return result
+    if exact and has_analytic_item_derivatives(model):
+        # Shared coordinates trail every item's derivative terms.
+        curvature = np.zeros(layout.size)
+        for term, item_counts in zip(
+            item_terms(model, nodes, _flatten_parameters(model)[1]), counts, strict=True
+        ):
+            assert term is not None
+            shared = term.second[-layout.size :, -layout.size :]
+            curvature += np.einsum("aaqc,qc->a", shared, item_counts)
+        errors = np.sqrt(
+            np.divide(
+                -1.0,
+                curvature,
+                out=np.full(layout.size, np.nan),
+                where=curvature < 0,
+            )
+        )
+    else:
+        loss = _numerical_objective(model, layout, nodes, counts, epsilon)
+        original = {name: model._parameters[name] for name in layout.masks}
+        try:
+            errors = np.asarray(
+                _diagonal_item_standard_errors(
+                    lambda vector: -loss(vector), layout.get(model), h, scheme=scheme
+                )
+            )
+        finally:
+            model._parameters.update(original)
+    offset = 0
+    for name, mask in layout.masks.items():
+        count = int(np.count_nonzero(mask))
+        result[name][mask] = errors[offset : offset + count]
+        offset += count
+    return result
 
 
 def _compute_item_se_curvature(

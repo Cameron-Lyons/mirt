@@ -44,7 +44,7 @@ def _softmax_loss_and_residual(
     loss, effective = _clipped_loss_and_counts(
         probabilities, counts, epsilon, max_probability
     )
-    residual = probabilities * effective.sum(axis=1, keepdims=True) - effective
+    residual = probabilities * effective.sum(axis=-1, keepdims=True) - effective
     return loss, residual
 
 

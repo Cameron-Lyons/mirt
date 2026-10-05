@@ -666,7 +666,7 @@ class FixedItemCalibrationResult:
         return {
             name: values[self.new_items]
             for name, values in model.parameters.items()
-            if values.ndim >= 1 and values.shape[0] == model.n_items
+            if model._item_indexed(name)
         }
 
 
@@ -722,7 +722,7 @@ def _anchor_parameter_values(
     masks = model.free_parameter_masks
     updated: dict[str, NDArray[np.float64]] = {}
     for name, values in current.items():
-        item_indexed = values.ndim >= 1 and values.shape[0] == model.n_items
+        item_indexed = model._item_indexed(name)
         if name not in supplied:
             # Omission is safe only where no anchor coordinate is free.
             if np.any(masks[name][anchor_items] if item_indexed else masks[name]):
@@ -792,6 +792,8 @@ def fixed_item_calibration(
         ``GradedResponseModel(n_items, n_categories=5)``. It is copied, not
         modified. Its existing free-parameter masks are respected, and the
         current values of new-item parameters are their starting values.
+        A :class:`~mirt.models.mixed_format.MixedItemModel` raises
+        ``MirtModelError``.
     anchor_items : list of int
         Response columns of the anchor items.
     anchor_parameters : BaseItemModel, FitResult or mapping, optional
@@ -850,6 +852,7 @@ def fixed_item_calibration(
     from mirt.estimation.em import EMEstimator
     from mirt.estimation.latent_density import GaussianDensity
     from mirt.models.base import BaseItemModel
+    from mirt.models.mixed_format import require_single_family
     from mirt.utils.data import validate_responses
 
     if not isinstance(model, BaseItemModel):
@@ -857,6 +860,12 @@ def fixed_item_calibration(
             "model must be an item model covering every response column",
             parameter="model",
         )
+    require_single_family(
+        model,
+        "fixed_item_calibration",
+        "fix the anchor coordinates with set_free_parameter_masks and fit with "
+        "MixedFormatEMEstimator and an estimated GaussianDensity",
+    )
     for name, flag in (
         ("estimate_mean", estimate_mean),
         ("estimate_cov", estimate_cov),
@@ -886,8 +895,8 @@ def fixed_item_calibration(
             )
         )
     masks = calibration_model.free_parameter_masks
-    for name, values in calibration_model.parameters.items():
-        if values.ndim >= 1 and values.shape[0] == calibration_model.n_items:
+    for name in calibration_model.parameters:
+        if calibration_model._item_indexed(name):
             masks[name][anchor_items] = False
         else:
             masks[name][...] = False

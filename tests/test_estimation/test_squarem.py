@@ -317,3 +317,50 @@ def test_free_item_parameters_pack_only_free_coordinates():
     rasch = FreeItemParameters(OneParameterLogistic(4))
     assert rasch.get(OneParameterLogistic(4)).size == 4
     np.testing.assert_array_equal(rasch.lower, np.full(4, -6.0))
+
+
+def test_fit_mirt_squarem_bypasses_the_native_2pl_fit(monkeypatch):
+    import mirt
+    import mirt.backends.rust.estimation as rust_estimation
+
+    responses = simdata(model="2PL", n_items=8, n_persons=500, seed=12)
+    plain = EMEstimator(tol=1e-6, max_iter=3000, compute_standard_errors=False).fit(
+        TwoParameterLogistic(8), responses
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the native full-EM fit runs plain EM")
+
+    monkeypatch.setattr(rust_estimation, "_em_fit_2pl_prepared", forbidden)
+    result = mirt.fit_mirt(responses, tol=1e-6, max_iter=3000, accelerate="squarem")
+    assert result.converged
+    assert result.n_iterations < plain.n_iterations
+    assert result.se_method == "oakes"
+    for name, values in plain.model.parameters.items():
+        np.testing.assert_allclose(result.model.parameters[name], values, atol=2e-3)
+
+
+def test_fit_mirt_forwards_squarem_to_polytomous_em():
+    import mirt
+
+    responses = simdata(model="GRM", n_items=6, n_categories=4, n_persons=500, seed=4)
+    options = dict(model="GRM", tol=1e-6, compute_standard_errors=False)
+    plain = mirt.fit_mirt(responses, **options)
+    accelerated = mirt.fit_mirt(responses, **options, accelerate="squarem")
+    assert accelerated.n_iterations < plain.n_iterations
+    assert accelerated.log_likelihood == pytest.approx(plain.log_likelihood, abs=1e-4)
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    [
+        ({"accelerate": "fast"}, "accelerate must be"),
+        ({"accelerate": "squarem", "estimation": "MHRM"}, "only to EM"),
+    ],
+)
+def test_fit_mirt_validates_accelerate(options, message):
+    import mirt
+
+    responses = simdata(model="2PL", n_items=4, n_persons=50, seed=1)
+    with pytest.raises(MirtValidationError, match=message):
+        mirt.fit_mirt(responses, **options)

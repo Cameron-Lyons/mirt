@@ -25,6 +25,7 @@ from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import (
     StartValues,
     _apply_starting_values,
+    _free_shared_parameters,
     _validate_start,
 )
 from mirt.estimation.em import EMEstimator
@@ -305,9 +306,11 @@ class WeightedEMEstimator(EMEstimator):
                 posterior_weights, survey_weights
             )
 
+        shared = bool(_free_shared_parameters(model))
+        shared_counts = []
         for item_idx in range(model.n_items):
             params, _ = self._get_item_params_and_bounds(model, item_idx)
-            if not params.size:
+            if not params.size and not (shared and model.is_polytomous):
                 continue
             category_counts = None
             if model.is_polytomous:
@@ -319,10 +322,11 @@ class WeightedEMEstimator(EMEstimator):
                 )
                 item_observed = category_counts.sum(axis=1)
                 item_correct = None
+                shared_counts.append(category_counts)
             else:
                 item_observed = observed[item_idx]
                 item_correct = correct[item_idx]
-            if not np.any(item_observed):
+            if not params.size or not np.any(item_observed):
                 continue
             optimal = self._optimize_item_params(
                 model,
@@ -335,6 +339,15 @@ class WeightedEMEstimator(EMEstimator):
                 r_kc=category_counts,
             )
             self._set_item_params(model, item_idx, optimal)
+        if shared:
+            from mirt.estimation._shared_step import binary_category_counts
+
+            self._m_step_shared(
+                model,
+                shared_counts
+                if model.is_polytomous
+                else binary_category_counts(correct, observed),
+            )
 
     def _compute_weighted_standard_errors(
         self,

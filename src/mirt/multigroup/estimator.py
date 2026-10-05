@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -32,6 +32,34 @@ if TYPE_CHECKING:
     from mirt.multigroup.latent import GroupLatentDistribution
     from mirt.multigroup.model import MultigroupModel
 
+# A pure item objective, its full parameter vector, the free vector positions
+# and the optimizer variables placed there.
+_BinaryTerm = tuple[
+    Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]],
+    NDArray[np.float64],
+    NDArray[np.intp],
+    NDArray[np.intp],
+]
+# Largest relative L-BFGS-B tolerance for a joint binary item solve. Item
+# losses are large sums, so looser values stop on flat 3PL/4PL directions
+# long before the item optimum, and EM then crawls toward the maximum.
+_JOINT_ITEM_FTOL = 1e-10
+_PARAMETER_BOUNDS = {
+    "discrimination": (0.1, 5.0),
+    "slopes": (0.1, 5.0),
+    "loadings": (-5.0, 5.0),
+    "general_loadings": (0.1, 5.0),
+    "specific_loadings": (0.1, 5.0),
+    "difficulty": (-6.0, 6.0),
+    "intercepts": (-6.0, 6.0),
+    "location": (-6.0, 6.0),
+    "thresholds": (-6.0, 6.0),
+    "steps": (-6.0, 6.0),
+    "guessing": (0.0, 0.5),
+    "slipping": (0.5, 1.0),
+    "upper": (0.5, 1.0),
+}
+
 
 class MultigroupEMEstimator:
     """EM estimator for simultaneous multigroup IRT estimation.
@@ -55,7 +83,8 @@ class MultigroupEMEstimator:
     item_optim_maxiter : int
         Maximum iterations for item parameter optimization.
     item_optim_ftol : float
-        Tolerance for item parameter optimization.
+        Relative tolerance for item parameter optimization. Built-in 1PL-4PL
+        items, whose free coordinates are solved jointly, use at most 1e-10.
     """
 
     def __init__(
@@ -286,48 +315,9 @@ class MultigroupEMEstimator:
         group_lls : list of float
             Marginal log-likelihood per group.
         """
-        quad_points = self._quadrature.nodes
-        quad_weights = self._quadrature.weights
-        n_quad = len(quad_weights)
-
         if should_use_rust() and self._can_use_rust_e_step(model):
             return self._e_step_rust(model, responses)
-
-        posterior_weights = []
-        group_lls = []
-
-        for g in range(model.n_groups):
-            group_model = model.get_group_model(g)
-            group_responses = responses[g]
-            n_persons = group_responses.shape[0]
-
-            if hasattr(group_model, "log_likelihood_batch"):
-                log_likelihoods = group_model.log_likelihood_batch(
-                    group_responses, quad_points
-                )
-            else:
-                log_likelihoods = np.zeros((n_persons, n_quad))
-                for q in range(n_quad):
-                    theta_q = quad_points[q : q + 1]
-                    log_likelihoods[:, q] = group_model.log_likelihood(
-                        group_responses, theta_q
-                    )
-
-            log_prior_mass = self._latent_density.log_quadrature_mass(
-                quad_points, quad_weights, g
-            )
-            log_joint = log_likelihoods + log_prior_mass[None, :]
-
-            log_marginal = logsumexp(log_joint, axis=1, keepdims=True)
-            log_posterior = log_joint - log_marginal
-
-            post_w = np.exp(log_posterior)
-            posterior_weights.append(post_w)
-
-            group_ll = np.sum(log_marginal)
-            group_lls.append(group_ll)
-
-        return posterior_weights, group_lls
+        return self._e_step_python(model, responses)
 
     def _can_use_rust_e_step(self, model: MultigroupModel) -> bool:
         """Check if Rust E-step can be used for this model."""
@@ -624,11 +614,11 @@ class MultigroupEMEstimator:
         For group-specific parameters: optimize independently per group.
         """
         quad_points = self._quadrature.nodes
-        n_items = model.n_items
-
-        for item_idx in range(n_items):
+        # Item updates never change which coordinates are free.
+        masks = [model.effective_free_parameter_masks(g) for g in range(model.n_groups)]
+        for item_idx in range(model.n_items):
             self._optimize_item(
-                model, item_idx, responses, posterior_weights, quad_points
+                model, item_idx, responses, posterior_weights, quad_points, masks=masks
             )
 
         model.synchronize_shared_parameters()
@@ -773,37 +763,52 @@ class MultigroupEMEstimator:
         responses: list[NDArray[np.int_]],
         posterior_weights: list[NDArray[np.float64]],
         quad_points: NDArray[np.float64],
+        *,
+        masks: Sequence[Mapping[str, NDArray[np.bool_]]] | None = None,
     ) -> None:
-        """Optimize parameters for a single item across all groups."""
+        """Optimize parameters for a single item across all groups.
+
+        Built-in binary items update every free coordinate in one block (see
+        ``_optimize_binary_block``). Other items update one parameter name at
+        a time, jointly across groups when it is shared. ``masks`` supplies
+        each group's effective free-parameter masks when already computed.
+        """
+        groups = model.group_models
         counts = [
             self._expected_item_counts(group, item_idx, data, posterior)
             for group, data, posterior in zip(
-                model.group_models, responses, posterior_weights, strict=True
+                groups, responses, posterior_weights, strict=True
             )
         ]
-        for param_name in model.parameter_names:
-            if model.is_item_parameter_shared(param_name, item_idx):
-                self._optimize_shared_item_param(
-                    model,
-                    item_idx,
-                    param_name,
-                    responses,
-                    posterior_weights,
-                    quad_points,
-                    counts=counts,
+        if masks is None:
+            masks = [
+                model.effective_free_parameter_masks(g) for g in range(model.n_groups)
+            ]
+        item_masks = {
+            name: [group_masks[name][item_idx].ravel() for group_masks in masks]
+            for name in model.parameter_names
+        }
+        shared = {
+            name
+            for name in item_masks
+            if model.is_item_parameter_shared(name, item_idx)
+        }
+        if self._optimize_binary_block(
+            groups, item_idx, item_masks, shared, counts, quad_points
+        ):
+            return
+        for param_name, name_masks in item_masks.items():
+            if param_name in shared:
+                self._optimize_parameter_block(
+                    groups, name_masks, counts, item_idx, param_name, quad_points
                 )
-            else:
-                for g in range(model.n_groups):
-                    self._optimize_group_item_param(
-                        model,
-                        g,
-                        item_idx,
-                        param_name,
-                        responses[g],
-                        posterior_weights[g],
-                        quad_points,
-                        counts=counts[g],
-                    )
+                continue
+            for group, mask, group_counts in zip(
+                groups, name_masks, counts, strict=True
+            ):
+                self._optimize_parameter_block(
+                    [group], [mask], [group_counts], item_idx, param_name, quad_points
+                )
 
     @staticmethod
     def _expected_item_counts(
@@ -846,9 +851,12 @@ class MultigroupEMEstimator:
                     models, responses, posterior_weights, strict=True
                 )
             ]
-        self._optimize_parameter_block(
-            models, masks, counts, item_idx, param_name, quad_points
-        )
+        if not self._optimize_binary_block(
+            models, item_idx, {param_name: masks}, {param_name}, counts, quad_points
+        ):
+            self._optimize_parameter_block(
+                models, masks, counts, item_idx, param_name, quad_points
+            )
 
     def _optimize_group_item_param(
         self,
@@ -873,9 +881,203 @@ class MultigroupEMEstimator:
             counts = self._expected_item_counts(
                 group, item_idx, group_responses, group_weights
             )
-        self._optimize_parameter_block(
-            [group], [mask], [counts], item_idx, param_name, quad_points
+        if not self._optimize_binary_block(
+            [group], item_idx, {param_name: [mask]}, (), [counts], quad_points
+        ):
+            self._optimize_parameter_block(
+                [group], [mask], [counts], item_idx, param_name, quad_points
+            )
+
+    def _optimize_binary_block(
+        self,
+        groups: Sequence[BaseItemModel],
+        item_idx: int,
+        masks: Mapping[str, Sequence[NDArray[np.bool_]]],
+        shared: Collection[str],
+        counts: Sequence[NDArray[np.float64]],
+        quad_points: NDArray[np.float64],
+    ) -> bool:
+        """Maximize a built-in binary item's free coordinates with one solver.
+
+        ``masks`` maps parameter names to each group's free coordinates of the
+        item; omitted names stay fixed. A free coordinate of a ``shared`` name
+        is one variable for every group that frees it, and other coordinates
+        are one variable per group. Without shared variables each group is
+        solved on its own, and groups whose item curves and variables
+        coincide pool their counts. A solve is kept only when it improves the
+        expected log-likelihood, as generalized EM requires.
+
+        Returns
+        -------
+        bool
+            ``False``, with every model unchanged, when the item needs the
+            per-parameter path: polytomous, custom, or restricted models.
+        """
+        first = groups[0]
+        # Pooled groups share one kernel, so every group needs the built-in
+        # curve, not only the group whose kernel is prepared.
+        if first.is_polytomous or any(
+            type(group) is not type(first) or not uses_builtin_model_hooks(group)
+            for group in groups
+        ):
+            return False
+        fixed_slope = first.model_name == "1PL"
+        if fixed_slope and np.any(masks.get("discrimination", False)):
+            return False
+        parameters = [group.parameters for group in groups]
+        names = [
+            name
+            for name in parameters[0]
+            if not (fixed_slope and name == "discrimination")
+        ]
+        rows = [
+            np.concatenate([np.ravel(values[name][item_idx]) for name in names])
+            for values in parameters
+        ]
+        observed = [bool(np.any(group_counts)) for group_counts in counts]
+        lower: list[float] = []
+        upper: list[float] = []
+        spans: dict[str, slice] = {}
+        positions: list[list[int]] = [[] for _ in groups]
+        variables: list[list[int]] = [[] for _ in groups]
+        start: list[float] = []
+        box: list[tuple[float, float]] = []
+        coupled = False
+        for name in names:
+            offset = len(lower)
+            size = np.size(parameters[0][name][item_idx])
+            spans[name] = slice(offset, offset + size)
+            bound = self._parameter_bound(first, name)
+            lower.extend([bound[0]] * size)
+            upper.extend([bound[1]] * size)
+            name_masks = masks.get(name)
+            if name_masks is None:
+                continue
+            if name in shared:
+                for coordinate in np.flatnonzero(np.logical_or.reduce(name_masks)):
+                    coupled = True
+                    for g, mask in enumerate(name_masks):
+                        if mask[coordinate]:
+                            positions[g].append(offset + coordinate)
+                            variables[g].append(len(start))
+                            value = rows[g][offset + coordinate]
+                    start.append(value)
+                    box.append(bound)
+                continue
+            for g, mask in enumerate(name_masks):
+                if not observed[g]:
+                    continue
+                for coordinate in np.flatnonzero(mask):
+                    positions[g].append(offset + coordinate)
+                    variables[g].append(len(start))
+                    start.append(rows[g][offset + coordinate])
+                    box.append(bound)
+
+        members = [g for g in range(len(groups)) if variables[g]]
+        problems = [members] if coupled else [[g] for g in members]
+        initial = np.asarray(start, dtype=np.float64)
+        solves = []
+        for problem in problems:
+            terms_groups = [g for g in problem if observed[g]]
+            if not terms_groups:
+                continue
+            used = np.unique(np.concatenate([variables[g] for g in problem]))
+            local = {g: np.searchsorted(used, variables[g]) for g in problem}
+            reference = terms_groups[0]
+            pooled = all(
+                positions[g] == positions[reference]
+                and variables[g] == variables[reference]
+                and all(
+                    np.array_equal(values[item_idx], parameters[g][name][item_idx])
+                    for name, values in parameters[reference].items()
+                )
+                for g in terms_groups[1:]
+            )
+            terms: list[_BinaryTerm] = []
+            for term in [terms_groups] if pooled else [[g] for g in terms_groups]:
+                g = term[0]
+                index = np.asarray(positions[g], dtype=np.intp)
+                trial = rows[g].copy()
+                trial[index] = initial[variables[g]]
+                # The kernel skips overflow guards when every evaluated vector
+                # lies in its box, so cover fixed values and the start too.
+                kernel_box = list(
+                    zip(
+                        np.minimum(lower, np.minimum(rows[g], trial)),
+                        np.maximum(upper, np.maximum(rows[g], trial)),
+                        strict=True,
+                    )
+                )
+                term_counts = np.sum([counts[h] for h in term], axis=0)
+                kernel = prepare_dichotomous_objective(
+                    groups[g],
+                    item_idx,
+                    quad_points,
+                    term_counts.sum(axis=1),
+                    term_counts[:, 1],
+                    self.prob_epsilon,
+                    kernel_box,
+                )
+                if kernel is None:
+                    return False
+                terms.append((kernel, rows[g], index, local[g]))
+            solves.append((problem, used, local, terms))
+
+        for problem, used, local, terms in solves:
+            solution = self._minimize_binary_terms(
+                terms, initial[used], [box[index] for index in used]
+            )
+            if solution is None:
+                continue
+            for g in problem:
+                row = rows[g].copy()
+                row[positions[g]] = solution[local[g]]
+                for name, span in spans.items():
+                    if not np.array_equal(row[span], rows[g][span]):
+                        self._set_param(groups[g], item_idx, name, row[span])
+        return True
+
+    def _minimize_binary_terms(
+        self,
+        terms: list[_BinaryTerm],
+        start: NDArray[np.float64],
+        box: list[tuple[float, float]],
+    ) -> NDArray[np.float64] | None:
+        """Minimize summed kernel losses; keep only an improving solution."""
+
+        def objective(
+            params: NDArray[np.float64],
+        ) -> tuple[float, NDArray[np.float64]]:
+            loss = 0.0
+            gradient = np.zeros_like(params)
+            for kernel, base, index, variables in terms:
+                trial = base.copy()
+                trial[index] = params[variables]
+                value, full_gradient = kernel(trial)
+                loss += value
+                gradient[variables] += full_gradient[index]
+            return loss, gradient
+
+        initial_loss = objective(start)[0]
+        result = minimize(
+            objective,
+            x0=start,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=box,
+            options={
+                "maxiter": self.item_optim_maxiter,
+                "ftol": min(self.item_optim_ftol, _JOINT_ITEM_FTOL),
+            },
         )
+        if not np.all(np.isfinite(result.x)):
+            return None
+        final_loss = objective(result.x)[0]
+        if not np.isfinite(final_loss) or final_loss > initial_loss + 1e-10 * max(
+            1.0, abs(initial_loss)
+        ):
+            return None
+        return np.asarray(result.x, dtype=np.float64)
 
     def _optimize_parameter_block(
         self,
@@ -888,12 +1090,13 @@ class MultigroupEMEstimator:
     ) -> None:
         """Maximize a free block and restore state after rejected trials.
 
-        Built-in binary items use pure prepared likelihoods and analytic
-        gradients. Other models retain their public probability and setter
-        hooks. An incomplete optimizer step is accepted only when it improves
-        the actual expected likelihood, as required by generalized EM.
+        Trials go through the models' public probability and setter hooks.
+        An incomplete optimizer step is accepted only when it improves the
+        actual expected likelihood, as required by generalized EM.
         """
-        if not any(np.any(group_counts) for group_counts in counts):
+        if not np.any(masks) or not any(
+            np.any(group_counts) for group_counts in counts
+        ):
             return
         originals = [
             group.parameters[param_name][item_idx].ravel().copy() for group in models
@@ -917,73 +1120,31 @@ class MultigroupEMEstimator:
             # Identical curves share sufficient statistics; retain separate
             # likelihood terms whenever another group parameter or hook differs.
             evaluations = [(models[0], originals[0], masks[0], np.sum(counts, axis=0))]
-        prepared: list[
-            tuple[
-                Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]],
-                NDArray[np.float64],
-                int,
-            ]
-        ] = []
-        for group, _, _, group_counts in evaluations:
-            kernel = (
-                None
-                if group.is_polytomous
-                else prepare_dichotomous_objective(
-                    group,
-                    item_idx,
-                    quad_points,
-                    group_counts.sum(axis=1),
-                    group_counts[:, 1],
-                    self.prob_epsilon,
-                )
-            )
-            if kernel is None:
-                prepared = []
-                break
-            names = list(group.parameters)
-            if group.model_name == "1PL":
-                names.remove("discrimination")
-            rows = [group.parameters[name][item_idx].ravel() for name in names]
-            offset = sum(row.size for row in rows[: names.index(param_name)])
-            prepared.append((kernel, np.concatenate(rows), offset))
-        analytic = len(prepared) == len(evaluations)
 
-        def evaluate(
-            params: NDArray[np.float64],
-        ) -> tuple[float, NDArray[np.float64]]:
+        def evaluate(params: NDArray[np.float64]) -> float:
             loss = 0.0
-            gradient = np.zeros_like(params)
-            for g, (group, original, mask, group_counts) in enumerate(evaluations):
+            for group, original, mask, group_counts in evaluations:
                 row = original.copy()
                 row[slots[mask[slots]]] = params[mask[slots]]
-                if analytic:
-                    kernel, full_params, offset = prepared[g]
-                    trial = full_params.copy()
-                    trial[offset : offset + row.size] = row
-                    value, full_gradient = kernel(trial)
-                    loss += value
-                    local_gradient = full_gradient[offset : offset + row.size]
-                    gradient[mask[slots]] += local_gradient[slots[mask[slots]]]
-                else:
-                    self._set_param(group, item_idx, param_name, row)
-                    probs = group.probability(quad_points, item_idx)
-                    if not group.is_polytomous:
-                        probs = np.column_stack((1 - probs, probs))
-                    if not np.all(np.isfinite(probs)):
-                        return np.inf, gradient
-                    loss -= float(
-                        np.sum(
-                            group_counts
-                            * np.log(
-                                np.clip(probs, self.prob_epsilon, 1 - self.prob_epsilon)
-                            )
+                self._set_param(group, item_idx, param_name, row)
+                probs = group.probability(quad_points, item_idx)
+                if not group.is_polytomous:
+                    probs = np.column_stack((1 - probs, probs))
+                if not np.all(np.isfinite(probs)):
+                    return np.inf
+                loss -= float(
+                    np.sum(
+                        group_counts
+                        * np.log(
+                            np.clip(probs, self.prob_epsilon, 1 - self.prob_epsilon)
                         )
                     )
-            return loss, gradient
+                )
+            return loss
 
         accepted = False
         try:
-            initial_loss = evaluate(current[active])[0]
+            initial_loss = evaluate(current[active])
             ordered_thresholds = param_name == "thresholds" and all(
                 group.model_name == "GRM" for group in models
             )
@@ -1007,9 +1168,8 @@ class MultigroupEMEstimator:
             matrix = np.asarray(constraint_matrix)
             constants = np.asarray(constraint_constants)
             result = minimize(
-                evaluate if analytic else lambda params: evaluate(params)[0],
+                evaluate,
                 x0=current[active],
-                jac=analytic,
                 method="SLSQP" if ordered_thresholds else "L-BFGS-B",
                 bounds=[bounds[index] for index in slots],
                 constraints=(
@@ -1031,7 +1191,7 @@ class MultigroupEMEstimator:
             if ordered_thresholds:
                 if np.min(matrix @ result.x + constants) < -1e-9:
                     return
-            final_loss = evaluate(result.x)[0]
+            final_loss = evaluate(result.x)
             if not np.isfinite(final_loss) or final_loss > initial_loss + 1e-10 * max(
                 1.0, abs(initial_loss)
             ):
@@ -1046,6 +1206,19 @@ class MultigroupEMEstimator:
                 for group, original in zip(models, originals, strict=True):
                     self._set_param(group, item_idx, param_name, original)
 
+    @staticmethod
+    def _parameter_bound(model: BaseItemModel, param_name: str) -> tuple[float, float]:
+        """Return the optimizer box for every coordinate of a parameter."""
+        if param_name == "slopes" and model.model_name == "NRM":
+            return (-5.0, 5.0)
+        if (
+            param_name == "discrimination"
+            and model.n_factors > 1
+            and not model.is_polytomous
+        ):
+            return (-5.0, 5.0)
+        return _PARAMETER_BOUNDS.get(param_name, (-10.0, 10.0))
+
     def _get_param_and_bounds(
         self,
         model: BaseItemModel,
@@ -1053,42 +1226,8 @@ class MultigroupEMEstimator:
         param_name: str,
     ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
         """Get current parameter value and bounds for optimization."""
-        values = model.parameters[param_name]
-
-        if values.ndim == 1:
-            current = np.array([values[item_idx]])
-        else:
-            current = values[item_idx].ravel().copy()
-
-        bounds_map = {
-            "discrimination": (0.1, 5.0),
-            "slopes": (0.1, 5.0),
-            "loadings": (-5.0, 5.0),
-            "general_loadings": (0.1, 5.0),
-            "specific_loadings": (0.1, 5.0),
-            "difficulty": (-6.0, 6.0),
-            "intercepts": (-6.0, 6.0),
-            "location": (-6.0, 6.0),
-            "thresholds": (-6.0, 6.0),
-            "steps": (-6.0, 6.0),
-            "guessing": (0.0, 0.5),
-            "slipping": (0.5, 1.0),
-            "upper": (0.5, 1.0),
-        }
-
-        default_bounds = (-10.0, 10.0)
-        bound = bounds_map.get(param_name, default_bounds)
-        if param_name == "slopes" and model.model_name == "NRM":
-            bound = (-5.0, 5.0)
-        if (
-            param_name == "discrimination"
-            and model.n_factors > 1
-            and not model.is_polytomous
-        ):
-            bound = (-5.0, 5.0)
-        bounds = [bound] * len(current)
-
-        return current, bounds
+        current = np.ravel(model.parameters[param_name][item_idx]).copy()
+        return current, [self._parameter_bound(model, param_name)] * current.size
 
     def _set_param(
         self,

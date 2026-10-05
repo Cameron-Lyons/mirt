@@ -232,6 +232,7 @@ class GradedResponseModel(PolytomousItemModel):
         threshold_idx: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
 
         a = self._parameters["discrimination"]
         b = self._parameters["thresholds"][item_idx, threshold_idx]
@@ -251,6 +252,7 @@ class GradedResponseModel(PolytomousItemModel):
         item_idx: int,
         category: int,
     ) -> NDArray[np.float64]:
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -284,7 +286,9 @@ class GradedResponseModel(PolytomousItemModel):
         """Compute all-item GRM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
         n_persons = theta.shape[0]
@@ -480,6 +484,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -517,7 +522,9 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         """Compute all-item GPCM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -747,6 +754,7 @@ class RatingScaleModel(PolytomousItemModel):
 
     model_name = "RSM"
     supports_multidimensional = False
+    _shared_parameters = frozenset({"thresholds"})
 
     def __init__(
         self,
@@ -822,6 +830,7 @@ class RatingScaleModel(PolytomousItemModel):
             Probability of category response for each theta
         """
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_cats
 
         if category < 0 or category >= n_cat:
@@ -851,7 +860,9 @@ class RatingScaleModel(PolytomousItemModel):
         """Compute all-item RSM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -937,19 +948,7 @@ class RatingScaleModel(PolytomousItemModel):
         if not all(np.all(np.isfinite(values)) for values in candidates.values()):
             raise ValueError("identified rating-scale parameters must be finite")
         self._parameters = candidates
-
-        self._is_fitted = True
         return self
-
-    def set_item_parameter(
-        self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        if param_name == "thresholds":
-            raise MirtValidationError("thresholds are shared; use set_parameters")
-        super().set_item_parameter(item_idx, param_name, value)
 
 
 class GradedRatingScaleModel(PolytomousItemModel):
@@ -994,6 +993,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
 
     model_name = "GRSM"
     supports_multidimensional = False
+    _shared_parameters = frozenset({"discrimination", "thresholds"})
 
     def __init__(
         self,
@@ -1059,6 +1059,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
         theta_1d = theta.ravel()
+        item_idx = self._validate_item_index(item_idx)
 
         a = self._parameters["discrimination"][0]
         b_j = self._parameters["difficulty"][item_idx]
@@ -1073,6 +1074,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         item_idx: int,
         category: int,
     ) -> NDArray[np.float64]:
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_cats
 
         if category < 0 or category >= n_cat:
@@ -1102,7 +1104,9 @@ class GradedRatingScaleModel(PolytomousItemModel):
         """Compute all-item GRSM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -1190,19 +1194,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         if not all(np.all(np.isfinite(values)) for values in candidates.values()):
             raise ValueError("identified rating-scale parameters must be finite")
         self._parameters = candidates
-
-        self._is_fitted = True
         return self
-
-    def set_item_parameter(
-        self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        if param_name in {"thresholds", "discrimination"}:
-            raise MirtValidationError(f"{param_name} is shared; use set_parameters")
-        super().set_item_parameter(item_idx, param_name, value)
 
 
 @_register_builtin_model
@@ -1294,6 +1286,7 @@ class NominalResponseModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -1331,7 +1324,9 @@ class NominalResponseModel(PolytomousItemModel):
         """Compute all-item NRM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
         if self.n_items < 8:
@@ -1483,3 +1478,31 @@ _AUTHORED_INFORMATION_HOOKS: dict[type[PolytomousItemModel], dict[str, object]] 
         NominalResponseModel,
     )
 }
+_RATING_SCALE_HOOKS = (
+    "probability",
+    "_category_probabilities",
+    "_canonical_parameter_values",
+    "free_parameter_masks",
+    "_apply_free_parameter_restrictions",
+    "parameters",
+    "set_parameters",
+    "log_likelihood",
+    "log_likelihood_batch",
+)
+_AUTHORED_RATING_SCALE_HOOKS: dict[type[PolytomousItemModel], dict[str, object]] = {
+    owner: {name: getattr(owner, name) for name in _RATING_SCALE_HOOKS}
+    for owner in (RatingScaleModel, GradedRatingScaleModel)
+}
+
+
+def _uses_authored_rating_scale_hooks(model: object) -> bool:
+    """Whether ``model`` is an exact RSM or GRSM with its authored curves.
+
+    The rating-scale families are not registered built-ins, so closed-form
+    estimation shortcuts require the exact class with no replaced hooks.
+    """
+    model_class = type(model)
+    authored = _AUTHORED_RATING_SCALE_HOOKS.get(model_class)
+    if authored is None or not vars(model).keys().isdisjoint(authored):
+        return False
+    return all(getattr(model_class, name) is hook for name, hook in authored.items())

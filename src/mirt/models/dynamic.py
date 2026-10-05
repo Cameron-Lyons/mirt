@@ -1745,6 +1745,8 @@ class BKTModel:
         self,
         responses: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
+        *,
+        transition_out: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Smooth shared or person-specific layouts in one chronological sweep.
 
@@ -1755,6 +1757,13 @@ class BKTModel:
         opportunity. A zero scaling factor leaves that trial's zero filter
         unnormalized, so the rest of the chain stays at zero and contributes
         ``log(1e-300)`` per trial, exactly as in the per-learner recursion.
+
+        An optional trial-major ``transition_out`` array with shape
+        ``(2, n_trials, n_persons)`` receives the smoothed probabilities of
+        learning and of forgetting since the chain's previous opportunity,
+        ``P(learned | previously unlearned, data)`` and
+        ``P(unlearned | previously learned, data)``. Entries at a chain's
+        first opportunity have no predecessor and carry no meaning.
         """
         n_persons, n_trials = responses.shape
         shared = skill_assignments.ndim == 1
@@ -1836,6 +1845,21 @@ class BKTModel:
             weighted_learned = learned_emissions[trial] * beta_learned
             posterior[0, trial] *= beta_unlearned
             posterior[1, trial] *= beta_learned
+            if transition_out is not None:
+                # Each message to the previous opportunity sums over this
+                # trial's state, so its parts give the transition posteriors.
+                learned_part = learn[trial] * weighted_learned
+                unlearned_part = forget[trial] * weighted_unlearned
+                kept_unlearned = (1.0 - learn[trial]) * weighted_unlearned
+                kept_learned = (1.0 - forget[trial]) * weighted_learned
+                from_unlearned = kept_unlearned + learned_part
+                from_learned = unlearned_part + kept_learned
+                transition_out[0, trial] = learned_part / np.where(
+                    from_unlearned > 0.0, from_unlearned, 1.0
+                )
+                transition_out[1, trial] = unlearned_part / np.where(
+                    from_learned > 0.0, from_learned, 1.0
+                )
             total = scaling[trial]
             divisor = np.where(total > 0.0, total, 1.0)
             store(

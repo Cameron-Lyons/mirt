@@ -5,15 +5,16 @@ log-likelihood. Keeping that objective in one place makes the observed,
 cross-product, and sandwich estimators consistent and ensures that a fitted
 latent density is not silently replaced by the quadrature's default mass.
 
-Built-in item models whose parameters each belong to one item use the exact
-Louis observed information and marginal scores from
+Built-in item models whose parameters each belong to one item, or to all
+items as rating-scale thresholds do, use the exact Louis observed
+information and marginal scores from
 :mod:`mirt.estimation._louis_information`. Other models difference the
 marginal log-likelihood, which costs O(P^2) likelihood evaluations.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -727,6 +728,22 @@ class CovarianceEstimate:
     method: str
 
 
+def _free_values(
+    arrays: Mapping[str, NDArray[np.float64]],
+    layouts: dict[str, _ParameterLayout],
+) -> NDArray[np.float64]:
+    """Gather full-shape arrays at the free coordinates; missing names are 0."""
+    chunks = [
+        (
+            np.asarray(arrays[name], dtype=np.float64).ravel()[layout.free_indices]
+            if name in arrays
+            else np.zeros(layout.free_indices.size)
+        )
+        for name, layout in layouts.items()
+    ]
+    return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.float64)
+
+
 def _coordinates_at_bounds(
     layouts: dict[str, _ParameterLayout],
     bounds: Callable[[str], tuple[float, float]],
@@ -752,6 +769,7 @@ def estimate_covariance(
     frequencies: NDArray[np.float64] | None = None,
     h: float = 1e-5,
     bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
 ) -> CovarianceEstimate:
     """Estimate the free-parameter covariance of a fitted marginal model.
 
@@ -775,6 +793,11 @@ def estimate_covariance(
     bounds : callable, optional
         Maps a parameter name to its optimizer box. Free coordinates on a
         bound are held fixed and receive NaN standard errors.
+    prior_information : mapping of str to ndarray, optional
+        Negative second derivative of an independent item log-prior, in the
+        stored parameter shapes, for Bayes modal estimates. It is added to the
+        observed information, to the bread of the sandwich, and to the score
+        cross-product that ``"crossprod"`` inverts.
 
     Returns
     -------
@@ -791,6 +814,12 @@ def estimate_covariance(
         person_weights=frequencies,
         observed=method != "crossprod",
     )
+    if prior_information is not None:
+        curvature = np.diag(_free_values(prior_information, layouts))
+        if information is not None:
+            information = information + curvature
+        if method == "crossprod":
+            meat = meat + curvature
     active = np.ones(meat.shape[0], dtype=np.bool_)
     if bounds is not None:
         active &= ~_coordinates_at_bounds(layouts, bounds)

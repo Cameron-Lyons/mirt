@@ -586,13 +586,29 @@ fn compute_total_ll(
     person_ll.iter().sum()
 }
 
-/// Metropolis-Hastings Robbins-Monro for 2PL
+/// Ability sweeps before the first MHRM parameter step.
+const MHRM_WARMUP_SWEEPS: usize = 30;
+/// Step halvings allowed before an MHRM item keeps its parameters.
+const MHRM_MAX_HALVINGS: usize = 10;
+/// Eigenvalue floor relative to the largest information eigenvalue.
+const MHRM_CURVATURE_FLOOR: f64 = 1e-8;
+/// Optimizer box `[a, b]` and per-cycle step limits for MHRM items.
+const MHRM_LOWER: [f64; 2] = [0.1, -6.0];
+const MHRM_UPPER: [f64; 2] = [5.0, 6.0];
+const MHRM_STEP_LIMIT: [f64; 2] = [1.0, 1.0];
+
+/// Metropolis-Hastings Robbins-Monro (Cai, 2010) for 2PL
 ///
-/// Every cycle draws abilities with a random-walk Metropolis step and then moves
-/// each item along its mean residual gradient with gain `1 / (cycle + 1)`
-/// (`"standard"`) or `min(1, 10 / (cycle + 10))` (`"adaptive"`). Returns the mean
-/// of the post-burn-in iterates (the final iterate when `burnin >= n_cycles`)
-/// and the log-likelihood of the final ability draw under those parameters.
+/// After 30 warm-up ability sweeps, every cycle draws abilities with a
+/// random-walk Metropolis step and moves each item along its complete-data
+/// score, preconditioned by the running complete-data information
+/// `G_k = G_{k-1} + g_k (H_k - G_{k-1})`. Burn-in cycles use `g_k = 1`; later
+/// gains are `1 / (t + 1)` (`"standard"`) or `min(1, 10 / (t + 10))`
+/// (`"adaptive"`) for the `t`-th post-burn-in cycle. Steps hold coordinates that
+/// a bound would cut, move at most one unit, and halve until the item's
+/// complete-data likelihood on the draw does not decrease. Returns the mean of
+/// the post-burn-in iterates (the final iterate when `burnin >= n_cycles`) and
+/// the log-likelihood of the final ability draw under those parameters.
 #[pyfunction]
 #[pyo3(signature = (responses, n_cycles, burnin, proposal_sd, seed, gain_sequence="standard"))]
 #[allow(clippy::type_complexity)]
@@ -629,45 +645,59 @@ pub fn mhrm_fit_2pl<'py>(
     let (discrimination, difficulty, ll) = py.detach(|| {
         let mut discrimination: Vec<f64> = vec![1.0; n_items];
         let mut difficulty: Vec<f64> = vec![0.0; n_items];
+        let mut information: Vec<Option<[f64; 3]>> = vec![None; n_items];
         let mut theta: Vec<f64> = vec![0.0; n_persons];
         let mut disc_sum = vec![0.0; n_items];
         let mut diff_sum = vec![0.0; n_items];
 
         let mut rng = StdRng::seed_from_u64(seed);
-
-        for cycle in 0..n_cycles {
-            theta = sample_theta_mh(
+        let mut sample = |theta: &[f64], discrimination: &[f64], difficulty: &[f64]| {
+            sample_theta_mh(
                 &responses,
-                &theta,
-                &discrimination,
-                &difficulty,
+                theta,
+                discrimination,
+                difficulty,
                 n_persons,
                 n_items,
                 &mut rng,
                 proposal_sd,
-            );
+            )
+        };
+        for _ in 0..MHRM_WARMUP_SWEEPS {
+            theta = sample(&theta, &discrimination, &difficulty);
+        }
 
-            let gain = if adaptive_gain {
-                (10.0 / (cycle as f64 + 10.0)).min(1.0)
+        for cycle in 0..n_cycles {
+            theta = sample(&theta, &discrimination, &difficulty);
+
+            let gain = if cycle < burnin {
+                1.0
+            } else if adaptive_gain {
+                (10.0 / ((cycle - burnin) as f64 + 10.0)).min(1.0)
             } else {
-                1.0 / (cycle as f64 + 1.0)
+                1.0 / ((cycle - burnin) as f64 + 1.0)
             };
             let step = |j: usize| {
-                robbins_monro_2pl_item(
+                mhrm_2pl_item(
                     &responses,
                     &theta,
                     j,
-                    discrimination[j],
-                    difficulty[j],
+                    [discrimination[j], difficulty[j]],
+                    information[j],
                     gain,
                 )
             };
             // Small cycles finish faster than a parallel region wakes its workers.
-            (discrimination, difficulty) = if responses.len() < 32_768 {
-                (0..n_items).map(step).unzip()
+            let updates: Vec<([f64; 2], Option<[f64; 3]>)> = if responses.len() < 32_768 {
+                (0..n_items).map(step).collect()
             } else {
-                (0..n_items).into_par_iter().map(step).unzip()
+                (0..n_items).into_par_iter().map(step).collect()
             };
+            for (j, ([a, b], item_information)) in updates.into_iter().enumerate() {
+                discrimination[j] = a;
+                difficulty[j] = b;
+                information[j] = item_information;
+            }
 
             if cycle >= burnin {
                 for j in 0..n_items {
@@ -701,37 +731,126 @@ pub fn mhrm_fit_2pl<'py>(
     ))
 }
 
-/// One Robbins-Monro step for item `j` along the mean residual gradient
-/// (`mean(residual * theta)`, `-mean(residual)`) at clipped probabilities.
-fn robbins_monro_2pl_item(
+/// Clipped complete-data loss of item `j` at `[a, b]` with its gradient and
+/// symmetric Hessian `[h_aa, h_ab, h_bb]`; clipped probabilities contribute
+/// only to the loss, as in the NumPy kernel.
+fn complete_data_2pl_item(
     responses: &numpy::ndarray::ArrayView2<i32>,
     theta: &[f64],
     j: usize,
-    a: f64,
-    b: f64,
-    gain: f64,
-) -> (f64, f64) {
-    let mut residual_sum = 0.0;
-    let mut weighted_residual_sum = 0.0;
+    [a, b]: [f64; 2],
+) -> (f64, [f64; 2], [f64; 3], usize) {
+    let mut loss = 0.0;
+    let mut gradient = [0.0; 2];
+    let mut hessian = [0.0; 3];
     let mut count = 0usize;
     for (&response, &ability) in responses.column(j).iter().zip(theta) {
         if response < 0 {
             continue;
         }
-        let p = sigmoid(a * (ability - b)).clamp(EPSILON, 1.0 - EPSILON);
-        let residual = response as f64 - p;
-        residual_sum += residual;
-        weighted_residual_sum += residual * ability;
         count += 1;
+        let centered = ability - b;
+        let raw = sigmoid(a * centered);
+        let p = raw.clamp(EPSILON, 1.0 - EPSILON);
+        loss -= if response == 1 {
+            p.ln()
+        } else {
+            (1.0 - p).ln()
+        };
+        if p != raw {
+            continue;
+        }
+        let residual = p - response as f64;
+        let weight = p * (1.0 - p);
+        gradient[0] += residual * centered;
+        gradient[1] -= residual * a;
+        hessian[0] += weight * centered * centered;
+        hessian[1] -= weight * a * centered + residual;
+        hessian[2] += weight * a * a;
     }
+    (loss, gradient, hessian, count)
+}
+
+/// Solve the symmetric 2x2 system `information @ step = rhs` with eigenvalues
+/// replaced by their magnitudes and floored relative to the largest.
+fn precondition_2x2([h_aa, h_ab, h_bb]: [f64; 3], rhs: [f64; 2]) -> [f64; 2] {
+    let mean = 0.5 * (h_aa + h_bb);
+    let radius = (0.25 * (h_aa - h_bb).powi(2) + h_ab * h_ab).sqrt();
+    let values = [mean - radius, mean + radius];
+    // Eigenvector of the larger eigenvalue; the other is orthogonal.
+    let (x, y) = if h_ab != 0.0 {
+        (values[1] - h_bb, h_ab)
+    } else if h_aa >= h_bb {
+        (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
+    };
+    let norm = x.hypot(y);
+    let first = [x / norm, y / norm];
+    let second = [-first[1], first[0]];
+    let scale = values[0].abs().max(values[1].abs());
+    let floor = (MHRM_CURVATURE_FLOOR * scale).max(f64::MIN_POSITIVE);
+    let mut step = [0.0; 2];
+    for (vector, value) in [(second, values[0]), (first, values[1])] {
+        let coefficient = (vector[0] * rhs[0] + vector[1] * rhs[1]) / value.abs().max(floor);
+        step[0] += coefficient * vector[0];
+        step[1] += coefficient * vector[1];
+    }
+    step
+}
+
+/// One preconditioned Robbins-Monro update of item `j`, returning the new
+/// `[a, b]` and running information. Mirrors `MHRMEstimator._update_parameters`.
+fn mhrm_2pl_item(
+    responses: &numpy::ndarray::ArrayView2<i32>,
+    theta: &[f64],
+    j: usize,
+    params: [f64; 2],
+    information: Option<[f64; 3]>,
+    gain: f64,
+) -> ([f64; 2], Option<[f64; 3]>) {
+    let (loss, gradient, hessian, count) = complete_data_2pl_item(responses, theta, j, params);
     if count == 0 {
-        return (a, b);
+        return (params, information);
     }
-    let count = count as f64;
-    (
-        (a + gain * (weighted_residual_sum / count)).clamp(0.1, 5.0),
-        (b - gain * (residual_sum / count)).clamp(-6.0, 6.0),
-    )
+    let current = match information {
+        None => hessian,
+        Some(previous) => [0, 1, 2].map(|k| previous[k] + gain * (hessian[k] - previous[k])),
+    };
+
+    let held = [0, 1].map(|k| {
+        (params[k] <= MHRM_LOWER[k] && gradient[k] > 0.0)
+            || (params[k] >= MHRM_UPPER[k] && gradient[k] < 0.0)
+    });
+    let mut step = match held {
+        [false, false] => precondition_2x2(current, [-gradient[0], -gradient[1]]),
+        [true, true] => [0.0, 0.0],
+        [false, true] => [precondition_1x1(current[0], -gradient[0]), 0.0],
+        [true, false] => [0.0, precondition_1x1(current[2], -gradient[1])],
+    };
+    step = step.map(|value| value * gain);
+    if !step.iter().all(|value| value.is_finite()) {
+        return (params, Some(current));
+    }
+    let ratio = (step[0].abs() / MHRM_STEP_LIMIT[0]).max(step[1].abs() / MHRM_STEP_LIMIT[1]);
+    if ratio > 1.0 {
+        step = step.map(|value| value / ratio);
+    }
+    for _ in 0..MHRM_MAX_HALVINGS {
+        let trial = [0, 1].map(|k| (params[k] + step[k]).clamp(MHRM_LOWER[k], MHRM_UPPER[k]));
+        if complete_data_2pl_item(responses, theta, j, trial).0 <= loss {
+            return (trial, Some(current));
+        }
+        step = step.map(|value| value * 0.5);
+    }
+    (params, Some(current))
+}
+
+/// One-coordinate counterpart of `precondition_2x2`.
+fn precondition_1x1(information: f64, rhs: f64) -> f64 {
+    rhs / information
+        .abs()
+        .max((MHRM_CURVATURE_FLOOR * information.abs()).max(f64::MIN_POSITIVE))
 }
 
 /// Bootstrap parameter estimation for 2PL
@@ -1240,10 +1359,12 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Newton3plControls, NewtonControls, expected_log_likelihood_3pl, newton_2pl_item,
-        newton_3pl_item, score_and_information_3pl,
+        Newton3plControls, NewtonControls, complete_data_2pl_item, expected_log_likelihood_3pl,
+        mhrm_2pl_item, newton_2pl_item, newton_3pl_item, precondition_2x2,
+        score_and_information_3pl,
     };
     use crate::utils::{gauss_hermite_quadrature, sigmoid};
+    use numpy::ndarray::Array2;
 
     const CONTROLS: Newton3plControls = Newton3plControls {
         max_iter: 200,
@@ -1342,5 +1463,73 @@ mod tests {
             previous = value;
         }
         assert!((params[2] - 0.3).abs() < 1e-4, "{params:?}");
+    }
+
+    #[test]
+    fn precondition_solves_with_curvature_magnitudes() {
+        // [[3, 1], [1, 2]] is positive definite: an ordinary solve.
+        let step = precondition_2x2([3.0, 1.0, 2.0], [1.0, -2.0]);
+        assert!((step[0] - 0.8).abs() < 1e-12 && (step[1] + 1.4).abs() < 1e-12);
+        // A negative eigenvalue is replaced by its magnitude.
+        let step = precondition_2x2([2.0, 0.0, -4.0], [1.0, -2.0]);
+        assert!((step[0] - 0.5).abs() < 1e-12 && (step[1] + 0.5).abs() < 1e-12);
+        let step = precondition_2x2([0.0, 0.0, 0.0], [1.0, -2.0]);
+        assert!(step.iter().all(|value| value.is_finite()));
+    }
+
+    /// Abilities on a grid and deterministic 2PL responses at `[a, b]`.
+    fn grid_responses(a: f64, b: f64) -> (Vec<f64>, Array2<i32>) {
+        let theta: Vec<f64> = (0..400).map(|i| -3.0 + 6.0 * i as f64 / 399.0).collect();
+        let responses = Array2::from_shape_fn((theta.len(), 1), |(i, _)| {
+            let p = sigmoid(a * (theta[i] - b));
+            i32::from((i as f64 * 0.618_034).fract() < p)
+        });
+        (theta, responses)
+    }
+
+    #[test]
+    fn complete_data_hessian_matches_gradient_differences() {
+        let (theta, responses) = grid_responses(1.4, 0.3);
+        let view = responses.view();
+        let params = [1.1, -0.2];
+        let (_, _, hessian, count) = complete_data_2pl_item(&view, &theta, 0, params);
+        assert_eq!(count, theta.len());
+        let step = 1e-6;
+        for (k, rows) in [(0, [0, 1]), (1, [1, 2])] {
+            let mut forward = params;
+            forward[k] += step;
+            let mut backward = params;
+            backward[k] -= step;
+            let up = complete_data_2pl_item(&view, &theta, 0, forward).1;
+            let down = complete_data_2pl_item(&view, &theta, 0, backward).1;
+            for (row, index) in rows.into_iter().enumerate() {
+                let expected = (up[row] - down[row]) / (2.0 * step);
+                assert!((hessian[index] - expected).abs() < 1e-5 * expected.abs().max(1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn unit_gain_steps_climb_to_the_complete_data_maximum() {
+        let (theta, responses) = grid_responses(1.4, 0.3);
+        let view = responses.view();
+        let mut params = [1.0, 0.0];
+        let mut information = None;
+        let mut previous = f64::INFINITY;
+        for _ in 0..30 {
+            (params, information) = mhrm_2pl_item(&view, &theta, 0, params, information, 1.0);
+            let (loss, gradient, _, _) = complete_data_2pl_item(&view, &theta, 0, params);
+            assert!(loss <= previous + 1e-9);
+            previous = loss;
+            if gradient.iter().all(|value| value.abs() < 1e-8) {
+                break;
+            }
+        }
+        let gradient = complete_data_2pl_item(&view, &theta, 0, params).1;
+        assert!(
+            gradient.iter().all(|value| value.abs() < 1e-6),
+            "{gradient:?}"
+        );
+        assert!((params[0] - 1.4).abs() < 0.3 && (params[1] - 0.3).abs() < 0.2);
     }
 }

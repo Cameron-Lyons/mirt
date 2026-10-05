@@ -70,7 +70,9 @@ def fscores(
     prior_mean : ndarray, optional
         Prior mean for Bayesian methods. Default is 0.
     prior_cov : ndarray, optional
-        Prior covariance for Bayesian methods. Default is identity.
+        Prior covariance for Bayesian methods. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to the
+        identity otherwise.
     person_ids : list or 1-D ndarray, optional
         Identifiers for each person in the output, one per response row.
     bounds : tuple of float, default=(-6.0, 6.0)
@@ -116,6 +118,8 @@ def fscores(
 
     if isinstance(model_or_result, FitResult):
         model = model_or_result.model
+        if prior_cov is None:
+            prior_cov = model_or_result.latent_covariance
     else:
         model = model_or_result
 

@@ -181,16 +181,6 @@ class TwoPLNestedLogit(PolytomousItemModel):
             result.append(key)
         return result
 
-    def _validate_item_index(self, item_idx: int) -> int:
-        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-            item_idx, (int, np.integer)
-        ):
-            raise IndexError("item_idx must be an integer")
-        index = int(item_idx)
-        if index < 0 or index >= self.n_items:
-            raise IndexError(f"item_idx {index} out of range [0, {self.n_items})")
-        return index
-
     def _validate_category(self, item_idx: int, category: int) -> int:
         if isinstance(category, (bool, np.bool_)) or not isinstance(
             category, (int, np.integer)

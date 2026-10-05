@@ -173,9 +173,11 @@ def mhrm_fit_2pl(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
     """Fit 2PL model using MHRM algorithm in Rust.
 
-    Every cycle samples abilities and takes a Robbins-Monro step on all item
-    parameters; the estimates average the iterates after ``burnin`` (the final
-    iterate when ``burnin >= n_cycles``).
+    The kernel runs the algorithm of ``MHRMEstimator`` (Cai, 2010): every
+    cycle samples abilities and takes a Robbins-Monro step on each item,
+    preconditioned by its running complete-data information. Burn-in cycles
+    use unit gains; the estimates average the iterates after ``burnin`` (the
+    final iterate when ``burnin >= n_cycles``).
 
     Parameters
     ----------
@@ -184,13 +186,14 @@ def mhrm_fit_2pl(
     n_cycles : int
         Number of MHRM cycles.
     burnin : int
-        Number of initial cycles excluded from the parameter average.
+        Number of initial unit-gain cycles, excluded from the parameter average.
     proposal_sd : float
         Standard deviation of the ability random-walk proposal.
     seed : int, optional
         Random seed.
     gain_sequence : {"standard", "adaptive"}
-        Gain ``1 / (cycle + 1)`` or ``min(1, 10 / (cycle + 10))``.
+        Gain ``1 / (t + 1)`` or ``min(1, 10 / (t + 10))`` for the ``t``-th
+        cycle after burn-in.
 
     Returns
     -------

@@ -236,7 +236,9 @@ def gen_random_pars(
         omitted or retained at their identifying values, and coordinates fixed
         with ``set_free_parameter_masks`` keep their current values. An item
         whose random thresholds would lose their order around a fixed
-        threshold keeps its current thresholds.
+        threshold keeps its current thresholds. The components of a
+        :class:`~mirt.models.mixed_format.MixedItemModel` draw values for
+        their own families under qualified names such as ``"3PL.guessing"``.
 
     Examples
     --------
@@ -269,6 +271,29 @@ def gen_random_pars(
         name="upper_range",
         probability=True,
     )
+
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        # Parameter names identify a family only within its component.
+        ranges = (discrimination_range, difficulty_range, guessing_range, upper_range)
+        streams = np.random.default_rng(seed).integers(
+            0, 2**63, size=len(model.component_models)
+        )
+        component_sets = [
+            gen_random_pars(component, n_sets, int(stream), *ranges)
+            for component, stream in zip(model.component_models, streams, strict=True)
+        ]
+        return [
+            {
+                f"{prefix}.{name}": values
+                for prefix, sets in zip(
+                    model.component_names, component_sets, strict=True
+                )
+                for name, values in sets[index].items()
+            }
+            for index in range(n_sets)
+        ]
 
     base_parameters = model.parameters
     if (
@@ -471,13 +496,13 @@ def _fit_single_start(
     ],
 ) -> tuple[int, float, FitResult | None, str | None]:
     """Fit one starting-value set and preserve its original ordering."""
-    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mixed_format_em import em_estimator_for
 
     start_index, model, responses, start_params, fit_kwargs = args
     try:
         trial_model = model.copy()
         trial_model.set_parameters(**start_params)
-        estimator = EMEstimator(**fit_kwargs)
+        estimator = em_estimator_for(trial_model, **fit_kwargs)
         result = estimator.fit(trial_model, responses, start="model")
         log_likelihood = float(result.log_likelihood)
         if not np.isfinite(log_likelihood):

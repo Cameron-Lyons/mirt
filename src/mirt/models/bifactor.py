@@ -102,6 +102,7 @@ class BifactorModel(DichotomousItemModel):
         if item_idx is None:
             slopes = np.column_stack((self.general_loadings, self.specific_loadings))
             return slopes, self.intercepts, self._specific_factor_indices
+        item_idx = self._validate_item_index(item_idx)
         return (
             np.array(
                 [self.general_loadings[item_idx], self.specific_loadings[item_idx]]
@@ -163,9 +164,7 @@ class BifactorModel(DichotomousItemModel):
         item_idx: int,
     ) -> NDArray[np.float64]:
         """Return item Fisher matrices across multidimensional theta points."""
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"item_idx {item_idx} out of range [0, {self.n_items})")
-
+        item_idx = self._validate_item_index(item_idx)
         theta = self._ensure_theta_2d(theta)
         return _item_information(
             self._logits(theta, item_idx), self._item_slope(item_idx)

@@ -11,6 +11,9 @@ Core Functions
    :nosignatures:
 
    fit_mirt
+   bfactor
+   mirt_model
+   ModelSpec
    itemfit
    personfit
    dif
@@ -36,6 +39,7 @@ Models
    GeneralizedPartialCredit
    PartialCreditModel
    NominalResponseModel
+   MixedItemModel
    SequentialResponseModel
    ContinuationRatioModel
    AdjacentCategoryModel
@@ -58,6 +62,9 @@ Models
    models.MultilevelIRTModel
    models.ThreeLevelIRTModel
    models.CrossedRandomEffectsModel
+   models.ManyFacetRaschModel
+   models.PolytomousMFRM
+   models.Facet
    ResponseTimeModel
    DINA
    DINO
@@ -101,14 +108,23 @@ Estimation
    :nosignatures:
 
    EMEstimator
+   BifactorEMEstimator
+   MixedFormatEMEstimator
    MHRMEstimator
    GibbsSampler
    MCMCResult
    BLEstimator
    ResponseTimeGibbsSampler
    RTModelPriors
+   fit_bkt_em
+   BKTEMResult
+   BKTGibbsSampler
+   BKTPriors
    IRTreeEMEstimator
    IRTreeResult
+   estimation.FactorCovarianceDensity
+   fit_mfrm
+   models.MFRMResult
 
 Diagnostics
 -----------
@@ -282,6 +298,7 @@ Exceptions
 
    MirtError
    MirtValidationError
+   MirtIndexError
    MirtDataError
    MirtConvergenceError
 

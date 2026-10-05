@@ -97,17 +97,6 @@ def _scale_information(
     return np.where(base_information > 0.0, saturated, 0.0)
 
 
-def _validate_item_index(n_items: int, item_idx: int) -> int:
-    if (
-        isinstance(item_idx, bool)
-        or not isinstance(item_idx, Integral)
-        or item_idx < 0
-        or item_idx >= n_items
-    ):
-        raise IndexError(f"Item index {item_idx} out of range [0, {n_items})")
-    return int(item_idx)
-
-
 def _theta_values(
     model: DichotomousItemModel | PolytomousItemModel,
     theta: NDArray[np.float64],
@@ -323,7 +312,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         self, item_idx: int, *, include_tau_zero: bool = False
     ) -> NDArray[np.float64]:
         """Return the active subjective thresholds for one item."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         c = self._n_categories[item] - 1
         m = 2 * c + 1
         values = self._parameters["thresholds"][item, :m].copy()
@@ -333,7 +322,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
 
     def independent_thresholds(self, item_idx: int) -> NDArray[np.float64]:
         """Return the freely specified first-half thresholds for one item."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         c = self._n_categories[item] - 1
         return self._parameters["thresholds"][item, :c].copy()
 
@@ -341,7 +330,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         self, item_idx: int, values: NDArray[np.float64]
     ) -> None:
         """Set first-half thresholds and construct their symmetric partners."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         c = self._n_categories[item] - 1
         try:
             independent = np.asarray(values, dtype=np.float64)
@@ -498,7 +487,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         """Compute stable GGUM category probabilities."""
         values = _theta_values(self, theta)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             return self._item_components(
                 values,
                 item,
@@ -544,7 +533,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         """Compute the probability of one observed response category."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         if (
             isinstance(category, bool)
             or not isinstance(category, Integral)
@@ -572,7 +561,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         values = _theta_values(self, theta)
         if item_idx is not None:
             return self._item_information_from_values(
-                values, _validate_item_index(self.n_items, item_idx)
+                values, self._validate_item_index(item_idx)
             )
 
         total = np.zeros(len(values), dtype=np.float64)
@@ -602,7 +591,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         values = _theta_values(self, theta)
         return self._item_information_from_values(
-            values, _validate_item_index(self.n_items, item_idx)
+            values, self._validate_item_index(item_idx)
         )
 
     def expected_score(
@@ -744,7 +733,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         value: float | NDArray[np.float64],
     ) -> None:
         """Set a validated parameter for one item."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         if param_name not in self._parameters:
             raise MirtValidationError(
                 f"Unknown parameter: {param_name}", parameter=param_name
@@ -845,7 +834,7 @@ class _UnfoldingDichotomousModel(DichotomousItemModel):
         value: float | NDArray[np.float64],
     ) -> None:
         """Set one validated scalar item parameter."""
-        item = _validate_item_index(self.n_items, item_idx)
+        item = self._validate_item_index(item_idx)
         if param_name not in self._parameters:
             raise MirtValidationError(
                 f"Unknown parameter: {param_name}", parameter=param_name
@@ -967,7 +956,7 @@ class IdealPointModel(_UnfoldingDichotomousModel):
         """Compute stable Gaussian ideal-point probabilities."""
         values = _theta_values(self, theta)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             distance = values - self._parameters["location"][item]
             with np.errstate(over="ignore"):
                 exponent = -self._parameters["discrimination"][item] * distance**2
@@ -1031,7 +1020,7 @@ class IdealPointModel(_UnfoldingDichotomousModel):
         """Compute Fisher information with the peak limit handled exactly."""
         values = _theta_values(self, theta)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             discrimination = np.full_like(
                 values, self._parameters["discrimination"][item]
             )
@@ -1160,7 +1149,7 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         """Compute hyperbolic-cosine probabilities without overflow."""
         values = _theta_values(self, theta)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             return self._stable_probability(
                 self._linear_predictor_from_values(values, item)
             )
@@ -1193,7 +1182,7 @@ class HyperbolicCosineModel(_UnfoldingDichotomousModel):
         """Compute stable Fisher information."""
         values = _theta_values(self, theta)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             predictor = self._linear_predictor_from_values(values, item)
             probability = self._stable_probability(predictor)
             base_information = (

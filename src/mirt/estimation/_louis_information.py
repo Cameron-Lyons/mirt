@@ -5,10 +5,12 @@ posterior expectation of the complete-data information minus the posterior
 variance of the complete-data score. On a quadrature grid with a fixed prior
 mass both terms are finite sums, so the identity is exact. Only derivatives
 of each item's category log-probabilities at the nodes are needed. Built-in
-unidimensional logistic, graded and partial-credit items use closed forms.
-Other built-in item models difference one item's curve at a time, which
-costs a few dozen curve evaluations per item rather than O(P^2) marginal
-likelihood evaluations. Latent-density parameters are treated as fixed.
+unidimensional logistic, graded, partial-credit and rating-scale items use
+closed forms. Other built-in item models difference one item's curve at a
+time, which costs a few dozen curve evaluations per item rather than O(P^2)
+marginal likelihood evaluations. Parameters shared by all items, such as
+rating-scale thresholds, enter every item's derivatives and are accumulated
+once. Latent-density parameters are treated as fixed.
 
 References
 ----------
@@ -33,6 +35,7 @@ from mirt.estimation._posterior import normalize_log_posterior
 if TYPE_CHECKING:
     from mirt.estimation.standard_errors import _ParameterLayout
     from mirt.models.base import BaseItemModel
+    from mirt.models.mixed_format import MixedItemModel
 
 # Person-by-node-by-parameter scratch for one block of score vectors.
 _MAX_BLOCK_ENTRIES = 1 << 22
@@ -48,12 +51,14 @@ class _ItemTerms:
 
     ``first`` has shape ``(k, Q, C)`` and ``second`` ``(k, k, Q, C)`` for the
     item's ``k`` free coordinates, which occupy ``columns`` of the free
-    parameter vector.
+    parameter vector. The last ``n_shared`` coordinates are shared by every
+    item and appear in the same order in each item's terms.
     """
 
     columns: NDArray[np.intp]
     first: NDArray[np.float64]
     second: NDArray[np.float64]
+    n_shared: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,27 +104,42 @@ def _analytic_model_types() -> tuple[type, ...]:
 
 def has_analytic_item_derivatives(model: BaseItemModel) -> bool:
     """Whether closed-form item derivatives describe ``model`` exactly."""
-    return (
-        model.n_factors == 1
-        and type(model) in _analytic_model_types()
-        and uses_builtin_model_hooks(model, likelihood=True)
-    )
+    from mirt.models.polytomous import _uses_authored_rating_scale_hooks
+
+    if model.n_factors != 1:
+        return False
+    if type(model) in _analytic_model_types():
+        return uses_builtin_model_hooks(model, likelihood=True)
+    return _uses_authored_rating_scale_hooks(model)
 
 
 def supports_louis_information(model: BaseItemModel) -> bool:
-    """Whether every free parameter belongs to one item of a built-in model.
+    """Whether each free parameter belongs to one item or to all items.
 
     Exact built-in types keep the person likelihood a product of item curves
-    evaluated by ``probability``, which item-local derivatives require.
+    evaluated by ``probability``, which item-local derivatives require. Of
+    those, only the rating-scale families have parameters shared by all
+    items. A mixed-format model qualifies when each of its components does
+    and none has shared parameters.
     """
     from mirt.estimation._patterns import supports_pattern_compression
+    from mirt.models.mixed_format import MixedItemModel, uses_component_likelihoods
+    from mirt.models.polytomous import _uses_authored_rating_scale_hooks
 
+    if isinstance(model, MixedItemModel):
+        return (
+            uses_component_likelihoods(model)
+            and all(map(supports_louis_information, model.component_models))
+            and not any(
+                getattr(component, "_shared_parameters", frozenset())
+                for component in model.component_models
+            )
+        )
+    if _uses_authored_rating_scale_hooks(model):
+        return True
     if not supports_pattern_compression(model):
         return False
-    return all(
-        values.ndim >= 1 and values.shape[0] == model.n_items
-        for values in model._parameters.values()
-    )
+    return all(model._item_indexed(name) for name in model._parameters)
 
 
 def _item_categories(model: BaseItemModel) -> list[int]:
@@ -134,20 +154,29 @@ def _item_categories(model: BaseItemModel) -> list[int]:
 def _item_coordinates(
     model: BaseItemModel,
     layouts: dict[str, _ParameterLayout],
-) -> list[list[tuple[str, tuple[int, ...], int]]]:
-    """Group free coordinates by item as (name, index within row, column)."""
+) -> tuple[list[list[tuple[str, tuple[int, ...], int]]], int]:
+    """Group free coordinates by item as (name, index within row, column).
+
+    Coordinates of parameters shared by all items are appended to every
+    item with their full storage index. Returns the groups and the number of
+    shared coordinates.
+    """
     per_item: list[list[tuple[str, tuple[int, ...], int]]] = [
         [] for _ in range(model.n_items)
     ]
+    shared: list[tuple[str, tuple[int, ...], int]] = []
     offset = 0
     for name, layout in layouts.items():
         for rank, flat in enumerate(layout.free_indices):
-            index = np.unravel_index(int(flat), layout.shape)
-            per_item[int(index[0])].append(
-                (name, tuple(int(value) for value in index[1:]), offset + rank)
+            index = tuple(
+                int(value) for value in np.unravel_index(int(flat), layout.shape)
             )
+            if name in model._shared_parameters:
+                shared.append((name, index, offset + rank))
+            else:
+                per_item[index[0]].append((name, index[1:], offset + rank))
         offset += layout.free_indices.size
-    return per_item
+    return [coordinates + shared for coordinates in per_item], len(shared)
 
 
 def _log_terms_from_probabilities(
@@ -211,14 +240,12 @@ def _logistic_terms(
 
 
 def _graded_terms(
-    model: BaseItemModel,
-    item: int,
+    a: float,
+    thresholds: NDArray[np.float64],
     theta: NDArray[np.float64],
-    n_categories: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return terms for (discrimination, thresholds 0..K-2) of a GRM item."""
-    a = float(model._parameters["discrimination"][item])
-    thresholds = model._parameters["thresholds"][item, : n_categories - 1]
+    """Return terms for (discrimination, thresholds 0..K-2) of a graded item."""
+    n_categories = thresholds.size + 1
     centered = theta[:, None] - thresholds[None, :]
     s = sigmoid(a * centered)
     u = s * (1.0 - s)
@@ -247,18 +274,16 @@ def _graded_terms(
 
 
 def _partial_credit_terms(
-    model: BaseItemModel,
-    item: int,
+    a: float,
+    steps: NDArray[np.float64],
     theta: NDArray[np.float64],
-    n_categories: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return terms for (discrimination, steps 0..K-2) of a partial-credit item.
 
     Category logits are ``a * sum_{v < c} (theta - step_v)``, so their second
     derivatives are constant and the log-softmax derivatives follow directly.
     """
-    a = float(model._parameters["discrimination"][item])
-    steps = model._parameters["steps"][item, : n_categories - 1]
+    n_categories = steps.size + 1
     n_points = theta.size
     k = n_categories
     features = np.zeros((n_points, k))
@@ -293,23 +318,44 @@ def _analytic_terms(
     coordinates: list[tuple[str, tuple[int, ...], int]],
     n_categories: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    from mirt.models.polytomous import GradedResponseModel
+    from mirt.models.polytomous import (
+        GradedRatingScaleModel,
+        GradedResponseModel,
+        RatingScaleModel,
+    )
 
     if not model.is_polytomous:
         names = [name for name, _, _ in coordinates]
         return _logistic_terms(model, item, theta, names)
-    if type(model) is GradedResponseModel:
-        first, second = _graded_terms(model, item, theta, n_categories)
+    parameters = model._parameters
+    n_steps = n_categories - 1
+    # Rating-scale items are graded or partial-credit items whose steps are
+    # the item location plus the shared thresholds.
+    if type(model) in (RatingScaleModel, GradedRatingScaleModel):
+        steps = parameters["difficulty"][item] + parameters["thresholds"][:n_steps]
+        a = float(parameters.get("discrimination", np.ones(1))[0])
     else:
-        first, second = _partial_credit_terms(model, item, theta, n_categories)
-    rows = np.array(
-        [
-            0 if name == "discrimination" else 1 + index[0]
-            for name, index, _ in coordinates
-        ],
-        dtype=np.intp,
-    )
-    return first[rows], second[np.ix_(rows, rows)]
+        name = "thresholds" if type(model) is GradedResponseModel else "steps"
+        steps = parameters[name][item, :n_steps]
+        a = float(parameters["discrimination"][item])
+    if type(model) in (GradedResponseModel, GradedRatingScaleModel):
+        first, second = _graded_terms(a, steps, theta)
+    else:
+        first, second = _partial_credit_terms(a, steps, theta)
+    # Each coordinate is a linear combination of the (slope, steps) rows.
+    jacobian = np.zeros((len(coordinates), n_categories))
+    for row, (name, index, _) in enumerate(coordinates):
+        if name == "discrimination":
+            jacobian[row, 0] = 1.0
+        elif name == "difficulty":
+            jacobian[row, 1:] = 1.0
+        else:
+            jacobian[row, 1 + index[0]] = 1.0
+    k = len(coordinates)
+    first = np.tensordot(jacobian, first, axes=1)
+    second = np.tensordot(jacobian, second, axes=1).reshape(k, n_categories, -1)
+    second = np.matmul(jacobian, second).reshape(k, k, *first.shape[1:])
+    return first, second
 
 
 def _numerical_terms(
@@ -322,8 +368,16 @@ def _numerical_terms(
     """Central differences of one item's clipped category log-probabilities."""
     names = {name for name, _, _ in coordinates}
     original = {name: model._parameters[name] for name in names}
+    # Shared coordinates carry their full storage index.
+    keys = [
+        index if name in model._shared_parameters else (item, *index)
+        for name, index, _ in coordinates
+    ]
     centers = np.array(
-        [original[name][(item, *index)] for name, index, _ in coordinates],
+        [
+            original[name][key]
+            for (name, _, _), key in zip(coordinates, keys, strict=True)
+        ],
         dtype=np.float64,
     )
     steps = _DERIVATIVE_STEP * np.maximum(1.0, np.abs(centers))
@@ -333,8 +387,7 @@ def _numerical_terms(
     ) -> NDArray[np.float64]:
         updated = {name: values.copy() for name, values in original.items()}
         for position, offset in offsets.items():
-            name, index, _ = coordinates[position]
-            updated[name][(item, *index)] += offset
+            updated[coordinates[position][0]][keys[position]] += offset
         model._parameters.update(updated)
         probabilities = np.asarray(model.probability(nodes, item), dtype=np.float64)
         if probabilities.ndim == 1:
@@ -375,18 +428,58 @@ def item_terms(
     layouts: dict[str, _ParameterLayout],
 ) -> list[_ItemTerms | None]:
     """Return each item's log-probability derivatives, or None without free ones."""
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        return _mixed_item_terms(model, nodes, layouts)
     analytic = has_analytic_item_derivatives(model)
     theta = nodes[:, 0] if analytic else nodes
     categories = _item_categories(model)
+    grouped, n_shared = _item_coordinates(model, layouts)
     terms: list[_ItemTerms | None] = []
-    for item, coordinates in enumerate(_item_coordinates(model, layouts)):
+    for item, coordinates in enumerate(grouped):
         if not coordinates:
             terms.append(None)
             continue
         compute = _analytic_terms if analytic else _numerical_terms
         first, second = compute(model, item, theta, coordinates, categories[item])
         columns = np.array([column for _, _, column in coordinates], dtype=np.intp)
-        terms.append(_ItemTerms(columns, first, second))
+        terms.append(_ItemTerms(columns, first, second, n_shared))
+    return terms
+
+
+def _mixed_item_terms(
+    model: MixedItemModel,
+    nodes: NDArray[np.float64],
+    layouts: dict[str, _ParameterLayout],
+) -> list[_ItemTerms | None]:
+    """Place each component's item terms at its test items and columns.
+
+    Every component's coordinates keep their columns in the mixed-format
+    layout. Cross-component information then comes from the posterior
+    covariance of the scores, as for any two items.
+    """
+    parts: dict[int, dict[str, _ParameterLayout]] = {}
+    columns: dict[int, list[NDArray[np.intp]]] = {}
+    offset = 0
+    for name, layout in layouts.items():
+        component, local = model.parameter_component(name)
+        size = layout.free_indices.size
+        parts.setdefault(component, {})[local] = layout
+        columns.setdefault(component, []).append(np.arange(offset, offset + size))
+        offset += size
+
+    terms: list[_ItemTerms | None] = [None] * model.n_items
+    components = model.components
+    for component, local_layouts in parts.items():
+        part, items = components[component]
+        # Component columns follow ``local_layouts``; map them to the model's.
+        placement = np.concatenate(columns[component])
+        for position, term in enumerate(item_terms(part, nodes, local_layouts)):
+            if term is not None:
+                terms[items[position]] = _ItemTerms(
+                    placement[term.columns], term.first, term.second
+                )
     return terms
 
 
@@ -413,20 +506,32 @@ def _posterior_block(
 
 
 class _Scores:
-    """Complete-data score sums kept in item-major parameter order."""
+    """Complete-data score sums kept in item-major parameter order.
+
+    Each item's own coordinates occupy consecutive columns. Coordinates
+    shared by all items follow them once, and every item's derivatives with
+    respect to them accumulate there.
+    """
 
     def __init__(self, terms: list[_ItemTerms | None]) -> None:
         self.terms = terms
         self.items = [item for item, term in enumerate(terms) if term is not None]
-        self.order = np.concatenate(
-            [terms[item].columns for item in self.items] or [np.empty(0, dtype=np.intp)]
-        )
+        self.n_shared = terms[self.items[0]].n_shared if self.items else 0
+        own = [
+            terms[item].columns[: terms[item].columns.size - self.n_shared]
+            for item in self.items
+        ]
+        chunks = [np.empty(0, dtype=np.intp)]
+        if own:
+            chunks = [*own, terms[self.items[-1]].columns[own[-1].size :]]
+        self.order = np.concatenate(chunks)
         self.n_parameters = int(self.order.size)
         self.offsets: list[int] = []
         offset = 0
-        for item in self.items:
+        for columns in own:
             self.offsets.append(offset)
-            offset += terms[item].columns.size
+            offset += columns.size
+        self.shared_start = offset
 
     def to_flat(self, matrix: NDArray[np.float64]) -> NDArray[np.float64]:
         """Reorder an item-major matrix to the free-parameter layout."""
@@ -434,14 +539,19 @@ class _Scores:
         result[np.ix_(self.order, self.order)] = matrix
         return result
 
+    def item_columns(self, position: int) -> NDArray[np.intp]:
+        """Return item-major columns of one item's own and shared coordinates."""
+        start = self.offsets[position]
+        own = self.terms[self.items[position]].columns.size - self.n_shared
+        return np.r_[start : start + own, self.shared_start : self.n_parameters]
+
     def complete(self, counts: list[NDArray[np.float64]]) -> NDArray[np.float64]:
         """Posterior-expected complete-data information from category counts."""
         result = np.zeros((self.n_parameters, self.n_parameters))
         for position, item in enumerate(self.items):
             second = self.terms[item].second
-            start = self.offsets[position]
-            block = slice(start, start + second.shape[0])
-            result[block, block] = -np.einsum("abqc,qc->ab", second, counts[position])
+            block = np.ix_(self.item_columns(position), self.item_columns(position))
+            result[block] -= np.einsum("abqc,qc->ab", second, counts[position])
         return result
 
 
@@ -478,12 +588,19 @@ class _CategoricalScores(_Scores):
     ) -> NDArray[np.float64]:
         n_points = posterior.shape[1]
         scores = np.empty((responses.shape[0], n_points, self.n_parameters))
+        scores[:, :, self.shared_start :] = 0.0
+        own = slice(None, None if not self.n_shared else -self.n_shared)
         codes = []
         for position, item in enumerate(self.items):
             table = self.tables[position]
             item_codes = self._codes(responses[:, item], table.shape[0] - 1)
             start = self.offsets[position]
-            scores[:, :, start : start + table.shape[2]] = table[item_codes]
+            gathered = table[item_codes]
+            scores[:, :, start : start + table.shape[2] - self.n_shared] = gathered[
+                ..., own
+            ]
+            if self.n_shared:
+                scores[:, :, self.shared_start :] += gathered[..., own.stop :]
             codes.append(item_codes)
         person = np.matmul(posterior[:, None, :], scores)[:, 0, :]
         if observed:

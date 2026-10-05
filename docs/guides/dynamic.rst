@@ -205,8 +205,8 @@ use the compiled parallel implementation when it is available, as do
 person-specific layouts repeated across many learners; the NumPy fallback
 also processes all learners at once. BKT Gibbs sampling also filters all
 learners together for hidden-state draws. Set ``use_rust=False`` on
-``BKTModel`` or
-``BKTGibbsSampler`` to select the NumPy implementation for a specific workflow;
+``BKTModel``, ``BKTGibbsSampler``, or ``fit_bkt_em`` to select the NumPy
+implementation for a specific workflow;
 the global ``mirt.set_backend("numpy")`` preference is also honored.
 
 Terminal helpers such as ``predict_mastery_batch`` and
@@ -227,6 +227,54 @@ latent mastery states:
        n_trials_per_skill=20,
        seed=42,
    )
+
+Estimating parameters
+---------------------
+
+``fit_bkt_em`` estimates every skill's initial mastery, learning, slip, and
+guess probabilities by maximum likelihood with Baum-Welch EM:
+
+.. code-block:: python
+
+   from mirt.estimation import fit_bkt_em
+
+   result = fit_bkt_em(
+       responses,
+       skills,
+       skill_names=model.skill_names,
+       n_starts=4,
+       seed=0,
+   )
+   fitted = result.model
+   print(fitted.p_learn, fitted.p_slip)
+   print(result.converged, result.n_iterations, result.bic)
+   print(result.summary())
+
+Each iteration smooths all learners' per-skill chains together and sets each
+parameter to its expected-count ratio, so the log-likelihood never decreases;
+``log_likelihood_history`` records it at the starting values and after every
+iteration. ``converged`` is ``False`` when ``max_iter`` iterations pass before
+the log-likelihood changes by less than ``tol``. ``skill_assignments`` may be a
+shared trial layout or a person-specific matrix matching the responses.
+
+Slip and guess are bounded to ``(1e-4, 0.5)`` by default. Keeping both below
+0.5 makes a correct response at least as likely after learning as before,
+which rules out label-swapped solutions in which the "learned" state behaves
+like the unlearned one. Pass ``slip_bounds`` or ``guess_bounds`` to change the
+limits, or equal limits to fix a parameter. ``n_starts`` adds random starts
+and keeps the fit with the largest log-likelihood; the per-start values are in
+``start_log_likelihoods``.
+
+``allow_forgetting=True`` also estimates a forgetting probability per skill.
+Forgetting and learning trade off against each other, so EM needs more
+iterations, particularly when the data contain little forgetting, and more
+opportunities per skill to recover the parameters well. AIC and BIC count four
+parameters per skill, or five with forgetting, less any slip or guess
+probability fixed by equal bounds.
+
+``BKTGibbsSampler`` instead samples the posterior under Beta priors and
+reports posterior means for a shared layout. With flat priors and ample data
+its estimates agree closely with ``fit_bkt_em``, which is much faster.
 
 State-space filtering
 ---------------------

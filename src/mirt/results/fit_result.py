@@ -195,13 +195,43 @@ def _item_labels(model: BaseItemModel) -> list[str]:
     return [str(index) for index in range(model.n_items)]
 
 
+def _parameter_rows(
+    model: BaseItemModel, name: str
+) -> Sequence[int] | NDArray[np.intp]:
+    """Test items behind the rows of a per-item parameter array.
+
+    The arrays of a mixed-format component follow that component's items.
+    """
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        return model.parameter_items(name)
+    return range(model.n_items)
+
+
+def _row_labels(model: BaseItemModel, name: str, items: list[str]) -> list[str]:
+    """Labels of the rows of ``name`` given every item's label."""
+    return [items[item] for item in _parameter_rows(model, name)]
+
+
+def _indexed_by_item(model: BaseItemModel, name: str, shape: tuple[int, ...]) -> bool:
+    """Whether a parameter has one leading row per item it covers.
+
+    Parameters shared by all items never do, even when their length happens
+    to equal the number of items.
+    """
+    shared: frozenset[str] = getattr(model, "_shared_parameters", frozenset())
+    rows = _parameter_rows(model, name)
+    return bool(shape) and shape[0] == len(rows) and name not in shared
+
+
 def _coordinate_label(
     name: str,
-    shape: tuple[int, ...],
     index: tuple[int, ...],
     items: list[str],
+    per_item: bool,
 ) -> str:
-    if shape and shape[0] == len(items):
+    if per_item:
         parts = [items[index[0]], *(str(value) for value in index[1:])]
     else:
         parts = [str(value) for value in index]
@@ -213,8 +243,10 @@ def _coordinate_positions(model: BaseItemModel) -> dict[str, tuple[str, int]]:
     items = _item_labels(model)
     positions: dict[str, tuple[str, int]] = {}
     for name, values in model.parameters.items():
+        rows = _row_labels(model, name, items)
+        per_item = _indexed_by_item(model, name, values.shape)
         for flat, index in enumerate(np.ndindex(values.shape)):
-            label = _coordinate_label(name, values.shape, index, items)
+            label = _coordinate_label(name, index, rows, per_item)
             positions[label] = (name, flat)
     return positions
 
@@ -230,9 +262,11 @@ def _free_parameter_labels(model: BaseItemModel) -> list[str]:
     masks = model.free_parameter_masks
     labels = []
     for name, values in model.parameters.items():
+        rows = _row_labels(model, name, items)
+        per_item = _indexed_by_item(model, name, values.shape)
         for flat in np.flatnonzero(np.asarray(masks[name]).ravel()):
             index = tuple(int(i) for i in np.unravel_index(flat, values.shape))
-            labels.append(_coordinate_label(name, values.shape, index, items))
+            labels.append(_coordinate_label(name, index, rows, per_item))
     return labels
 
 
@@ -307,6 +341,11 @@ class FitResult:
         Labels of the ``vcov`` rows, such as ``"discrimination[Item_1]"`` or
         ``"thresholds[Item_1,0]"`` (zero-based columns). Derived from the
         model's free parameters when ``vcov`` is given without labels.
+    latent_covariance : ndarray of shape (n_factors, n_factors), optional
+        Estimated covariance of the latent factors, for example from a
+        confirmatory ``fit_mirt(spec=...)`` fit with ``COV`` terms. ``None``
+        when the factors are standard normal and uncorrelated. ``fscores``
+        uses it as the default prior covariance.
     """
 
     model: BaseItemModel
@@ -322,6 +361,7 @@ class FitResult:
     se_method: str | None = None
     vcov: NDArray[np.float64] | None = None
     vcov_labels: list[str] | None = None
+    latent_covariance: NDArray[np.float64] | None = None
 
     def __post_init__(self) -> None:
         for name in ("n_iterations", "n_observations", "n_parameters"):
@@ -377,6 +417,50 @@ class FitResult:
                 expected="str or None",
             )
         self._validate_covariance()
+        self._validate_latent_covariance()
+
+    def _validate_latent_covariance(self) -> None:
+        if self.latent_covariance is None:
+            return
+        n_factors = self.model.n_factors
+        try:
+            matrix = np.array(self.latent_covariance, dtype=np.float64, copy=True)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "latent_covariance must be a numeric matrix",
+                parameter="latent_covariance",
+            ) from exc
+        if matrix.shape != (n_factors, n_factors):
+            raise MirtValidationError(
+                f"latent_covariance must have shape ({n_factors}, {n_factors})",
+                parameter="latent_covariance",
+                value=matrix.shape,
+            )
+        if not np.all(np.isfinite(matrix)) or not np.allclose(
+            matrix, matrix.T, rtol=1e-10, atol=1e-12
+        ):
+            raise MirtValidationError(
+                "latent_covariance must be finite and symmetric",
+                parameter="latent_covariance",
+            )
+        try:
+            np.linalg.cholesky(matrix)
+        except np.linalg.LinAlgError as exc:
+            raise MirtValidationError(
+                "latent_covariance must be positive definite",
+                parameter="latent_covariance",
+            ) from exc
+        self.latent_covariance = matrix
+
+    @property
+    def factor_correlation(self) -> NDArray[np.float64] | None:
+        """Correlation matrix of :attr:`latent_covariance`, if estimated."""
+        if self.latent_covariance is None:
+            return None
+        scale = np.sqrt(np.diag(self.latent_covariance))
+        correlation = self.latent_covariance / np.outer(scale, scale)
+        np.fill_diagonal(correlation, 1.0)
+        return correlation
 
     def _validate_covariance(self) -> None:
         if self.vcov is None:
@@ -558,9 +642,9 @@ class FitResult:
         shape: tuple[int, ...],
         index: tuple[int, ...],
     ) -> str:
-        if shape and shape[0] == self.model.n_items:
-            item_index = index[0]
-            item_name = self.model.item_names[item_index]
+        if _indexed_by_item(self.model, parameter_name, shape):
+            rows = _parameter_rows(self.model, parameter_name)
+            item_name = self.model.item_names[rows[index[0]]]
             if len(index) == 1:
                 return item_name
             suffix = ",".join(str(value) for value in index[1:])
@@ -626,14 +710,35 @@ class FitResult:
                     f"{values['ci_upper'][index]:>8.4f}"
                 )
 
+        if self.latent_covariance is not None:
+            labels = [f"F{index + 1}" for index in range(len(self.latent_covariance))]
+            lines.append("\nLatent covariance:")
+            lines.append(f"{'':<15}" + "".join(f"{label:>10}" for label in labels))
+            for label, row in zip(labels, self.latent_covariance, strict=True):
+                lines.append(
+                    f"{label:<15}" + "".join(f"{value:>10.4f}" for value in row)
+                )
+
         lines.append("=" * width)
         return "\n".join(lines)
 
     def _coefficient_columns(self, *, include_se: bool) -> dict[str, Any]:
+        from mirt.models.mixed_format import MixedItemModel
+
         data: dict[str, Any] = {}
-        for parameter_name, raw_values in self.model.parameters.items():
+        parameters = self.model.parameters
+        item_errors = None
+        if isinstance(self.model, MixedItemModel):
+            # One row per item, NaN where an item's family lacks a parameter.
+            parameters = self.model.item_parameter_arrays()
+            item_errors = self.model.item_parameter_arrays(self.standard_errors)
+        for parameter_name, raw_values in parameters.items():
             values = np.asarray(raw_values, dtype=np.float64)
-            if values.ndim not in (1, 2) or values.shape[0] != self.model.n_items:
+            # Mixed-format arrays from item_parameter_arrays are per item.
+            per_item = item_errors is not None or _indexed_by_item(
+                self.model, parameter_name, values.shape
+            )
+            if values.ndim not in (1, 2) or not per_item:
                 raise MirtValidationError(
                     "wide coefficient output requires per-item parameter arrays; "
                     "use parameter_statistics() or to_dict() for global parameters",
@@ -641,7 +746,11 @@ class FitResult:
                     value=values.shape,
                     expected=f"first dimension {self.model.n_items}",
                 )
-            errors = self._errors_for(parameter_name, values)
+            errors = (
+                self._errors_for(parameter_name, values)
+                if item_errors is None
+                else item_errors[parameter_name]
+            )
             if values.ndim == 1:
                 data[parameter_name] = values
                 if include_se:
@@ -706,6 +815,7 @@ class FitResult:
         ``model`` records the family name, dimensions, item names, and
         per-item category counts (``None`` for dichotomous models), which
         together with the parameters let :meth:`from_dict` rebuild the model.
+        Parameters include ``latent_covariance`` when it was estimated.
         With standard errors, ``se_method`` and a ``vcov`` mapping of row
         ``labels`` and ``matrix`` are included when recorded. Unknown standard
         errors and covariances serialize as ``NaN``, which Python's ``json``
@@ -725,6 +835,8 @@ class FitResult:
             result["parameters"] = {
                 name: values.tolist() for name, values in self.model.parameters.items()
             }
+            if self.latent_covariance is not None:
+                result["latent_covariance"] = self.latent_covariance.tolist()
         if include_standard_errors:
             result["standard_errors"] = {
                 name: values.tolist() for name, values in self.standard_errors.items()
@@ -799,6 +911,7 @@ class FitResult:
             "log_posterior",
             "se_method",
             "vcov",
+            "latent_covariance",
             *_FIT_STATISTIC_FIELDS,
         }
         unknown = set(payload) - allowed
@@ -859,6 +972,7 @@ class FitResult:
             se_method=payload.get("se_method"),
             vcov=vcov,
             vcov_labels=vcov_labels,
+            latent_covariance=payload.get("latent_covariance"),
         )
 
     @classmethod

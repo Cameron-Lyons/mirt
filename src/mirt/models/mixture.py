@@ -199,16 +199,6 @@ class MixtureIRT(BaseItemModel):
             raise IndexError(f"class_idx {index} out of range [0, {self._n_classes})")
         return index
 
-    def _validate_item_index(self, item_idx: int) -> int:
-        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-            item_idx, (int, np.integer)
-        ):
-            raise IndexError("item_idx must be an integer")
-        index = int(item_idx)
-        if index < 0 or index >= self.n_items:
-            raise IndexError(f"item_idx {index} out of range [0, {self.n_items})")
-        return index
-
     def _stack_class_parameters(
         self,
         item_idx: int | None = None,

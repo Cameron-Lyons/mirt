@@ -390,7 +390,7 @@ def _iter_statistic_fits(
     task: _StatisticFitTask,
 ) -> Iterator[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
     """Yield fit results so jackknife statistics can be reduced immediately."""
-    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mixed_format_em import em_estimator_for
 
     for indices in _iter_sample_indices(task):
         fit_responses = task.responses[indices]
@@ -400,7 +400,9 @@ def _iter_statistic_fits(
             task.warm_start,
         )
         try:
-            estimator = EMEstimator(max_iter=task.max_iter, tol=1e-3, verbose=False)
+            estimator = em_estimator_for(
+                boot_model, max_iter=task.max_iter, tol=1e-3, verbose=False
+            )
             result = estimator.fit(boot_model, fit_responses)
 
             if task.statistic == "parameters":
@@ -520,7 +522,7 @@ def _fit_parametric_replicate(
     replicate_rng: np.random.Generator,
 ) -> tuple[dict[str, NDArray[np.float64]] | None, str | None]:
     """Simulate and fit one parametric-bootstrap replicate."""
-    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mixed_format_em import em_estimator_for
 
     theta = replicate_rng.standard_normal((task.n_persons, task.model.n_factors))
     sim_data = draw_item_responses(task.model, theta, replicate_rng)
@@ -530,7 +532,9 @@ def _fit_parametric_replicate(
         task.warm_start,
     )
     try:
-        estimator = EMEstimator(max_iter=task.max_iter, tol=1e-3, verbose=False)
+        estimator = em_estimator_for(
+            boot_model, max_iter=task.max_iter, tol=1e-3, verbose=False
+        )
         result = estimator.fit(boot_model, sim_data)
         return (
             {
@@ -1159,10 +1163,10 @@ def _refit_log_likelihood(
     estimator_options: Mapping[str, Any],
 ) -> tuple[float, BaseItemModel]:
     """Refit a model copy from its current estimates and return its LL."""
-    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mixed_format_em import em_estimator_for
 
     start = _prepare_bootstrap_model(model, model.parameters, warm_start)
-    result = EMEstimator(**estimator_options).fit(start, responses)
+    result = em_estimator_for(start, **estimator_options).fit(start, responses)
     log_likelihood = float(result.log_likelihood)
     if not np.isfinite(log_likelihood):
         raise ArithmeticError("fit returned a non-finite log-likelihood")

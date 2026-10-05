@@ -16,6 +16,7 @@ from scipy import stats
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
+from mirt.estimation.bkt_em import _bkt_result_fields, _prepare_bkt_fit
 from mirt.models.dynamic import (
     BKTModel,
     BKTResult,
@@ -201,8 +202,11 @@ class LongitudinalPriors:
 class BKTGibbsSampler:
     """Gibbs sampler for Bayesian Knowledge Tracing.
 
-    Uses Baum-Welch style updates for hidden states and
-    Beta-Binomial conjugacy for parameter sampling.
+    Each iteration draws every learner's hidden mastery states by
+    forward-filtering backward-sampling, then draws each skill's parameters
+    from their conjugate Beta full conditionals. Estimates are posterior
+    means. :func:`~mirt.estimation.bkt_em.fit_bkt_em` provides maximum
+    likelihood estimation by Baum-Welch EM.
     """
 
     def __init__(
@@ -308,7 +312,6 @@ class BKTGibbsSampler:
             allow_forgetting,
         )
         n_persons, n_trials = responses.shape
-        n_skills = model.n_skills
 
         # Preserve the established seeded chain while replacing later draws
         # with an equivalent vectorized path.
@@ -376,34 +379,8 @@ class BKTGibbsSampler:
         model.p_slip = np.mean(chains["p_slip"], axis=0)
         model.p_guess = np.mean(chains["p_guess"], axis=0)
 
-        learning_curves = np.zeros((n_persons, n_skills))
-        skill_mastery = np.zeros((n_persons, n_skills))
-        gamma, log_likelihoods = model.forward_backward_batch(
-            responses, skill_assignments
-        )
-
-        for skill_idx in range(n_skills):
-            skill_mask = skill_assignments == skill_idx
-            if np.any(skill_mask):
-                learned = gamma[:, skill_mask, 1]
-                skill_mastery[:, skill_idx] = learned[:, -1]
-                learning_curves[:, skill_idx] = learned.mean(axis=1)
-
-        ll_final = float(log_likelihoods.sum())
-        n_params = 4 * n_skills if not allow_forgetting else 5 * n_skills
-        n_obs = np.sum(responses >= 0)
-        aic = -2 * ll_final + 2 * n_params
-        bic = -2 * ll_final + np.log(n_obs) * n_params
-
         return BKTResult(
-            model=model,
-            learning_curves=learning_curves,
-            skill_mastery=skill_mastery,
-            log_likelihood=ll_final,
-            aic=aic,
-            bic=bic,
-            n_observations=int(n_obs),
-            n_parameters=n_params,
+            **_bkt_result_fields(model, responses, skill_assignments),
             converged=True,
         )
 
@@ -415,39 +392,14 @@ class BKTGibbsSampler:
         allow_forgetting: bool,
     ) -> tuple[NDArray[np.int_], NDArray[np.int_], BKTModel]:
         """Validate fit inputs and construct the matching BKT model."""
-        responses = np.asarray(responses)
-        skill_assignments = np.asarray(skill_assignments)
-
-        if responses.ndim != 2:
-            raise ValueError("responses must have shape (n_persons, n_trials)")
-        if responses.shape[0] == 0:
-            raise ValueError("responses must contain at least one person")
-        if responses.shape[1] == 0:
-            raise ValueError("responses must contain at least one trial")
-        if skill_assignments.ndim != 1:
-            raise ValueError("skill_assignments must be one-dimensional")
-        if len(skill_assignments) != responses.shape[1]:
-            raise ValueError("skill_assignments length must match the number of trials")
-        if not np.issubdtype(skill_assignments.dtype, np.integer):
-            raise ValueError("skill_assignments must contain integer values")
-        if np.any(skill_assignments < 0):
-            raise ValueError("skill_assignments must contain non-negative values")
-        if not isinstance(allow_forgetting, (bool, np.bool_)):
-            raise TypeError("allow_forgetting must be a boolean")
-
-        if n_skills is None:
-            n_skills = int(np.max(skill_assignments)) + 1
-        model = BKTModel(
-            n_skills=n_skills,
-            allow_forgetting=bool(allow_forgetting),
+        return _prepare_bkt_fit(
+            responses,
+            skill_assignments,
+            n_skills,
+            allow_forgetting,
             use_rust=self.use_rust,
+            person_layouts=False,
         )
-        responses, skill_assignments = model._validate_batch(
-            responses, skill_assignments
-        )
-        if not np.any(responses >= 0):
-            raise ValueError("responses must contain at least one observed value")
-        return responses, skill_assignments, model
 
     def _sample_states_ffbs(
         self,

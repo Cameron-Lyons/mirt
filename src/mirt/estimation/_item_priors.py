@@ -65,11 +65,7 @@ def resolve_item_priors(
     """
     if priors is None:
         return {}
-    item_parameters = [
-        name
-        for name, values in model._parameters.items()
-        if values.ndim and values.shape[0] == model.n_items
-    ]
+    item_parameters = [name for name in model._parameters if model._item_indexed(name)]
     if isinstance(priors, PriorSpecification):
         resolved = {}
         for name in _SPECIFICATION_FIELDS:
@@ -108,8 +104,8 @@ class ItemPriorPenalty:
         masks = model.free_parameter_masks
         terms = []
         offset = 0
-        for name, values in model._parameters.items():
-            if values.ndim == 0 or values.shape[0] != model.n_items:
+        for name in model._parameters:
+            if not model._item_indexed(name):
                 continue
             n_free = int(np.count_nonzero(masks[name][item_idx]))
             prior = self.priors.get(name)
@@ -129,6 +125,26 @@ class ItemPriorPenalty:
             if free.size:
                 total += float(np.sum(prior.log_pdf(free)))
         return total
+
+    def information(self, model: BaseItemModel) -> dict[str, NDArray[np.float64]]:
+        """Return the negative second derivative of the log-prior.
+
+        Item priors are independent across coordinates, so the log-prior
+        Hessian is diagonal. Arrays have the stored parameter shapes, with the
+        curvature at free coordinates and zeros elsewhere.
+        """
+        masks = model.free_parameter_masks
+        result = {}
+        for name, prior in self.priors.items():
+            canonical = model._canonical_parameter_values(name, model._parameters[name])
+            curvature = np.zeros_like(canonical)
+            free = masks[name]
+            if np.any(free):
+                curvature[free] = -np.asarray(
+                    prior.hess_log_pdf(canonical[free]), dtype=np.float64
+                )
+            result[name] = curvature
+        return result
 
     def penalize(
         self,

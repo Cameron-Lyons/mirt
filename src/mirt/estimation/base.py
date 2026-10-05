@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeAlias
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from mirt.exceptions import MirtValidationError
+from mirt.exceptions import MirtModelError, MirtValidationError
 from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
@@ -43,7 +43,13 @@ def _parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
     -------
     tuple of float
         Lower and upper bound shared by every free coordinate of ``name``.
+        Qualified parameters of a mixed-format model use their component's.
     """
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        component, local = model.parameter_component(name)
+        return _parameter_bounds(model.component_models[component], local)
     if name == "slopes" and model.model_name == "NRM":
         return (-5.0, 5.0)
     if "discrimination" in name or "slope" in name:
@@ -200,6 +206,17 @@ def _free_masks_from_fixed(
     return free
 
 
+def _free_shared_parameters(model: BaseItemModel) -> tuple[str, ...]:
+    """Return the parameters shared by all items that have a free coordinate."""
+    shared = model._shared_parameters
+    if not shared:
+        return ()
+    masks = model.free_parameter_masks
+    return tuple(
+        name for name in model._parameters if name in shared and np.any(masks[name])
+    )
+
+
 def _reject_parameter_restrictions(model: BaseItemModel, estimator: str) -> None:
     """Raise when user masks fix parameters that ``estimator`` would move."""
     if getattr(model, "_free_parameter_restrictions", None):
@@ -213,6 +230,11 @@ def _reject_parameter_restrictions(model: BaseItemModel, estimator: str) -> None
 
 
 class BaseEstimator(ABC):
+    # Whether the M-step also updates parameters shared by all items, such as
+    # rating-scale thresholds. Itemwise estimators without that step refuse
+    # models whose shared parameters are free rather than leave them unchanged.
+    _estimates_shared_parameters: bool = False
+
     def __init__(
         self,
         max_iter: int = 500,
@@ -296,19 +318,54 @@ class BaseEstimator(ABC):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(max_iter={self.max_iter}, tol={self.tol})"
 
+    def _check_shared_parameters(self, model: BaseItemModel) -> None:
+        """Refuse free shared parameters that this estimator cannot update.
+
+        Raises
+        ------
+        MirtModelError
+            If ``model`` has free parameters shared by all items and the
+            estimator's M-step updates item parameters only.
+        """
+        if self._estimates_shared_parameters:
+            return
+        shared = _free_shared_parameters(model)
+        if shared:
+            raise MirtModelError(
+                f"{type(self).__name__} cannot estimate {', '.join(shared)}, "
+                f"which {model.model_name} shares across items; use EMEstimator "
+                "or BLEstimator, or hold them fixed with set_free_parameter_masks",
+                model_type=model.model_name,
+            )
+
     def _get_item_params_and_bounds(
         self,
         model: BaseItemModel,
         item_idx: int,
     ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
-        """Get current item parameters and their bounds for optimization."""
+        """Get current item parameters and their bounds for optimization.
+
+        Parameters shared by all items are left out. Estimators without a
+        shared-parameter step raise ``MirtModelError`` when one is free.
+        """
+        from mirt.models.mixed_format import MixedItemModel
+
+        if isinstance(model, MixedItemModel):
+            # Its parameters are not item-indexed, so itemwise optimization
+            # would silently leave them unchanged.
+            raise MirtModelError(
+                f"{type(self).__name__} cannot optimize a MixedItemModel; fit "
+                "it with MixedFormatEMEstimator or fit_mirt(model=[...])",
+                model_type=model.model_name,
+            )
+        self._check_shared_parameters(model)
         params_list: list[float] = []
         bounds: list[tuple[float, float]] = []
         params = model.parameters
         free_masks = model.free_parameter_masks
 
         for name, values in params.items():
-            if values.ndim == 0 or values.shape[0] != model.n_items:
+            if not model._item_indexed(name):
                 continue
 
             canonical = model._canonical_parameter_values(name, values)
@@ -333,7 +390,7 @@ class BaseEstimator(ABC):
         free_masks = model.free_parameter_masks
 
         for name, values in model.parameters.items():
-            if values.ndim == 0 or values.shape[0] != model.n_items:
+            if not model._item_indexed(name):
                 continue
 
             item_values = np.asarray(values[item_idx]).copy()

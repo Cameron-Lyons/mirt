@@ -353,6 +353,206 @@ class GaussianDensity(LatentDensity):
         return n
 
 
+def _gaussian_deviance(
+    cov: NDArray[np.float64], second_moment: NDArray[np.float64]
+) -> float:
+    """Return ``log|cov| + tr(cov^-1 S)``, or infinity when ``cov`` is not PD."""
+    try:
+        cholesky = np.linalg.cholesky(cov)
+    except np.linalg.LinAlgError:
+        return np.inf
+    log_det = 2.0 * float(np.sum(np.log(np.diag(cholesky))))
+    return log_det + float(np.trace(np.linalg.solve(cov, second_moment)))
+
+
+def _is_block_pattern(free: NDArray[np.bool_]) -> bool:
+    """Return whether ``free`` links factors into blocks with every pair free."""
+    linked = free | np.eye(len(free), dtype=np.bool_)
+    closure = linked.astype(np.int64)
+    for _ in range(max(1, len(free).bit_length())):
+        closure = np.minimum(closure @ closure, 1)
+    return bool(np.array_equal(closure.astype(np.bool_), linked))
+
+
+def _constrained_gaussian_covariance(
+    second_moment: NDArray[np.float64],
+    start: NDArray[np.float64],
+    free: NDArray[np.bool_],
+    *,
+    max_iter: int = 100,
+    tol: float = 1e-10,
+) -> NDArray[np.float64]:
+    """Maximize a zero-mean Gaussian likelihood over patterned covariances.
+
+    Maximizes ``-log|C| - tr(C^{-1} S)`` over symmetric matrices ``C`` that
+    equal ``start`` outside the symmetric mask ``free``. When every variance
+    is free, the fixed covariances are zero and the free entries form complete
+    blocks, the maximizer is ``S`` restricted to those blocks. Otherwise Fisher
+    scoring with step halving keeps every iterate positive definite and never
+    decreases the likelihood.
+
+    Parameters
+    ----------
+    second_moment : ndarray of shape (K, K)
+        Second-moment matrix ``S`` about the zero mean.
+    start : ndarray of shape (K, K)
+        Positive definite starting covariance; supplies the fixed entries.
+    free : ndarray of bool, shape (K, K)
+        Symmetric mask of the entries to estimate.
+    max_iter : int, default=100
+        Maximum number of scoring steps.
+    tol : float, default=1e-10
+        Stop when no free entry moves by more than this amount.
+
+    Returns
+    -------
+    ndarray of shape (K, K)
+        The constrained maximizer.
+    """
+    n_dimensions = len(start)
+    off_diagonal = ~np.eye(n_dimensions, dtype=np.bool_)
+    if (
+        np.all(np.diag(free))
+        and not np.any(start[off_diagonal & ~free])
+        and _is_block_pattern(free)
+    ):
+        return np.where(free, second_moment, 0.0)
+
+    rows, cols = np.nonzero(np.triu(free))
+    current = np.array(start, dtype=np.float64, copy=True)
+    if rows.size == 0:
+        return current
+    # Free entry (i, j) moves C along w * (e_i e_j' + e_j e_i').
+    weight = np.where(rows == cols, 0.5, 1.0)
+    value = _gaussian_deviance(current, second_moment)
+    for _ in range(max_iter):
+        precision = np.linalg.inv(current)
+        residual = precision - precision @ second_moment @ precision
+        gradient = 2.0 * weight * residual[rows, cols]
+        information = (
+            2.0
+            * np.outer(weight, weight)
+            * (
+                precision[np.ix_(cols, rows)] * precision[np.ix_(rows, cols)]
+                + precision[np.ix_(cols, cols)] * precision[np.ix_(rows, rows)]
+            )
+        )
+        step = np.linalg.solve(information, gradient)
+        direction = np.zeros_like(current)
+        direction[rows, cols] = step
+        direction[cols, rows] = step
+        length = 1.0
+        while length > 1e-8:
+            candidate = current - length * direction
+            candidate_value = _gaussian_deviance(candidate, second_moment)
+            if candidate_value <= value:
+                break
+            length *= 0.5
+        else:
+            break
+        current, value = candidate, candidate_value
+        if length * np.max(np.abs(step)) < tol:
+            break
+    return current
+
+
+class FactorCovarianceDensity(GaussianDensity):
+    """Zero-mean Gaussian density with estimated factor correlations.
+
+    Factor variances stay at their starting values (one by default) unless
+    freed, so the density holds a correlation matrix whose free entries are
+    estimated by EM while the other covariances stay at their starting
+    values (zero by default).
+
+    Each EM iteration maximizes the expected complete-data log-likelihood
+    over the free entries with the item parameters held at their new values
+    (an ECM step, Meng and Rubin, 1993), so EM keeps increasing the
+    likelihood, or the posterior when item priors are used. Complete blocks
+    of free entries with free variances have a closed form; other patterns
+    use Fisher scoring with step halving.
+
+    Parameters
+    ----------
+    n_dimensions : int
+        Number of factors.
+    free : array_like of bool, shape (n_dimensions, n_dimensions), optional
+        Symmetric mask of estimated covariance entries. ``True`` off the
+        diagonal estimates a correlation; ``True`` on the diagonal frees a
+        variance, which is identified only when fixed slopes set the scale of
+        that factor. By default every correlation is free and the variances
+        are fixed.
+    cov : ndarray of shape (n_dimensions, n_dimensions), optional
+        Positive definite starting covariance, identity by default. Entries
+        outside ``free`` stay at their starting values.
+
+    Attributes
+    ----------
+    cov : ndarray
+        Current factor covariance; a correlation matrix with the default
+        unit variances.
+
+    References
+    ----------
+    Meng, X.-L., & Rubin, D. B. (1993). Maximum likelihood estimation via the
+    ECM algorithm: A general framework. *Biometrika*, 80(2), 267-278.
+    """
+
+    def __init__(
+        self,
+        n_dimensions: int,
+        free: NDArray[np.bool_] | None = None,
+        cov: NDArray[np.float64] | None = None,
+    ) -> None:
+        n_dimensions = _validate_count(n_dimensions, name="n_dimensions")
+        super().__init__(cov=cov, estimate_cov=True, n_dimensions=n_dimensions)
+        if free is None:
+            mask = ~np.eye(n_dimensions, dtype=np.bool_)
+        else:
+            mask = np.asarray(free)
+            if mask.dtype != np.bool_ or mask.shape != (n_dimensions, n_dimensions):
+                raise ValueError(
+                    f"free must be a Boolean array of shape "
+                    f"({n_dimensions}, {n_dimensions})"
+                )
+            if not np.array_equal(mask, mask.T):
+                raise ValueError("free must be symmetric")
+        self._free = mask.copy()
+
+    @property
+    def free(self) -> NDArray[np.bool_]:
+        """Symmetric mask of the estimated covariance entries."""
+        return self._free.copy()
+
+    @property
+    def correlation(self) -> NDArray[np.float64]:
+        """Factor correlation matrix implied by :attr:`cov`."""
+        scale = np.sqrt(np.diag(self.cov))
+        correlation = self.cov / np.outer(scale, scale)
+        np.fill_diagonal(correlation, 1.0)
+        return correlation
+
+    @property
+    def n_parameters(self) -> int:
+        return int(np.count_nonzero(np.triu(self._free)))
+
+    def update(
+        self,
+        theta_points: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> None:
+        """Maximize over the free entries with the other entries held fixed."""
+        points = _as_multivariate_points(
+            theta_points, n_dimensions=self.n_dimensions, name="theta_points"
+        )
+        normalized = _normalize_weights(weights, n_points=len(points))
+        moment = points.T @ (normalized[:, None] * points)
+        cov = _constrained_gaussian_covariance(
+            (moment + moment.T) / 2, self.cov, self._free
+        )
+        self.cov = (cov + cov.T) / 2
+        self._update_precision()
+
+
 class EmpiricalHistogram(LatentDensity):
     """Empirical histogram density (nonparametric).
 

@@ -123,7 +123,7 @@ def mc_standard_errors(
         originals = {
             name: values[item].copy()
             for name, values in parameters.items()
-            if values.ndim > 0 and values.shape[0] == model.n_items
+            if model._item_indexed(name)
         }
         if not any(np.any(masks[name][item]) for name in originals):
             continue

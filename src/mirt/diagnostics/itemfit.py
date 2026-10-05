@@ -396,8 +396,15 @@ def _sx2_parameter_counts(
             )
         return values.astype(np.int64, copy=False)
     result = np.zeros(model.n_items, dtype=np.int64)
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        # Component arrays are indexed by each component's own items.
+        for component, items in model.components:
+            result[items] = _sx2_parameter_counts(component, None, statistic=statistic)
+        return result
     shared_design = (
-        getattr(model, "model_name", "") in {"RSM", "GRSM"}
+        bool(getattr(model, "_shared_parameters", ()))
         or hasattr(model, "item_features")
         or hasattr(model, "testlet_membership")
         or "class_proportions" in getattr(model, "parameters", {})

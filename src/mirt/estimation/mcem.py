@@ -325,11 +325,18 @@ class MCEMEstimator(BaseEstimator):
         -------
         FitResult
             Fitted model with estimates and diagnostics
+
+        Raises
+        ------
+        MirtModelError
+            If the model has free parameters shared by all items, such as
+            rating-scale thresholds, which the itemwise M-step cannot update.
         """
         from mirt.results.fit_result import FitResult
 
         start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
+        self._check_shared_parameters(model)
         n_persons = responses.shape[0]
         n_factors = model.n_factors
 

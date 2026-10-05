@@ -118,6 +118,9 @@ def mod2values(model: "BaseItemModel") -> ModelValues:
     >>> print(f"Discriminations shape: {values.discrimination.shape}")
     >>> print(f"Mean difficulty: {np.mean(values.difficulty):.2f}")
     """
+    from mirt.models.mixed_format import require_single_family
+
+    require_single_family(model, "mod2values")
     n_items = model.n_items
     n_dims = model.n_factors
     parameters = {
@@ -213,14 +216,11 @@ def extract_item(
     if values.slipping is not None:
         slipping = float(values.slipping[item_idx])
 
+    shared: frozenset[str] = getattr(model, "_shared_parameters", frozenset())
     item_parameters: dict[str, float | NDArray[np.float64]] = {}
     for name, parameter in values.parameters.items():
-        is_shared_rating_parameter = model.model_name in {"RSM", "GRSM"} and name in {
-            "discrimination",
-            "thresholds",
-        }
         if (
-            not is_shared_rating_parameter
+            name not in shared
             and parameter.ndim > 0
             and parameter.shape[0] == values.n_items
         ):

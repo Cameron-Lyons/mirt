@@ -199,6 +199,34 @@ def test_shared_parameters_belong_to_the_anchors():
     assert not result.model.free_parameter_masks["thresholds"].any()
 
 
+def test_shared_parameters_stay_whole_when_as_many_as_the_items():
+    # Three shared thresholds for three items used to be read as one per item,
+    # so the anchors' thresholds were rejected or left free.
+    responses = simdata("GRM", n_persons=300, n_items=3, n_categories=4, seed=7)
+    anchors = {"difficulty": np.array([-0.5]), "thresholds": np.array([0, 0.8, 1.9])}
+
+    result = fixed_item_calibration(
+        responses,
+        RatingScaleModel(3, n_categories=4),
+        [0],
+        anchors,
+        compute_standard_errors=False,
+    )
+
+    np.testing.assert_array_equal(result.model.thresholds, anchors["thresholds"])
+    assert not result.model.free_parameter_masks["thresholds"].any()
+    assert set(result.new_item_parameters) == {"difficulty"}
+    assert result.new_item_parameters["difficulty"].shape == (2,)
+
+    unsupplied = fixed_item_calibration(
+        responses,
+        RatingScaleModel(3, n_categories=4),
+        [0],
+        compute_standard_errors=False,
+    )
+    np.testing.assert_array_equal(unsupplied.model.thresholds, [0.0, 1.0, 2.0])
+
+
 def test_family_fixed_anchor_parameters_may_be_omitted():
     responses = simdata("1PL", n_persons=300, n_items=5, seed=6)
 

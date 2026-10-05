@@ -56,11 +56,11 @@ def squarem_point(
 
 
 class FreeItemParameters:
-    """Pack a model's free item-indexed parameters into one bounded vector.
+    """Pack a model's free item and shared parameters into one bounded vector.
 
     Coordinates follow model parameter order and C order within each array,
-    as the itemwise M-step uses them. Parameters that are not indexed by item
-    are never moved by the M-step and are left out.
+    as the M-step uses them. Parameters that are neither indexed by item nor
+    shared by all items are never moved by the M-step and are left out.
     """
 
     def __init__(self, model: BaseItemModel) -> None:
@@ -68,8 +68,8 @@ class FreeItemParameters:
         self._masks: dict[str, NDArray[np.bool_]] = {}
         lower: list[NDArray[np.float64]] = []
         upper: list[NDArray[np.float64]] = []
-        for name, values in model.parameters.items():
-            if values.ndim == 0 or values.shape[0] != model.n_items:
+        for name in model.parameters:
+            if name not in model._shared_parameters and not model._item_indexed(name):
                 continue
             mask = np.asarray(masks[name], dtype=np.bool_)
             count = int(np.count_nonzero(mask))

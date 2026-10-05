@@ -407,6 +407,9 @@ def _extract_link_parameters(
     asymmetry for the selected anchors; absent asymptotes and asymmetry take
     their logistic defaults.
     """
+    from mirt.models.mixed_format import require_single_family
+
+    require_single_family(model, "Core linking")
     if model.n_factors != 1:
         raise ValueError("Core linking requires unidimensional models")
     try:
@@ -709,6 +712,9 @@ def transform_parameters(
     BaseItemModel
         Model with transformed parameters.
     """
+    from mirt.models.mixed_format import require_single_family
+
+    require_single_family(model, "transform_parameters")
     scale, shift = _validate_transform_constants(A, B)
 
     if not in_place:

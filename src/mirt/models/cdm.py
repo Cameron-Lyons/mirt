@@ -83,16 +83,6 @@ class BaseCDM(BaseItemModel):
         bit_indices = np.arange(self._n_attributes, dtype=np.uint64)[None, :]
         return ((pattern_indices >> bit_indices) & 1).astype(np.int_)
 
-    def _validate_item_index(self, item_idx: int) -> int:
-        if (
-            isinstance(item_idx, (bool, np.bool_))
-            or not isinstance(item_idx, (int, np.integer))
-            or item_idx < 0
-            or item_idx >= self.n_items
-        ):
-            raise IndexError(f"item_idx must be in [0, {self.n_items})")
-        return int(item_idx)
-
     def _ensure_alpha_2d(self, alpha: ArrayLike) -> NDArray[np.int_]:
         """Validate and normalize one or more binary mastery patterns."""
         raw = np.asarray(alpha)

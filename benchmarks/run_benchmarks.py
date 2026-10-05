@@ -73,6 +73,7 @@ SUITE_ORDER = (
     "qmcem-mstep",
     "qmcem-fit",
     "mcem-sampling",
+    "bifactor-fit",
 )
 
 
@@ -2551,6 +2552,67 @@ def bench_cat(
     )
 
 
+def bench_bifactor_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure bifactor EM on reduced grids against the product-grid EM.
+
+    Three specific factors at 21 points per factor need 194,481 product-grid
+    nodes, so the product-grid reference uses 7 points (2,401 nodes).
+    """
+    from mirt.estimation.bifactor_em import BifactorEMEstimator
+    from mirt.estimation.em import EMEstimator
+    from mirt.models.bifactor import BifactorModel
+
+    rng = np.random.default_rng(83)
+    template = BifactorModel(n_items, np.arange(n_items) % 3)
+    template.set_parameters(
+        general_loadings=rng.uniform(0.8, 1.6, n_items),
+        specific_loadings=rng.uniform(0.5, 1.2, n_items),
+        intercepts=rng.normal(size=n_items),
+    )
+    theta = rng.standard_normal((n_persons, template.n_factors))
+    responses = (rng.random((n_persons, n_items)) < template.probability(theta)).astype(
+        int
+    )
+
+    def reduced(n_quadpts: int, standard_errors: bool) -> Callable[[], None]:
+        def run() -> None:
+            BifactorEMEstimator(
+                n_quadpts=n_quadpts,
+                max_iter=10,
+                tol=1e-12,
+                compute_standard_errors=standard_errors,
+            ).fit(BifactorModel(n_items, template.specific_factors), responses)
+
+        return run
+
+    def product() -> None:
+        EMEstimator(
+            n_quadpts=7,
+            max_iter=10,
+            tol=1e-12,
+            use_rust=False,
+            use_gpu=False,
+            compute_standard_errors=False,
+        ).fit(BifactorModel(n_items, template.specific_factors), responses)
+
+    workloads = (
+        ("bifactor_fit_reduced_q7", reduced(7, False)),
+        ("bifactor_fit_reduced_q21", reduced(21, False)),
+        ("bifactor_fit_reduced_q21_se", reduced(21, True)),
+        ("bifactor_fit_product_q7", product),
+    )
+    return [
+        BenchResult(
+            name,
+            _time(run, repeats=repeats, warmups=warmups),
+            _peak_traced_bytes(run),
+        )
+        for name, run in workloads
+    ]
+
+
 def _positive_int(value: str) -> int:
     """Parse a strictly positive command-line integer."""
     try:
@@ -2753,6 +2815,8 @@ def run_suites(
         results.extend(bench_qmcem_fit(n_persons, n_items, repeats, warmups))
     if "mcem-sampling" in suites:
         results.extend(bench_mcem_sampling(n_persons, n_items, repeats, warmups))
+    if "bifactor-fit" in suites:
+        results.extend(bench_bifactor_fit(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -2965,6 +3029,7 @@ def _validate_baseline_compatibility(
                 "gpu_likelihood_",
                 "binary_likelihood_",
                 "score_equating_",
+                "bifactor_fit_",
             )
         )
     )

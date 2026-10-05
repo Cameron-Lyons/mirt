@@ -754,3 +754,93 @@ class TestMCMCParameterRecovery:
 
         diff_std = np.std(result.chains["difficulty"], axis=0)
         assert np.all(diff_std > 0), "Posterior should show variation"
+
+
+class TestGibbsChains:
+    """Several Gibbs chains, serially or in spawned worker processes."""
+
+    @staticmethod
+    def _responses() -> np.ndarray:
+        rng = np.random.default_rng(0)
+        return (rng.random((40, 3)) < 0.6).astype(int)
+
+    def test_parallel_chains_match_serial_chains(self, monkeypatch):
+        import mirt.utils._parallel as parallel
+
+        pools = []
+        original = parallel._process_pool
+
+        def record(max_workers, *args, **kwargs):
+            pools.append(max_workers)
+            return original(max_workers, *args, **kwargs)
+
+        monkeypatch.setattr(parallel, "_process_pool", record)
+        results = {}
+        for parallel_chains in (False, True):
+            sampler = GibbsSampler(
+                n_iter=12,
+                burnin=4,
+                n_chains=2,
+                seed=5,
+                use_rust=False,
+                parallel_chains=parallel_chains,
+            )
+            results[parallel_chains] = sampler.fit(
+                TwoParameterLogistic(3), self._responses()
+            )
+
+        # Workers come from the spawn pool that carries the backend choice.
+        assert pools == [2]
+        reference = GibbsSampler(n_iter=12, burnin=4, use_rust=False)
+        chains = [
+            reference._run_single_chain(
+                TwoParameterLogistic(3), self._responses(), 40, s
+            )
+            for s in (5, 1005)
+        ]
+        for name, chain in results[False].chains.items():
+            np.testing.assert_array_equal(results[True].chains[name], chain)
+            np.testing.assert_array_equal(
+                chain, np.concatenate([single[name] for single in chains])
+            )
+
+    def test_native_chains_are_stacked(self):
+        import mirt
+        from mirt.backends.rust.estimation import gibbs_sample_2pl
+
+        if not mirt.is_rust_available():
+            pytest.skip("native backend unavailable")
+        responses = self._responses()
+        # The native 2PL path used to ignore n_chains and return one chain.
+        result = GibbsSampler(n_iter=12, burnin=4, n_chains=2, seed=5).fit(
+            TwoParameterLogistic(3), responses
+        )
+        singles = [
+            gibbs_sample_2pl(responses, n_iter=12, burnin=4, thin=1, seed=seed)
+            for seed in (5, 1005)
+        ]
+        names = ("discrimination", "difficulty", "theta", "log_likelihood")
+        for k, name in enumerate(names):
+            np.testing.assert_array_equal(
+                result.chains[name],
+                np.concatenate([np.asarray(single[k]) for single in singles]),
+            )
+
+    @pytest.mark.parametrize("n_chains", [0, 1.5, True])
+    def test_invalid_chain_counts_are_rejected(self, n_chains):
+        from mirt.exceptions import MirtValidationError
+
+        with pytest.raises(MirtValidationError, match="n_chains"):
+            GibbsSampler(n_chains=n_chains)
+
+    def test_parallel_chains_reject_unpicklable_models(self):
+        from mirt.exceptions import MirtValidationError
+
+        class LocalTwoPL(TwoParameterLogistic):
+            pass
+
+        sampler = GibbsSampler(
+            n_iter=4, burnin=1, n_chains=2, use_rust=False, parallel_chains=True
+        )
+        with pytest.raises(MirtValidationError, match="parallel_chains=False"):
+            sampler.fit(LocalTwoPL(3), self._responses())

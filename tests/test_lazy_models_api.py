@@ -52,7 +52,7 @@ def test_plain_models_import_defers_numerical_dependencies_and_modules() -> None
         "numpy_loaded": False,
         "scipy_loaded": False,
         "model_submodules": [],
-        "export_count": 115,
+        "export_count": 116,
         "exports_visible": True,
     }
 
@@ -140,7 +140,7 @@ def test_star_import_resolves_every_public_model_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 115,
+        "export_count": 116,
         "all_cached": True,
     }
 

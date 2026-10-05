@@ -14,13 +14,16 @@ if TYPE_CHECKING:
     from mirt.estimation._em_context import EMFitContext
     from mirt.estimation.mcmc import MCMCResult
     from mirt.estimation.priors import Prior, PriorSpecification
+    from mirt.model_syntax import ModelSpec
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+
+    _ItemFamily = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 
 
 def fit_mirt(
     data: NDArray[np.int_] | Any,
-    model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
+    model: _ItemFamily | Sequence[_ItemFamily] = "2PL",
     n_factors: int = 1,
     n_categories: int | Sequence[int] | None = None,
     estimation: Literal["EM", "MHRM", "MCMC", "Gibbs"] = "EM",
@@ -37,6 +40,8 @@ def fit_mirt(
     se_method: Literal[
         "auto", "oakes", "crossprod", "sandwich", "complete_data"
     ] = "auto",
+    spec: ModelSpec | str | None = None,
+    accelerate: Literal["none", "squarem"] = "none",
 ) -> FitResult:
     """Fit an Item Response Theory model to response data.
 
@@ -51,7 +56,7 @@ def fit_mirt(
         ``NaN`` (including pandas/polars nulls).
         For dichotomous models, responses should be 0 or 1.
         For polytomous models, responses should be 0, 1, ..., n_categories-1.
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
+    model : str or sequence of str, default="2PL"
         IRT model to fit:
 
         - "1PL": One-parameter logistic (Rasch-like with common discrimination)
@@ -63,6 +68,14 @@ def fit_mirt(
         - "PCM": Partial Credit Model (polytomous)
         - "NRM": Nominal Response Model (polytomous)
 
+        A sequence names one family per item for a mixed-format test, for
+        example ``["3PL"] * 20 + ["GRM"] * 5``. It fits a
+        :class:`~mirt.models.mixed_format.MixedItemModel` by
+        :class:`~mirt.estimation.mixed_format_em.MixedFormatEMEstimator`,
+        whose parameters are qualified by family, such as ``"3PL.guessing"``,
+        in ``start_values``, ``fixed`` and the results. Mixed formats require
+        ``estimation="EM"``; a sequence naming one family fits that family.
+
     n_factors : int, default=1
         Number of latent factors. Only "2PL", "GRM", "GPCM" and "NRM" support
         more than one factor; other families raise ``MirtModelError``.
@@ -70,6 +83,7 @@ def fit_mirt(
         Category count for all polytomous items, or one count per item.
         If None, each item's count is inferred from its largest observed code,
         with a minimum of two. Wholly unobserved items require explicit counts.
+        For a mixed-format test, a sequence gives 2 for dichotomous items.
     estimation : {"EM", "MHRM", "MCMC", "Gibbs"}, default="EM"
         Estimation method. "MCMC" and "Gibbs" are aliases for Gibbs sampling;
         results are returned as a FitResult with posterior-mean parameters and
@@ -103,10 +117,11 @@ def fit_mirt(
     priors : PriorSpecification or mapping of str to Prior, optional
         Item-parameter priors for Bayes modal estimation with EM, for example
         ``{"guessing": BetaPrior(5, 17)}``. See ``EMEstimator(item_priors=...)``.
-        The result reports ``log_posterior``; standard errors ignore the prior.
-        Starting values, fixed coordinates and priors bypass the native 2PL EM
-        fast path, and ``start_values`` runs MHRM and Gibbs sampling with the
-        NumPy samplers.
+        The result reports ``log_posterior``, and standard errors add the
+        prior's negative second derivative to the information, so they reflect
+        the curvature of the log-posterior. Starting values, fixed coordinates
+        and priors bypass the native 2PL EM fast path, and ``start_values``
+        runs MHRM and Gibbs sampling with the NumPy samplers.
     se_method : {"auto", "oakes", "crossprod", "sandwich", "complete_data"}, \
 default="auto"
         Standard-error estimator for EM fits (see :class:`EMEstimator`).
@@ -119,6 +134,22 @@ default="auto"
         parameter covariance in ``FitResult.vcov``, and ``FitResult.se_method``
         records the estimator used. Other estimation methods accept only
         ``"auto"``.
+    spec : ModelSpec or str, optional
+        Confirmatory structure from :func:`mirt_model`, or model syntax that
+        is parsed against the item names. Items load only on their factors,
+        ``COV`` correlations are estimated and reported as
+        ``FitResult.latent_covariance``, and ``FIXED``, ``START`` and
+        ``PRIOR`` act like ``fixed``, ``start_values`` and ``priors``, which
+        can still be combined with them (priors only from one source).
+        Multiple factors are supported for "2PL" (fitted as a slope-intercept
+        :class:`MultidimensionalModel`), "GRM" and "GPCM"; one factor for
+        every family. Requires EM estimation.
+    accelerate : {"none", "squarem"}, default="none"
+        EM acceleration (see :class:`EMEstimator`). ``"squarem"`` extrapolates
+        consecutive EM steps by SQUAREM, which usually needs far fewer
+        iterations on slowly converging fits. It runs the generic EM loop, so
+        a unidimensional 2PL fit skips the native full-EM fast path. Other
+        estimation methods accept only ``"none"``.
 
     Returns
     -------
@@ -138,9 +169,13 @@ default="auto"
         If data is not 2D or contains invalid response codes.
     MirtValidationError
         If ``n_factors`` is not a positive integer, the estimation method is
-        unknown, or a polytomous category count is invalid.
+        unknown, a polytomous category count is invalid, per-item families
+        do not name every item or are used without EM, or ``accelerate`` is
+        unknown or requested for a method other than EM.
     MirtModelError
         If the model type is unknown or does not support ``n_factors``.
+    NotImplementedError
+        If ``spec`` contains ``CONSTRAIN`` equality constraints.
 
     Examples
     --------
@@ -159,13 +194,14 @@ default="auto"
     from mirt.estimation._em_context import EMFitContext
     from mirt.estimation._item_priors import validate_item_priors
     from mirt.estimation.base import _apply_starting_values, _free_masks_from_fixed
-    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.em import _ACCELERATIONS, EMEstimator
     from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
     from mirt.estimation.standard_errors import validate_se_method
     from mirt.exceptions import MirtValidationError
     from mirt.models._factory import (
         build_item_model,
-        item_model_class,
+        build_mixed_item_model,
+        validate_item_types,
         validate_n_factors,
     )
 
@@ -185,31 +221,87 @@ default="auto"
             value=se_method,
             expected="'auto' for MHRM, MCMC and Gibbs",
         )
+    if not isinstance(accelerate, str) or accelerate not in _ACCELERATIONS:
+        raise MirtValidationError(
+            "accelerate must be 'none' or 'squarem'",
+            parameter="accelerate",
+            value=accelerate,
+            expected="'none' or 'squarem'",
+        )
+    if accelerate != "none" and estimation != "EM":
+        raise MirtValidationError(
+            "accelerate applies only to EM estimation",
+            parameter="accelerate",
+            value=accelerate,
+            expected="'none' for MHRM, MCMC and Gibbs",
+        )
     from mirt.results.fit_result import FitResult
     from mirt.typing import EstimationMethod
     from mirt.utils.data import response_column_names, validate_responses
 
     # Reject unknown families and factor counts before reading the data.
-    item_model_class(model)
+    validate_item_types(model)
     n_factors = validate_n_factors(n_factors)
 
     if item_names is None:
         item_names = response_column_names(data)
     data = validate_responses(data)
+    if spec is not None:
+        from mirt.model_syntax import _fit_spec
+
+        return _fit_spec(
+            data,
+            spec,
+            model=model,
+            n_factors=n_factors,
+            n_categories=n_categories,
+            estimation=estimation,
+            n_quadpts=n_quadpts,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=verbose,
+            item_names=item_names,
+            use_rust=use_rust,
+            compute_standard_errors=compute_standard_errors,
+            start_values=start_values,
+            fixed=fixed,
+            priors=priors,
+            se_method=se_method,
+            accelerate=accelerate,
+        )
 
     n_persons, n_items = data.shape
 
     if item_names is None:
         item_names = [f"Item_{i + 1}" for i in range(n_items)]
 
-    irt_model = build_item_model(
-        model,
-        n_items,
-        n_factors=n_factors,
-        n_categories=n_categories,
-        item_names=item_names,
-        responses=data,
-    )
+    item_types = validate_item_types(model, n_items)
+    if not isinstance(item_types, str) and len(set(item_types)) == 1:
+        item_types = item_types[0]
+    if isinstance(item_types, str):
+        irt_model = build_item_model(
+            item_types,
+            n_items,
+            n_factors=n_factors,
+            n_categories=n_categories,
+            item_names=item_names,
+            responses=data,
+        )
+    elif estimation != "EM":
+        raise MirtValidationError(
+            "per-item model families require estimation='EM'",
+            parameter="estimation",
+            value=estimation,
+            expected="EM",
+        )
+    else:
+        irt_model = build_mixed_item_model(
+            item_types,
+            n_factors=n_factors,
+            n_categories=n_categories,
+            item_names=item_names,
+            responses=data,
+        )
 
     estimation_method: EstimationMethod = estimation
 
@@ -227,16 +319,18 @@ default="auto"
         # The native samplers do not accept starting values.
         _apply_starting_values(irt_model, start_values)
         use_rust = False
-    # The native 2PL path starts from its own values and ignores masks and priors.
+    # The native 2PL path starts from its own values, ignores masks and priors,
+    # and runs plain EM.
     customized = (
         start_values is not None
         or bool(irt_model._free_parameter_restrictions)
         or item_priors is not None
+        or accelerate != "none"
     )
 
     if (
         should_use_rust(use_rust)
-        and model == "2PL"
+        and item_types == "2PL"
         and n_factors == 1
         and estimation_method == "EM"
         and not customized
@@ -282,7 +376,12 @@ default="auto"
             )
 
     if estimation_method == "EM":
-        estimator = EMEstimator(
+        estimator_class = EMEstimator
+        if not isinstance(item_types, str):
+            from mirt.estimation.mixed_format_em import MixedFormatEMEstimator
+
+            estimator_class = MixedFormatEMEstimator
+        estimator = estimator_class(
             n_quadpts=n_quadpts,
             max_iter=max_iter,
             tol=tol,
@@ -291,6 +390,7 @@ default="auto"
             compute_standard_errors=compute_standard_errors,
             item_priors=item_priors,
             se_method=se_method,
+            accelerate=accelerate,
         )
         if start_values is None:
             return estimator.fit(irt_model, data)
