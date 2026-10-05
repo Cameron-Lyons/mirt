@@ -305,9 +305,9 @@ def vuong_test(
 
     Notes
     -----
-    Personwise likelihoods are marginalized over a standard-normal latent
-    distribution. This matches the default latent distribution used during
-    model estimation.
+    Personwise likelihoods are marginalized over each fit's latent
+    population: its estimated ``latent_covariance`` when it has one, and the
+    standard normal otherwise, as during estimation.
     """
     from mirt.results._common import validate_alpha
     from mirt.scoring._common import validate_scoring_responses
@@ -354,8 +354,15 @@ def vuong_test(
                 "responses must contain the observations used to fit both models"
             )
 
-    ll1 = _compute_person_loglik(model1, validated_responses, n_quadpts)
-    ll2 = _compute_person_loglik(model2, validated_responses, n_quadpts)
+    ll1, ll2 = (
+        _compute_person_loglik(
+            result.model,
+            validated_responses,
+            n_quadpts,
+            getattr(result, "latent_covariance", None),
+        )
+        for result in (result1, result2)
+    )
 
     diff = ll1 - ll2
 
@@ -399,8 +406,12 @@ def _compute_person_loglik(
     model: Any,
     responses: NDArray[np.int_],
     n_quadpts: int,
+    prior_cov: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Compute each person's marginal response-pattern log-likelihood."""
+    """Compute each person's marginal response-pattern log-likelihood.
+
+    Abilities follow ``N(0, prior_cov)``, standard normal by default.
+    """
     from mirt.scoring._common import build_quadrature
     from mirt.utils.numeric import logsumexp_axis1
 
@@ -408,7 +419,7 @@ def _compute_person_loglik(
         n_quadpts=n_quadpts,
         n_factors=model.n_factors,
         prior_mean=None,
-        prior_cov=None,
+        prior_cov=prior_cov,
     )
     weights = np.asarray(quad_weights, dtype=np.float64)
     if (

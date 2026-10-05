@@ -82,7 +82,7 @@ class FullDiagnosticReport(ReportBuilder):
             section("Item Parameters", self._parameter_table(include_tests=False))
         )
 
-        fit_stats = compute_itemfit(self.fit_result.model, self.responses)
+        fit_stats = compute_itemfit(self.fit_result, self.responses)
         sections.append(
             section(
                 "Item Fit Statistics",
@@ -90,7 +90,7 @@ class FullDiagnosticReport(ReportBuilder):
             )
         )
 
-        fit_indices = compute_fit_indices(self.fit_result.model, self.responses)
+        fit_indices = compute_fit_indices(self.fit_result, self.responses)
         sections.append(self._build_modelfit_section(fit_indices))
 
         if self.include_ld:
@@ -98,7 +98,7 @@ class FullDiagnosticReport(ReportBuilder):
                 from mirt.diagnostics.ld import compute_ld_statistics
 
                 ld_results = compute_ld_statistics(
-                    self.fit_result.model, self.responses, self.theta
+                    self.fit_result, self.responses, self.theta
                 )
                 sections.append(self._build_ld_section(ld_results))
             except (

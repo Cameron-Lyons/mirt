@@ -332,7 +332,41 @@ do not need multiple workers.
 Fixed-item calibration
 ----------------------
 
-:func:`mirt.fixed_calib` calibrates new items onto an existing scale defined by
-anchors.
+Fixed-item parameter calibration (FIPC) places new items on the scale of
+previously calibrated anchor items without a separate linking step.
+:func:`mirt.fixed_item_calibration` holds the anchor parameters at their known
+values while EM estimates the new items together with the mean and covariance
+of the calibration population. It supports every dichotomous and polytomous
+item family, and responses to new items given to only part of the sample may be
+coded as missing:
+
+.. code-block:: python
+
+   import mirt
+
+   # Columns 0-4 hold anchor items whose parameters are stored in anchor_model.
+   calibration = mirt.fixed_item_calibration(
+       responses,
+       mirt.GradedResponseModel(responses.shape[1], n_categories=4),
+       anchor_items=[0, 1, 2, 3, 4],
+       anchor_parameters=anchor_model,
+   )
+   print(calibration.latent_mean, calibration.latent_cov)
+   new_items = calibration.new_item_parameters
+   scores = mirt.fscores(
+       calibration.model,
+       responses,
+       prior_mean=calibration.latent_mean,
+       prior_cov=calibration.latent_cov,
+   )
+
+``anchor_parameters`` may be a model or fit result containing exactly the
+anchor items, in ``anchor_items`` order, or a mapping from parameter names to
+anchor rows. Anchor parameters report zero standard errors, and the new items'
+standard errors are conditional on the estimated population. Parameters shared
+by all items, such as rating-scale thresholds, belong to the anchored scale and
+stay fixed. The legacy :func:`mirt.fixed_calib` fits only new 2PL items under a
+standard normal population. :doc:`mixed_format` shows how to calibrate
+mixed-format tests against fixed anchors.
 
 See ``examples/equating.py``.

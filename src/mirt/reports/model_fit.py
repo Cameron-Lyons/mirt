@@ -66,7 +66,7 @@ class ModelFitReport(ReportBuilder):
 
         sections.append(self._model_summary_section())
 
-        fit_indices = compute_fit_indices(self.fit_result.model, self.responses)
+        fit_indices = compute_fit_indices(self.fit_result, self.responses)
         sections.append(
             section("Fit Indices", self._build_fit_indices_table(fit_indices))
         )

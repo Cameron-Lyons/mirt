@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import math
 from numbers import Real
-from typing import Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtValidationError
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 def validate_alpha(alpha: float) -> float:
@@ -120,3 +124,44 @@ def resolve_item_model(model_or_result: Any) -> Any:
     if isinstance(model_or_result, FitResult):
         return model_or_result.model
     return model_or_result
+
+
+class LatentPrior(NamedTuple):
+    """An item model with the normal latent population to integrate it over.
+
+    ``mean`` and ``cov`` are ``None`` where the population takes its
+    standard-normal default (zero mean, identity covariance).
+    """
+
+    model: BaseItemModel
+    mean: NDArray[Any] | None
+    cov: NDArray[Any] | None
+
+
+def resolve_latent_prior(
+    model_or_result: BaseItemModel | FitResult,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
+) -> LatentPrior:
+    """Return the item model and the latent population a consumer assumes.
+
+    A ``FitResult`` supplies its estimated ``latent_covariance`` (for example
+    the factor correlations of a confirmatory fit) as the default
+    ``prior_cov``. Explicit arguments take precedence. A bare model, or a fit
+    without an estimated covariance, keeps the standard-normal default, so
+    every consumer integrates over the same population as ``fscores``.
+    Consumers validate the returned arrays.
+    """
+    from mirt.results.fit_result import FitResult
+
+    if isinstance(model_or_result, FitResult):
+        if prior_cov is None:
+            prior_cov = model_or_result.latent_covariance
+        model = model_or_result.model
+    else:
+        model = model_or_result
+    return LatentPrior(
+        model,
+        None if prior_mean is None else np.asarray(prior_mean),
+        None if prior_cov is None else np.asarray(prior_cov),
+    )

@@ -188,6 +188,7 @@ a cost budget exactly, which greedy content balancing cannot guarantee:
    import numpy as np
    from mirt.cat import CATEngine, ContentArea, ContentBlueprint, ShadowTestSelection
 
+   # fit.model is a calibrated pool of at least 120 items.
    expected_seconds = np.full(fit.model.n_items, 90.0)
    blueprint = ContentBlueprint([
        ContentArea("Algebra", items=set(range(60)), min_items=10, max_items=10),
@@ -266,6 +267,7 @@ covariance onto a policy-relevant composite:
 
    from mirt.cat import CompositeClassificationStop, MCATEngine
 
+   # fit.model is a two-factor calibration.
    classification = CompositeClassificationStop(
        weights=[0.7, 0.3],
        cut_score=0.0,

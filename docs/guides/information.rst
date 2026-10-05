@@ -44,8 +44,9 @@ Inspect conditional reliability
 
 ``conditional_rxx`` converts total information into a reliability profile
 over the supplied ability values. It uses a standard-normal reference
-variance by default and accepts another positive latent variance when the
-target population is more or less dispersed.
+variance by default, or the estimated latent variance of a ``FitResult``
+that has one, and accepts another positive latent variance when the target
+population is more or less dispersed.
 
 .. code-block:: python
 

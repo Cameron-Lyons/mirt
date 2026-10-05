@@ -53,7 +53,9 @@ def _validate_count(value: int, name: str, minimum: int) -> int:
         or not isinstance(value, (int, np.integer))
         or value < minimum
     ):
-        expected = "positive integer" if minimum == 1 else "non-negative integer"
+        expected = {0: "non-negative integer", 1: "positive integer"}.get(
+            minimum, f"integer of at least {minimum}"
+        )
         raise MirtValidationError(
             f"{name} must be a {expected}",
             parameter=name,
@@ -275,6 +277,15 @@ class MHRMEstimator(BaseEstimator):
     post-burn-in iterates. Items are updated blockwise, so any built-in item
     family, including polytomous and multidimensional ones, is supported.
 
+    Standard errors of unidimensional 1PL-4PL, GRM, GPCM and PCM fits come
+    from the exact observed information of the marginal likelihood at the
+    estimates (Louis, 1982), integrated by Gauss-Hermite quadrature over the
+    standard normal ability prior; they match EM's ``se_method="oakes"`` and
+    fill ``FitResult.vcov``. Other models report the standard deviation of
+    the post-burn-in iterates, labelled ``se_method="mhrm_iterate_sd"``. That
+    measures the Robbins-Monro noise around the estimate, not sampling
+    variability, so it is no substitute for a standard error.
+
     Uses fast parallel Rust backend for 2PL models when available.
 
     References
@@ -282,6 +293,10 @@ class MHRMEstimator(BaseEstimator):
     Cai, L. (2010). Metropolis-Hastings Robbins-Monro algorithm for
     confirmatory item factor analysis. Journal of Educational and
     Behavioral Statistics, 35(3), 307-335.
+
+    Louis, T. A. (1982). Finding the observed information matrix when using
+    the EM algorithm. Journal of the Royal Statistical Society: Series B,
+    44(2), 226-233.
     """
 
     def __init__(
@@ -294,6 +309,8 @@ class MHRMEstimator(BaseEstimator):
         verbose: bool = False,
         use_rust: bool = True,
         seed: int | None = None,
+        compute_standard_errors: bool = True,
+        n_quadpts: int = 21,
     ) -> None:
         """Initialize MHRM estimator.
 
@@ -319,9 +336,22 @@ class MHRMEstimator(BaseEstimator):
             Whether to use Rust backend when available
         seed : int, optional
             Random seed for reproducibility
+        compute_standard_errors : bool
+            Whether to compute standard errors. Without them the result has
+            an empty standard-error mapping.
+        n_quadpts : int
+            Gauss-Hermite points for the observed-information standard errors.
         """
         n_cycles = _validate_count(n_cycles, "n_cycles", 1)
         burnin = _validate_count(burnin, "burnin", 0)
+        n_quadpts = _validate_count(n_quadpts, "n_quadpts", 2)
+        if not isinstance(compute_standard_errors, (bool, np.bool_)):
+            raise MirtValidationError(
+                "compute_standard_errors must be a boolean",
+                parameter="compute_standard_errors",
+                value=compute_standard_errors,
+                expected="bool",
+            )
         if (
             isinstance(proposal_sd, (bool, np.bool_))
             or not isinstance(proposal_sd, (int, float, np.integer, np.floating))
@@ -349,6 +379,8 @@ class MHRMEstimator(BaseEstimator):
         self.gain_sequence = gain_sequence
         self.use_rust = use_rust
         self.seed = seed
+        self.compute_standard_errors = bool(compute_standard_errors)
+        self.n_quadpts = n_quadpts
 
     def fit(
         self,
@@ -370,7 +402,8 @@ class MHRMEstimator(BaseEstimator):
         Returns
         -------
         FitResult
-            Fitted model result
+            Fitted model result. ``se_method`` records how the standard
+            errors were computed (see the class notes).
 
         Raises
         ------
@@ -417,27 +450,8 @@ class MHRMEstimator(BaseEstimator):
             n_params = 2 * n_items
             aic = -2 * log_likelihood + 2 * n_params
             bic = -2 * log_likelihood + np.log(n_persons) * n_params
-
-            from mirt.backends.rust.diagnostics import compute_item_se_parallel
-            from mirt.backends.rust.estep import e_step_complete
-            from mirt.estimation.quadrature import GaussHermiteQuadrature
-
-            disc = np.asarray(discrimination)
-            diff = np.asarray(difficulty)
-            quad = GaussHermiteQuadrature(n_points=21, n_dimensions=1)
-            posterior_weights, _ = e_step_complete(
-                responses,
-                quad.nodes.ravel(),
-                quad.weights.ravel(),
-                disc,
-                diff,
-            )
-            se_a, se_b = compute_item_se_parallel(
-                responses,
-                posterior_weights,
-                quad.nodes.ravel(),
-                disc,
-                diff,
+            standard_errors, se_method, covariance = self._standard_errors(
+                model, responses, None
             )
 
             return FitResult(
@@ -445,14 +459,13 @@ class MHRMEstimator(BaseEstimator):
                 log_likelihood=log_likelihood,
                 n_iterations=self.n_cycles,
                 converged=True,
-                standard_errors={
-                    "discrimination": np.asarray(se_a),
-                    "difficulty": np.asarray(se_b),
-                },
+                standard_errors=standard_errors,
                 aic=aic,
                 bic=bic,
-                n_observations=n_persons * n_items,
+                n_observations=n_persons,
                 n_parameters=n_params,
+                se_method=se_method,
+                vcov=covariance,
             )
 
         if not model._parameters:
@@ -490,23 +503,70 @@ class MHRMEstimator(BaseEstimator):
 
         theta_final = self._estimate_theta_map(model, responses, rng)
         ll = float(np.sum(model.log_likelihood(responses, theta_final)))
-
-        se = {}
-        for name, chain in param_history.items():
-            if chain:
-                se[name] = np.std(chain, axis=0)
+        standard_errors, se_method, covariance = self._standard_errors(
+            model, responses, param_history
+        )
 
         return FitResult(
             model=model,
             log_likelihood=ll,
             n_iterations=self.n_cycles,
             converged=True,
-            standard_errors=se,
+            standard_errors=standard_errors,
             aic=-2 * ll + 2 * self._count_parameters(model),
             bic=-2 * ll + np.log(n_persons) * self._count_parameters(model),
-            n_observations=n_persons * n_items,
+            n_observations=n_persons,
             n_parameters=self._count_parameters(model),
+            se_method=se_method,
+            vcov=covariance,
         )
+
+    def _standard_errors(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        history: dict[str, list[NDArray[np.float64]]] | None,
+    ) -> tuple[dict[str, NDArray[np.float64]], str | None, NDArray[np.float64] | None]:
+        """Return standard errors, their method and the parameter covariance.
+
+        Models with exact item derivatives use the observed information at
+        the estimates. Others fall back to the spread of the post-burn-in
+        iterates in ``history``.
+        """
+        from mirt.estimation._louis_information import has_analytic_item_derivatives
+        from mirt.estimation._patterns import (
+            compress_responses,
+            supports_pattern_compression,
+        )
+        from mirt.estimation.base import _parameter_bounds
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        from mirt.estimation.standard_errors import estimate_covariance
+
+        if not self.compute_standard_errors:
+            return {}, None, None
+        if has_analytic_item_derivatives(model):
+            frequencies = None
+            if supports_pattern_compression(model):
+                responses, frequencies = compress_responses(responses)
+            quadrature = GaussHermiteQuadrature(
+                n_points=self.n_quadpts, n_dimensions=model.n_factors
+            )
+            estimate = estimate_covariance(
+                model,
+                responses,
+                quadrature,
+                quadrature.weights,
+                "oakes",
+                frequencies=frequencies,
+                bounds=lambda name: _parameter_bounds(model, name),
+            )
+            return estimate.standard_errors, "oakes", estimate.covariance
+        errors = {
+            name: np.std(chain, axis=0)
+            for name, chain in (history or {}).items()
+            if chain
+        }
+        return errors, "mhrm_iterate_sd" if errors else None, None
 
     def _sample_theta(
         self,

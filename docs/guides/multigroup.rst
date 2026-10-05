@@ -19,7 +19,9 @@ Invariance
 
 Common ``invariance`` specifications include ``configural``, ``metric``,
 ``scalar``, and ``strict``. Use :func:`mirt.multigroup.compare_invariance`
-to compare nested models.
+to compare nested models. Item-level invariance tests, with anchor selection
+and drop or add schemes, are described under
+:func:`mirt.multigroup.multigroup_dif` in :doc:`dif`.
 
 Configural fits standardize every group's latent mean to zero and covariance
 to the identity. Metric fits keep means fixed and estimate nonreference

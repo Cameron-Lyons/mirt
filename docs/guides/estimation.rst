@@ -3,7 +3,10 @@ Estimation Controls
 
 ``fit_mirt`` and the estimators accept starting values, fixed parameters and
 item priors, much like the ``value`` and ``est`` columns of R's ``mirt``
-``pars`` table and its ``PRIOR`` syntax.
+``pars`` table and its ``PRIOR`` syntax. The same controls can be written as
+model syntax (:doc:`model_syntax`), mixed-format tests name parameters by
+family (:doc:`mixed_format`), and :doc:`uncertainty` describes the standard
+errors that EM reports.
 
 Starting values and fixed parameters
 ------------------------------------
@@ -129,6 +132,70 @@ parameters. The Monte Carlo EM estimators update items one at a time and
 raise ``MirtModelError`` for a model with free shared parameters; hold them
 fixed with ``model.set_free_parameter_masks`` to use those estimators.
 
+Equality constraints across items
+---------------------------------
+
+``constraints`` holds a parameter equal across a set of items, like
+``CONSTRAIN`` in R's ``mirt.model``. Each entry names one stored parameter
+and its items, as a mapping or a tuple; items are zero-based positions or
+item names, and omitting them ties every item:
+
+.. code-block:: python
+
+   responses = mirt.simdata("2PL", n_persons=1000, n_items=10, seed=1)
+
+   # One common slope: the Rasch structure with an estimated slope.
+   rasch_like = mirt.fit_mirt(
+       responses, model="2PL", constraints=[{"parameter": "discrimination"}]
+   )
+   # Equal slopes within two blocks of items.
+   blocks = mirt.fit_mirt(
+       responses,
+       model="2PL",
+       constraints=[("discrimination", range(5)), ("discrimination", range(5, 10))],
+   )
+
+For an array parameter, ``"column"`` (or a third tuple element) ties one
+coordinate of each item's row, such as one threshold or the slope on one
+factor; without it whole rows are tied column by column:
+
+.. code-block:: python
+
+   likert = mirt.simdata("GRM", n_persons=1000, n_items=6, n_categories=4, seed=2)
+   graded = mirt.fit_mirt(
+       likert,
+       model="GRM",
+       constraints=[
+           ("discrimination", [0, 1, 2]),
+           {"parameter": "thresholds", "items": [3, 4], "column": 0},
+       ],
+   )
+
+Tied coordinates start from the mean of their starting values and stay
+exactly equal. In each M-step the items they link are optimized jointly, with
+every tied group as one coordinate, so EM still increases the likelihood at
+every iteration; ``accelerate="squarem"`` also extrapolates a group as one
+coordinate. Each group counts as one parameter in ``n_parameters``, AIC and
+BIC, so likelihood-ratio tests against the unconstrained model have the right
+degrees of freedom. Standard errors come from the information of the
+constrained parameters, ``J' I J`` for the 0/1 matrix ``J`` that maps each
+group to its coordinates, by every ``se_method``. Tied coordinates report the
+group's estimate and standard error, and ``FitResult.vcov`` repeats the
+group's row and column for each of them, so the covariance is singular in
+those directions.
+
+Tied coordinates must be free, and one coordinate may belong to one group
+only; parameters shared by all items, such as rating-scale thresholds, are
+already common. Item priors apply to every stored coordinate, so a group's
+value receives its prior once per tied item. Constraints are also available as
+``EMEstimator(constraints=...)`` and accept
+:class:`~mirt.estimation.constraints.EqualityConstraint` objects. The native
+full-EM paths are skipped, while the batched 2PL and native polytomous M-steps
+still update the untied items. Constraints are not available for mixed-format
+models or for estimation methods other than EM, and ``FitResult`` does not
+record them: the bootstrap utilities, which refit the model, fit it without
+the constraints.
+
 Monte Carlo EM convergence
 --------------------------
 
@@ -217,6 +284,15 @@ family is supported; unidimensional 2PL fits use the native kernel:
 
    estimator = mirt.MHRMEstimator(n_cycles=1000, burnin=250, seed=1)
    result = estimator.fit(mirt.GradedResponseModel(n_items=10, n_categories=4), data)
+
+Standard errors of unidimensional 1PL-4PL, GRM, GPCM and PCM fits come from
+the exact observed information of the marginal likelihood at the MH-RM
+estimates, integrated on ``n_quadpts`` Gauss-Hermite points, as EM computes
+them with ``se_method="oakes"``; ``FitResult.vcov`` holds their covariance.
+For other models ``se_method="mhrm_iterate_sd"`` marks the spread of the
+post-burn-in iterates, which reflects the Robbins-Monro noise rather than
+sampling variability; fit with EM and ``se_method="oakes"`` for
+observed-information errors.
 
 ``GibbsSampler(n_chains=k)`` stacks the draws of ``k`` chains seeded
 ``seed + 1000 * i``. With ``parallel_chains=True`` NumPy chains run in spawned

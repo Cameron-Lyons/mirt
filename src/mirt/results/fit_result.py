@@ -330,9 +330,11 @@ class FitResult:
     se_method : str, optional
         Estimator behind ``standard_errors``: ``"oakes"`` (observed
         information), ``"crossprod"``, ``"sandwich"``, ``"complete_data"``
-        (itemwise complete-data curvature, which understates uncertainty) or
+        (itemwise complete-data curvature, which understates uncertainty),
         ``"hessian"`` (inverse Hessian of the marginal likelihood from
-        ``BLEstimator``). ``None`` when unrecorded.
+        ``BLEstimator``) or ``"mhrm_iterate_sd"`` (spread of the MH-RM
+        iterates, which is not a sampling standard error). ``None`` when
+        unrecorded.
     vcov : ndarray of shape (P, P), optional
         Covariance of the free parameters. Rows and columns of coordinates
         held at an optimizer bound, or whose variance is not estimable, are
@@ -344,8 +346,9 @@ class FitResult:
     latent_covariance : ndarray of shape (n_factors, n_factors), optional
         Estimated covariance of the latent factors, for example from a
         confirmatory ``fit_mirt(spec=...)`` fit with ``COV`` terms. ``None``
-        when the factors are standard normal and uncorrelated. ``fscores``
-        uses it as the default prior covariance.
+        when the factors are standard normal and uncorrelated. Scoring,
+        plausible values, simulation and the fit diagnostics that accept a
+        ``FitResult`` use it as the default latent population.
     """
 
     model: BaseItemModel

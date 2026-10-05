@@ -49,7 +49,8 @@ def generate_plausible_values(
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted IRT model
+        Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
+        ``latent_covariance`` is then the default population covariance.
     responses : NDArray
         Response matrix (n_persons, n_items)
     n_plausible : int
@@ -83,7 +84,8 @@ def generate_plausible_values(
         predictions. Defaults to zero.
     prior_cov : array-like, optional
         Positive definite ``(n_factors, n_factors)`` population covariance.
-        Defaults to the identity.
+        Defaults to the ``latent_covariance`` of a ``FitResult`` when it has
+        one, and to the identity otherwise.
 
     Returns
     -------
@@ -110,10 +112,9 @@ def generate_plausible_values(
     resolution. The MCMC method uses the same normal prior and starts every
     chain at its prior mean.
     """
-    from mirt.results.fit_result import FitResult
+    from mirt.results._common import resolve_latent_prior
 
-    if isinstance(model, FitResult):
-        model = model.model
+    model, prior_mean, prior_cov = resolve_latent_prior(model, prior_mean, prior_cov)
 
     if not model.is_fitted:
         raise ValueError("Model must be fitted before generating plausible values")

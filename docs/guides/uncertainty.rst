@@ -36,14 +36,16 @@ Select another estimator with ``se_method`` on ``fit_mirt`` or
 
 The default ``"auto"`` uses ``"oakes"`` where the exact computation applies
 and ``"complete_data"`` for nominal, multidimensional and custom item models.
-For EM and Bock-Lieberman fits, ``result.se_method`` names the estimator
-used, so check it before relying on the errors; it is ``None`` for estimators
-that do not record one. An explicit ``"oakes"`` also works for those models:
-built-in nominal and multidimensional models difference each item's curve,
-and custom models difference the marginal likelihood, which takes O(P^2)
-likelihood evaluations for P parameters. Exploratory multidimensional
-solutions are rotationally unidentified, so their information matrix is
-singular.
+For EM, Bock-Lieberman and MH-RM fits, ``result.se_method`` names the
+estimator used, so check it before relying on the errors; it is ``None`` for
+estimators that do not record one. An explicit ``"oakes"`` also works for
+those models: built-in nominal and multidimensional models difference each
+item's curve, and custom models difference the marginal likelihood, which
+takes O(P^2) likelihood evaluations for P parameters. Exploratory
+multidimensional solutions are rotationally unidentified, so their
+information matrix is singular. MH-RM fits report ``"oakes"`` where the exact
+computation applies and otherwise ``"mhrm_iterate_sd"``, the spread of the
+Robbins-Monro iterates, which is not a standard error.
 
 The matrix estimators treat the latent density as fixed, which slightly
 understates uncertainty when its mean, variance or shape is estimated.
@@ -190,9 +192,10 @@ covariance matrices.
    )
 
 Plausible values reproduce population moments only when their prior matches
-the population. On short tests, draws under the default standard normal prior
-shrink toward it, so pass the population mean and covariance on the model's
-scale. A ``(n_persons, n_factors)`` mean conditions each person's draws, for
+the population. A ``FitResult`` supplies its estimated ``latent_covariance``
+as the default prior covariance; otherwise the prior is standard normal. On
+short tests, draws shrink toward the prior, so pass the population mean and
+covariance on the model's scale when they differ from it. A ``(n_persons, n_factors)`` mean conditions each person's draws, for
 example on latent-regression predictions:
 
 .. code-block:: python

@@ -10,6 +10,7 @@ from numpy.typing import NDArray
 from mirt.estimation.base import _parameter_bounds
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import TiedCoordinates
     from mirt.models.base import BaseItemModel
 
 # Smallest gap the generic GRM M-step keeps between movable thresholds.
@@ -60,10 +61,14 @@ class FreeItemParameters:
 
     Coordinates follow model parameter order and C order within each array,
     as the M-step uses them. Parameters that are neither indexed by item nor
-    shared by all items are never moved by the M-step and are left out.
+    shared by all items are never moved by the M-step and are left out. A
+    group of coordinates tied by equality constraints is one coordinate, at
+    the position of its first member.
     """
 
-    def __init__(self, model: BaseItemModel) -> None:
+    def __init__(
+        self, model: BaseItemModel, tied: TiedCoordinates | None = None
+    ) -> None:
         masks = model.free_parameter_masks
         self._masks: dict[str, NDArray[np.bool_]] = {}
         lower: list[NDArray[np.float64]] = []
@@ -81,6 +86,19 @@ class FreeItemParameters:
             upper.append(np.full(count, high))
         self.lower = np.concatenate(lower) if lower else np.empty(0)
         self.upper = np.concatenate(upper) if upper else np.empty(0)
+        self._expand: NDArray[np.intp] | None = None
+        self._keep: NDArray[np.intp] | None = None
+        if tied is not None:
+            self._expand = tied.tying(
+                {
+                    name: np.flatnonzero(mask.ravel())
+                    for name, mask in self._masks.items()
+                }
+            )
+            # Every member of a group holds the same value and bounds.
+            _, self._keep = np.unique(self._expand, return_index=True)
+            self.lower = self.lower[self._keep]
+            self.upper = self.upper[self._keep]
 
     def get(self, model: BaseItemModel) -> NDArray[np.float64]:
         """Return the current free coordinates."""
@@ -89,7 +107,8 @@ class FreeItemParameters:
             model._canonical_parameter_values(name, params[name])[mask]
             for name, mask in self._masks.items()
         ]
-        return np.concatenate(chunks) if chunks else np.empty(0)
+        vector = np.concatenate(chunks) if chunks else np.empty(0)
+        return vector if self._keep is None else vector[self._keep]
 
     def set(
         self,
@@ -103,6 +122,8 @@ class FreeItemParameters:
         Invalid points leave the model unchanged. With ``check_order``, graded
         thresholds must keep the ordering gap of the current parameters.
         """
+        if self._expand is not None:
+            vector = vector[self._expand]
         params = model.parameters
         updates = {}
         offset = 0

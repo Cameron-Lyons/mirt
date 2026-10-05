@@ -383,9 +383,11 @@ allocations and exclude process RSS and native library workspace.
 Fast paths use exact built-in model types; custom and multidimensional scoring
 or polytomous optimization retain their generic implementations. Native M-steps
 use analytic gradients and a projected BFGS optimizer with backtracking, so
-fixed-iteration fits can differ slightly from SciPy fits. Compare the objective,
-parameter recovery, and convergence as well as speed. Itemwise EM standard errors
-and full marginal-information standard errors retain their separate objectives.
+fixed-iteration fits can differ slightly from SciPy fits. The graded M-step
+projects onto ordered thresholds with the SciPy constraint's minimum gap, and
+tied thresholds move together. Compare the objective, parameter recovery, and
+convergence as well as speed. Itemwise EM standard errors and full
+marginal-information standard errors retain their separate objectives.
 
 Core EM E-steps return per-person **log** marginal likelihoods internally; avoid
 converting them to probabilities for convergence or fit statistics. Prepared fit

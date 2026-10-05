@@ -349,14 +349,11 @@ def ability_posterior(
     ``prior_cov`` defaults to the ``latent_covariance`` of a ``FitResult``
     when it has one, and to the identity otherwise.
     """
-    from mirt.results.fit_result import FitResult
+    from mirt.results._common import resolve_latent_prior
 
-    if isinstance(model_or_result, FitResult):
-        model = model_or_result.model
-        if prior_cov is None:
-            prior_cov = model_or_result.latent_covariance
-    else:
-        model = model_or_result
+    model, prior_mean, prior_cov = resolve_latent_prior(
+        model_or_result, prior_mean, prior_cov
+    )
     scorer = EAPScorer(
         n_quadpts=n_quadpts,
         prior_mean=prior_mean,

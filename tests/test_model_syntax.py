@@ -487,7 +487,20 @@ def test_spec_priors_require_full_coverage_and_one_source(small_data) -> None:
 @pytest.mark.parametrize(
     ("syntax", "error", "message"),
     [
-        (TWO_FACTORS + "\nCONSTRAIN = (1-3, a1)", NotImplementedError, "line 4"),
+        (TWO_FACTORS + "\nCONSTRAIN = (1, 6, a1, a2)", NotImplementedError, "line 4"),
+        (TWO_FACTORS + "\nCONSTRAIN = (5-6, a1)", MirtValidationError, "load on"),
+        (TWO_FACTORS + "\nCONSTRAIN = (1-5, a3)", MirtValidationError, "factor 3"),
+        (TWO_FACTORS + "\nCONSTRAIN = (5-6, a)", MirtValidationError, "only one"),
+        (
+            TWO_FACTORS + "\nCONSTRAIN = (1-3, a1), (3-5, a1)",
+            MirtValidationError,
+            "line 4: a1 of Item_3 is already tied",
+        ),
+        (
+            TWO_FACTORS + "\nFIXED = (2, a1)\nCONSTRAIN = (1-3, a1)",
+            MirtValidationError,
+            "Item_2 .*is fixed",
+        ),
         (TWO_FACTORS + "\nSTART = (1, a2, 1.0)", MirtValidationError, "load on"),
         (TWO_FACTORS + "\nFIXED = (1, a3)", MirtValidationError, "factor 3"),
         ("F = 1-10\nFIXED = (1, d)", MirtValidationError, "difficulty"),
@@ -498,6 +511,62 @@ def test_spec_priors_require_full_coverage_and_one_source(small_data) -> None:
 def test_fit_rejects_invalid_specifications(small_data, syntax, error, message):
     with pytest.raises(error, match=message):
         fit_mirt(small_data, "2PL", spec=syntax)
+
+
+def test_constrain_fits_equal_slopes_through_constraints() -> None:
+    data = mirt.simdata(model="2PL", n_persons=600, n_items=6, seed=8)
+
+    from_spec = fit_mirt(data, "2PL", spec="F = 1-6\nCONSTRAIN = (1-4, a1)")
+    from_keywords = fit_mirt(
+        data, "2PL", constraints=[("discrimination", [0, 1, 2, 3])]
+    )
+
+    slopes = from_spec.model.parameters["discrimination"]
+    assert np.unique(slopes[:4]).size == 1
+    assert from_spec.n_parameters == from_keywords.n_parameters == 12 - 3
+    for name, values in from_keywords.model.parameters.items():
+        assert_allclose(from_spec.model.parameters[name], values)
+    assert_allclose(
+        from_spec.standard_errors["discrimination"],
+        from_keywords.standard_errors["discrimination"],
+    )
+
+
+def test_constrain_ties_factor_slopes_and_whole_rows(small_data) -> None:
+    result = fit_mirt(
+        small_data,
+        "2PL",
+        spec=TWO_FACTORS + "\nCONSTRAIN = (1-5, a1), (6-7, d)",
+        n_quadpts=9,
+        compute_standard_errors=False,
+    )
+    slopes = result.model.parameters["slopes"]
+    assert np.unique(slopes[:5, 0]).size == 1
+    assert np.all(slopes[:5, 1] == 0.0)
+    assert np.unique(result.model.parameters["intercepts"][5:7]).size == 1
+    assert result.n_parameters == 20 - 4 - 1 + 1
+
+    graded = mirt.simdata(model="GRM", n_persons=400, n_items=4, seed=3)
+    both = fit_mirt(
+        graded,
+        "GRM",
+        spec="F = 1-4\nCONSTRAIN = (1-2, thresholds)",
+        constraints=[("discrimination", [2, 3])],
+        compute_standard_errors=False,
+        max_iter=20,
+    )
+    thresholds = both.model.parameters["thresholds"]
+    assert_allclose(thresholds[0], thresholds[1])
+    assert both.model.parameters["discrimination"][2] == pytest.approx(
+        both.model.parameters["discrimination"][3]
+    )
+
+
+def test_constrain_needs_free_coordinates(small_data) -> None:
+    with pytest.raises(MirtValidationError, match="line 2: CONSTRAIN selects no"):
+        fit_mirt(small_data[:, :4], "1PL", spec="F = 1-4\nCONSTRAIN = (1-4, a1)")
+    with pytest.raises(MirtValidationError, match="at least two items"):
+        fit_mirt(small_data, "2PL", spec=TWO_FACTORS + "\nCONSTRAIN = (1, a1)")
 
 
 def test_fit_rejects_unsupported_settings(small_data) -> None:

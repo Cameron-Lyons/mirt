@@ -25,6 +25,7 @@ from mirt.utils.numeric import (
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 _SX2_TARGET_CHUNK_ELEMENTS = 1_000_000
@@ -37,7 +38,7 @@ _DEFAULT_THETA_GROUPS = 10
 
 
 def compute_itemfit(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_] | None = None,
     statistics: Sequence[str] | str | None = None,
     theta: NDArray[np.float64] | None = None,
@@ -52,13 +53,16 @@ def compute_itemfit(
     na_rm: bool = False,
     n_plausible: int = 100,
     seed: int | None = None,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute mean-square, theta-binned and Orlando-Thissen S-X2 item fit.
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted item response model.
+    model : BaseItemModel or FitResult
+        Fitted item response model, or the ``FitResult`` of a fit, whose
+        estimated ``latent_covariance`` then defines the latent population.
     responses : ndarray of shape (n_persons, n_items)
         Integer category codes. Negative codes and NaN denote missing
         responses.
@@ -78,9 +82,10 @@ def compute_itemfit(
     min_expected : float, default=1.0
         Minimum expected S-X2 cell count for sparse-cell pooling.
     n_quadpts : int, default=41
-        Standard-normal quadrature points per model factor for S-X2.
+        Gauss-Hermite quadrature points per model factor for S-X2.
     quadrature_points, quadrature_weights : array-like, optional
-        Explicit latent grid and probability masses for S-X2.
+        Explicit latent grid and probability masses for S-X2. They replace
+        the normal population of ``prior_mean`` and ``prior_cov`` for S-X2.
     item_parameter_counts : array-like, optional
         Estimated parameters per item for chi-square degrees of freedom.
     na_rm : bool, default=False
@@ -89,6 +94,12 @@ def compute_itemfit(
         Plausible-value draws for PV_Q1.
     seed : int, optional
         Seed for the PV_Q1 plausible-value draws.
+    prior_mean : array-like of shape (n_factors,), optional
+        Mean of the normal latent population. Default zero.
+    prior_cov : array-like of shape (n_factors, n_factors), optional
+        Covariance of the normal latent population. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to the
+        identity otherwise.
 
     Returns
     -------
@@ -117,9 +128,12 @@ def compute_itemfit(
     available responses regardless of ``na_rm``.
 
     ``theta`` supplies person abilities for mean-square statistics, but does
-    not define S-X2 expected counts. S-X2 uses standard-normal quadrature by
-    default; explicit points and probability-mass weights can specify a
-    different fitted latent distribution.
+    not define S-X2 expected counts. S-X2 integrates over the normal latent
+    population, by default the standard normal or a ``FitResult``'s estimated
+    factor covariance, on a Gauss-Hermite grid; explicit points and
+    probability-mass weights can specify a different fitted latent
+    distribution. The EAP abilities that replace an omitted ``theta``, and
+    the PV_Q1 posteriors, use the same population as their prior.
 
     ``min_expected`` controls sparse-cell pooling, with zero disabling it.
     Binary items pool adjacent score rows; ordinal items pool extreme score
@@ -151,6 +165,9 @@ def compute_itemfit(
     and reports the median statistic, which keeps closer to the nominal error
     rate.
     """
+    from mirt.results._common import resolve_latent_prior
+
+    model, prior_mean, prior_cov = resolve_latent_prior(model, prior_mean, prior_cov)
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     requested = _validate_statistics(
         statistics, _ITEMFIT_STATISTICS, default=("infit", "outfit")
@@ -207,6 +224,8 @@ def compute_itemfit(
                 quadrature_weights=quadrature_weights,
                 item_parameter_counts=item_parameter_counts,
                 na_rm=na_rm,
+                prior_mean=prior_mean,
+                prior_cov=prior_cov,
             )
         )
         if p_adjust != "none":
@@ -221,7 +240,13 @@ def compute_itemfit(
     if theta is None or "PV_Q1" in binned:
         from mirt.scoring import fscores
 
-        scores = fscores(model, responses, method="EAP")
+        scores = fscores(
+            model,
+            responses,
+            method="EAP",
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
         eap = np.asarray(scores.theta, dtype=np.float64).reshape(n_persons, n_factors)
         if "PV_Q1" in binned:
             spread = np.asarray(scores.standard_error, dtype=np.float64)
@@ -429,6 +454,8 @@ def _sx2_quadrature(
     n_quadpts: int,
     points: ArrayLike | None,
     weights: ArrayLike | None,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     n_factors = getattr(model, "n_factors", 1)
     if (points is None) != (weights is None):
@@ -446,10 +473,14 @@ def _sx2_quadrature(
             raise ValueError(
                 "default quadrature exceeds 100000 points; supply a bounded explicit quadrature grid"
             )
-        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        from mirt.scoring._common import build_quadrature
 
-        grid = GaussHermiteQuadrature(n_points=int(n_quadpts), n_dimensions=n_factors)
-        return grid.nodes, grid.weights
+        return build_quadrature(
+            n_quadpts=int(n_quadpts),
+            n_factors=n_factors,
+            prior_mean=None if prior_mean is None else np.asarray(prior_mean),
+            prior_cov=None if prior_cov is None else np.asarray(prior_cov),
+        )
     nodes = np.asarray(points, dtype=np.float64)
     masses = np.asarray(weights, dtype=np.float64)
     if nodes.ndim == 1 and n_factors == 1:
@@ -759,6 +790,8 @@ def _compute_s_x2(
     quadrature_weights: ArrayLike | None,
     item_parameter_counts: ArrayLike | None,
     na_rm: bool,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     from mirt.models.cdm_advanced import HigherOrderCDM
     from mirt.models.mixture import MixtureIRT
@@ -787,7 +820,7 @@ def _compute_s_x2(
     observed, score_counts = _sx2_response_counts(responses, categories, na_rm=na_rm)
     parameter_counts = _sx2_parameter_counts(model, item_parameter_counts)
     nodes, weights = _sx2_quadrature(
-        model, n_quadpts, quadrature_points, quadrature_weights
+        model, n_quadpts, quadrature_points, quadrature_weights, prior_mean, prior_cov
     )
     conditional, marginal = _conditional_category_probabilities(
         model, categories, nodes, weights
@@ -810,7 +843,7 @@ def _compute_s_x2(
 
 
 def compute_s_x2(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_groups: int | None = None,
@@ -822,12 +855,15 @@ def compute_s_x2(
     quadrature_weights: ArrayLike | None = None,
     item_parameter_counts: ArrayLike | None = None,
     na_rm: bool = False,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute exact-total-score conditional Orlando-Thissen S-X2 item fit.
 
     Binary and ordinal expected counts are integrated over the latent ability
     distribution by score recursion. See :func:`compute_itemfit` for pooling,
-    quadrature, parameter-count, missing-response, and multiplicity controls.
+    quadrature, latent-population, parameter-count, missing-response, and
+    multiplicity controls.
     ``theta`` is accepted and validated for compatibility; S-X2 does not use
     plug-in respondent ability estimates. ``n_groups`` is deprecated.
     """
@@ -844,4 +880,6 @@ def compute_s_x2(
         quadrature_weights=quadrature_weights,
         item_parameter_counts=item_parameter_counts,
         na_rm=na_rm,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
     )

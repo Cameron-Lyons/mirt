@@ -4,8 +4,8 @@ Confirmatory Models and Model Syntax
 :func:`mirt.mirt_model` reads a subset of the model syntax of R's
 ``mirt.model``. The resulting :class:`mirt.ModelSpec` assigns items to
 factors, frees factor correlations and sets starting values, fixed
-parameters and priors. ``fit_mirt(data, spec=...)`` then fits the
-confirmatory model and estimates the factor correlations.
+parameters, priors and equality constraints. ``fit_mirt(data, spec=...)``
+then fits the confirmatory model and estimates the factor correlations.
 
 Fitting correlated factors
 --------------------------
@@ -67,8 +67,8 @@ Statement                              Meaning
 ``START = (1-5, a1, 1.5)``             Starting values.
 ``PRIOR = (1-10, d, norm, 0, 2)``      Priors: ``norm`` (mean, sd), ``lnorm``
                                        (log mean, log sd) or ``beta`` (shapes).
-``CONSTRAIN = (1-3, a1)``              Equality constraints; parsed, but not yet
-                                       fitted (``NotImplementedError``).
+``CONSTRAIN = (1-3, a1), (4-6, d)``    Equality constraints: one parameter held
+                                       equal across the listed items.
 =====================================  =============================================
 
 Parameter names are resolved against the fitted model: ``a`` selects all
@@ -87,6 +87,32 @@ a stored parameter, so all ``PRIOR`` groups for one parameter must use the
 same distribution and together cover its free coordinates; priors come either
 from the syntax or from ``priors=``.
 
+Equality constraints
+--------------------
+
+``CONSTRAIN`` holds one parameter equal across the items of each group and
+is fitted through the ``constraints`` argument of :func:`mirt.fit_mirt` (see
+:doc:`estimation`). ``(1-5, a1)`` gives items 1 to 5 one slope on ``F1``;
+``a`` ties the slopes on every factor, factor by factor; a stored name such
+as ``thresholds`` ties whole item rows column by column. Coordinates that the
+loading pattern or the family fixes, such as unused slopes and category
+padding, are left out:
+
+.. code-block:: python
+
+   result = mirt.fit_mirt(
+       responses,
+       model="2PL",
+       spec="F1 = 1-5\nF2 = 6-10\nCOV = F1*F2\nCONSTRAIN = (1-5, a1), (6-10, a2)",
+   )
+
+Each group counts as one parameter, tied coordinates share their estimate
+and standard error, and the groups combine with ``constraints=``. A group
+must tie free coordinates of at least two items, so ``FIXED`` and
+``CONSTRAIN`` cannot name the same coordinate. R's form that equates
+different parameters, such as ``CONSTRAIN = (1, 3, a1, a2)``, raises
+``NotImplementedError``.
+
 Factor correlations and variances
 ---------------------------------
 
@@ -96,10 +122,18 @@ likelihood over the free correlations with the item parameters held fixed
 (an ECM step), so every iteration increases the likelihood, or the posterior
 when priors are used. The estimate is stored in ``FitResult.latent_covariance``
 (with ``factor_correlation`` as its correlation matrix), counted in
-``n_parameters``, printed by ``summary()`` and used by :func:`mirt.fscores`
-and :func:`mirt.ability_posterior` as the default prior covariance. Standard
-errors treat the latent covariance as fixed, and other diagnostics such as
-:func:`mirt.itemfit` still assume uncorrelated standard normal factors.
+``n_parameters`` and printed by ``summary()``. Given the ``FitResult``, these
+functions use it as the latent population: :func:`mirt.fscores`,
+:func:`mirt.ability_posterior`, the EAPsum functions, plausible values,
+imputation and :func:`mirt.simdata`, and the diagnostics that integrate over
+the population or score abilities by EAP: :func:`mirt.itemfit` (S-X2, X2, G2,
+PV-Q1, infit and outfit), ``compute_m2`` and ``compute_fit_indices``, the
+residual and local-dependence statistics, ``vuong_test`` and the reliability
+summaries. Pass the item model instead (``result.model``) for the standard
+normal, or ``prior_cov`` to choose another population. M2 projects out the
+estimated correlations like the free item parameters, so each costs one degree
+of freedom. Standard errors treat the latent covariance as fixed, and the
+bootstrap utilities still refit with uncorrelated standard normal factors.
 
 ``COV = F1*F1`` frees the variance of ``F1``. The variance is identified only
 when ``FIXED`` holds a nonzero slope on ``F1``, as in a marker-item model,
@@ -138,8 +172,9 @@ slopes follow a loading pattern:
 Limitations
 -----------
 
-* Only EM estimation is supported, and ``CONSTRAIN``, ``MEAN``, ``LBOUND``,
-  ``UBOUND`` and multiple-group keywords are not.
+* Only EM estimation is supported, and ``MEAN``, ``LBOUND``, ``UBOUND``,
+  ``CONSTRAINB`` and other multiple-group keywords are not; ``CONSTRAIN``
+  groups must each equate a single parameter.
 * The quadrature grid has ``n_quadpts ** n_factors`` nodes. Lower
   ``n_quadpts`` (for example to 9) for three or more factors.
 * Several factors are available for "2PL", "GRM" and "GPCM" models.

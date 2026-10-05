@@ -40,6 +40,7 @@ from mirt.diagnostics.multiple_testing import (
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 @dataclass
@@ -153,7 +154,7 @@ class LDResult:
 
 
 def compute_ld_statistics(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
@@ -165,8 +166,9 @@ def compute_ld_statistics(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : NDArray of shape (n_persons, n_items)
         Response matrix with integer responses
     theta : NDArray of shape (n_persons,) or (n_persons, n_factors), optional
@@ -188,7 +190,7 @@ def compute_ld_statistics(
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
     n_items = responses.shape[1]
-    theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
+    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
     residuals, positive_probabilities = _compute_residuals_and_positive_probabilities(
         model,
@@ -261,7 +263,7 @@ def compute_ld_statistics(
 
 
 def compute_q3(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
@@ -272,8 +274,9 @@ def compute_q3(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : NDArray
         Response matrix
     theta : NDArray, optional
@@ -285,7 +288,7 @@ def compute_q3(
         Matrix of Q3 statistics
     """
     responses = np.asarray(responses)
-    theta = _ability_matrix(model, responses, theta)
+    model, theta = _ability_matrix(model, responses, theta)
 
     residuals, _ = _compute_residuals_and_positive_probabilities(
         model, responses, theta
@@ -294,7 +297,7 @@ def compute_q3(
 
 
 def compute_ld_chi2(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
@@ -304,8 +307,9 @@ def compute_ld_chi2(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : NDArray
         Response matrix
     theta : NDArray, optional
@@ -325,7 +329,7 @@ def compute_ld_chi2(
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
     n_items = responses.shape[1]
-    theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
+    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
     chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
@@ -343,24 +347,30 @@ def compute_ld_chi2(
 
 
 def _ability_matrix(
-    model: BaseItemModel,
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None,
     **fscores_kwargs: int,
-) -> NDArray[np.float64]:
-    """Return person abilities as an ``(n_persons, n_factors)`` matrix.
+) -> tuple[BaseItemModel, NDArray[np.float64]]:
+    """Return the item model and person abilities as an ``(n, n_factors)`` matrix.
 
-    Missing abilities default to EAP scores.
+    Missing abilities default to EAP scores under the latent population of a
+    ``FitResult``, as :func:`mirt.fscores` computes them.
     """
+    from mirt.results._common import resolve_item_model
+
+    model: BaseItemModel = resolve_item_model(model_or_result)
     if theta is None:
         from mirt.scoring import fscores
 
-        theta = fscores(model, responses, method="EAP", **fscores_kwargs).theta
+        theta = fscores(
+            model_or_result, responses, method="EAP", **fscores_kwargs
+        ).theta
 
     theta = np.atleast_2d(theta)
     if theta.shape[0] == 1 and responses.shape[0] > 1:
         theta = theta.T
-    return theta
+    return model, theta
 
 
 def _compute_residuals_and_positive_probabilities(

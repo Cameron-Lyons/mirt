@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -30,6 +30,11 @@ from mirt.estimation._item_priors import (
     validate_item_priors,
 )
 from mirt.estimation._posterior import normalize_log_posterior
+from mirt.estimation._shared_step import (
+    EqualityConstraints,
+    TiedCoordinates,
+    validate_equality_constraints,
+)
 from mirt.estimation.base import (
     BaseEstimator,
     StartValues,
@@ -268,6 +273,28 @@ default="auto"
         log-posterior at the mode. Parameters shared by all items take no
         priors. Priors bypass the fused native 3PL iteration, the batched
         Newton logistic M-step and the native polytomous M-step.
+    constraints : sequence, optional
+        Equality constraints across items, as in the ``CONSTRAIN`` statement
+        of R's ``mirt.model``. Each group ties one stored parameter of several
+        items: a mapping ``{"parameter": "discrimination", "items": [0, 1,
+        2]}``, a tuple ``("discrimination", [0, 1, 2])``, or an
+        :class:`~mirt.estimation.constraints.EqualityConstraint`. Items are
+        zero-based positions or item names, and omitted items mean every item.
+        For array parameters, ``"column"`` (the third tuple element) ties one
+        coordinate of each item's row, such as one threshold or the slope on
+        one factor; without it whole rows are tied column by column. Tied
+        coordinates must be free, start from their mean and stay exactly
+        equal. The items they link are optimized jointly in each M-step with
+        every group as one coordinate, so EM stays monotone. Each group counts
+        as one parameter in ``n_parameters``, AIC and BIC. Standard errors
+        come from the information of the constrained parameters,
+        ``J' I J`` for the 0/1 matrix ``J`` mapping groups to coordinates;
+        ``FitResult.vcov`` repeats a group's row for each of its
+        coordinates, so tied coordinates have equal errors and are perfectly
+        correlated. Constraints bypass the fused native 3PL iteration; the
+        batched Newton logistic M-step and the native polytomous M-step
+        update only the other items. Constraints are not available for
+        mixed-format models.
 
     References
     ----------
@@ -302,6 +329,7 @@ default="auto"
         accelerate: Literal["none", "squarem"] = "none",
         item_priors: ItemPriors | None = None,
         se_method: StandardErrorMethod = "auto",
+        constraints: EqualityConstraints | None = None,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
@@ -340,6 +368,9 @@ default="auto"
         self.item_priors = validate_item_priors(item_priors)
         self._prior_penalty: ItemPriorPenalty | None = None
         self.se_method = validate_se_method(se_method)
+        self.constraints = validate_equality_constraints(constraints)
+        # Coordinates tied by ``constraints`` in the model being fitted.
+        self._tied: TiedCoordinates | None = None
         # Method and free-parameter covariance behind the latest standard errors.
         self._se_details: tuple[str, NDArray[np.float64] | None] | None = None
         self._quadrature: GaussHermiteQuadrature | None = None
@@ -382,18 +413,26 @@ default="auto"
             from its current estimates. ``"model"`` starts from the model's
             current values. A mapping of parameter names to arrays overrides
             the ``"default"`` values; it also sets the values at which fixed
-            coordinates are held.
+            coordinates are held. Coordinates tied by ``constraints`` start
+            from the mean of their starting values.
 
         Returns
         -------
         FitResult
             Fitted model, log-likelihood, standard errors and fit statistics.
+
+        Raises
+        ------
+        MirtValidationError
+            If ``constraints`` do not match the model's free coordinates.
         """
         from mirt.estimation._patterns import supports_pattern_compression
+        from mirt.estimation._shared_step import resolve_equality_constraints
         from mirt.estimation.latent_density import GaussianDensity, create_density
 
         start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
+        self._tied = resolve_equality_constraints(self.constraints, model)
         _warn_large_grid(model, self.n_quadpts)
         self._quadrature = GaussHermiteQuadrature(
             n_points=self.n_quadpts,
@@ -421,6 +460,8 @@ default="auto"
 
         priors = resolve_item_priors(self.item_priors, model)
         _apply_starting_values(model, start)
+        if self._tied is not None:
+            self._tied.equalize(model)
 
         builtin = supports_pattern_compression(model)
         with EMFitContext(
@@ -470,6 +511,8 @@ default="auto"
         se_method, covariance = self._se_details or (None, None)
 
         n_params = model.n_parameters + self._latent_density.n_parameters
+        if self._tied is not None:
+            n_params -= self._tied.n_redundant
         aic = self._compute_aic(current_ll, n_params)
         bic = self._compute_bic(current_ll, n_params, n_persons)
 
@@ -618,7 +661,7 @@ default="auto"
             squarem_step_length,
         )
 
-        parameters = FreeItemParameters(model)
+        parameters = FreeItemParameters(model, self._tied)
         history = self._convergence_history
         n_e_steps = n_m_steps = 0
 
@@ -697,6 +740,7 @@ default="auto"
             or not should_use_rust(self.use_rust)
             or self._should_use_gpu
             or self._prior_penalty is not None
+            or self._tied is not None
             or type(model) is not ThreeParameterLogistic
             or not uses_builtin_model_hooks(model, likelihood=True)
             or model._free_parameter_restrictions
@@ -972,6 +1016,12 @@ default="auto"
 
         quad_points = self._quadrature.nodes
         fit_context = self._fit_context
+        tied = self._tied
+        context = (
+            fit_context
+            if fit_context is not None and fit_context.responses is responses
+            else EMFitContext(responses)
+        )
 
         if (
             model.is_polytomous
@@ -981,6 +1031,12 @@ default="auto"
             from mirt.backends.rust.polytomous_mstep import try_polytomous_m_step
             from mirt.models.polytomous import GradedResponseModel
 
+            # The native step moves every item, so items linked by equality
+            # constraints get their values back and are optimized jointly.
+            held = {
+                item: self._get_item_params_and_bounds(model, item)[0]
+                for item in (() if tied is None else tied.items)
+            }
             # Loose relative tolerances stop the native graded optimizer early,
             # and the noisy M-steps triple the EM iterations. Partial-credit
             # items converge cleanly and would only slow down.
@@ -995,13 +1051,25 @@ default="auto"
                 n_jobs=self.n_jobs,
                 context=fit_context,
             ):
+                for item, values in held.items():
+                    self._set_item_params(model, item, values)
+                if held:
+                    self._m_step_tied(
+                        model,
+                        responses,
+                        posterior_weights,
+                        quad_points,
+                        {
+                            item: {
+                                "r_kc": context.expected_category_counts(
+                                    item, model.n_categories[item], posterior_weights
+                                )
+                            }
+                            for item in held
+                        },
+                    )
                 return
 
-        context = (
-            fit_context
-            if fit_context is not None and fit_context.responses is responses
-            else EMFitContext(responses)
-        )
         item_counts: dict[int, dict[str, NDArray[np.float64]]]
         if model.is_polytomous:
             category_counts = context.category_counts(
@@ -1015,11 +1083,22 @@ default="auto"
             correct, observed = context.expected_counts(posterior_weights)
             items: Iterable[int] = range(model.n_items)
             if self._uses_newton_logistic_m_step(model):
-                items = self._newton_logistic_m_step(model, correct, observed)
+                items = self._newton_logistic_m_step(
+                    model, correct, observed, skip=() if tied is None else tied.items
+                )
             item_counts = {
                 item_idx: {"r_k": correct[item_idx], "n_k_valid": observed[item_idx]}
                 for item_idx in items
             }
+        # Items linked by equality constraints are optimized jointly below.
+        tied_counts: dict[int, dict[str, NDArray[np.float64]]] = {}
+        for item in () if tied is None else tied.items:
+            item_counts.pop(item, None)
+            tied_counts[item] = (
+                {"r_kc": category_counts[item]}
+                if model.is_polytomous
+                else {"r_k": correct[item], "n_k_valid": observed[item]}
+            )
 
         n_jobs = self.n_jobs
         if n_jobs == -1:
@@ -1060,6 +1139,11 @@ default="auto"
             for item_idx, optimal_params in results:
                 self._set_item_params(model, item_idx, optimal_params)
 
+        if tied_counts:
+            self._m_step_tied(
+                model, responses, posterior_weights, quad_points, tied_counts
+            )
+
         if _free_shared_parameters(model):
             from mirt.estimation._shared_step import binary_category_counts
 
@@ -1088,6 +1172,67 @@ default="auto"
             max_iter=self.item_optim_maxiter,
             ftol=self._item_optim_ftol(precise=True),
         )
+
+    def _m_step_tied(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        posterior_weights: NDArray[np.float64],
+        quad_points: NDArray[np.float64],
+        item_counts: dict[int, dict[str, NDArray[np.float64]]],
+    ) -> None:
+        """Optimize the items linked by equality constraints jointly.
+
+        ``item_counts`` holds each tied item's expected counts, as passed to
+        :meth:`_optimize_item`. Each component of linked items is a separate
+        problem.
+        """
+        from mirt.estimation._shared_step import (
+            TiedItemObjective,
+            optimize_tied_items,
+            with_differenced_gradient,
+        )
+
+        assert self._tied is not None
+        for component in self._tied.components:
+            parts: list[TiedItemObjective] = []
+            numerical: list[TiedItemObjective] = []
+            try:
+                for item in component:
+                    start, bounds, objective, analytic = self._item_objective(
+                        model,
+                        item,
+                        responses,
+                        posterior_weights,
+                        quad_points,
+                        **item_counts[item],
+                    )
+                    if objective is not None and not analytic:
+                        objective = with_differenced_gradient(objective, bounds)
+                    part = TiedItemObjective(
+                        item,
+                        start,
+                        bounds,
+                        objective,
+                        _graded_threshold_constraint(model, item, start.size),
+                    )
+                    parts.append(part)
+                    if not analytic:
+                        numerical.append(part)
+                optimized = optimize_tied_items(
+                    model,
+                    self._tied,
+                    parts,
+                    max_iter=self.item_optim_maxiter,
+                    ftol=self._item_optim_ftol(precise=True),
+                )
+            finally:
+                # Numerical objectives write trial values to the model.
+                for part in numerical:
+                    self._set_item_params(model, part.item, part.start)
+            if optimized is not None:
+                for part, values in zip(parts, optimized, strict=True):
+                    self._set_item_params(model, part.item, values)
 
     def _item_optim_ftol(self, precise: bool = False) -> float:
         """Return the relative item-optimizer tolerance for this M-step."""
@@ -1129,12 +1274,14 @@ default="auto"
         model: BaseItemModel,
         correct: NDArray[np.float64],
         observed: NDArray[np.float64],
+        skip: Sequence[int] = (),
     ) -> NDArray[np.intp]:
         """Solve all 1PL/2PL items jointly and return items needing the fallback.
 
-        Items with no observed responses keep their values. Estimates that do
-        not converge or leave the optimizer box are left to the bounded
-        itemwise optimizer, which then returns the constrained optimum.
+        Items with no observed responses, and the items in ``skip`` (which
+        another step updates), keep their values. Estimates that do not
+        converge or leave the optimizer box are left to the bounded itemwise
+        optimizer, which then returns the constrained optimum.
         """
         from mirt.estimation._logistic_newton import newton_logistic_items
         from mirt.models.dichotomous import OneParameterLogistic
@@ -1159,6 +1306,7 @@ default="auto"
             low, high = _parameter_bounds(model, "discrimination")
             accepted &= np.all((new_slopes >= low) & (new_slopes <= high), axis=1)
         observed_items = np.any(observed, axis=1)
+        observed_items[np.asarray(skip, dtype=np.intp)] = False
         accepted &= observed_items
 
         updates = {"difficulty": np.where(accepted, new_difficulty, difficulty)}
@@ -1203,13 +1351,79 @@ default="auto"
         r_kc: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Optimize item parameters and return optimal parameter vector."""
+        current_params, bounds, objective, analytic = self._item_objective(
+            model,
+            item_idx,
+            responses,
+            posterior_weights,
+            quad_points,
+            valid_mask,
+            r_k,
+            n_k_valid,
+            r_kc,
+        )
+        if objective is None:
+            return current_params
+
+        constraint = _graded_threshold_constraint(model, item_idx, current_params.size)
+        constrained = {"constraints": (constraint,)} if constraint is not None else {}
+        try:
+            result = minimize(
+                objective,
+                x0=current_params,
+                method="SLSQP" if constraint is not None else "L-BFGS-B",
+                jac=analytic,
+                bounds=bounds,
+                options={
+                    "maxiter": self.item_optim_maxiter,
+                    "ftol": self._item_optim_ftol(),
+                },
+                **constrained,
+            )
+            if constraint is not None and (
+                not np.all(np.isfinite(result.x))
+                or np.any(constraint.A @ result.x < constraint.lb - 1e-8)
+            ):
+                raise MirtEstimationError(
+                    f"GRM item {item_idx} optimization did not preserve threshold ordering"
+                )
+            return result.x
+        finally:
+            if not analytic:
+                self._set_item_params(model, item_idx, current_params)
+
+    def _item_objective(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+        responses: NDArray[np.int_],
+        posterior_weights: NDArray[np.float64],
+        quad_points: NDArray[np.float64],
+        valid_mask: NDArray[np.bool_] | None = None,
+        r_k: NDArray[np.float64] | None = None,
+        n_k_valid: NDArray[np.float64] | None = None,
+        r_kc: NDArray[np.float64] | None = None,
+    ) -> tuple[
+        NDArray[np.float64],
+        list[tuple[float, float]],
+        Callable[[NDArray[np.float64]], Any] | None,
+        bool,
+    ]:
+        """Return one item's M-step problem in its free-coordinate layout.
+
+        Returns the current free coordinates, the optimizer box, the negative
+        expected log-likelihood (minus any item log-prior), and whether that
+        objective also returns its gradient. The objective is None when the
+        item has no free coordinates or no expected responses. A numerical
+        objective writes trial values to the model, which the caller restores.
+        """
         item_responses = responses[:, item_idx]
         if valid_mask is None:
             valid_mask = item_responses >= 0
 
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
         if not current_params.size:
-            return current_params
+            return current_params, bounds, None, True
 
         objective: Callable[
             [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
@@ -1230,7 +1444,7 @@ default="auto"
                     valid_mask,
                 )
             if not np.any(r_kc):
-                return current_params
+                return current_params, bounds, None, True
             prepared = prepare_polytomous_objective(
                 model, item_idx, quad_points, r_kc, self.prob_epsilon
             )
@@ -1250,7 +1464,7 @@ default="auto"
             if n_k_valid is None:
                 n_k_valid = np.sum(posterior_weights[valid_mask], axis=0)
             if not np.any(n_k_valid):
-                return current_params
+                return current_params, bounds, None, True
             if r_k is None:
                 r_k = np.sum(
                     item_responses[valid_mask, None] * posterior_weights[valid_mask, :],
@@ -1297,33 +1511,7 @@ default="auto"
             objective, bounds = self._prior_penalty.penalize(
                 model, item_idx, objective, bounds, analytic=analytic
             )
-
-        constraint = _graded_threshold_constraint(model, item_idx, current_params.size)
-        constrained = {"constraints": (constraint,)} if constraint is not None else {}
-        try:
-            result = minimize(
-                objective,
-                x0=current_params,
-                method="SLSQP" if constraint is not None else "L-BFGS-B",
-                jac=analytic,
-                bounds=bounds,
-                options={
-                    "maxiter": self.item_optim_maxiter,
-                    "ftol": self._item_optim_ftol(),
-                },
-                **constrained,
-            )
-            if constraint is not None and (
-                not np.all(np.isfinite(result.x))
-                or np.any(constraint.A @ result.x < constraint.lb - 1e-8)
-            ):
-                raise MirtEstimationError(
-                    f"GRM item {item_idx} optimization did not preserve threshold ordering"
-                )
-            return result.x
-        finally:
-            if not analytic:
-                self._set_item_params(model, item_idx, current_params)
+        return current_params, bounds, objective, analytic
 
     def _optimize_item(
         self,
@@ -1435,7 +1623,8 @@ default="auto"
 
         ``posterior_weights`` are final E-step posteriors already scaled by
         any pattern frequencies. The method and free-parameter covariance are
-        kept in ``_se_details`` for the fit result.
+        kept in ``_se_details`` for the fit result. Coordinates tied by
+        equality constraints share the error of their group.
         """
         from mirt.estimation.standard_errors import estimate_covariance
 
@@ -1444,6 +1633,8 @@ default="auto"
             errors = self._complete_data_standard_errors(
                 model, responses, posterior_weights, person_weights=person_weights
             )
+            if self._tied is not None:
+                errors = self._tied.combine_standard_errors(errors)
             self._se_details = ("complete_data", None)
             return errors
 
@@ -1463,6 +1654,7 @@ default="auto"
             h=self.se_step_size,
             bounds=lambda name: _parameter_bounds(model, name),
             prior_information=self._prior_information(model),
+            tied=self._tied,
         )
         self._se_details = (method, estimate.covariance)
         return estimate.standard_errors

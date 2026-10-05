@@ -79,6 +79,14 @@ be any item models that share ``n_factors``:
    )
    result = mirt.MixedFormatEMEstimator().fit(model, responses)
 
+A rating-scale component (:class:`~mirt.models.polytomous.RatingScaleModel`
+or :class:`~mirt.models.polytomous.GradedRatingScaleModel`) shares its
+thresholds among its own items. Its M-step ends with the same joint update of
+those shared parameters as a single-family fit, so they are estimated with
+the rest of the test; their observed-information standard errors use
+differences of the marginal likelihood. Equality constraints across items
+(``constraints``) are not available for mixed-format models.
+
 Calibrated item pools
 ---------------------
 

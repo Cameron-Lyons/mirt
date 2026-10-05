@@ -100,6 +100,7 @@ def compute_drf(
     -------
     dict
         Dictionary with:
+
         - 'information_ref': Test information for reference group
         - 'information_focal': Test information for focal group on the
           reference scale

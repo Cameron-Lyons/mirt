@@ -6,8 +6,8 @@ This guide walks through a minimal end-to-end IRT workflow with MIRT.
 Basic Usage
 -----------
 
-1. **Prepare your data**: Response data should be a 2D NumPy array where rows
-   are respondents and columns are items.
+1. **Prepare your data**: Response data should be a 2D NumPy array or data
+   frame where rows are respondents and columns are items.
 
 2. **Fit a model**: Use ``fit_mirt()`` with an appropriate model type.
 
@@ -71,6 +71,34 @@ sample and are required for wholly unobserved items. A scalar count applies
 to every item. GRM EM calibration constrains adjacent thresholds to remain
 ordered, including free thresholds next to fixed ones.
 
+Data frames and missing responses
+---------------------------------
+
+``fit_mirt`` and ``fit_multigroup`` also accept pandas and polars data frames.
+Unique column names become the item names unless ``item_names`` is given.
+``NaN`` (R's ``NA``), pandas' ``pd.NA`` and polars nulls mark missing
+responses, as do negative codes. ``fscores``, ``ability_posterior`` and
+``personfit`` still require missing responses coded as negative numbers, so
+convert ``NaN`` before scoring:
+
+.. code-block:: python
+
+   import numpy as np
+   import pandas as pd
+   import mirt
+
+   data = mirt.load_dataset("LSAT7")["data"].astype(float)
+   data[:3, 0] = np.nan
+   frame = pd.DataFrame(data, columns=["Q1", "Q2", "Q3", "Q4", "Q5"])
+
+   result = mirt.fit_mirt(frame, model="2PL")
+   print(result.model.item_names)  # ['Q1', 'Q2', 'Q3', 'Q4', 'Q5']
+
+   coded = np.where(np.isnan(data), -1, data).astype(int)
+   scores = mirt.fscores(result, coded)
+
+Infinite, non-integer and text codes are rejected.
+
 Scoring
 -------
 
@@ -106,6 +134,20 @@ response rows evaluated at once:
 Smaller batches reduce peak working memory; larger batches can improve throughput
 on systems with ample memory. Compressed rows are expanded back to their original
 respondent order without changing estimates or standard errors.
+
+Simulating data
+---------------
+
+``simdata`` draws response matrices from built-in generating models, or from a
+fitted model or ``FitResult``. Built-in dichotomous and polytomous item models
+also simulate responses at given abilities:
+
+.. code-block:: python
+
+   import numpy as np
+
+   new_sample = mirt.simdata(result, n_persons=500, seed=1)
+   draws = result.model.simulate(np.linspace(-2.0, 2.0, 5), seed=1)
 
 Model Fit
 ---------
@@ -181,8 +223,10 @@ remaining expected cell below the requested minimum also gives ``NaN``.
 An ordinal item whose maximum score exceeds the remaining test's maximum
 has no full-category score group and returns ``S_X2=NaN``, ``df=0``.
 
-By default, S-X2 integrates over independent standard-normal factors with 41
+By default, S-X2 integrates over independent standard-normal factors, or over
+the estimated ``latent_covariance`` of a ``FitResult`` that has one, with 41
 quadrature points per factor and assumes conditionally independent items.
+``prior_mean`` and ``prior_cov`` choose another normal population.
 ``MixtureIRT`` and ``HigherOrderCDM`` need joint integration over their shared
 latent classes or mastery patterns and are rejected. Testlet and bifactor
 models remain conditionally independent when all their factors are specified;
@@ -191,8 +235,8 @@ variances. Full-factor testlet curves use the supplied testlet-factor values;
 they do not rescale those values using the model's stored testlet variances.
 S-X2 therefore needs explicit quadrature masses for that full-factor
 distribution when it differs from independent standard normals.
-Fitted nonstandard factor distributions are not selected
-automatically.
+Other fitted nonstandard factor distributions, such as an empirical
+histogram, are not selected automatically.
 For a different fitted latent distribution,
 supply both its grid and nonnegative probability masses:
 
@@ -249,11 +293,11 @@ models. Unknown statistic names raise ``MirtValidationError``.
 Overall model fit
 ~~~~~~~~~~~~~~~~~
 
-For overall fit, use the fitted item model directly:
+For overall fit, pass the fit result or its item model:
 
 .. code-block:: python
 
-   overall = mirt.compute_fit_indices(result.model, responses, n_quadpts=31)
+   overall = mirt.compute_fit_indices(result, responses, n_quadpts=31)
    print(overall)
 
 ``compute_m2()`` tests binary items with M2 and ordinal items with the collapsed
@@ -266,7 +310,11 @@ the category codes 0, 1, ... have meaningful order and spacing; it does not test
 every category-specific univariate and bivariate margin.
 
 The default null model has independent standard normal latent factors and
-conditionally independent item responses. ``MixtureIRT`` and ``HigherOrderCDM``
+conditionally independent item responses. A ``FitResult`` with an estimated
+``latent_covariance`` replaces the standard normal with that population, and
+its estimated correlations and variances are projected out like the item
+parameters; ``prior_mean`` and ``prior_cov`` give a known normal population
+instead. ``MixtureIRT`` and ``HigherOrderCDM``
 are not supported: averaging their shared latent classes or mastery patterns
 before forming joint moments would violate this assumption. For testlet and
 bifactor models, integration conditions on all factors, and the stated
@@ -303,3 +351,16 @@ asymptotic and assumes regular, consistent parameter estimation.
 Probability and response calculations run in bounded blocks. The dense
 moment covariance itself requires space proportional to the fourth power of
 the item count; this is a computational consideration for very long tests.
+
+Next steps
+----------
+
+* :doc:`guides/estimation` covers starting values, fixed parameters, item
+  priors, SQUAREM acceleration, rating-scale and bifactor models, and MHRM.
+* :doc:`guides/model_syntax` fits confirmatory models with correlated factors.
+* :doc:`guides/mixed_format` combines item families in one test.
+* :doc:`guides/uncertainty` explains standard errors, parameter draws,
+  plausible values, and bootstrap tests.
+* :doc:`guides/dif`, :doc:`guides/multigroup` and :doc:`guides/equating` compare
+  groups and link forms.
+* :doc:`guides/cat` runs adaptive tests and simulation studies.

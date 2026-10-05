@@ -38,6 +38,8 @@ Models
    GradedResponseModel
    GeneralizedPartialCredit
    PartialCreditModel
+   RatingScaleModel
+   GradedRatingScaleModel
    NominalResponseModel
    MixedItemModel
    SequentialResponseModel
@@ -217,6 +219,15 @@ CAT
    CATEngine
    CATResult
    CATState
+   cat.MCATEngine
+   cat.ShadowTestSelection
+   cat.SEChangeStop
+   cat.MinInformationStop
+   cat.PredictedSEReductionStop
+   cat.assemble_form
+   cat.assemble_parallel_forms
+   cat.summarize_cat_simulation
+   cat.CATSimulationReport
 
 Equating
 --------
@@ -231,6 +242,7 @@ Equating
    equipercentile_equating
    kernel_equating
    irt_kernel_equating
+   KernelEquatingResult
    chain_link
    link_mirt
    transform_mirt_theta

@@ -25,6 +25,7 @@ from mirt.exceptions import MirtValidationError
 from mirt.utils.numeric import logsumexp, logsumexp_axis1
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import TiedCoordinates
     from mirt.estimation.quadrature import GaussHermiteQuadrature
     from mirt.models.base import BaseItemModel
 
@@ -770,6 +771,7 @@ def estimate_covariance(
     h: float = 1e-5,
     bounds: Callable[[str], tuple[float, float]] | None = None,
     prior_information: Mapping[str, NDArray[np.float64]] | None = None,
+    tied: TiedCoordinates | None = None,
 ) -> CovarianceEstimate:
     """Estimate the free-parameter covariance of a fitted marginal model.
 
@@ -798,6 +800,12 @@ def estimate_covariance(
         stored parameter shapes, for Bayes modal estimates. It is added to the
         observed information, to the bread of the sandwich, and to the score
         cross-product that ``"crossprod"`` inverts.
+    tied : TiedCoordinates, optional
+        Coordinates held equal by equality constraints. The information and
+        cross-product of the constrained parameters are ``J' I J`` and
+        ``J' S J`` for the 0/1 matrix ``J`` mapping each tied group to its
+        coordinates, and the covariance ``J V J'`` gives every coordinate of
+        a group the group's row.
 
     Returns
     -------
@@ -823,7 +831,22 @@ def estimate_covariance(
     active = np.ones(meat.shape[0], dtype=np.bool_)
     if bounds is not None:
         active &= ~_coordinates_at_bounds(layouts, bounds)
-    covariance = _covariance(method, information, meat, active)
+    if tied is None:
+        covariance = _covariance(method, information, meat, active)
+    else:
+        tying = tied.tying(
+            {name: layout.free_indices for name, layout in layouts.items()}
+        )
+        jacobian = np.zeros((tying.size, int(tying.max(initial=-1)) + 1))
+        jacobian[np.arange(tying.size), tying] = 1.0
+        if information is not None:
+            information = jacobian.T @ information @ jacobian
+        meat = jacobian.T @ meat @ jacobian
+        # A group is held at a bound when its coordinates are.
+        reduced_active = np.ones(jacobian.shape[1], dtype=np.bool_)
+        np.logical_and.at(reduced_active, tying, active)
+        reduced = _covariance(method, information, meat, reduced_active)
+        covariance = reduced[np.ix_(tying, tying)]
     return CovarianceEstimate(
         _se_from_covariance(covariance, layouts, model), covariance, method
     )

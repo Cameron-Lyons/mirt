@@ -274,9 +274,9 @@ def _load_lsat6() -> dict[str, Any]:
 
 
 def _load_lsat7() -> dict[str, Any]:
-    """LSAT Section 7 data from Bock & Aitkin (1981).
+    """LSAT Section 7 data (Bock & Lieberman, 1970; Bock & Aitkin, 1981).
 
-    5 binary items from the Law School Admission Test.
+    5 binary items from the Law School Admission Test, 1000 examinees.
     """
     patterns = np.array(
         [
@@ -316,41 +316,11 @@ def _load_lsat7() -> dict[str, Any]:
         dtype=np.int_,
     )
 
+    # Bock & Lieberman (1970) LSAT Section 7 pattern counts (1000 examinees),
+    # as distributed with R's ltm and mirt packages.
     frequencies = np.array(
-        [
-            12,
-            19,
-            1,
-            7,
-            3,
-            19,
-            3,
-            17,
-            10,
-            5,
-            3,
-            7,
-            7,
-            23,
-            13,
-            59,
-            4,
-            28,
-            3,
-            14,
-            8,
-            51,
-            15,
-            90,
-            6,
-            63,
-            39,
-            175,
-            35,
-            89,
-            42,
-            110,
-        ]
+        [12, 19, 1, 7, 3, 19, 3, 17, 10, 5, 3, 7, 7, 23, 8, 28]
+        + [7, 39, 11, 34, 14, 51, 15, 90, 6, 25, 7, 35, 18, 136, 32, 308]
     )
 
     data = np.repeat(patterns, frequencies, axis=0)

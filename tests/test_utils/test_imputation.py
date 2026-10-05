@@ -231,7 +231,7 @@ class TestImputeResponses:
             assert kwargs["compute_standard_errors"] is False
             return SimpleNamespace(model=fake_model)
 
-        def fake_posterior(model, observed, n_imputations, n_quadpts, rng):
+        def fake_posterior(model, observed, n_imputations, n_quadpts, rng, prior_cov):
             calls["posterior"] += 1
             np.testing.assert_array_equal(observed, responses[:2])
             return np.zeros((len(observed), 1, n_imputations))
@@ -276,7 +276,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, prior_cov: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )
@@ -314,7 +314,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, prior_cov: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )
@@ -359,7 +359,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, prior_cov: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )

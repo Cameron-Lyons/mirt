@@ -1,6 +1,7 @@
 """Batched native polytomous optimization.
 
 Fallback mode: optional. Unsupported models retain generic item optimization.
+Graded thresholds stay ordered with the generic optimizer's minimum gap.
 """
 
 from __future__ import annotations

@@ -32,6 +32,7 @@ from mirt.utils.numeric import (
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 _RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
@@ -171,24 +172,31 @@ class ResidualAnalysisResult:
 
 
 def _resolve_theta(
-    model: BaseItemModel,
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None,
-) -> NDArray[np.float64]:
-    """Return ability estimates in the shape expected by item models."""
+) -> tuple[BaseItemModel, NDArray[np.float64]]:
+    """Return the item model and abilities in the shape it expects.
+
+    Omitted abilities are EAP scores under the latent population of a
+    ``FitResult``, as :func:`mirt.fscores` computes them.
+    """
+    from mirt.results._common import resolve_item_model
+
+    model: BaseItemModel = resolve_item_model(model_or_result)
     if theta is None:
         from mirt.scoring import fscores
 
-        theta = fscores(model, responses, method="EAP").theta
+        theta = fscores(model_or_result, responses, method="EAP").theta
 
     theta_array = np.asarray(theta)
     if theta_array.ndim == 1:
-        return theta_array.reshape(-1, 1)
+        return model, theta_array.reshape(-1, 1)
 
     theta_array = np.atleast_2d(theta_array)
     if theta_array.shape[0] == 1 and responses.shape[0] > 1:
         theta_array = theta_array.T
-    return theta_array
+    return model, theta_array
 
 
 def _item_expected_value_variance(
@@ -408,7 +416,7 @@ def _compute_residual_arrays(
 
 
 def compute_residuals(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     residual_type: str = "standardized",
@@ -417,8 +425,9 @@ def compute_residuals(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : ndarray of shape (n_persons, n_items)
         Response matrix
     theta : ndarray, optional
@@ -435,7 +444,7 @@ def compute_residuals(
     if residual_type not in _RESIDUAL_TYPES:
         raise ValueError(f"Unknown residual type: {residual_type}")
 
-    theta_array = _resolve_theta(model, responses, theta)
+    model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
         responses,
@@ -446,7 +455,7 @@ def compute_residuals(
 
 
 def analyze_residuals(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
 ) -> ResidualAnalysisResult:
@@ -454,8 +463,9 @@ def analyze_residuals(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : ndarray
         Response matrix
     theta : ndarray, optional
@@ -467,7 +477,7 @@ def analyze_residuals(
         Complete residual analysis results
     """
     responses = np.asarray(responses)
-    theta_array = _resolve_theta(model, responses, theta)
+    model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
         responses,
@@ -576,7 +586,7 @@ def _stream_fit_statistics(
 
 
 def compute_outfit_infit(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     *,
@@ -590,8 +600,9 @@ def compute_outfit_infit(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : ndarray
         Response matrix
     theta : ndarray, optional
@@ -626,7 +637,7 @@ def compute_outfit_infit(
     responses = np.asarray(responses)
     if responses.ndim != 2:
         raise ValueError("responses must be a two-dimensional matrix")
-    theta_array = _resolve_theta(model, responses, theta)
+    model, theta_array = _resolve_theta(model, responses, theta)
     statistics = _stream_fit_statistics(
         model,
         responses,
@@ -640,7 +651,7 @@ def compute_outfit_infit(
 
 
 def identify_misfitting_patterns(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None = None,
     z_threshold: float = 2.0,
@@ -656,8 +667,9 @@ def identify_misfitting_patterns(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
     responses : ndarray
         Response matrix
     theta : ndarray, optional
@@ -673,7 +685,7 @@ def identify_misfitting_patterns(
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
     responses = np.asarray(responses)
-    theta_array = _resolve_theta(model, responses, theta)
+    model, theta_array = _resolve_theta(model, responses, theta)
     n_persons, n_items = responses.shape
     totals = _ItemPersonFit(n_persons, n_items)
     rows_per_chunk = max(1, n_persons)

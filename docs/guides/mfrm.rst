@@ -120,7 +120,8 @@ Standard errors and fit statistics
 ----------------------------------
 
 Standard errors come from the inverse of the exact observed information
-(Louis' identity) and cover every level of an anchored facet. ``result.infit`` and ``result.outfit`` hold mean-square fit
+(Louis' identity) and cover every level of an anchored facet.
+``result.infit`` and ``result.outfit`` hold mean-square fit
 statistics for every facet level and ``result.item_infit`` and
 ``result.item_outfit`` for every item. They average the squared residuals
 over each person's posterior distribution, so both have expectation one

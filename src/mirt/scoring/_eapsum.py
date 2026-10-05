@@ -697,12 +697,17 @@ def _log_space_sum_score_distribution(
     return log_dist
 
 
-def _resolve_model(model_or_result: BaseItemModel | FitResult) -> BaseItemModel:
-    from mirt.results.fit_result import FitResult
+def _resolved_scorer(
+    model_or_result: BaseItemModel | FitResult,
+    n_quadpts: int,
+    prior_mean: NDArray[np.float64] | None,
+    prior_cov: NDArray[np.float64] | None,
+) -> tuple[BaseItemModel, EAPSumScorer]:
+    """Unwrap a fit result and default the prior to its latent covariance."""
+    from mirt.results._common import resolve_latent_prior
 
-    if isinstance(model_or_result, FitResult):
-        return model_or_result.model
-    return model_or_result
+    model, mean, cov = resolve_latent_prior(model_or_result, prior_mean, prior_cov)
+    return model, EAPSumScorer(n_quadpts=n_quadpts, prior_mean=mean, prior_cov=cov)
 
 
 def _validated_sum_scores(
@@ -754,21 +759,19 @@ def eapsum(
     n_quadpts : int
         Number of quadrature points
     prior_mean : ndarray, optional
-        Prior mean
+        Prior mean. Default zero.
     prior_cov : ndarray, optional
-        Prior covariance
+        Prior variance, as a ``(1, 1)`` matrix. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to one
+        otherwise.
 
     Returns
     -------
     ScoreResult
         Scoring results
     """
-    scorer = EAPSumScorer(
-        n_quadpts=n_quadpts,
-        prior_mean=prior_mean,
-        prior_cov=prior_cov,
-    )
-    return scorer.score(_resolve_model(model), responses)
+    item_model, scorer = _resolved_scorer(model, n_quadpts, prior_mean, prior_cov)
+    return scorer.score(item_model, responses)
 
 
 def eapsum_table(
@@ -793,7 +796,9 @@ def eapsum_table(
     prior_mean : ndarray, optional
         Prior mean for theta. Default zero.
     prior_cov : ndarray, optional
-        Prior variance for theta, as a ``(1, 1)`` matrix. Default one.
+        Prior variance for theta, as a ``(1, 1)`` matrix. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to one
+        otherwise.
 
     Returns
     -------
@@ -809,12 +814,8 @@ def eapsum_table(
     >>> table = eapsum_table(result, data)
     >>> table.to_dataframe()
     """
-    scorer = EAPSumScorer(
-        n_quadpts=n_quadpts,
-        prior_mean=prior_mean,
-        prior_cov=prior_cov,
-    )
-    return scorer.score_table(_resolve_model(model_or_result), responses)
+    model, scorer = _resolved_scorer(model_or_result, n_quadpts, prior_mean, prior_cov)
+    return scorer.score_table(model, responses)
 
 
 def sum_score_to_theta(
@@ -841,7 +842,9 @@ def sum_score_to_theta(
     prior_mean : ndarray, optional
         Prior mean for theta. Default zero.
     prior_cov : ndarray, optional
-        Prior variance for theta, as a ``(1, 1)`` matrix. Default one.
+        Prior variance for theta, as a ``(1, 1)`` matrix. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to one
+        otherwise.
 
     Returns
     -------
@@ -857,11 +860,7 @@ def sum_score_to_theta(
         If a sum score is not a finite integer between 0 and the maximum
         attainable sum score.
     """
-    scorer = EAPSumScorer(
-        n_quadpts=n_quadpts,
-        prior_mean=prior_mean,
-        prior_cov=prior_cov,
-    )
-    theta_values, se_values, _ = scorer._full_form_arrays(_resolve_model(model))
+    item_model, scorer = _resolved_scorer(model, n_quadpts, prior_mean, prior_cov)
+    theta_values, se_values, _ = scorer._full_form_arrays(item_model)
     indices = _validated_sum_scores(sum_scores, theta_values.shape[0] - 1)
     return theta_values[indices], se_values[indices]

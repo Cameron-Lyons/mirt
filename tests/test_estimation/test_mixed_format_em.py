@@ -31,8 +31,10 @@ from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
 from mirt.models.mixed_format import MixedItemModel
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
+    GradedRatingScaleModel,
     GradedResponseModel,
     NominalResponseModel,
+    RatingScaleModel,
 )
 from mirt.results.fit_result import FitResult
 from mirt.utils.calibration import fixed_item_calibration
@@ -441,6 +443,54 @@ def test_multidimensional_and_nominal_components() -> None:
     assert fitted.se_method == "complete_data"
     assert _parameter_bounds(nominal, "NRM.slopes") == (-5.0, 5.0)
     assert _parameter_bounds(nominal, "2PL.discrimination") == (0.1, 5.0)
+
+
+@pytest.mark.parametrize("family", [RatingScaleModel, GradedRatingScaleModel])
+def test_components_with_shared_parameters_estimate_them(family) -> None:
+    rng = np.random.default_rng(12)
+    binary = TwoParameterLogistic(4)
+    binary.set_parameters(
+        discrimination=rng.uniform(0.9, 1.8, 4), difficulty=rng.normal(size=4)
+    )
+    rating = family(5, 4)
+    rating.set_parameters(
+        difficulty=rng.normal(0.0, 0.5, 5), thresholds=np.array([-1.0, 0.2, 1.1])
+    )
+    true = MixedItemModel([(binary, range(4)), (rating, range(4, 9))])
+    responses = true.simulate(rng.standard_normal((1500, 1)), seed=13)
+
+    model = MixedItemModel(
+        [(TwoParameterLogistic(4), range(4)), (family(5, 4), range(4, 9))]
+    )
+    name = f"{model.component_names[1]}.thresholds"
+    start = model.parameters[name]
+    result = MixedFormatEMEstimator(tol=1e-8, se_method="complete_data").fit(
+        model, responses
+    )
+
+    # Each component's M-step ends with the joint step over its shared
+    # coordinates; without it the thresholds would keep their defaults.
+    estimate = model.parameters[name]
+    assert not np.allclose(estimate, start)
+    quadrature = GaussHermiteQuadrature(21, 1)
+    mass = quadrature.weights / quadrature.weights.sum()
+    gradient = []
+    for column in np.flatnonzero(model.free_parameter_masks[name]):
+        values = []
+        for sign in (1.0, -1.0):
+            trial = estimate.copy()
+            trial[column] += sign * 1e-5
+            model._parameters[name] = trial
+            values.append(
+                louis._posterior_block(
+                    model, responses, quadrature.nodes, np.log(mass)
+                )[1].sum()
+            )
+        model._parameters[name] = estimate
+        gradient.append((values[0] - values[1]) / 2e-5)
+    assert np.max(np.abs(gradient)) < 0.02
+    errors = result.standard_errors[name][model.free_parameter_masks[name]]
+    assert np.all(np.isfinite(errors) & (errors > 0))
 
 
 def test_parameter_bounds_follow_components() -> None:

@@ -76,7 +76,7 @@ class ItemAnalysisReport(ReportBuilder):
             section("Item Parameters", self._parameter_table(include_tests=True))
         )
 
-        fit_stats = compute_itemfit(self.fit_result.model, self.responses)
+        fit_stats = compute_itemfit(self.fit_result, self.responses)
         sections.append(
             section(
                 "Item Fit Statistics",

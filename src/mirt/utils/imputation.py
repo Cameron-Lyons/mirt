@@ -211,7 +211,8 @@ def impute_responses(
         IRT model for model-based imputation (default: '2PL'). A model name
         estimates item parameters from the responses. A fitted model or fit
         result reuses its calibration, including multiple latent dimensions
-        and declared ordinal categories.
+        and declared ordinal categories. A fit result's estimated
+        ``latent_covariance`` is the ability prior.
     n_imputations : int
         Number of imputations for multiple imputation
     missing_code : int
@@ -281,12 +282,14 @@ def impute_responses(
             return [responses.copy() for _ in range(n_imputations)]
         return responses
 
+    prior_cov = None
     if method in ("EM", "multiple"):
         from mirt.models.base import BaseItemModel
+        from mirt.results._common import resolve_latent_prior
         from mirt.results.fit_result import FitResult
 
         if isinstance(model, FitResult):
-            model = model.model
+            model, _, prior_cov = resolve_latent_prior(model)
         if model is None:
             model = "2PL"
         if isinstance(model, BaseItemModel):
@@ -348,11 +351,11 @@ def impute_responses(
 
     if method == "EM":
         assert model is not None
-        return _impute_em(responses, missing_mask, model, rng)
+        return _impute_em(responses, missing_mask, model, rng, prior_cov)
 
     assert model is not None
     return _impute_multiple(
-        responses, missing_mask, model, n_imputations, rng, n_quadpts
+        responses, missing_mask, model, n_imputations, rng, n_quadpts, prior_cov
     )
 
 
@@ -476,6 +479,7 @@ def _impute_em(
     missing_mask: NDArray[np.bool_],
     model: str | BaseItemModel,
     rng: np.random.Generator,
+    prior_cov: NDArray[np.float64] | None = None,
 ) -> NDArray[np.int_]:
     """Draw missing responses from an observed-data MML calibration."""
     from mirt import fit_mirt
@@ -501,7 +505,7 @@ def _impute_em(
             )
             return _impute_random(responses, missing_mask, rng)
 
-    scores = fscores(model, observed_responses, method="EAP")
+    scores = fscores(model, observed_responses, method="EAP", prior_cov=prior_cov)
     imputed = responses.copy()
     _draw_model_responses(
         imputed,
@@ -520,6 +524,7 @@ def _impute_multiple(
     n_imputations: int,
     rng: np.random.Generator,
     n_quadpts: int,
+    prior_cov: NDArray[np.float64] | None = None,
 ) -> list[NDArray[np.int_]]:
     """Draw conditional on observed responses and fixed item parameters."""
     from mirt import fit_mirt
@@ -546,6 +551,7 @@ def _impute_multiple(
             n_imputations,
             n_quadpts,
             rng,
+            prior_cov=prior_cov,
         )
     except _MODEL_FIT_FAILURES as exc:
         if not isinstance(model, str):
@@ -582,14 +588,21 @@ def _posterior_ability_draws(
     n_imputations: int,
     n_quadpts: int,
     rng: np.random.Generator,
+    prior_cov: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Sample joint posterior nodes with bounded likelihood row storage."""
-    from mirt.utils.plausible import _generate_pv_posterior
+    from mirt.utils.plausible import (
+        _generate_pv_posterior,
+        _resolve_population_prior,
+    )
 
     n_nodes = int(n_quadpts) ** model.n_factors
     chunk_size = max(1, _MODEL_DRAW_TARGET_ELEMENTS // n_nodes)
+    prior = _resolve_population_prior(
+        None, prior_cov, model.n_factors, responses.shape[0]
+    )
     return _generate_pv_posterior(
-        model, responses, n_imputations, n_quadpts, rng, chunk_size
+        model, responses, n_imputations, n_quadpts, rng, chunk_size, prior=prior
     )
 
 

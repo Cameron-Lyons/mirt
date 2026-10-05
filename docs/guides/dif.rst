@@ -212,5 +212,6 @@ Related utilities
   moments across groups, from the calibration and final abilities of
   :func:`mirt.compute_grdif` (no refit)
 * :func:`mirt.compute_dtf` / :func:`mirt.compute_drf` — test/response functioning
+* :doc:`multigroup` — multiple-group models and invariance testing
 
 See ``examples/dif_analysis.py``.

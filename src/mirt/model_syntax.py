@@ -8,6 +8,7 @@
     START = (1, a1, 1.5)
     FIXED = (1, a1)
     PRIOR = (1-10, d, norm, 0, 2)
+    CONSTRAIN = (6-10, a2)
 
 into a :class:`ModelSpec`, which ``fit_mirt(data, spec=...)`` fits as a
 confirmatory model with estimated factor correlations.
@@ -27,6 +28,7 @@ from numpy.typing import ArrayLike, NDArray
 from mirt.exceptions import MirtModelError, MirtValidationError
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityGroup
     from mirt.estimation.latent_density import FactorCovarianceDensity
     from mirt.estimation.priors import Prior, PriorSpecification
     from mirt.estimation.standard_errors import StandardErrorMethod
@@ -433,9 +435,12 @@ def mirt_model(syntax: str, item_names: Sequence[str] | None = None) -> ModelSpe
         deviation), ``lnorm`` (log-scale mean and standard deviation) or
         ``beta`` (two shape parameters). Every free coordinate of a stored
         parameter must receive the same prior.
-    ``CONSTRAIN = (1-3, a1)``
-        Equality constraints. They are parsed, but :func:`mirt.fit_mirt`
-        does not fit them yet.
+    ``CONSTRAIN = (1-3, a1), (4-6, d)``
+        Equality constraints: each group holds one parameter equal across its
+        items, and a whole-row parameter such as ``thresholds`` column by
+        column. :func:`mirt.fit_mirt` passes them to ``constraints``. Groups
+        that equate different parameters, such as ``(1, 3, a1, a2)``, are
+        parsed but raise ``NotImplementedError`` when fitted.
 
     Parameter names are resolved against the model when it is fitted:
     ``a`` selects the slopes and ``a1``, ``a2``, ... the slopes on each
@@ -928,6 +933,68 @@ def _spec_priors(
     return priors
 
 
+def _spec_constraints(
+    model: BaseItemModel, spec: ModelSpec, targets: _ParameterTargets
+) -> list[EqualityGroup]:
+    """Translate ``CONSTRAIN`` groups into equality groups of stored columns.
+
+    Each group equates one parameter across its items; a whole-row parameter
+    such as ``thresholds`` is tied column by column. Coordinates that the
+    family or the loading pattern fixes, such as category padding, are left
+    out. Must run before ``FIXED`` masks are applied, so that tying a fixed
+    coordinate is reported rather than ignored.
+    """
+    from mirt.estimation._shared_step import EqualityGroup
+
+    family_free = model.free_parameter_masks
+    groups: list[EqualityGroup] = []
+    tied: set[tuple[str, int, int | None]] = set()
+    for entry in spec.constraints:
+        if len(entry.parameters) != 1:
+            raise NotImplementedError(
+                f"line {entry.line}: CONSTRAIN groups that equate different "
+                f"parameters ({', '.join(entry.parameters)}) are not supported; "
+                "give each parameter its own group"
+            )
+        if len(entry.items) < 2:
+            raise _syntax_error(
+                "CONSTRAIN groups must list at least two items", entry.line
+            )
+        selected = 0
+        for name, mask in targets.masks(entry).items():
+            rows = (mask & family_free[name]).reshape(model.n_items, -1)
+            columns = (None,) if mask.ndim == 1 else range(rows.shape[1])
+            for column in columns:
+                items = np.flatnonzero(rows[:, 0 if column is None else column])
+                if items.size == 1:
+                    raise _syntax_error(
+                        f"CONSTRAIN ties {entry.parameters[0]} of only one item"
+                        + ("" if column is None else f" in column {column + 1}"),
+                        entry.line,
+                    )
+                if items.size:
+                    for item in items:
+                        if (name, int(item), column) in tied:
+                            raise _syntax_error(
+                                f"{entry.parameters[0]} of {model.item_names[item]} "
+                                "is already tied by another CONSTRAIN group; merge "
+                                "the two groups",
+                                entry.line,
+                            )
+                        tied.add((name, int(item), column))
+                    groups.append(
+                        EqualityGroup(name, tuple(int(item) for item in items), column)
+                    )
+                    selected += 1
+        if not selected:
+            raise _syntax_error(
+                f"CONSTRAIN selects no free {entry.parameters[0]} coordinates "
+                f"of the {model.model_name} model",
+                entry.line,
+            )
+    return groups
+
+
 def _factor_density(
     model: BaseItemModel,
     spec: ModelSpec,
@@ -977,11 +1044,13 @@ def _fit_spec(
     priors: PriorSpecification | Mapping[str, Prior] | None,
     se_method: StandardErrorMethod,
     accelerate: Literal["none", "squarem"] = "none",
+    constraints: Sequence[EqualityGroup] = (),
 ) -> FitResult:
     """Fit a confirmatory model for ``fit_mirt(data, spec=...)``.
 
-    ``fit_mirt`` has validated the responses, the family and ``n_factors``;
-    ``item_names`` are the caller's or the data's names, if any.
+    ``fit_mirt`` has validated the responses, the family, ``n_factors`` and
+    the structure of ``constraints``; ``item_names`` are the caller's or the
+    data's names, if any.
     """
     from mirt.estimation._item_priors import (
         _SPECIFICATION_FIELDS,
@@ -1037,11 +1106,6 @@ def _fit_spec(
             value=n_factors,
             expected=str(spec.n_factors),
         )
-    if spec.constraints:
-        raise NotImplementedError(
-            f"line {spec.constraints[0].line}: CONSTRAIN equality constraints "
-            "are not supported by fit_mirt yet"
-        )
     pattern = spec.loading_pattern(n_items)
     unloaded = np.flatnonzero(~pattern.any(axis=1))
     if unloaded.size:
@@ -1053,6 +1117,7 @@ def _fit_spec(
 
     irt_model = _confirmatory_model(model, pattern, n_categories, item_names, responses)
     targets = _ParameterTargets(irt_model, pattern)
+    equality = [*_spec_constraints(irt_model, spec, targets), *constraints]
     free = irt_model.free_parameter_masks
     for entry in spec.fixed:
         for name, mask in targets.masks(entry).items():
@@ -1092,6 +1157,7 @@ def _fit_spec(
         item_priors=spec_priors or priors,
         se_method=se_method,
         accelerate=accelerate,
+        constraints=equality,
     )
     result = estimator.fit(irt_model, responses, start=start or "default")
     if density is None:
