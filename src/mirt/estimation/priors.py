@@ -1,7 +1,10 @@
 """Custom prior distributions for Bayesian IRT estimation.
 
 This module provides flexible prior specifications for item parameters,
-supporting both informative and weakly informative priors.
+supporting both informative and weakly informative priors. Pass them to
+``EMEstimator(item_priors=...)`` or ``fit_mirt(priors=...)`` for Bayes modal
+estimation; ``grad_log_pdf`` supplies the derivatives its M-steps use and
+``hess_log_pdf`` the prior curvature its standard errors include.
 
 Supported distributions:
 - Normal / Truncated Normal
@@ -23,6 +26,9 @@ from numpy.typing import NDArray
 from scipy import special, stats
 
 _LOG_TWO_PI = float(np.log(2.0 * np.pi))
+_GRADIENT_STEP = 1e-6
+# Step for differencing gradients, which may themselves be differenced.
+_HESSIAN_STEP = 1e-4
 
 
 def _finite_scalar(value: float, name: str) -> float:
@@ -61,6 +67,14 @@ def _float_values(x: NDArray[np.float64]) -> NDArray[np.float64]:
     return np.asarray(x, dtype=np.float64)
 
 
+def _ratio(coefficient: float, values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return ``coefficient / values``, using zero for a zero coefficient."""
+    if coefficient == 0.0:
+        return np.zeros_like(values)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return coefficient / values
+
+
 class Prior(ABC):
     """Abstract base class for prior distributions."""
 
@@ -68,6 +82,34 @@ class Prior(ABC):
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute log probability density at x."""
         pass
+
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Compute the derivative of the log density at x.
+
+        The built-in priors return analytic derivatives, with ``NaN`` outside
+        their support. This fallback for custom subclasses uses central
+        differences of :meth:`log_pdf`.
+        """
+        values = _float_values(x)
+        step = _GRADIENT_STEP * np.maximum(1.0, np.abs(values))
+        with np.errstate(invalid="ignore"):
+            return (self.log_pdf(values + step) - self.log_pdf(values - step)) / (
+                2.0 * step
+            )
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Compute the second derivative of the log density at x.
+
+        The built-in priors return analytic values, with ``NaN`` outside
+        their support. This fallback for custom subclasses uses central
+        differences of :meth:`grad_log_pdf`.
+        """
+        values = _float_values(x)
+        step = _HESSIAN_STEP * np.maximum(1.0, np.abs(values))
+        with np.errstate(invalid="ignore"):
+            return (
+                self.grad_log_pdf(values + step) - self.grad_log_pdf(values - step)
+            ) / (2.0 * step)
 
     @abstractmethod
     def sample(
@@ -124,6 +166,16 @@ class NormalPrior(Prior):
         with np.errstate(over="ignore", invalid="ignore"):
             standardized = (values - self._mu) / self._sigma
             return self._log_normalizer - 0.5 * standardized * standardized
+
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        with np.errstate(over="ignore", invalid="ignore"):
+            return (self._mu - values) / (self._sigma * self._sigma)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = np.full(values.shape, -1.0 / (self._sigma * self._sigma))
+        return np.where(np.isnan(values), np.nan, curvature)
 
     def sample(
         self,
@@ -187,6 +239,21 @@ class TruncatedNormalPrior(Prior):
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         return self._dist.logpdf(x)
 
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        mu = float(self.mu)
+        sigma = float(self.sigma)
+        in_support = (values >= float(self.lower)) & (values <= float(self.upper))
+        with np.errstate(over="ignore", invalid="ignore"):
+            gradient = (mu - values) / (sigma * sigma)
+        return np.where(in_support, gradient, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        sigma = float(self.sigma)
+        in_support = (values >= float(self.lower)) & (values <= float(self.upper))
+        return np.where(in_support, -1.0 / (sigma * sigma), np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -247,6 +314,21 @@ class LogNormalPrior(Prior):
             np.where(values > 0.0, log_density, -np.inf),
         )
 
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            standardized = (np.log(values) - self._mu) / (self._sigma * self._sigma)
+            gradient = -(1.0 + standardized) / values
+        return np.where(values > 0.0, gradient, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        variance = self._sigma * self._sigma
+        with np.errstate(divide="ignore", invalid="ignore"):
+            standardized = (np.log(values) - self._mu) / variance
+            curvature = (1.0 + standardized - 1.0 / variance) / (values * values)
+        return np.where(values > 0.0, curvature, np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -304,6 +386,22 @@ class BetaPrior(Prior):
             np.where(in_support, log_density, -np.inf),
         )
 
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        gradient = _ratio(self._alpha - 1.0, values) - _ratio(
+            self._beta - 1.0, 1.0 - values
+        )
+        in_support = (values >= 0.0) & (values <= 1.0)
+        return np.where(in_support, gradient, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = -_ratio(self._alpha - 1.0, values * values) - _ratio(
+            self._beta - 1.0, (1.0 - values) ** 2
+        )
+        in_support = (values >= 0.0) & (values <= 1.0)
+        return np.where(in_support, curvature, np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -354,6 +452,16 @@ class UniformPrior(Prior):
             np.nan,
             np.where(in_support, self._log_density, -np.inf),
         )
+
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        in_support = (values >= self._lower) & (values <= self._upper)
+        return np.where(in_support, 0.0, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        in_support = (values >= self._lower) & (values <= self._upper)
+        return np.where(in_support, 0.0, np.nan)
 
     def sample(
         self,
@@ -414,6 +522,18 @@ class GammaPrior(Prior):
             np.where(in_support, log_density, -np.inf),
         )
 
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        gradient = _ratio(self._shape - 1.0, values) - self._rate
+        in_support = (values >= 0.0) & np.isfinite(values)
+        return np.where(in_support, gradient, np.nan)
+
+    def hess_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        values = _float_values(x)
+        curvature = -_ratio(self._shape - 1.0, values * values)
+        in_support = (values >= 0.0) & np.isfinite(values)
+        return np.where(in_support, curvature, np.nan)
+
     def sample(
         self,
         size: int | tuple[int, ...],
@@ -446,6 +566,9 @@ class CustomPrior(Prior):
         Prior mean
     variance_value : float
         Prior variance
+    grad_log_pdf_fn : callable, optional
+        Derivative of ``log_pdf_fn``. Central differences are used when it is
+        omitted.
     """
 
     def __init__(
@@ -456,14 +579,22 @@ class CustomPrior(Prior):
         ],
         mean_value: float = 0.0,
         variance_value: float = 1.0,
+        grad_log_pdf_fn: Callable[[NDArray[np.float64]], NDArray[np.float64]]
+        | None = None,
     ) -> None:
         self._log_pdf_fn = log_pdf_fn
         self._sample_fn = sample_fn
         self._mean = mean_value
         self._variance = variance_value
+        self._grad_log_pdf_fn = grad_log_pdf_fn
 
     def log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         return self._log_pdf_fn(x)
+
+    def grad_log_pdf(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
+        if self._grad_log_pdf_fn is None:
+            return super().grad_log_pdf(x)
+        return np.asarray(self._grad_log_pdf_fn(x), dtype=np.float64)
 
     def sample(
         self,
@@ -484,6 +615,16 @@ class CustomPrior(Prior):
         return f"CustomPrior(mean={self._mean}, variance={self._variance})"
 
 
+# Item priors that ``PriorSpecification`` fills in for omitted fields, as
+# (family, mu, sigma).
+_SPECIFICATION_DEFAULTS: dict[
+    str, tuple[type[LogNormalPrior] | type[NormalPrior], float, float]
+] = {
+    "discrimination": (LogNormalPrior, 0, 0.5),
+    "difficulty": (NormalPrior, 0, 2),
+}
+
+
 @dataclass
 class PriorSpecification:
     """Complete prior specification for IRT model parameters.
@@ -491,15 +632,29 @@ class PriorSpecification:
     Attributes
     ----------
     discrimination : Prior
-        Prior for discrimination parameters
+        Prior for discrimination parameters. Defaults to
+        ``LogNormalPrior(0, 0.5)``.
     difficulty : Prior
-        Prior for difficulty parameters
+        Prior for difficulty parameters. Defaults to ``NormalPrior(0, 2)``.
     guessing : Prior or None
         Prior for guessing parameters (3PL, 4PL)
     upper : Prior or None
         Prior for upper asymptote (4PL)
     theta : Prior
         Prior for latent abilities
+
+    Notes
+    -----
+    As item priors for EM (``fit_mirt(priors=...)`` or
+    ``EMEstimator(item_priors=...)``), each field applies to the stored
+    per-item parameter of the same name, and ``theta`` is not used. A
+    specification that reaches no parameter of the fitted model, such as one
+    for a nominal model, which stores ``slopes`` and ``intercepts``, raises
+    ``MirtValidationError``. A discrimination or difficulty prior other than
+    the defaults above for a parameter the model lacks, such as
+    ``difficulty`` for a graded model, which stores ``thresholds``, is
+    ignored with a ``UserWarning``. Pass a mapping of parameter names to
+    priors for other parameters.
     """
 
     discrimination: Prior | None = None
@@ -509,10 +664,9 @@ class PriorSpecification:
     theta: Prior | None = None
 
     def __post_init__(self) -> None:
-        if self.discrimination is None:
-            self.discrimination = LogNormalPrior(mu=0, sigma=0.5)
-        if self.difficulty is None:
-            self.difficulty = NormalPrior(mu=0, sigma=2)
+        for name, (family, mu, sigma) in _SPECIFICATION_DEFAULTS.items():
+            if getattr(self, name) is None:
+                setattr(self, name, family(mu=mu, sigma=sigma))
         if self.theta is None:
             self.theta = NormalPrior(mu=0, sigma=1)
 

@@ -46,7 +46,7 @@ def test_private_theta_overrides_use_the_public_curve(monkeypatch, kind, paralle
     method = (
         estimator._optimize_item_return if parallel else estimator._optimize_item_params
     )
-    method(model, 0, responses, posterior, theta, posterior.sum(axis=0))
+    method(model, 0, responses, posterior, theta)
     for name in original:
         np.testing.assert_array_equal(model.parameters[name], original[name])
 
@@ -111,6 +111,43 @@ def test_affine_gradient_matches_public_clipped_likelihood(kind, item, epsilon):
     np.testing.assert_allclose(gradient, numerical, rtol=3e-7, atol=2e-8)
     for key, value in original.items():
         np.testing.assert_array_equal(model.parameters[key], value)
+
+
+@pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
+def test_fixed_coordinates_keep_the_affine_objective(kind):
+    # A masked loading used to send the item to numerical differentiation.
+    model = _model(kind)
+    masks = model.free_parameter_masks
+    loadings = "slopes" if "slopes" in masks else "general_loadings"
+    row = masks[loadings].reshape(model.n_items, -1)[1]
+    row[np.flatnonzero(row)[0]] = False
+    model.set_free_parameter_masks(masks)
+    rng = np.random.default_rng(615)
+    theta = rng.normal(size=(29, model.n_factors)) * 3.0
+    observed = rng.uniform(0.0, 10.0, 29)
+    correct = observed * rng.random(29)
+    estimator = EMEstimator()
+    params, _, objective, analytic = estimator._item_objective(
+        model, 1, np.zeros((1, 3), dtype=int), None, theta, None, correct, observed
+    )
+    assert analytic
+    params = params + 0.1
+    actual, gradient = objective(params)
+    expected = _public_objective(model, 1, theta, observed, correct, 1e-10, params)
+    np.testing.assert_allclose(actual, expected, rtol=1e-13)
+    numerical = np.empty_like(params)
+    for coordinate in range(len(params)):
+        offset = np.zeros_like(params)
+        offset[coordinate] = 1e-5
+        numerical[coordinate] = (
+            _public_objective(
+                model, 1, theta, observed, correct, 1e-10, params + offset
+            )
+            - _public_objective(
+                model, 1, theta, observed, correct, 1e-10, params - offset
+            )
+        ) / 2e-5
+    np.testing.assert_allclose(gradient, numerical, rtol=3e-7, atol=2e-8)
 
 
 @pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
@@ -201,9 +238,7 @@ def test_prepared_item_optimization_does_not_mutate_model(kind):
     theta = rng.normal(size=(11, model.n_factors))
     posterior = rng.dirichlet(np.ones(11), size=18)
     estimator = EMEstimator(use_rust=False)
-    result = estimator._optimize_item_params(
-        model, 0, responses, posterior, theta, posterior.sum(axis=0)
-    )
+    result = estimator._optimize_item_params(model, 0, responses, posterior, theta)
     assert np.isfinite(result).all()
     for key in original:
         np.testing.assert_array_equal(model.parameters[key], original[key])
@@ -260,7 +295,7 @@ def test_parallel_numerical_objectives_do_not_mutate_shared_model(
         results = list(
             executor.map(
                 lambda item: estimator._optimize_item_return(
-                    model, item, responses, posterior, theta, posterior.sum(axis=0)
+                    model, item, responses, posterior, theta
                 ),
                 range(2),
             )

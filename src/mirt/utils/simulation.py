@@ -1,9 +1,15 @@
-from typing import Literal, overload
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Literal, overload
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 SimulationModel = Literal[
     "1PL",
@@ -36,13 +42,14 @@ _VALID_SIMULATION_MODELS = frozenset(
 _EXCESS_ZERO_MODELS = frozenset({"ZI-2PL", "ZI-3PL", "HURDLE"})
 _MAX_STABLE_LOGIT = np.finfo(np.float64).max
 _MAX_POLYTOMOUS_CHUNK_ENTRIES = 1_000_000
+_DEFAULT_N_ITEMS = 20
 
 
 @overload
 def simdata(
-    model: SimulationModel = "2PL",
+    model: SimulationModel | BaseItemModel | FitResult = "2PL",
     n_persons: int = 500,
-    n_items: int = 20,
+    n_items: int | None = None,
     n_categories: int = 2,
     n_factors: int = 1,
     theta: NDArray[np.float64] | None = None,
@@ -65,9 +72,9 @@ def simdata(
 
 @overload
 def simdata(
-    model: SimulationModel = "2PL",
+    model: SimulationModel | BaseItemModel | FitResult = "2PL",
     n_persons: int = 500,
-    n_items: int = 20,
+    n_items: int | None = None,
     n_categories: int = 2,
     n_factors: int = 1,
     theta: NDArray[np.float64] | None = None,
@@ -90,9 +97,9 @@ def simdata(
 
 @overload
 def simdata(
-    model: SimulationModel = "2PL",
+    model: SimulationModel | BaseItemModel | FitResult = "2PL",
     n_persons: int = 500,
-    n_items: int = 20,
+    n_items: int | None = None,
     n_categories: int = 2,
     n_factors: int = 1,
     theta: NDArray[np.float64] | None = None,
@@ -114,9 +121,9 @@ def simdata(
 
 
 def simdata(
-    model: SimulationModel = "2PL",
+    model: SimulationModel | BaseItemModel | FitResult = "2PL",
     n_persons: int = 500,
-    n_items: int = 20,
+    n_items: int | None = None,
     n_categories: int = 2,
     n_factors: int = 1,
     theta: NDArray[np.float64] | None = None,
@@ -142,8 +149,13 @@ def simdata(
 
     Parameters
     ----------
-    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM", "ZI-2PL", "ZI-3PL", "HURDLE"}, default="2PL"
-        IRT model to simulate from:
+    model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM", "ZI-2PL", "ZI-3PL", "HURDLE"}, item model or FitResult, default="2PL"
+        IRT model to simulate from. A dichotomous or polytomous item model,
+        or a fit result wrapping one, simulates from its current parameters;
+        then only ``n_persons``, ``theta`` and ``seed`` apply, and abilities
+        default to standard normal draws on every model factor, or to normal
+        draws with a fit result's estimated ``latent_mean`` and
+        ``latent_covariance``. Named models:
 
         - "1PL": One-parameter logistic (equal discrimination)
         - "2PL": Two-parameter logistic
@@ -159,8 +171,9 @@ def simdata(
 
     n_persons : int, default=500
         Number of persons to simulate.
-    n_items : int, default=20
-        Number of items to simulate.
+    n_items : int, optional
+        Number of items to simulate. Defaults to the leading dimension of the
+        first supplied item-parameter array, otherwise 20.
     n_categories : int, default=2
         Number of response categories for polytomous models.
     n_factors : int, default=1
@@ -231,14 +244,52 @@ def simdata(
     >>> # Simulate polytomous GRM data
     >>> data = simdata(model="GRM", n_categories=5, n_items=15)
 
+    >>> # Simulate a new sample from a fitted model
+    >>> from mirt import fit_mirt
+    >>> fit = fit_mirt(data, model="GRM", n_categories=5, max_iter=5)
+    >>> new_data = simdata(fit, n_persons=200, seed=1)
+
     >>> # Retain the latent structural-zero labels from a ZI-2PL simulation
     >>> data, structural = simdata(
     ...     model="ZI-2PL", n_items=10, return_structural_zeros=True, seed=42
     ... )
     """
+    item_parameters = {
+        "discrimination": discrimination,
+        "difficulty": difficulty,
+        "guessing": guessing,
+        "upper": upper,
+        "thresholds": thresholds,
+        "steps": steps,
+        "slopes": slopes,
+        "intercepts": intercepts,
+        "zero_inflation": zero_inflation,
+        "engagement_intercept": engagement_intercept,
+        "engagement_slope": engagement_slope,
+    }
+    if not isinstance(model, str):
+        supplied = [
+            name for name, value in item_parameters.items() if value is not None
+        ]
+        if supplied or return_structural_zeros:
+            raise ValueError(
+                "item parameters and return_structural_zeros apply only to "
+                "named simulation models"
+            )
+        return _simulate_from_model(
+            model,
+            n_persons=n_persons,
+            n_items=n_items,
+            n_factors=n_factors,
+            theta=theta,
+            seed=seed,
+        )
+
     model = model.upper()
     if model not in _VALID_SIMULATION_MODELS:
         raise ValueError(f"Unknown model: {model}")
+    if n_items is None:
+        n_items = _infer_n_items(item_parameters)
     if isinstance(n_items, bool) or not isinstance(n_items, (int, np.integer)):
         raise ValueError("n_items must be a positive integer")
     if isinstance(n_persons, bool) or not isinstance(n_persons, (int, np.integer)):
@@ -454,6 +505,82 @@ def simdata(
         )
 
     raise AssertionError("unreachable simulation model")
+
+
+def _infer_n_items(item_parameters: dict[str, object]) -> int:
+    """Read the item count from the first supplied item-parameter array."""
+    for name, value in item_parameters.items():
+        if value is None:
+            continue
+        array = np.asarray(value)
+        if array.ndim == 0 or array.shape[0] < 1:
+            raise ValueError(f"{name} must have one entry per item")
+        return int(array.shape[0])
+    return _DEFAULT_N_ITEMS
+
+
+def _simulate_from_model(
+    model: BaseItemModel | FitResult,
+    *,
+    n_persons: int,
+    n_items: int | None,
+    n_factors: int,
+    theta: NDArray[np.float64] | None,
+    seed: int | None,
+) -> NDArray[np.int_]:
+    """Simulate responses from a dichotomous or polytomous model object."""
+    from mirt._categorical import draw_item_responses
+    from mirt.models.base import DichotomousItemModel, PolytomousItemModel
+    from mirt.results._common import resolve_latent_prior
+
+    item_model, latent_mean, latent_cov = resolve_latent_prior(model)
+    if not isinstance(item_model, (DichotomousItemModel, PolytomousItemModel)):
+        raise ValueError(
+            "model must be a simulation model name, a dichotomous or polytomous "
+            "item model, or a FitResult wrapping one"
+        )
+    if n_items is not None and n_items != item_model.n_items:
+        raise ValueError(f"n_items must match the model's {item_model.n_items} items")
+    if n_factors not in (1, item_model.n_factors):
+        raise ValueError(
+            f"n_factors must match the model's {item_model.n_factors} factors"
+        )
+
+    rng = np.random.default_rng(seed)
+    if theta is None:
+        if (
+            isinstance(n_persons, (bool, np.bool_))
+            or not isinstance(n_persons, (int, np.integer))
+            or n_persons < 1
+        ):
+            raise ValueError("n_persons must be a positive integer")
+        theta_values = rng.standard_normal((int(n_persons), item_model.n_factors))
+        if latent_cov is not None:
+            theta_values = theta_values @ np.linalg.cholesky(latent_cov).T
+        if latent_mean is not None:
+            theta_values += latent_mean
+    else:
+        theta_values = np.asarray(theta, dtype=np.float64)
+        if theta_values.ndim == 1 and item_model.n_factors == 1:
+            theta_values = theta_values.reshape(-1, 1)
+        if (
+            theta_values.ndim != 2
+            or theta_values.shape[0] < 1
+            or theta_values.shape[1] != item_model.n_factors
+        ):
+            raise ValueError(
+                f"theta must have shape (n_persons, {item_model.n_factors})"
+            )
+        if not np.all(np.isfinite(theta_values)):
+            raise ValueError("theta must contain finite values")
+
+    width = (
+        item_model.max_categories if isinstance(item_model, PolytomousItemModel) else 1
+    )
+    chunk_size = max(1, _MAX_POLYTOMOUS_CHUNK_ENTRIES // (item_model.n_items * width))
+    return draw_item_responses(
+        item_model, theta_values, rng, chunk_size=chunk_size, dtype=np.int_
+    )
 
 
 def _prepare_parameter(

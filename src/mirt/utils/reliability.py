@@ -11,6 +11,7 @@ from mirt._information import _test_information, _theta_array
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 Density = Literal["norm", "uniform"] | Callable[[NDArray[np.float64]], ArrayLike]
@@ -42,9 +43,9 @@ def _conditional_reliability(
 
 
 def conditional_rxx(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: ArrayLike,
-    latent_variance: float = 1.0,
+    latent_variance: float | None = None,
 ) -> NDArray[np.float64]:
     """Compute reliability at each supplied ability value.
 
@@ -55,12 +56,14 @@ def conditional_rxx(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted unidimensional IRT model.
+    model : BaseItemModel or FitResult
+        A fitted unidimensional IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values at which to compute reliability.
-    latent_variance : float, default=1
+    latent_variance : float, optional
         Positive finite variance of the reference ability distribution.
+        Defaults to the estimated ``latent_covariance`` of a ``FitResult``
+        when it has one, and to one otherwise.
 
     Returns
     -------
@@ -73,8 +76,13 @@ def conditional_rxx(
     ValueError
         If the model is multidimensional or an argument is invalid.
     """
+    from mirt.results._common import resolve_latent_prior
+
+    model, _, latent_cov = resolve_latent_prior(model)
     if model.n_factors != 1:
         raise ValueError("conditional_rxx supports unidimensional models only")
+    if latent_variance is None:
+        latent_variance = 1.0 if latent_cov is None else float(latent_cov[0, 0])
     if isinstance(latent_variance, (bool, np.bool_)) or np.ndim(latent_variance) != 0:
         raise ValueError("latent_variance must be a positive finite scalar")
     try:
@@ -132,7 +140,7 @@ def _quadrature_weights(
 
 
 def marginal_rxx(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta_range: tuple[float, float] = (-6.0, 6.0),
     n_points: int = 61,
     density: Density = "norm",
@@ -146,14 +154,17 @@ def marginal_rxx(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta_range : tuple of float, default=(-6, 6)
         Finite lower and upper integration bounds.
     n_points : int, default=61
         Number of evenly spaced quadrature points. Must be at least 2.
     density : {"norm", "uniform"} or callable, default="norm"
-        Ability density. A callable receives the theta grid and returns
+        Ability density. ``"norm"`` is the normal with the estimated
+        ``latent_mean`` and ``latent_covariance`` of a ``FitResult`` as its
+        mean and variance when it has them, and the standard normal
+        otherwise. A callable receives the theta grid and returns
         non-negative weights.
 
     Returns
@@ -166,6 +177,9 @@ def marginal_rxx(
     ValueError
         If the model is multidimensional or an argument is invalid.
     """
+    from mirt.results._common import resolve_latent_prior
+
+    model, latent_mean, latent_cov = resolve_latent_prior(model)
     if model.n_factors != 1:
         raise ValueError("marginal_rxx supports unidimensional models only")
     if isinstance(n_points, bool) or not isinstance(n_points, int) or n_points < 2:
@@ -182,7 +196,16 @@ def marginal_rxx(
         theta = np.linspace(0.5 * lower, 0.5 * upper, n_points) * 2.0
     else:
         theta = np.linspace(lower, upper, n_points)
-    weights = _quadrature_weights(theta, density)
+    if (latent_mean is not None or latent_cov is not None) and (
+        isinstance(density, str) and density == "norm"
+    ):
+        # The standard-normal weights of (theta - mean) / sd are
+        # N(mean, sd^2) weights.
+        mean = 0.0 if latent_mean is None else float(latent_mean[0])
+        sd = 1.0 if latent_cov is None else float(np.sqrt(latent_cov[0, 0]))
+        weights = _quadrature_weights((theta - mean) / sd, density)
+    else:
+        weights = _quadrature_weights(theta, density)
     test_information = _test_information(model, theta.reshape(-1, 1))
 
     centered = _centered_theta(theta[:, None])[:, 0]

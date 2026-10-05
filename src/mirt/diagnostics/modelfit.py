@@ -16,16 +16,34 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy import stats
+from scipy.linalg import lapack, solve_triangular
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.data import _response_array
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityConstraints
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 _MOMENT_CHUNK_ELEMENTS = 262_144
+_CHOLESKY_MIN_RECIPROCAL_CONDITION = 1e-8
+
+
+@dataclass(frozen=True)
+class _LatentNormal:
+    """Normal latent population of the integrated (marginal) moments.
+
+    ``estimated`` lists the ``(row, column)`` covariance entries, with
+    ``row <= column``, that were estimated together with the items.
+    """
+
+    mean: NDArray[np.float64]
+    cov: NDArray[np.float64]
+    estimated: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,10 +123,14 @@ class _FitMoments:
 
 
 def compute_m2(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
+    *,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute M2 limited-information fit statistic.
 
@@ -121,17 +143,30 @@ def compute_m2(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix (n_persons, n_items)
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
+        ``latent_covariance`` then defines the latent population.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Fixed person abilities defining a conditional response model. If
-        omitted, moments are integrated against a standard normal latent
-        distribution. Abilities estimated from these responses do not satisfy
-        the fixed-design assumption needed for chi-square calibration.
+        omitted, moments are integrated against the normal latent population.
+        Abilities estimated from these responses do not satisfy the
+        fixed-design assumption needed for chi-square calibration.
     n_quadpts : int
         Number of quadrature points for integration
+    prior_mean : array-like of shape (n_factors,), optional
+        Mean of the normal latent population. Default zero.
+    prior_cov : array-like of shape (n_factors, n_factors), optional
+        Covariance of the normal latent population. Defaults to the
+        ``latent_covariance`` of a ``FitResult`` when it has one, and to the
+        identity otherwise.
+    constraints : sequence, optional
+        Equality constraints of the fit, in any form that
+        ``fit_mirt(constraints=...)`` accepts. Each group of tied coordinates
+        is one estimated parameter: its derivative columns are summed into
+        one tangent direction, which removes one degree of freedom.
 
     Returns
     -------
@@ -141,7 +176,16 @@ def compute_m2(
         - 'df': Degrees of freedom
         - 'p_value': P-value
         - 'M2_df_ratio': M2/df ratio
+
+    Notes
+    -----
+    A population passed as ``prior_mean`` or ``prior_cov`` is treated as
+    known. The latent covariance of a ``FitResult`` was estimated with the
+    items: its free entries, the nonzero covariances and the variances that
+    differ from one, are projected out like the free item parameters, and
+    each removes one degree of freedom.
     """
+    model, latent = _resolve_latent_population(model, prior_mean, prior_cov)
     response_values, max_observed = _validate_diagnostic_inputs(model, responses)
     moments = _prepare_fit_moments(
         model,
@@ -149,31 +193,49 @@ def compute_m2(
         max_observed,
         theta,
         n_quadpts,
+        latent=latent,
     )
-    return _m2_from_moments(model, moments, response_values, theta, n_quadpts)
+    return _m2_from_moments(
+        model,
+        moments,
+        response_values,
+        theta,
+        n_quadpts,
+        latent=latent,
+        constraints=constraints,
+    )
 
 
 def compute_fit_indices(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
+    *,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute model fit indices (RMSEA, CFI, TLI, SRMSR).
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
+        ``latent_covariance`` then defines the latent population.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix, with missing responses as in :func:`compute_m2`.
     theta : NDArray, optional
         Fixed person abilities defining a conditional response model. If
-        omitted, moments are integrated against a standard normal latent
-        distribution. Response-derived ability estimates invalidate the
-        fixed-design chi-square calibration.
+        omitted, moments are integrated against the normal latent population.
+        Response-derived ability estimates invalidate the fixed-design
+        chi-square calibration.
     n_quadpts : int
         Number of quadrature points
+    prior_mean, prior_cov : array-like, optional
+        Normal latent population, as in :func:`compute_m2`.
+    constraints : sequence, optional
+        Equality constraints of the fit, as in :func:`compute_m2`.
 
     Returns
     -------
@@ -186,6 +248,7 @@ def compute_fit_indices(
         - 'TLI': Tucker-Lewis Index (NNFI)
         - 'SRMSR': Standardized Root Mean Square Residual
     """
+    model, latent = _resolve_latent_population(model, prior_mean, prior_cov)
     response_values, max_observed = _validate_diagnostic_inputs(model, responses)
     n_persons = response_values.shape[0]
     moments = _prepare_fit_moments(
@@ -194,10 +257,18 @@ def compute_fit_indices(
         max_observed,
         theta,
         n_quadpts,
+        latent=latent,
     )
     design = _moment_design(response_values)
     m2_result = _m2_from_moments(
-        model, moments, response_values, theta, n_quadpts, design
+        model,
+        moments,
+        response_values,
+        theta,
+        n_quadpts,
+        design,
+        latent=latent,
+        constraints=constraints,
     )
     M2 = m2_result["M2"]
     df = m2_result["df"]
@@ -224,6 +295,56 @@ def compute_fit_indices(
         "M2_df": df,
         "M2_p": m2_result["p_value"],
     }
+
+
+def _resolve_latent_population(
+    model_or_result: BaseItemModel | FitResult,
+    prior_mean: ArrayLike | None,
+    prior_cov: ArrayLike | None,
+) -> tuple[BaseItemModel, _LatentNormal | None]:
+    """Return the item model and its latent population (``None``: standard)."""
+    from mirt.results._common import resolve_latent_prior
+    from mirt.results.fit_result import FitResult
+    from mirt.scoring._common import resolve_prior_distribution
+
+    estimated: tuple[tuple[int, int], ...] = ()
+    if isinstance(model_or_result, FitResult) and prior_cov is None:
+        fitted = model_or_result.latent_covariance
+        if fitted is not None:
+            # Estimation starts from the identity, so a covariance held at
+            # its standard value stays exactly zero and a fixed variance one.
+            rows, columns = np.triu_indices(len(fitted))
+            values = fitted[rows, columns]
+            free = np.where(rows == columns, values != 1.0, values != 0.0)
+            estimated = tuple(
+                (int(row), int(column))
+                for row, column in zip(rows[free], columns[free], strict=True)
+            )
+    model, mean, cov = resolve_latent_prior(model_or_result, prior_mean, prior_cov)
+    if mean is None and cov is None:
+        return model, None
+    mean, cov = resolve_prior_distribution(
+        n_factors=model.n_factors, prior_mean=mean, prior_cov=cov
+    )
+    return model, _LatentNormal(mean, cov, estimated)
+
+
+def _latent_grid(
+    model: BaseItemModel,
+    n_quadpts: int,
+    latent: _LatentNormal | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Gauss-Hermite nodes of the latent population and normalized weights."""
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+    _validate_quadrature_count(n_quadpts)
+    quadrature = GaussHermiteQuadrature(
+        n_points=n_quadpts,
+        n_dimensions=model.n_factors,
+        mean=None if latent is None else latent.mean,
+        cov=None if latent is None else latent.cov,
+    )
+    return quadrature.nodes, _normalized_weights(quadrature.weights)
 
 
 def _compute_expected_margins(
@@ -283,7 +404,7 @@ def _validate_diagnostic_inputs(
             "M2 does not support HigherOrderCDM: shared mastery-pattern "
             "integration is required for the joint response moments"
         )
-    values = np.asarray(responses)
+    values = _response_array(responses)
     if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] == 0:
         raise ValueError(
             "responses must be a two-dimensional matrix with at least "
@@ -417,30 +538,16 @@ def _moment_rows_per_chunk(model: BaseItemModel) -> int:
 
 
 def _integrate_model_moments(
-    model: BaseItemModel, n_quadpts: int
+    model: BaseItemModel,
+    n_quadpts: int,
+    *,
+    latent: _LatentNormal | None = None,
 ) -> tuple[_ScoreMoments, int]:
     """Integrate model moments without retaining full-grid probability arrays."""
-    from mirt.estimation.quadrature import GaussHermiteQuadrature
-
-    _validate_quadrature_count(n_quadpts)
-    quadrature = GaussHermiteQuadrature(
-        n_points=n_quadpts, n_dimensions=model.n_factors
+    nodes, weights = _latent_grid(model, n_quadpts, latent)
+    univariate, seconds, bivariate, max_score = _integrate_on_grid(
+        model, nodes, weights
     )
-    weights = _normalized_weights(quadrature.weights)
-    univariate = np.zeros(model.n_items)
-    seconds = np.zeros(model.n_items)
-    bivariate = np.zeros((model.n_items, model.n_items))
-    rows_per_chunk = _moment_rows_per_chunk(model)
-    max_score = 0
-    for start in range(0, weights.size, rows_per_chunk):
-        stop = start + rows_per_chunk
-        means, conditional_seconds, max_score = _conditional_score_moments(
-            model, quadrature.nodes[start:stop]
-        )
-        block_weights = weights[start:stop]
-        univariate += block_weights @ means
-        seconds += block_weights @ conditional_seconds
-        bivariate += (means * block_weights[:, None]).T @ means
     pair_means = univariate[:, None]
     return _ScoreMoments(
         univariate,
@@ -450,12 +557,37 @@ def _integrate_model_moments(
     ), max_score
 
 
+def _integrate_on_grid(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    weights: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], int]:
+    """Return weighted item score means, second moments and score products."""
+    univariate = np.zeros(model.n_items)
+    seconds = np.zeros(model.n_items)
+    bivariate = np.zeros((model.n_items, model.n_items))
+    rows_per_chunk = _moment_rows_per_chunk(model)
+    max_score = 0
+    for start in range(0, weights.size, rows_per_chunk):
+        stop = start + rows_per_chunk
+        means, conditional_seconds, max_score = _conditional_score_moments(
+            model, nodes[start:stop]
+        )
+        block_weights = weights[start:stop]
+        univariate += block_weights @ means
+        seconds += block_weights @ conditional_seconds
+        bivariate += (means * block_weights[:, None]).T @ means
+    return univariate, seconds, bivariate, max_score
+
+
 def _prepare_fit_moments(
     model: BaseItemModel,
     responses: NDArray[np.float64],
     max_observed: float,
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
+    *,
+    latent: _LatentNormal | None = None,
 ) -> _FitMoments:
     """Stream moments, sharing observation counts and complete-block shortcuts."""
     observed = _SampleMomentAccumulator(model.n_items)
@@ -465,7 +597,9 @@ def _prepare_fit_moments(
         _prepare_theta(model, theta, responses.shape[0]) if theta is not None else None
     )
     if theta is None:
-        expected_moments, max_score = _integrate_model_moments(model, n_quadpts)
+        expected_moments, max_score = _integrate_model_moments(
+            model, n_quadpts, latent=latent
+        )
 
     rows_per_chunk = (
         _moment_rows_per_chunk(model)
@@ -536,17 +670,19 @@ def _moment_design(responses: NDArray[np.float64]) -> _MomentDesign:
     n_moments = n_items * (n_items + 1) // 2
     counts = np.zeros(n_moments)
     overlap = np.zeros((n_moments, n_moments))
+    complete_rows = 0
     chunk_rows = max(1, _MOMENT_CHUNK_ELEMENTS // n_moments)
     for start in range(0, len(responses), chunk_rows):
         block = responses[start : start + chunk_rows]
         valid = np.isfinite(block) & (block >= 0)
         if np.all(valid):
-            counts += len(block)
-            overlap += len(block)
+            complete_rows += len(block)
         else:
             present = _score_features(valid.astype(np.float64))
             counts += present.sum(axis=0)
             overlap += present.T @ present
+    counts += complete_rows
+    overlap += complete_rows
     return _MomentDesign(counts, overlap)
 
 
@@ -591,17 +727,14 @@ def _integration_blocks(
     responses: NDArray[np.float64],
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
+    *,
+    latent: _LatentNormal | None = None,
 ) -> Iterator[
     tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]
 ]:
     """Yield bounded quadrature blocks or fixed-design person blocks."""
     if theta is None:
-        from mirt.estimation.quadrature import GaussHermiteQuadrature
-
-        _validate_quadrature_count(n_quadpts)
-        quadrature = GaussHermiteQuadrature(n_quadpts, model.n_factors)
-        nodes = quadrature.nodes
-        weights = _normalized_weights(quadrature.weights)
+        nodes, weights = _latent_grid(model, n_quadpts, latent)
     else:
         nodes = _prepare_theta(model, theta, len(responses))
     n_moments = model.n_items * (model.n_items + 1) // 2
@@ -629,13 +762,15 @@ def _model_sample_covariance(
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
     design: _MomentDesign,
+    *,
+    latent: _LatentNormal | None = None,
 ) -> NDArray[np.float64]:
     n_moments = len(design.counts)
     conditional = np.zeros((n_moments, n_moments))
     raw = np.zeros_like(conditional)
     mean = np.zeros(n_moments)
     for nodes, weights, present in _integration_blocks(
-        model, responses, theta, n_quadpts
+        model, responses, theta, n_quadpts, latent=latent
     ):
         means, seconds, _ = _conditional_score_moments(model, nodes)
         conditional += _conditional_covariance_sum(means, seconds, weights, present)
@@ -677,6 +812,8 @@ def _model_moment_jacobian(
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
     design: _MomentDesign,
+    *,
+    latent: _LatentNormal | None = None,
 ) -> NDArray[np.float64]:
     """Differentiate actual free parameters on an isolated model instance."""
     from mirt._model_defaults import uses_builtin_model_hooks
@@ -693,7 +830,7 @@ def _model_moment_jacobian(
     builtin = uses_builtin_model_hooks(model)
     left, right = np.triu_indices(model.n_items, 1)
     for nodes, weights, present in _integration_blocks(
-        model, responses, theta, n_quadpts
+        model, responses, theta, n_quadpts, latent=latent
     ):
         means, _, _ = _conditional_score_moments(model, nodes)
         original = _score_features(means)
@@ -790,6 +927,84 @@ def _model_moment_jacobian(
     return jacobian if theta is None else _safe_divide(jacobian, design.counts[:, None])
 
 
+def _tie_columns(
+    model: BaseItemModel,
+    jacobian: NDArray[np.float64],
+    constraints: EqualityConstraints | None,
+) -> NDArray[np.float64]:
+    """Sum the derivative columns of coordinates tied by equality constraints.
+
+    Columns follow the free coordinates of ``model.free_parameter_masks``, as
+    in :func:`_model_moment_jacobian`. A tied group moves as one parameter.
+    """
+    if constraints is None:
+        return jacobian
+    from mirt.estimation._shared_step import resolve_equality_constraints
+
+    tied = resolve_equality_constraints(constraints, model)
+    if tied is None:
+        return jacobian
+    tying = tied.tying(
+        {
+            name: np.flatnonzero(mask)
+            for name, mask in model.free_parameter_masks.items()
+        }
+    )
+    return jacobian @ np.eye(int(tying.max(initial=-1)) + 1)[tying]
+
+
+def _latent_moment_jacobian(
+    model: BaseItemModel,
+    n_quadpts: int,
+    latent: _LatentNormal,
+) -> NDArray[np.float64]:
+    """Differentiate integrated moments by the estimated covariance entries.
+
+    Gauss-Hermite nodes of ``N(mean, cov)`` are ``mean + L z`` for standard
+    nodes ``z`` and the Cholesky factor ``L`` of ``cov``, with unchanged
+    weights, so a perturbed covariance only moves the nodes.
+    """
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+    standard = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=model.n_factors)
+    standard_nodes = standard.nodes
+    weights = _normalized_weights(standard.weights)
+
+    def integrated_features(cov: NDArray[np.float64]) -> NDArray[np.float64] | None:
+        try:
+            factor = np.linalg.cholesky(cov)
+        except np.linalg.LinAlgError:
+            return None
+        univariate, _, bivariate, _ = _integrate_on_grid(
+            model, standard_nodes @ factor.T + latent.mean, weights
+        )
+        return _flatten_score_moments(univariate, bivariate)
+
+    columns = []
+    for row, column in latent.estimated:
+        step = np.cbrt(np.finfo(float).eps) * max(abs(latent.cov[row, column]), 1.0)
+        shifted = []
+        for offset in (step, -step):
+            cov = latent.cov.copy()
+            cov[row, column] += offset
+            if row != column:
+                cov[column, row] += offset
+            shifted.append(integrated_features(cov))
+        upper, lower = shifted
+        if upper is not None and lower is not None:
+            columns.append((upper - lower) / (2 * step))
+            continue
+        center = integrated_features(latent.cov)
+        assert center is not None
+        if upper is not None:
+            columns.append((upper - center) / step)
+        elif lower is not None:
+            columns.append((center - lower) / step)
+        else:
+            raise ValueError("cannot differentiate moments by the latent covariance")
+    return np.column_stack(columns)
+
+
 def _projected_chi_square(
     residual: NDArray[np.float64],
     covariance: NDArray[np.float64],
@@ -813,14 +1028,35 @@ def _projected_chi_square(
     standardized = covariance[np.ix_(active, active)] / np.outer(
         scales[active], scales[active]
     )
-    values, vectors = np.linalg.eigh(standardized)
-    threshold = max(float(np.max(values)), 1.0) * 1e-10
-    if np.any(values < -threshold):
-        raise ValueError("model moment covariance is not positive semidefinite")
-    positive = values > threshold
-    whitening = (vectors[:, positive] / np.sqrt(values[positive])).T
-    whitened = whitening @ (residual[active] / scales[active])
-    tangent = whitening @ (jacobian[active] / scales[active, None])
+    scaled_residual = residual[active] / scales[active]
+    scaled_jacobian = jacobian[active] / scales[active, None]
+    factor = _well_conditioned_cholesky(standardized)
+    if factor is not None:
+        # Cholesky and eigenvector whitening differ by an orthogonal rotation,
+        # which leaves the statistic, tangent rank and degrees unchanged.
+        whitened_columns = solve_triangular(
+            factor,
+            np.column_stack((scaled_residual, scaled_jacobian)),
+            lower=True,
+            check_finite=False,
+        )
+        whitened = whitened_columns[:, 0]
+        tangent = whitened_columns[:, 1:]
+        n_supported = len(scaled_residual)
+        null_residual_norm = 0.0
+    else:
+        values, vectors = np.linalg.eigh(standardized)
+        threshold = max(float(np.max(values)), 1.0) * 1e-10
+        if np.any(values < -threshold):
+            raise ValueError("model moment covariance is not positive semidefinite")
+        positive = values > threshold
+        whitening = (vectors[:, positive] / np.sqrt(values[positive])).T
+        whitened = whitening @ scaled_residual
+        tangent = whitening @ scaled_jacobian
+        n_supported = int(np.count_nonzero(positive))
+        null_residual_norm = float(
+            np.linalg.norm(vectors[:, ~positive].T @ scaled_residual)
+        )
     norms = np.linalg.norm(tangent, axis=0)
     nonzero = norms > 1e-9
     if np.any(nonzero):
@@ -831,17 +1067,36 @@ def _projected_chi_square(
         whitened -= basis[:, :rank] @ (basis[:, :rank].T @ whitened)
     else:
         rank = 0
-    degrees = int(np.count_nonzero(positive)) - rank
+    degrees = n_supported - rank
     if degrees <= 0:
         return np.nan, 0
     # A residual outside covariance support is impossible under the null;
     # pseudoinverse weighting must not silently erase this evidence of misfit.
-    null_residual = vectors[:, ~positive].T @ (residual[active] / scales[active])
-    impossible = np.linalg.norm(null_residual) > 1e-6 or np.any(
-        np.abs(residual[~active]) > 1e-10
-    )
+    impossible = null_residual_norm > 1e-6 or np.any(np.abs(residual[~active]) > 1e-10)
     statistic = np.inf if impossible else float(whitened @ whitened)
     return statistic, degrees
+
+
+def _well_conditioned_cholesky(
+    matrix: NDArray[np.float64],
+) -> NDArray[np.float64] | None:
+    """Return the lower Cholesky factor when no eigenvalue is near the rank cut.
+
+    The eigenvalue path drops dimensions with eigenvalues at most
+    ``1e-10 * max(lambda_max, 1)``. A correlation matrix has
+    ``lambda_max >= 1`` and ``kappa_2 <= kappa_1``, so a reciprocal 1-norm
+    condition estimate above ``1e-8`` keeps every eigenvalue above that cut
+    even if the LAPACK estimate understates ``||A^-1||_1`` a hundredfold.
+    Otherwise ``None`` selects the eigenvalue path and its rank checks.
+    """
+    factor, info = lapack.dpotrf(matrix, lower=1, clean=1)
+    if info != 0:
+        return None
+    norm = float(np.max(np.sum(np.abs(matrix), axis=0)))
+    reciprocal_condition, info = lapack.dpocon(factor, norm, uplo="L")
+    if info != 0 or not reciprocal_condition > _CHOLESKY_MIN_RECIPROCAL_CONDITION:
+        return None
+    return factor
 
 
 def _m2_from_moments(
@@ -851,6 +1106,9 @@ def _m2_from_moments(
     theta: NDArray[np.float64] | None,
     n_quadpts: int,
     design: _MomentDesign | None = None,
+    *,
+    latent: _LatentNormal | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute a genuinely covariance-weighted limited-information test."""
     if design is None:
@@ -858,8 +1116,20 @@ def _m2_from_moments(
     selected = design.counts > 0
     observed = _flatten_score_moments(moments.observed_uni, moments.observed_bi)
     expected = _flatten_score_moments(moments.expected_uni, moments.expected_bi)
-    covariance = _model_sample_covariance(model, responses, theta, n_quadpts, design)
-    jacobian = _model_moment_jacobian(model, responses, theta, n_quadpts, design)
+    covariance = _model_sample_covariance(
+        model, responses, theta, n_quadpts, design, latent=latent
+    )
+    jacobian = _tie_columns(
+        model,
+        _model_moment_jacobian(
+            model, responses, theta, n_quadpts, design, latent=latent
+        ),
+        constraints,
+    )
+    if theta is None and latent is not None and latent.estimated:
+        jacobian = np.column_stack(
+            (jacobian, _latent_moment_jacobian(model, n_quadpts, latent))
+        )
     statistic, degrees = _projected_chi_square(
         (observed - expected)[selected],
         covariance[np.ix_(selected, selected)],
@@ -971,69 +1241,3 @@ def _compute_tli(chi2: float, df: int, chi2_0: float, df_0: int) -> float:
 
     tli = (ratio_0 - ratio) / (ratio_0 - 1)
     return float(tli)
-
-
-def _compute_srmsr(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    n_quadpts: int,
-    theta: NDArray[np.float64] | None = None,
-) -> float:
-    """Compute Standardized Root Mean Square Residual."""
-    response_values, max_observed = _validate_diagnostic_inputs(model, responses)
-    moments = _prepare_fit_moments(
-        model,
-        response_values,
-        max_observed,
-        theta,
-        n_quadpts,
-    )
-    return _srmsr_from_moments(moments)
-
-
-def model_fit_summary(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    theta: NDArray[np.float64] | None = None,
-) -> str:
-    """Generate a formatted summary of model fit statistics.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix
-    theta : NDArray, optional
-        Ability estimates
-
-    Returns
-    -------
-    str
-        Formatted summary string
-    """
-    fit = compute_fit_indices(model, responses, theta)
-
-    lines = [
-        "Model Fit Summary",
-        "=" * 50,
-        "",
-        f"M2 statistic:     {fit['M2']:.3f}",
-        f"Degrees of freedom: {fit['M2_df']}",
-        f"P-value:          {fit['M2_p']:.4f}",
-        "",
-        f"RMSEA:            {fit['RMSEA']:.4f}",
-        f"  90% CI:         [{fit['RMSEA_CI_lower']:.4f}, {fit['RMSEA_CI_upper']:.4f}]",
-        f"CFI:              {fit['CFI']:.4f}",
-        f"TLI:              {fit['TLI']:.4f}",
-        f"SRMSR:            {fit['SRMSR']:.4f}",
-        "",
-        "Interpretation guidelines:",
-        "  RMSEA < 0.05: Good fit",
-        "  RMSEA < 0.08: Acceptable fit",
-        "  CFI > 0.95: Good fit",
-        "  TLI > 0.95: Good fit",
-        "  SRMSR < 0.08: Good fit",
-    ]
-
-    return "\n".join(lines)

@@ -163,7 +163,7 @@ def test_probability_and_information_use_shared_bounded_evaluation(
         calls.append(points.copy())
         return original(points, slope, *parameters, **kwargs)
 
-    monkeypatch.setattr(dichotomous, "_FIVE_PL_CURVE_CHUNK_ELEMENTS", 17)
+    monkeypatch.setattr(dichotomous, "_UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS", 17)
     monkeypatch.setattr(dichotomous, "_five_pl_curve", tracked)
     actual = getattr(model, method)(theta, item_idx)
     np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=0.0)
@@ -212,7 +212,7 @@ def test_paired_batches_preserve_reordered_items_and_extreme_inputs(monkeypatch)
         calls.append((points.copy(), item_indices.copy()))
         return original(points, *parameters, item_indices=item_indices, **kwargs)
 
-    monkeypatch.setattr(dichotomous, "_FIVE_PL_CURVE_CHUNK_ELEMENTS", 7)
+    monkeypatch.setattr(dichotomous, "_UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS", 7)
     monkeypatch.setattr(dichotomous, "_five_pl_curve", tracked)
     with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
         actual = model.probability_pairs(theta, indices)

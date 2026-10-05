@@ -16,6 +16,7 @@ from scipy import stats
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
+from mirt.estimation.bkt_em import _bkt_result_fields, _prepare_bkt_fit
 from mirt.models.dynamic import (
     BKTModel,
     BKTResult,
@@ -201,8 +202,11 @@ class LongitudinalPriors:
 class BKTGibbsSampler:
     """Gibbs sampler for Bayesian Knowledge Tracing.
 
-    Uses Baum-Welch style updates for hidden states and
-    Beta-Binomial conjugacy for parameter sampling.
+    Each iteration draws every learner's hidden mastery states by
+    forward-filtering backward-sampling, then draws each skill's parameters
+    from their conjugate Beta full conditionals. Estimates are posterior
+    means. :func:`~mirt.estimation.bkt_em.fit_bkt_em` provides maximum
+    likelihood estimation by Baum-Welch EM.
     """
 
     def __init__(
@@ -308,7 +312,6 @@ class BKTGibbsSampler:
             allow_forgetting,
         )
         n_persons, n_trials = responses.shape
-        n_skills = model.n_skills
 
         # Preserve the established seeded chain while replacing later draws
         # with an equivalent vectorized path.
@@ -321,7 +324,6 @@ class BKTGibbsSampler:
             "p_forget": [],
             "p_slip": [],
             "p_guess": [],
-            "log_likelihood": [],
         }
 
         for iteration in range(self.n_iter):
@@ -367,9 +369,6 @@ class BKTGibbsSampler:
                 chains["p_slip"].append(model.p_slip.copy())
                 chains["p_guess"].append(model.p_guess.copy())
 
-                ll = self._compute_log_likelihood(responses, skill_assignments, model)
-                chains["log_likelihood"].append(ll)
-
             if self.verbose and (iteration + 1) % 200 == 0:
                 ll = self._compute_log_likelihood(responses, skill_assignments, model)
                 print(f"Iteration {iteration + 1}/{self.n_iter}: LL = {ll:.4f}")
@@ -380,32 +379,8 @@ class BKTGibbsSampler:
         model.p_slip = np.mean(chains["p_slip"], axis=0)
         model.p_guess = np.mean(chains["p_guess"], axis=0)
 
-        learning_curves = np.zeros((n_persons, n_skills))
-        skill_mastery = np.zeros((n_persons, n_skills))
-        gamma, _ = model.forward_backward_batch(responses, skill_assignments)
-
-        for skill_idx in range(n_skills):
-            skill_mask = skill_assignments == skill_idx
-            if np.any(skill_mask):
-                learned = gamma[:, skill_mask, 1]
-                skill_mastery[:, skill_idx] = learned[:, -1]
-                learning_curves[:, skill_idx] = learned.mean(axis=1)
-
-        ll_final = self._compute_log_likelihood(responses, skill_assignments, model)
-        n_params = 4 * n_skills if not allow_forgetting else 5 * n_skills
-        n_obs = np.sum(responses >= 0)
-        aic = -2 * ll_final + 2 * n_params
-        bic = -2 * ll_final + np.log(n_obs) * n_params
-
         return BKTResult(
-            model=model,
-            learning_curves=learning_curves,
-            skill_mastery=skill_mastery,
-            log_likelihood=ll_final,
-            aic=aic,
-            bic=bic,
-            n_observations=int(n_obs),
-            n_parameters=n_params,
+            **_bkt_result_fields(model, responses, skill_assignments),
             converged=True,
         )
 
@@ -417,39 +392,14 @@ class BKTGibbsSampler:
         allow_forgetting: bool,
     ) -> tuple[NDArray[np.int_], NDArray[np.int_], BKTModel]:
         """Validate fit inputs and construct the matching BKT model."""
-        responses = np.asarray(responses)
-        skill_assignments = np.asarray(skill_assignments)
-
-        if responses.ndim != 2:
-            raise ValueError("responses must have shape (n_persons, n_trials)")
-        if responses.shape[0] == 0:
-            raise ValueError("responses must contain at least one person")
-        if responses.shape[1] == 0:
-            raise ValueError("responses must contain at least one trial")
-        if skill_assignments.ndim != 1:
-            raise ValueError("skill_assignments must be one-dimensional")
-        if len(skill_assignments) != responses.shape[1]:
-            raise ValueError("skill_assignments length must match the number of trials")
-        if not np.issubdtype(skill_assignments.dtype, np.integer):
-            raise ValueError("skill_assignments must contain integer values")
-        if np.any(skill_assignments < 0):
-            raise ValueError("skill_assignments must contain non-negative values")
-        if not isinstance(allow_forgetting, (bool, np.bool_)):
-            raise TypeError("allow_forgetting must be a boolean")
-
-        if n_skills is None:
-            n_skills = int(np.max(skill_assignments)) + 1
-        model = BKTModel(
-            n_skills=n_skills,
-            allow_forgetting=bool(allow_forgetting),
+        return _prepare_bkt_fit(
+            responses,
+            skill_assignments,
+            n_skills,
+            allow_forgetting,
             use_rust=self.use_rust,
+            person_layouts=False,
         )
-        responses, skill_assignments = model._validate_batch(
-            responses, skill_assignments
-        )
-        if not np.any(responses >= 0):
-            raise ValueError("responses must contain at least one observed value")
-        return responses, skill_assignments, model
 
     def _sample_states_ffbs(
         self,
@@ -667,11 +617,13 @@ class BKTGibbsSampler:
 class LongitudinalGibbsSampler:
     """Gibbs sampler for Longitudinal IRT with growth curves.
 
-    Samples:
-    1. Growth factors (η₀, η₁) given θ trajectories
-    2. Item parameters given responses and θ
-    3. Residual variance
+    Each sweep samples:
+    1. θ trajectories by one Metropolis-Hastings step from the current chain
+       state, with prior N(growth-curve prediction, residual variance)
+    2. Growth factors (η₀, η₁) given θ trajectories
+    3. Item parameters given responses and θ
     4. Population parameters
+    5. Residual variance
     """
 
     def __init__(
@@ -791,12 +743,16 @@ class LongitudinalGibbsSampler:
             "growth_mean": [],
             "growth_cov": [],
             "residual_variance": [],
-            "log_likelihood": [],
         }
 
         for iteration in range(self.n_iter):
             theta_trajectories = self._sample_theta(
-                responses, model, growth_factors, time_values, rng
+                responses,
+                model,
+                theta_trajectories,
+                growth_factors,
+                time_values,
+                rng,
             )
 
             growth_factors = self._sample_growth_factors(
@@ -818,9 +774,6 @@ class LongitudinalGibbsSampler:
                 chains["growth_mean"].append(model.growth_mean.copy())
                 chains["growth_cov"].append(model.growth_cov.copy())
                 chains["residual_variance"].append(model.residual_variance)
-
-                ll = self._compute_log_likelihood(responses, theta_trajectories, model)
-                chains["log_likelihood"].append(ll)
 
             if self.verbose and (iteration + 1) % 200 == 0:
                 ll = self._compute_log_likelihood(responses, theta_trajectories, model)
@@ -921,21 +874,21 @@ class LongitudinalGibbsSampler:
         self,
         responses: NDArray[np.int_],
         model: LongitudinalIRTModel,
+        theta_current: NDArray[np.float64],
         growth_factors: NDArray[np.float64],
         time_values: NDArray[np.float64],
         rng: np.random.Generator,
     ) -> NDArray[np.float64]:
-        """Sample theta trajectories using MH."""
-        theta_pred = model.compute_theta(growth_factors, time_values)
-        proposal_sd = 0.3
-        current = theta_pred.reshape(-1).copy()
-        proposed = np.empty_like(current)
-        log_uniform = np.empty_like(current)
+        """Advance every theta trajectory by one random-walk MH step.
 
-        # Keep proposal and acceptance draws interleaved for seeded compatibility.
-        for index, value in enumerate(current):
-            proposed[index] = value + rng.normal(0, proposal_sd)
-            log_uniform[index] = np.log(rng.random())
+        The chain state ``theta_current`` is the starting point and the
+        growth-curve prediction is the mean of the conditional prior
+        ``N(theta_pred, residual_variance)``.
+        """
+        theta_pred = model.compute_theta(growth_factors, time_values).reshape(-1)
+        current = np.asarray(theta_current, dtype=np.float64).reshape(-1)
+        proposed = current + rng.normal(0.0, 0.3, size=current.shape)
+        log_uniform = np.log(rng.random(current.shape))
 
         flat_responses = responses.reshape(-1, model.n_items)
         ll_current = _longitudinal_log_likelihood_rows(
@@ -948,14 +901,13 @@ class LongitudinalGibbsSampler:
             proposed,
             model,
         )
-        residual_sd = np.sqrt(model.residual_variance)
-        prior_current = stats.norm.logpdf(current, current, residual_sd)
-        prior_proposed = stats.norm.logpdf(proposed, current, residual_sd)
-        accepted = log_uniform < (
-            ll_proposed + prior_proposed - ll_current - prior_current
+        log_prior_ratio = (
+            -0.5
+            / model.residual_variance
+            * ((proposed - theta_pred) ** 2 - (current - theta_pred) ** 2)
         )
-        current[accepted] = proposed[accepted]
-        return current.reshape(theta_pred.shape)
+        accepted = log_uniform < ll_proposed - ll_current + log_prior_ratio
+        return np.where(accepted, proposed, current).reshape(theta_current.shape)
 
     def _sample_growth_factors(
         self,

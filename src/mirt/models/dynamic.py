@@ -5,6 +5,7 @@ from typing import Literal
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.optimize import least_squares
 from scipy.spatial.distance import cdist
 
 from mirt._backend_config import should_use_rust
@@ -22,6 +23,9 @@ from mirt.utils.numeric import logsumexp
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 _GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
+# Smaller repeated layouts are cheaper in the vectorized NumPy smoother than in
+# separate compiled calls.
+_BKT_NATIVE_LAYOUT_MIN_LEARNERS = 32
 BKTSkillCriterion = Literal[
     "information_gain",
     "mastery_gain",
@@ -31,106 +35,152 @@ BKTSkillCriterion = Literal[
 
 
 @dataclass(frozen=True)
-class _GrowthCovariance:
-    """Low-rank representation of a marginal growth covariance matrix."""
+class _MaskedGrowthCovariance:
+    """Per-person Woodbury factors of masked random-intercept/slope covariances.
+
+    Person ``i`` observes ``n_i`` occasions with marginal covariance
+    ``Sigma_i = B_i B_i^T + residual_variance * I`` where ``B_i`` holds the
+    observed rows of ``[sqrt(intercept_var), sqrt(slope_var) * t]``. With the
+    2x2 core ``M_i = residual_variance * I + B_i^T B_i``, Woodbury gives
+    ``Sigma_i^{-1} = (I - B_i M_i^{-1} B_i^T) / residual_variance`` and
+    Sylvester's identity gives
+    ``log|Sigma_i| = (n_i - 2) log(residual_variance) + log|M_i|``.
+
+    Every method takes and returns ``(n_persons, n_times)`` arrays that are
+    zero at unobserved occasions. Complete data stores one shared core.
+    """
 
     residual_variance: float
-    log_determinant: float
-    orthonormal_basis: NDArray[np.float64] | None = None
-    covariance_factor: NDArray[np.float64] | None = None
+    basis: NDArray[np.float64]
+    observation_mask: NDArray[np.bool_] | None
+    observation_counts: NDArray[np.float64]
+    inverse_core: NDArray[np.float64]
+    log_determinants: NDArray[np.float64]
+    has_random_effects: bool
 
     @classmethod
     def from_time_values(
         cls,
         time_values: NDArray[np.float64],
-        intercept_variance: float,
-        slope_variance: float,
-        residual_variance: float,
-    ) -> _GrowthCovariance:
-        """Factor the covariance without constructing its dense matrix."""
-        random_effect_columns = []
-        if intercept_variance > 0.0:
-            random_effect_columns.append(
-                np.full(time_values.size, np.sqrt(intercept_variance))
-            )
-        if slope_variance > 0.0:
-            random_effect_columns.append(time_values * np.sqrt(slope_variance))
+        variances: tuple[float, float, float],
+        observation_mask: NDArray[np.bool_] | None,
+    ) -> _MaskedGrowthCovariance:
+        """Factor every person's observed covariance without dense matrices."""
+        intercept_variance, slope_variance, residual_variance = variances
+        basis = cls.random_effect_basis(time_values, intercept_variance, slope_variance)
+        weights = (
+            None if observation_mask is None else observation_mask.astype(np.float64)
+        )
+        counts = (
+            np.array([float(time_values.size)])
+            if weights is None
+            else np.sum(weights, axis=1)
+        )
 
-        if not random_effect_columns:
+        has_random_effects = intercept_variance > 0.0 or slope_variance > 0.0
+        log_residual_variance = np.log(residual_variance)
+        if not has_random_effects:
             return cls(
                 residual_variance=residual_variance,
-                log_determinant=time_values.size * np.log(residual_variance),
+                basis=basis,
+                observation_mask=observation_mask,
+                observation_counts=counts,
+                inverse_core=(np.eye(2) / residual_variance)[None],
+                log_determinants=counts * log_residual_variance,
+                has_random_effects=False,
             )
 
-        random_effect_basis = np.column_stack(random_effect_columns)
-        orthonormal_basis, triangular_basis = np.linalg.qr(
-            random_effect_basis,
-            mode="reduced",
+        outer_basis = (basis[:, :, None] * basis[:, None, :]).reshape(-1, 4)
+        gram = (
+            np.sum(outer_basis, axis=0, keepdims=True)
+            if weights is None
+            else weights @ outer_basis
         )
-        basis_covariance = (
-            residual_variance * np.eye(orthonormal_basis.shape[1])
-            + triangular_basis @ triangular_basis.T
-        )
-        covariance_factor = np.linalg.cholesky(basis_covariance)
-        log_determinant = (time_values.size - orthonormal_basis.shape[1]) * np.log(
-            residual_variance
-        ) + 2.0 * np.sum(np.log(np.diag(covariance_factor)))
+        core = gram.reshape(-1, 2, 2) + residual_variance * np.eye(2)
+        determinant = core[:, 0, 0] * core[:, 1, 1] - core[:, 0, 1] * core[:, 1, 0]
+        inverse_core = np.empty_like(core)
+        inverse_core[:, 0, 0] = core[:, 1, 1]
+        inverse_core[:, 1, 1] = core[:, 0, 0]
+        inverse_core[:, 0, 1] = -core[:, 0, 1]
+        inverse_core[:, 1, 0] = -core[:, 1, 0]
+        inverse_core /= determinant[:, None, None]
+        log_determinants = (counts - 2.0) * log_residual_variance + np.log(determinant)
         return cls(
             residual_variance=residual_variance,
-            log_determinant=float(log_determinant),
-            orthonormal_basis=orthonormal_basis,
-            covariance_factor=covariance_factor,
+            basis=basis,
+            observation_mask=observation_mask,
+            observation_counts=counts,
+            inverse_core=inverse_core,
+            log_determinants=log_determinants,
+            has_random_effects=has_random_effects,
         )
 
-    def solve(self, values: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Apply the inverse covariance to one or more column vectors."""
-        if self.orthonormal_basis is None or self.covariance_factor is None:
-            return values / self.residual_variance
-
-        basis_coordinates = self.orthonormal_basis.T @ values
-        orthogonal_values = (
-            values - self.orthonormal_basis @ basis_coordinates
-        ) / self.residual_variance
-        solved_coordinates = np.linalg.solve(
-            self.covariance_factor.T,
-            np.linalg.solve(self.covariance_factor, basis_coordinates),
+    @staticmethod
+    def random_effect_basis(
+        time_values: NDArray[np.float64],
+        intercept_variance: float,
+        slope_variance: float,
+    ) -> NDArray[np.float64]:
+        """Return ``[sqrt(intercept_var), sqrt(slope_var) * t]`` rows."""
+        return np.column_stack(
+            [
+                np.full(time_values.size, np.sqrt(intercept_variance)),
+                time_values * np.sqrt(slope_variance),
+            ]
         )
-        return orthogonal_values + self.orthonormal_basis @ solved_coordinates
 
-    def quadratic_forms(
+    def masked(self, values: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Zero unobserved occasions; ``values`` may be one shared row."""
+        if self.observation_mask is None:
+            return values
+        return np.where(self.observation_mask, values, 0.0)
+
+    def random_effect_means(
         self,
         residuals: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Evaluate row-wise covariance-weighted squared residuals."""
-        if self.orthonormal_basis is None or self.covariance_factor is None:
-            return np.einsum("ij,ij->i", residuals, residuals) / (
-                self.residual_variance
-            )
+        """Return ``M_i^{-1} B_i^T r_i``, the standardized random-effect means."""
+        projections = residuals @ self.basis
+        if self.inverse_core.shape[0] == 1:
+            return projections @ self.inverse_core[0]
+        return np.einsum("nab,nb->na", self.inverse_core, projections)
 
-        basis_coordinates = residuals @ self.orthonormal_basis
-        orthogonal_residuals = residuals - basis_coordinates @ self.orthonormal_basis.T
-        whitened_coordinates = np.linalg.solve(
-            self.covariance_factor,
-            basis_coordinates.T,
+    def _whitened(
+        self,
+        residuals: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return ``residual_variance * Sigma_i^{-1} r_i`` and the effect means."""
+        effects = self.random_effect_means(residuals)
+        return residuals - self.masked(effects @ self.basis.T), effects
+
+    def solve(self, residuals: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Apply each person's inverse covariance to their residual row."""
+        if not self.has_random_effects:
+            return residuals / self.residual_variance
+        whitened, _ = self._whitened(residuals)
+        return whitened / self.residual_variance
+
+    def quadratic_forms(self, residuals: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Evaluate ``r_i^T Sigma_i^{-1} r_i`` as a sum of nonnegative terms."""
+        if not self.has_random_effects:
+            return np.einsum("ij,ij->i", residuals, residuals) / self.residual_variance
+        whitened, effects = self._whitened(residuals)
+        residual_part = np.einsum("ij,ij->i", whitened, whitened)
+        return residual_part / self.residual_variance + np.einsum(
+            "ij,ij->i", effects, effects
         )
-        return np.einsum(
-            "ij,ij->i",
-            orthogonal_residuals,
-            orthogonal_residuals,
-        ) / self.residual_variance + np.einsum(
-            "ij,ij->j",
-            whitened_coordinates,
-            whitened_coordinates,
+
+    def conditional_variances(
+        self,
+        prediction_basis: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return the posterior variance of ``prediction_basis @ u`` per person."""
+        return self.residual_variance * np.einsum(
+            "pa,nab,pb->np",
+            prediction_basis,
+            self.inverse_core,
+            prediction_basis,
         )
-
-
-@dataclass(frozen=True)
-class _GrowthObservationPattern:
-    """Rows sharing observed columns and one covariance factorization."""
-
-    rows: NDArray[np.int_]
-    columns: NDArray[np.int_]
-    covariance: _GrowthCovariance
 
 
 @dataclass(frozen=True, slots=True)
@@ -1691,68 +1741,146 @@ class BKTModel:
 
         return beta
 
-    def _backward_batch_shared_python(
+    def _forward_backward_layouts(
         self,
         responses: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
-        scaling: NDArray[np.float64],
-        skill_trials: list[NDArray[np.int_]] | None = None,
-    ) -> NDArray[np.float64]:
-        """Vectorize backward smoothing across a validated shared layout."""
-        n_persons, n_trials = responses.shape
-        beta = np.zeros((n_persons, n_trials, 2), dtype=np.float64)
-        if skill_trials is None:
-            skill_trials = self._skill_trials(skill_assignments)
-
-        for skill_idx, trial_indices in enumerate(skill_trials):
-            if len(trial_indices) == 0:
-                continue
-            beta[:, trial_indices[-1]] = 1.0
-            transition = self.transition_matrix(skill_idx)
-
-            for trial, next_trial in zip(
-                trial_indices[-2::-1],
-                trial_indices[:0:-1],
-                strict=True,
-            ):
-                emissions = self._emission_batch(
-                    responses[:, next_trial],
-                    skill_idx,
-                )
-                beta[:, trial] = (emissions * beta[:, next_trial]) @ transition.T
-                valid_scaling = scaling[:, next_trial] > 0.0
-                beta[valid_scaling, trial] /= scaling[valid_scaling, next_trial, None]
-
-        return beta
-
-    def _forward_backward_batch_shared_python(
-        self,
-        responses: NDArray[np.int_],
-        skill_assignments: NDArray[np.int_],
+        *,
+        transition_out: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Run vectorized fallback smoothing for one shared skill layout."""
-        skill_trials = self._skill_trials(skill_assignments)
-        alpha, scaling = self._forward_batch_shared_python(
-            responses,
-            skill_assignments,
-            skill_trials,
+        """Smooth shared or person-specific layouts in one chronological sweep.
+
+        Every learner's skills are independent two-state chains. The forward
+        pass retains each (learner, skill) predicted state and visits trials in
+        order, so learners with different layouts advance together. The
+        backward pass retains each chain's pending message for its previous
+        opportunity. A zero scaling factor leaves that trial's zero filter
+        unnormalized, so the rest of the chain stays at zero and contributes
+        ``log(1e-300)`` per trial, exactly as in the per-learner recursion.
+
+        An optional trial-major ``transition_out`` array with shape
+        ``(2, n_trials, n_persons)`` receives the smoothed probabilities of
+        learning and of forgetting since the chain's previous opportunity,
+        ``P(learned | previously unlearned, data)`` and
+        ``P(unlearned | previously learned, data)``. Entries at a chain's
+        first opportunity have no predecessor and carry no meaning.
+        """
+        n_persons, n_trials = responses.shape
+        shared = skill_assignments.ndim == 1
+        # Trial-major arrays keep every per-trial row contiguous.
+        trial_skills = (
+            skill_assignments[:, None]
+            if shared
+            else np.ascontiguousarray(skill_assignments.T)
         )
-        beta = self._backward_batch_shared_python(
-            responses,
-            skill_assignments,
-            scaling,
-            skill_trials,
+        # Emission tables are indexed by (skill, response + 1).
+        response_columns = np.ascontiguousarray(responses.T) + 1
+        no_response = np.ones(self.n_skills)
+        unlearned_emissions = np.column_stack(
+            [no_response, 1.0 - self.p_guess, self.p_guess]
+        )[trial_skills, response_columns]
+        learned_emissions = np.column_stack(
+            [no_response, self.p_slip, 1.0 - self.p_slip]
+        )[trial_skills, response_columns]
+        learn = self.p_learn[trial_skills]
+        forget = self.p_forget[trial_skills]
+
+        # Each (skill, learner) chain keeps its pending state in these arrays.
+        states = np.empty((2, self.n_skills, n_persons), dtype=np.float64)
+        states[0] = (1.0 - self.p_init)[:, None]
+        states[1] = self.p_init[:, None]
+        unlearned_states = states[0].reshape(-1)
+        learned_states = states[1].reshape(-1)
+        chain_index = (
+            None if shared else trial_skills * n_persons + np.arange(n_persons)
         )
-        alpha *= beta
-        gamma_sum = np.sum(alpha, axis=2, keepdims=True)
-        np.divide(
-            alpha,
-            gamma_sum,
-            out=alpha,
-            where=gamma_sum > 0.0,
-        )
-        log_likelihoods = np.sum(np.log(scaling + 1e-300), axis=1)
-        return alpha, log_likelihoods
+
+        def chain(trial: int) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+            if chain_index is None:
+                skill = trial_skills[trial, 0]
+                return states[0, skill], states[1, skill]
+            index = chain_index[trial]
+            return unlearned_states[index], learned_states[index]
+
+        def store(
+            trial: int,
+            unlearned: NDArray[np.float64],
+            learned: NDArray[np.float64],
+        ) -> None:
+            if chain_index is None:
+                skill = trial_skills[trial, 0]
+                states[0, skill] = unlearned
+                states[1, skill] = learned
+            else:
+                index = chain_index[trial]
+                unlearned_states[index] = unlearned
+                learned_states[index] = learned
+
+        posterior = np.empty((2, n_trials, n_persons), dtype=np.float64)
+        scaling = np.empty((n_trials, n_persons), dtype=np.float64)
+        for trial in range(n_trials):
+            prior_unlearned, prior_learned = chain(trial)
+            filtered_unlearned = np.multiply(
+                prior_unlearned, unlearned_emissions[trial], out=posterior[0, trial]
+            )
+            filtered_learned = np.multiply(
+                prior_learned, learned_emissions[trial], out=posterior[1, trial]
+            )
+            total = np.add(filtered_unlearned, filtered_learned, out=scaling[trial])
+            divisor = np.where(total > 0.0, total, 1.0)
+            filtered_unlearned /= divisor
+            filtered_learned /= divisor
+            store(
+                trial,
+                filtered_unlearned * (1.0 - learn[trial])
+                + filtered_learned * forget[trial],
+                filtered_unlearned * learn[trial]
+                + filtered_learned * (1.0 - forget[trial]),
+            )
+
+        states.fill(1.0)
+        for trial in range(n_trials - 1, -1, -1):
+            beta_unlearned, beta_learned = chain(trial)
+            weighted_unlearned = unlearned_emissions[trial] * beta_unlearned
+            weighted_learned = learned_emissions[trial] * beta_learned
+            posterior[0, trial] *= beta_unlearned
+            posterior[1, trial] *= beta_learned
+            if transition_out is not None:
+                # Each message to the previous opportunity sums over this
+                # trial's state, so its parts give the transition posteriors.
+                learned_part = learn[trial] * weighted_learned
+                unlearned_part = forget[trial] * weighted_unlearned
+                kept_unlearned = (1.0 - learn[trial]) * weighted_unlearned
+                kept_learned = (1.0 - forget[trial]) * weighted_learned
+                from_unlearned = kept_unlearned + learned_part
+                from_learned = unlearned_part + kept_learned
+                transition_out[0, trial] = learned_part / np.where(
+                    from_unlearned > 0.0, from_unlearned, 1.0
+                )
+                transition_out[1, trial] = unlearned_part / np.where(
+                    from_learned > 0.0, from_learned, 1.0
+                )
+            total = scaling[trial]
+            divisor = np.where(total > 0.0, total, 1.0)
+            store(
+                trial,
+                (
+                    (1.0 - learn[trial]) * weighted_unlearned
+                    + learn[trial] * weighted_learned
+                )
+                / divisor,
+                (
+                    forget[trial] * weighted_unlearned
+                    + (1.0 - forget[trial]) * weighted_learned
+                )
+                / divisor,
+            )
+
+        posterior_sum = posterior[0] + posterior[1]
+        posterior_sum[posterior_sum <= 0.0] = 1.0
+        posterior /= posterior_sum
+        log_likelihoods = np.sum(np.log(scaling + 1e-300), axis=0)
+        return posterior.transpose(2, 1, 0).copy(), log_likelihoods
 
     def forward_backward(
         self,
@@ -1873,52 +2001,79 @@ class BKTModel:
         responses: NDArray[np.int_],
         skill_assignments: NDArray[np.int_],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Run batch smoothing for validated inputs."""
+        """Run batch smoothing for validated inputs.
+
+        Shared layouts (including a matrix whose rows are all identical) use
+        the compiled kernel when it is available. With the compiled kernel,
+        person-specific layouts shared by at least
+        ``_BKT_NATIVE_LAYOUT_MIN_LEARNERS`` learners are also smoothed as
+        compiled batches. All other learners, and every learner on the NumPy
+        fallback, advance together through :meth:`_forward_backward_layouts`
+        whatever the number of distinct layouts.
+        """
+        n_persons = responses.shape[0]
+        if (
+            skill_assignments.ndim == 2
+            and n_persons > 0
+            and np.all(skill_assignments == skill_assignments[0])
+        ):
+            skill_assignments = skill_assignments[0]
         if skill_assignments.ndim == 1:
             native = self._native_forward_backward_batch(responses, skill_assignments)
             if native is not None:
                 return native
-            return self._forward_backward_batch_shared_python(
-                responses,
-                skill_assignments,
-            )
+            return self._forward_backward_layouts(responses, skill_assignments)
+        repeated_layouts = (
+            self._repeated_layout_rows(skill_assignments)
+            if self._can_use_native_inference()
+            else []
+        )
+        if not repeated_layouts:
+            return self._forward_backward_layouts(responses, skill_assignments)
 
         gamma = np.empty((*responses.shape, 2), dtype=np.float64)
-        log_likelihoods = np.empty(responses.shape[0], dtype=np.float64)
-        layout_rows: dict[bytes, list[int]] = {}
-        for row, layout in enumerate(skill_assignments):
-            layout_rows.setdefault(layout.tobytes(), []).append(row)
-
-        native_available = self._can_use_native_inference()
-        if not native_available and len(layout_rows) == responses.shape[0]:
-            for row, layout in enumerate(skill_assignments):
-                gamma[row], log_likelihoods[row] = self._forward_backward_python(
-                    responses[row], layout
-                )
-            return gamma, log_likelihoods
-
-        for row_group in layout_rows.values():
-            rows = np.asarray(row_group, dtype=np.intp)
-            layout = skill_assignments[row_group[0]]
-            layout_responses = responses[rows]
-            result = (
-                self._native_forward_backward_batch(layout_responses, layout)
-                if native_available
-                else None
+        log_likelihoods = np.empty(n_persons, dtype=np.float64)
+        remaining = np.ones(n_persons, dtype=np.bool_)
+        for rows in repeated_layouts:
+            native = self._native_forward_backward_batch(
+                responses[rows],
+                skill_assignments[rows[0]],
             )
-            if result is None:
-                if rows.size == 1:
-                    row = int(rows[0])
-                    gamma[row], log_likelihoods[row] = self._forward_backward_python(
-                        responses[row], layout
-                    )
-                    continue
-                result = self._forward_backward_batch_shared_python(
-                    layout_responses,
-                    layout,
-                )
-            gamma[rows], log_likelihoods[rows] = result
+            if native is not None:
+                gamma[rows], log_likelihoods[rows] = native
+                remaining[rows] = False
+
+        if np.any(remaining):
+            rows = np.flatnonzero(remaining)
+            gamma[rows], log_likelihoods[rows] = self._forward_backward_layouts(
+                responses[rows],
+                skill_assignments[rows],
+            )
         return gamma, log_likelihoods
+
+    @staticmethod
+    def _repeated_layout_rows(
+        skill_assignments: NDArray[np.int_],
+    ) -> list[NDArray[np.intp]]:
+        """Return rows sharing a layout with enough learners for compiled calls."""
+        layouts = np.ascontiguousarray(skill_assignments)
+        layout_keys = layouts.view(
+            np.dtype((np.void, layouts.dtype.itemsize * layouts.shape[1]))
+        ).ravel()
+        _, layout_ids, layout_counts = np.unique(
+            layout_keys,
+            return_inverse=True,
+            return_counts=True,
+        )
+        grouped_rows = np.split(
+            np.argsort(layout_ids, kind="stable"),
+            np.cumsum(layout_counts)[:-1],
+        )
+        return [
+            rows
+            for rows in grouped_rows
+            if rows.size >= _BKT_NATIVE_LAYOUT_MIN_LEARNERS
+        ]
 
     def viterbi(
         self,
@@ -3219,7 +3374,8 @@ class NonlinearGrowthModel:
     inflection : float
         Inflection point (γ), for logistic/Gompertz.
     initial_value : float
-        Value at t=0.
+        Reserved for backward compatibility; not used by the growth curves,
+        which are fully determined by the asymptote, rate and inflection.
     residual_variance : float
         Residual variance.
     """
@@ -3401,52 +3557,115 @@ class NonlinearGrowthModel:
         time_values: NDArray[np.float64],
         observations: NDArray[np.float64],
         max_iter: int = 100,
-    ) -> dict[str, float]:
-        """Fit model to individual trajectory.
+    ) -> dict[str, float | bool]:
+        """Fit the growth curve to one person's trajectory by least squares.
 
-        Uses simple gradient descent to estimate parameters.
+        The asymptote, rate and (for logistic and Gompertz curves) inflection
+        point are estimated jointly with a trust-region reflective
+        nonlinear least-squares solver. The rate is optimized on the log
+        scale so it stays positive and is bounded to ``[1e-8, 1e8]``; the
+        asymptote and inflection point are unconstrained, so declining
+        trajectories are fitted with a negative asymptote. Starting values
+        are the observation with the largest magnitude, ``self.rate`` and the
+        median time point.
 
         Parameters
         ----------
         time_values : NDArray
-            Time points.
+            One-dimensional finite time points.
         observations : NDArray
-            Observed values.
+            Finite observed values, one per time point. At least one more
+            observation than free parameters is required (three for the
+            exponential curve, four otherwise).
         max_iter : int
-            Maximum iterations.
+            Maximum number of residual evaluations used by the solver, not
+            counting those spent on finite-difference Jacobians.
 
         Returns
         -------
         dict
-            Estimated parameters.
+            ``asymptote``, ``rate`` and ``inflection`` estimates as floats,
+            ``converged`` (whether the solver met its tolerance with the rate
+            strictly inside its bounds) and ``sse`` (residual sum of
+            squares). Exponential curves do not depend on the inflection
+            point, so ``inflection`` is returned unchanged from the model.
         """
-        asymptote = float(np.max(observations))
-        rate = self.rate
-        inflection = float(time_values[len(time_values) // 2])
+        if self.growth_type not in ("exponential", "logistic", "gompertz"):
+            raise ValueError(f"Unknown growth type: {self.growth_type}")
+        times = np.asarray(time_values, dtype=np.float64)
+        values = np.asarray(observations, dtype=np.float64)
+        if times.ndim != 1 or values.ndim != 1:
+            raise ValueError("time_values and observations must be 1D arrays")
+        if times.shape != values.shape:
+            raise ValueError("time_values and observations must have the same length")
+        if not (np.all(np.isfinite(times)) and np.all(np.isfinite(values))):
+            raise ValueError("time_values and observations must be finite")
+        if isinstance(max_iter, bool) or not isinstance(max_iter, (int, np.integer)):
+            raise ValueError("max_iter must be a positive integer")
+        if max_iter < 1:
+            raise ValueError("max_iter must be a positive integer")
 
-        learning_rate = 0.01
-
-        for _ in range(max_iter):
-            pred = self.compute_theta(
-                time_values,
-                asymptote=asymptote,
-                rate=rate,
-                inflection=inflection,
+        fits_inflection = self.growth_type != "exponential"
+        n_free = 3 if fits_inflection else 2
+        if times.size < n_free + 1:
+            raise ValueError(
+                f"{self.growth_type} growth requires at least {n_free + 1} "
+                f"observations, got {times.size}"
             )
-            error = observations - pred
 
-            grad_a = -2 * np.mean(error * pred / asymptote)
-            asymptote -= learning_rate * grad_a
-            asymptote = max(0.1, asymptote)
+        fixed_inflection = float(self.inflection)
+        initial_rate = float(self.rate)
+        if not np.isfinite(initial_rate) or initial_rate <= 0.0:
+            initial_rate = 1.0
+        log_rate_bounds = (np.log(1e-8), np.log(1e8))
+        start = [
+            float(values[np.argmax(np.abs(values))]),
+            float(np.clip(np.log(initial_rate), *log_rate_bounds)),
+            float(np.median(times)),
+        ][:n_free]
+        lower = [-np.inf, log_rate_bounds[0], -np.inf][:n_free]
+        upper = [np.inf, log_rate_bounds[1], np.inf][:n_free]
 
-            if self.growth_type in ["logistic", "gompertz"]:
-                grad_g = 2 * np.mean(error * self.growth_velocity(time_values))
-                inflection -= learning_rate * grad_g
+        def residuals(parameters: NDArray[np.float64]) -> NDArray[np.float64]:
+            inflection = parameters[2] if fits_inflection else fixed_inflection
+            with np.errstate(over="ignore", invalid="ignore"):
+                fitted = self.compute_theta(
+                    times,
+                    asymptote=parameters[0],
+                    rate=np.exp(parameters[1]),
+                    inflection=inflection,
+                )
+            return np.asarray(fitted - values, dtype=np.float64)
 
+        initial = np.asarray(start, dtype=np.float64)
+        if not np.all(np.isfinite(residuals(initial))):
+            raise ValueError(
+                f"{self.growth_type} growth curve overflows at the starting "
+                "values; rescale time_values"
+            )
+        result = least_squares(
+            residuals,
+            initial,
+            method="trf",
+            bounds=(lower, upper),
+            max_nfev=int(max_iter),
+        )
+        estimates = np.asarray(result.x, dtype=np.float64)
+        sse = float(np.sum(np.square(result.fun)))
+        converged = bool(
+            result.success
+            and np.all(np.isfinite(estimates))
+            and np.isfinite(sse)
+            and result.active_mask[1] == 0
+        )
         return {
-            "asymptote": asymptote,
-            "rate": rate,
-            "inflection": inflection,
+            "asymptote": float(estimates[0]),
+            "rate": float(np.exp(estimates[1])),
+            "inflection": (
+                float(estimates[2]) if fits_inflection else fixed_inflection
+            ),
+            "converged": converged,
+            "sse": sse,
         }
 
 
@@ -3722,85 +3941,17 @@ class GrowthMixtureModel:
             )
         return observation_values, times, trajectories, variances, observation_mask
 
-    @staticmethod
-    def _prepare_observation_patterns(
-        observations: NDArray[np.float64],
-        times: NDArray[np.float64],
-        variances: tuple[float, float, float],
-        observation_mask: NDArray[np.bool_] | None,
-    ) -> list[_GrowthObservationPattern]:
-        """Group rows by observed occasions and factor each covariance once."""
-        if observation_mask is None:
-            unique_patterns = np.ones((1, observations.shape[1]), dtype=np.bool_)
-            row_groups = [np.arange(observations.shape[0], dtype=np.int_)]
-        else:
-            unique_patterns, inverse, counts = np.unique(
-                observation_mask,
-                axis=0,
-                return_inverse=True,
-                return_counts=True,
-            )
-            grouped_rows = np.argsort(inverse, kind="stable")
-            row_groups = np.split(grouped_rows, np.cumsum(counts)[:-1])
-
-        intercept_variance, slope_variance, residual_variance = variances
-        patterns = []
-        for pattern, rows in zip(unique_patterns, row_groups, strict=True):
-            columns = np.flatnonzero(pattern)
-            covariance = _GrowthCovariance.from_time_values(
-                times[columns],
-                intercept_variance,
-                slope_variance,
-                residual_variance,
-            )
-            patterns.append(
-                _GrowthObservationPattern(
-                    rows=rows,
-                    columns=columns,
-                    covariance=covariance,
-                )
-            )
-        return patterns
-
-    def _class_log_likelihood_from_patterns(
+    def _class_log_likelihood_from_covariance(
         self,
-        observations: NDArray[np.float64],
+        masked_observations: NDArray[np.float64],
         trajectories: NDArray[np.float64],
-        patterns: list[_GrowthObservationPattern],
+        covariance: _MaskedGrowthCovariance,
     ) -> NDArray[np.float64]:
-        """Evaluate validated trajectories using prepared observation patterns."""
-        if len(patterns) == 1 and patterns[0].columns.size == observations.shape[1]:
-            return self._complete_class_log_likelihood(
-                observations,
-                trajectories,
-                patterns[0].covariance,
-            )
-
-        log_likelihoods = np.empty(
-            (observations.shape[0], self.n_classes),
-            dtype=np.float64,
-        )
-        for pattern in patterns:
-            values = observations[np.ix_(pattern.rows, pattern.columns)]
-            class_trajectories = trajectories[:, pattern.columns]
-            log_likelihoods[pattern.rows] = self._complete_class_log_likelihood(
-                values,
-                class_trajectories,
-                pattern.covariance,
-            )
-        return log_likelihoods
-
-    def _complete_class_log_likelihood(
-        self,
-        observations: NDArray[np.float64],
-        trajectories: NDArray[np.float64],
-        covariance: _GrowthCovariance,
-    ) -> NDArray[np.float64]:
-        """Evaluate one fully observed trajectory matrix."""
-        if covariance.orthonormal_basis is None:
+        """Evaluate class log likelihoods for zero-filled observation rows."""
+        if covariance.observation_mask is None and not covariance.has_random_effects:
             quadratic_forms = (
                 cdist(
-                    observations,
+                    masked_observations,
                     trajectories,
                     metric="sqeuclidean",
                 )
@@ -3808,18 +3959,19 @@ class GrowthMixtureModel:
             )
         else:
             quadratic_forms = np.empty(
-                (observations.shape[0], self.n_classes),
+                (masked_observations.shape[0], self.n_classes),
                 dtype=np.float64,
             )
             for class_index, trajectory in enumerate(trajectories):
                 quadratic_forms[:, class_index] = covariance.quadratic_forms(
-                    observations - trajectory
+                    masked_observations - covariance.masked(trajectory)
                 )
 
         normalization = (
-            observations.shape[1] * np.log(2.0 * np.pi) + covariance.log_determinant
+            covariance.observation_counts * np.log(2.0 * np.pi)
+            + covariance.log_determinants
         )
-        return -0.5 * (quadratic_forms + normalization)
+        return -0.5 * (quadratic_forms + normalization[:, None])
 
     def class_log_likelihood(
         self,
@@ -3846,9 +3998,11 @@ class GrowthMixtureModel:
         Notes
         -----
         The marginal trajectory covariance is
-        ``intercept_var * 1 1^T + slope_var * t t^T + residual_variance * I``.
-        It is evaluated through its low-rank random-effect basis without
-        constructing a dense time-by-time covariance matrix.
+        ``intercept_var * 1 1^T + slope_var * t t^T + residual_variance * I``,
+        restricted to each person's observed occasions. It is evaluated for
+        all persons at once through the Woodbury and Sylvester identities on
+        the rank-two random-effect basis, without constructing dense
+        time-by-time covariance matrices.
         """
         values, times, trajectories, variances, observation_mask = (
             self._validated_trajectory_data(
@@ -3856,16 +4010,15 @@ class GrowthMixtureModel:
                 time_values,
             )
         )
-        patterns = self._prepare_observation_patterns(
-            values,
+        covariance = _MaskedGrowthCovariance.from_time_values(
             times,
             variances,
             observation_mask,
         )
-        return self._class_log_likelihood_from_patterns(
-            values,
+        return self._class_log_likelihood_from_covariance(
+            covariance.masked(values),
             trajectories,
-            patterns,
+            covariance,
         )
 
     def _posterior_from_log_likelihoods(
@@ -4028,7 +4181,15 @@ class GrowthMixtureModel:
         include_residual: bool,
         compute_variance: bool,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
-        """Compute grouped conditional trajectory moments."""
+        """Compute conditional trajectory moments for every person at once.
+
+        Given class ``k``, the standardized random effects have posterior mean
+        ``c_ik = M_i^{-1} B_i^T r_ik`` and covariance
+        ``residual_variance * M_i^{-1}`` (see :class:`_MaskedGrowthCovariance`),
+        so predictions at new times only need the 2-column prediction basis.
+        Class mixtures are accumulated with a weighted Welford update to keep
+        small between-class spreads accurate at large offsets.
+        """
         values, times, trajectories, variances, observation_mask = (
             self._validated_trajectory_data(
                 observations,
@@ -4050,133 +4211,76 @@ class GrowthMixtureModel:
                 piecewise_changepoint=prediction_changepoint,
             )
 
-        patterns = self._prepare_observation_patterns(
-            values,
+        covariance = _MaskedGrowthCovariance.from_time_values(
             times,
             variances,
             observation_mask,
         )
-        log_likelihoods = self._class_log_likelihood_from_patterns(
-            values,
+        masked_values = covariance.masked(values)
+        log_likelihoods = self._class_log_likelihood_from_covariance(
+            masked_values,
             trajectories,
-            patterns,
+            covariance,
         )
         posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
-        intercept_variance, slope_variance, _ = variances
-        predictions = np.empty(
-            (values.shape[0], prediction_values.size),
-            dtype=np.float64,
-        )
-        prediction_variances = np.empty_like(predictions) if compute_variance else None
-        prior_random_variance = (
-            intercept_variance + slope_variance * prediction_values**2
-            if compute_variance
-            else None
+        intercept_variance, slope_variance, residual_variance = variances
+        prediction_basis = _MaskedGrowthCovariance.random_effect_basis(
+            prediction_values,
+            intercept_variance,
+            slope_variance,
         )
 
-        for pattern in patterns:
-            pattern_posteriors = posteriors[pattern.rows]
-            if compute_variance:
-                pattern_predictions = np.zeros(
-                    (pattern.rows.size, prediction_values.size),
-                    dtype=np.float64,
-                )
-                between_class_variance = np.zeros_like(pattern_predictions)
-                cumulative_class_mass = np.zeros(pattern.rows.size, dtype=np.float64)
-            else:
-                pattern_predictions = pattern_posteriors @ prediction_trajectories
-                between_class_variance = None
-                cumulative_class_mass = None
-            conditional_variance = (
-                prior_random_variance.copy()
-                if prior_random_variance is not None
-                else None
-            )
-            has_random_effects = intercept_variance > 0.0 or slope_variance > 0.0
-            if has_random_effects:
-                observed_times = times[pattern.columns]
-                cross_covariance = np.full(
-                    (prediction_values.size, pattern.columns.size),
-                    intercept_variance,
-                    dtype=np.float64,
-                )
-                if slope_variance > 0.0:
-                    cross_covariance += slope_variance * np.outer(
-                        prediction_values,
-                        observed_times,
-                    )
-                if conditional_variance is not None:
-                    precision_cross_covariance = pattern.covariance.solve(
-                        cross_covariance.T
-                    )
-                    conditional_variance -= np.einsum(
-                        "ij,ji->i",
-                        cross_covariance,
-                        precision_cross_covariance,
-                    )
-                pattern_values = values[np.ix_(pattern.rows, pattern.columns)]
-            else:
-                cross_covariance = None
-                pattern_values = None
+        def class_corrections(class_index: int) -> NDArray[np.float64]:
+            residuals = masked_values - covariance.masked(trajectories[class_index])
+            effects = covariance.random_effect_means(residuals)
+            return effects @ prediction_basis.T
 
-            if has_random_effects or compute_variance:
+        if not compute_variance:
+            predictions = posteriors @ prediction_trajectories
+            if covariance.has_random_effects:
                 for class_index in range(self.n_classes):
-                    if pattern_values is not None and cross_covariance is not None:
-                        residuals = (
-                            pattern_values - trajectories[class_index, pattern.columns]
-                        )
-                        precision_residuals = pattern.covariance.solve(residuals.T).T
-                        correction = precision_residuals @ cross_covariance.T
-                    else:
-                        correction = 0.0
+                    predictions += posteriors[:, class_index, None] * class_corrections(
+                        class_index
+                    )
+            return predictions, None
 
-                    class_weights = pattern_posteriors[:, class_index]
-                    if (
-                        between_class_variance is not None
-                        and cumulative_class_mass is not None
-                    ):
-                        class_predictions = (
-                            prediction_trajectories[class_index] + correction
-                        )
-                        updated_class_mass = cumulative_class_mass + class_weights
-                        relative_weight = np.divide(
-                            class_weights,
-                            updated_class_mass,
-                            out=np.zeros_like(class_weights),
-                            where=updated_class_mass > 0.0,
-                        )
-                        difference = class_predictions - pattern_predictions
-                        updated_predictions = (
-                            pattern_predictions + relative_weight[:, None] * difference
-                        )
-                        between_class_variance += class_weights[:, None] * (
-                            difference * (class_predictions - updated_predictions)
-                        )
-                        pattern_predictions = updated_predictions
-                        cumulative_class_mass = updated_class_mass
-                    else:
-                        pattern_predictions += class_weights[:, None] * correction
+        n_persons = values.shape[0]
+        predictions = np.zeros((n_persons, prediction_values.size), dtype=np.float64)
+        between_class_variance = np.zeros_like(predictions)
+        cumulative_class_mass = np.zeros(n_persons, dtype=np.float64)
+        for class_index in range(self.n_classes):
+            class_predictions = prediction_trajectories[class_index] + (
+                class_corrections(class_index) if covariance.has_random_effects else 0.0
+            )
+            class_weights = posteriors[:, class_index]
+            updated_class_mass = cumulative_class_mass + class_weights
+            relative_weight = np.divide(
+                class_weights,
+                updated_class_mass,
+                out=np.zeros_like(class_weights),
+                where=updated_class_mass > 0.0,
+            )
+            difference = class_predictions - predictions
+            updated_predictions = predictions + relative_weight[:, None] * difference
+            between_class_variance += class_weights[:, None] * (
+                difference * (class_predictions - updated_predictions)
+            )
+            predictions = updated_predictions
+            cumulative_class_mass = updated_class_mass
 
-            predictions[pattern.rows] = pattern_predictions
-            if (
-                prediction_variances is not None
-                and between_class_variance is not None
-                and cumulative_class_mass is not None
-                and conditional_variance is not None
-            ):
-                if include_residual:
-                    conditional_variance += variances[2]
-                prediction_variances[pattern.rows] = np.maximum(
-                    conditional_variance
-                    + np.divide(
-                        between_class_variance,
-                        cumulative_class_mass[:, None],
-                        out=np.zeros_like(between_class_variance),
-                        where=cumulative_class_mass[:, None] > 0.0,
-                    ),
-                    0.0,
-                )
-
+        conditional_variance = covariance.conditional_variances(prediction_basis)
+        if include_residual:
+            conditional_variance = conditional_variance + residual_variance
+        prediction_variances = np.maximum(
+            conditional_variance
+            + np.divide(
+                between_class_variance,
+                cumulative_class_mass[:, None],
+                out=np.zeros_like(between_class_variance),
+                where=cumulative_class_mass[:, None] > 0.0,
+            ),
+            0.0,
+        )
         return predictions, prediction_variances
 
     def simulate(
@@ -4341,36 +4445,33 @@ class GrowthMixtureModel:
                 dtype=np.float64,
             ).copy()
 
-        patterns = self._prepare_observation_patterns(
-            observations,
+        covariance = _MaskedGrowthCovariance.from_time_values(
             times,
             variances,
             observation_mask,
         )
-        complete_data = (
-            len(patterns) == 1 and patterns[0].columns.size == observations.shape[1]
-        )
-        pattern_updates = (
-            []
-            if complete_data
-            else [
-                (
-                    pattern,
-                    design[pattern.columns],
-                    design[pattern.columns].T
-                    @ pattern.covariance.solve(design[pattern.columns]),
-                )
-                for pattern in patterns
-            ]
-        )
+        observations = covariance.masked(observations)
+        complete_data = observation_mask is None
+        if not complete_data:
+            # Fixed variance components make each person's GLS terms
+            # X_i^T Sigma_i^{-1} X_i and X_i^T Sigma_i^{-1} y_i constant across
+            # iterations, so the M-step reduces to posterior-weighted sums.
+            precision_grams = np.stack(
+                [
+                    covariance.solve(covariance.masked(column)) @ design
+                    for column in design.T
+                ],
+                axis=2,
+            )
+            precision_observations = covariance.solve(observations) @ design
 
         converged = False
         for iteration in range(max_iter):
             trajectories = self._validated_class_trajectories(times)
-            log_likelihoods = self._class_log_likelihood_from_patterns(
+            log_likelihoods = self._class_log_likelihood_from_covariance(
                 observations,
                 trajectories,
-                patterns,
+                covariance,
             )
             posteriors, _ = self._posterior_from_log_likelihoods(log_likelihoods)
 
@@ -4395,26 +4496,10 @@ class GrowthMixtureModel:
                     rcond=None,
                 )[0].T
             else:
-                normal_matrices = np.zeros(
-                    (self.n_classes, design.shape[1], design.shape[1]),
-                    dtype=np.float64,
+                normal_matrices = np.tensordot(
+                    posteriors, precision_grams, axes=([0], [0])
                 )
-                right_hand_sides = np.zeros(
-                    (self.n_classes, design.shape[1]),
-                    dtype=np.float64,
-                )
-                for pattern, pattern_design, precision_gram in pattern_updates:
-                    pattern_posteriors = posteriors[pattern.rows]
-                    pattern_mass = np.sum(pattern_posteriors, axis=0)
-                    weighted_observations = (
-                        pattern_posteriors.T
-                        @ observations[np.ix_(pattern.rows, pattern.columns)]
-                    )
-                    precision_weighted_observations = pattern.covariance.solve(
-                        weighted_observations.T
-                    ).T
-                    normal_matrices += pattern_mass[:, None, None] * precision_gram
-                    right_hand_sides += precision_weighted_observations @ pattern_design
+                right_hand_sides = posteriors.T @ precision_observations
 
                 coefficients = np.column_stack(
                     [self.class_intercepts, self.class_slopes]
@@ -4463,10 +4548,10 @@ class GrowthMixtureModel:
                 break
 
         final_trajectories = self._validated_class_trajectories(times)
-        final_log_likelihoods = self._class_log_likelihood_from_patterns(
+        final_log_likelihoods = self._class_log_likelihood_from_covariance(
             observations,
             final_trajectories,
-            patterns,
+            covariance,
         )
         final_posteriors, log_normalizer = self._posterior_from_log_likelihoods(
             final_log_likelihoods

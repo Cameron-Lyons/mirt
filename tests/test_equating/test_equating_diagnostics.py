@@ -632,6 +632,246 @@ class TestDeltaMethodSE:
         assert se_a > 0
         assert se_b > 0
 
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    def test_implicit_curve_derivatives_match_reoptimization(self, method):
+        """Implicit-function derivatives equal tightly re-optimized ones."""
+        from scipy.optimize import least_squares
+        from scipy.special import expit
+
+        rng = np.random.default_rng(4)
+        n_items = 5
+        old_a = rng.uniform(0.7, 1.8, n_items)
+        old_b = np.linspace(-1.5, 1.5, n_items)
+        guessing = np.linspace(0.05, 0.25, n_items)
+        new_a = old_a * 1.2 * np.exp(rng.normal(0, 0.1, n_items))
+        new_b = (old_b - 0.3) / 1.2 + rng.normal(0, 0.1, n_items)
+        model_old = ThreeParameterLogistic(n_items=n_items)
+        model_new = ThreeParameterLogistic(n_items=n_items)
+        model_old.set_parameters(
+            discrimination=old_a, difficulty=old_b, guessing=guessing
+        )
+        model_new.set_parameters(
+            discrimination=new_a, difficulty=new_b, guessing=guessing
+        )
+        anchors = list(range(n_items))
+        size = model_old.n_parameters
+        root = rng.normal(0.0, 0.05, (size, size))
+        vcov = root @ root.T + 1e-3 * np.eye(size)
+        result = link(model_old, model_new, anchors, anchors, method=method)
+
+        se = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        theta = np.linspace(-4.0, 4.0, 61)
+        root_weights = np.sqrt(np.exp(-0.5 * theta**2) / np.exp(-0.5 * theta**2).sum())
+
+        def fit(parameters):
+            a_o, b_o, c_o, a_n, b_n, c_n = np.split(parameters, 6)
+            curves_old = c_o + (1 - c_o) * expit(a_o * (theta[:, None] - b_o))
+
+            def residual(x):
+                grid = (theta - x[1]) / np.exp(x[0])
+                curves_new = c_n + (1 - c_n) * expit(a_n * (grid[:, None] - b_n))
+                difference = curves_old - curves_new
+                if method == "haebara":
+                    return (root_weights[:, None] * difference).ravel()
+                return root_weights * difference.sum(axis=1)
+
+            start = [np.log(result.constants.A), result.constants.B]
+            solution = least_squares(
+                residual, start, method="lm", xtol=1e-15, ftol=1e-15, gtol=1e-15
+            )
+            return np.array([np.exp(solution.x[0]), solution.x[1]])
+
+        parameters = np.concatenate([old_a, old_b, guessing, new_a, new_b, guessing])
+        jacobian = np.empty((2, parameters.size))
+        for index in range(parameters.size):
+            step = 1e-4 * max(1.0, abs(parameters[index]))
+            upper, lower = parameters.copy(), parameters.copy()
+            upper[index] += step
+            lower[index] -= step
+            jacobian[:, index] = (fit(upper) - fit(lower)) / (2.0 * step)
+        covariance = np.zeros((2 * size, 2 * size))
+        covariance[:size, :size] = vcov
+        covariance[size:, size:] = vcov
+        expected = np.sqrt(np.diag(jacobian @ covariance @ jacobian.T))
+
+        np.testing.assert_allclose(se, expected, rtol=5e-5)
+
+    def test_native_curve_family_uses_model_curves(self):
+        """Non-logistic families propagate through their own response curves."""
+        from scipy.optimize import least_squares
+
+        from mirt.models.dichotomous import ComplementaryLogLog
+
+        n_items = 4
+        model_old = ComplementaryLogLog(n_items)
+        model_new = ComplementaryLogLog(n_items)
+        old_a = np.array([0.8, 1.1, 1.4, 1.7])
+        old_b = np.array([-1.2, -0.3, 0.4, 1.3])
+        model_old.set_parameters(discrimination=old_a, difficulty=old_b)
+        model_new.set_parameters(
+            discrimination=old_a * np.array([1.25, 1.15, 1.3, 1.2]),
+            difficulty=(old_b - 0.3) / 1.2 + np.array([0.1, -0.05, 0.08, -0.1]),
+        )
+        anchors = list(range(n_items))
+        size = model_old.n_parameters
+        vcov = np.eye(size) * 0.01
+        result = link(model_old, model_new, anchors, anchors)
+
+        se = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+
+        theta = np.linspace(-4.0, 4.0, 61)
+        root_weights = np.sqrt(np.exp(-0.5 * theta**2) / np.exp(-0.5 * theta**2).sum())
+
+        def fit(parameters):
+            old = ComplementaryLogLog(n_items)
+            new = ComplementaryLogLog(n_items)
+            old.set_parameters(discrimination=parameters[0], difficulty=parameters[1])
+            new.set_parameters(discrimination=parameters[2], difficulty=parameters[3])
+            curves_old = old.probability(theta[:, None]).sum(axis=1)
+
+            def residual(x):
+                grid = (theta - x[1]) / np.exp(x[0])
+                return root_weights * (
+                    curves_old - new.probability(grid[:, None]).sum(axis=1)
+                )
+
+            start = [np.log(result.constants.A), result.constants.B]
+            solution = least_squares(
+                residual, start, method="lm", xtol=1e-15, ftol=1e-15, gtol=1e-15
+            )
+            return np.array([np.exp(solution.x[0]), solution.x[1]])
+
+        parameters = np.array(
+            [old_a, old_b, model_new.discrimination, model_new.difficulty]
+        )
+        jacobian = np.empty((2, parameters.size))
+        for index in range(parameters.size):
+            row, column = divmod(index, n_items)
+            step = 1e-4 * max(1.0, abs(parameters[row, column]))
+            upper, lower = parameters.copy(), parameters.copy()
+            upper[row, column] += step
+            lower[row, column] -= step
+            jacobian[:, index] = (fit(upper) - fit(lower)) / (2.0 * step)
+        expected = np.sqrt(0.01 * np.sum(jacobian**2, axis=1))
+
+        np.testing.assert_allclose(se, expected, rtol=1e-4)
+
+    def test_native_asymptote_on_its_bound_is_probed_inside_it(self):
+        """A zero lower asymptote gets one-sided differences, not a rejection."""
+        from mirt.models.zeroinflated import ZeroInflated2PL, ZeroInflated3PL
+
+        n_items = 5
+        old_a = np.array([0.8, 1.0, 1.2, 1.4, 1.6])
+        old_b = np.array([-1.2, -0.5, 0.0, 0.6, 1.3])
+        values = {
+            "old": {"discrimination": old_a, "difficulty": old_b},
+            "new": {
+                "discrimination": old_a * np.array([1.25, 1.15, 1.3, 1.2, 1.1]),
+                "difficulty": (old_b - 0.3) / 1.2
+                + np.array([0.1, -0.05, 0.08, -0.1, 0.02]),
+            },
+        }
+        zero_inflation = np.array([0.05, 0.1, 0.0, 0.2, 0.1])
+        anchors = list(range(n_items))
+        rng = np.random.default_rng(9)
+        root = rng.normal(0.0, 0.05, (2 * n_items, 2 * n_items))
+        location_covariance = root @ root.T
+
+        def standard_errors(model_type, guessing_variance=0.0):
+            forms = []
+            for label in ("old", "new"):
+                model = model_type(n_items)
+                model.set_parameters(**values[label], zero_inflation=zero_inflation)
+                if model_type is ZeroInflated3PL:
+                    # Guessing exactly on its lower bound makes ZI-3PL curves
+                    # identical to ZI-2PL curves.
+                    model.set_parameters(guessing=np.zeros(n_items))
+                forms.append(model)
+            vcov = np.zeros((forms[0].n_parameters, forms[0].n_parameters))
+            vcov[: 2 * n_items, : 2 * n_items] = location_covariance
+            if model_type is ZeroInflated3PL:
+                guessing = slice(2 * n_items, 3 * n_items)
+                vcov[guessing, guessing] = guessing_variance * np.eye(n_items)
+            result = link(*forms, anchors, anchors, method="haebara")
+            return np.array(
+                delta_method_se(
+                    result,
+                    vcov,
+                    vcov,
+                    anchors,
+                    anchors,
+                    model_old=forms[0],
+                    model_new=forms[1],
+                )
+            )
+
+        without_guessing = standard_errors(ZeroInflated2PL)
+        np.testing.assert_allclose(
+            standard_errors(ZeroInflated3PL), without_guessing, rtol=1e-8
+        )
+        with_guessing = standard_errors(ZeroInflated3PL, guessing_variance=1e-4)
+        assert np.all(np.isfinite(with_guessing))
+        assert np.all(with_guessing > without_guessing)
+
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    def test_curve_uncertainty_accepts_tied_reference_difficulties(self, method):
+        """Tied reference difficulties fall back to a mean/mean start."""
+        anchors = [0, 1, 2, 3]
+        model_old = TwoParameterLogistic(n_items=4)
+        model_new = TwoParameterLogistic(n_items=4)
+        model_old.set_parameters(
+            discrimination=np.array([1.0, 1.2, 0.8, 1.5]), difficulty=np.zeros(4)
+        )
+        model_new.set_parameters(
+            discrimination=np.array([1.1, 1.3, 0.9, 1.4]),
+            difficulty=np.array([0.1, -0.1, 0.05, -0.02]),
+        )
+        result = link(model_old, model_new, anchors, anchors, method=method)
+        vcov = np.eye(model_old.n_parameters) * 0.01
+
+        delta = delta_method_se(
+            result,
+            vcov,
+            vcov,
+            anchors,
+            anchors,
+            model_old=model_old,
+            model_new=model_new,
+        )
+        bootstrap = bootstrap_linking_se(
+            model_old,
+            model_new,
+            None,
+            None,
+            anchors,
+            anchors,
+            method=method,
+            n_bootstrap=5,
+            seed=1,
+        )
+
+        assert np.all(np.isfinite(delta)) and np.all(np.asarray(delta) > 0)
+        assert np.all(np.isfinite(bootstrap[:2])) and np.all(
+            np.asarray(bootstrap[:2]) > 0
+        )
+
 
 class TestComputeLinkingFit:
     """Tests for compute_linking_fit function."""

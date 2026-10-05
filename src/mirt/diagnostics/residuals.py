@@ -21,12 +21,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.data import _missing_coded_responses
+from mirt.utils.numeric import (
+    _fit_cell_terms,
+    _FitStatsAccumulator,
+    _fourth_central_moment,
+)
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 _RESIDUAL_TYPES = frozenset({"raw", "standardized", "pearson", "deviance"})
@@ -43,86 +50,48 @@ class _ResidualComputation:
     variances: NDArray[np.float64] | None
 
 
-@dataclass
-class _FitAccumulator:
-    """Sums and counts needed to finalize item and person fit statistics."""
+class _ItemPersonFit:
+    """Item and person mean-square totals built on the shared fit accumulator.
 
-    item_square_sum: NDArray[np.float64]
-    item_weighted_sum: NDArray[np.float64]
-    item_variance_sum: NDArray[np.float64]
-    item_n: NDArray[np.intp]
-    person_square_sum: NDArray[np.float64]
-    person_weighted_sum: NDArray[np.float64]
-    person_variance_sum: NDArray[np.float64]
-    person_n: NDArray[np.intp]
+    Item and person statistics therefore follow exactly the same rules as
+    :func:`~mirt.diagnostics.itemfit.compute_itemfit` and
+    :func:`~mirt.diagnostics.personfit.compute_personfit`.
+    """
 
-    @classmethod
-    def create(cls, n_persons: int, n_items: int) -> _FitAccumulator:
-        """Create a zeroed accumulator for a response matrix shape."""
-        return cls(
-            item_square_sum=np.zeros(n_items),
-            item_weighted_sum=np.zeros(n_items),
-            item_variance_sum=np.zeros(n_items),
-            item_n=np.zeros(n_items, dtype=np.intp),
-            person_square_sum=np.zeros(n_persons),
-            person_weighted_sum=np.zeros(n_persons),
-            person_variance_sum=np.zeros(n_persons),
-            person_n=np.zeros(n_persons, dtype=np.intp),
-        )
-
-    def finish(self) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
-        """Finalize fit means and retain their observation counts."""
-        return {
-            "item_outfit": np.divide(
-                self.item_square_sum,
-                self.item_n,
-                out=np.full(self.item_square_sum.shape, np.nan),
-                where=self.item_n > 0,
-            ),
-            "item_infit": np.divide(
-                self.item_weighted_sum,
-                self.item_variance_sum + PROB_EPSILON,
-                out=np.full(self.item_weighted_sum.shape, np.nan),
-                where=self.item_n > 0,
-            ),
-            "person_outfit": np.divide(
-                self.person_square_sum,
-                self.person_n,
-                out=np.full(self.person_square_sum.shape, np.nan),
-                where=self.person_n > 0,
-            ),
-            "person_infit": np.divide(
-                self.person_weighted_sum,
-                self.person_variance_sum + PROB_EPSILON,
-                out=np.full(self.person_weighted_sum.shape, np.nan),
-                where=self.person_n > 0,
-            ),
-            "item_n": self.item_n,
-            "person_n": self.person_n,
-        }
+    def __init__(
+        self, n_persons: int, n_items: int, *, standardized: bool = False
+    ) -> None:
+        self.items = _FitStatsAccumulator(n_items, standardized=standardized)
+        self.persons = _FitStatsAccumulator(n_persons, standardized=standardized)
+        self.item_n = np.zeros(n_items, dtype=np.intp)
+        self.person_n = np.zeros(n_persons, dtype=np.intp)
 
     def add(
         self,
-        residuals: NDArray[np.float64],
-        variances: NDArray[np.float64],
+        responses: NDArray[np.float64],
+        expected: NDArray[np.float64],
+        variance: NDArray[np.float64],
         *,
-        rows: slice = slice(None),
+        items: slice = slice(None),
+        persons: slice = slice(None),
+        fourth_moment: NDArray[np.float64] | None = None,
     ) -> None:
-        """Reduce a row block without retaining its temporary arrays."""
-        valid = np.isfinite(residuals)
-        squared = np.zeros_like(residuals)
-        np.square(residuals, out=squared, where=valid)
-        self.item_square_sum += np.sum(squared, axis=0)
-        self.item_n += np.sum(valid, axis=0, dtype=np.intp)
-        self.person_square_sum[rows] += np.sum(squared, axis=1)
-        self.person_n[rows] += np.sum(valid, axis=1, dtype=np.intp)
-        self.item_variance_sum += np.sum(variances, axis=0, where=valid, initial=0.0)
-        self.person_variance_sum[rows] += np.sum(
-            variances, axis=1, where=valid, initial=0.0
-        )
-        np.multiply(squared, variances, out=squared, where=valid)
-        self.item_weighted_sum += np.sum(squared, axis=0)
-        self.person_weighted_sum[rows] += np.sum(squared, axis=1)
+        """Add a person-by-item block; negative codes are missing."""
+        terms = _fit_cell_terms(responses, expected, variance, fourth_moment)
+        self.item_n[items] += np.count_nonzero(terms.observed, axis=0)
+        self.person_n[persons] += np.count_nonzero(terms.observed, axis=1)
+        self.items.add_terms(terms, axis=0, target=items)
+        self.persons.add_terms(terms, axis=1, target=persons)
+
+    def finish(self) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
+        """Finalize item and person statistics and their valid counts."""
+        result: dict[str, NDArray[np.float64] | NDArray[np.intp]] = {}
+        for prefix, accumulator in (("item", self.items), ("person", self.persons)):
+            for name, values in accumulator.statistics().items():
+                result[f"{prefix}_{name}"] = values
+        result["item_n"] = self.item_n
+        result["person_n"] = self.person_n
+        return result
 
 
 @dataclass
@@ -204,24 +173,31 @@ class ResidualAnalysisResult:
 
 
 def _resolve_theta(
-    model: BaseItemModel,
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None,
-) -> NDArray[np.float64]:
-    """Return ability estimates in the shape expected by item models."""
+) -> tuple[BaseItemModel, NDArray[np.float64]]:
+    """Return the item model and abilities in the shape it expects.
+
+    Omitted abilities are EAP scores under the latent population of a
+    ``FitResult``, as :func:`mirt.fscores` computes them.
+    """
+    from mirt.results._common import resolve_item_model
+
+    model: BaseItemModel = resolve_item_model(model_or_result)
     if theta is None:
         from mirt.scoring import fscores
 
-        theta = fscores(model, responses, method="EAP").theta
+        theta = fscores(model_or_result, responses, method="EAP").theta
 
     theta_array = np.asarray(theta)
     if theta_array.ndim == 1:
-        return theta_array.reshape(-1, 1)
+        return model, theta_array.reshape(-1, 1)
 
     theta_array = np.atleast_2d(theta_array)
     if theta_array.shape[0] == 1 and responses.shape[0] > 1:
         theta_array = theta_array.T
-    return theta_array
+    return model, theta_array
 
 
 def _item_expected_value_variance(
@@ -345,7 +321,7 @@ def _compute_batched_residual_arrays(
         residuals["pearson"] = raw / np.sqrt(expected + PROB_EPSILON)
     if "deviance" in residual_types:
         if probabilities.ndim == 3:
-            safe_responses = np.where(valid, responses, 0)
+            safe_responses = np.where(valid, responses, 0).astype(np.intp)
             observed_probability = np.take_along_axis(
                 probabilities,
                 safe_responses[:, :, None],
@@ -429,7 +405,7 @@ def _compute_residual_arrays(
         if "deviance" in residuals:
             with np.errstate(divide="ignore", invalid="ignore"):
                 if probs.ndim == 2:
-                    p_obs = probs[valid, observed]
+                    p_obs = probs[valid, observed.astype(np.intp)]
                 else:
                     p_obs = np.where(observed == 1, probs[valid], 1 - probs[valid])
                 p_obs = np.clip(p_obs, PROB_EPSILON, 1 - PROB_EPSILON)
@@ -441,8 +417,8 @@ def _compute_residual_arrays(
 
 
 def compute_residuals(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     residual_type: str = "standardized",
 ) -> NDArray[np.float64]:
@@ -450,10 +426,12 @@ def compute_residuals(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates. If None, EAP estimates are computed.
     residual_type : str
@@ -464,11 +442,11 @@ def compute_residuals(
     ndarray
         Residual matrix of same shape as responses
     """
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     if residual_type not in _RESIDUAL_TYPES:
         raise ValueError(f"Unknown residual type: {residual_type}")
 
-    theta_array = _resolve_theta(model, responses, theta)
+    model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
         responses,
@@ -479,18 +457,20 @@ def compute_residuals(
 
 
 def analyze_residuals(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
 ) -> ResidualAnalysisResult:
     """Comprehensive residual analysis for IRT model.
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
 
@@ -499,8 +479,8 @@ def analyze_residuals(
     ResidualAnalysisResult
         Complete residual analysis results
     """
-    responses = np.asarray(responses)
-    theta_array = _resolve_theta(model, responses, theta)
+    responses = _missing_coded_responses(responses)
+    model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
         responses,
@@ -577,43 +557,42 @@ def _stream_fit_statistics(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
+    *,
+    standardized: bool = False,
 ) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
     """Accumulate fit statistics directly from one item probability pass."""
     n_persons, n_items = responses.shape
-    accumulator = _FitAccumulator.create(n_persons, n_items)
+    totals = _ItemPersonFit(n_persons, n_items, standardized=standardized)
 
     for item_index in range(n_items):
-        _, expected, variance = _item_expected_value_variance(
+        probabilities, expected, variance = _item_expected_value_variance(
             model,
             theta,
             item_index,
         )
-        valid = responses[:, item_index] >= 0
-        observed = responses[valid, item_index]
-        valid_variance = variance[valid]
-        raw = observed - expected[valid]
-        squared = np.square(raw) / (valid_variance + PROB_EPSILON)
-        weighted = squared * valid_variance
+        column = responses[:, item_index]
+        totals.add(
+            column[:, None],
+            expected[:, None],
+            variance[:, None],
+            items=slice(item_index, item_index + 1),
+            fourth_moment=(
+                _fourth_central_moment(probabilities, expected)[:, None]
+                if standardized
+                else None
+            ),
+        )
 
-        count = int(np.count_nonzero(valid))
-        accumulator.item_n[item_index] = count
-        accumulator.item_square_sum[item_index] = np.sum(squared)
-        accumulator.item_weighted_sum[item_index] = np.sum(weighted)
-        accumulator.item_variance_sum[item_index] = np.sum(valid_variance)
-        accumulator.person_n[valid] += 1
-        accumulator.person_square_sum[valid] += squared
-        accumulator.person_weighted_sum[valid] += weighted
-        accumulator.person_variance_sum[valid] += valid_variance
-
-    return accumulator.finish()
+    return totals.finish()
 
 
 def compute_outfit_infit(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     *,
     include_counts: bool = False,
+    include_standardized: bool = False,
 ) -> dict[str, NDArray[np.float64] | NDArray[np.intp]]:
     """Compute outfit and infit statistics for items and persons.
 
@@ -622,14 +601,22 @@ def compute_outfit_infit(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
     include_counts : bool, default=False
         Include valid observation counts as ``item_n`` and ``person_n``.
+    include_standardized : bool, default=False
+        Include Wilson-Hilferty standardized mean squares as
+        ``item_z_outfit``, ``item_z_infit``, ``person_z_outfit`` and
+        ``person_z_infit``. With the default EAP abilities the item z
+        statistics are biased toward overfit and only descriptive (see
+        :func:`~mirt.diagnostics.itemfit.compute_itemfit`).
 
     Returns
     -------
@@ -637,14 +624,30 @@ def compute_outfit_infit(
         Dictionary with ``item_outfit``, ``item_infit``, ``person_outfit``, and
         ``person_infit``. When requested, ``item_n`` and ``person_n`` contain
         the corresponding valid observation counts.
+
+    Notes
+    -----
+    The statistics match :func:`~mirt.diagnostics.itemfit.compute_itemfit`
+    and :func:`~mirt.diagnostics.personfit.compute_personfit`: infit is
+    ``sum((x - E)^2) / sum(W)`` over observed responses, and outfit averages
+    ``(x - E)^2 / W`` over observed responses whose modeled variance ``W``
+    exceeds ``PROB_EPSILON``. Near-deterministic responses are excluded from
+    outfit because their squared standardized residuals are unbounded.
     """
     if not isinstance(include_counts, (bool, np.bool_)):
         raise ValueError("include_counts must be boolean")
-    responses = np.asarray(responses)
+    if not isinstance(include_standardized, (bool, np.bool_)):
+        raise ValueError("include_standardized must be boolean")
+    responses = _missing_coded_responses(responses)
     if responses.ndim != 2:
         raise ValueError("responses must be a two-dimensional matrix")
-    theta_array = _resolve_theta(model, responses, theta)
-    statistics = _stream_fit_statistics(model, responses, theta_array)
+    model, theta_array = _resolve_theta(model, responses, theta)
+    statistics = _stream_fit_statistics(
+        model,
+        responses,
+        theta_array,
+        standardized=bool(include_standardized),
+    )
     if not include_counts:
         del statistics["item_n"]
         del statistics["person_n"]
@@ -652,8 +655,8 @@ def compute_outfit_infit(
 
 
 def identify_misfitting_patterns(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     z_threshold: float = 2.0,
     outfit_threshold: float = 1.5,
@@ -662,14 +665,18 @@ def identify_misfitting_patterns(
 
     Compute standardized residuals in bounded probability blocks and retain only
     flagged entries and fit-statistic totals. Models without batch metadata
-    retain the itemwise probability fallback.
+    retain the itemwise probability fallback. Item and person outfit and infit
+    follow :func:`compute_outfit_infit`, so near-deterministic responses do
+    not enter outfit.
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : ndarray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
     z_threshold : float
@@ -682,10 +689,10 @@ def identify_misfitting_patterns(
     dict
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
-    responses = np.asarray(responses)
-    theta_array = _resolve_theta(model, responses, theta)
+    responses = _missing_coded_responses(responses)
+    model, theta_array = _resolve_theta(model, responses, theta)
     n_persons, n_items = responses.shape
-    accumulator = _FitAccumulator.create(n_persons, n_items)
+    totals = _ItemPersonFit(n_persons, n_items)
     rows_per_chunk = max(1, n_persons)
     if getattr(model, "n_items", None) == n_items:
         rows_per_chunk = max(
@@ -710,7 +717,13 @@ def identify_misfitting_patterns(
         expected = computation.expected_values
         variances = computation.variances
         assert expected is not None and variances is not None
-        accumulator.add(z, variances, rows=slice(start, stop))
+        usable = np.isfinite(z)
+        totals.add(
+            np.where(usable, block, -1),
+            np.where(usable, expected, 0.0),
+            np.where(usable, variances, 0.0),
+            persons=slice(start, stop),
+        )
         aberrant.extend(
             {
                 "person": int(start + i),
@@ -721,7 +734,7 @@ def identify_misfitting_patterns(
             }
             for i, j in np.argwhere(np.isfinite(z) & (np.abs(z) > z_threshold))
         )
-    fit_stats = accumulator.finish()
+    fit_stats = totals.finish()
 
     misfitting_items = [
         {

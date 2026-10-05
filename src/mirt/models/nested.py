@@ -16,35 +16,17 @@ items. *Psychometrika, 49*(4), 501-519.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import categorical_log_likelihood_batch, category_offsets
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import PolytomousItemModel
-
-_MAX_NESTED_PROBABILITY_CHUNK_ENTRIES = 1_000_000
-
-
-def _nested_category_chunks(
-    category_counts: list[int],
-    n_persons: int,
-) -> Iterator[tuple[int, NDArray[np.intp]]]:
-    """Group equal-width nested-logit items into bounded probability chunks."""
-    counts = np.asarray(category_counts, dtype=np.intp)
-    for n_categories in np.unique(counts):
-        item_indices = np.flatnonzero(counts == n_categories)
-        chunk_size = max(
-            1,
-            _MAX_NESTED_PROBABILITY_CHUNK_ENTRIES
-            // max(1, n_persons * int(n_categories)),
-        )
-        for start in range(0, item_indices.size, chunk_size):
-            yield int(n_categories), item_indices[start : start + chunk_size]
+from mirt.models.polytomous import _category_count_chunks
 
 
 class TwoPLNestedLogit(PolytomousItemModel):
@@ -131,17 +113,20 @@ class TwoPLNestedLogit(PolytomousItemModel):
         """Conditional nominal intercepts, padded to the maximum category count."""
         return self._parameters["distractor_intercepts"]
 
+    def _distractor_anchors(self) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
+        """Return each item's keyed and reference distractor columns."""
+        correct = np.asarray(self._correct, dtype=np.intp)
+        return correct, np.where(correct != 0, 0, 1)
+
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
+        rows = np.arange(self.n_items)
+        correct, reference = self._distractor_anchors()
         for name in ("distractor_slopes", "distractor_intercepts"):
-            active = np.zeros_like(self._parameters[name], dtype=np.bool_)
-            for item, (n_categories, correct) in enumerate(
-                zip(self._n_categories, self._correct, strict=True)
-            ):
-                reference = 0 if correct != 0 else 1
-                active[item, :n_categories] = True
-                active[item, [correct, reference]] = False
+            active = self._category_columns(self._parameters[name].shape[1])
+            active[rows, correct] = False
+            active[rows, reference] = False
             masks[name] = active
         return self._apply_free_parameter_restrictions(masks)
 
@@ -150,13 +135,11 @@ class TwoPLNestedLogit(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         canonical = super()._canonical_parameter_values(name, values)
         if name in {"distractor_slopes", "distractor_intercepts"}:
-            for item, (n_categories, correct) in enumerate(
-                zip(self._n_categories, self._correct, strict=True)
-            ):
-                reference = 0 if correct != 0 else 1
-                canonical[item, :n_categories] -= canonical[item, reference]
-                canonical[item, correct] = 0.0
-                canonical[item, n_categories:] = 0.0
+            rows = np.arange(self.n_items)
+            correct, reference = self._distractor_anchors()
+            canonical -= canonical[rows, reference][:, None]
+            canonical[rows, correct] = 0.0
+            canonical[~self._category_columns(canonical.shape[1])] = 0.0
         return canonical
 
     @property
@@ -197,16 +180,6 @@ class TwoPLNestedLogit(PolytomousItemModel):
                 )
             result.append(key)
         return result
-
-    def _validate_item_index(self, item_idx: int) -> int:
-        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-            item_idx, (int, np.integer)
-        ):
-            raise IndexError("item_idx must be an integer")
-        index = int(item_idx)
-        if index < 0 or index >= self.n_items:
-            raise IndexError(f"item_idx {index} out of range [0, {self.n_items})")
-        return index
 
     def _validate_category(self, item_idx: int, category: int) -> int:
         if isinstance(category, (bool, np.bool_)) or not isinstance(
@@ -448,7 +421,7 @@ class TwoPLNestedLogit(PolytomousItemModel):
             (theta.size, self.n_items, self.max_categories),
             dtype=np.float64,
         )
-        for n_categories, item_indices in _nested_category_chunks(
+        for n_categories, item_indices in _category_count_chunks(
             self._n_categories,
             theta.size,
         ):
@@ -646,15 +619,16 @@ class TwoPLNestedLogit(PolytomousItemModel):
         """Evaluate all response patterns at every supplied ability point."""
         values = self._validate_responses(responses)
         theta_values = self._validate_theta(theta)
-        result = np.zeros((values.shape[0], theta_values.size), dtype=np.float64)
-        for item_idx in range(self.n_items):
+        offsets = category_offsets(self._n_categories)
+        log_table = np.empty((sum(self._n_categories), theta_values.size))
+        for item_idx, (offset, n_categories) in enumerate(
+            zip(offsets, self._n_categories, strict=True)
+        ):
             probability, _ = self._item_curves_from_theta(theta_values, item_idx)
-            log_probability = np.log(np.clip(probability, PROB_EPSILON, 1.0))
-            responses_item = values[:, item_idx]
-            observed = responses_item >= 0
-            if np.any(observed):
-                result[observed] += log_probability[:, responses_item[observed]].T
-        return result
+            log_table[offset : offset + n_categories] = np.log(
+                np.clip(probability, PROB_EPSILON, 1.0)
+            ).T
+        return categorical_log_likelihood_batch(log_table, offsets, values)
 
     def copy(self) -> Self:
         """Create a deep copy while preserving the item answer key."""

@@ -11,6 +11,9 @@ MirtError
 MirtValidationError
     Raised when input validation fails (data shape, parameter bounds, etc.).
 
+MirtIndexError
+    Raised when an item index is not an integer or lies outside the model.
+
 MirtEstimationError
     Raised when model estimation fails to converge or encounters numerical issues.
 
@@ -114,6 +117,19 @@ class MirtValidationError(MirtError, ValueError):
         if expected is not None:
             kwargs["expected"] = expected
         super().__init__(message, **kwargs)
+
+
+class MirtIndexError(MirtValidationError, IndexError):
+    """Raised when an item index is not an integer or is out of range.
+
+    The class derives from both :class:`MirtValidationError` (a
+    ``ValueError``) and ``IndexError``, so handlers written for either
+    convention keep working.
+
+    Examples
+    --------
+    >>> raise MirtIndexError("item_idx 5 out of range [0, 3)", parameter="item_idx")
+    """
 
 
 class MirtEstimationError(MirtError, RuntimeError):
@@ -282,6 +298,7 @@ class MirtDataError(MirtError, ValueError):
 __all__ = [
     "MirtError",
     "MirtValidationError",
+    "MirtIndexError",
     "MirtEstimationError",
     "MirtConvergenceError",
     "MirtModelError",

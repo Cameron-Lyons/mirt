@@ -105,10 +105,16 @@ def test_linked_observed_scores_match_hand_computed_binomial_percentiles():
     )
 
     # Old Binomial(2, .2) probabilities: [.64, .32, .04], giving percentile
-    # midpoints [.32, .80, .98]. New Binomial(3, .7) probabilities:
-    # [.027, .189, .441, .343], with midpoints [.0135, .1215, .4365, .8285].
+    # ranks [.32, .80, .98]. New Binomial(3, .7) probabilities:
+    # [.027, .189, .441, .343] have cumulative probabilities
+    # [.027, .216, .657, 1]. Each rank is inverted within the new score
+    # whose interval [y - .5, y + .5] contains it (Kolen and Brennan, 2014).
     expected = np.array(
-        [1.0 + (0.32 - 0.1215) / 0.315, 2.0 + (0.8 - 0.4365) / 0.392, 3.0]
+        [
+            1.5 + (0.32 - 0.216) / 0.441,
+            2.5 + (0.8 - 0.657) / 0.343,
+            2.5 + (0.98 - 0.657) / 0.343,
+        ]
     )
     np.testing.assert_allclose(actual.new_scores, expected, atol=1e-12)
 
@@ -123,13 +129,14 @@ def test_linked_true_scores_match_closed_form_different_length_forms():
     )
     linking = LinkingResult(LinkingConstants(A=A, B=B), anchor_items=[])
 
-    actual = true_score_equating(old, new, linking_result=linking, n_theta=4001)
+    actual = true_score_equating(old, new, linking_result=linking)
 
     # Inverting 4*logistic(theta-.2) gives theta=.2+log(score/(4-score)).
-    # Endpoint scores use the documented finite lookup range [-4, 4].
-    theta = np.array([-4.0, 0.2 + np.log(1.0 / 3.0), 0.2, 0.2 + np.log(3.0), 4.0])
-    expected = 6.0 / (1.0 + np.exp(-(theta + 0.4)))
-    np.testing.assert_allclose(actual.new_scores, expected, atol=1e-6)
+    # The unattainable endpoint scores map to the endpoints of the new form.
+    theta = np.array([0.2 + np.log(1.0 / 3.0), 0.2, 0.2 + np.log(3.0)])
+    interior = 6.0 / (1.0 + np.exp(-(theta + 0.4)))
+    expected = np.concatenate(([0.0], interior, [6.0]))
+    np.testing.assert_allclose(actual.new_scores, expected, atol=1e-12)
 
 
 @pytest.mark.parametrize(

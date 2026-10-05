@@ -66,6 +66,10 @@ class MultigroupModel:
         n_groups: int,
         group_labels: Sequence[str] | None = None,
     ) -> None:
+        from mirt.models.mixed_format import require_single_family
+
+        # Group models share parameters through per-item arrays.
+        require_single_family(base_model, "MultigroupModel")
         if (
             isinstance(n_groups, (bool, np.bool_))
             or not isinstance(n_groups, (int, np.integer))

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -11,21 +12,33 @@ from scipy import stats
 from scipy.integrate import trapezoid
 
 from mirt.constants import PROB_EPSILON
-from mirt.diagnostics._utils import extract_item_se, fit_group_models, split_groups
+from mirt.diagnostics._utils import (
+    fit_linked_group_models,
+    resolve_anchor_items,
+    split_groups,
+)
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
+from mirt.utils.bootstrap import _validate_n_jobs
 
 if TYPE_CHECKING:
-    from mirt.results.fit_result import FitResult
+    from mirt.diagnostics._utils import LinkedGroupModels
+    from mirt.multigroup.dif import DIFScheme
 
 
+_DIF_METHODS = frozenset({"likelihood_ratio", "wald", "lord", "raju"})
+_DIF_MODELS = frozenset({"1PL", "2PL", "3PL", "GRM", "GPCM"})
+_SLOPE_PARAMETERS = frozenset({"discrimination", "slopes"})
+_LOCATION_PARAMETERS = ("difficulty", "thresholds", "steps")
+_ETS_ALPHA = 0.05
 _GRDIF_MODELS = frozenset({"1PL", "2PL", "3PL", "GRM", "GPCM"})
 _GRDIF_SCORING_METHODS = frozenset({"EAP", "MAP", "ML", "WLE"})
 _GRDIF_PURIFICATION_METHODS = frozenset({"grdif_rs", "grdif_r", "grdif_s"})
 _GRDIF_SCALING_METHODS = frozenset({"mean", "mad", "iqr"})
+_GRDIF_EFFECT_TYPES = frozenset({"delta_mrr", "delta_msr", "max_diff"})
 
 
 def compute_dif(
@@ -39,261 +52,398 @@ def compute_dif(
     tol: float = 1e-4,
     focal_group: str | int | None = None,
     p_adjust: PValueAdjustment = "none",
+    *,
+    anchors: Sequence[int | str] | None = None,
+    scheme: DIFScheme = "drop",
+    n_jobs: int = 1,
 ) -> dict[str, Any]:
-    """Compute Differential Item Functioning statistics.
+    """Compute Differential Item Functioning statistics on a common scale.
 
     DIF analysis tests whether items function differently across groups
-    after controlling for ability level.
+    after controlling for ability. Every method compares the groups on one
+    latent scale, so a difference in group ability (impact) is not reported
+    as DIF.
+
+    The default likelihood-ratio method fits one baseline multiple-group
+    model plus one refit per tested item. For 30 binary 2PL items and 1,000
+    persons per group this takes one to two seconds; 3PL and polytomous
+    items are several times slower per item. ``n_jobs=-1`` runs the refits
+    in parallel, and ``method="wald"`` or
+    :func:`mirt.diagnostics.compute_grdif` are fast screens without refits.
 
     Args:
         data: Response matrix (n_persons x n_items).
         groups: Group membership array (n_persons,). Must have exactly 2 groups.
         model: IRT model type.
         method: DIF detection method:
-            - 'likelihood_ratio': Likelihood ratio test (recommended)
-            - 'wald': Wald test on parameter differences
-            - 'lord': Lord's chi-square test
-            - 'raju': Raju's area measures
+            - 'likelihood_ratio': Nested multiple-group likelihood-ratio test
+              (see :func:`mirt.multigroup.multigroup_dif`). Each studied item
+              is compared constrained versus free across groups while the
+              focal latent mean and variance are estimated. It needs one
+              baseline fit plus one refit per tested item.
+            - 'wald': Wald test of item-parameter differences after linking
+              separately calibrated groups by Stocking-Lord over the anchors.
+              Focal estimates and standard errors are rescaled by the linking
+              constants. The statistic uses each parameter's standard error
+              from the group fits and ignores parameter covariances and
+              linking error, so it can be liberal, particularly in small
+              samples and for polytomous items; prefer 'likelihood_ratio'
+              for inference. Separate 3PL calibrations estimate guessing
+              poorly, so 'wald' and 'raju' are unreliable for 3PL, whereas
+              'likelihood_ratio' holds guessing equal across groups.
+            - 'lord': Lord's chi-square; an alias of 'wald'.
+            - 'raju': Raju's signed and unsigned areas between the linked item
+              response curves. Areas are descriptive: ``p_value`` is ``NaN``
+              and the ETS class uses the signed area alone.
         n_categories: Number of categories for polytomous models.
         n_quadpts: Number of quadrature points for EM.
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
-        p_adjust: Multiple-testing adjustment across items. Supported values are
-            'none', 'bonferroni', 'holm', and 'fdr_bh'. Default 'none'.
+        p_adjust: Multiple-testing adjustment across tested items. Supported
+            values are 'none', 'bonferroni', 'holm', and 'fdr_bh'. Default
+            'none', as in :func:`mirt.multigroup.multigroup_dif` and R's
+            ``mirt::DIF``.
+        anchors: Items assumed free of DIF, by index or name (column names
+            of a DataFrame, otherwise ``Item_0``, ``Item_1``, ...). They are
+            not tested and get ``NaN`` statistics. Likelihood-ratio tests
+            constrain them in every model; the other methods link the groups
+            over them. ``None`` treats every other item as an anchor in a
+            likelihood-ratio test and links on all items otherwise, which
+            assumes DIF that balances across items.
+        scheme: Likelihood-ratio scheme: 'drop', 'add', 'drop_sequential' or
+            'add_sequential' (see :func:`mirt.multigroup.multigroup_dif`).
+            The 'add' schemes require ``anchors``.
+        n_jobs: Worker processes for likelihood-ratio refits. ``-1`` uses all
+            cores.
 
     Returns:
-        Dictionary with DIF statistics:
-            - 'statistic': Test statistic for each item
+        Dictionary with one value per item for:
+            - 'statistic': LR or Wald chi-square, or Raju's unsigned area
+            - 'df': Degrees of freedom of the test (``NaN`` for Raju)
             - 'p_value': P-value for each item
             - 'p_value_adjusted': Multiplicity-adjusted P-value for each item
-            - 'effect_size': Effect size measure
-            - 'classification': ETS classification using adjusted P-values
+            - 'effect_size': Focal-minus-reference item location on the
+              common scale (signed area for Raju); positive values mean the
+              item is harder for the focal group
+            - 'classification': ETS A/B/C class from the effect size and the
+              adjusted P-value
             - 'adjustment': Adjustment method for each row
-    """
-    if method not in {"likelihood_ratio", "wald", "lord", "raju"}:
-        raise ValueError(f"Unknown DIF method: {method}")
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+            - 'tested': Whether the item was tested (False for anchors)
+            - 'converged': Whether the fits behind each row converged; for
+              untested items, whether every fit converged
+        and the metadata keys 'method', 'anchors' and 'linking_constants'
+        (``(A, B)`` placing the focal group on the reference scale, or None
+        for likelihood-ratio tests).
 
+    Raises:
+        ValueError: If the method, model, scheme or anchors are invalid.
+    """
+    from mirt.multigroup.dif import DIF_SCHEMES, resolve_items
+    from mirt.utils.data import response_column_names
+
+    if method not in _DIF_METHODS:
+        raise ValueError(f"Unknown DIF method: {method}")
+    if model not in _DIF_MODELS:
+        raise ValueError(f"model must be one of: {', '.join(sorted(_DIF_MODELS))}")
+    if scheme not in DIF_SCHEMES:
+        raise ValueError(f"scheme must be one of: {', '.join(sorted(DIF_SCHEMES))}")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
+    n_jobs = _validate_n_jobs(n_jobs)
+
+    item_names = response_column_names(data)
     data = np.asarray(data)
     groups = np.asarray(groups)
     n_items = data.shape[1]
-
-    ref_data, focal_data, _, _, _, _ = split_groups(data, groups, focal_group)
-
-    ref_result, focal_result = fit_group_models(
-        ref_data,
-        focal_data,
-        model=model,
-        n_categories=n_categories,
-        n_quadpts=n_quadpts,
-        max_iter=max_iter,
-        tol=tol,
+    if item_names is None:
+        item_names = [f"Item_{item}" for item in range(n_items)]
+    likelihood_ratio = method == "likelihood_ratio"
+    anchor_items = resolve_anchor_items(
+        resolve_items(anchors, item_names, "anchors"),
+        n_items,
+        name="anchors",
+        minimum=1 if likelihood_ratio else 2,
     )
+    tested = np.ones(n_items, dtype=np.bool_)
+    if anchor_items is not None:
+        tested[anchor_items] = False
+
+    ref_data, focal_data, _, _, ref_group, _ = split_groups(data, groups, focal_group)
+    fit_options = {
+        "n_categories": n_categories,
+        "n_quadpts": n_quadpts,
+        "max_iter": max_iter,
+        "tol": tol,
+    }
 
     result: dict[str, Any]
-    if method == "likelihood_ratio":
-        result = _dif_likelihood_ratio(ref_result, focal_result, n_items)
-    elif method == "wald":
-        result = _dif_wald(ref_result, focal_result, n_items)
-    elif method == "lord":
-        result = _dif_wald(ref_result, focal_result, n_items)
+    if likelihood_ratio:
+        result = _dif_likelihood_ratio(
+            data,
+            groups,
+            ref_group,
+            model,
+            anchors=anchor_items,
+            scheme=scheme,
+            p_adjust=p_adjust,
+            n_jobs=n_jobs,
+            **fit_options,
+        )
+        result["linking_constants"] = None
     else:
-        result = _dif_raju(ref_result, focal_result, n_items)
+        linked = fit_linked_group_models(
+            ref_data,
+            focal_data,
+            model=model,
+            anchor_items=anchor_items,
+            compute_standard_errors=method != "raju",
+            **fit_options,
+        )
+        result = (
+            _dif_raju(linked, tested) if method == "raju" else _dif_wald(linked, tested)
+        )
+        result["p_value_adjusted"] = adjust_p_values(result["p_value"], p_adjust)
+        result["converged"] = np.full(
+            n_items, bool(linked.reference.converged and linked.focal.converged)
+        )
+        result["linking_constants"] = (linked.A, linked.B)
 
-    adjusted = adjust_p_values(result["p_value"], p_adjust)
-    result["p_value_adjusted"] = adjusted
-    result["classification"] = _ets_classify(result["effect_size"], adjusted)
+    result["classification"] = _ets_classify(
+        result["effect_size"],
+        None if method == "raju" else result["p_value_adjusted"],
+    )
     result["adjustment"] = np.full(n_items, p_adjust)
+    result["tested"] = tested
+    result["method"] = method
+    result["anchors"] = anchor_items
     return result
 
 
 def _dif_likelihood_ratio(
-    ref_result: FitResult,
-    focal_result: FitResult,
-    n_items: int,
-) -> dict[str, NDArray[np.float64]]:
-    """Likelihood ratio test for DIF."""
-    statistics = np.zeros(n_items)
-    p_values = np.zeros(n_items)
-    effect_sizes = np.zeros(n_items)
+    data: NDArray[np.int_],
+    groups: NDArray[Any],
+    reference_group: Any,
+    model: str,
+    *,
+    anchors: list[int] | None,
+    scheme: DIFScheme,
+    p_adjust: PValueAdjustment,
+    n_jobs: int,
+    n_categories: int | None,
+    n_quadpts: int,
+    max_iter: int,
+    tol: float,
+) -> dict[str, Any]:
+    """Nested multiple-group likelihood-ratio tests for two groups."""
+    from mirt.multigroup.dif import run_multigroup_dif
 
-    for item_idx in range(n_items):
-        ref_params = ref_result.model.get_item_parameters(item_idx)
-        focal_params = focal_result.model.get_item_parameters(item_idx)
+    labels = np.unique(groups)
+    reference_index = int(np.flatnonzero(labels == reference_group)[0])
+    table = run_multigroup_dif(
+        data,
+        groups,
+        model,
+        anchors=anchors,
+        scheme=scheme,
+        p_adjust=p_adjust,
+        alpha=_ETS_ALPHA,
+        n_categories=n_categories,
+        n_quadpts=n_quadpts,
+        max_iter=max_iter,
+        tol=tol,
+        # A label string is unambiguous when labels are integers too.
+        reference_group=str(labels[reference_index]),
+        n_jobs=n_jobs,
+    )
 
-        diff_sum_sq = 0.0
-        n_params = 0
-
-        for param_name in ref_params:
-            ref_val = np.atleast_1d(ref_params[param_name])
-            focal_val = np.atleast_1d(focal_params[param_name])
-
-            ref_se_full = ref_result.standard_errors.get(
-                param_name, np.ones_like(ref_val)
+    n_items = data.shape[1]
+    statistic = np.full(n_items, np.nan)
+    df = np.full(n_items, np.nan)
+    p_value = np.full(n_items, np.nan)
+    p_value_adjusted = np.full(n_items, np.nan)
+    effect_size = np.full(n_items, np.nan)
+    # Untested anchors report whether every fit of the analysis converged.
+    converged = np.full(n_items, all(row.converged for row in table.rows))
+    for row in table.rows:
+        statistic[row.item] = row.chi2
+        df[row.item] = row.df
+        p_value[row.item] = row.p_value
+        p_value_adjusted[row.item] = row.p_value_adjusted
+        converged[row.item] = row.converged
+        if row.group_parameters is not None:
+            n_active = (
+                None if table.n_categories is None else table.n_categories[row.item] - 1
             )
-            focal_se_full = focal_result.standard_errors.get(
-                param_name, np.ones_like(focal_val)
-            )
-
-            ref_se = extract_item_se(ref_se_full, item_idx)
-            focal_se = extract_item_se(focal_se_full, item_idx)
-
-            pooled_var = ref_se**2 + focal_se**2
-            pooled_var = np.where(pooled_var > 0, pooled_var, 1.0)
-
-            diff = ref_val - focal_val
-            diff_sum_sq += np.sum(diff**2 / pooled_var)
-            n_params += len(ref_val)
-
-        statistics[item_idx] = diff_sum_sq
-        p_values[item_idx] = 1 - stats.chi2.cdf(diff_sum_sq, df=max(1, n_params))
-
-        if "difficulty" in ref_params and "difficulty" in focal_params:
-            ref_b = float(np.atleast_1d(ref_params["difficulty"])[0])
-            focal_b = float(np.atleast_1d(focal_params["difficulty"])[0])
-            effect_sizes[item_idx] = abs(ref_b - focal_b)
-        elif "thresholds" in ref_params and "thresholds" in focal_params:
-            ref_b = np.mean(ref_params["thresholds"])
-            focal_b = np.mean(focal_params["thresholds"])
-            effect_sizes[item_idx] = abs(ref_b - focal_b)
-        elif "intercepts" in ref_params and "intercepts" in focal_params:
-            ref_b = float(np.atleast_1d(ref_params["intercepts"])[0])
-            focal_b = float(np.atleast_1d(focal_params["intercepts"])[0])
-            effect_sizes[item_idx] = abs(ref_b - focal_b)
-
-    classification = _ets_classify(effect_sizes, p_values)
+            effect_size[row.item] = _item_location(
+                row.group_parameters[1 - reference_index], n_active
+            ) - _item_location(row.group_parameters[reference_index], n_active)
 
     return {
-        "statistic": statistics,
-        "p_value": p_values,
-        "effect_size": effect_sizes,
-        "classification": classification,
+        "statistic": statistic,
+        "df": df,
+        "p_value": p_value,
+        "p_value_adjusted": p_value_adjusted,
+        "effect_size": effect_size,
+        "converged": converged,
     }
 
 
 def _dif_wald(
-    ref_result: FitResult,
-    focal_result: FitResult,
-    n_items: int,
+    linked: LinkedGroupModels,
+    tested: NDArray[np.bool_],
 ) -> dict[str, NDArray[np.float64]]:
-    """Wald test for DIF."""
-    statistics = np.zeros(n_items)
-    p_values = np.zeros(n_items)
-    effect_sizes = np.zeros(n_items)
+    """Wald test of linked item-parameter differences (Lord's chi-square)."""
+    reference = linked.reference.model
+    focal = linked.focal_on_reference
+    n_items = int(reference.n_items)
+    reference_errors = linked.reference.standard_errors
+    focal_errors = _linked_standard_errors(linked.focal.standard_errors, linked.A)
+    n_active = _active_locations(reference)
 
-    for item_idx in range(n_items):
-        ref_params = ref_result.model.get_item_parameters(item_idx)
-        focal_params = focal_result.model.get_item_parameters(item_idx)
-
-        wald_sum = 0.0
-        df = 0
-
-        for param_name in ref_params:
-            ref_val = np.atleast_1d(ref_params[param_name])
-            focal_val = np.atleast_1d(focal_params[param_name])
-
-            ref_se_full = ref_result.standard_errors.get(param_name)
-            focal_se_full = focal_result.standard_errors.get(param_name)
-
-            if ref_se_full is None or focal_se_full is None:
+    statistic = np.full(n_items, np.nan)
+    df = np.full(n_items, np.nan)
+    effect_size = np.full(n_items, np.nan)
+    for item in np.flatnonzero(tested):
+        reference_parameters = reference.get_item_parameters(item)
+        focal_parameters = focal.get_item_parameters(item)
+        wald = 0.0
+        n_compared = 0
+        for name, reference_value in reference_parameters.items():
+            if name not in reference_errors or name not in focal_errors:
                 continue
+            difference = np.ravel(reference_value) - np.ravel(focal_parameters[name])
+            variance = (
+                _item_row(reference_errors[name], item, n_items) ** 2
+                + _item_row(focal_errors[name], item, n_items) ** 2
+            )
+            valid = (
+                np.isfinite(difference)
+                & np.isfinite(variance)
+                & (variance > PROB_EPSILON)
+            )
+            wald += float(np.sum(difference[valid] ** 2 / variance[valid]))
+            n_compared += int(np.count_nonzero(valid))
+        if n_compared:
+            statistic[item] = wald
+            df[item] = n_compared
+        effect_size[item] = _item_location(
+            focal_parameters, n_active[item]
+        ) - _item_location(reference_parameters, n_active[item])
 
-            ref_se = extract_item_se(ref_se_full, item_idx)
-            focal_se = extract_item_se(focal_se_full, item_idx)
-
-            pooled_var = ref_se**2 + focal_se**2
-            valid = pooled_var > PROB_EPSILON
-
-            if np.any(valid):
-                diff = ref_val - focal_val
-                wald_sum += np.sum((diff[valid] ** 2) / pooled_var[valid])
-                df += np.sum(valid)
-
-        statistics[item_idx] = wald_sum
-        p_values[item_idx] = 1 - stats.chi2.cdf(wald_sum, df=max(1, df))
-
-        if "difficulty" in ref_params and "difficulty" in focal_params:
-            ref_b = float(np.atleast_1d(ref_params["difficulty"])[0])
-            focal_b = float(np.atleast_1d(focal_params["difficulty"])[0])
-            effect_sizes[item_idx] = abs(ref_b - focal_b)
-
-    classification = _ets_classify(effect_sizes, p_values)
-
+    p_value = np.full(n_items, np.nan)
+    has_test = np.isfinite(statistic)
+    p_value[has_test] = stats.chi2.sf(statistic[has_test], df[has_test])
     return {
-        "statistic": statistics,
-        "p_value": p_values,
-        "effect_size": effect_sizes,
-        "classification": classification,
+        "statistic": statistic,
+        "df": df,
+        "p_value": p_value,
+        "effect_size": effect_size,
     }
 
 
 def _dif_raju(
-    ref_result: FitResult,
-    focal_result: FitResult,
-    n_items: int,
+    linked: LinkedGroupModels,
+    tested: NDArray[np.bool_],
 ) -> dict[str, NDArray[np.float64]]:
-    """Raju's area measures for DIF."""
-    theta_range = np.linspace(-4, 4, 100)
-    theta_2d = theta_range.reshape(-1, 1)
+    """Raju's signed and unsigned areas between linked response curves.
 
-    statistics = np.zeros(n_items)
-    effect_sizes = np.zeros(n_items)
-    p_values = np.zeros(n_items)
+    Polytomous expected scores are divided by the item's maximum score.
+    Areas are integrated over theta in [-4, 4] on the reference scale.
+    """
+    theta = np.linspace(-4.0, 4.0, 100)
+    reference = linked.reference.model
+    n_items = int(reference.n_items)
+    scale = np.ones(n_items)
+    if reference.is_polytomous:
+        scale = np.asarray(reference.n_categories, dtype=np.float64) - 1.0
+    reference_curves = (
+        _expected_response_matrix(reference, theta[:, None], n_items) / scale
+    )
+    focal_curves = (
+        _expected_response_matrix(linked.focal_on_reference, theta[:, None], n_items)
+        / scale
+    )
+    difference = reference_curves - focal_curves
 
-    for item_idx in range(n_items):
-        ref_prob = ref_result.model.probability(theta_2d, item_idx)
-        focal_prob = focal_result.model.probability(theta_2d, item_idx)
-
-        if ref_prob.ndim > 1:
-            n_cat = ref_prob.shape[1]
-            categories = np.arange(n_cat)
-            ref_expected = np.sum(ref_prob * categories, axis=1)
-            focal_expected = np.sum(focal_prob * categories, axis=1)
-            ref_prob = ref_expected / (n_cat - 1)
-            focal_prob = focal_expected / (n_cat - 1)
-
-        diff = ref_prob - focal_prob
-
-        unsigned_area = trapezoid(np.abs(diff), theta_range)
-        statistics[item_idx] = unsigned_area
-
-        signed_area = trapezoid(diff, theta_range)
-        effect_sizes[item_idx] = signed_area
-
-        se_area = 0.1 * (1 + 0.5 * unsigned_area)
-        z = unsigned_area / se_area
-        p_values[item_idx] = 2 * (1 - stats.norm.cdf(abs(z)))
-
-    classification = _ets_classify(np.abs(effect_sizes), p_values)
-
+    statistic = np.full(n_items, np.nan)
+    effect_size = np.full(n_items, np.nan)
+    statistic[tested] = trapezoid(np.abs(difference), theta, axis=0)[tested]
+    effect_size[tested] = trapezoid(difference, theta, axis=0)[tested]
     return {
-        "statistic": statistics,
-        "p_value": p_values,
-        "effect_size": effect_sizes,
-        "classification": classification,
+        "statistic": statistic,
+        "df": np.full(n_items, np.nan),
+        "p_value": np.full(n_items, np.nan),
+        "effect_size": effect_size,
     }
+
+
+def _linked_standard_errors(
+    standard_errors: dict[str, NDArray[np.float64]],
+    A: float,
+) -> dict[str, NDArray[np.float64]]:
+    """Rescale focal standard errors like the linked parameters.
+
+    Slopes become ``a / A`` and locations ``A * b + B``; asymptotes are
+    unchanged.
+    """
+    scaled = {}
+    for name, values in standard_errors.items():
+        errors = np.asarray(values, dtype=np.float64)
+        if name in _SLOPE_PARAMETERS:
+            errors = errors / A
+        elif name in _LOCATION_PARAMETERS:
+            errors = errors * A
+        scaled[name] = errors
+    return scaled
+
+
+def _item_row(
+    values: NDArray[np.float64], item: int, n_items: int
+) -> NDArray[np.float64]:
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim and array.shape[0] == n_items:
+        return np.ravel(array[item])
+    return np.ravel(array)
+
+
+def _active_locations(model: Any) -> list[int | None]:
+    """Number of active category locations per item (None if dichotomous)."""
+    if not model.is_polytomous:
+        return [None] * int(model.n_items)
+    return [int(count) - 1 for count in model.n_categories]
+
+
+def _item_location(parameters: dict[str, Any], n_active: int | None) -> float:
+    """Item location: difficulty, or the mean active threshold or step."""
+    for name in _LOCATION_PARAMETERS:
+        if name in parameters:
+            values = np.ravel(np.asarray(parameters[name], dtype=np.float64))
+            if n_active is not None:
+                values = values[:n_active]
+            values = values[np.isfinite(values)]
+            return float(np.mean(values)) if values.size else np.nan
+    return np.nan
 
 
 def _ets_classify(
     effect_sizes: NDArray[np.float64],
-    p_values: NDArray[np.float64],
-) -> NDArray:
-    """Classify DIF using ETS guidelines (A/B/C)."""
-    n_items = len(effect_sizes)
-    classification = np.empty(n_items, dtype="U1")
+    p_values: NDArray[np.float64] | None,
+) -> NDArray[np.str_]:
+    """Classify DIF using ETS guidelines (A/B/C).
 
-    for i in range(n_items):
-        es = abs(effect_sizes[i])
-        p = p_values[i]
-
-        if p > 0.05 or es < 0.426:
-            classification[i] = "A"
-        elif es < 0.638:
-            classification[i] = "B"
-        else:
-            classification[i] = "C"
-
+    Items are class A unless the absolute effect reaches 0.426 and the
+    p-value is at most 0.05; classes B and C split at 0.638. Without
+    p-values (descriptive methods) the effect size alone decides, and a
+    missing effect size or p-value gives class A.
+    """
+    magnitude = np.abs(np.asarray(effect_sizes, dtype=np.float64))
+    classification = np.where(
+        magnitude < 0.426, "A", np.where(magnitude < 0.638, "B", "C")
+    ).astype("U1")
+    negligible = ~np.isfinite(magnitude)
+    if p_values is not None:
+        negligible |= ~(np.asarray(p_values, dtype=np.float64) <= _ETS_ALPHA)
+    classification[negligible] = "A"
     return classification
 
 
@@ -316,7 +466,9 @@ def flag_dif_items(
             values are 'none', 'bonferroni', 'holm', and 'fdr_bh'.
 
     Returns:
-        Boolean array indicating flagged items.
+        Boolean array indicating flagged items. Results of the descriptive
+        'raju' method carry no p-values, so they are flagged on effect size
+        alone; untested items and failed tests are never flagged.
     """
     if isinstance(alpha, (bool, np.bool_)):
         raise ValueError("alpha must be finite and in (0, 1)")
@@ -337,12 +489,17 @@ def flag_dif_items(
     if classification not in {None, "B", "C"}:
         raise ValueError("classification must be 'B', 'C', or None")
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    p_values = adjust_p_values(dif_results["p_value"], p_adjust)
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     effect_sizes = np.asarray(dif_results["effect_size"], dtype=np.float64)
-    classes = _ets_classify(effect_sizes, p_values)
+    if dif_results.get("method") == "raju":
+        significant = np.isfinite(effect_sizes)
+        classes = _ets_classify(effect_sizes, None)
+    else:
+        p_values = adjust_p_values(dif_results["p_value"], p_adjust)
+        significant = p_values <= alpha
+        classes = _ets_classify(effect_sizes, p_values)
 
-    flags = (p_values <= alpha) & (np.abs(effect_sizes) >= min_effect_size)
+    flags = significant & (np.abs(effect_sizes) >= min_effect_size)
 
     if classification is not None:
         if classification == "B":
@@ -541,28 +698,24 @@ def _group_residual_moments(
     NDArray[np.float64],
     NDArray[np.int_],
 ]:
-    """Compute group-by-item residual moments with itemwise missingness."""
-    n_groups = len(unique_groups)
-    n_items = residuals.shape[1]
-    mrr = np.zeros((n_groups, n_items), dtype=np.float64)
-    msr = np.zeros((n_groups, n_items), dtype=np.float64)
-    var_mrr = np.ones((n_groups, n_items), dtype=np.float64)
-    var_msr = np.ones((n_groups, n_items), dtype=np.float64)
-    effective_counts = np.ones((n_groups, n_items), dtype=np.int64)
+    """Compute group-by-item residual moments with itemwise missingness.
+
+    ``residuals`` must be zero where responses are missing.
+    """
+    mrr, msr, group_counts = _group_residual_means(
+        residuals, valid, group_masks, unique_groups
+    )
+    effective_counts = np.where(group_counts >= 2, group_counts, 1)
+    var_mrr = np.ones_like(mrr)
+    var_msr = np.ones_like(msr)
 
     for group_index, group in enumerate(unique_groups):
         mask = group_masks[group]
         group_valid = valid[mask]
         group_residuals = residuals[mask]
-        counts = np.count_nonzero(group_valid, axis=0)
-        sufficient = counts >= 2
-        effective_counts[group_index, sufficient] = counts[sufficient]
-
-        sums = np.sum(np.where(group_valid, group_residuals, 0.0), axis=0)
         squared = group_residuals**2
-        squared_sums = np.sum(np.where(group_valid, squared, 0.0), axis=0)
-        mrr[group_index, sufficient] = sums[sufficient] / counts[sufficient]
-        msr[group_index, sufficient] = squared_sums[sufficient] / counts[sufficient]
+        counts = group_counts[group_index]
+        sufficient = counts >= 2
 
         raw_scale = _column_scale(
             group_residuals,
@@ -660,6 +813,9 @@ def compute_grdif(
             - 'purification_complete': Whether the anchor set converged
             - 'purification_stop_reason': Convergence or stopping condition
             - 'theta': Final ability estimates used by the reported statistics
+            - 'mrr': Mean raw residual per group and item (n_groups x n_items)
+            - 'msr': Mean squared residual per group and item
+            - 'group_item_counts': Valid responses per group and item
 
     References:
         Lim, H., et al. (2024). Detecting Differential Item Functioning among
@@ -668,7 +824,7 @@ def compute_grdif(
     """
     from mirt import fit_mirt
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,
@@ -763,6 +919,7 @@ def compute_grdif(
             purification_complete = False
             purification_stop_reason = "max_iterations"
 
+    expected = _expected_response_matrix(fit_result.model, theta, n_items)
     grdif_r, grdif_s, grdif_rs, p_r, p_s, p_rs = _compute_grdif_statistics(
         data,
         theta,
@@ -770,6 +927,11 @@ def compute_grdif(
         group_masks,
         unique_groups,
         scaling_method,
+        expected_responses=expected,
+    )
+    valid = data >= 0
+    mrr, msr, group_item_counts = _group_residual_means(
+        np.where(valid, data - expected, 0.0), valid, group_masks, unique_groups
     )
     p_r_adjusted, p_s_adjusted, p_rs_adjusted = _adjust_grdif_families(
         p_r,
@@ -800,7 +962,37 @@ def compute_grdif(
         "purification_complete": purification_complete,
         "purification_stop_reason": purification_stop_reason,
         "theta": theta.copy(),
+        "mrr": mrr,
+        "msr": msr,
+        "group_item_counts": group_item_counts,
     }
+
+
+def _group_residual_means(
+    residuals: NDArray[np.float64],
+    valid: NDArray[np.bool_],
+    group_masks: dict[Any, NDArray[np.bool_]],
+    unique_groups: NDArray[Any],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.int_]]:
+    """Group-by-item mean raw and squared residuals with valid-response counts.
+
+    ``residuals`` must be zero where responses are missing. Means are zero
+    where a group has fewer than two valid responses.
+    """
+    n_groups, n_items = len(unique_groups), residuals.shape[1]
+    mrr = np.zeros((n_groups, n_items), dtype=np.float64)
+    msr = np.zeros((n_groups, n_items), dtype=np.float64)
+    counts = np.zeros((n_groups, n_items), dtype=np.int64)
+    for index, group in enumerate(unique_groups):
+        mask = group_masks[group]
+        counts[index] = np.count_nonzero(valid[mask], axis=0)
+        sufficient = counts[index] >= 2
+        divisor = np.maximum(counts[index], 1)
+        mrr[index] = np.where(sufficient, residuals[mask].sum(axis=0) / divisor, 0.0)
+        msr[index] = np.where(
+            sufficient, (residuals[mask] ** 2).sum(axis=0) / divisor, 0.0
+        )
+    return mrr, msr, counts
 
 
 def _adjust_grdif_families(
@@ -973,7 +1165,7 @@ def compute_pairwise_rdif(
     """
     from mirt import fit_mirt
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,
@@ -1068,75 +1260,87 @@ def grdif_effect_size(
     groups: NDArray,
     grdif_results: dict[str, Any],
     effect_type: Literal["delta_mrr", "delta_msr", "max_diff"] = "delta_mrr",
+    *,
+    model: Any = None,
 ) -> NDArray[np.float64]:
     """Compute effect sizes for GRDIF flagged items.
 
+    Effect sizes are the spread (maximum minus minimum) across groups of the
+    residual moments behind the GRDIF test, so they use the same calibration
+    and final ability estimates as :func:`compute_grdif`. No model is
+    refitted. Only groups with at least two valid responses to an item
+    count; items with fewer than two such groups get zero.
+
     Args:
-        data: Response matrix.
-        groups: Group membership array.
+        data: Response matrix used for ``grdif_results``.
+        groups: Group membership array used for ``grdif_results``.
         grdif_results: Output from compute_grdif().
         effect_type: Type of effect size:
             - 'delta_mrr': Maximum difference in mean raw residuals
             - 'delta_msr': Maximum difference in mean squared residuals
             - 'max_diff': Maximum of both
+        model: Fitted item model. Required only when ``grdif_results`` lacks
+            the 'mrr', 'msr' and 'group_item_counts' entries; the moments are
+            then recomputed from ``grdif_results['theta']``.
 
     Returns:
         Effect size array for each item.
+
+    Raises:
+        ValueError: If the inputs do not match the results, or if the moments
+            are missing and no model is given.
     """
-    from mirt import fit_mirt
-    from mirt.scoring import fscores
+    if effect_type not in _GRDIF_EFFECT_TYPES:
+        valid = ", ".join(sorted(_GRDIF_EFFECT_TYPES))
+        raise ValueError(f"effect_type must be one of: {valid}")
+    values = np.asarray(data)
+    labels = np.asarray(groups)
+    if values.ndim != 2 or labels.ndim != 1 or labels.shape[0] != values.shape[0]:
+        raise ValueError(
+            "data must be two-dimensional with one group label per response row"
+        )
+    n_items = values.shape[1]
 
-    data = np.asarray(data)
-    groups = np.asarray(groups)
-    n_items = data.shape[1]
+    if all(key in grdif_results for key in ("mrr", "msr", "group_item_counts")):
+        mrr = np.asarray(grdif_results["mrr"], dtype=np.float64)
+        msr = np.asarray(grdif_results["msr"], dtype=np.float64)
+        counts = np.asarray(grdif_results["group_item_counts"])
+    elif model is not None:
+        theta = np.asarray(grdif_results["theta"], dtype=np.float64)
+        if theta.ndim == 1:
+            theta = theta[:, None]
+        if theta.shape[0] != values.shape[0]:
+            raise ValueError("grdif_results['theta'] must have one row per person")
+        unique_groups = np.asarray(grdif_results["group_labels"])
+        valid = values >= 0
+        mrr, msr, counts = _group_residual_means(
+            np.where(
+                valid, values - _expected_response_matrix(model, theta, n_items), 0.0
+            ),
+            valid,
+            {group: labels == group for group in unique_groups},
+            unique_groups,
+        )
+    else:
+        raise ValueError(
+            "grdif_results lacks residual moments; pass the fitted model= used "
+            "by compute_grdif"
+        )
+    if mrr.ndim != 2 or mrr.shape[1] != n_items or msr.shape != mrr.shape:
+        raise ValueError("grdif_results moments must have one column per item")
+    if counts.shape != mrr.shape:
+        raise ValueError("group_item_counts must match the residual moments")
 
-    unique_groups = np.array(grdif_results["group_labels"])
+    qualifying = counts >= 2
+    enough_groups = np.count_nonzero(qualifying, axis=0) >= 2
 
-    fit_result = fit_mirt(data, model="2PL", verbose=False)
-    score_result = fscores(fit_result.model, data, method="EAP")
-    theta = score_result.theta
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
+    def spread(moments: NDArray[np.float64]) -> NDArray[np.float64]:
+        upper = np.max(np.where(qualifying, moments, -np.inf), axis=0)
+        lower = np.min(np.where(qualifying, moments, np.inf), axis=0)
+        return np.where(enough_groups, upper - lower, 0.0)
 
-    effect_sizes = np.zeros(n_items)
-
-    for item_idx in range(n_items):
-        mrr_values = []
-        msr_values = []
-
-        for g in unique_groups:
-            mask = groups == g
-            responses_g = data[mask, item_idx]
-            theta_g = theta[mask]
-
-            valid = responses_g >= 0
-            if np.sum(valid) < 2:
-                continue
-
-            responses_valid = responses_g[valid]
-            theta_valid = theta_g[valid]
-
-            expected = fit_result.model.probability(theta_valid, item_idx=item_idx)
-            if expected.ndim > 1:
-                n_cat = expected.shape[1]
-                categories = np.arange(n_cat)
-                expected = np.sum(expected * categories, axis=1)
-            else:
-                expected = expected.ravel()
-
-            residuals = responses_valid - expected
-            mrr_values.append(np.mean(residuals))
-            msr_values.append(np.mean(residuals**2))
-
-        if len(mrr_values) >= 2:
-            delta_mrr = np.max(mrr_values) - np.min(mrr_values)
-            delta_msr = np.max(msr_values) - np.min(msr_values)
-
-            if effect_type == "delta_mrr":
-                effect_sizes[item_idx] = delta_mrr
-            elif effect_type == "delta_msr":
-                effect_sizes[item_idx] = delta_msr
-            else:
-                effect_sizes[item_idx] = max(delta_mrr, delta_msr)
-
-    return effect_sizes
+    if effect_type == "delta_mrr":
+        return spread(mrr)
+    if effect_type == "delta_msr":
+        return spread(msr)
+    return np.maximum(spread(mrr), spread(msr))

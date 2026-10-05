@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -249,33 +250,6 @@ def compute_probability_moments(
     return probabilities, expected, expected * (1.0 - expected)
 
 
-def compute_expected_variance(
-    model: BaseItemModel,
-    theta: NDArray[np.float64],
-    n_items: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute expected values and variances for all items.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model.
-    theta : array of shape (n_persons, n_factors)
-        Person ability estimates.
-    n_items : int
-        Number of items.
-
-    Returns
-    -------
-    expected : array of shape (n_persons, n_items)
-        Expected scores for each person-item combination.
-    variance : array of shape (n_persons, n_items)
-        Variance of scores for each person-item combination.
-    """
-    _, expected, variance = compute_probability_moments(model, theta, n_items)
-    return expected, variance
-
-
 def compute_fit_stats(
     responses: NDArray[np.int_],
     expected: NDArray[np.float64],
@@ -340,14 +314,125 @@ def compute_fit_stats(
     return accumulator.finish()
 
 
-class _FitStatsAccumulator:
-    """Accumulate bounded response blocks without averaging partial ratios."""
+def _fourth_central_moment(
+    probabilities: NDArray[np.float64],
+    expected: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return the fourth central moment of each modeled item score.
 
-    def __init__(self, output_size: int) -> None:
+    Parameters
+    ----------
+    probabilities : array
+        Category probabilities. Binary items use the positive-response
+        probability with the same shape as ``expected``; polytomous items add a
+        trailing, zero-padded category axis.
+    expected : array
+        Expected item scores.
+
+    Returns
+    -------
+    array
+        ``E[(X - E[X])^4]`` with the shape of ``expected``.
+    """
+    if probabilities.shape == expected.shape:
+        variance = probabilities * (1.0 - probabilities)
+        return variance * (1.0 - 3.0 * variance)
+    deviations = np.arange(probabilities.shape[-1], dtype=np.float64)
+    deviations = np.square(deviations - expected[..., None])
+    return np.einsum("...k,...k->...", probabilities, np.square(deviations))
+
+
+def _wilson_hilferty_z(
+    mean_square: NDArray[np.float64],
+    variance: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Standardize mean-square fit statistics with the cube-root transform.
+
+    ``t = (MS^(1/3) - 1)(3/q) + q/3`` where ``q^2`` is the modeled variance of
+    the mean square (Wright & Masters, 1982). Entries with an undefined mean
+    square or a nonpositive variance are ``NaN``.
+    """
+    result = np.full(np.shape(mean_square), np.nan)
+    defined = np.isfinite(mean_square) & np.isfinite(variance) & (variance > 0.0)
+    q = np.sqrt(variance[defined])
+    result[defined] = (np.cbrt(mean_square[defined]) - 1.0) * (3.0 / q) + q / 3.0
+    return result
+
+
+@dataclass(frozen=True)
+class _FitCellTerms:
+    """Per-cell mean-square terms shared by item and person reductions."""
+
+    observed: NDArray[np.bool_]
+    squared: NDArray[np.float64]
+    variance: NDArray[np.float64]
+    eligible: NDArray[np.bool_]
+    outfit: NDArray[np.float64]
+    infit_kurtosis: NDArray[np.float64] | None = None
+    outfit_kurtosis: NDArray[np.float64] | None = None
+
+
+def _fit_cell_terms(
+    responses: NDArray,
+    expected: NDArray[np.float64],
+    variance: NDArray[np.float64],
+    fourth_moment: NDArray[np.float64] | None = None,
+) -> _FitCellTerms:
+    """Validate a block and return its infit, outfit and kurtosis terms.
+
+    Missing (negative) responses contribute nothing. Outfit and its variance
+    use only observed entries whose variance exceeds ``PROB_EPSILON``.
+    """
+    if responses.dtype.kind not in "biuf" or not np.all(np.isfinite(responses)):
+        raise ValueError("responses must contain only finite numeric values")
+    if not np.all(np.isfinite(expected)):
+        raise ValueError("expected must contain only finite values")
+    if not np.all(np.isfinite(variance)) or np.any(variance < -_PROBABILITY_TOLERANCE):
+        raise ValueError("variance must contain finite non-negative values")
+    if fourth_moment is not None and not np.all(np.isfinite(fourth_moment)):
+        raise ValueError("fourth_moment must contain only finite values")
+
+    observed = responses >= 0
+    squared = np.where(observed, responses, expected)
+    squared -= expected
+    np.square(squared, out=squared)
+    cell_variance = np.where(observed, np.maximum(variance, 0.0), 0.0)
+    eligible = cell_variance > PROB_EPSILON
+    outfit = np.divide(
+        squared, cell_variance, out=np.zeros_like(squared), where=eligible
+    )
+    if fourth_moment is None:
+        return _FitCellTerms(observed, squared, cell_variance, eligible, outfit)
+    fourth = np.where(observed, np.maximum(fourth_moment, 0.0), 0.0)
+    squared_variance = np.square(cell_variance)
+    return _FitCellTerms(
+        observed,
+        squared,
+        cell_variance,
+        eligible,
+        outfit,
+        infit_kurtosis=fourth - squared_variance,
+        outfit_kurtosis=np.divide(
+            fourth, squared_variance, out=np.zeros_like(fourth), where=eligible
+        ),
+    )
+
+
+class _FitStatsAccumulator:
+    """Accumulate bounded response blocks without averaging partial ratios.
+
+    With ``standardized=True`` the accumulator also sums the fourth-moment
+    terms that give the modeled variance of each mean square, so
+    :meth:`standardized` can return Wilson-Hilferty z statistics.
+    """
+
+    def __init__(self, output_size: int, *, standardized: bool = False) -> None:
         self.infit_numerator = np.zeros(output_size)
         self.infit_denominator = np.zeros(output_size)
         self.outfit_sum = np.zeros(output_size)
         self.outfit_count = np.zeros(output_size, dtype=np.intp)
+        self.infit_kurtosis = np.zeros(output_size) if standardized else None
+        self.outfit_kurtosis = np.zeros(output_size) if standardized else None
 
     def add(
         self,
@@ -357,32 +442,33 @@ class _FitStatsAccumulator:
         *,
         axis: int = 0,
         target: slice = slice(None),
+        fourth_moment: NDArray[np.float64] | None = None,
     ) -> None:
         """Add an aligned block to item totals or a slice of person totals."""
-        if responses.dtype.kind not in "biuf" or not np.all(np.isfinite(responses)):
-            raise ValueError("responses must contain only finite numeric values")
-        if not np.all(np.isfinite(expected)):
-            raise ValueError("expected must contain only finite values")
-        if not np.all(np.isfinite(variance)) or np.any(
-            variance < -_PROBABILITY_TOLERANCE
-        ):
-            raise ValueError("variance must contain finite non-negative values")
+        self.add_terms(
+            _fit_cell_terms(responses, expected, variance, fourth_moment),
+            axis=axis,
+            target=target,
+        )
 
-        block_variance = np.maximum(variance, 0.0)
-        valid = responses >= 0
-        squared = np.where(valid, responses, expected)
-        squared -= expected
-        np.square(squared, out=squared)
-        self.infit_numerator[target] += np.sum(squared, axis=axis)
-        block_variance = np.where(valid, block_variance, 0.0)
-        self.infit_denominator[target] += np.sum(block_variance, axis=axis)
-
-        eligible = block_variance > PROB_EPSILON
-        self.outfit_count[target] += np.sum(eligible, axis=axis)
-        squared = np.where(eligible, squared, 0.0)
-        np.maximum(block_variance, PROB_EPSILON, out=block_variance)
-        np.divide(squared, block_variance, out=squared)
-        self.outfit_sum[target] += np.sum(squared, axis=axis)
+    def add_terms(
+        self,
+        terms: _FitCellTerms,
+        *,
+        axis: int = 0,
+        target: slice = slice(None),
+    ) -> None:
+        """Reduce precomputed cell terms along ``axis`` into ``target``."""
+        self.infit_numerator[target] += np.sum(terms.squared, axis=axis)
+        self.infit_denominator[target] += np.sum(terms.variance, axis=axis)
+        self.outfit_count[target] += np.count_nonzero(terms.eligible, axis=axis)
+        self.outfit_sum[target] += np.sum(terms.outfit, axis=axis)
+        if self.infit_kurtosis is None or self.outfit_kurtosis is None:
+            return
+        if terms.infit_kurtosis is None or terms.outfit_kurtosis is None:
+            raise ValueError("fourth_moment is required for standardized statistics")
+        self.infit_kurtosis[target] += np.sum(terms.infit_kurtosis, axis=axis)
+        self.outfit_kurtosis[target] += np.sum(terms.outfit_kurtosis, axis=axis)
 
     def finish(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Apply eligibility thresholds after all blocks have accumulated."""
@@ -403,3 +489,37 @@ class _FitStatsAccumulator:
         )
 
         return infit, outfit
+
+    def statistics(self) -> dict[str, NDArray[np.float64]]:
+        """Return outfit and infit, each followed by its z statistic if tracked.
+
+        Standardized accumulators add Wilson-Hilferty ``z_outfit`` and
+        ``z_infit``. The outfit variance is ``sum(C / W^2) / N^2 - 1 / N`` over
+        the entries that enter the outfit mean, and the infit variance is
+        ``sum(C - W^2) / (sum W)^2`` over observed entries, where ``W`` and
+        ``C`` are the second and fourth central moments of each modeled score.
+        """
+        infit, outfit = self.finish()
+        if self.infit_kurtosis is None or self.outfit_kurtosis is None:
+            return {"outfit": outfit, "infit": infit}
+        count = self.outfit_count.astype(np.float64)
+        outfit_variance = np.full_like(self.outfit_sum, np.nan)
+        np.divide(
+            self.outfit_kurtosis / np.maximum(count, 1.0) - 1.0,
+            count,
+            out=outfit_variance,
+            where=count > 0,
+        )
+        infit_variance = np.full_like(self.infit_numerator, np.nan)
+        np.divide(
+            self.infit_kurtosis,
+            np.square(self.infit_denominator),
+            out=infit_variance,
+            where=self.infit_denominator > PROB_EPSILON,
+        )
+        return {
+            "outfit": outfit,
+            "z_outfit": _wilson_hilferty_z(outfit, outfit_variance),
+            "infit": infit,
+            "z_infit": _wilson_hilferty_z(infit, infit_variance),
+        }

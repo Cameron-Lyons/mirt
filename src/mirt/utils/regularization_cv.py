@@ -13,6 +13,7 @@ from mirt.constants import PROB_EPSILON
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.regularized import RegularizedMIRTEstimator, RegularizedMIRTResult
 from mirt.exceptions import MirtDataError, MirtEstimationError, MirtValidationError
+from mirt.utils._parallel import _process_pool, resolve_n_jobs
 from mirt.utils.data import validate_responses
 from mirt.utils.numeric import logsumexp
 
@@ -201,20 +202,7 @@ def cv_select_lambda(
             value=n_folds,
             expected=f"<= {responses.shape[0]}",
         )
-    if isinstance(n_jobs, (bool, np.bool_)) or not isinstance(
-        n_jobs, (int, np.integer)
-    ):
-        raise MirtValidationError(
-            "n_jobs must be an integer",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
-    if n_jobs == 0 or n_jobs < -1:
-        raise MirtValidationError(
-            "n_jobs must be -1 or a positive integer",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
+    resolved_jobs = resolve_n_jobs(n_jobs, n_folds)
 
     estimator_options = {
         "penalty": penalty,
@@ -256,16 +244,8 @@ def cv_select_lambda(
         for fold in range(n_folds)
     ]
 
-    resolved_jobs = int(n_jobs)
-    if resolved_jobs == -1:
-        import os
-
-        resolved_jobs = os.cpu_count() or 1
-
-    if resolved_jobs > 1 and n_folds > 1:
-        from mirt.utils._parallel import _process_pool
-
-        with _process_pool(min(resolved_jobs, n_folds), mp_context) as executor:
+    if resolved_jobs > 1:
+        with _process_pool(resolved_jobs, mp_context) as executor:
             fold_results = list(executor.map(_evaluate_regularization_fold, tasks))
     else:
         fold_results = []

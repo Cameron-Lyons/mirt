@@ -3,10 +3,10 @@
 import numpy as np
 from numpy.testing import assert_allclose
 
-import mirt.scoring.eapsum as eapsum_module
+import mirt.scoring._eapsum as eapsum_module
 from mirt import GradedResponseModel
 from mirt.scoring._common import build_quadrature
-from mirt.scoring.eapsum import EAPSumScorer
+from mirt.scoring._eapsum import EAPSumScorer
 from mirt.utils.numeric import logsumexp
 
 
@@ -62,19 +62,27 @@ def test_polytomous_recursion_matches_scalar_reference() -> None:
     )
     item_indices = (0, 2, 3)
     max_score = sum(model._n_categories[index] - 1 for index in item_indices)
+    scorer = EAPSumScorer(21)
 
-    actual = EAPSumScorer(21)._compute_sum_score_distribution(
+    actual = scorer._compute_sum_score_distribution(
         model,
         quad_points,
         max_score,
         item_indices,
     )
     expected = _scalar_distribution(model, quad_points, item_indices)
+    log_space = eapsum_module._log_space_sum_score_distribution(
+        scorer._item_probability_tables(model, quad_points, item_indices),
+        len(quad_points),
+    )
 
-    assert_allclose(actual, expected, rtol=0.0, atol=0.0)
+    # The probability-space recursion differs from the log-space
+    # reference only by rounding; the retained log-space fallback is exact.
+    assert_allclose(actual, expected, rtol=0.0, atol=1e-12)
+    assert_allclose(log_space, expected, rtol=0.0, atol=0.0)
 
 
-def test_polytomous_recursion_combines_whole_score_slices(monkeypatch) -> None:
+def test_log_space_recursion_combines_whole_score_slices(monkeypatch) -> None:
     model = _mixed_model()
     quad_points, _ = build_quadrature(
         n_quadpts=17,
@@ -83,6 +91,7 @@ def test_polytomous_recursion_combines_whole_score_slices(monkeypatch) -> None:
         prior_cov=None,
     )
     item_indices = (0, 2, 3)
+    tables = EAPSumScorer(17)._item_probability_tables(model, quad_points, item_indices)
     call_count = 0
     original = np.logaddexp
 
@@ -92,12 +101,7 @@ def test_polytomous_recursion_combines_whole_score_slices(monkeypatch) -> None:
         return original(*args, **kwargs)
 
     monkeypatch.setattr(np, "logaddexp", counted_logaddexp)
-    EAPSumScorer(17)._compute_sum_score_distribution(
-        model,
-        quad_points,
-        sum(model._n_categories[index] - 1 for index in item_indices),
-        item_indices,
-    )
+    eapsum_module._log_space_sum_score_distribution(tables, len(quad_points))
 
     assert call_count == sum(model._n_categories[index] for index in item_indices)
 

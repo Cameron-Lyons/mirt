@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import optimize, stats
+from scipy import optimize
 from scipy.special import expit, softmax
 
 if TYPE_CHECKING:
@@ -26,10 +26,22 @@ from mirt.equating.linking import (
     LinkingConstants,
     LinkingFitStatistics,
     LinkingResult,
+    _normalize_anchor_indices,
+    _validate_curve_grid,
+    _validate_linking_constants,
+    _validate_transform_constants,
+    link,
 )
 
 _ORDERED_METHODS = frozenset({"mean_sigma", "mean_mean", "stocking_lord", "haebara"})
 _NRM_METHODS = frozenset({"stocking_lord", "haebara"})
+# Built-in family names mapped to the transformation they support.
+_POLYTOMOUS_MODEL_TYPES: dict[str, Literal["grm", "gpcm", "nrm"]] = {
+    "GRM": "grm",
+    "GPCM": "gpcm",
+    "PCM": "gpcm",
+    "NRM": "nrm",
+}
 
 
 @dataclass
@@ -64,64 +76,17 @@ def link_grm(
     ``a_old = a_new / A`` and ``threshold_old = A * threshold_new + B``.
     Corresponding anchor items must have the same number of categories.
     """
-    if method not in _ORDERED_METHODS:
-        raise ValueError(f"Unknown method: {method}")
-    old_items, new_items, theta_grid, normalized_weights = _validate_link_inputs(
+    return _link_ordered_model(
         model_old,
         model_new,
         anchors_old,
         anchors_new,
+        method,
         theta_range,
         n_theta,
         weights,
-    )
-    disc_old = _extract_discrimination(model_old, old_items, "old")
-    disc_new = _extract_discrimination(model_new, new_items, "new")
-    thresholds_old = _extract_thresholds(model_old, old_items, "old")
-    thresholds_new = _extract_thresholds(model_new, new_items, "new")
-
-    A, B, convergence_info = _link_ordered_parameters(
-        disc_old,
-        thresholds_old,
-        disc_new,
-        thresholds_new,
-        theta_grid,
-        normalized_weights,
-        method,
+        compute_diagnostics,
         "grm",
-    )
-    A, B = _validate_linking_constants(A, B, method)
-
-    fit_statistics = None
-    anchor_diagnostics = None
-    if compute_diagnostics:
-        fit_statistics = _compute_grm_fit(
-            disc_old,
-            thresholds_old,
-            disc_new,
-            thresholds_new,
-            A,
-            B,
-            theta_grid,
-            normalized_weights,
-        )
-        anchor_diagnostics = _compute_grm_diagnostics(
-            disc_old,
-            thresholds_old,
-            disc_new,
-            thresholds_new,
-            A,
-            B,
-            old_items,
-            theta_grid,
-        )
-
-    return LinkingResult(
-        constants=LinkingConstants(A=A, B=B, method=method),
-        anchor_items=old_items,
-        fit_statistics=fit_statistics,
-        anchor_diagnostics=anchor_diagnostics,
-        convergence_info=convergence_info,
     )
 
 
@@ -144,6 +109,33 @@ def link_gpcm(
     ``a_old = a_new / A`` and ``step_old = A * step_new + B``.
     Corresponding anchor items must have the same number of categories.
     """
+    return _link_ordered_model(
+        model_old,
+        model_new,
+        anchors_old,
+        anchors_new,
+        method,
+        theta_range,
+        n_theta,
+        weights,
+        compute_diagnostics,
+        "gpcm",
+    )
+
+
+def _link_ordered_model(
+    model_old: "BaseItemModel",
+    model_new: "BaseItemModel",
+    anchors_old: list[int],
+    anchors_new: list[int],
+    method: str,
+    theta_range: tuple[float, float],
+    n_theta: int,
+    weights: NDArray[np.float64] | None,
+    compute_diagnostics: bool,
+    model_type: Literal["grm", "gpcm"],
+) -> LinkingResult:
+    """Link GRM thresholds or GPCM steps, which share one ordered kernel."""
     if method not in _ORDERED_METHODS:
         raise ValueError(f"Unknown method: {method}")
     old_items, new_items, theta_grid, normalized_weights = _validate_link_inputs(
@@ -155,45 +147,48 @@ def link_gpcm(
         n_theta,
         weights,
     )
+    extract_locations = _extract_thresholds if model_type == "grm" else _extract_steps
     disc_old = _extract_discrimination(model_old, old_items, "old")
     disc_new = _extract_discrimination(model_new, new_items, "new")
-    steps_old = _extract_steps(model_old, old_items, "old")
-    steps_new = _extract_steps(model_new, new_items, "new")
+    locations_old = extract_locations(model_old, old_items, "old")
+    locations_new = extract_locations(model_new, new_items, "new")
 
     A, B, convergence_info = _link_ordered_parameters(
         disc_old,
-        steps_old,
+        locations_old,
         disc_new,
-        steps_new,
+        locations_new,
         theta_grid,
         normalized_weights,
         method,
-        "gpcm",
+        model_type,
     )
     A, B = _validate_linking_constants(A, B, method)
 
     fit_statistics = None
     anchor_diagnostics = None
     if compute_diagnostics:
-        fit_statistics = _compute_gpcm_fit(
+        fit_statistics = _compute_ordered_fit(
             disc_old,
-            steps_old,
+            locations_old,
             disc_new,
-            steps_new,
+            locations_new,
             A,
             B,
             theta_grid,
             normalized_weights,
+            model_type,
         )
-        anchor_diagnostics = _compute_gpcm_diagnostics(
+        anchor_diagnostics = _compute_ordered_diagnostics(
             disc_old,
-            steps_old,
+            locations_old,
             disc_new,
-            steps_new,
+            locations_new,
             A,
             B,
             old_items,
             theta_grid,
+            model_type,
         )
 
     return LinkingResult(
@@ -386,31 +381,9 @@ def _validate_link_inputs(
     if len(anchors_old) < 2:
         raise ValueError("At least 2 anchor items are required")
 
-    normalized: list[list[int]] = []
-    for label, anchors, n_items in (
-        ("old", anchors_old, model_old.n_items),
-        ("new", anchors_new, model_new.n_items),
-    ):
-        current: list[int] = []
-        for anchor in anchors:
-            if isinstance(anchor, (bool, np.bool_)) or not isinstance(
-                anchor, (int, np.integer)
-            ):
-                raise ValueError(
-                    f"Anchor indices for the {label} model must be integers"
-                )
-            index = int(anchor)
-            if index < 0 or index >= n_items:
-                raise ValueError(
-                    f"Anchor index {index} out of range for the {label} model "
-                    f"with {n_items} items"
-                )
-            current.append(index)
-        if len(set(current)) != len(current):
-            raise ValueError(f"Anchor indices for the {label} model must be unique")
-        normalized.append(current)
-
-    old_items, new_items = normalized
+    old_items, new_items = _normalize_anchor_indices(
+        anchors_old, anchors_new, model_old.n_items, model_new.n_items
+    )
     old_categories = model_old.n_categories
     new_categories = model_new.n_categories
     for old_item, new_item in zip(old_items, new_items, strict=True):
@@ -423,59 +396,24 @@ def _validate_link_inputs(
     return old_items, new_items, theta_grid, normalized_weights
 
 
-def _validate_curve_grid(
-    theta_range: tuple[float, float],
-    n_theta: int,
-    weights: NDArray[np.float64] | None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Validate integration settings and normalize weights."""
-    if not isinstance(theta_range, (tuple, list)) or len(theta_range) != 2:
-        raise ValueError("theta_range must contain exactly two values")
-    lower, upper = float(theta_range[0]), float(theta_range[1])
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-        raise ValueError("theta_range must contain finite, increasing values")
-    if isinstance(n_theta, (bool, np.bool_)) or not isinstance(
-        n_theta, (int, np.integer)
-    ):
-        raise ValueError("n_theta must be an integer")
-    if n_theta < 2:
-        raise ValueError("n_theta must be at least 2")
-
-    theta_grid = np.linspace(lower, upper, int(n_theta))
-    if weights is None:
-        normalized_weights = stats.norm.pdf(theta_grid)
-    else:
-        normalized_weights = np.asarray(weights, dtype=np.float64)
-        if normalized_weights.shape != (n_theta,):
-            raise ValueError(f"weights must have shape ({n_theta},)")
-        if not np.all(np.isfinite(normalized_weights)):
-            raise ValueError("weights must be finite")
-        if np.any(normalized_weights < 0.0):
-            raise ValueError("weights must be non-negative")
-    weight_sum = float(np.sum(normalized_weights))
-    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-        raise ValueError("weights must have a positive sum")
-    return theta_grid, normalized_weights / weight_sum
+def _polytomous_model_type(
+    model: "BaseItemModel",
+) -> Literal["grm", "gpcm", "nrm"] | None:
+    """Return the polytomous transformation type of a built-in family."""
+    return _POLYTOMOUS_MODEL_TYPES.get(getattr(model, "model_name", ""))
 
 
-def _validate_transform_constants(A: float, B: float) -> tuple[float, float]:
-    """Require a finite, orientation-preserving transformation."""
-    scale, shift = float(A), float(B)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("A must be finite and positive")
-    if not np.isfinite(shift):
-        raise ValueError("B must be finite")
-    return scale, shift
+def _linker_for(model: "BaseItemModel") -> Callable[..., LinkingResult]:
+    """Return the pairwise linker for a model's response family.
 
-
-def _validate_linking_constants(A: float, B: float, method: str) -> tuple[float, float]:
-    """Require finite constants from a linking method."""
-    scale, shift = float(A), float(B)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise RuntimeError(f"{method} linking did not produce a positive finite slope")
-    if not np.isfinite(shift):
-        raise RuntimeError(f"{method} linking did not produce a finite intercept")
-    return scale, shift
+    GRM uses :func:`link_grm`, GPCM and PCM use :func:`link_gpcm`, NRM uses
+    :func:`link_nrm`, and every other family uses the dichotomous
+    :func:`~mirt.equating.linking.link`.
+    """
+    model_type = _polytomous_model_type(model)
+    if model_type is None:
+        return link
+    return {"grm": link_grm, "gpcm": link_gpcm, "nrm": link_nrm}[model_type]
 
 
 def _require_parameter(
@@ -860,90 +798,6 @@ def _curve_link_ordered(
     return _minimize_positive_scale(criterion, initial_A, initial_B, method)
 
 
-def _stocking_lord_grm(
-    disc_old: NDArray[np.float64],
-    thresholds_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    thresholds_new: list[NDArray[np.float64]],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[float, float, dict]:
-    """Stocking-Lord expected-score matching for GRM."""
-    return _curve_link_ordered(
-        disc_old,
-        thresholds_old,
-        disc_new,
-        thresholds_new,
-        theta_grid,
-        weights,
-        "stocking_lord",
-        "grm",
-    )
-
-
-def _haebara_grm(
-    disc_old: NDArray[np.float64],
-    thresholds_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    thresholds_new: list[NDArray[np.float64]],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[float, float, dict]:
-    """Haebara category-curve matching for GRM."""
-    return _curve_link_ordered(
-        disc_old,
-        thresholds_old,
-        disc_new,
-        thresholds_new,
-        theta_grid,
-        weights,
-        "haebara",
-        "grm",
-    )
-
-
-def _stocking_lord_gpcm(
-    disc_old: NDArray[np.float64],
-    steps_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    steps_new: list[NDArray[np.float64]],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[float, float, dict]:
-    """Stocking-Lord expected-score matching for GPCM."""
-    return _curve_link_ordered(
-        disc_old,
-        steps_old,
-        disc_new,
-        steps_new,
-        theta_grid,
-        weights,
-        "stocking_lord",
-        "gpcm",
-    )
-
-
-def _haebara_gpcm(
-    disc_old: NDArray[np.float64],
-    steps_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    steps_new: list[NDArray[np.float64]],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[float, float, dict]:
-    """Haebara category-curve matching for GPCM."""
-    return _curve_link_ordered(
-        disc_old,
-        steps_old,
-        disc_new,
-        steps_new,
-        theta_grid,
-        weights,
-        "haebara",
-        "gpcm",
-    )
-
-
 def _minimize_positive_scale(
     criterion: Callable[[NDArray[np.float64]], float],
     initial_A: float,
@@ -1082,26 +936,6 @@ def _link_nrm_parameters(
     return _minimize_positive_scale(criterion, initial_A, initial_B, method)
 
 
-def _stocking_lord_nrm(
-    slopes_old: list[NDArray[np.float64]],
-    intercepts_old: list[NDArray[np.float64]],
-    slopes_new: list[NDArray[np.float64]],
-    intercepts_new: list[NDArray[np.float64]],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[float, float, dict]:
-    """Stocking-Lord expected-score matching for NRM."""
-    return _link_nrm_parameters(
-        slopes_old,
-        intercepts_old,
-        slopes_new,
-        intercepts_new,
-        theta_grid,
-        weights,
-        "stocking_lord",
-    )
-
-
 def _ordered_curve_summaries(
     disc_old: NDArray[np.float64],
     locations_old: list[NDArray[np.float64]],
@@ -1183,54 +1017,6 @@ def _compute_ordered_fit(
     )
 
 
-def _compute_grm_fit(
-    disc_old: NDArray[np.float64],
-    thresholds_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    thresholds_new: list[NDArray[np.float64]],
-    A: float,
-    B: float,
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> LinkingFitStatistics:
-    """Compute fit statistics for GRM linking."""
-    return _compute_ordered_fit(
-        disc_old,
-        thresholds_old,
-        disc_new,
-        thresholds_new,
-        A,
-        B,
-        theta_grid,
-        weights,
-        "grm",
-    )
-
-
-def _compute_gpcm_fit(
-    disc_old: NDArray[np.float64],
-    steps_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    steps_new: list[NDArray[np.float64]],
-    A: float,
-    B: float,
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> LinkingFitStatistics:
-    """Compute fit statistics for GPCM linking."""
-    return _compute_ordered_fit(
-        disc_old,
-        steps_old,
-        disc_new,
-        steps_new,
-        A,
-        B,
-        theta_grid,
-        weights,
-        "gpcm",
-    )
-
-
 def _robust_z_scores(values: NDArray[np.float64]) -> NDArray[np.float64]:
     """Compute MAD-based scores while retaining isolated tied outliers."""
     median = float(np.median(values))
@@ -1282,54 +1068,6 @@ def _compute_ordered_diagnostics(
         area_diff=area_diff,
         robust_z=robust_z,
         flagged=np.abs(robust_z) > 2.5,
-    )
-
-
-def _compute_grm_diagnostics(
-    disc_old: NDArray[np.float64],
-    thresholds_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    thresholds_new: list[NDArray[np.float64]],
-    A: float,
-    B: float,
-    anchor_indices: list[int],
-    theta_grid: NDArray[np.float64],
-) -> AnchorDiagnostics:
-    """Compute anchor diagnostics for GRM linking."""
-    return _compute_ordered_diagnostics(
-        disc_old,
-        thresholds_old,
-        disc_new,
-        thresholds_new,
-        A,
-        B,
-        anchor_indices,
-        theta_grid,
-        "grm",
-    )
-
-
-def _compute_gpcm_diagnostics(
-    disc_old: NDArray[np.float64],
-    steps_old: list[NDArray[np.float64]],
-    disc_new: NDArray[np.float64],
-    steps_new: list[NDArray[np.float64]],
-    A: float,
-    B: float,
-    anchor_indices: list[int],
-    theta_grid: NDArray[np.float64],
-) -> AnchorDiagnostics:
-    """Compute anchor diagnostics for GPCM linking."""
-    return _compute_ordered_diagnostics(
-        disc_old,
-        steps_old,
-        disc_new,
-        steps_new,
-        A,
-        B,
-        anchor_indices,
-        theta_grid,
-        "gpcm",
     )
 
 

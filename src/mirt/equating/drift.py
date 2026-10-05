@@ -12,6 +12,11 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import optimize, stats
 
+from mirt.equating.linking import (
+    _normalize_anchor_indices,
+    _validate_transform_constants,
+)
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -225,32 +230,11 @@ def _validate_drift_inputs(
     if model_old.n_factors != 1 or model_new.n_factors != 1:
         raise ValueError("Drift analysis requires unidimensional models")
 
-    normalized: list[list[int]] = []
-    for label, items, n_items in (
-        ("old", items_old, model_old.n_items),
-        ("new", items_new, model_new.n_items),
-    ):
-        current: list[int] = []
-        for item in items:
-            if isinstance(item, (bool, np.bool_)) or not isinstance(
-                item, (int, np.integer)
-            ):
-                raise ValueError(
-                    f"Anchor indices for the {label} model must be integers"
-                )
-            index = int(item)
-            if index < 0 or index >= n_items:
-                raise ValueError(
-                    f"Anchor index {index} out of range for the {label} model "
-                    f"with {n_items} items"
-                )
-            current.append(index)
-        if len(set(current)) != len(current):
-            raise ValueError(f"Anchor indices for the {label} model must be unique")
-        normalized.append(current)
-
+    normalized = _normalize_anchor_indices(
+        items_old, items_new, model_old.n_items, model_new.n_items
+    )
     _validate_theta_grid(theta_range, n_theta)
-    return normalized[0], normalized[1]
+    return normalized
 
 
 def _validate_theta_grid(
@@ -308,13 +292,7 @@ def _resolve_linking_constants(
             theta_range,
             n_theta,
         )
-
-    scale, shift = float(A), float(B)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("A must be finite and positive")
-    if not np.isfinite(shift):
-        raise ValueError("B must be finite")
-    return scale, shift
+    return _validate_transform_constants(A, B)
 
 
 def _estimate_curve_link(

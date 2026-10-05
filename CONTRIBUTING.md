@@ -42,6 +42,10 @@ Wrappers live under `src/mirt/backends/rust/`. Each module declares `FALLBACK_MO
 
 Prefer public APIs and `mirt.should_use_rust()` over private `_rust_backend` symbols.
 
+Every function registered in `mirt_rs` must be called as `mirt_rs.<name>` by
+package code, and every such call must resolve; `tests/test_native_registry.py`
+enforces both. Crate modules are private, so rustc reports unused helpers.
+
 ## Rust checks
 
 The extension lives under `rust_src/` with the workspace `Cargo.toml` at the repo root.
@@ -379,9 +383,11 @@ allocations and exclude process RSS and native library workspace.
 Fast paths use exact built-in model types; custom and multidimensional scoring
 or polytomous optimization retain their generic implementations. Native M-steps
 use analytic gradients and a projected BFGS optimizer with backtracking, so
-fixed-iteration fits can differ slightly from SciPy fits. Compare the objective,
-parameter recovery, and convergence as well as speed. Itemwise EM standard errors
-and full marginal-information standard errors retain their separate objectives.
+fixed-iteration fits can differ slightly from SciPy fits. The graded M-step
+projects onto ordered thresholds with the SciPy constraint's minimum gap, and
+tied thresholds move together. Compare the objective, parameter recovery, and
+convergence as well as speed. Itemwise EM standard errors and full
+marginal-information standard errors retain their separate objectives.
 
 Core EM E-steps return per-person **log** marginal likelihoods internally; avoid
 converting them to probabilities for convergence or fit statistics. Prepared fit

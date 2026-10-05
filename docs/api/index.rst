@@ -11,6 +11,9 @@ Core Functions
    :nosignatures:
 
    fit_mirt
+   bfactor
+   mirt_model
+   ModelSpec
    itemfit
    personfit
    dif
@@ -29,22 +32,46 @@ Models
    TwoParameterLogistic
    ThreeParameterLogistic
    FourParameterLogistic
+   FiveParameterLogistic
+   ComplementaryLogLog
+   NegativeLogLog
    GradedResponseModel
    GeneralizedPartialCredit
    PartialCreditModel
+   RatingScaleModel
+   GradedRatingScaleModel
    NominalResponseModel
+   MixedItemModel
+   SequentialResponseModel
+   ContinuationRatioModel
+   AdjacentCategoryModel
    TwoPLNestedLogit
    ThreePLNestedLogit
    FourPLNestedLogit
    BifactorModel
+   PartiallyCompensatoryModel
+   NoncompensatoryModel
+   DisjunctiveModel
+   MonotonicSplineModel
+   MonotonicPolynomialModel
+   KernelSmoothingModel
+   ExplanatoryIRT
+   RaschLLTM
    MixtureIRT
    TestletModel
+   BifactorTestletModel
+   RandomTestletEffectsModel
    models.MultilevelIRTModel
    models.ThreeLevelIRTModel
    models.CrossedRandomEffectsModel
+   models.ManyFacetRaschModel
+   models.PolytomousMFRM
+   models.Facet
    ResponseTimeModel
    DINA
    DINO
+   GDINA
+   HigherOrderCDM
    IRTreeModel
 
 Custom Models
@@ -83,13 +110,23 @@ Estimation
    :nosignatures:
 
    EMEstimator
+   BifactorEMEstimator
+   MixedFormatEMEstimator
    MHRMEstimator
    GibbsSampler
    MCMCResult
    BLEstimator
    ResponseTimeGibbsSampler
+   RTModelPriors
+   fit_bkt_em
+   BKTEMResult
+   BKTGibbsSampler
+   BKTPriors
    IRTreeEMEstimator
    IRTreeResult
+   estimation.FactorCovarianceDensity
+   fit_mfrm
+   models.MFRMResult
 
 Diagnostics
 -----------
@@ -144,6 +181,8 @@ Scoring
 
    fscores
    ability_posterior
+   scoring.eapsum_table
+   scoring.SumScoreTable
 
 Cross-validation
 ----------------
@@ -180,6 +219,15 @@ CAT
    CATEngine
    CATResult
    CATState
+   cat.MCATEngine
+   cat.ShadowTestSelection
+   cat.SEChangeStop
+   cat.MinInformationStop
+   cat.PredictedSEReductionStop
+   cat.assemble_form
+   cat.assemble_parallel_forms
+   cat.summarize_cat_simulation
+   cat.CATSimulationReport
 
 Equating
 --------
@@ -192,6 +240,9 @@ Equating
    true_score_equating
    observed_score_equating
    equipercentile_equating
+   kernel_equating
+   irt_kernel_equating
+   KernelEquatingResult
    chain_link
    link_mirt
    transform_mirt_theta
@@ -207,6 +258,8 @@ Multigroup
 
    fit_multigroup
    compare_invariance
+   multigroup_dif
+   select_dif_anchors
 
 Reports
 -------
@@ -239,6 +292,10 @@ Utils
    combine_plausible_values
    plausible_value_regression
    plausible_value_statistics
+   bootstrap_lr
+   BootstrapLRResult
+   fixed_item_calibration
+   FixedItemCalibrationResult
    draw_parameters
    posterior_summary
    sample_expected_scores
@@ -253,6 +310,7 @@ Exceptions
 
    MirtError
    MirtValidationError
+   MirtIndexError
    MirtDataError
    MirtConvergenceError
 

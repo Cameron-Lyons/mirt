@@ -3,8 +3,8 @@
 //! This module provides parallelized fixed-item calibration using Rayon,
 //! enabling efficient calibration of new items to an existing scale.
 
-use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::ndarray::Array2;
+use numpy::{IntoPyArray, PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
@@ -285,32 +285,85 @@ pub fn fixed_calib_em<'py>(
     let theta_grid_vec: Vec<f64> = theta_grid.to_vec();
     let log_weights = compute_log_weights(&quad_weights.to_vec());
 
-    let anchor_responses: Vec<Vec<i32>> = (0..n_persons)
-        .map(|i| anchor_items.iter().map(|&j| responses[[i, j]]).collect())
-        .collect();
+    let (new_disc, new_diff, theta_est, log_likelihood, final_iter, converged) = py.detach(|| {
+        let anchor_responses: Vec<Vec<i32>> = (0..n_persons)
+            .map(|i| anchor_items.iter().map(|&j| responses[[i, j]]).collect())
+            .collect();
 
-    let new_responses: Vec<Vec<i32>> = (0..n_persons)
-        .map(|i| new_items.iter().map(|&j| responses[[i, j]]).collect())
-        .collect();
+        let new_responses: Vec<Vec<i32>> = (0..n_persons)
+            .map(|i| new_items.iter().map(|&j| responses[[i, j]]).collect())
+            .collect();
 
-    let anchor_ll = compute_anchor_likelihood(
-        &anchor_responses,
-        &theta_grid_vec,
-        &anchor_disc_vec,
-        &anchor_diff_vec,
-    );
+        let anchor_ll = compute_anchor_likelihood(
+            &anchor_responses,
+            &theta_grid_vec,
+            &anchor_disc_vec,
+            &anchor_diff_vec,
+        );
 
-    let mut new_disc = vec![init_disc; n_new];
-    let mut new_diff = vec![init_diff; n_new];
+        let mut new_disc = vec![init_disc; n_new];
+        let mut new_diff = vec![init_diff; n_new];
 
-    let mut converged = false;
-    let mut log_likelihood = f64::NEG_INFINITY;
-    let mut final_iter = 0;
+        let mut converged = false;
+        let mut log_likelihood = f64::NEG_INFINITY;
+        let mut final_iter = 0;
 
-    for iteration in 0..max_iter {
-        final_iter = iteration + 1;
+        for iteration in 0..max_iter {
+            final_iter = iteration + 1;
 
-        let (posterior_weights, new_ll) = e_step_fixed_calib(
+            let (posterior_weights, new_ll) = e_step_fixed_calib(
+                &anchor_ll,
+                &new_responses,
+                &theta_grid_vec,
+                &log_weights,
+                &new_disc,
+                &new_diff,
+            );
+            if (new_ll - log_likelihood).abs() < tol {
+                converged = true;
+                break;
+            }
+            log_likelihood = new_ll;
+
+            let old_disc = new_disc.clone();
+            let old_diff = new_diff.clone();
+
+            let (updated_disc, updated_diff) = m_step_fixed_calib(
+                &new_responses,
+                &posterior_weights,
+                &theta_grid_vec,
+                &old_disc,
+                &old_diff,
+                disc_bounds,
+                diff_bounds,
+                prob_clamp,
+                min_count,
+                min_valid_points,
+            );
+            new_disc = updated_disc;
+            new_diff = updated_diff;
+
+            let max_disc_change = new_disc
+                .iter()
+                .zip(old_disc.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            let max_diff_change = new_diff
+                .iter()
+                .zip(old_diff.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+
+            if max_disc_change + max_diff_change < tol {
+                converged = true;
+                break;
+            }
+        }
+
+        // The final M-step can change item parameters immediately before the loop
+        // exits. Recompute the posterior so theta and likelihood describe the
+        // parameters returned to Python.
+        let (posterior_weights, log_likelihood) = e_step_fixed_calib(
             &anchor_ll,
             &new_responses,
             &theta_grid_vec,
@@ -318,78 +371,32 @@ pub fn fixed_calib_em<'py>(
             &new_disc,
             &new_diff,
         );
-        if (new_ll - log_likelihood).abs() < tol {
-            converged = true;
-            break;
-        }
-        log_likelihood = new_ll;
 
-        let old_disc = new_disc.clone();
-        let old_diff = new_diff.clone();
+        let theta_est: Vec<f64> = (0..n_persons)
+            .into_par_iter()
+            .map(|i| {
+                let mut theta_eap = 0.0;
+                for q in 0..n_quad {
+                    theta_eap += posterior_weights[[i, q]] * theta_grid_vec[q];
+                }
+                theta_eap
+            })
+            .collect();
 
-        let (updated_disc, updated_diff) = m_step_fixed_calib(
-            &new_responses,
-            &posterior_weights,
-            &theta_grid_vec,
-            &old_disc,
-            &old_diff,
-            disc_bounds,
-            diff_bounds,
-            prob_clamp,
-            min_count,
-            min_valid_points,
-        );
-        new_disc = updated_disc;
-        new_diff = updated_diff;
-
-        let max_disc_change = new_disc
-            .iter()
-            .zip(old_disc.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
-        let max_diff_change = new_diff
-            .iter()
-            .zip(old_diff.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
-
-        if max_disc_change + max_diff_change < tol {
-            converged = true;
-            break;
-        }
-    }
-
-    // The final M-step can change item parameters immediately before the loop
-    // exits. Recompute the posterior so theta and likelihood describe the
-    // parameters returned to Python.
-    let (posterior_weights, log_likelihood) = e_step_fixed_calib(
-        &anchor_ll,
-        &new_responses,
-        &theta_grid_vec,
-        &log_weights,
-        &new_disc,
-        &new_diff,
-    );
-
-    let theta_est: Vec<f64> = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let mut theta_eap = 0.0;
-            for q in 0..n_quad {
-                theta_eap += posterior_weights[[i, q]] * theta_grid_vec[q];
-            }
-            theta_eap
-        })
-        .collect();
-
-    let disc_arr: Array1<f64> = new_disc.into();
-    let diff_arr: Array1<f64> = new_diff.into();
-    let theta_arr: Array1<f64> = theta_est.into();
+        (
+            new_disc,
+            new_diff,
+            theta_est,
+            log_likelihood,
+            final_iter,
+            converged,
+        )
+    });
 
     (
-        disc_arr.to_pyarray(py),
-        diff_arr.to_pyarray(py),
-        theta_arr.to_pyarray(py),
+        new_disc.into_pyarray(py),
+        new_diff.into_pyarray(py),
+        theta_est.into_pyarray(py),
         log_likelihood,
         final_iter,
         converged,

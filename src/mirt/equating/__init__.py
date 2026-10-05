@@ -7,7 +7,7 @@ functionality including:
 - Robust linking (bisector, orthogonal regression)
 - Polytomous model linking (GRM, GPCM, NRM)
 - Multidimensional linking (Procrustes rotation)
-- Score equating (true score, observed score)
+- Score equating (true score, observed score, Gaussian kernel)
 - Item parameter drift detection
 - Chain linking across multiple time points
 
@@ -79,6 +79,9 @@ _LAZY_IMPORTS = {
     "score_equating_summary": "mirt.equating.score_equating",
     "compute_see": "mirt.equating.score_equating",
     "ScoreEquatingResult": "mirt.equating.score_equating",
+    "kernel_equating": "mirt.equating.kernel",
+    "irt_kernel_equating": "mirt.equating.kernel",
+    "KernelEquatingResult": "mirt.equating.kernel",
     "chain_link": "mirt.equating.chain",
     "accumulate_constants": "mirt.equating.chain",
     "transform_to_reference": "mirt.equating.chain",

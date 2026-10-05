@@ -94,9 +94,7 @@ def test_native_stopping_reconstruction_preserves_previous_session_state(
     previous_state = engine.get_current_state()
     previous_result = engine.get_result().to_dict()
     previous_trigger = engine._stopping._triggered_rule
-    previous_flags = [rule._triggered for rule in engine._stopping.rules]
     assert previous_trigger is engine._stopping.rules[1]
-    assert previous_flags == [False, True]
     assert previous_result["stopping_reason"] == "SE threshold reached (SE <= 100.0)"
 
     # Both conditions will hold in the next batch, whose authored first rule
@@ -108,7 +106,6 @@ def test_native_stopping_reconstruction_preserves_previous_session_state(
     assert engine.get_current_state() == previous_state
     assert engine.get_result().to_dict() == previous_result
     assert engine._stopping._triggered_rule is previous_trigger
-    assert [rule._triggered for rule in engine._stopping.rules] == previous_flags
     assert all(
         result.stopping_reason == "Maximum items reached (1)" for result in results
     )

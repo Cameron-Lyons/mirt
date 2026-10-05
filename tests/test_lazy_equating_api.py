@@ -44,7 +44,7 @@ def test_plain_equating_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "scipy_loaded": False,
         "equating_submodules": [],
-        "export_count": 57,
+        "export_count": 60,
         "exports_visible": True,
     }
 
@@ -136,7 +136,7 @@ def test_star_import_resolves_every_public_equating_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 57,
+        "export_count": 60,
         "all_cached": True,
     }
 

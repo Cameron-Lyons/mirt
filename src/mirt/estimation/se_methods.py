@@ -1,12 +1,27 @@
 """Standard error computation methods for IRT models.
 
 This module provides multiple methods for computing standard errors:
-- Numerical (finite difference Hessian)
-- Louis (missing information principle)
-- Sandwich (robust standard errors)
-- Oakes (cross-product of scores)
-- Crossprod (observed information from scores)
-- SEM (supplemented EM)
+
+- Numerical, central, forward and Richardson: itemwise finite differences of
+  the expected complete-data log-likelihood (diagonal complete-data curvature,
+  which ignores the missing information and understates uncertainty).
+  Parameters shared by all items, such as rating-scale thresholds, are
+  differenced in the expected log-likelihood summed over items.
+- Louis, Oakes and SEM: the observed information of the marginal likelihood
+- Crossprod: the outer product of marginal person scores
+- Sandwich: observed information bread around the score cross-product
+- Fisher: the marginal expected information, by response-pattern enumeration
+
+The marginal information and scores are exact (Louis, 1982) for the item
+models accepted by
+:func:`~mirt.estimation._louis_information.supports_louis_information`:
+1PL-4PL with any number of factors, GRM, GPCM, PCM, NRM, RSM, GRSM,
+multidimensional and bifactor models, and the other built-in families whose
+likelihood is a product of item curves. Other models, such as custom,
+testlet or mixture models, use central differences of the marginal
+log-likelihood, which cost O(P^2) likelihood evaluations. As in fitted
+results, the matrix methods hold coordinates on an EM optimizer bound fixed
+with ``NaN`` standard errors.
 
 References
 ----------
@@ -19,7 +34,7 @@ Oakes, D. (1999). Direct calculation of the information matrix via the EM
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
@@ -46,6 +61,8 @@ SEMethod = Literal[
     "sem",
     "fisher",
 ]
+# Methods built from each item's own expected complete-data likelihood.
+_ITEMWISE_METHODS = frozenset({"numerical", "central", "forward", "richardson"})
 
 
 def _valid_second_derivative(
@@ -121,6 +138,13 @@ def _diagonal_item_standard_errors(
     return np.sqrt(-1.0 / curvature) if curvature < 0 else np.nan
 
 
+def _em_bounds(model: BaseItemModel) -> Callable[[str], tuple[float, float]]:
+    """Return the optimizer boxes that EM fits hold coordinates fixed at."""
+    from mirt.estimation.base import _parameter_bounds
+
+    return lambda name: _parameter_bounds(model, name)
+
+
 def compute_se(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -144,9 +168,17 @@ def compute_se(
     posterior_weights : ndarray
         Posterior weights from final E-step.
     method : str
-        Method for SE computation.
+        Method for SE computation. The default ``"numerical"`` is itemwise
+        complete-data curvature; ``"oakes"`` (or its aliases ``"louis"`` and
+        ``"sem"``) gives observed-information standard errors. The matrix
+        methods (``"oakes"``, ``"louis"``, ``"sem"``, ``"crossprod"``,
+        ``"sandwich"`` and ``"fisher"``) hold coordinates on an EM optimizer
+        bound, such as a guessing parameter of 0, fixed with ``NaN`` standard
+        errors, so they match the fitted ``se_method`` of an EM result
+        without item priors or equality constraints.
     step_size : float
-        Step size for numerical differentiation.
+        Step size for numerical differentiation. Matrix-based methods use it
+        only for models without exact item derivatives.
     n_jobs : int
         Number of parallel jobs for item-wise computation.
         Use -1 for all CPUs, 1 for sequential.
@@ -158,7 +190,32 @@ def compute_se(
     -------
     dict
         Standard errors for each parameter.
+
+    Notes
+    -----
+    For a :class:`~mirt.models.mixed_format.MixedItemModel`, the itemwise
+    methods difference each component on its own items and report its
+    errors under qualified names such as ``"3PL.guessing"``.
     """
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel) and method in _ITEMWISE_METHODS:
+        responses = np.asarray(responses)
+        return {
+            f"{prefix}.{name}": errors
+            for prefix, (component, items) in zip(
+                model.component_names, model.components, strict=True
+            )
+            for name, errors in compute_se(
+                component,
+                responses[:, items],
+                quadrature,
+                posterior_weights,
+                method,
+                step_size,
+                n_jobs,
+            ).items()
+        }
     if method in ("numerical", "central"):
         return _se_numerical_central(
             model, responses, quadrature, posterior_weights, step_size, n_jobs
@@ -223,7 +280,13 @@ def compute_se(
         )
     elif method == "fisher":
         return _se_fisher(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     else:
         raise ValueError(f"Unknown SE method: {method}")
@@ -269,19 +332,24 @@ def _se_itemwise_numerical(
     free_masks = model.free_parameter_masks
     result = {name: np.zeros_like(values) for name, values in params.items()}
     workers = resolve_n_jobs(n_jobs)
+    shared = any(np.any(free_masks[name]) for name in model._shared_parameters)
     names_by_item = {
-        item: tuple(name for name, mask in free_masks.items() if np.any(mask[item]))
+        item: tuple(
+            name
+            for name, mask in free_masks.items()
+            if name not in model._shared_parameters and np.any(mask[item])
+        )
         for item in range(model.n_items)
     }
     items = [item for item, names in names_by_item.items() if names]
-    if not items:
+    if not items and not shared:
         return result
 
     with EMFitContext(responses) as context:
         correct = observed = None
         category_counts: dict[int, NDArray[np.float64]] = {}
         if model.is_polytomous:
-            for item in items:
+            for item in range(model.n_items) if shared else items:
                 category_counts[item] = context.expected_category_counts(
                     item, model.n_categories[item], posterior_weights
                 )
@@ -289,6 +357,23 @@ def _se_itemwise_numerical(
             correct, observed = context.expected_counts(
                 posterior_weights, cache_components=False
             )
+        if shared:
+            from mirt.estimation._shared_step import binary_category_counts
+
+            counts = (
+                [category_counts[item] for item in range(model.n_items)]
+                if model.is_polytomous
+                else binary_category_counts(correct, observed)
+            )
+            for step in (h, h / 2) if richardson else (h,):
+                errors = shared_parameter_standard_errors(
+                    model, quadrature.nodes, counts, step, scheme=scheme
+                )
+                for name, values in errors.items():
+                    # Richardson combines the full and half steps.
+                    result[name] = (
+                        values if step == h else (4 * values - result[name]) / 3
+                    )
 
         def compute_item(
             item: int,
@@ -332,7 +417,7 @@ def _se_itemwise_numerical(
                 item_result[name] = first
             return item, item_result
 
-        if workers == 1 or len(items) == 1:
+        if workers == 1 or len(items) <= 1:
             results = map(compute_item, items)
         else:
             results = context.executor(min(workers, len(items))).map(
@@ -346,6 +431,96 @@ def _se_itemwise_numerical(
         name: model._expand_parameter_standard_errors(name, errors)
         for name, errors in result.items()
     }
+
+
+def shared_parameter_standard_errors(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    counts: Sequence[NDArray[np.float64]],
+    h: float,
+    *,
+    scheme: Literal["central", "forward"] = "central",
+    epsilon: float = PROB_EPSILON,
+    exact: bool = False,
+) -> dict[str, NDArray[np.float64]]:
+    """Diagonal complete-data curvature of parameters shared by all items.
+
+    Each free shared coordinate is differenced in the expected complete-data
+    log-likelihood summed over items, matching the itemwise convention for
+    item parameters.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted model. Its parameters are restored before returning.
+    nodes : ndarray of shape (n_points, n_factors)
+        Quadrature nodes.
+    counts : sequence of ndarray
+        Each item's expected ``(n_points, n_categories)`` counts; a binary
+        item has incorrect and correct columns.
+    h : float
+        Finite-difference step.
+    scheme : {"central", "forward"}, default="central"
+        Difference stencil.
+    epsilon : float, optional
+        Probability clipping bound.
+    exact : bool, default=False
+        Use closed-form second derivatives when the model has them, in place
+        of differences with ``h`` and ``scheme``.
+
+    Returns
+    -------
+    dict
+        Standard errors of each shared parameter, zero at fixed coordinates.
+    """
+    from mirt.estimation._louis_information import (
+        has_analytic_item_derivatives,
+        item_terms,
+    )
+    from mirt.estimation._shared_step import SharedParameters, _numerical_objective
+    from mirt.estimation.standard_errors import _flatten_parameters
+
+    layout = SharedParameters(model)
+    result = {
+        name: np.zeros_like(model._parameters[name])
+        for name in model._shared_parameters
+    }
+    if not layout.size:
+        return result
+    if exact and has_analytic_item_derivatives(model):
+        # Shared coordinates trail every item's derivative terms.
+        curvature = np.zeros(layout.size)
+        for term, item_counts in zip(
+            item_terms(model, nodes, _flatten_parameters(model)[1]), counts, strict=True
+        ):
+            assert term is not None
+            shared = term.second[-layout.size :, -layout.size :]
+            curvature += np.einsum("aaqc,qc->a", shared, item_counts)
+        errors = np.sqrt(
+            np.divide(
+                -1.0,
+                curvature,
+                out=np.full(layout.size, np.nan),
+                where=curvature < 0,
+            )
+        )
+    else:
+        loss = _numerical_objective(model, layout, nodes, counts, epsilon)
+        original = {name: model._parameters[name] for name in layout.masks}
+        try:
+            errors = np.asarray(
+                _diagonal_item_standard_errors(
+                    lambda vector: -loss(vector), layout.get(model), h, scheme=scheme
+                )
+            )
+        finally:
+            model._parameters.update(original)
+    offset = 0
+    for name, mask in layout.masks.items():
+        count = int(np.count_nonzero(mask))
+        result[name][mask] = errors[offset : offset + count]
+        offset += count
+    return result
 
 
 def _compute_item_se_curvature(
@@ -516,6 +691,7 @@ def _se_sandwich(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -543,6 +719,7 @@ def _se_oakes(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -570,6 +747,7 @@ def _se_crossprod(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -597,6 +775,7 @@ def _se_sem(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -607,42 +786,27 @@ def _se_fisher(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Expected (Fisher) information standard errors.
+    """Marginal expected (Fisher) information standard errors.
 
-    Uses the expected information matrix computed from the model.
-    This assumes the model is correctly specified.
+    The information ``N * sum_y P(y) s(y) s(y)'`` sums the outer products of
+    exact marginal scores over every complete response pattern, weighted by
+    the pattern probabilities under the fitted model. It assumes the model is
+    correctly specified and is available for at most ``2**16`` patterns.
     """
-    quad_points = quadrature.nodes
-    quad_weights = quadrature.weights
-    n_persons = responses.shape[0]
+    del n_jobs
+    from mirt.estimation.standard_errors import (
+        _resolve_prior_mass,
+        _se_from_information,
+        compute_expected_information,
+    )
 
-    se_dict = {}
-    free_masks = model.free_parameter_masks
-
-    for param_name, values in model.parameters.items():
-        free_mask = free_masks[param_name]
-        if not np.any(free_mask):
-            se_dict[param_name] = np.zeros_like(values)
-            continue
-
-        se = np.zeros_like(values)
-
-        for item_idx in range(model.n_items):
-            info = model.information(quad_points, item_idx)
-            expected_info = n_persons * np.sum(quad_weights * info)
-
-            if values.ndim == 1:
-                se[item_idx] = (
-                    1.0 / np.sqrt(expected_info) if expected_info > 0 else np.nan
-                )
-            else:
-                se[item_idx] = np.full(
-                    values.shape[1],
-                    1.0 / np.sqrt(expected_info) if expected_info > 0 else np.nan,
-                )
-
-        se[~free_mask] = 0.0
-        se_dict[param_name] = model._expand_parameter_standard_errors(param_name, se)
-
-    return se_dict
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    information, layouts = compute_expected_information(
+        model, quadrature, mass, response_array.shape[0], h
+    )
+    return _se_from_information(information, layouts, model, _em_bounds(model))

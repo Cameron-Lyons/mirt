@@ -101,6 +101,8 @@ class _LogicalMultidimensionalModel(DichotomousItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
         return self._probability_only(theta, item_idx)
 
     def probability_pairs(
@@ -130,6 +132,8 @@ class _LogicalMultidimensionalModel(DichotomousItemModel):
     ) -> NDArray[np.float64]:
         """Return scalar item information as the Fisher-matrix trace."""
         theta = self._ensure_theta_2d(theta)
+        if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
         probability, gradient = self._probability_and_gradient(theta, item_idx)
         return _scalar_fisher_information(probability, gradient)
 
@@ -139,6 +143,7 @@ class _LogicalMultidimensionalModel(DichotomousItemModel):
         item_idx: int,
     ) -> NDArray[np.float64]:
         """Return item Fisher matrices with shape ``(n_theta, n_factors, n_factors)``."""
+        item_idx = self._validate_item_index(item_idx)
         theta = self._ensure_theta_2d(theta)
         probability, gradient = self._probability_and_gradient(theta, item_idx)
         return _matrix_fisher_information(probability, gradient)

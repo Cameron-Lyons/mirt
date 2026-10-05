@@ -675,46 +675,26 @@ def _chain_vertical_scale(
     reference_grade: int,
 ) -> VerticalScaleResult:
     """Perform chain vertical scaling via sequential pairwise linking."""
-    from mirt.equating.linking import link
+    from mirt.equating.chain import chain_link
 
-    n_grades = len(grade_data)
-    linking_results: list[LinkingResult] = []
-
-    cumulative_A = [1.0] * n_grades
-    cumulative_B = [0.0] * n_grades
-
-    for i in range(n_grades - 1):
-        lower_gd = grade_data[i]
-        upper_gd = grade_data[i + 1]
-        lower_model = grade_models[i].model
-        upper_model = grade_models[i + 1].model
-
-        anchor_lower, anchor_upper = _resolve_anchor_pair(lower_gd, upper_gd)
-
-        link_result = link(
-            lower_model,
-            upper_model,
-            anchor_lower,
-            anchor_upper,
-            method=linking_method,
-            compute_diagnostics=True,
-        )
-        linking_results.append(link_result)
-
-        A_pair = link_result.constants.A
-        B_pair = link_result.constants.B
-
-        cumulative_A[i + 1] = cumulative_A[i] * A_pair
-        cumulative_B[i + 1] = cumulative_A[i] * B_pair + cumulative_B[i]
-
-    ref_A = cumulative_A[reference_grade]
-    ref_B = cumulative_B[reference_grade]
-
-    final_A = [a / ref_A for a in cumulative_A]
-    final_B = [(b - ref_B) / ref_A for b in cumulative_B]
-
+    pairs = [
+        _resolve_anchor_pair(lower, upper)
+        for lower, upper in zip(grade_data[:-1], grade_data[1:], strict=True)
+    ]
+    chain = chain_link(
+        [gm.model for gm in grade_models],
+        pairs,
+        method=linking_method,
+        reference_index=reference_grade,
+        compute_drift=False,
+    )
     return _vertical_scale_result(
-        grade_models, final_A, final_B, linking_results, "chain", reference_grade
+        grade_models,
+        chain.cumulative_A,
+        chain.cumulative_B,
+        chain.pairwise_results,
+        "chain",
+        reference_grade,
     )
 
 
@@ -766,7 +746,7 @@ def _concurrent_vertical_scale(
         LinkingResult,
         _compute_anchor_diagnostics,
         _compute_fit_statistics,
-        _extract_link_parameters,
+        _link_form,
         _validate_curve_grid,
     )
 
@@ -793,14 +773,8 @@ def _concurrent_vertical_scale(
     theta_grid, weights = _validate_curve_grid((-4.0, 4.0), 61, None)
     linking_results = []
     for index, (anchors_lower, anchors_upper) in enumerate(pairs):
-        model_lower = grade_models[index].model
-        model_upper = grade_models[index + 1].model
-        disc_old, diff_old, lower_old, upper_old = _extract_link_parameters(
-            model_lower, anchors_lower, "lower"
-        )
-        disc_new, diff_new, lower_new, upper_new = _extract_link_parameters(
-            model_upper, anchors_upper, "upper"
-        )
+        form_lower = _link_form(grade_models[index].model, anchors_lower, "lower")
+        form_upper = _link_form(grade_models[index + 1].model, anchors_upper, "upper")
         # Recover the upper -> lower map implied by the joint common metric.
         A = final_A[index + 1] / final_A[index]
         B = (final_B[index + 1] - final_B[index]) / final_A[index]
@@ -809,32 +783,10 @@ def _concurrent_vertical_scale(
                 constants=LinkingConstants(A, B, method=linking_method),
                 anchor_items=anchors_lower,
                 anchor_diagnostics=_compute_anchor_diagnostics(
-                    disc_old,
-                    diff_old,
-                    disc_new,
-                    diff_new,
-                    A,
-                    B,
-                    anchors_lower,
-                    theta_grid,
-                    lower_old,
-                    upper_old,
-                    lower_new,
-                    upper_new,
+                    form_lower, form_upper, A, B, anchors_lower, theta_grid
                 ),
                 fit_statistics=_compute_fit_statistics(
-                    disc_old,
-                    diff_old,
-                    disc_new,
-                    diff_new,
-                    A,
-                    B,
-                    theta_grid,
-                    weights,
-                    lower_old,
-                    upper_old,
-                    lower_new,
-                    upper_new,
+                    form_lower, form_upper, A, B, theta_grid, weights
                 ),
                 convergence_info={
                     "method": linking_method,

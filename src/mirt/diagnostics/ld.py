@@ -26,7 +26,7 @@ from numbers import Integral, Real
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy import stats
 
 from mirt._correlation import q3_correlations
@@ -34,12 +34,14 @@ from mirt._local_dependence import ld_pair_statistics
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
+from mirt.utils.data import _missing_coded_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 @dataclass
@@ -153,8 +155,8 @@ class LDResult:
 
 
 def compute_ld_statistics(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     q3_threshold: float = 0.2,
@@ -165,10 +167,12 @@ def compute_ld_statistics(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray of shape (n_persons, n_items)
-        Response matrix with integer responses
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Integer response matrix. Negative codes, ``NaN`` and the nulls of
+        nullable DataFrame columns denote missing responses.
     theta : NDArray of shape (n_persons,) or (n_persons, n_factors), optional
         Ability estimates. If None, EAP estimates are computed.
     n_quadpts : int
@@ -185,21 +189,10 @@ def compute_ld_statistics(
     LDResult
         Object containing all LD statistics and flagged pairs
     """
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP", n_quadpts=n_quadpts)
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
+    responses = _missing_coded_responses(responses)
+    n_items = responses.shape[1]
+    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
     residuals, positive_probabilities = _compute_residuals_and_positive_probabilities(
         model,
@@ -272,8 +265,8 @@ def compute_ld_statistics(
 
 
 def compute_q3(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Compute Yen's Q3 statistics for all item pairs.
@@ -283,10 +276,12 @@ def compute_q3(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Ability estimates
 
@@ -295,38 +290,18 @@ def compute_q3(
     NDArray
         Matrix of Q3 statistics
     """
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import compute_q3_matrix as rust_compute_q3
+    responses = _missing_coded_responses(responses)
+    model, theta = _ability_matrix(model, responses, theta)
 
-    responses = np.asarray(responses)
-    n_persons = responses.shape[0]
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP")
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            return rust_compute_q3(responses, theta_flat, disc.ravel(), diff.ravel())
-
-    residuals = _compute_residuals(model, responses, theta)
+    residuals, _ = _compute_residuals_and_positive_probabilities(
+        model, responses, theta
+    )
     return _compute_q3(residuals, responses)
 
 
 def compute_ld_chi2(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
+    model: BaseItemModel | FitResult,
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     p_adjust: PValueAdjustment = "none",
@@ -335,10 +310,12 @@ def compute_ld_chi2(
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix
+    model : BaseItemModel or FitResult
+        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
+        are then EAP scores under its estimated latent covariance.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Ability estimates
     n_quadpts : int
@@ -353,39 +330,12 @@ def compute_ld_chi2(
     p_value_matrix : NDArray
         Matrix of raw or adjusted p-values, according to ``p_adjust``.
     """
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import (
-        compute_ld_chi2_matrix as rust_compute_chi2,
-    )
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
+    responses = _missing_coded_responses(responses)
+    n_items = responses.shape[1]
+    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP", n_quadpts=n_quadpts)
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            chi2_matrix = rust_compute_chi2(
-                responses, theta_flat, disc.ravel(), diff.ravel()
-            )
-        else:
-            chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
-    else:
-        chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
+    chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
     p_value_matrix = np.zeros_like(chi2_matrix)
     rows, columns = np.triu_indices(n_items, k=1)
@@ -400,44 +350,31 @@ def compute_ld_chi2(
     return chi2_matrix, p_value_matrix
 
 
-def _compute_residuals(
-    model: BaseItemModel,
+def _ability_matrix(
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
-    theta: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Compute standardized residuals for each person-item combination."""
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import compute_standardized_residuals
+    theta: NDArray[np.float64] | None,
+    **fscores_kwargs: int,
+) -> tuple[BaseItemModel, NDArray[np.float64]]:
+    """Return the item model and person abilities as an ``(n, n_factors)`` matrix.
 
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            return compute_standardized_residuals(
-                responses, theta_flat, disc.ravel(), diff.ravel()
-            )
+    Missing abilities default to EAP scores under the latent population of a
+    ``FitResult``, as :func:`mirt.fscores` computes them.
+    """
+    from mirt.results._common import resolve_item_model
 
-    n_persons, n_items = responses.shape
-    residuals = np.full((n_persons, n_items), np.nan)
+    model: BaseItemModel = resolve_item_model(model_or_result)
+    if theta is None:
+        from mirt.scoring import fscores
 
-    for j in range(n_items):
-        probs = model.probability(theta, j)
+        theta = fscores(
+            model_or_result, responses, method="EAP", **fscores_kwargs
+        ).theta
 
-        if probs.ndim == 2:
-            n_cats = probs.shape[1]
-            expected = np.sum(probs * np.arange(n_cats), axis=1)
-            variance = np.sum(probs * (np.arange(n_cats) ** 2), axis=1) - expected**2
-        else:
-            expected = probs
-            variance = probs * (1 - probs)
-
-        valid = responses[:, j] >= 0
-        residuals[valid, j] = (responses[valid, j] - expected[valid]) / np.sqrt(
-            variance[valid] + PROB_EPSILON
-        )
-
-    return residuals
+    theta = np.atleast_2d(theta)
+    if theta.shape[0] == 1 and responses.shape[0] > 1:
+        theta = theta.T
+    return model, theta
 
 
 def _compute_residuals_and_positive_probabilities(
@@ -587,7 +524,7 @@ def flag_ld_pairs(
         )
         if p_adjust is None:
             p_adjust = ld_result.p_adjustment
-        p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+        p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
 
     rows, columns = np.triu_indices_from(ld_result.q3_matrix, k=1)
     selected = np.zeros(rows.size, dtype=bool)

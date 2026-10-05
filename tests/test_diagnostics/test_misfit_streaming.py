@@ -35,10 +35,22 @@ def _reference_flags(model, responses, theta, z_threshold, outfit_threshold):
             valid = np.isfinite(scores)
             if not np.any(valid):
                 continue
-            squares = scores[valid] ** 2
-            outfit = np.mean(squares)
-            infit = np.sum(squares * variances[valid]) / (
-                variances[valid].sum() + PROB_EPSILON
+            # Shared mean-square rules: infit has no variance offset and
+            # outfit skips near-deterministic entries (variance <= epsilon).
+            observed = responses[:, index] if axis == 0 else responses[index]
+            means = expected[:, index] if axis == 0 else expected[index]
+            squares = (observed[valid] - means[valid]) ** 2
+            weights = np.maximum(variances[valid], 0.0)
+            eligible = weights > PROB_EPSILON
+            outfit = (
+                np.mean(squares[eligible] / weights[eligible])
+                if np.any(eligible)
+                else np.nan
+            )
+            infit = (
+                squares.sum() / weights.sum()
+                if weights.sum() > PROB_EPSILON
+                else np.nan
             )
             if outfit > outfit_threshold:
                 flags[name].append({key: index, "outfit": outfit, "infit": infit})
@@ -230,13 +242,15 @@ def test_thresholds_remain_strict_across_blocks(monkeypatch):
     theta = np.zeros(2)
     threshold = 0.5 / np.sqrt(0.25 + PROB_EPSILON)
     monkeypatch.setattr(residuals, "_MISFIT_TARGET_CHUNK_ELEMENTS", 2)
+    # Every observed response has p = 0.5, so each item and person outfit is
+    # exactly (0.5 ** 2) / 0.25 = 1.
     result = residuals.identify_misfitting_patterns(
-        model, responses, theta, z_threshold=threshold, outfit_threshold=threshold**2
+        model, responses, theta, z_threshold=threshold, outfit_threshold=1.0
     )
     assert not any(result.values())
     below = np.nextafter(threshold, 0)
     flagged = residuals.identify_misfitting_patterns(
-        model, responses, theta, z_threshold=below, outfit_threshold=threshold**2
+        model, responses, theta, z_threshold=below, outfit_threshold=1.0
     )
     assert [
         (entry["person"], entry["item"]) for entry in flagged["aberrant_responses"]

@@ -4,13 +4,21 @@ This module provides functions for linking IRT models across
 multiple time points or administrations using pairwise linking.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.equating.linking import LinkingResult, link
+from mirt.equating.linking import LinkingResult, link, transform_parameters
+from mirt.equating.polytomous import (
+    _NRM_METHODS,
+    _ORDERED_METHODS,
+    _linker_for,
+    _polytomous_model_type,
+    transform_polytomous_parameters,
+)
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -18,6 +26,8 @@ if TYPE_CHECKING:
 
 _PROBABILITY_TOLERANCE = 1e-10
 _CONCURRENT_METHODS = frozenset({"stocking_lord", "tcc", "haebara"})
+# Absolute forward-difference step used by scipy's L-BFGS-B by default.
+_FORWARD_DIFFERENCE_STEP = 1e-8
 
 
 @dataclass
@@ -167,12 +177,17 @@ def chain_link(
     Parameters
     ----------
     models : list[BaseItemModel]
-        List of models in temporal order.
+        List of models in temporal order. Adjacent models must share a
+        response family: dichotomous forms use :func:`link`, GRM forms use
+        :func:`link_grm`, GPCM/PCM forms use :func:`link_gpcm`, and NRM forms
+        use :func:`link_nrm`.
     anchor_item_pairs : list[tuple[list[int], list[int]]]
         List of (anchors_t, anchors_t+1) pairs for consecutive models.
         Length should be len(models) - 1.
     method : str
-        Linking method for pairwise linking.
+        Linking method for pairwise linking. Polytomous pairs support the
+        methods of their family's linker; ``"tcc"`` is their Stocking-Lord
+        expected-score criterion.
     reference_index : int
         Index of reference model (default 0 = first).
     theta_range : tuple[float, float]
@@ -180,7 +195,9 @@ def chain_link(
     n_theta : int
         Number of theta points.
     compute_drift : bool
-        Whether to track drift accumulation.
+        Whether to track drift accumulation. NRM anchors have no single
+        location parameter, so their ``drift_difficulty_changes`` are NaN;
+        their robust z-statistics are still reported.
 
     Returns
     -------
@@ -220,6 +237,7 @@ def chain_link(
 
     _validate_grid(theta_range, n_theta)
 
+    pair_linkers = []
     for pair_index, (anchors_left, anchors_right) in enumerate(anchor_item_pairs):
         _validate_anchor_pair(
             anchors_left,
@@ -228,18 +246,21 @@ def chain_link(
             models[pair_index + 1].n_items,
             name=f"anchor_item_pairs[{pair_index}]",
         )
+        pair_linkers.append(
+            _pair_linker(models[pair_index], models[pair_index + 1], method, pair_index)
+        )
 
     pairwise_results: list[LinkingResult] = []
 
-    for t in range(n_models - 1):
+    for t, (linker, pair_method, _) in enumerate(pair_linkers):
         anchors_t, anchors_t1 = anchor_item_pairs[t]
 
-        result = link(
+        result = linker(
             models[t],
             models[t + 1],
             anchors_t,
             anchors_t1,
-            method=method,
+            method=pair_method,
             theta_range=theta_range,
             n_theta=n_theta,
             compute_diagnostics=True,
@@ -261,7 +282,10 @@ def chain_link(
     if compute_drift:
         drift_accumulation, drift_item_ids, drift_difficulty_changes = (
             _compute_drift_accumulation(
-                pairwise_results, anchor_item_pairs, cumulative_A
+                pairwise_results,
+                anchor_item_pairs,
+                cumulative_A,
+                [has_location for _, _, has_location in pair_linkers],
             )
         )
 
@@ -274,6 +298,35 @@ def chain_link(
         drift_item_ids=drift_item_ids,
         drift_difficulty_changes=drift_difficulty_changes,
     )
+
+
+def _pair_linker(
+    model_left: "BaseItemModel",
+    model_right: "BaseItemModel",
+    method: str,
+    pair_index: int,
+) -> tuple[Callable[..., LinkingResult], str, bool]:
+    """Choose one adjacent pair's linker, its method, and location units.
+
+    The flag reports whether the anchors' signed location differences are in
+    theta units, which NRM category-intercept contrasts are not.
+    """
+    family = _polytomous_model_type(model_left)
+    if family != _polytomous_model_type(model_right):
+        raise ValueError(
+            f"anchor_item_pairs[{pair_index}] links different response families: "
+            f"{model_left.model_name} and {model_right.model_name}"
+        )
+    if family is None:
+        return link, method, True
+    pair_method = "stocking_lord" if method == "tcc" else method
+    supported = _NRM_METHODS if family == "nrm" else _ORDERED_METHODS
+    if pair_method not in supported:
+        raise ValueError(
+            f"{method} linking is not available for {model_left.model_name} "
+            f"models; use one of {', '.join(sorted(supported))}"
+        )
+    return _linker_for(model_left), pair_method, family != "nrm"
 
 
 def accumulate_constants(
@@ -347,8 +400,13 @@ def _compute_drift_accumulation(
     pairwise_results: list[LinkingResult],
     anchor_item_pairs: list[tuple[list[int], list[int]]],
     cumulative_A: list[float],
+    location_units: list[bool] | None = None,
 ) -> tuple[NDArray[np.float64], list[tuple[int, int]], NDArray[np.float64]]:
-    """Align adjacent-link diagnostics using physical anchor correspondences."""
+    """Align adjacent-link diagnostics using physical anchor correspondences.
+
+    Difficulty changes stay NaN for links whose signed location differences
+    are not in theta units (``location_units[t]`` is False).
+    """
     parents: dict[tuple[int, int], tuple[int, int]] = {}
 
     def find(node: tuple[int, int]) -> tuple[int, int]:
@@ -384,12 +442,14 @@ def _compute_drift_accumulation(
             or signed_b.shape != (len(indices),)
         ):
             raise ValueError("Pairwise anchor diagnostics do not match anchor items")
+        has_location = location_units is None or location_units[t]
         for index, z_score, difference in zip(indices, z_scores, signed_b, strict=True):
             column = columns[find((t, int(index)))]
             drift_matrix[t, column] = z_score
-            # Pair diagnostics use earlier - transformed later. Multiplication
-            # by the earlier form's slope puts the opposite change on reference.
-            difficulty_changes[t, column] = -cumulative_A[t] * difference
+            if has_location:
+                # Pair diagnostics use earlier - transformed later. Multiplying
+                # by the earlier slope puts the opposite change on reference.
+                difficulty_changes[t, column] = -cumulative_A[t] * difference
 
     return drift_matrix, item_ids, difficulty_changes
 
@@ -405,7 +465,9 @@ def transform_to_reference(
     Parameters
     ----------
     model : BaseItemModel
-        Model to transform.
+        Model to transform. GRM, GPCM, and NRM parameters are transformed
+        with :func:`transform_polytomous_parameters`. PCM discriminations are
+        fixed at 1 and cannot be rescaled, so PCM models raise ValueError.
     chain_result : ChainLinkingResult
         Chain linking result.
     time_index : int
@@ -418,10 +480,13 @@ def transform_to_reference(
     BaseItemModel
         Model on reference scale.
     """
-    from mirt.equating.linking import transform_parameters
-
     A, B = _time_point_constants(chain_result, time_index)
 
+    model_type = _polytomous_model_type(model)
+    if model_type is not None:
+        return transform_polytomous_parameters(
+            model, A, B, model_type=model_type, in_place=in_place
+        )
     return transform_parameters(model, A, B, in_place=in_place)
 
 
@@ -580,14 +645,14 @@ def _expected_item_score_curves(
     theta: NDArray[np.float64],
     item_indices: NDArray[np.int_],
 ) -> _ItemCurveSet:
-    """Evaluate selected items without scanning unused portions of large banks."""
-    n_theta = theta.shape[0]
-    all_items_selected = len(item_indices) == model.n_items and np.array_equal(
-        item_indices, np.arange(model.n_items)
-    )
+    """Evaluate selected items without scanning unused portions of large banks.
 
-    if all_items_selected:
-        probabilities = np.array(model.probability(theta), dtype=np.float64, copy=True)
+    Selections covering at least a quarter of the bank use one batched
+    probability call; sparse selections of large banks are evaluated per item.
+    """
+    n_theta = theta.shape[0]
+    if len(item_indices) * 4 >= model.n_items:
+        probabilities = np.asarray(model.probability(theta), dtype=np.float64)
     else:
         probabilities = None
 
@@ -597,7 +662,7 @@ def _expected_item_score_curves(
             model.n_items,
         ):
             raise ValueError("model returned invalid polytomous probabilities")
-        probabilities = _validated_probabilities(probabilities)
+        probabilities = _validated_probabilities(probabilities[:, item_indices, :])
         probability_mass = probabilities.sum(axis=2, keepdims=True)
         if np.any(np.abs(probability_mass - 1.0) > _PROBABILITY_TOLERANCE):
             raise ValueError("model category probabilities must sum to one")
@@ -607,8 +672,8 @@ def _expected_item_score_curves(
         return _ItemCurveSet(
             expected=probabilities @ categories,
             categories=[
-                probabilities[:, int(index), : category_counts[int(index)]]
-                for index in item_indices
+                probabilities[:, column, : category_counts[int(index)]]
+                for column, index in enumerate(item_indices)
             ],
         )
 
@@ -652,7 +717,7 @@ def _expected_item_score_curves(
     if probabilities.shape != (n_theta, model.n_items):
         raise ValueError("model returned invalid dichotomous probabilities")
     return _ItemCurveSet(
-        expected=_validated_probabilities(probabilities),
+        expected=_validated_probabilities(probabilities[:, item_indices]),
         categories=None,
     )
 
@@ -740,50 +805,107 @@ def concurrent_link(
     reference_curves = _expected_item_score_curves(
         models[reference_index], theta_grid[:, None], selected_items[reference_index]
     )
+    # Moving one form's (log A, B) only changes the relations that touch it.
+    incident_relations = [
+        [
+            position
+            for position, (left_model, right_model, _, _) in enumerate(relations)
+            if index in (left_model, right_model)
+        ]
+        for index in range(n_models)
+    ]
+    max_log_slope = float(np.log(100.0))
+
+    def form_curves(
+        params: NDArray[np.float64], position: int, index: int
+    ) -> _ItemCurveSet:
+        slopes = np.exp(params[:n_free_models])
+        theta = (theta_grid - params[n_free_models + position]) / slopes[position]
+        return _expected_item_score_curves(
+            models[index], theta[:, None], selected_items[index]
+        )
+
+    def relation_terms(
+        relation: tuple[int, int, NDArray[np.int_], NDArray[np.int_]],
+        score_curves: list[_ItemCurveSet],
+    ) -> list[float]:
+        left_model, right_model, anchors_left, anchors_right = relation
+        left_curves = score_curves[left_model].expected[:, anchors_left]
+        right_curves = score_curves[right_model].expected[:, anchors_right]
+        if method != "haebara":
+            curve_difference = left_curves.sum(axis=1) - right_curves.sum(axis=1)
+            return [float(weights @ curve_difference**2)]
+        left_categories = score_curves[left_model].categories
+        right_categories = score_curves[right_model].categories
+        if left_categories is None or right_categories is None:
+            curve_difference = left_curves - right_curves
+            return [float(np.sum(weights[:, None] * curve_difference**2))]
+        return [
+            float(
+                np.sum(
+                    weights[:, None]
+                    * (
+                        left_categories[int(left_index)]
+                        - right_categories[int(right_index)]
+                    )
+                    ** 2
+                )
+            )
+            for left_index, right_index in zip(anchors_left, anchors_right, strict=True)
+        ]
+
+    def total_loss(terms: list[list[float]]) -> float:
+        # Sequential accumulation keeps every probe on the same rounding path.
+        total = 0.0
+        for relation_loss in terms:
+            for term in relation_loss:
+                total += term
+        return total
+
+    cache: dict[bytes, tuple[list[_ItemCurveSet], list[list[float]]]] = {}
+
+    def evaluate(
+        params: NDArray[np.float64],
+    ) -> tuple[list[_ItemCurveSet], list[list[float]]]:
+        key = params.tobytes()
+        if key not in cache:
+            score_curves = [reference_curves] * n_models
+            for position, index in enumerate(free_indices):
+                score_curves[index] = form_curves(params, position, index)
+            terms = [relation_terms(relation, score_curves) for relation in relations]
+            cache.clear()
+            cache[key] = (score_curves, terms)
+        return cache[key]
 
     def criterion(params: NDArray[np.float64]) -> float:
-        slopes = np.ones(n_models, dtype=np.float64)
-        intercepts = np.zeros(n_models, dtype=np.float64)
-        slopes[free_indices] = np.exp(params[:n_free_models])
-        intercepts[free_indices] = params[n_free_models:]
+        return total_loss(evaluate(params)[1])
 
-        total_loss = 0.0
-        score_curves = [reference_curves] * n_models
-        for index in free_indices:
-            score_curves[index] = _expected_item_score_curves(
-                models[index],
-                ((theta_grid - intercepts[index]) / slopes[index])[:, None],
-                selected_items[index],
-            )
-
-        for left_model, right_model, anchors_left, anchors_right in relations:
-            left_curves = score_curves[left_model].expected[:, anchors_left]
-            right_curves = score_curves[right_model].expected[:, anchors_right]
-            if method == "haebara":
-                left_categories = score_curves[left_model].categories
-                right_categories = score_curves[right_model].categories
-                if left_categories is None or right_categories is None:
-                    curve_difference = left_curves - right_curves
-                    total_loss += float(np.sum(weights[:, None] * curve_difference**2))
-                else:
-                    for left_index, right_index in zip(
-                        anchors_left, anchors_right, strict=True
-                    ):
-                        category_difference = (
-                            left_categories[int(left_index)]
-                            - right_categories[int(right_index)]
-                        )
-                        total_loss += float(
-                            np.sum(weights[:, None] * category_difference**2)
-                        )
-            else:
-                curve_difference = left_curves.sum(axis=1) - right_curves.sum(axis=1)
-                total_loss += float(weights @ curve_difference**2)
-
-        return total_loss
+    def gradient(params: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Forward differences that re-evaluate only the perturbed form."""
+        score_curves, terms = evaluate(params)
+        base_loss = total_loss(terms)
+        result = np.empty_like(params)
+        for position, index in enumerate(free_indices):
+            for slot in (position, n_free_models + position):
+                # Match L-BFGS-B's default absolute step and bound handling.
+                step = _FORWARD_DIFFERENCE_STEP
+                if slot < n_free_models and params[slot] + step > max_log_slope:
+                    step = -step
+                probe = params.copy()
+                probe[slot] = params[slot] + step
+                probe_curves = list(score_curves)
+                probe_curves[index] = form_curves(probe, position, index)
+                probe_terms = list(terms)
+                for relation_position in incident_relations[index]:
+                    probe_terms[relation_position] = relation_terms(
+                        relations[relation_position], probe_curves
+                    )
+                result[slot] = (total_loss(probe_terms) - base_loss) / (
+                    probe[slot] - params[slot]
+                )
+        return result
 
     x0 = np.zeros(2 * n_free_models, dtype=np.float64)
-    max_log_slope = float(np.log(100.0))
     bounds = [(-max_log_slope, max_log_slope)] * n_free_models + [
         (None, None)
     ] * n_free_models
@@ -791,6 +913,7 @@ def concurrent_link(
     result = optimize.minimize(
         criterion,
         x0,
+        jac=gradient,
         method="L-BFGS-B",
         bounds=bounds,
         options={"maxiter": int(max_iter), "ftol": tol, "gtol": tol},

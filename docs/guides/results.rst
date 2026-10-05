@@ -104,8 +104,28 @@ serialized:
 
    json_text = result.to_json(indent=2)
 
-The export contains model metadata and scalar fit statistics. Parameter and uncertainty
-arrays are converted to nested Python lists.
+The export contains model metadata, including per-item category counts for
+polytomous models, and scalar fit statistics. Parameter and uncertainty arrays are
+converted to nested Python lists.
+
+Results from the ``fit_mirt`` families (1PL, 2PL, 3PL, 4PL, GRM, GPCM, PCM and NRM)
+can be rebuilt from a full export and scored again, as can confirmatory
+``fit_mirt(spec=...)`` fits (a multi-factor 2PL is exported as ``"MIRT"`` with its
+loading pattern), ``bfactor`` fits (``"Bifactor"`` with the specific-factor labels)
+and mixed-format fits of these families (``"Mixed"`` with each component's family and
+items):
+
+.. code-block:: python
+
+   restored = mirt.FitResult.from_json(result.to_json())
+   scores = mirt.fscores(restored, responses)
+
+Coordinates held fixed by ``fixed``, ``FIXED`` or ``set_free_parameter_masks`` are
+exported as ``free_parameter_masks`` and restored, and so is an estimated
+``latent_covariance``. ``from_dict()`` and ``from_json()`` reject unknown fields,
+exports written with ``include_parameters=False``, and other models, such as custom
+item types or rating-scale components. Unknown standard errors are written as ``NaN``,
+which Python's ``json`` module accepts but strict JSON parsers may not.
 
 Person-score results
 --------------------
@@ -141,6 +161,22 @@ scalar cut or an array broadcastable to the score shape, including one cut per f
 for multidimensional scores. Zero standard error produces a deterministic decision
 away from the cut, while infinite or unknown uncertainty does not force a decision.
 
+EAP grids for bifactor models
+-----------------------------
+
+EAP integrates over a product grid of ``n_quadpts ** n_factors`` nodes, so its
+default points per dimension fall as factors are added (five for six or more
+factors). For a bifactor model, such as a ``mirt.bfactor`` result, ``fscores``
+instead integrates each specific factor jointly with the general factor on a
+two-dimensional grid, as ``bfactor`` estimation does (Gibbons and Hedeker, 1992).
+This equals the product-grid EAP at the same ``n_quadpts`` but costs time linear in
+the number of specific factors, so bifactor scores default to 49 points per
+dimension whatever the factor count. It applies when the prior keeps the specific
+factors independent given the general factor, as the default standard-normal
+prior does. ``ability_posterior`` must return the joint grid and therefore keeps
+the product grid; it warns when an automatic bifactor grid has fewer than 11
+points per dimension, which biases the posterior summaries.
+
 WLE performance and missing responses
 -------------------------------------
 
@@ -151,10 +187,11 @@ available and a vectorized, memory-bounded NumPy implementation otherwise. Pass
 available CPU cores. Other model families and multidimensional models retain the
 general scorer.
 
-Negative response values are treated as missing. Missing items contribute neither
-log likelihood nor test information, so reported WLE standard errors reflect only
-the items observed for each person. A person with no observed items receives theta
-zero and infinite standard error.
+Negative response values, ``NaN`` and the nulls of nullable data frame columns are
+treated as missing by every scoring method, as by ``fit_mirt``. Missing items
+contribute neither log likelihood nor test information, so reported WLE standard
+errors reflect only the items observed for each person. A person with no observed
+items receives theta zero and infinite standard error.
 
 Posterior ability distributions
 -------------------------------

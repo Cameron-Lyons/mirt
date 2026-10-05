@@ -92,10 +92,15 @@ def test_fit_evaluates_and_normalizes_each_importance_draw_once(method, monkeypa
     monkeypatch.setattr(mcem_module, "normalize_log_posterior", counted_normalization)
     monkeypatch.setattr(estimator, "_m_step_mc", lambda *args: None)
     monkeypatch.setattr(estimator, "_check_convergence", lambda *args: False)
+    monkeypatch.setattr(estimator, "_monte_carlo_converged", lambda *args: False)
     result = estimator.fit(model, responses)
     assert result.n_iterations == 3
     importance = method not in ("posterior", "stochastic")
-    assert calls["probability"] == (4 if importance else 64)
+    # MCEM's ascent check evaluates the draws of iterations two and three at
+    # the previous iterate, without normalizing them; their likelihoods at the
+    # current iterate come from the E-step.
+    ascent = 2 if method in ("importance", "posterior") else 0
+    assert calls["probability"] == (4 if importance else 64) + ascent
     assert calls["normalization"] == (4 if importance else 0)
 
 
@@ -130,6 +135,7 @@ def test_fit_releases_previous_draw_and_keeps_final_draw_for_errors(
     monkeypatch.setattr(model, "probability", check_previous_draw)
     monkeypatch.setattr(estimator, "_m_step_mc", remember_draw)
     monkeypatch.setattr(estimator, "_check_convergence", lambda *args: False)
+    monkeypatch.setattr(estimator, "_monte_carlo_converged", lambda *args: False)
     monkeypatch.setattr(estimator, "_compute_standard_errors_mc", check_final_draw)
     result = estimator.fit(model, responses)
     assert result.n_iterations == len(draws) == 3

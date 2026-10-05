@@ -231,7 +231,9 @@ class TestImputeResponses:
             assert kwargs["compute_standard_errors"] is False
             return SimpleNamespace(model=fake_model)
 
-        def fake_posterior(model, observed, n_imputations, n_quadpts, rng):
+        def fake_posterior(
+            model, observed, n_imputations, n_quadpts, rng, prior_cov, prior_mean
+        ):
             calls["posterior"] += 1
             np.testing.assert_array_equal(observed, responses[:2])
             return np.zeros((len(observed), 1, n_imputations))
@@ -276,7 +278,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, **priors: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )
@@ -314,7 +316,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, **priors: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )
@@ -359,7 +361,7 @@ class TestImputeResponses:
         monkeypatch.setattr(
             imputation_module,
             "_posterior_ability_draws",
-            lambda model, observed, n_imputations, n_quadpts, rng: np.zeros(
+            lambda model, observed, n_imputations, n_quadpts, rng, **priors: np.zeros(
                 (len(observed), 1, n_imputations)
             ),
         )
@@ -910,3 +912,81 @@ class TestAverageMI:
 
         with pytest.raises(MirtValidationError, match="Uncertainty"):
             averageMI([1.0, 2.0], variances=[1.0, "invalid"])
+
+
+class TestEMImputation:
+    """EM imputation calibrates once on the observed responses."""
+
+    @staticmethod
+    def _missing_responses(model_name, seed, **kwargs):
+        from mirt import simdata
+
+        responses = simdata(model_name, n_persons=300, n_items=6, seed=seed, **kwargs)
+        missing = np.random.default_rng(seed).random(responses.shape) < 0.2
+        return np.where(missing, -1, responses), missing
+
+    def test_named_model_is_fitted_once_on_the_observed_responses(self, monkeypatch):
+        responses, missing = self._missing_responses("2PL", 3)
+        calls = []
+        original_fit = mirt.fit_mirt
+
+        def counting_fit(data, **kwargs):
+            calls.append((np.array(data, copy=True), kwargs))
+            return original_fit(data, **kwargs)
+
+        monkeypatch.setattr(mirt, "fit_mirt", counting_fit)
+
+        impute_responses(responses, method="EM", seed=4)
+
+        assert len(calls) == 1
+        data, options = calls[0]
+        np.testing.assert_array_equal(data, responses)
+        assert options["compute_standard_errors"] is False
+
+    @pytest.mark.parametrize(
+        ("model_name", "options", "n_categories"),
+        [("2PL", {}, 2), ("GRM", {"n_categories": 4}, 4)],
+    )
+    def test_imputations_keep_observed_cells_and_valid_codes(
+        self, model_name, options, n_categories
+    ):
+        responses, missing = self._missing_responses(model_name, 7, **options)
+
+        first = impute_responses(responses, method="EM", model=model_name, seed=8)
+        second = impute_responses(responses, method="EM", model=model_name, seed=8)
+
+        np.testing.assert_array_equal(first, second)
+        np.testing.assert_array_equal(first[~missing], responses[~missing])
+        assert np.all((first >= 0) & (first < n_categories))
+
+    def test_imputations_follow_the_observed_data_calibration(self):
+        from mirt import fit_mirt, fscores, simdata
+
+        responses = simdata("2PL", n_persons=4000, n_items=8, seed=12)
+        missing = np.random.default_rng(13).random(responses.shape) < 0.25
+        observed = np.where(missing, -1, responses)
+
+        imputed = impute_responses(observed, method="EM", seed=14)
+
+        model = fit_mirt(observed, model="2PL", compute_standard_errors=False).model
+        theta = fscores(model, observed, method="EAP").theta.reshape(-1, 1)
+        expected = model.probability(theta)
+        drawn = imputed[missing].mean()
+        predicted = expected[missing].mean()
+        mc_error = np.sqrt(predicted * (1 - predicted) / missing.sum())
+        assert abs(drawn - predicted) < 4 * mc_error
+
+    def test_calibration_failure_warns_and_draws_empirically(self, monkeypatch):
+        responses = np.array([[-1, 1], [0, -1], [1, 0]])
+
+        def failed_fit(*args, **kwargs):
+            raise RuntimeError("calibration failed")
+
+        monkeypatch.setattr(mirt, "fit_mirt", failed_fit)
+        with pytest.warns(RuntimeWarning, match="calibration failed"):
+            imputed = impute_responses(responses, method="EM", seed=2)
+
+        np.testing.assert_array_equal(
+            imputed[responses >= 0], responses[responses >= 0]
+        )
+        assert np.isin(imputed, [0, 1]).all()

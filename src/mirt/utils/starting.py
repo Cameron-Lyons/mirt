@@ -131,6 +131,27 @@ def _random_category_parameter(
     return np.sort(draws, axis=-1) if ordered else draws
 
 
+def _restore_unordered_rows(
+    model: BaseItemModel,
+    values: NDArray[np.float64],
+    current: NDArray[np.float64],
+) -> None:
+    """Keep the current thresholds of items whose random order was broken.
+
+    Fixed thresholds keep their values among random ones, which can leave an
+    item's active thresholds out of order.
+    """
+    if values.ndim != 2:
+        return
+    categories = getattr(model, "n_categories", None)
+    for item_index in range(values.shape[0]):
+        n_active = values.shape[1]
+        if categories is not None and len(categories) == model.n_items:
+            n_active = min(categories[item_index] - 1, n_active)
+        if np.any(np.diff(values[item_index, :n_active]) <= 0.0):
+            values[item_index] = current[item_index]
+
+
 def _random_ggum_thresholds(
     model: BaseItemModel,
     current: NDArray[np.float64],
@@ -212,7 +233,12 @@ def gen_random_pars(
     list of dict
         List of parameter dictionaries containing random starting values for
         all free model parameters. Fixed and reference-category parameters are
-        omitted or retained at their identifying values.
+        omitted or retained at their identifying values, and coordinates fixed
+        with ``set_free_parameter_masks`` keep their current values. An item
+        whose random thresholds would lose their order around a fixed
+        threshold keeps its current thresholds. The components of a
+        :class:`~mirt.models.mixed_format.MixedItemModel` draw values for
+        their own families under qualified names such as ``"3PL.guessing"``.
 
     Examples
     --------
@@ -246,6 +272,29 @@ def gen_random_pars(
         probability=True,
     )
 
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        # Parameter names identify a family only within its component.
+        ranges = (discrimination_range, difficulty_range, guessing_range, upper_range)
+        streams = np.random.default_rng(seed).integers(
+            0, 2**63, size=len(model.component_models)
+        )
+        component_sets = [
+            gen_random_pars(component, n_sets, int(stream), *ranges)
+            for component, stream in zip(model.component_models, streams, strict=True)
+        ]
+        return [
+            {
+                f"{prefix}.{name}": values
+                for prefix, sets in zip(
+                    model.component_names, component_sets, strict=True
+                )
+                for name, values in sets[index].items()
+            }
+            for index in range(n_sets)
+        ]
+
     base_parameters = model.parameters
     if (
         any(name in base_parameters for name in ("guessing", "lower"))
@@ -261,6 +310,7 @@ def gen_random_pars(
     fixed_parameters = _FIXED_PARAMETERS_BY_MODEL.get(
         getattr(model, "model_name", ""), frozenset()
     )
+    restrictions = getattr(model, "_free_parameter_restrictions", {})
     random_sets: list[dict[str, NDArray[np.float64]]] = []
 
     for _ in range(n_sets):
@@ -321,6 +371,12 @@ def gen_random_pars(
                 )
                 params[name] = current + noise
 
+        for name, free in restrictions.items():
+            if name not in params:
+                continue
+            np.copyto(params[name], base_parameters[name], where=~free)
+            if name == "thresholds" and getattr(model, "model_name", "") != "GGUM":
+                _restore_unordered_rows(model, params[name], base_parameters[name])
         random_sets.append(params)
 
     return random_sets
@@ -439,21 +495,26 @@ def _fit_single_start(
         dict[str, Any],
     ],
 ) -> tuple[int, float, FitResult | None, str | None]:
-    """Fit one starting-value set and preserve its original ordering."""
-    from mirt.estimation.em import EMEstimator
+    """Fit one starting-value set and preserve its original ordering.
+
+    Returns the start's index, its objective (the log-posterior of a Bayes
+    modal fit and the log-likelihood otherwise), the fit and any error.
+    """
+    from mirt.estimation._refit import em_estimator_for
 
     start_index, model, responses, start_params, fit_kwargs = args
     try:
         trial_model = model.copy()
         trial_model.set_parameters(**start_params)
-        # EM initialization otherwise replaces the supplied starting values.
-        trial_model._is_fitted = True
-        estimator = EMEstimator(**fit_kwargs)
-        result = estimator.fit(trial_model, responses)
-        log_likelihood = float(result.log_likelihood)
-        if not np.isfinite(log_likelihood):
+        estimator = em_estimator_for(trial_model, **fit_kwargs)
+        result = estimator.fit(trial_model, responses, start="model")
+        log_posterior = getattr(result, "log_posterior", None)
+        objective = float(
+            result.log_likelihood if log_posterior is None else log_posterior
+        )
+        if not np.isfinite(objective):
             raise ArithmeticError("fit returned a non-finite log-likelihood")
-        return start_index, log_likelihood, result, None
+        return start_index, objective, result, None
     except (
         TypeError,
         ValueError,
@@ -477,7 +538,8 @@ def multi_start_fit(
     """Fit model with multiple random starting values.
 
     Performs multiple fits with different random starting values and
-    returns the best result based on log-likelihood.
+    returns the best result based on log-likelihood, or on the log-posterior
+    when ``fit_kwargs`` include ``item_priors``.
 
     Parameters
     ----------
@@ -493,13 +555,29 @@ def multi_start_fit(
         Print progress.
     n_jobs : int
         Number of parallel jobs. Use -1 for all CPUs, 1 for sequential.
+        Workers are spawned as fresh interpreters that use the current
+        backend, so the model, its class and ``fit_kwargs`` must be picklable,
+        and scripts must guard their entry point with
+        ``if __name__ == "__main__":``.
     **fit_kwargs
-        Additional arguments passed to the estimator.
+        Additional arguments passed to the estimator: ``EMEstimator``,
+        ``MixedFormatEMEstimator`` for mixed-format models, or
+        ``BifactorEMEstimator`` for built-in bifactor models when it takes
+        every argument. Each start gets its own copy of a ``latent_density``
+        instance.
 
     Returns
     -------
     FitResult
         Best fit result across all starts.
+
+    Notes
+    -----
+    The starts are fitted without standard errors. Unless
+    ``compute_standard_errors=False``, the best start then takes one more EM
+    iteration from its estimates, which yields the posterior at which its
+    standard errors are computed, so they are computed once rather than for
+    every start; ``n_iterations`` includes that iteration.
 
     Examples
     --------
@@ -514,31 +592,26 @@ def multi_start_fit(
     >>> bool(np.isfinite(result.log_likelihood))
     True
     """
-    import os
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import as_completed
+
+    from mirt.utils._parallel import _process_pool, ensure_picklable, resolve_n_jobs
 
     n_starts = _validate_positive_integer(n_starts, name="n_starts")
-    if (
-        isinstance(n_jobs, (bool, np.bool_))
-        or not isinstance(n_jobs, (int, np.integer))
-        or n_jobs == 0
-        or n_jobs < -1
-    ):
-        raise MirtValidationError(
-            "n_jobs must be a positive integer or -1",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
-    n_jobs = int(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs, n_starts)
     validated = _validate_model_responses(model, responses)
     random_starts = gen_random_pars(model, n_sets=n_starts, seed=seed)
-
-    if n_jobs == -1:
-        n_jobs = os.cpu_count() or 1
-    n_jobs = min(n_jobs, n_starts)
+    compute_errors = fit_kwargs.get("compute_standard_errors", True)
+    if not isinstance(compute_errors, (bool, np.bool_)):
+        raise MirtValidationError(
+            "compute_standard_errors must be a boolean",
+            parameter="compute_standard_errors",
+            value=compute_errors,
+            expected="bool",
+        )
+    start_kwargs = {**fit_kwargs, "compute_standard_errors": False}
 
     args_list = [
-        (index, model, validated, start_params, fit_kwargs)
+        (index, model, validated, start_params, start_kwargs)
         for index, start_params in enumerate(random_starts)
     ]
     outcomes: list[tuple[int, float, FitResult | None, str | None]] = []
@@ -546,7 +619,8 @@ def multi_start_fit(
     if n_jobs == 1:
         outcomes = [_fit_single_start(args) for args in args_list]
     else:
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        ensure_picklable(_fit_single_start, args_list[0], n_jobs=n_jobs)
+        with _process_pool(n_jobs) as executor:
             futures = {
                 executor.submit(_fit_single_start, args): args[0] for args in args_list
             }
@@ -559,11 +633,14 @@ def multi_start_fit(
 
     outcomes.sort(key=lambda outcome: outcome[0])
     if verbose:
-        for start_index, ll, result, error in outcomes:
+        for start_index, _, result, error in outcomes:
             if result is None:
                 print(f"Start {start_index + 1}/{n_starts}: Failed ({error})")
             else:
-                print(f"Start {start_index + 1}/{n_starts}: LL = {ll:.4f}")
+                print(
+                    f"Start {start_index + 1}/{n_starts}: "
+                    f"LL = {result.log_likelihood:.4f}"
+                )
 
     successful = [outcome for outcome in outcomes if outcome[2] is not None]
     if not successful:
@@ -575,4 +652,42 @@ def multi_start_fit(
     best_result = best[2]
     if best_result is None:  # Narrow the optional type for static checkers.
         raise RuntimeError("No successful starting value set was retained")
-    return best_result
+    if not compute_errors:
+        return best_result
+    return _with_standard_errors(best_result, validated, fit_kwargs)
+
+
+def _with_standard_errors(
+    result: FitResult,
+    responses: NDArray[np.int_],
+    fit_kwargs: dict[str, Any],
+) -> FitResult:
+    """Add standard errors to a start's fit by one more EM iteration."""
+    from dataclasses import replace
+
+    from mirt.estimation._refit import em_estimator_for
+
+    recipe = result.refit_recipe
+    overrides = {"max_iter": 1, "compute_standard_errors": True}
+    if recipe is None:
+        options = {**fit_kwargs, **overrides}
+    else:
+        # The recipe holds the start's settings and its fitted latent density.
+        options = {**overrides, "verbose": fit_kwargs.get("verbose", False)}
+    estimator = em_estimator_for(result.model, recipe=recipe, **options)
+    final = estimator.fit(result.model, responses, start="model")
+    final_recipe = final.refit_recipe
+    if recipe is None or final_recipe is None:
+        final_recipe = recipe
+    else:
+        # Later refits keep the start's iteration limit and the final density.
+        settings = dict(final_recipe.options)
+        settings.pop("max_iter", None)
+        if "max_iter" in recipe.options:
+            settings["max_iter"] = recipe.options["max_iter"]
+        final_recipe = replace(final_recipe, options=settings)
+    return replace(
+        final,
+        n_iterations=result.n_iterations + final.n_iterations,
+        refit_recipe=final_recipe,
+    )

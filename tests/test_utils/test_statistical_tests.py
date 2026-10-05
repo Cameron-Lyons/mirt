@@ -7,7 +7,9 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy import stats
 
+import mirt
 from mirt._core import sigmoid
+from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     ThreeParameterLogistic,
@@ -15,6 +17,7 @@ from mirt.models.dichotomous import (
 )
 from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import GradedResponseModel
+from mirt.results import FitResult
 from mirt.utils.statistical_tests import lagrange, likelihood_ratio, wald
 
 
@@ -101,6 +104,40 @@ def test_wald_inverts_model_information_when_available() -> None:
     assert_allclose(result.standard_errors, [0.5])
 
 
+def test_wald_reads_the_covariance_of_a_fit_result() -> None:
+    data = mirt.simdata(model="2PL", n_persons=600, n_items=4, seed=5)
+    result = mirt.fit_mirt(data, model="2PL", tol=1e-7)
+    vcov = result.vcov
+    estimates = np.concatenate([result.model.discrimination, result.model.difficulty])
+
+    single = wald(result, param_indices=[5], constraint_values=[0.0])
+    assert single.statistic == pytest.approx(estimates[5] ** 2 / vcov[5, 5])
+    assert_allclose(single.standard_errors, [result.standard_errors["difficulty"][1]])
+
+    contrast = np.zeros(8)
+    contrast[[0, 4]] = [1.0, -1.0]
+    combined = wald(result, contrast_matrix=contrast)
+    variance = vcov[0, 0] + vcov[4, 4] - 2.0 * vcov[0, 4]
+    assert combined.statistic == pytest.approx(
+        (estimates[0] - estimates[4]) ** 2 / variance
+    )
+
+
+def test_wald_rejects_fixed_parameters_and_warns_without_covariance() -> None:
+    data = mirt.simdata(model="2PL", n_persons=300, n_items=3, seed=6)
+    rasch = mirt.fit_mirt(data, model="1PL")
+    with pytest.raises(MirtValidationError, match="fixed"):
+        wald(rasch, param_indices=[0], constraint_values=[1.0])
+
+    errors_only = FitResult(rasch.model, -1.0, 1, True, rasch.standard_errors, 0.0, 0.0)
+    with pytest.warns(UserWarning, match="squared standard errors"):
+        test = wald(errors_only, param_indices=[3])
+    difficulty_se = rasch.standard_errors["difficulty"][0]
+    assert test.statistic == pytest.approx(
+        (rasch.model.difficulty[0] / difficulty_se) ** 2
+    )
+
+
 def test_wald_requires_real_covariance_information() -> None:
     model = TwoParameterLogistic(1)
 
@@ -157,6 +194,151 @@ def test_wald_validates_hypothesis_inputs(kwargs: dict, message: str) -> None:
 
     with pytest.raises(ValueError, match=message):
         wald(model, **kwargs)
+
+
+def _three_pl_with_bound_covariance() -> FitResult:
+    model = ThreeParameterLogistic(3).set_parameters(
+        discrimination=np.array([1.0, 1.4, 0.8]),
+        difficulty=np.array([-0.5, 0.2, 0.9]),
+        guessing=np.array([0.0, 0.2, 0.15]),
+    )
+    covariance = np.diag([0.04, 0.05, 0.03, 0.02, 0.03, 0.04, np.nan, 0.004, 0.009])
+    covariance[0, 3] = covariance[3, 0] = 0.01
+    # The first guessing coordinate sits on its lower bound.
+    covariance[6, :] = covariance[:, 6] = np.nan
+    return FitResult(model, -1.0, 1, True, {}, 0.0, 0.0, vcov=covariance)
+
+
+def test_wald_accepts_the_nan_rows_of_a_fit_covariance() -> None:
+    # Regression: wald(model, vcov=result.vcov) rejected the NaN rows that
+    # mark parameters on an optimizer bound.
+    result = _three_pl_with_bound_covariance()
+    contrast = np.zeros(9)
+    contrast[[0, 3, 7]] = [1.0, -1.0, 2.0]
+
+    explicit = wald(result.model, contrast_matrix=contrast, vcov=result.vcov)
+    fitted = wald(result, contrast_matrix=contrast)
+    assert explicit.statistic == pytest.approx(fitted.statistic)
+    assert_allclose(explicit.standard_errors, fitted.standard_errors)
+
+    with pytest.raises(MirtValidationError, match="NaN"):
+        wald(result.model, param_indices=[6], vcov=result.vcov)
+    with pytest.raises(MirtValidationError, match="NaN"):
+        lagrange(
+            result.model,
+            np.array([[0, 1, 1], [1, 0, 1]]),
+            np.array([0.0, 1.0]),
+            param_indices=[6],
+            vcov=result.vcov,
+        )
+    vcov = result.vcov.copy()
+    vcov[0, 1] = vcov[1, 0] = np.nan
+    with pytest.raises(ValueError, match="only finite values"):
+        wald(result.model, param_indices=[0], vcov=vcov)
+
+
+def _discrimination_fixed_fit(
+    true_discrimination: float,
+) -> tuple[FitResult, np.ndarray]:
+    rng = np.random.default_rng(8)
+    discrimination = np.array([true_discrimination, 1.0, 1.2, 0.8, 1.5])
+    truth = TwoParameterLogistic(5).set_parameters(
+        discrimination=discrimination, difficulty=rng.normal(0.0, 0.8, 5)
+    )
+    data = np.asarray(truth.simulate(rng.standard_normal((1200, 1)), seed=4))
+    data[rng.random(data.shape) < 0.03] = -1
+    constrained = mirt.fit_mirt(
+        data,
+        model="2PL",
+        fixed={"discrimination": np.arange(5) == 0},
+        start_values={"discrimination": np.ones(5)},
+        tol=1e-8,
+    )
+    return constrained, data
+
+
+def test_lagrange_scores_a_fit_result_with_the_marginal_likelihood() -> None:
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _finite_difference_information,
+        _finite_difference_scores,
+    )
+
+    # Regression: lagrange(result, ...) raised a bare AttributeError.
+    constrained, data = _discrimination_fixed_fit(2.0)
+    test = lagrange(constrained, data, param_indices=[0])
+
+    # Reference: free the discrimination and difference the marginal
+    # log-likelihood of the freed model at the constrained estimates.
+    freed = constrained.model.copy().set_free_parameter_masks(None)
+    quadrature = GaussHermiteQuadrature(21)
+    mass = quadrature.weights / quadrature.weights.sum()
+    information, _ = _finite_difference_information(freed, data, quadrature, mass, 1e-4)
+    scores, _ = _finite_difference_scores(freed, data, quadrature, mass, 1e-5)
+    score = scores.sum(axis=0)
+    expected = score[0] ** 2 * np.linalg.inv(information)[0, 0]
+
+    assert_allclose(test.scores, score[:1], rtol=1e-6)
+    assert test.statistic == pytest.approx(expected, rel=1e-5)
+    assert test.df == 1
+    assert test.p_value < 1e-3
+    # Under the null the statistic is small, like the likelihood ratio.
+    null, null_data = _discrimination_fixed_fit(1.0)
+    full = mirt.fit_mirt(null_data, model="2PL", tol=1e-8)
+    ratio, _ = likelihood_ratio(full.log_likelihood, null.log_likelihood, 1)
+    statistic = lagrange(null, null_data, param_indices=[0]).statistic
+    assert statistic == pytest.approx(ratio, abs=0.1)
+
+
+def test_lagrange_validates_fit_result_hypotheses() -> None:
+    constrained, data = _discrimination_fixed_fit(1.0)
+
+    with pytest.raises(ValueError, match="theta is not used"):
+        lagrange(constrained, data, np.zeros(data.shape[0]), [0])
+    with pytest.raises(MirtValidationError, match="must name fixed parameters"):
+        lagrange(constrained, data, param_indices=[1])
+    rasch = mirt.fit_mirt(data, model="1PL", max_iter=50)
+    with pytest.raises(MirtValidationError, match="model family fixes"):
+        lagrange(rasch, data, param_indices=[0])
+    with pytest.raises(ValueError, match="theta is required"):
+        lagrange(constrained.model, data, param_indices=[0], vcov=np.eye(10))
+    with pytest.raises(ValueError, match="param_indices is required"):
+        lagrange(constrained, data)
+    with pytest.raises(ValueError, match="n_quadpts must be a positive integer"):
+        lagrange(constrained, data, param_indices=[0], n_quadpts=0)
+    # The likelihood score of the free parameters is not zero at a posterior
+    # mode, so the marginal score test needs a maximum-likelihood fit.
+    bayes_modal = FitResult(
+        constrained.model, -1.0, 1, True, {}, 0.0, 0.0, log_posterior=-2.0
+    )
+    with pytest.raises(MirtValidationError, match="maximum-likelihood fit"):
+        lagrange(bayes_modal, data, param_indices=[0])
+
+
+def test_lagrange_fit_result_accepts_an_explicit_covariance() -> None:
+    constrained, data = _discrimination_fixed_fit(2.0)
+    marginal = lagrange(constrained, data, param_indices=[0])
+
+    explicit = lagrange(constrained, data, param_indices=[0], vcov=np.eye(10) * 0.5)
+    assert_allclose(explicit.scores, marginal.scores)
+    assert explicit.statistic == pytest.approx(0.5 * marginal.scores[0] ** 2)
+
+
+def test_lagrange_rejects_indefinite_observed_information(monkeypatch) -> None:
+    import mirt.estimation.standard_errors as standard_errors
+
+    constrained, data = _discrimination_fixed_fit(1.0)
+    original = standard_errors._score_and_information
+
+    def indefinite(*args, **kwargs):
+        score, information, layouts = original(*args, **kwargs)
+        information = information.copy()
+        information[0, 0] = -1.0
+        return score, information, layouts
+
+    monkeypatch.setattr(standard_errors, "_score_and_information", indefinite)
+    with pytest.raises(MirtValidationError, match="not positive definite"):
+        lagrange(constrained, data, param_indices=[0])
 
 
 def test_lagrange_matches_analytic_two_parameter_scores_with_missing_data() -> None:

@@ -78,6 +78,7 @@ class MultidimensionalModel(DichotomousItemModel):
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         slopes, intercepts = self.slopes, self.intercepts
         if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
             return slopes[item_idx], intercepts[item_idx]
         return slopes, intercepts
 
@@ -126,9 +127,7 @@ class MultidimensionalModel(DichotomousItemModel):
         item_idx: int,
     ) -> NDArray[np.float64]:
         """Return item Fisher matrices across multidimensional theta points."""
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"item_idx {item_idx} out of range [0, {self.n_items})")
-
+        item_idx = self._validate_item_index(item_idx)
         theta = self._ensure_theta_2d(theta)
         return _item_information(
             self._logits(theta, item_idx), self._parameters["slopes"][item_idx]

@@ -77,6 +77,52 @@ def test_objective_and_gradient_match_public_curves(
 
 
 @pytest.mark.parametrize(("factory", "factors"), _MODELS)
+def test_fixed_coordinates_keep_the_prepared_objective(factory, factors):
+    # Items with coordinates fixed by masks used to fall back to numerical
+    # differentiation of the public curves.
+    rng = np.random.default_rng(311)
+    model = factory(2, n_categories=[3, 5], n_factors=factors)
+    estimator = EMEstimator()
+    params, _ = estimator._get_item_params_and_bounds(model, 1)
+    estimator._set_item_params(model, 1, params + rng.uniform(-0.3, 0.3, params.size))
+    masks = {
+        name: mask.copy()
+        for name, mask in model.free_parameter_masks.items()
+        if model._item_indexed(name)
+    }
+    # Fix every other free coordinate of the second item.
+    count = 0
+    for mask in masks.values():
+        row = mask.reshape(model.n_items, -1)[1]
+        for index in np.flatnonzero(row):
+            row[index] = count % 2 == 1
+            count += 1
+    model.set_free_parameter_masks(masks)
+    params, _ = estimator._get_item_params_and_bounds(model, 1)
+    params += rng.uniform(-0.1, 0.1, params.size)
+    theta = rng.normal(size=(43, factors)) * 1.5
+    counts = rng.uniform(0.0, 5.0, (43, 5))
+    _, _, objective, analytic = estimator._item_objective(
+        model, 1, np.zeros((1, 2), dtype=int), None, theta, r_kc=counts
+    )
+    assert analytic
+    value, gradient = objective(params)
+
+    def reference(trial):
+        return _reference(model, 1, theta, counts, estimator.prob_epsilon, trial)
+
+    assert value == pytest.approx(reference(params), rel=1e-12, abs=1e-12)
+    expected = np.zeros_like(params)
+    for coordinate in range(params.size):
+        delta = np.zeros_like(params)
+        delta[coordinate] = 1e-5
+        expected[coordinate] = (
+            reference(params + delta) - reference(params - delta)
+        ) / 2e-5
+    np.testing.assert_allclose(gradient, expected, rtol=2e-5, atol=2e-7)
+
+
+@pytest.mark.parametrize(("factory", "factors"), _MODELS)
 def test_optimizer_recovers_interior_category_curves(factory, factors):
     rng = np.random.default_rng(328)
     truth = factory(1, n_categories=4, n_factors=factors)
@@ -240,7 +286,6 @@ def test_item_counts_respect_explicit_observation_mask(monkeypatch):
         responses,
         posterior,
         theta,
-        posterior.sum(axis=0),
         valid_mask=observed,
     )
 

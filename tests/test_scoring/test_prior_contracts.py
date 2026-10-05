@@ -12,9 +12,9 @@ from scipy.special import expit
 from mirt import get_backend, set_backend
 from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.models import TwoParameterLogistic
+from mirt.scoring import EAPSumScorer, sum_score_to_theta
 from mirt.scoring._common import resolve_prior_distribution
 from mirt.scoring.eap import EAPScorer
-from mirt.scoring.eapsum import EAPSumScorer, sum_score_to_theta
 from mirt.scoring.map import MAPScorer
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,8 @@ from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
     NoExposureControl,
+    ProgressiveRestricted,
+    Randomesque,
     create_exposure_control,
 )
 
@@ -125,6 +128,42 @@ def get_pending_item(engine: Any) -> int:
         engine._pending_item = engine._select_next_item()
 
     return int(engine._pending_item)
+
+
+def select_constrained_item(
+    engine: Any,
+    *,
+    criteria: Callable[[set[int]], dict[int, float]],
+    select: Callable[[set[int]], int],
+) -> int:
+    """Select an item after applying content and exposure constraints.
+
+    Content constraints filter the available pool first, then exposure control
+    filters what remains. Progressive control selects from its own information
+    window. Randomesque control draws from the top ``k`` items ranked by the
+    strategy's ``criteria``, breaking ties by item index. Otherwise the
+    strategy's ``select`` callback chooses among the eligible items.
+    """
+    content_eligible = engine._content.filter_items(
+        engine._available_items, engine._items_administered
+    )
+    exposure = engine._exposure
+    eligible = exposure.filter_items(
+        content_eligible, engine.model, engine._current_theta
+    )
+
+    if isinstance(exposure, ProgressiveRestricted):
+        return exposure.select_from_eligible(
+            eligible,
+            n_administered=len(engine._items_administered),
+            max_items=engine._selection_horizon,
+        )
+    if isinstance(exposure, Randomesque):
+        ranked = sorted(
+            criteria(eligible).items(), key=lambda pair: (-pair[1], pair[0])
+        )
+        return exposure.select_from_ranked(ranked)
+    return select(eligible)
 
 
 def consume_pending_item(engine: Any, response: int) -> tuple[int, int]:

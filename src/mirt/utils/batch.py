@@ -6,17 +6,16 @@ and comparing them efficiently.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from multiprocessing import get_context
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt.exceptions import MirtValidationError
+from mirt.utils._parallel import _process_pool, resolve_n_jobs
 from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
@@ -128,23 +127,6 @@ def _validate_integer_grid(
     return normalized
 
 
-def _resolve_worker_count(n_jobs: int, n_tasks: int) -> int:
-    """Normalize the requested worker count and cap it to useful work."""
-    if (
-        isinstance(n_jobs, (bool, np.bool_))
-        or not isinstance(n_jobs, (int, np.integer))
-        or n_jobs == 0
-        or n_jobs < -1
-    ):
-        raise MirtValidationError(
-            "n_jobs must be a positive integer or -1",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
-    requested = (os.cpu_count() or 1) if n_jobs == -1 else int(n_jobs)
-    return min(requested, n_tasks)
-
-
 def _validate_on_error(on_error: OnError) -> OnError:
     if on_error not in ("raise", "skip"):
         raise MirtValidationError(
@@ -208,7 +190,7 @@ def _execute_tasks(
     parallel_backend: ParallelBackend,
 ) -> tuple[dict[str, FitResult], dict[str, str]]:
     """Execute independent fits and retain deterministic result ordering."""
-    worker_count = _resolve_worker_count(n_jobs, len(tasks))
+    worker_count = resolve_n_jobs(n_jobs, len(tasks))
     completed: dict[str, FitResult] = {}
     failures: dict[str, str] = {}
 
@@ -230,11 +212,8 @@ def _execute_tasks(
             if parallel_backend == "thread":
                 executor = ThreadPoolExecutor(max_workers=worker_count)
             else:
-                # Forking after the native backend initializes its thread pool can
-                # deadlock the child. Spawn workers from a clean interpreter instead.
-                executor = ProcessPoolExecutor(
-                    max_workers=worker_count,
-                    mp_context=get_context("spawn"),
+                executor = _process_pool(
+                    worker_count,
                     initializer=_initialize_process_worker,
                     initargs=(responses,),
                 )

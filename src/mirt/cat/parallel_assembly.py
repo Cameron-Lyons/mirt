@@ -18,13 +18,17 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt.cat.assembly import (
     FormAssemblyResult,
+    _check_rounded_solution,
     _information_matrix,
     _prepare_item_bundles,
+    _solver_incumbent,
+    _solver_status,
     _validate_blueprint,
     _validate_costs,
     _validate_enemy_pairs,
     _validate_form_size,
     _validate_item_set,
+    _validate_require_optimal,
     _validate_theta,
     _validate_weights,
 )
@@ -59,6 +63,13 @@ class ParallelFormAssemblyResult:
         Pairwise shared-item counts. Diagonal entries equal the form size.
     solver_message : str
         Completion detail reported by the mixed-integer optimizer.
+    is_optimal : bool
+        Whether the optimizer proved the joint assembly optimal, within its
+        relative gap tolerance ``mip_rel_gap``. ``False`` means a solver limit
+        stopped the search and the forms are the best feasible solution found.
+    mip_gap : float | None
+        Relative gap between the objective and the optimizer's bound, when
+        reported.
     """
 
     forms: tuple[FormAssemblyResult, ...]
@@ -67,6 +78,8 @@ class ParallelFormAssemblyResult:
     item_usage: dict[int, int]
     overlap_matrix: NDArray[np.intp]
     solver_message: str
+    is_optimal: bool = True
+    mip_gap: float | None = None
 
     @property
     def n_forms(self) -> int:
@@ -94,6 +107,7 @@ class ParallelFormAssemblyResult:
                 f"Items per form: {self.form_size}",
                 f"Objective: {objective_name} = {self.objective_value:.6g}",
                 f"Maximum pairwise overlap: {max_overlap}",
+                _solver_status(self.is_optimal, self.mip_gap),
             ]
         )
 
@@ -184,6 +198,7 @@ def assemble_parallel_forms(
     max_item_usage: int = 1,
     max_pairwise_overlap: int | None = None,
     solver_options: Mapping[str, bool | int | float] | None = None,
+    require_optimal: bool = False,
 ) -> ParallelFormAssemblyResult:
     """Jointly assemble exact parallel forms from one calibrated item pool.
 
@@ -236,17 +251,24 @@ def assemble_parallel_forms(
     max_pairwise_overlap : int, optional
         Maximum shared items between every pair of forms.
     solver_options : mapping, optional
-        Options forwarded to :func:`scipy.optimize.milp`.
+        Options forwarded to :func:`scipy.optimize.milp`, such as
+        ``time_limit``, ``node_limit``, or ``mip_rel_gap``.
+    require_optimal : bool, default=False
+        Raise when a solver limit stops the search before optimality is
+        proven. By default the best feasible forms found are returned with
+        ``is_optimal=False`` and the ``mip_gap``.
 
     Returns
     -------
     ParallelFormAssemblyResult
-        Joint optimum and per-form/cross-form diagnostics.
+        Joint solution and per-form/cross-form diagnostics.
 
     Raises
     ------
     RuntimeError
-        If the joint constraints have no optimal feasible solution.
+        If the joint constraints are infeasible, if a solver limit is reached
+        before any feasible solution is found, or if ``require_optimal`` is
+        set and optimality was not proven.
     """
     pool_size = getattr(model, "n_items", None)
     if (
@@ -258,6 +280,7 @@ def assemble_parallel_forms(
     pool_size = int(pool_size)
     if getattr(model, "n_factors", None) != 1:
         raise ValueError("assemble_parallel_forms requires a unidimensional model")
+    require_optimal = _validate_require_optimal(require_optimal)
 
     form_count = _validate_positive_count(n_forms, "n_forms", minimum=2)
     theta_values = _validate_theta(theta)
@@ -490,6 +513,8 @@ def assemble_parallel_forms(
         shape=(len(lower_bounds), n_variables),
         dtype=np.float64,
     ).tocsr()
+    constraint_lower = np.asarray(lower_bounds, dtype=np.float64)
+    constraint_upper = np.asarray(upper_bounds, dtype=np.float64)
     variable_lower = np.zeros(n_variables, dtype=np.float64)
     variable_upper = np.concatenate(
         (
@@ -518,22 +543,19 @@ def assemble_parallel_forms(
         ),
         bounds=Bounds(variable_lower, variable_upper),
         constraints=LinearConstraint(
-            constraint_matrix,
-            np.asarray(lower_bounds, dtype=np.float64),
-            np.asarray(upper_bounds, dtype=np.float64),
+            constraint_matrix, constraint_lower, constraint_upper
         ),
         options=options,
     )
-    if not result.success or result.x is None:
-        raise RuntimeError(f"parallel form assembly failed: {result.message}")
+    solution, is_optimal, mip_gap = _solver_incumbent(
+        result, require_optimal=require_optimal, label="parallel form assembly"
+    )
 
-    selected_mask = result.x[:n_selection].reshape(form_count, n_candidates) > 0.5
+    selected_mask = solution[:n_selection].reshape(form_count, n_candidates) > 0.5
     selected_by_form = tuple(
         candidate_indices[np.flatnonzero(selected_mask[form_idx])]
         for form_idx in range(form_count)
     )
-    if any(selected.size != size for selected in selected_by_form):
-        raise RuntimeError("parallel form assembly returned an invalid item count")
 
     information_by_form = np.stack(
         [
@@ -542,11 +564,27 @@ def assemble_parallel_forms(
         ]
     )
     weighted_information = information_by_form @ weights
+    rounded = np.zeros(n_variables, dtype=np.float64)
+    rounded[:n_selection] = selected_mask.ravel()
     if targets is None:
         joint_objective = float(np.min(weighted_information))
+        rounded[objective_offset] = joint_objective
     else:
         deviations = np.abs(information_by_form - targets)
         joint_objective = float(np.mean(deviations @ weights))
+        rounded[objective_offset:overlap_offset] = deviations.ravel()
+    if n_overlap:
+        first_forms, second_forms = np.asarray(form_pairs, dtype=np.intp).T
+        shared = selected_mask[first_forms] & selected_mask[second_forms]
+        rounded[overlap_offset:] = shared.ravel()
+    _check_rounded_solution(
+        constraint_matrix,
+        rounded,
+        (constraint_lower, constraint_upper),
+        (variable_lower, variable_upper),
+        label="parallel form assembly",
+        message=str(result.message),
+    )
 
     per_form_results: list[FormAssemblyResult] = []
     for form_idx, selected in enumerate(selected_by_form):
@@ -580,6 +618,8 @@ def assemble_parallel_forms(
                 content_counts=content_counts,
                 total_cost=total_cost,
                 solver_message=str(result.message),
+                is_optimal=is_optimal,
+                mip_gap=mip_gap,
             )
         )
 
@@ -600,4 +640,6 @@ def assemble_parallel_forms(
         item_usage=item_usage,
         overlap_matrix=overlap_matrix,
         solver_message=str(result.message),
+        is_optimal=is_optimal,
+        mip_gap=mip_gap,
     )

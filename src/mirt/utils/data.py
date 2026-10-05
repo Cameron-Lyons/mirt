@@ -7,10 +7,12 @@ from mirt.exceptions import MirtDataError
 
 
 def validate_responses(
-    responses: NDArray[Any] | list[Any],
+    responses: Any,
     n_items: int | None = None,
     allow_missing: bool = True,
     missing_code: int = -1,
+    *,
+    nan_as_missing: bool = True,
 ) -> NDArray[np.int_]:
     """Validate and convert response data for IRT analysis.
 
@@ -20,8 +22,9 @@ def validate_responses(
     Parameters
     ----------
     responses : array-like of shape (n_persons, n_items)
-        Response data to validate. Can be a list, numpy array, or any
-        array-like object.
+        Response data to validate. Can be a list, numpy array, pandas or
+        polars DataFrame, or any array-like object. Nullable DataFrame columns
+        are read with their missing entries as ``NaN``.
     n_items : int, optional
         Expected number of items. If provided, validates that responses
         have this many columns.
@@ -30,6 +33,10 @@ def validate_responses(
     missing_code : int, default=-1
         Value used to represent missing responses in the returned array. Any
         negative input value is treated as missing and normalized to this code.
+    nan_as_missing : bool, default=True
+        Treat ``NaN`` entries (R's ``NA``) as missing responses when
+        ``allow_missing`` is true. Infinite and non-integer values are always
+        rejected.
 
     Returns
     -------
@@ -54,8 +61,12 @@ def validate_responses(
     >>> # With missing data
     >>> data_with_missing = [[1, -1, 1], [0, 1, 0]]
     >>> validated = validate_responses(data_with_missing, allow_missing=True)
+
+    >>> # NaN is missing as well
+    >>> validate_responses([[1.0, np.nan], [0.0, 1.0]]).tolist()
+    [[1, -1], [0, 1]]
     """
-    responses = np.asarray(responses)
+    responses = _response_array(responses)
 
     if responses.ndim != 2:
         raise MirtDataError(
@@ -94,6 +105,15 @@ def validate_responses(
         )
 
     if dtype_kind == "f":
+        nan_mask = np.isnan(responses)
+        if nan_as_missing and np.any(nan_mask):
+            if not allow_missing:
+                raise MirtDataError(
+                    "responses contains NaN values (missing data not allowed)",
+                    n_persons=n_persons,
+                    n_items=n_cols,
+                )
+            responses = np.where(nan_mask, missing_code, responses)
         if not np.all(np.isfinite(responses)):
             raise MirtDataError(
                 "finite response codes are required; values must be finite integer values",
@@ -132,6 +152,69 @@ def validate_responses(
             responses[missing_mask] = missing_code
 
     return responses
+
+
+def _response_array(responses: Any) -> NDArray[Any]:
+    """Convert responses to an array, reading nullable DataFrame columns as floats."""
+    array = np.asarray(responses)
+    if array.dtype != object or not hasattr(responses, "to_numpy"):
+        return array
+    # pandas nullable columns (Int64, boolean) convert to objects holding pd.NA.
+    # Only numeric and boolean columns are read this way, so text columns such
+    # as "1" are still rejected as non-numeric, as they are for plain arrays.
+    dtypes = getattr(responses, "dtypes", ())
+    if not all(getattr(dtype, "kind", "O") in "biuf" for dtype in dtypes):
+        return array
+    try:
+        return np.asarray(responses.to_numpy(dtype=np.float64, na_value=np.nan))
+    except (TypeError, ValueError):
+        return array
+
+
+def _missing_coded_responses(responses: Any, missing_code: int = -1) -> NDArray[Any]:
+    """Read responses as an array whose ``NaN`` entries are ``missing_code``.
+
+    This is the missing-data convention of :func:`validate_responses` for
+    callers that check response codes themselves: nullable DataFrame columns
+    are read as floats and every ``NaN`` becomes ``missing_code``. Other
+    values, including infinities and non-numeric entries, are returned
+    unchanged for the caller to validate.
+    """
+    array = _response_array(responses)
+    if array.dtype.kind == "f":
+        missing = np.isnan(array)
+        if np.any(missing):
+            array = np.where(missing, float(missing_code), array)
+    return array
+
+
+def response_column_names(responses: Any) -> list[str] | None:
+    """Return the column labels of a DataFrame-like response matrix.
+
+    Returns ``None`` for arrays, for non-unique labels, and for the default
+    positional labels of pandas (``0, 1, ...``) and polars (``column_0,
+    column_1, ...``), which carry no item names.
+    """
+    if isinstance(responses, np.ndarray):
+        return None
+    columns = getattr(responses, "columns", None)
+    if columns is None:
+        return None
+    try:
+        labels = list(columns)
+    except TypeError:
+        return None
+    if all(
+        isinstance(label, (int, np.integer)) and not isinstance(label, bool)
+        for label in labels
+    ) and [int(label) for label in labels] == list(range(len(labels))):
+        return None
+    names = [str(label) for label in labels]
+    if names == [f"column_{index}" for index in range(len(names))]:
+        return None
+    if len(set(names)) != len(names):
+        return None
+    return names
 
 
 def check_response_pattern(

@@ -179,7 +179,9 @@ def test_core_uncertainty_respects_private_curve_overrides(poly):
 def test_core_curvature_retains_configured_clipping():
     model = TwoParameterLogistic(2)
     responses, quadrature, posterior = _problem(model)
-    estimator = EMEstimator(n_quadpts=5, prob_epsilon=0.1, se_step_size=5e-3)
+    estimator = EMEstimator(
+        n_quadpts=5, prob_epsilon=0.1, se_step_size=5e-3, se_method="complete_data"
+    )
     estimator._quadrature = quadrature
     actual = estimator._compute_standard_errors(model, responses, posterior)
     expected = _personwise_reference(

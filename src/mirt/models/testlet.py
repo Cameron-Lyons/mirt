@@ -24,17 +24,6 @@ _TESTLET_LIKELIHOOD_TARGET_ELEMENTS = 1_000_000
 _TESTLET_PAIR_TARGET_ELEMENTS = 2_000_000
 
 
-def _validate_item_index(n_items: int, item_idx: int) -> int:
-    if (
-        isinstance(item_idx, bool)
-        or not isinstance(item_idx, Integral)
-        or item_idx < 0
-        or item_idx >= n_items
-    ):
-        raise IndexError(f"Item index {item_idx} out of range [0, {n_items})")
-    return int(item_idx)
-
-
 def _validate_membership(
     n_items: int,
     membership: NDArray[np.int_] | list[int],
@@ -458,7 +447,7 @@ class TestletModel(DichotomousItemModel):
         variances = self._parameters["testlet_variances"]
 
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             position = self._testlet_positions[item]
             variance = variances[position] if position >= 0 else 0.0
             scale = d[item] * np.sqrt(variance)
@@ -515,7 +504,7 @@ class TestletModel(DichotomousItemModel):
             return self._marginal_components(theta_values[:, 0], item_idx)[0]
 
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
         a = self._parameters["discrimination"]
         d = self._parameters["testlet_loadings"]
         b = self._parameters["difficulty"]
@@ -641,7 +630,7 @@ class TestletModel(DichotomousItemModel):
 
         probability = self.probability(theta_values, item_idx)
         if item_idx is not None:
-            item = _validate_item_index(self.n_items, item_idx)
+            item = self._validate_item_index(item_idx)
             squared_loading = self._parameters["discrimination"][item] ** 2
             if self._testlet_positions[item] >= 0:
                 squared_loading += self._parameters["testlet_loadings"][item] ** 2

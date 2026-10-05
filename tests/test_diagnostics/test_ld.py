@@ -624,3 +624,78 @@ class TestLDWithLocallyDependentData:
         q3_others[1, 0] = 0
 
         assert q3_01 > np.mean(q3_others)
+
+
+def _simulated_binary_model(model_name, *, n_persons=600, n_items=8, seed=0):
+    """Return a parameterized dichotomous model, simulated responses and theta."""
+    from mirt.models.dichotomous import (
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+
+    rng = np.random.default_rng(seed)
+    n_factors = 2 if model_name == "2PL-2D" else 1
+    if model_name == "1PL":
+        model = OneParameterLogistic(n_items=n_items)
+        model.set_parameters(difficulty=rng.normal(size=n_items))
+    elif model_name in {"2PL", "2PL-2D"}:
+        model = TwoParameterLogistic(n_items=n_items, n_factors=n_factors)
+        slopes = rng.uniform(0.8, 2.0, size=(n_items, n_factors))
+        model.set_parameters(
+            discrimination=slopes if n_factors > 1 else slopes[:, 0],
+            difficulty=rng.normal(size=n_items),
+        )
+    else:
+        model_class = (
+            ThreeParameterLogistic if model_name == "3PL" else FourParameterLogistic
+        )
+        model = model_class(n_items=n_items)
+        parameters = {
+            "discrimination": rng.uniform(0.8, 2.0, size=n_items),
+            "difficulty": rng.normal(size=n_items),
+            "guessing": np.full(n_items, 0.25),
+        }
+        if model_name == "4PL":
+            parameters["upper"] = np.full(n_items, 0.9)
+        model.set_parameters(**parameters)
+
+    theta = rng.normal(size=(n_persons, n_factors))
+    probabilities = model.probability(theta)
+    responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+    responses[rng.random(responses.shape) < 0.05] = -1
+    return model, responses, theta
+
+
+class TestStandaloneStatisticsMatchFullAnalysis:
+    """Standalone Q3/LD χ² agree with compute_ld_statistics on every backend.
+
+    The standalone functions used to send any dichotomous model with
+    discrimination and difficulty to the native 2PL kernels, silently dropping
+    guessing, upper asymptotes and extra factors.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _restore_backend(self):
+        import mirt
+
+        previous = mirt.get_backend()
+        yield
+        mirt.set_backend(previous)
+
+    @pytest.mark.parametrize("backend", ["auto", "numpy"])
+    @pytest.mark.parametrize("model_name", ["1PL", "2PL", "3PL", "4PL", "2PL-2D"])
+    def test_q3_and_chi2_match_full_analysis(self, model_name, backend):
+        import mirt
+
+        model, responses, theta = _simulated_binary_model(model_name)
+        full = compute_ld_statistics(model, responses, theta=theta)
+
+        mirt.set_backend(backend)
+        q3 = compute_q3(model, responses, theta)
+        chi2, _ = compute_ld_chi2(model, responses, theta)
+
+        assert q3.shape == (model.n_items, model.n_items)
+        assert_allclose(q3, full.q3_matrix, rtol=1e-12, atol=1e-12)
+        assert_allclose(chi2, full.ld_chi2_matrix, rtol=1e-12, equal_nan=True)

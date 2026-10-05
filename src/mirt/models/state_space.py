@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from dataclasses import dataclass
 from statistics import NormalDist
 from typing import Literal
@@ -1399,35 +1398,72 @@ class StateSpaceIRT:
         n_quadpts: int,
     ) -> NDArray[np.float64]:
         """Integrate item probabilities over Gaussian state distributions."""
-        marginal = np.zeros(
-            (state_means.size, self.n_items),
-            dtype=np.float64,
-        )
-
-        for weight, probabilities in self._state_observation_quadrature(
+        probabilities, _ = self._integrate_over_states(
             state_means,
             state_variances,
             n_quadpts,
-        ):
-            marginal += weight * probabilities
+        )
+        assert probabilities is not None
+        return probabilities
 
-        probabilities = marginal.reshape(state_means.shape + (self.n_items,))
-        return np.clip(probabilities, 0.0, 1.0)
-
-    def _state_observation_quadrature(
+    def _integrate_over_states(
         self,
         state_means: NDArray[np.float64],
         state_variances: NDArray[np.float64],
         n_quadpts: int,
-    ) -> Iterator[tuple[float, NDArray[np.float64]]]:
-        """Yield weighted conditional probabilities over Gaussian states."""
+        responses: NDArray[np.int_] | None = None,
+        *,
+        probabilities: bool = True,
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
+        """Integrate over Gaussian states in one pass over the quadrature nodes.
+
+        Returns the marginal item probabilities, with shape
+        ``state_means.shape + (n_items,)``, when ``probabilities`` is true and
+        the joint response-pattern log-likelihoods, with shape
+        ``state_means.shape``, when ``responses`` is given. Rows without an
+        observed response score zero; unrequested outputs are ``None``.
+        """
         nodes, weights = standard_normal_quadrature(n_quadpts)
         flat_means = state_means.ravel()
         flat_scales = np.sqrt(state_variances).ravel()
+        marginal = (
+            np.zeros((flat_means.size, self.n_items), dtype=np.float64)
+            if probabilities
+            else None
+        )
+        node_scores = None
+        if responses is not None:
+            flat_responses = responses.reshape(-1, self.n_items)
+            correct = (flat_responses == 1).astype(np.float64)
+            incorrect = (flat_responses == 0).astype(np.float64)
+            node_scores = np.empty((weights.size, flat_means.size), dtype=np.float64)
 
-        for node, weight in zip(nodes, weights, strict=True):
-            states = flat_means + flat_scales * node
-            yield float(weight), self._observation_probability(states)
+        for index, (node, weight) in enumerate(zip(nodes, weights, strict=True)):
+            conditional = self._observation_probability(flat_means + flat_scales * node)
+            if marginal is not None:
+                marginal += weight * conditional
+            if node_scores is not None:
+                # Clipped probabilities keep both logs finite under the 0/1 masks.
+                node_scores[index] = (
+                    np.log(weight)
+                    + np.einsum("ij,ij->i", correct, np.log(conditional))
+                    + np.einsum("ij,ij->i", incorrect, np.log1p(-conditional))
+                )
+
+        integrated = (
+            None
+            if marginal is None
+            else np.clip(
+                marginal.reshape(state_means.shape + (self.n_items,)),
+                0.0,
+                1.0,
+            )
+        )
+        if node_scores is None:
+            return integrated, None
+        scores = np.logaddexp.reduce(node_scores, axis=0)
+        scores[~np.any(flat_responses >= 0, axis=1)] = 0.0
+        return integrated, scores.reshape(state_means.shape)
 
     def state_response_probabilities(
         self,
@@ -1516,32 +1552,15 @@ class StateSpaceIRT:
         n_quadpts: int,
     ) -> NDArray[np.float64]:
         """Integrate joint response-pattern likelihoods over Gaussian states."""
-        flat_responses = responses.reshape(-1, self.n_items)
-        observed = flat_responses >= 0
-        correct = flat_responses == 1
-        incorrect = flat_responses == 0
-        scores = np.full(state_means.size, -np.inf, dtype=np.float64)
-
-        for weight, probabilities in self._state_observation_quadrature(
+        _, scores = self._integrate_over_states(
             state_means,
             state_variances,
             n_quadpts,
-        ):
-            conditional_score = np.sum(
-                np.where(
-                    correct,
-                    np.log(probabilities),
-                    np.where(incorrect, np.log1p(-probabilities), 0.0),
-                ),
-                axis=1,
-            )
-            scores = np.logaddexp(
-                scores,
-                np.log(weight) + conditional_score,
-            )
-
-        scores[~np.any(observed, axis=1)] = 0.0
-        return scores.reshape(state_means.shape)
+            responses,
+            probabilities=False,
+        )
+        assert scores is not None
+        return scores
 
     def _integrated_response_diagnostics(
         self,
@@ -1551,42 +1570,14 @@ class StateSpaceIRT:
         n_quadpts: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """Integrate item probabilities and joint scores in one quadrature pass."""
-        flat_responses = responses.reshape(-1, self.n_items)
-        observed = flat_responses >= 0
-        correct = flat_responses == 1
-        incorrect = flat_responses == 0
-        marginal = np.zeros(
-            (state_means.size, self.n_items),
-            dtype=np.float64,
-        )
-        scores = np.full(state_means.size, -np.inf, dtype=np.float64)
-
-        for weight, probabilities in self._state_observation_quadrature(
+        probabilities, scores = self._integrate_over_states(
             state_means,
             state_variances,
             n_quadpts,
-        ):
-            marginal += weight * probabilities
-            conditional_score = np.sum(
-                np.where(
-                    correct,
-                    np.log(probabilities),
-                    np.where(incorrect, np.log1p(-probabilities), 0.0),
-                ),
-                axis=1,
-            )
-            scores = np.logaddexp(
-                scores,
-                np.log(weight) + conditional_score,
-            )
-
-        scores[~np.any(observed, axis=1)] = 0.0
-        response_probabilities = np.clip(
-            marginal.reshape(state_means.shape + (self.n_items,)),
-            0.0,
-            1.0,
+            responses,
         )
-        return response_probabilities, scores.reshape(state_means.shape)
+        assert probabilities is not None and scores is not None
+        return probabilities, scores
 
     @staticmethod
     def _item_response_diagnostics(

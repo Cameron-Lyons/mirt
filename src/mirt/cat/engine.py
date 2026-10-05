@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import cache
+from inspect import signature
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -26,10 +28,14 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
+    select_constrained_item,
     simulate_error_moments,
     validate_replications,
     validate_simulation_values,
 )
+from mirt.cat._lockstep import conditional_error_moments as lockstep_error_moments
+from mirt.cat._lockstep import simulate as simulate_lockstep
+from mirt.cat._lockstep import supports_lockstep
 from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.cat._native import uses_native_defaults
 from mirt.cat.content import ContentConstraint, NoContentConstraint
@@ -37,14 +43,17 @@ from mirt.cat.exposure import (
     ExposureControl,
     NoExposureControl,
     ProgressiveRestricted,
-    Randomesque,
 )
 from mirt.cat.results import CATResult, CATState
 from mirt.cat.selection import (
+    AStratified,
     ItemSelectionStrategy,
+    MaxExpectedInformation,
     MaxFisherInformation,
+    _selection_strategy_class,
     create_selection_strategy,
 )
+from mirt.cat.shadow import ShadowTestSelection
 from mirt.cat.stopping import (
     CombinedStop,
     MaxItemsStop,
@@ -58,11 +67,46 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
+def _hook_accepts_test_length(hook: Any) -> bool:
+    """Return whether a selection hook accepts a ``test_length`` keyword."""
+    try:
+        parameters = signature(hook).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        parameter.name == "test_length" or parameter.kind is parameter.VAR_KEYWORD
+        for parameter in parameters
+    )
+
+
+_cached_hook_accepts_test_length = cache(_hook_accepts_test_length)
+
+
+def _accepts_test_length(strategy: ItemSelectionStrategy) -> bool:
+    """Return whether horizon-aware selection hooks accept ``test_length``.
+
+    Subclasses or instances that replace a hook with the original signature
+    keep working; they schedule strata over their own ``test_length`` or the
+    pool size.
+    """
+    for name in ("select_item", "get_item_criteria"):
+        hook = getattr(strategy, name)
+        hook = getattr(hook, "__func__", hook)
+        try:
+            accepts = _cached_hook_accepts_test_length(hook)
+        except TypeError:  # unhashable callable
+            accepts = _hook_accepts_test_length(hook)
+        if not accepts:
+            return False
+    return True
+
+
 def _validate_batch_controls(
     true_thetas: NDArray[np.float64] | list[float],
     n_replications: int,
     use_rust: bool,
-) -> tuple[NDArray[np.float64], int, bool]:
+    vectorized: bool,
+) -> tuple[NDArray[np.float64], int, bool, bool]:
     """Validate controls shared by unidimensional batch diagnostics."""
     thetas = validate_simulation_values(true_thetas, name="true_thetas").ravel()
     if thetas.size == 0:
@@ -70,7 +114,14 @@ def _validate_batch_controls(
     n_replications = validate_replications(n_replications)
     if not isinstance(use_rust, (bool, np.bool_)):
         raise ValueError("use_rust must be boolean")
-    return np.ascontiguousarray(thetas), n_replications, bool(use_rust)
+    if not isinstance(vectorized, (bool, np.bool_)):
+        raise ValueError("vectorized must be boolean")
+    return (
+        np.ascontiguousarray(thetas),
+        n_replications,
+        bool(use_rust),
+        bool(vectorized),
+    )
 
 
 @_register_native_defaults
@@ -154,7 +205,7 @@ class CATEngine:
 
         if isinstance(item_selection, str):
             selection_kwargs: dict[str, Any] = {}
-            if item_selection.upper() == "MEI":
+            if _selection_strategy_class(item_selection) is MaxExpectedInformation:
                 selection_kwargs = {
                     "n_quadpts": n_quadpts,
                     "theta_bounds": theta_bounds,
@@ -186,6 +237,13 @@ class CATEngine:
 
         self._exposure = configure_exposure_control(exposure_control, seed=seed)
         self._content = configure_content_constraint(content_constraint)
+        if isinstance(self._selection, ShadowTestSelection) and isinstance(
+            self._exposure, ProgressiveRestricted
+        ):
+            raise ValueError(
+                "ShadowTestSelection cannot be combined with progressive exposure "
+                "control, which selects items without the selection strategy"
+            )
 
         self._current_theta = initial_theta
         self._current_se = float("inf")
@@ -260,38 +318,33 @@ class CATEngine:
 
     def _select_next_item(self) -> int:
         """Internal item selection with constraint handling."""
-        content_eligible = self._content.filter_items(
-            self._available_items, self._items_administered
+        strategy = self._selection
+        # a-stratified strata and shadow tests span the engine's test horizon
+        # unless the strategy was configured with its own test length.
+        options: dict[str, Any] = (
+            {"test_length": self._selection_horizon}
+            if isinstance(strategy, (AStratified, ShadowTestSelection))
+            and _accepts_test_length(strategy)
+            else {}
         )
-
-        exposure_eligible = self._exposure.filter_items(
-            content_eligible, self.model, self._current_theta
-        )
-
-        if isinstance(self._exposure, ProgressiveRestricted):
-            return self._exposure.select_from_eligible(
-                exposure_eligible,
-                n_administered=len(self._items_administered),
-                max_items=self._selection_horizon,
-            )
-
-        if isinstance(self._exposure, Randomesque):
-            criteria = self._selection.get_item_criteria(
+        return select_constrained_item(
+            self,
+            criteria=lambda eligible: strategy.get_item_criteria(
                 self.model,
                 self._current_theta,
-                exposure_eligible,
+                eligible,
                 administered_items=self._items_administered,
                 responses=self._responses,
-            )
-            ranked = sorted(criteria.items(), key=lambda x: x[1], reverse=True)
-            return self._exposure.select_from_ranked(ranked)
-
-        return self._selection.select_item(
-            self.model,
-            self._current_theta,
-            exposure_eligible,
-            self._items_administered,
-            self._responses,
+                **options,
+            ),
+            select=lambda eligible: strategy.select_item(
+                self.model,
+                self._current_theta,
+                eligible,
+                self._items_administered,
+                self._responses,
+                **options,
+            ),
         )
 
     def administer_item(self, response: int) -> CATState:
@@ -480,8 +533,34 @@ class CATEngine:
         true_thetas: NDArray[np.float64] | list[float],
         n_replications: int = 1,
         use_rust: bool = True,
+        vectorized: bool = True,
     ) -> list[CATResult]:
         """Simulate CAT for multiple examinees.
+
+        Three implementations share one result contract, tried in order:
+
+        1. The Rust backend, for matching 1PL/2PL, EAP, MFI, and SE-stop
+           configurations when ``use_rust`` is True. Its results omit the
+           estimate and information histories.
+        2. Lock-step simulation when ``vectorized`` is True, for unmodified
+           engines using MFI selection, EAP scoring, SE and/or maximum-length
+           stopping, no exposure or content control, and a built-in
+           unidimensional 1PL-4PL, GRM, GPCM, or PCM model. All examinees
+           advance together with one vectorized step per item position.
+        3. Independent sessions through :meth:`run_simulation`, the reference
+           implementation used for every other configuration.
+
+        Given the same responses, lock step reproduces the reference item
+        paths, estimates, standard errors, stopping reasons, and histories.
+        Both paths turn one uniform draw from the engine's generator into
+        each response, but the reference starts each examinee's draws right
+        after the previous examinee's last one, while lock step reserves
+        ``L`` draws per examinee, where ``L`` is ``max_items`` capped at the
+        pool size. A seeded engine therefore gives identical results on both
+        paths when every examinee answers ``L`` items (fixed-length tests)
+        and other, equally distributed, responses when tests end early.
+        The Rust and lock-step paths leave the engine's interactive session
+        state unchanged.
 
         Parameters
         ----------
@@ -490,32 +569,41 @@ class CATEngine:
         n_replications : int, optional
             Number of replications per theta value. Default is 1.
         use_rust : bool, optional
-            Use Rust backend for parallel simulation if available. Default is True.
-            Available for matching 1PL/2PL, EAP, MFI, and SE-stop configurations.
+            Use the Rust backend when the configuration supports it.
+            Default is True.
+        vectorized : bool, optional
+            Use lock-step simulation when the configuration supports it.
+            Set False to run independent sessions with the engine's random
+            stream. Default is True.
 
         Returns
         -------
         list[CATResult]
-            List of CAT results for all simulations.
+            Results for all simulations, with all replications of the first
+            theta first.
         """
-        thetas, n_replications, use_rust = _validate_batch_controls(
+        thetas, n_replications, use_rust, vectorized = _validate_batch_controls(
             true_thetas,
             n_replications,
             use_rust,
+            vectorized,
         )
 
-        can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
+        if should_use_rust(use_rust) and self._can_use_rust_simulation():
+            native_results = self._run_batch_rust(thetas, n_replications)
+            if native_results is not None:
+                return native_results
 
-        if can_use_rust:
-            return self._run_batch_rust(thetas, n_replications)
+        if vectorized and supports_lockstep(self):
+            lockstep_results = simulate_lockstep(self, thetas, n_replications)
+            if lockstep_results is not None:
+                return lockstep_results
 
-        results = []
-        for theta in thetas:
-            for _ in range(n_replications):
-                result = self.run_simulation(float(theta))
-                results.append(result)
-
-        return results
+        return [
+            self.run_simulation(float(theta))
+            for theta in thetas
+            for _ in range(n_replications)
+        ]
 
     def _can_use_rust_simulation(self) -> bool:
         """Check if Rust simulation can be used."""
@@ -564,8 +652,14 @@ class CATEngine:
         quad = GaussHermiteQuadrature(self.n_quadpts, n_dimensions=1)
         return quad.nodes.ravel(), quad.weights.ravel()
 
-    def _native_stopping_parameters(self) -> tuple[float, int, int] | None:
-        """Translate supported stopping rules into native controls."""
+    def _native_stopping_parameters(
+        self, *, require_standard_error: bool = True
+    ) -> tuple[float, int, int] | None:
+        """Translate supported stopping rules into native controls.
+
+        Without ``require_standard_error``, maximum-length rules alone are
+        accepted too and the returned SE threshold is ``-inf``.
+        """
         if type(self._stopping) is CombinedStop:
             if not uses_native_defaults(self._stopping, CombinedStop):
                 return None
@@ -608,7 +702,11 @@ class CATEngine:
             else:
                 return None
 
-        if se_threshold is None or min_items < 1 or min_items > max_items:
+        if se_threshold is None:
+            if require_standard_error:
+                return None
+            se_threshold = -np.inf
+        if min_items < 1 or min_items > max_items:
             return None
         return se_threshold, max_items, min_items
 
@@ -629,8 +727,8 @@ class CATEngine:
         self,
         true_thetas: NDArray[np.float64],
         n_replications: int,
-    ) -> list[CATResult]:
-        """Run batch simulation using Rust backend."""
+    ) -> list[CATResult] | None:
+        """Run batch simulation using Rust backend, or None if it is unavailable."""
         params = self.model.parameters
         disc = params["discrimination"].astype(np.float64)
         diff = params["difficulty"].astype(np.float64)
@@ -652,12 +750,7 @@ class CATEngine:
         )
 
         if result is None:
-            results = []
-            for theta in true_thetas:
-                for _ in range(n_replications):
-                    res = self.run_simulation(float(theta))
-                    results.append(res)
-            return results
+            return None
 
         theta_est, se_est, n_items, _, item_paths, response_paths = result
 
@@ -704,6 +797,7 @@ class CATEngine:
         true_thetas: NDArray[np.float64] | list[float],
         n_replications: int = 100,
         use_rust: bool = True,
+        vectorized: bool = True,
     ) -> tuple[
         NDArray[np.float64],
         NDArray[np.float64],
@@ -721,16 +815,22 @@ class CATEngine:
         use_rust : bool, optional
             Use Rust backend for parallel computation if available. Default is True.
             Available for matching 1PL/2PL, EAP, MFI, and SE-stop configurations.
+        vectorized : bool, optional
+            Use lock-step simulation when the configuration supports it, as
+            described in :meth:`run_batch_simulation`. A seeded engine then
+            draws the same responses as ``run_batch_simulation`` with the same
+            arguments. Default is True.
 
         Returns
         -------
         tuple[NDArray, NDArray, NDArray, NDArray]
             Tuple of (thetas, biases, MSEs, avg_items).
         """
-        thetas, n_replications, use_rust = _validate_batch_controls(
+        thetas, n_replications, use_rust, vectorized = _validate_batch_controls(
             true_thetas,
             n_replications,
             use_rust,
+            vectorized,
         )
 
         can_use_rust = should_use_rust(use_rust) and self._can_use_rust_simulation()
@@ -758,6 +858,11 @@ class CATEngine:
 
             if result is not None:
                 return result
+
+        if vectorized and supports_lockstep(self):
+            moments = lockstep_error_moments(self, thetas, n_replications)
+            if moments is not None:
+                return (thetas, *moments)
 
         biases = np.zeros(len(thetas))
         mses = np.zeros(len(thetas))

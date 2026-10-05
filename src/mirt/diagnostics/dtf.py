@@ -7,6 +7,8 @@ ability distribution so their scale remains interpretable as score points.
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -16,10 +18,15 @@ from scipy import integrate, stats
 
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import (
+    BootstrapSummary,
     create_paired_resample_chunks,
     create_theta_grid,
     fit_group_models,
+    link_focal_to_reference,
+    resolve_anchor_items,
     split_groups,
+    summarize_bootstrap,
+    validate_two_group_inputs,
 )
 from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
 
@@ -40,15 +47,6 @@ _BOOTSTRAP_EXCEPTIONS = (
 )
 
 
-@dataclass(frozen=True)
-class _BootstrapSummary:
-    standard_error: float
-    p_value: float
-    confidence_interval: tuple[float, float]
-    n_successful: int
-    n_failed: int
-
-
 @dataclass(slots=True)
 class _DTFBootstrapTask:
     ref_data: NDArray[np.int_]
@@ -60,6 +58,7 @@ class _DTFBootstrapTask:
     fit_kwargs: dict[str, Any]
     rng_state: dict[str, Any]
     n_replicates: int
+    anchor_items: list[int] | None = None
 
 
 def compute_dtf(
@@ -76,6 +75,7 @@ def compute_dtf(
     confidence_level: float = 0.95,
     random_state: int | np.random.Generator | None = 42,
     n_jobs: int = 1,
+    anchor_items: Sequence[int] | None = None,
     **fit_kwargs: Any,
 ) -> dict[str, Any]:
     """Compute Differential Test Functioning statistics.
@@ -84,6 +84,16 @@ def compute_dtf(
     theta grid.  The reported statistic is an average score difference over
     the selected ability weighting, rather than an unnormalized geometric
     area that changes merely because ``theta_range`` is widened.
+
+    Each group is calibrated separately on its own standard-normal ability
+    scale. With ``anchor_items`` the focal calibration is linked onto the
+    reference scale by Stocking-Lord over those items, in the observed fit
+    and in every bootstrap replicate, so a difference in group ability
+    (impact) is not counted as DTF. Without anchors the curves are compared
+    unlinked, impact is confounded with DTF, and a warning is issued.
+    Linking on every item is not offered: the Stocking-Lord criterion
+    matches the test characteristic curves that DTF compares, so it would
+    drive DTF towards zero by construction.
 
     Parameters
     ----------
@@ -119,6 +129,9 @@ def compute_dtf(
     n_jobs
         Number of worker processes for bootstrap refits. Use ``-1`` for all
         available CPU cores. Default 1.
+    anchor_items
+        At least two items assumed free of DIF that define the link between
+        the group scales.
     **fit_kwargs
         Additional arguments passed to ``fit_mirt``.
 
@@ -127,6 +140,9 @@ def compute_dtf(
     dict
         Statistic, uncertainty estimates, expected-score curves, pointwise
         differences, group metadata, grid, and bootstrap diagnostics.
+        ``linking_constants`` holds ``(A, B)`` with
+        ``theta_reference = A * theta_focal + B``, or None when unlinked;
+        ``expected_score_focal`` is on the reference scale when linked.
 
     References
     ----------
@@ -145,6 +161,7 @@ def compute_dtf(
         confidence_level=confidence_level,
     )
     n_jobs = _validate_n_jobs(n_jobs)
+    anchors = resolve_anchor_items(anchor_items, values.shape[1])
 
     ref_data, focal_data, ref_mask, focal_mask, ref_group, selected_focal = (
         split_groups(values, labels, focal_group=focal_group)
@@ -153,12 +170,23 @@ def compute_dtf(
     integration_weights, weighting_name = _create_integration_weights(
         theta_grid, weighting
     )
+    if anchors is None:
+        warnings.warn(
+            "compute_dtf compares separately standardized group calibrations "
+            "without linking, so group impact is confounded with DTF; pass "
+            "anchor_items to link the groups",
+            UserWarning,
+            stacklevel=2,
+        )
     ref_result, focal_result = fit_group_models(
         ref_data, focal_data, model=model, **fit_kwargs
     )
+    focal_model, linking_constants = _place_focal(
+        ref_result.model, focal_result.model, anchors
+    )
 
     expected_ref = _compute_expected_score(ref_result.model, theta_grid)
-    expected_focal = _compute_expected_score(focal_result.model, theta_grid)
+    expected_focal = _compute_expected_score(focal_model, theta_grid)
     difference = expected_ref - expected_focal
     statistic = _aggregate_dtf(difference, theta_grid, method, integration_weights)
 
@@ -177,6 +205,7 @@ def compute_dtf(
         random_state=random_state,
         fit_kwargs=fit_kwargs,
         n_jobs=n_jobs,
+        anchor_items=anchors,
     )
 
     return {
@@ -201,7 +230,21 @@ def compute_dtf(
         "n_bootstrap_successful": bootstrap.n_successful,
         "n_bootstrap_failed": bootstrap.n_failed,
         "n_jobs": n_jobs,
+        "anchor_items": anchors,
+        "linking_constants": linking_constants,
     }
+
+
+def _place_focal(
+    reference_model: BaseItemModel,
+    focal_model: BaseItemModel,
+    anchors: list[int] | None,
+) -> tuple[BaseItemModel, tuple[float, float] | None]:
+    """Link the focal model over the anchors, or keep it unlinked."""
+    if anchors is None:
+        return focal_model, None
+    linked, A, B = link_focal_to_reference(reference_model, focal_model, anchors)
+    return linked, (A, B)
 
 
 def _validate_dtf_inputs(
@@ -231,26 +274,7 @@ def _validate_dtf_inputs(
         raise ValueError("n_bootstrap must be a nonnegative integer")
     if not np.isfinite(confidence_level) or not 0.0 < confidence_level < 1.0:
         raise ValueError("confidence_level must be finite and in (0, 1)")
-
-    limits = np.asarray(theta_range, dtype=np.float64)
-    if limits.shape != (2,) or not np.all(np.isfinite(limits)):
-        raise ValueError("theta_range must contain two finite values")
-    if limits[0] >= limits[1]:
-        raise ValueError("theta_range must be strictly increasing")
-
-    values = np.asarray(data)
-    labels = np.asarray(groups)
-    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
-        raise ValueError("data must be a nonempty two-dimensional response matrix")
-    if labels.ndim != 1:
-        raise ValueError("groups must be one-dimensional")
-    if labels.shape[0] != values.shape[0]:
-        raise ValueError("groups length must match the number of response-matrix rows")
-    if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
-        raise ValueError("groups must not contain missing or non-finite labels")
-    if labels.dtype.kind == "O" and any(label is None for label in labels):
-        raise ValueError("groups must not contain missing labels")
-    return values, labels, (float(limits[0]), float(limits[1]))
+    return validate_two_group_inputs(data, groups, theta_range)
 
 
 def _create_integration_weights(
@@ -356,9 +380,10 @@ def _bootstrap_dtf_statistics(
     random_state: int | np.random.Generator | None,
     fit_kwargs: dict[str, Any],
     n_jobs: int = 1,
-) -> _BootstrapSummary:
+    anchor_items: list[int] | None = None,
+) -> BootstrapSummary:
     if n_bootstrap == 0:
-        return _BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
+        return BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
 
     rng = np.random.default_rng(random_state)
     ref_indices = np.flatnonzero(groups == ref_group)
@@ -377,6 +402,7 @@ def _bootstrap_dtf_statistics(
             fit_kwargs=fit_kwargs,
             rng_state=rng_state,
             n_replicates=chunk_size,
+            anchor_items=anchor_items,
         )
         for rng_state, chunk_size in create_paired_resample_chunks(
             rng=rng,
@@ -387,36 +413,11 @@ def _bootstrap_dtf_statistics(
         )
     ]
     task_results = _run_bootstrap_tasks(_fit_dtf_bootstrap_task, tasks, n_jobs)
-    bootstrap_statistics = [
-        statistic
-        for task_result in task_results
-        for statistic in task_result
-        if np.isfinite(statistic)
-    ]
-
-    n_successful = len(bootstrap_statistics)
-    n_failed = n_bootstrap - n_successful
-    if n_successful < 2:
-        return _BootstrapSummary(
-            np.nan, np.nan, (np.nan, np.nan), n_successful, n_failed
-        )
-
-    estimates = np.asarray(bootstrap_statistics, dtype=np.float64)
-    standard_error = float(np.std(estimates, ddof=1))
-    if standard_error <= PROB_EPSILON:
-        p_value = 1.0 if abs(observed_dtf) <= PROB_EPSILON else 0.0
-    else:
-        z_value = abs(observed_dtf) / standard_error
-        p_value = float(2.0 * stats.norm.sf(z_value))
-
-    tail_probability = (1.0 - confidence_level) / 2.0
-    lower, upper = np.quantile(estimates, [tail_probability, 1.0 - tail_probability])
-    return _BootstrapSummary(
-        standard_error,
-        p_value,
-        (float(lower), float(upper)),
-        n_successful,
-        n_failed,
+    return summarize_bootstrap(
+        [statistic for task_result in task_results for statistic in task_result],
+        observed=observed_dtf,
+        n_requested=n_bootstrap,
+        confidence_level=confidence_level,
     )
 
 
@@ -439,10 +440,11 @@ def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[float]:
                 model=task.model,
                 **task.fit_kwargs,
             )
-            expected_ref = _compute_expected_score(ref_result.model, task.theta_grid)
-            expected_focal = _compute_expected_score(
-                focal_result.model, task.theta_grid
+            focal_model, _ = _place_focal(
+                ref_result.model, focal_result.model, task.anchor_items
             )
+            expected_ref = _compute_expected_score(ref_result.model, task.theta_grid)
+            expected_focal = _compute_expected_score(focal_model, task.theta_grid)
             statistic = _aggregate_dtf(
                 expected_ref - expected_focal,
                 task.theta_grid,
@@ -453,75 +455,6 @@ def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[float]:
             statistic = np.nan
         statistics.append(statistic if np.isfinite(statistic) else np.nan)
     return statistics
-
-
-def _bootstrap_dtf_se(
-    data: NDArray[np.int_],
-    groups: NDArray[Any],
-    model: str,
-    method: str,
-    theta_range: tuple[float, float],
-    n_quadpts: int,
-    n_bootstrap: int = 100,
-    *,
-    observed_dtf: float | None = None,
-    weighting: DTFWeighting = "normal",
-    confidence_level: float = 0.95,
-    random_state: int | np.random.Generator | None = 42,
-    focal_group: Any | None = None,
-    n_jobs: int = 1,
-    **fit_kwargs: Any,
-) -> tuple[float, float]:
-    """Return bootstrap standard error and approximate p-value.
-
-    This compatibility wrapper retains the historical private helper's
-    two-value return while using the validated bootstrap implementation.
-    """
-    values, labels, theta_limits = _validate_dtf_inputs(
-        data=data,
-        groups=groups,
-        model=model,
-        method=method,
-        theta_range=theta_range,
-        n_quadpts=n_quadpts,
-        n_bootstrap=n_bootstrap,
-        confidence_level=confidence_level,
-    )
-    n_jobs = _validate_n_jobs(n_jobs)
-    ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
-        values, labels, focal_group=focal_group
-    )
-    theta_grid, _ = create_theta_grid(theta_limits, n_quadpts)
-    integration_weights, _ = _create_integration_weights(theta_grid, weighting)
-
-    if observed_dtf is None:
-        ref_result, focal_result = fit_group_models(
-            ref_data, focal_data, model=model, **fit_kwargs
-        )
-        difference = _compute_expected_score(
-            ref_result.model, theta_grid
-        ) - _compute_expected_score(focal_result.model, theta_grid)
-        observed_dtf = _aggregate_dtf(
-            difference, theta_grid, method, integration_weights
-        )
-
-    summary = _bootstrap_dtf_statistics(
-        data=values,
-        groups=labels,
-        model=model,
-        method=method,
-        theta_grid=theta_grid,
-        integration_weights=integration_weights,
-        observed_dtf=observed_dtf,
-        ref_group=ref_group,
-        focal_group=selected_focal,
-        n_bootstrap=n_bootstrap,
-        confidence_level=confidence_level,
-        random_state=random_state,
-        fit_kwargs=fit_kwargs,
-        n_jobs=n_jobs,
-    )
-    return summary.standard_error, summary.p_value
 
 
 def plot_dtf(

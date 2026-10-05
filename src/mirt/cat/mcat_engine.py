@@ -19,15 +19,13 @@ from mirt.cat._engine_common import (
     reset_session_state,
     run_simulation_loop,
     score_administered_responses,
+    select_constrained_item,
     simulate_error_moments,
     validate_replications,
     validate_simulation_values,
 )
 from mirt.cat.content import ContentConstraint
-from mirt.cat.exposure import (
-    ExposureControl,
-    ProgressiveRestricted,
-)
+from mirt.cat.exposure import ExposureControl
 from mirt.cat.mcat_selection import (
     MCATSelectionStrategy,
     create_mcat_selection_strategy,
@@ -287,28 +285,23 @@ class MCATEngine:
 
     def _select_next_item(self) -> int:
         """Internal item selection with constraint handling."""
-        content_eligible = self._content.filter_items(
-            self._available_items, self._items_administered
-        )
-
-        exposure_eligible = self._exposure.filter_items(
-            content_eligible, self.model, self._current_theta
-        )
-
-        if isinstance(self._exposure, ProgressiveRestricted):
-            return self._exposure.select_from_eligible(
-                exposure_eligible,
-                n_administered=len(self._items_administered),
-                max_items=self._selection_horizon,
-            )
-
-        return self._selection.select_item(
-            self.model,
-            self._current_theta,
-            self._current_covariance,
-            exposure_eligible,
-            self._items_administered,
-            self._responses,
+        strategy = self._selection
+        return select_constrained_item(
+            self,
+            criteria=lambda eligible: strategy.get_item_criteria(
+                self.model,
+                self._current_theta,
+                self._current_covariance,
+                eligible,
+            ),
+            select=lambda eligible: strategy.select_item(
+                self.model,
+                self._current_theta,
+                self._current_covariance,
+                eligible,
+                self._items_administered,
+                self._responses,
+            ),
         )
 
     def administer_item(self, response: int) -> MCATState:

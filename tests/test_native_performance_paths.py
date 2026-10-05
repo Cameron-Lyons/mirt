@@ -228,7 +228,7 @@ def test_native_polytomous_mstep_matches_scipy_objective(factory):
     )
     for j in range(2):
         optimized = estimator._optimize_item_params(
-            reference, j, responses, posterior, points, posterior.sum(axis=0)
+            reference, j, responses, posterior, points
         )
         estimator._set_item_params(reference, j, optimized)
         counts = np.column_stack(
@@ -374,7 +374,7 @@ def test_analytic_em_curvature_matches_finite_difference_objective(factory):
     )
     posterior = rng.random((250, 15))
     posterior /= posterior.sum(axis=1, keepdims=True)
-    estimator = EMEstimator(se_step_size=1e-3)
+    estimator = EMEstimator(se_step_size=1e-3, se_method="complete_data")
     estimator._quadrature = GaussHermiteQuadrature(n_points=15)
     before = model.parameters
     analytic = item_standard_errors(

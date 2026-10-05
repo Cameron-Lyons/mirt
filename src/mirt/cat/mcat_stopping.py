@@ -9,6 +9,16 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.cat._stopping_common import (
+    ChangeTracker,
+    combination_operator,
+    finite_real,
+    integer,
+    positive_real,
+    stable_count,
+    triggered_rule,
+)
+
 if TYPE_CHECKING:
     from mirt.cat.results import MCATState
 
@@ -48,6 +58,9 @@ class MCATStoppingRule(ABC):
         """
         pass
 
+    def reset(self) -> None:
+        """Reset state before the rule is reused for another session."""
+
 
 class CovarianceTraceStop(MCATStoppingRule):
     """Stop when trace of covariance matrix falls below a threshold.
@@ -65,17 +78,10 @@ class CovarianceTraceStop(MCATStoppingRule):
     """
 
     def __init__(self, threshold: float = 0.5):
-        if threshold <= 0:
-            raise ValueError("Trace threshold must be positive")
-        self.threshold = threshold
-        self._triggered = False
+        self.threshold = positive_real(threshold, "Trace threshold")
 
     def should_stop(self, state: MCATState) -> bool:
-        trace = np.trace(state.covariance)
-        if trace <= self.threshold:
-            self._triggered = True
-            return True
-        return False
+        return bool(np.trace(state.covariance) <= self.threshold)
 
     def get_reason(self) -> str:
         return f"Covariance trace threshold reached (trace <= {self.threshold})"
@@ -96,17 +102,10 @@ class CovarianceDeterminantStop(MCATStoppingRule):
     """
 
     def __init__(self, threshold: float = 0.01):
-        if threshold <= 0:
-            raise ValueError("Determinant threshold must be positive")
-        self.threshold = threshold
-        self._triggered = False
+        self.threshold = positive_real(threshold, "Determinant threshold")
 
     def should_stop(self, state: MCATState) -> bool:
-        det = np.linalg.det(state.covariance)
-        if det <= self.threshold:
-            self._triggered = True
-            return True
-        return False
+        return bool(np.linalg.det(state.covariance) <= self.threshold)
 
     def get_reason(self) -> str:
         return f"Covariance determinant threshold reached (det <= {self.threshold})"
@@ -126,17 +125,10 @@ class MaxSEStop(MCATStoppingRule):
     """
 
     def __init__(self, threshold: float = 0.3):
-        if threshold <= 0:
-            raise ValueError("SE threshold must be positive")
-        self.threshold = threshold
-        self._triggered = False
+        self.threshold = positive_real(threshold, "SE threshold")
 
     def should_stop(self, state: MCATState) -> bool:
-        max_se = np.max(state.standard_error)
-        if max_se <= self.threshold:
-            self._triggered = True
-            return True
-        return False
+        return bool(np.max(state.standard_error) <= self.threshold)
 
     def get_reason(self) -> str:
         return f"All SE thresholds reached (max SE <= {self.threshold})"
@@ -155,17 +147,10 @@ class AvgSEStop(MCATStoppingRule):
     """
 
     def __init__(self, threshold: float = 0.3):
-        if threshold <= 0:
-            raise ValueError("Average SE threshold must be positive")
-        self.threshold = threshold
-        self._triggered = False
+        self.threshold = positive_real(threshold, "Average SE threshold")
 
     def should_stop(self, state: MCATState) -> bool:
-        avg_se = np.mean(state.standard_error)
-        if avg_se <= self.threshold:
-            self._triggered = True
-            return True
-        return False
+        return bool(np.mean(state.standard_error) <= self.threshold)
 
     def get_reason(self) -> str:
         return f"Average SE threshold reached (mean SE <= {self.threshold})"
@@ -183,16 +168,10 @@ class MaxItemsMCATStop(MCATStoppingRule):
     """
 
     def __init__(self, max_items: int):
-        if max_items <= 0:
-            raise ValueError("max_items must be positive")
-        self.max_items = max_items
-        self._triggered = False
+        self.max_items = integer(max_items, "max_items", minimum=1)
 
     def should_stop(self, state: MCATState) -> bool:
-        if state.n_items >= self.max_items:
-            self._triggered = True
-            return True
-        return False
+        return state.n_items >= self.max_items
 
     def get_reason(self) -> str:
         return f"Maximum items reached ({self.max_items})"
@@ -213,39 +192,16 @@ class ThetaChangeMCATStop(MCATStoppingRule):
     """
 
     def __init__(self, threshold: float = 0.01, n_stable: int = 3):
-        if threshold <= 0:
-            raise ValueError("threshold must be positive")
-        if n_stable < 1:
-            raise ValueError("n_stable must be at least 1")
-        self.threshold = threshold
-        self.n_stable = n_stable
-        self._stable_count = 0
-        self._last_theta: np.ndarray | None = None
-        self._triggered = False
+        self.threshold: float = positive_real(threshold, "threshold")
+        self.n_stable: int = stable_count(n_stable)
+        self._changes = ChangeTracker()
 
     def should_stop(self, state: MCATState) -> bool:
-        if self._last_theta is None:
-            self._last_theta = state.theta.copy()
-            return False
-
-        max_change = np.max(np.abs(state.theta - self._last_theta))
-        self._last_theta = state.theta.copy()
-
-        if max_change <= self.threshold:
-            self._stable_count += 1
-        else:
-            self._stable_count = 0
-
-        if self._stable_count >= self.n_stable:
-            self._triggered = True
-            return True
-        return False
+        return self._changes.update(state.theta, self.threshold) >= self.n_stable
 
     def reset(self) -> None:
         """Reset the rule for a new examinee."""
-        self._stable_count = 0
-        self._last_theta = None
-        self._triggered = False
+        self._changes.reset()
 
     def get_reason(self) -> str:
         return (
@@ -286,16 +242,14 @@ class CompositeClassificationStop(MCATStoppingRule):
             raise ValueError("weights must be a one-dimensional array of finite values")
         if not np.any(values != 0.0):
             raise ValueError("weights must contain at least one nonzero value")
-        if isinstance(cut_score, bool) or not isinstance(cut_score, Real):
-            raise ValueError("cut_score must be finite")
-        cut_value = float(cut_score)
-        if not np.isfinite(cut_value):
-            raise ValueError("cut_score must be finite")
-        if isinstance(confidence, bool) or not isinstance(confidence, Real):
+        cut_value = finite_real(cut_score, "cut_score")
+        if (
+            isinstance(confidence, (bool, np.bool_))
+            or not isinstance(confidence, Real)
+            or not 0.5 < float(confidence) < 1.0
+        ):
             raise ValueError("confidence must be strictly between 0.5 and 1")
         confidence_value = float(confidence)
-        if not np.isfinite(confidence_value) or not 0.5 < confidence_value < 1.0:
-            raise ValueError("confidence must be strictly between 0.5 and 1")
 
         from scipy.special import ndtri
 
@@ -303,7 +257,6 @@ class CompositeClassificationStop(MCATStoppingRule):
         self.cut_score: float = cut_value
         self.confidence: float = confidence_value
         self._critical_z: float = float(ndtri(confidence_value))
-        self._triggered: bool = False
         self._classification: Literal["above", "below"] | None = None
 
     @property
@@ -356,7 +309,6 @@ class CompositeClassificationStop(MCATStoppingRule):
             else distance >= self._critical_z * standard_error
         )
         if confident:
-            self._triggered = True
             self._classification = "above" if composite > self.cut_score else "below"
             return True
         return False
@@ -370,7 +322,6 @@ class CompositeClassificationStop(MCATStoppingRule):
 
     def reset(self) -> None:
         """Clear classification details from the prior session."""
-        self._triggered = False
         self._classification = None
 
 
@@ -383,8 +334,9 @@ class CombinedMCATStop(MCATStoppingRule):
         List of stopping rules to combine.
     operator : {"and", "or"}
         Logical operator for combining rules. Default is "or".
-        - "or": Stop when ANY rule is satisfied
-        - "and": Stop when ALL rules are satisfied
+        - "or": Stop when ANY rule is satisfied; later rules are not
+          evaluated once one stops.
+        - "and": Stop when ALL rules are satisfied; every rule is evaluated.
     min_items : int
         Minimum items before stopping rules are evaluated. Default is 0.
     """
@@ -397,31 +349,17 @@ class CombinedMCATStop(MCATStoppingRule):
     ):
         if not rules:
             raise ValueError("At least one rule is required")
-        if operator not in ("and", "or"):
-            raise ValueError("operator must be 'and' or 'or'")
-
-        self.rules = rules
-        self.operator = operator
-        self.min_items = min_items
+        self.operator = combination_operator(operator)
+        self.rules = list(rules)
+        self.min_items = integer(min_items, "min_items", minimum=0)
         self._triggered_rule: MCATStoppingRule | None = None
 
     def should_stop(self, state: MCATState) -> bool:
+        self._triggered_rule = None
         if state.n_items < self.min_items:
             return False
-
-        results = [rule.should_stop(state) for rule in self.rules]
-
-        if self.operator == "or":
-            for rule, result in zip(self.rules, results, strict=True):
-                if result:
-                    self._triggered_rule = rule
-                    return True
-            return False
-        else:
-            if all(results):
-                self._triggered_rule = self.rules[0]
-                return True
-            return False
+        self._triggered_rule = triggered_rule(self.rules, self.operator, state)
+        return self._triggered_rule is not None
 
     def get_reason(self) -> str:
         if self._triggered_rule is not None:
@@ -430,10 +368,9 @@ class CombinedMCATStop(MCATStoppingRule):
 
     def reset(self) -> None:
         """Reset all rules for a new examinee."""
-        for rule in self.rules:
-            if hasattr(rule, "reset"):
-                rule.reset()
         self._triggered_rule = None
+        for rule in self.rules:
+            rule.reset()
 
 
 def create_mcat_stopping_rule(

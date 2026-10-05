@@ -7,14 +7,12 @@ information, and structural-zero diagnostics on the same likelihood.
 
 from __future__ import annotations
 
-from typing import Self
-
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
 from mirt.exceptions import MirtValidationError
-from mirt.models.base import DichotomousItemModel
+from mirt.models.base import DichotomousItemModel, _AtomicParameterState
 
 _NORMAL_NODES, _NORMAL_WEIGHTS = np.polynomial.hermite.hermgauss(41)
 _NORMAL_NODES = np.sqrt(2.0) * _NORMAL_NODES
@@ -27,7 +25,7 @@ def _safe_sigmoid(values: NDArray[np.float64]) -> NDArray[np.float64]:
         return sigmoid(values)
 
 
-class _ZeroResponseModel(DichotomousItemModel):
+class _ZeroResponseModel(_AtomicParameterState, DichotomousItemModel):
     """Shared likelihood and diagnostics for excess-zero response models."""
 
     @property
@@ -74,77 +72,6 @@ class _ZeroResponseModel(DichotomousItemModel):
                     expected="[0, 1)",
                 )
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
-        """Set model parameters atomically after validating their domains."""
-        candidate = {name: values.copy() for name, values in self._parameters.items()}
-
-        for name, value in params.items():
-            if name not in candidate:
-                valid_params = ", ".join(candidate)
-                raise MirtValidationError(
-                    f"Unknown parameter: {name}. Valid parameters: {valid_params}",
-                    parameter=name,
-                    expected=valid_params,
-                )
-
-            value_arr = np.asarray(value, dtype=np.float64)
-            expected_shape = candidate[name].shape
-            if value_arr.shape != expected_shape:
-                raise MirtValidationError(
-                    f"Shape mismatch for {name}: expected {expected_shape}, "
-                    f"got {value_arr.shape}",
-                    parameter=name,
-                    value=value_arr.shape,
-                    expected=str(expected_shape),
-                )
-            candidate[name] = value_arr.copy()
-
-        self._validate_parameter_state(candidate)
-        self._parameters = candidate
-        return self
-
-    def set_item_parameter(
-        self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        """Set one item parameter while preserving model validity."""
-        item_idx = self._validate_item_idx(item_idx)
-        if param_name not in self._parameters:
-            valid_params = ", ".join(self._parameters)
-            raise MirtValidationError(
-                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}",
-                parameter=param_name,
-                expected=valid_params,
-            )
-
-        value_arr = np.asarray(value, dtype=np.float64)
-        if value_arr.ndim != 0:
-            raise MirtValidationError(
-                f"{param_name} must be a scalar for one item",
-                parameter=param_name,
-                value=value_arr.shape,
-                expected="scalar",
-            )
-
-        updated = self._parameters[param_name].copy()
-        updated[item_idx] = float(value_arr)
-        self.set_parameters(**{param_name: updated})
-
-    def _validate_item_idx(self, item_idx: int) -> int:
-        if isinstance(item_idx, bool) or not isinstance(item_idx, (int, np.integer)):
-            raise MirtValidationError(
-                "item_idx must be an integer",
-                parameter="item_idx",
-                value=item_idx,
-                expected="integer",
-            )
-        item_idx = int(item_idx)
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return item_idx
-
     def _prepare_evaluation(
         self,
         theta: NDArray[np.float64],
@@ -166,7 +93,7 @@ class _ZeroResponseModel(DichotomousItemModel):
                 expected="finite values",
             )
         if item_idx is not None:
-            item_idx = self._validate_item_idx(item_idx)
+            item_idx = self._validate_item_index(item_idx)
         self._validate_parameter_state(self._parameters)
         return theta_2d[:, 0], item_idx
 

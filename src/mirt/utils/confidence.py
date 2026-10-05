@@ -11,6 +11,12 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtDataError, MirtEstimationError, MirtValidationError
+from mirt.utils._validation import (
+    as_finite_vector,
+    validate_alpha,
+    validate_finite_scalar,
+    validate_positive_scalar,
+)
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -69,9 +75,9 @@ def PLCI(
     _validate_interval_model(model)
     parameter = _validate_parameter_name(param_name)
     item_index = _validate_item_index(param_idx, model.n_items)
-    alpha_value = _validate_alpha(alpha)
+    alpha_value = validate_alpha(alpha)
     iterations = _validate_positive_integer(max_iter, "max_iter")
-    tolerance = _validate_positive_scalar(tol, "tol")
+    tolerance = validate_positive_scalar(tol, "tol")
     quadrature_points = _validate_positive_integer(n_quadpts, "n_quadpts")
     data = _validate_response_matrix(responses, model.n_items)
     if not np.any(data[:, item_index] >= 0):
@@ -239,11 +245,11 @@ def score_CI(
     from scipy import stats
 
     _validate_interval_model(model)
-    theta_value = _validate_finite_scalar(theta, "theta")
-    alpha_value = _validate_alpha(alpha)
+    theta_value = validate_finite_scalar(theta, "theta")
+    alpha_value = validate_alpha(alpha)
     ci_method = _validate_score_method(method)
     iterations = _validate_positive_integer(max_iter, "max_iter")
-    tolerance = _validate_positive_scalar(tol, "tol")
+    tolerance = validate_positive_scalar(tol, "tol")
 
     if ci_method == "wald":
         information = np.asarray(
@@ -347,7 +353,7 @@ def delta_method(
     transformed, standard_error : tuple[float, float]
         Transformed estimate and its delta-method standard error.
     """
-    estimate_values = _as_finite_vector(estimates, "estimates")
+    estimate_values = as_finite_vector(estimates, "estimates")
     correlation_factor, parameter_errors = _validate_covariance(
         vcov, estimate_values.size
     )
@@ -356,7 +362,7 @@ def delta_method(
             "transform_func must be callable",
             parameter="transform_func",
         )
-    step = _validate_positive_scalar(eps, "eps")
+    step = validate_positive_scalar(eps, "eps")
     transformed = _evaluate_transform(transform_func, estimate_values.copy())
 
     if gradient_func is None:
@@ -620,18 +626,6 @@ def _validate_item_index(param_idx: int, n_items: int) -> int:
     return int(param_idx)
 
 
-def _validate_alpha(alpha: float) -> float:
-    value = _validate_finite_scalar(alpha, "alpha")
-    if not 0.0 < value < 1.0:
-        raise MirtValidationError(
-            "alpha must be between 0 and 1",
-            parameter="alpha",
-            value=alpha,
-            expected="0 < alpha < 1",
-        )
-    return value
-
-
 def _validate_positive_integer(value: int, parameter: str) -> int:
     if (
         not isinstance(value, (int, np.integer))
@@ -645,58 +639,6 @@ def _validate_positive_integer(value: int, parameter: str) -> int:
             expected=">= 1",
         )
     return int(value)
-
-
-def _validate_positive_scalar(value: float, parameter: str) -> float:
-    result = _validate_finite_scalar(value, parameter)
-    if result <= 0.0:
-        raise MirtValidationError(
-            f"{parameter} must be positive",
-            parameter=parameter,
-            value=value,
-            expected="> 0",
-        )
-    return result
-
-
-def _validate_finite_scalar(value: float, parameter: str) -> float:
-    if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        )
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        ) from exc
-    if not np.isfinite(result):
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        )
-    return result
-
-
-def _as_finite_vector(values: ArrayLike, parameter: str) -> NDArray[np.float64]:
-    try:
-        result = np.asarray(values, dtype=np.float64).reshape(-1)
-    except (TypeError, ValueError) as exc:
-        raise MirtValidationError(
-            f"{parameter} must contain numeric values",
-            parameter=parameter,
-        ) from exc
-    if result.size == 0 or not np.all(np.isfinite(result)):
-        raise MirtValidationError(
-            f"{parameter} must be nonempty and finite",
-            parameter=parameter,
-        )
-    return result
 
 
 def _validate_covariance(

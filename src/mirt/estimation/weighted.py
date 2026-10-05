@@ -22,6 +22,12 @@ from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._patterns import supports_pattern_compression
 from mirt.estimation._posterior import normalize_log_posterior
+from mirt.estimation.base import (
+    StartValues,
+    _apply_starting_values,
+    _free_shared_parameters,
+    _validate_start,
+)
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 
@@ -88,6 +94,11 @@ class WeightedEMEstimator(EMEstimator):
         Whether to print iteration progress.
     normalize_weights : bool
         Whether to normalize weights to sum to sample size.
+    compute_standard_errors : bool, default=True
+        Whether to compute item parameter standard errors after fitting.
+    prob_epsilon, item_optim_maxiter, item_optim_ftol, se_step_size
+        Item-optimizer and standard-error controls, as for
+        :class:`~mirt.estimation.em.EMEstimator`.
 
     Notes
     -----
@@ -97,7 +108,12 @@ class WeightedEMEstimator(EMEstimator):
     where w_i is the weight for person i and L_i is their marginal likelihood.
 
     Standard errors use itemwise complete-data curvature with survey-weighted
-    posterior counts. They do not account for clustering or stratification.
+    posterior counts (``FitResult.se_method="complete_data"``, without a
+    parameter covariance). They do not account for clustering or
+    stratification. The other options of
+    :class:`~mirt.estimation.em.EMEstimator` (item priors, equality
+    constraints, latent densities, acceleration, ``n_jobs`` and
+    ``use_rust``) are not available for weighted fits.
     """
 
     def __init__(
@@ -107,8 +123,24 @@ class WeightedEMEstimator(EMEstimator):
         tol: float = 1e-4,
         verbose: bool = False,
         normalize_weights: bool = True,
+        *,
+        compute_standard_errors: bool = True,
+        prob_epsilon: float = 1e-10,
+        item_optim_maxiter: int = 50,
+        item_optim_ftol: float = 1e-6,
+        se_step_size: float = 1e-5,
     ) -> None:
-        super().__init__(n_quadpts, max_iter, tol, verbose)
+        super().__init__(
+            n_quadpts,
+            max_iter,
+            tol,
+            verbose,
+            prob_epsilon=prob_epsilon,
+            item_optim_maxiter=item_optim_maxiter,
+            item_optim_ftol=item_optim_ftol,
+            se_step_size=se_step_size,
+            compute_standard_errors=compute_standard_errors,
+        )
         if not isinstance(normalize_weights, (bool, np.bool_)):
             raise ValueError("normalize_weights must be a boolean")
         self.normalize_weights = bool(normalize_weights)
@@ -120,13 +152,16 @@ class WeightedEMEstimator(EMEstimator):
         weights: NDArray[np.float64] | None = None,
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
+        *,
+        start: StartValues = "default",
     ) -> FitResult:
         """Fit model with survey weights.
 
         Parameters
         ----------
         model : BaseItemModel
-            IRT model to fit
+            IRT model to fit. Coordinates fixed with
+            ``set_free_parameter_masks`` keep their values.
         responses : ndarray of shape (n_persons, n_items)
             Response matrix
         weights : ndarray of shape (n_persons,), optional
@@ -135,19 +170,22 @@ class WeightedEMEstimator(EMEstimator):
             Prior mean for latent abilities
         prior_cov : ndarray, optional
             Prior covariance for latent abilities
+        start : {"default", "model"} or mapping, default="default"
+            Starting values, as for :meth:`EMEstimator.fit`.
 
         Returns
         -------
         FitResult
             Fitted model with estimates and diagnostics
         """
+        start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
         previous_context = self._fit_context
         with EMFitContext(responses) as context:
             self._fit_context = context
             try:
                 return self._fit_weighted_prepared(
-                    model, responses, weights, prior_mean, prior_cov
+                    model, responses, weights, prior_mean, prior_cov, start
                 )
             finally:
                 self._fit_context = previous_context
@@ -159,6 +197,7 @@ class WeightedEMEstimator(EMEstimator):
         weights: NDArray[np.float64] | None,
         prior_mean: NDArray[np.float64] | None,
         prior_cov: NDArray[np.float64] | None,
+        start: StartValues = "default",
     ) -> FitResult:
         from mirt.results.fit_result import FitResult
 
@@ -184,8 +223,7 @@ class WeightedEMEstimator(EMEstimator):
         if prior_cov is None:
             prior_cov = np.eye(model.n_factors)
 
-        if not model._is_fitted:
-            model._initialize_parameters()
+        _apply_starting_values(model, start)
 
         self._convergence_history = []
         prev_ll = -np.inf
@@ -221,9 +259,15 @@ class WeightedEMEstimator(EMEstimator):
 
         model._is_fitted = True
 
-        standard_errors = self._compute_weighted_standard_errors(
-            model, responses, posterior_weights, weights
+        self._se_details = None
+        standard_errors = (
+            self._compute_weighted_standard_errors(
+                model, responses, posterior_weights, weights
+            )
+            if self.compute_standard_errors
+            else {}
         )
+        se_method, covariance = self._se_details or (None, None)
 
         n_params = model.n_parameters
         effective_n = _effective_sample_size(weights)
@@ -240,6 +284,8 @@ class WeightedEMEstimator(EMEstimator):
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+            se_method=se_method,
+            vcov=covariance,
         )
 
     def _e_step_weighted(
@@ -294,9 +340,11 @@ class WeightedEMEstimator(EMEstimator):
                 posterior_weights, survey_weights
             )
 
+        shared = bool(_free_shared_parameters(model))
+        shared_counts = []
         for item_idx in range(model.n_items):
             params, _ = self._get_item_params_and_bounds(model, item_idx)
-            if not params.size:
+            if not params.size and not (shared and model.is_polytomous):
                 continue
             category_counts = None
             if model.is_polytomous:
@@ -308,10 +356,11 @@ class WeightedEMEstimator(EMEstimator):
                 )
                 item_observed = category_counts.sum(axis=1)
                 item_correct = None
+                shared_counts.append(category_counts)
             else:
                 item_observed = observed[item_idx]
                 item_correct = correct[item_idx]
-            if not np.any(item_observed):
+            if not params.size or not np.any(item_observed):
                 continue
             optimal = self._optimize_item_params(
                 model,
@@ -319,12 +368,20 @@ class WeightedEMEstimator(EMEstimator):
                 responses,
                 posterior_weights,
                 quad_points,
-                item_observed,
                 r_k=item_correct,
                 n_k_valid=item_observed,
                 r_kc=category_counts,
             )
             self._set_item_params(model, item_idx, optimal)
+        if shared:
+            from mirt.estimation._shared_step import binary_category_counts
+
+            self._m_step_shared(
+                model,
+                shared_counts
+                if model.is_polytomous
+                else binary_category_counts(correct, observed),
+            )
 
     def _compute_weighted_standard_errors(
         self,

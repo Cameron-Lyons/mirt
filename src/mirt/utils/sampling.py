@@ -4,6 +4,7 @@ Provides functions for drawing parameter samples from the
 posterior distribution for uncertainty quantification.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -11,9 +12,20 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
+
+# Optional per-item parameters carried by draws, in sampling-layout order.
+_OPTIONAL_PARAMETERS = ("guessing", "slipping", "upper", "asymmetry")
+_PARAMETER_LIMITS = {
+    "guessing": (0.0, 0.5),
+    "slipping": (0.0, 0.5),
+    "upper": (0.5, 1.0),
+    "asymmetry": (PROB_EPSILON, np.inf),
+}
 
 
 @dataclass
@@ -44,21 +56,6 @@ class ParameterSamples:
     asymmetry: NDArray[np.float64] | None = None
 
 
-def _draw_bounded_parameter(
-    rng: np.random.Generator,
-    values: NDArray[np.float64] | None,
-    n_samples: int,
-    lower: float,
-    upper: float,
-    scale: float = 0.02,
-) -> NDArray[np.float64] | None:
-    """Draw independent bounded samples for an optional item parameter."""
-    if values is None:
-        return None
-    draws = rng.normal(values, scale, size=(n_samples, values.size))
-    return np.clip(draws, lower, upper)
-
-
 def _optional_model_parameter(
     model: "BaseItemModel",
     name: str,
@@ -74,8 +71,103 @@ def _optional_model_parameter(
     return parameter
 
 
+def _legacy_draws(
+    rng: np.random.Generator,
+    mean: NDArray[np.float64],
+    optional: dict[str, NDArray[np.float64]],
+    n_samples: int,
+) -> tuple[NDArray[np.float64], dict[str, NDArray[np.float64]]]:
+    """Deprecated draws from fixed scales when no covariance is available."""
+    warnings.warn(
+        "draw_parameters() without a covariance uses a fixed 0.01 * I "
+        "covariance and fixed scales for asymptote and asymmetry parameters, "
+        "which do not reflect estimation uncertainty. Pass a FitResult or an "
+        "explicit vcov; this fallback will raise MirtValidationError in a "
+        "future release.",
+        FutureWarning,
+        stacklevel=3,
+    )
+    core = rng.multivariate_normal(
+        mean, np.eye(mean.size) * 0.01, size=n_samples, check_valid="raise"
+    )
+    draws = {}
+    for name, values in optional.items():
+        scale = 0.05 if name == "asymmetry" else 0.02
+        draws[name] = rng.normal(values, scale, size=(n_samples, values.size))
+    return core, draws
+
+
+def _held_coordinates(
+    covariance: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Separate coordinates held fixed, which have all-NaN rows and columns.
+
+    ``FitResult.vcov`` marks parameters on an optimizer bound, or without an
+    estimable variance, this way. Returns a copy of the square matrix with
+    those rows and columns zeroed, and the mask of held coordinates.
+
+    Raises
+    ------
+    ValueError
+        If any other entry is not finite.
+    """
+    matrix = np.array(covariance, dtype=np.float64)
+    missing = np.isnan(matrix)
+    held = missing.all(axis=1) & missing.all(axis=0)
+    if not np.all(np.isfinite(matrix[np.ix_(~held, ~held)])):
+        raise ValueError(
+            "vcov must contain only finite values, apart from all-NaN rows and "
+            "columns that mark parameters held fixed"
+        )
+    matrix[held, :] = 0.0
+    matrix[:, held] = 0.0
+    return matrix, held
+
+
+def _normal_draws(
+    rng: np.random.Generator,
+    mean: NDArray[np.float64],
+    covariance: NDArray[np.float64],
+    random: NDArray[np.bool_],
+    n_samples: int,
+) -> NDArray[np.float64]:
+    """Draw jointly normal values; coordinates outside ``random`` stay fixed."""
+    draws = np.tile(mean, (n_samples, 1))
+    if not np.any(random):
+        return draws
+    block = covariance[np.ix_(random, random)]
+    block = (block + block.T) / 2
+    min_eig = np.min(np.linalg.eigvalsh(block))
+    if min_eig < REGULARIZATION_EPSILON:
+        block = block + np.eye(block.shape[0]) * (REGULARIZATION_EPSILON - min_eig)
+    draws[:, random] = rng.multivariate_normal(
+        mean[random], block, size=n_samples, check_valid="raise"
+    )
+    return draws
+
+
+def _result_draws(
+    rng: np.random.Generator,
+    result: "FitResult",
+    names: list[str],
+    mean: NDArray[np.float64],
+    n_samples: int,
+) -> NDArray[np.float64]:
+    """Draw ``names`` from a fit result's covariance or standard errors."""
+    covariance, random, joint = result._parameter_covariance(names)
+    if not joint:
+        warnings.warn(
+            "the fit result has no parameter covariance (vcov); parameters are "
+            "drawn independently from their standard errors, ignoring "
+            "cross-parameter covariance",
+            UserWarning,
+            stacklevel=3,
+        )
+    return _normal_draws(rng, mean, covariance, random, n_samples)
+
+
 def draw_parameters(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     n_samples: int = 1000,
     vcov: NDArray[np.float64] | None = None,
     method: str = "mvn",
@@ -83,18 +175,33 @@ def draw_parameters(
 ) -> ParameterSamples:
     """Draw parameter samples from approximate posterior.
 
-    Uses the asymptotic normal approximation to the posterior
-    distribution based on the variance-covariance matrix.
+    Uses the asymptotic normal approximation to the sampling distribution of
+    the item parameters.
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted model exposing discrimination and one difficulty per item.
+    model : FitResult or BaseItemModel
+        A fit result, or a fitted model exposing discrimination and one
+        difficulty per item. Without ``vcov``, a fit result supplies its
+        free-parameter covariance (``result.vcov``); its model must store
+        ``discrimination`` and ``difficulty`` rather than derive them, as an
+        LLTM derives difficulty from feature weights. When the result has
+        only standard errors, parameters are drawn independently with a
+        ``UserWarning``. Fixed parameters, and parameters on an optimizer
+        bound or without a standard error, are held at their estimates.
     n_samples : int
         Number of samples to draw. Default 1000.
     vcov : NDArray[np.float64], optional
-        Discrimination/difficulty variance-covariance matrix. If None, uses a
-        compatible ``model.vcov`` when available or a diagonal default.
+        Covariance in the sampling layout: discrimination (item-major, with
+        factors varying fastest), difficulty, then guessing, slipping, upper,
+        and asymmetry for the parameters the model has. A matrix covering
+        discrimination and difficulty only holds the other parameters at
+        their estimates, as do rows and columns that are entirely ``NaN``,
+        which ``FitResult.vcov`` uses for parameters on an optimizer bound.
+        When nothing is fixed, the ``result.vcov`` of a unidimensional 2PL,
+        3PL or 4PL fit is in this layout. A bare model without ``vcov`` or
+        ``model.vcov`` falls back, with a ``FutureWarning``, to fixed sampling
+        scales that do not reflect estimation uncertainty and will be removed.
     method : str
         Sampling method. Currently only "mvn" (asymptotic multivariate
         normal sampling) is supported.
@@ -104,26 +211,34 @@ def draw_parameters(
     Returns
     -------
     ParameterSamples
-        Container with parameter samples.
+        Container with parameter samples. Draws are clipped to each
+        parameter's admissible range.
 
     Examples
     --------
     >>> result = fit_mirt(responses, model="2PL")
-    >>> samples = draw_parameters(result.model, n_samples=1000)
-    >>> # Compute 95% credible interval for item 0 discrimination
+    >>> samples = draw_parameters(result, n_samples=1000)
+    >>> # Compute 95% interval for item 0 discrimination
     >>> ci = np.percentile(samples.discrimination[:, 0], [2.5, 97.5])
     >>> print(f"95% CI: [{ci[0]:.3f}, {ci[1]:.3f}]")
     """
+    from mirt.results.fit_result import FitResult
+
     if not isinstance(n_samples, int) or isinstance(n_samples, bool) or n_samples <= 0:
         raise ValueError("n_samples must be a positive integer")
     if method != "mvn":
         raise ValueError("method must be 'mvn'")
 
+    result: FitResult | None = None
+    if isinstance(model, FitResult):
+        result, item_model = model, model.model
+    else:
+        item_model = model
     rng = np.random.default_rng(seed)
 
     try:
-        disc = np.asarray(model.discrimination, dtype=np.float64)
-        diff = np.asarray(model.difficulty, dtype=np.float64)
+        disc = np.asarray(item_model.discrimination, dtype=np.float64)
+        diff = np.asarray(item_model.difficulty, dtype=np.float64)
     except AttributeError as exc:
         raise ValueError(
             "model must expose discrimination and difficulty parameters"
@@ -141,81 +256,82 @@ def draw_parameters(
     if not np.all(np.isfinite(disc)) or not np.all(np.isfinite(diff)):
         raise ValueError("model parameters must be finite")
 
-    disc_flat = disc.ravel()
-    diff_flat = diff.ravel()
+    optional: dict[str, NDArray[np.float64]] = {}
+    for name in _OPTIONAL_PARAMETERS:
+        values = _optional_model_parameter(item_model, name, n_items)
+        if values is not None:
+            optional[name] = values
+    core = np.concatenate([disc.ravel(), diff])
+    n_core = core.size
 
-    mean = np.concatenate([disc_flat, diff_flat])
-    n_params = len(mean)
+    def joint_mean(names: list[str]) -> NDArray[np.float64]:
+        return np.concatenate([core, *(optional[name] for name in names)])
 
-    if vcov is None:
-        model_vcov = getattr(model, "vcov", None)
-        if model_vcov is not None and np.shape(model_vcov) == (n_params, n_params):
-            vcov = np.asarray(model_vcov, dtype=np.float64)
-        else:
-            vcov = np.eye(n_params, dtype=np.float64) * 0.01
-    else:
+    # ``sampled`` lists the optional parameters that follow the core in draws.
+    sampled: list[str] = []
+    legacy: dict[str, NDArray[np.float64]] = {}
+    if vcov is not None:
         vcov = np.asarray(vcov, dtype=np.float64)
-        if vcov.shape != (n_params, n_params):
-            raise ValueError(f"vcov must have shape {(n_params, n_params)}")
+        n_joint = n_core + n_items * len(optional)
+        if optional and vcov.shape == (n_joint, n_joint):
+            sampled = list(optional)
+        elif vcov.shape != (n_core, n_core):
+            alternative = f" or {(n_joint, n_joint)}" if optional else ""
+            raise ValueError(f"vcov must have shape {(n_core, n_core)}{alternative}")
+        vcov, held = _held_coordinates(vcov)
+        draws = _normal_draws(rng, joint_mean(sampled), vcov, ~held, n_samples)
+    elif result is not None:
+        stored = item_model.parameters
+        if "discrimination" not in stored or "difficulty" not in stored:
+            raise MirtValidationError(
+                "draw_parameters(result) requires stored discrimination and "
+                f"difficulty parameters, but the {item_model.model_name} model "
+                f"stores {', '.join(stored)}; pass vcov in the sampling layout",
+                parameter="model",
+            )
+        sampled = [name for name in optional if name in stored]
+        draws = _result_draws(
+            rng,
+            result,
+            ["discrimination", "difficulty", *sampled],
+            joint_mean(sampled),
+            n_samples,
+        )
+    else:
+        model_vcov = getattr(item_model, "vcov", None)
+        if model_vcov is not None and np.shape(model_vcov) == (n_core, n_core):
+            model_vcov, held = _held_coordinates(model_vcov)
+            draws = _normal_draws(rng, core, model_vcov, ~held, n_samples)
+        else:
+            draws, legacy = _legacy_draws(rng, core, optional, n_samples)
 
-    if not np.all(np.isfinite(vcov)):
-        raise ValueError("vcov must contain only finite values")
-
-    vcov = (vcov + vcov.T) / 2
-    min_eig = np.min(np.linalg.eigvalsh(vcov))
-    if min_eig < REGULARIZATION_EPSILON:
-        vcov = vcov + np.eye(n_params) * (REGULARIZATION_EPSILON - min_eig)
-
-    samples = rng.multivariate_normal(mean, vcov, size=n_samples, check_valid="raise")
-
-    n_disc = len(disc_flat)
-    disc_samples = samples[:, :n_disc].reshape(n_samples, n_items, n_dims)
-    diff_samples = samples[:, n_disc:].reshape(n_samples, -1)
-
-    disc_samples = np.maximum(disc_samples, 0.01)
-
-    if disc_samples.shape[2] == 1:
+    n_disc = disc.size
+    disc_samples = np.maximum(
+        draws[:, :n_disc].reshape(n_samples, n_items, n_dims), 0.01
+    )
+    if n_dims == 1:
         disc_samples = disc_samples.squeeze(axis=2)
 
-    guessing_samples = _draw_bounded_parameter(
-        rng,
-        _optional_model_parameter(model, "guessing", n_items),
-        n_samples,
-        0.0,
-        0.5,
-    )
-    slipping_samples = _draw_bounded_parameter(
-        rng,
-        _optional_model_parameter(model, "slipping", n_items),
-        n_samples,
-        0.0,
-        0.5,
-    )
-    upper_samples = _draw_bounded_parameter(
-        rng,
-        _optional_model_parameter(model, "upper", n_items),
-        n_samples,
-        0.5,
-        1.0,
-    )
-    if guessing_samples is not None and upper_samples is not None:
-        upper_samples = np.maximum(upper_samples, guessing_samples + PROB_EPSILON)
-
-    asymmetry = _optional_model_parameter(model, "asymmetry", n_items)
-    asymmetry_samples = None
-    if asymmetry is not None:
-        asymmetry_samples = np.maximum(
-            rng.normal(asymmetry, 0.05, size=(n_samples, n_items)),
-            PROB_EPSILON,
+    samples: dict[str, NDArray[np.float64]] = {}
+    for name, values in optional.items():
+        if name in sampled:
+            start = n_core + n_items * sampled.index(name)
+            block = draws[:, start : start + n_items]
+        else:
+            block = legacy.get(name, np.tile(values, (n_samples, 1)))
+        samples[name] = np.clip(block, *_PARAMETER_LIMITS[name])
+    if "guessing" in samples and "upper" in samples:
+        samples["upper"] = np.maximum(
+            samples["upper"], samples["guessing"] + PROB_EPSILON
         )
 
     return ParameterSamples(
         discrimination=disc_samples,
-        difficulty=diff_samples,
-        guessing=guessing_samples,
-        slipping=slipping_samples,
-        upper=upper_samples,
-        asymmetry=asymmetry_samples,
+        difficulty=draws[:, n_disc:n_core].copy(),
+        guessing=samples.get("guessing"),
+        slipping=samples.get("slipping"),
+        upper=samples.get("upper"),
+        asymmetry=samples.get("asymmetry"),
     )
 
 
@@ -355,7 +471,7 @@ def posterior_summary(
 
     Examples
     --------
-    >>> samples = draw_parameters(result.model)
+    >>> samples = draw_parameters(result)
     >>> summary = posterior_summary(samples)
     >>> print(summary["discrimination"]["mean"])
     >>> print(summary["discrimination"]["ci_lower"])

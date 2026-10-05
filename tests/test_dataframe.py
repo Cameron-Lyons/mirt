@@ -245,3 +245,105 @@ def test_dif_materializes_item_identifiers_for_polars(monkeypatch: Any) -> None:
 
 def test_default_backend_creates_polars_dataframe() -> None:
     assert isinstance(create_dataframe({"score": [1]}), pl.DataFrame)
+
+
+def _binary_responses() -> np.ndarray:
+    rng = np.random.default_rng(21)
+    return (rng.random((150, 4)) < 0.6).astype(np.int_)
+
+
+@pytest.mark.parametrize("frame_type", ["pandas", "polars"])
+def test_fit_mirt_uses_dataframe_columns_as_item_names(frame_type: str) -> None:
+    names = ["q_alpha", "q_beta", "q_gamma", "q_delta"]
+    responses = _binary_responses()
+    frame = (
+        pd.DataFrame(responses, columns=names)
+        if frame_type == "pandas"
+        else pl.DataFrame(responses, schema=names, orient="row")
+    )
+
+    result = mirt.fit_mirt(frame, max_iter=5)
+    set_dataframe_backend("pandas")
+
+    assert result.model.item_names == names
+    assert list(result.coef().index) == names
+    assert list(mirt.itemfit(result, responses).index) == names
+
+
+def test_explicit_item_names_take_precedence_over_columns() -> None:
+    frame = pd.DataFrame(_binary_responses(), columns=["a", "b", "c", "d"])
+
+    result = mirt.fit_mirt(frame, item_names=["w", "x", "y", "z"], max_iter=2)
+
+    assert result.model.item_names == ["w", "x", "y", "z"]
+
+
+@pytest.mark.parametrize(
+    "columns",
+    [None, ["a", "a", "b", "c"]],
+    ids=["positional", "duplicate"],
+)
+def test_unnamed_or_ambiguous_columns_keep_default_item_names(
+    columns: list[str] | None,
+) -> None:
+    frame = pd.DataFrame(_binary_responses(), columns=columns)
+
+    result = mirt.fit_mirt(frame, max_iter=2)
+
+    assert result.model.item_names == ["Item_1", "Item_2", "Item_3", "Item_4"]
+
+
+def test_nan_missing_values_fit_like_negative_missing_codes() -> None:
+    responses = _binary_responses()
+    rng = np.random.default_rng(22)
+    missing = rng.random(responses.shape) < 0.1
+    coded = np.where(missing, -1, responses)
+    with_nan = np.where(missing, np.nan, responses.astype(float))
+
+    expected = mirt.fit_mirt(coded, max_iter=50)
+    for data in (with_nan, pd.DataFrame(with_nan, columns=list("abcd"))):
+        actual = mirt.fit_mirt(data, max_iter=50)
+        assert actual.log_likelihood == pytest.approx(
+            expected.log_likelihood, abs=1e-10
+        )
+        for name, values in expected.model.parameters.items():
+            np.testing.assert_allclose(
+                actual.model.parameters[name], values, rtol=0, atol=1e-10
+            )
+
+
+def test_nullable_pandas_columns_treat_na_as_missing() -> None:
+    responses = _binary_responses()
+    frame = pd.DataFrame(responses, columns=list("abcd")).astype("Int64")
+    frame.iloc[0, 1] = pd.NA
+
+    validated = mirt.validate_responses(frame)
+
+    expected = responses.copy()
+    expected[0, 1] = -1
+    np.testing.assert_array_equal(validated, expected)
+    assert mirt.fit_mirt(frame, max_iter=2).model.item_names == list("abcd")
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        pd.DataFrame({"a": ["yes", "no"], "b": [1, 0]}),
+        # Numeric text is rejected as it is for plain arrays, not parsed.
+        pd.DataFrame({"a": ["1", "0"], "b": [1, 0]}),
+        pd.DataFrame({"a": pd.array(["1", None], dtype="string"), "b": [1, 0]}),
+    ],
+    ids=["text", "numeric-text", "string-dtype"],
+)
+def test_non_numeric_dataframe_is_still_rejected(frame: pd.DataFrame) -> None:
+    with pytest.raises(mirt.MirtDataError, match="numeric"):
+        mirt.validate_responses(frame)
+
+
+def test_polars_default_column_names_keep_default_item_names() -> None:
+    frame = pl.DataFrame(_binary_responses())
+    assert frame.columns[0] == "column_0"
+
+    result = mirt.fit_mirt(frame, max_iter=2)
+
+    assert result.model.item_names == ["Item_1", "Item_2", "Item_3", "Item_4"]

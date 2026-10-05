@@ -9,10 +9,36 @@ from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.dichotomous import TwoParameterLogistic
 
 
-@pytest.mark.parametrize("value", [0.5, np.nan, np.inf, -np.inf, 1 + 0j, "1"])
+@pytest.mark.parametrize("value", [0.5, np.inf, -np.inf, 1 + 0j, "1"])
 def test_validate_responses_rejects_non_integer_numeric_codes(value):
     with pytest.raises(MirtDataError):
         validate_responses(np.array([[0, value]]))
+
+
+def test_validate_responses_treats_nan_as_missing():
+    # NaN (R's NA) used to be rejected as a non-finite code; it now means missing.
+    responses = validate_responses(np.array([[0.0, np.nan], [np.nan, 1.0]]))
+
+    np.testing.assert_array_equal(responses, [[0, -1], [-1, 1]])
+    assert responses.dtype == np.int_
+
+
+def test_validate_responses_nan_uses_requested_missing_code():
+    responses = validate_responses(np.array([[np.nan, 1.0]]), missing_code=-9)
+
+    np.testing.assert_array_equal(responses, [[-9, 1]])
+
+
+def test_validate_responses_can_reject_nan_explicitly():
+    with pytest.raises(MirtDataError, match="finite response codes"):
+        validate_responses(np.array([[0.0, np.nan]]), nan_as_missing=False)
+    with pytest.raises(MirtDataError, match="missing data not allowed"):
+        validate_responses(np.array([[0.0, np.nan]]), allow_missing=False)
+
+
+def test_validate_responses_still_rejects_infinite_codes_with_missing_values():
+    with pytest.raises(MirtDataError, match="finite response codes"):
+        validate_responses(np.array([[np.nan, np.inf]]))
 
 
 @pytest.mark.parametrize(

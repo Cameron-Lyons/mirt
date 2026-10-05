@@ -96,6 +96,7 @@ def test_group_fits_skip_inference_by_default(
     assert options == [False, False, True, True]
 
 
+@pytest.mark.filterwarnings("ignore:compute_dtf compares separately:UserWarning")
 def test_spawned_dtf_bootstrap_matches_serial_results() -> None:
     responses = _responses()
     data = np.vstack((responses, responses[:, ::-1]))

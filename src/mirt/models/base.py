@@ -1,16 +1,29 @@
+import operator
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from typing import Self
+from typing import Any, Self
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    draw_item_responses,
+)
 from mirt._model_defaults import record_model_base as _record_model_base
 from mirt.constants import PROB_EPSILON
-from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
+from mirt.exceptions import (
+    MirtDataError,
+    MirtIndexError,
+    MirtModelError,
+    MirtValidationError,
+)
 
 _DICHOTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
+_POLYTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
 _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES = 131_072
+_POLYTOMOUS_MAX_INFORMATION_VALUES = 1_000_000
 
 
 def _dichotomous_batch_fallback(
@@ -42,11 +55,40 @@ def _dichotomous_batch_fallback(
     return result
 
 
+def _simulate_responses(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    seed: int | None,
+    chunk_size: int | None,
+    default_rows: int,
+) -> NDArray[np.int32]:
+    """Draw responses in person chunks from one seeded stream."""
+    theta_values = model._ensure_theta_2d(theta)
+    n_persons = theta_values.shape[0]
+    if chunk_size is None:
+        chunk_size = max(1, min(n_persons, default_rows))
+    elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+        chunk_size, (int, np.integer)
+    ):
+        raise ValueError("chunk_size must be a positive integer")
+    elif chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    return draw_item_responses(
+        model,
+        theta_values,
+        np.random.default_rng(seed),
+        chunk_size=int(chunk_size),
+        dtype=np.int32,
+    )
+
+
 @_record_model_base
 class BaseItemModel(ABC):
     model_name: str = "BaseModel"
     n_params_per_item: int = 0
     supports_multidimensional: bool = False
+    # Stored parameters common to every item rather than indexed by item.
+    _shared_parameters: frozenset[str] = frozenset()
 
     def __init__(
         self,
@@ -61,19 +103,25 @@ class BaseItemModel(ABC):
                 value=n_items,
                 expected="> 0",
             )
-        if n_factors <= 0:
+        if (
+            not isinstance(n_factors, (int, float, np.integer, np.floating))
+            or n_factors <= 0
+        ):
             raise MirtValidationError(
                 "n_factors must be positive",
                 parameter="n_factors",
                 value=n_factors,
                 expected="> 0",
             )
-        if n_factors > 1 and not self.supports_multidimensional:
-            raise MirtModelError(
-                f"{self.model_name} does not support multidimensional models",
-                model_type=self.model_name,
-                n_factors=n_factors,
-            )
+        if not self.supports_multidimensional:
+            if n_factors != 1:
+                raise MirtModelError(
+                    f"{self.model_name} only supports unidimensional models",
+                    model_type=self.model_name,
+                    n_factors=n_factors,
+                )
+            # Store a plain int even when given 1.0, True or np.int64(1).
+            n_factors = 1
 
         self.n_items = n_items
         self.n_factors = n_factors
@@ -299,6 +347,13 @@ class BaseItemModel(ABC):
         return np.asarray(errors, dtype=np.float64).copy()
 
     def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        self._parameters.update(self._coerce_parameter_updates(params))
+        return self
+
+    def _coerce_parameter_updates(
+        self, params: Mapping[str, Any]
+    ) -> dict[str, NDArray[np.float64]]:
+        """Return owned float arrays for known parameters with stored shapes."""
         validated: dict[str, NDArray[np.float64]] = {}
         for name, value in params.items():
             if name not in self._parameters:
@@ -325,18 +380,42 @@ class BaseItemModel(ABC):
                     expected=str(self._parameters[name].shape),
                 )
             validated[name] = value_arr
-        self._parameters.update(validated)
-        return self
+        return validated
 
     def _validate_item_index(self, item_idx: int) -> int:
-        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-            item_idx, (int, np.integer)
-        ):
-            raise IndexError("item_idx must be an integer")
-        index = int(item_idx)
+        """Return ``item_idx`` as an ``int`` in ``[0, n_items)``.
+
+        Booleans, non-integers and negative indices raise
+        :class:`~mirt.exceptions.MirtIndexError`, which is both an
+        ``IndexError`` and a ``ValueError``.
+        """
+        try:
+            if isinstance(item_idx, (bool, np.bool_)):
+                raise TypeError
+            index = operator.index(item_idx)
+        except TypeError:
+            raise MirtIndexError(
+                "item_idx must be an integer", parameter="item_idx", value=item_idx
+            ) from None
         if index < 0 or index >= self.n_items:
-            raise IndexError(f"Item index {index} out of range [0, {self.n_items})")
+            raise MirtIndexError(
+                f"item_idx {index} out of range [0, {self.n_items})",
+                parameter="item_idx",
+            )
         return index
+
+    def _item_indexed(self, name: str) -> bool:
+        """Whether stored parameter ``name`` has one leading row per item.
+
+        Parameters listed in ``_shared_parameters`` apply to every item even
+        when their length happens to equal ``n_items``.
+        """
+        values = self._parameters[name]
+        return (
+            name not in self._shared_parameters
+            and values.ndim >= 1
+            and values.shape[0] == self.n_items
+        )
 
     def get_item_parameters(
         self, item_idx: int
@@ -346,12 +425,12 @@ class BaseItemModel(ABC):
 
         result: dict[str, float | NDArray[np.float64]] = {}
         for name, values in self._parameters.items():
-            if values.ndim == 1 and len(values) == self.n_items:
-                result[name] = float(values[item_idx])
-            elif values.ndim >= 2 and values.shape[0] == self.n_items:
-                result[name] = values[item_idx].copy()
-            else:
+            if not self._item_indexed(name):
                 result[name] = values.copy()
+            elif values.ndim == 1:
+                result[name] = float(values[item_idx])
+            else:
+                result[name] = values[item_idx].copy()
         return result
 
     def set_item_parameter(
@@ -380,12 +459,17 @@ class BaseItemModel(ABC):
                 expected=valid_params,
             )
 
-        current = self._parameters[param_name]
-        if current.ndim < 1 or current.shape[0] != self.n_items:
+        if param_name in self._shared_parameters:
+            raise MirtValidationError(
+                f"{param_name} is shared by all items; use set_parameters",
+                parameter=param_name,
+            )
+        if not self._item_indexed(param_name):
             raise MirtValidationError(
                 f"Parameter {param_name} does not have per-item values",
                 parameter=param_name,
             )
+        current = self._parameters[param_name]
 
         updated = current.copy()
         try:
@@ -442,6 +526,71 @@ class BaseItemModel(ABC):
             f"n_factors={self.n_factors}, "
             f"{status})"
         )
+
+
+@_record_model_base
+class _AtomicParameterState(BaseItemModel):
+    """Validate a complete candidate state before committing parameter updates.
+
+    Families with cross-parameter domains mix this in ahead of their item
+    model base and override :meth:`_validate_parameter_state`.
+    """
+
+    def _validate_parameter_state(
+        self,
+        parameters: dict[str, NDArray[np.float64]],
+    ) -> None:
+        """Raise when a complete candidate parameter state is invalid."""
+
+    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
+        """Set parameters atomically after validating the complete model state."""
+        candidate = {**self._parameters, **self._coerce_parameter_updates(params)}
+        self._validate_parameter_state(candidate)
+        self._parameters = candidate
+        return self
+
+    def set_item_parameter(
+        self,
+        item_idx: int,
+        param_name: str,
+        value: float | NDArray[np.float64],
+    ) -> None:
+        """Set one item's value, which must match one row of the parameter."""
+        item_idx = self._validate_item_index(item_idx)
+        if param_name not in self._parameters:
+            valid_params = ", ".join(self._parameters)
+            raise MirtValidationError(
+                f"Unknown parameter: {param_name}. Valid parameters: {valid_params}",
+                parameter=param_name,
+                expected=valid_params,
+            )
+
+        current = self._parameters[param_name]
+        try:
+            value_array = np.asarray(value, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"Invalid per-item value for {param_name}",
+                parameter=param_name,
+                value=value,
+            ) from exc
+        expected_shape = current.shape[1:]
+        if value_array.shape != expected_shape:
+            message = (
+                f"{param_name} must be a scalar for one item"
+                if not expected_shape
+                else f"{param_name} for one item must have shape {expected_shape}"
+            )
+            raise MirtValidationError(
+                message,
+                parameter=param_name,
+                value=value_array.shape,
+                expected=str(expected_shape) if expected_shape else "scalar",
+            )
+
+        updated = current.copy()
+        updated[item_idx] = value_array
+        self.set_parameters(**{param_name: updated})
 
 
 @_record_model_base
@@ -594,30 +743,13 @@ class DichotomousItemModel(BaseItemModel):
         -----
         A fixed seed produces identical responses for every valid chunk size.
         """
-        theta_values = self._ensure_theta_2d(theta)
-        n_persons = theta_values.shape[0]
-        if chunk_size is None:
-            chunk_size = max(
-                1,
-                min(
-                    n_persons,
-                    _DICHOTOMOUS_MAX_PROBABILITY_VALUES // self.n_items,
-                ),
-            )
-        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
-            chunk_size, (int, np.integer)
-        ):
-            raise ValueError("chunk_size must be a positive integer")
-        elif chunk_size <= 0:
-            raise ValueError("chunk_size must be a positive integer")
-
-        rng = np.random.default_rng(seed)
-        responses = np.empty((n_persons, self.n_items), dtype=np.int32)
-        for start in range(0, n_persons, int(chunk_size)):
-            stop = min(start + int(chunk_size), n_persons)
-            probabilities = self.probability(theta_values[start:stop])
-            responses[start:stop] = rng.random(probabilities.shape) < probabilities
-        return responses
+        return _simulate_responses(
+            self,
+            theta,
+            seed,
+            chunk_size,
+            _DICHOTOMOUS_MAX_PROBABILITY_VALUES // self.n_items,
+        )
 
 
 @_record_model_base
@@ -660,6 +792,11 @@ class PolytomousItemModel(BaseItemModel):
     def max_categories(self) -> int:
         return max(self._n_categories)
 
+    def _category_columns(self, width: int, offset: int = 0) -> NDArray[np.bool_]:
+        """Return a fresh ``(n_items, width)`` mask of columns below ``count - offset``."""
+        counts = np.asarray(self._n_categories, dtype=np.intp)
+        return np.arange(width) < (counts - offset)[:, None]
+
     def copy(self) -> Self:
         new_model = self.__class__(
             n_items=self.n_items,
@@ -671,6 +808,46 @@ class PolytomousItemModel(BaseItemModel):
         self._copy_parameter_restrictions_to(new_model)
         new_model._is_fitted = self._is_fitted
         return new_model
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate category responses conditional on latent trait values.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Latent trait values with shape ``(n_persons, n_factors)``. A
+            one-dimensional array is also accepted for unidimensional models.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Category codes ``0, ..., n_categories[j] - 1`` with shape
+            ``(n_persons, n_items)``.
+
+        Notes
+        -----
+        Each response is drawn by inverse CDF from ``probability(theta)``
+        with one uniform per person and item. A fixed seed produces identical
+        responses for every valid chunk size.
+        """
+        return _simulate_responses(
+            self,
+            theta,
+            seed,
+            chunk_size,
+            _POLYTOMOUS_MAX_PROBABILITY_VALUES // (self.n_items * self.max_categories),
+        )
 
     @abstractmethod
     def category_probability(
@@ -703,7 +880,9 @@ class PolytomousItemModel(BaseItemModel):
         n_persons = theta.shape[0]
 
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
 
         max_cat = max(self._n_categories)
         probs = np.zeros((n_persons, self.n_items, max_cat))
@@ -720,16 +899,17 @@ class PolytomousItemModel(BaseItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
-
         if item_idx is not None:
-            return self._item_information(theta, item_idx)
-
-        info = np.zeros(n_persons)
-        for i in range(self.n_items):
-            info += self._item_information(theta, i)
-
-        return info
+            return self._item_information(theta, self._validate_item_index(item_idx))
+        rows_per_block = max(1, _POLYTOMOUS_MAX_INFORMATION_VALUES // self.n_items)
+        if theta.shape[0] <= rows_per_block:
+            return self._information_by_item(theta).sum(axis=1)
+        # Long batches keep the per-item columns within a bounded block.
+        information = np.empty(theta.shape[0], dtype=np.float64)
+        for start in range(0, theta.shape[0], rows_per_block):
+            columns = self._information_by_item(theta[start : start + rows_per_block])
+            information[start : start + rows_per_block] = columns.sum(axis=1)
+        return information
 
     @abstractmethod
     def _item_information(
@@ -737,6 +917,18 @@ class PolytomousItemModel(BaseItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]: ...
+
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return every item's information with shape ``(n_theta, n_items)``.
+
+        Column ``j`` equals ``_item_information(theta, j)``. Families with
+        closed-form curves override this with an all-item kernel.
+        """
+        theta = self._ensure_theta_2d(theta)
+        information = np.empty((theta.shape[0], self.n_items), dtype=np.float64)
+        for item_idx in range(self.n_items):
+            information[:, item_idx] = self._item_information(theta, item_idx)
+        return information
 
     def expected_score(
         self,
@@ -747,6 +939,7 @@ class PolytomousItemModel(BaseItemModel):
         n_persons = theta.shape[0]
 
         if item_idx is not None:
+            item_idx = self._validate_item_index(item_idx)
             n_cat = self._n_categories[item_idx]
             probabilities = self._category_probabilities(theta, item_idx)
             return probabilities @ np.arange(n_cat)
@@ -762,7 +955,7 @@ class PolytomousItemModel(BaseItemModel):
         item_idx: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        return self._category_probabilities(theta, item_idx)
+        return self._category_probabilities(theta, self._validate_item_index(item_idx))
 
     def _validate_polytomous_responses(
         self,
@@ -860,21 +1053,14 @@ class PolytomousItemModel(BaseItemModel):
         responses = self._validate_polytomous_responses(responses)
         curve_theta = theta
         theta = self._ensure_theta_2d(theta)
-        n_persons = responses.shape[0]
-        n_theta = theta.shape[0]
-
-        ll = np.zeros((n_persons, n_theta))
-
-        for item_idx in range(self.n_items):
-            probs = self.probability(curve_theta, item_idx)
-            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-            log_probs = np.log(probs)
-
-            item_resp = responses[:, item_idx]
-            valid_mask = item_resp >= 0
-
-            if np.any(valid_mask):
-                response_indices = item_resp[valid_mask].astype(np.intp, copy=False)
-                ll[valid_mask, :] += log_probs[:, response_indices].T
-
-        return ll
+        offsets = category_offsets(self._n_categories)
+        log_table = np.empty((sum(self._n_categories), theta.shape[0]))
+        # Per-item curves keep overridden probability hooks authoritative.
+        for item_idx, (offset, n_categories) in enumerate(
+            zip(offsets, self._n_categories, strict=True)
+        ):
+            probabilities = self.probability(curve_theta, item_idx)[:, :n_categories]
+            log_table[offset : offset + n_categories] = np.log(
+                np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON)
+            ).T
+        return categorical_log_likelihood_batch(log_table, offsets, responses)

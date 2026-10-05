@@ -73,16 +73,24 @@ class FullDiagnosticReport(ReportBuilder):
     def _build_content(self) -> str:
         from mirt.diagnostics.itemfit import compute_itemfit
         from mirt.diagnostics.modelfit import compute_fit_indices
+        from mirt.reports._templates import section
 
         sections = []
 
-        sections.append(self._build_model_summary_section())
-        sections.append(self._build_parameter_section())
+        sections.append(self._model_summary_section("Model Type"))
+        sections.append(
+            section("Item Parameters", self._parameter_table(include_tests=False))
+        )
 
-        fit_stats = compute_itemfit(self.fit_result.model, self.responses)
-        sections.append(self._build_itemfit_section(fit_stats))
+        fit_stats = compute_itemfit(self.fit_result, self.responses)
+        sections.append(
+            section(
+                "Item Fit Statistics",
+                self._itemfit_table(fit_stats, include_guide=False),
+            )
+        )
 
-        fit_indices = compute_fit_indices(self.fit_result.model, self.responses)
+        fit_indices = compute_fit_indices(self.fit_result, self.responses)
         sections.append(self._build_modelfit_section(fit_indices))
 
         if self.include_ld:
@@ -90,7 +98,7 @@ class FullDiagnosticReport(ReportBuilder):
                 from mirt.diagnostics.ld import compute_ld_statistics
 
                 ld_results = compute_ld_statistics(
-                    self.fit_result.model, self.responses, self.theta
+                    self.fit_result, self.responses, self.theta
                 )
                 sections.append(self._build_ld_section(ld_results))
             except (
@@ -115,7 +123,7 @@ class FullDiagnosticReport(ReportBuilder):
                 create_se_plot_base64,
                 create_wright_map_base64,
             )
-            from mirt.reports._templates import embedded_plot, section
+            from mirt.reports._templates import embedded_plot
 
             sections.append(section("Visualizations", ""))
 
@@ -171,98 +179,6 @@ class FullDiagnosticReport(ReportBuilder):
                 )
 
         return "\n".join(sections)
-
-    def _build_model_summary_section(self) -> str:
-        from mirt.reports._templates import (
-            escape_text,
-            format_value,
-            section,
-            summary_box,
-        )
-
-        model = self.fit_result.model
-        stats = self.fit_result.fit_statistics()
-        html = f"""
-        <p><strong>Model Type:</strong> {escape_text(model.model_name)}</p>
-        <p><strong>Items:</strong> {model.n_items} | <strong>Factors:</strong> {model.n_factors}</p>
-        <p><strong>Persons:</strong> {stats["n_observations"]} | <strong>Parameters:</strong> {stats["n_parameters"]}</p>
-        <p><strong>Log-Likelihood:</strong> {format_value(stats["log_likelihood"], ".2f")}</p>
-        <p><strong>AIC:</strong> {format_value(stats["aic"], ".2f")} | <strong>BIC:</strong> {format_value(stats["bic"], ".2f")}</p>
-        <p><strong>Converged:</strong> {stats["converged"]} ({stats["n_iterations"]} iterations)</p>
-        """
-        return section("Model Summary", summary_box(html))
-
-    def _build_parameter_section(self) -> str:
-        from scipy import stats as scipy_stats
-
-        from mirt.reports._templates import format_value, section, table_from_data
-
-        model = self.fit_result.model
-        se = self.fit_result.standard_errors
-        z_crit = scipy_stats.norm.ppf(0.975)
-
-        headers = ["Item", "Parameter", "Estimate", "SE", "95% CI"]
-        rows: list[list[str]] = []
-
-        for param_name, values in model.parameters.items():
-            param_se = se.get(param_name, np.zeros_like(values))
-            if values.ndim == 1:
-                for i in range(len(values)):
-                    item_name = (
-                        model.item_names[i]
-                        if model.item_names and i < len(model.item_names)
-                        else f"Item_{i + 1}"
-                    )
-                    est = values[i]
-                    err = param_se[i] if i < len(param_se) else np.nan
-                    if err > 0 and not np.isnan(err):
-                        ci_lo, ci_hi = est - z_crit * err, est + z_crit * err
-                        ci_str = f"[{ci_lo:.3f}, {ci_hi:.3f}]"
-                    else:
-                        ci_str = "NA"
-                    rows.append(
-                        [
-                            item_name,
-                            param_name,
-                            format_value(est, ".4f"),
-                            format_value(err, ".4f"),
-                            ci_str,
-                        ]
-                    )
-
-        return section("Item Parameters", table_from_data(headers, rows))
-
-    def _build_itemfit_section(self, fit_stats: dict[str, NDArray[np.float64]]) -> str:
-        from mirt.reports._templates import format_value, section, table_from_data
-
-        model = self.fit_result.model
-        headers = ["Item", "Infit", "Outfit", "Flag"]
-        rows: list[list[str]] = []
-
-        infit = fit_stats.get("infit", np.ones(model.n_items))
-        outfit = fit_stats.get("outfit", np.ones(model.n_items))
-
-        for i in range(model.n_items):
-            item_name = (
-                model.item_names[i]
-                if model.item_names and i < len(model.item_names)
-                else f"Item_{i + 1}"
-            )
-            flag = ""
-            quality = None
-            if infit[i] < 0.7 or infit[i] > 1.3 or outfit[i] < 0.7 or outfit[i] > 1.3:
-                flag = "Misfit"
-                quality = "poor"
-            rows.append(
-                [
-                    item_name,
-                    format_value(infit[i], ".3f", quality),
-                    format_value(outfit[i], ".3f", quality),
-                    flag,
-                ]
-            )
-
-        return section("Item Fit Statistics", table_from_data(headers, rows))
 
     def _build_modelfit_section(self, fit_indices: dict[str, float]) -> str:
         from mirt.reports._templates import format_value, section, table_from_data

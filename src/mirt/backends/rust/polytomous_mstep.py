@@ -1,6 +1,7 @@
 """Batched native polytomous optimization.
 
 Fallback mode: optional. Unsupported models retain generic item optimization.
+Graded thresholds stay ordered with the generic optimizer's minimum gap.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ def try_polytomous_m_step(
     n_jobs: int,
     context: EMFitContext | None = None,
 ) -> bool:
+    from mirt.estimation.base import _parameter_bounds
     from mirt.models.polytomous import (
         GeneralizedPartialCredit,
         GradedResponseModel,
@@ -64,9 +66,11 @@ def try_polytomous_m_step(
     params, masks = model.parameters, model.free_parameter_masks
     packed = np.column_stack((params["discrimination"], params[name]))
     free = np.column_stack((masks["discrimination"], masks[name]))
-    lower = np.full(packed.shape[1], -6.0)
-    upper = np.full(packed.shape[1], 6.0)
-    lower[0], upper[0] = 0.1, 5.0
+    # Free starting values must lie inside the generic optimizer's boxes.
+    low, high = _parameter_bounds(model, name)
+    lower = np.full(packed.shape[1], low)
+    upper = np.full(packed.shape[1], high)
+    lower[0], upper[0] = _parameter_bounds(model, "discrimination")
     if not np.all(np.isfinite(packed)) or np.any(
         free & ((packed < lower) | (packed > upper))
     ):

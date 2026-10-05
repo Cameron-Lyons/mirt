@@ -18,7 +18,9 @@ class TestEAPScorerInitialization:
         """Test default initialization."""
         scorer = EAPScorer()
 
-        assert scorer.n_quadpts == 49
+        # The grid size is resolved from the model's factor count when scoring.
+        assert scorer.n_quadpts is None
+        assert repr(scorer) == "EAPScorer(n_quadpts=None)"
         assert scorer.prior_mean is None
         assert scorer.prior_cov is None
         assert scorer.batch_size is None
@@ -132,7 +134,7 @@ class TestEAPScorerScoring:
             ([0, 1], "2D"),
             ([[0, 1, 0]], "items, expected"),
             ([[0.0, 0.5]], "integer-valued"),
-            ([[0.0, np.nan]], "finite"),
+            ([[0.0, np.inf]], "finite"),
             ([[0, 2]], "only 0, 1"),
             ([["yes", "no"]], "numeric"),
         ],

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, ExitStack
 from types import TracebackType
@@ -119,6 +120,33 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
                 indicators *= person_weights[start:stop, None]
             counts += posterior[start:stop].T @ indicators
         return counts
+
+    def category_counts(
+        self,
+        n_categories: Sequence[int],
+        posterior: NDArray[np.float64],
+    ) -> list[NDArray[np.float64]]:
+        """Accumulate every item's category counts with blocked one-hot products.
+
+        Returns one ``(n_points, n_categories[j])`` array per item, equal to
+        :meth:`expected_category_counts` for that item. Missing responses and
+        codes outside an item's categories contribute nothing.
+        """
+        sizes = np.asarray(n_categories, dtype=np.intp)
+        offsets = np.concatenate(([0], np.cumsum(sizes)))
+        n_persons = self.responses.shape[0]
+        counts = np.zeros((posterior.shape[1], int(offsets[-1])))
+        chunk_size = max(1, _MAX_COUNT_ENTRIES // max(1, int(offsets[-1])))
+        for start in range(0, n_persons, chunk_size):
+            block = self.responses[start : start + chunk_size]
+            rows, items = np.nonzero((block >= 0) & (block < sizes))
+            indicators = np.zeros((block.shape[0], counts.shape[1]))
+            indicators[rows, offsets[items] + block[rows, items]] = 1.0
+            counts += posterior[start : start + chunk_size].T @ indicators
+        return [
+            np.ascontiguousarray(counts[:, low:high])
+            for low, high in zip(offsets[:-1], offsets[1:], strict=True)
+        ]
 
     def response_components(
         self, start: int, stop: int

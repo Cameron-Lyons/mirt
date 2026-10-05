@@ -394,40 +394,6 @@ def e_step_complete_gpu(
     return to_numpy(posterior_weights), to_numpy(marginal_ll)
 
 
-def compute_expected_counts_gpu(
-    responses: NDArray[np.int_],
-    posterior_weights: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """GPU-accelerated expected count computation for dichotomous items.
-
-    Parameters
-    ----------
-    responses : ndarray of shape (n_persons,)
-        Item responses for a single item. Missing coded as negative.
-    posterior_weights : ndarray of shape (n_persons, n_quad)
-        Posterior weights from E-step.
-
-    Returns
-    -------
-    r_k : ndarray of shape (n_quad,)
-        Expected number of correct responses at each quadrature point.
-    n_k : ndarray of shape (n_quad,)
-        Expected number of responses at each quadrature point.
-    """
-    torch, device = _load_torch_runtime()
-
-    resp = torch.from_numpy(responses.astype(np.float64)).to(device)
-    weights = torch.from_numpy(posterior_weights.astype(np.float64)).to(device)
-
-    valid = resp >= 0
-    correct = resp == 1
-
-    r_k = (weights[correct]).sum(dim=0)
-    n_k = (weights[valid]).sum(dim=0)
-
-    return to_numpy(r_k), to_numpy(n_k)
-
-
 def _torch_jj_lambda(torch: ModuleType, xi: Any) -> Any:
     """Evaluate the Jaakkola--Jordan coefficient without zero divisions."""
     xi_abs = torch.abs(xi)

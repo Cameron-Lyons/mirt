@@ -23,6 +23,55 @@ if TYPE_CHECKING:
 _MAX_IRTREE_SCRATCH_ENTRIES = 131_072
 
 
+def _collapse_to_trait_grids(
+    quad_points: NDArray[np.float64],
+    traits: NDArray[np.int_],
+    *counts: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], list[NDArray[np.float64]]]:
+    """Sum per-node quadrature counts over points sharing the node's trait value.
+
+    A binary node depends on the quadrature grid only through its own trait's
+    coordinate, so merging grid points with equal coordinates leaves every
+    node objective, gradient and information matrix unchanged. On a product
+    grid this shrinks ``n_quadpts ** n_traits`` points to ``n_quadpts``.
+
+    Parameters
+    ----------
+    quad_points : NDArray
+        Quadrature nodes with shape ``(n_points, n_traits)``.
+    traits : NDArray
+        Trait index of each node with shape ``(n_nodes,)``.
+    *counts : NDArray
+        Count arrays with shape ``(n_nodes, n_points)``.
+
+    Returns
+    -------
+    tuple
+        ``(points, collapsed)``: per-node trait values with shape
+        ``(n_nodes, n_values)`` and the matching summed counts. Traits with
+        fewer distinct values are padded with zero counts.
+    """
+    orders = np.argsort(quad_points, axis=0, kind="stable")
+    # On sorted coordinates the first index of each distinct value starts its run.
+    grids = [
+        np.unique(quad_points[order, trait], return_index=True)
+        for trait, order in enumerate(orders.T)
+    ]
+    width = max(grid.size for grid, _ in grids)
+    points = np.zeros((traits.size, width))
+    collapsed = [np.zeros((traits.size, width)) for _ in counts]
+    for trait, (grid, starts) in enumerate(grids):
+        rows = np.flatnonzero(traits == trait)
+        if not rows.size:
+            continue
+        points[rows, : grid.size] = grid
+        for source, target in zip(counts, collapsed, strict=True):
+            target[rows, : grid.size] = np.add.reduceat(
+                source[rows][:, orders[:, trait]], starts, axis=1
+            )
+    return points, collapsed
+
+
 @dataclass
 class IRTreeResult:
     """Result from IRTree model estimation."""
@@ -468,22 +517,29 @@ class IRTreeEMEstimator(BaseEstimator):
                 posterior_weights,
             )
 
+        node_points, (node_correct, node_total) = _collapse_to_trait_grids(
+            quad_points,
+            trait_assignments.reshape(-1),
+            expected_correct.reshape(-1, quad_points.shape[0]),
+            expected_total.reshape(-1, quad_points.shape[0]),
+        )
+        bounds = [(0.1, 5.0), (-6.0, 6.0)]
         for j in range(n_items):
             for node_idx in range(max_nodes):
-                n_q = expected_total[j, node_idx]
+                flat_idx = j * max_nodes + node_idx
+                n_q = node_total[flat_idx]
                 if not np.any(n_q > 0.0):
                     continue
-
-                trait_idx = trait_assignments[j, node_idx]
-                theta_values = quad_points[:, trait_idx]
-                r_q = expected_correct[j, node_idx]
 
                 current_a = model._parameters["discrimination"][j, node_idx]
                 current_b = model._parameters["difficulty"][j, node_idx]
 
-                bounds = [(0.1, 5.0), (-6.0, 6.0)]
                 neg_expected_ll = prepare_logistic_objective(
-                    theta_values[:, None], n_q, r_q, PROB_EPSILON, bounds=bounds
+                    node_points[flat_idx, :, None],
+                    n_q,
+                    node_correct[flat_idx],
+                    PROB_EPSILON,
+                    bounds=bounds,
                 )
                 if neg_expected_ll is None:
                     raise RuntimeError("Unable to prepare IRTree node objective")
@@ -592,24 +648,25 @@ class IRTreeEMEstimator(BaseEstimator):
                 pseudo_responses, valid_mask, posterior_weights
             )
             expected_total = counts.reshape(-1, counts.shape[-1])
-        quad_points = self._quadrature.nodes
+        node_points, (node_total,) = _collapse_to_trait_grids(
+            self._quadrature.nodes,
+            trait_assignments.reshape(-1),
+            expected_total,
+        )
         slopes = model._parameters["discrimination"].reshape(-1)
         difficulties = model._parameters["difficulty"].reshape(-1)
-        traits = trait_assignments.reshape(-1)
         slope_se = se["discrimination"].reshape(-1)
         difficulty_se = se["difficulty"].reshape(-1)
-        chunk_size = max(1, _MAX_IRTREE_SCRATCH_ENTRIES // len(quad_points))
+        chunk_size = max(1, _MAX_IRTREE_SCRATCH_ENTRIES // node_points.shape[1])
         for start in range(0, slopes.size, chunk_size):
             stop = min(start + chunk_size, slopes.size)
-            centered = (
-                quad_points[:, traits[start:stop]] - difficulties[None, start:stop]
-            )
+            centered = node_points[start:stop].T - difficulties[None, start:stop]
             probability = np.clip(
                 sigmoid(slopes[None, start:stop] * centered),
                 PROB_EPSILON,
                 1.0 - PROB_EPSILON,
             )
-            weight = expected_total[start:stop].T * probability * (1.0 - probability)
+            weight = node_total[start:stop].T * probability * (1.0 - probability)
             score_b = -slopes[start:stop]
             information = np.empty((stop - start, 2, 2))
             information[:, 0, 0] = np.sum(weight * np.square(centered), axis=0)

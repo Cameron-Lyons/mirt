@@ -46,17 +46,21 @@ def _reference_log_likelihood(
 def _reference_sample_theta(
     responses: np.ndarray,
     model: LongitudinalIRTModel,
+    theta_current: np.ndarray,
     growth_factors: np.ndarray,
     time_values: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
+    """Evaluate one scalar MH sweep that starts from the chain state."""
     theta_pred = model.compute_theta(growth_factors, time_values)
-    theta = theta_pred.copy()
+    theta = theta_current.copy()
     residual_sd = np.sqrt(model.residual_variance)
+    steps = rng.normal(0, 0.3, size=theta.size).reshape(theta.shape)
+    log_uniform = np.log(rng.random(theta.size)).reshape(theta.shape)
 
     for i in range(responses.shape[0]):
         for t in range(responses.shape[1]):
-            theta_proposed = theta[i, t] + rng.normal(0, 0.3)
+            theta_proposed = theta[i, t] + steps[i, t]
             prior_current = stats.norm.logpdf(
                 theta[i, t],
                 theta_pred[i, t],
@@ -92,7 +96,7 @@ def _reference_sample_theta(
                     proposed += np.log1p(-p_proposed)
 
             log_alpha = proposed + prior_proposed - current - prior_current
-            if np.log(rng.random()) < log_alpha:
+            if log_uniform[i, t] < log_alpha:
                 theta[i, t] = theta_proposed
 
     return theta
@@ -228,7 +232,7 @@ def test_vectorized_log_likelihood_matches_scalar_reference(
     assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
 
 
-def test_vectorized_theta_sampler_preserves_seeded_draws(
+def test_vectorized_theta_sampler_matches_scalar_reference(
     longitudinal_data: tuple[np.ndarray, np.ndarray, np.ndarray],
 ) -> None:
     responses, growth_factors, time_values = longitudinal_data
@@ -237,12 +241,17 @@ def test_vectorized_theta_sampler_preserves_seeded_draws(
         n_timepoints=responses.shape[1],
         discrimination=np.array([0.7, 1.1, 1.6, 0.9]),
         difficulty=np.array([-0.8, 0.2, 1.0, -0.1]),
+        residual_variance=0.4,
     )
     sampler = LongitudinalGibbsSampler(n_iter=2, burnin=1)
+    theta_current = model.compute_theta(
+        growth_factors, time_values
+    ) + np.random.default_rng(5).normal(0.0, 0.5, size=(3, 3))
 
     expected = _reference_sample_theta(
         responses,
         model,
+        theta_current,
         growth_factors,
         time_values,
         np.random.default_rng(91),
@@ -250,12 +259,80 @@ def test_vectorized_theta_sampler_preserves_seeded_draws(
     actual = sampler._sample_theta(
         responses,
         model,
+        theta_current,
         growth_factors,
         time_values,
         np.random.default_rng(91),
     )
 
     assert_array_equal(actual, expected)
+    assert np.any(actual != theta_current)
+
+
+def test_theta_sampler_keeps_chain_state_and_targets_conditional_prior() -> None:
+    """With no observed responses theta | growth is N(theta_pred, sigma^2).
+
+    Regression: the sampler used to restart each MH step at the growth-curve
+    prediction, which shrank the sampled residual variance towards zero and
+    left a point mass at the prediction.
+    """
+    rng = np.random.default_rng(0)
+    n_persons, n_timepoints, n_items = 500, 4, 3
+    residual_variance = 0.7
+    model = LongitudinalIRTModel(
+        n_items=n_items,
+        n_timepoints=n_timepoints,
+        residual_variance=residual_variance,
+    )
+    responses = np.full((n_persons, n_timepoints, n_items), -1, dtype=np.int_)
+    growth_factors = rng.normal(size=(n_persons, 2))
+    time_values = np.arange(n_timepoints, dtype=np.float64)
+    theta_pred = model.compute_theta(growth_factors, time_values)
+    sampler = LongitudinalGibbsSampler(n_iter=2, burnin=1)
+
+    theta = theta_pred.copy()
+    deviations = []
+    for sweep in range(300):
+        theta = sampler._sample_theta(
+            responses,
+            model,
+            theta,
+            growth_factors,
+            time_values,
+            rng,
+        )
+        if sweep >= 100:
+            deviations.append(theta - theta_pred)
+    deviations_array = np.asarray(deviations)
+
+    assert abs(deviations_array.var() / residual_variance - 1.0) < 0.05
+    assert abs(deviations_array.mean()) < 0.05
+    assert np.mean(deviations_array[-1] == 0.0) < 0.01
+
+
+def test_fit_recovers_residual_to_intercept_variance_ratio() -> None:
+    """The latent scale is not identified, so compare a scale-free ratio.
+
+    The old kernel pinned the residual variance at its 0.01 floor, about a
+    fifth of the generating ratio. Short chains of the fixed kernel land
+    between 0.8 and 1.8 times it across seeds, so the upper bound is loose.
+    """
+    n_items = 10
+    generator = LongitudinalIRTModel(
+        n_items=n_items,
+        n_timepoints=5,
+        residual_variance=0.1,
+        discrimination=np.linspace(0.8, 2.0, n_items),
+        difficulty=np.linspace(-1.5, 1.5, n_items),
+    )
+    responses, _, _ = generator.simulate(250, seed=4)
+
+    result = LongitudinalGibbsSampler(n_iter=150, burnin=75, seed=4).fit(responses)
+
+    true_ratio = generator.residual_variance / generator.growth_cov[0, 0]
+    ratio = result.model.residual_variance / result.model.growth_cov[0, 0]
+    assert result.model.residual_variance > 0.05
+    assert 0.5 * true_ratio < ratio < 2.5 * true_ratio
 
 
 def test_vectorized_item_sampler_preserves_seeded_draws(

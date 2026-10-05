@@ -8,12 +8,17 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.utils.data import _missing_coded_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+# Response patterns optimized together by row-batched scorers; bounds the
+# temporary likelihood arrays without giving up vectorization.
+BATCHED_SCORING_CHUNK_SIZE = 8192
 
 
 def observed_test_information(
@@ -21,16 +26,26 @@ def observed_test_information(
     theta: NDArray[np.float64],
     observed_mask: NDArray[np.bool_],
 ) -> NDArray[np.float64]:
-    """Return test information contributed by observed response items."""
+    """Return test information contributed by observed response items.
+
+    ``observed_mask`` is either one item mask of shape ``(n_items,)`` shared
+    by every theta row, or an ``(n_theta, n_items)`` mask that pairs each
+    theta row with its own observed items.
+    """
     observed_mask = np.asarray(observed_mask, dtype=np.bool_)
-    if observed_mask.shape != (model.n_items,):
+    n_theta = theta.shape[0]
+    if observed_mask.shape == (model.n_items,):
+        row_mask = None
+        observed_items = np.flatnonzero(observed_mask)
+    elif observed_mask.shape == (n_theta, model.n_items):
+        row_mask = observed_mask
+        observed_items = np.flatnonzero(observed_mask.any(axis=0))
+    else:
         raise ValueError(
-            f"observed_mask must have shape ({model.n_items},), "
-            f"got {observed_mask.shape}"
+            f"observed_mask must have shape ({model.n_items},) or "
+            f"({n_theta}, {model.n_items}), got {observed_mask.shape}"
         )
 
-    n_theta = theta.shape[0]
-    observed_items = np.flatnonzero(observed_mask)
     if observed_items.size == 0:
         return np.zeros(n_theta, dtype=np.float64)
 
@@ -39,14 +54,21 @@ def observed_test_information(
     if not model.is_polytomous:
         item_information = np.asarray(model.information(theta), dtype=np.float64)
         if item_information.shape == (n_theta, model.n_items):
-            return item_information[:, observed_mask].sum(axis=1)
+            if row_mask is None:
+                return item_information[:, observed_mask].sum(axis=1)
+            return np.where(row_mask, item_information, 0.0).sum(axis=1)
 
+    # Accumulate item by item so a row-specific mask adds exactly the same
+    # terms, in the same order, as scoring that row with its own 1-D mask.
     information = np.zeros(n_theta, dtype=np.float64)
     for item_idx in observed_items:
         item_information = np.asarray(
             model.information(theta, int(item_idx)), dtype=np.float64
-        )
-        information += item_information.reshape(n_theta, -1).sum(axis=1)
+        ).reshape(n_theta, -1)
+        item_total = item_information.sum(axis=1)
+        if row_mask is not None:
+            item_total = np.where(row_mask[:, item_idx], item_total, 0.0)
+        information += item_total
 
     return information
 
@@ -101,6 +123,12 @@ def build_quadrature(
     prior_cov: NDArray[np.float64] | None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Build Gauss-Hermite quadrature nodes and weights from prior settings."""
+    if (
+        isinstance(n_quadpts, (bool, np.bool_))
+        or not isinstance(n_quadpts, (int, np.integer))
+        or n_quadpts < 1
+    ):
+        raise ValueError("n_quadpts must be a positive integer")
     mean, cov = resolve_prior_distribution(
         n_factors=n_factors,
         prior_mean=prior_mean,
@@ -131,10 +159,14 @@ def resolve_n_jobs(n_jobs: int) -> int:
 
 def validate_scoring_responses(
     model: BaseItemModel,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
 ) -> NDArray[np.int_]:
-    """Validate a scoring matrix and normalize every missing code to -1."""
-    raw = np.asarray(responses)
+    """Validate a scoring matrix and normalize every missing code to -1.
+
+    Negative codes, ``NaN`` and the missing entries of nullable DataFrame
+    columns are missing responses, as in :func:`mirt.fit_mirt`.
+    """
+    raw = _missing_coded_responses(responses)
     if raw.ndim != 2:
         raise ValueError(f"responses must be 2D, got {raw.ndim}D")
     if raw.shape[1] != model.n_items:
@@ -196,6 +228,72 @@ def finite_difference_se(
     if hessian > 0:
         return float(np.sqrt(1.0 / hessian))
     return float(np.nan)
+
+
+def finite_difference_se_rows(
+    objective: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+    estimate: NDArray[np.float64],
+    *,
+    center: NDArray[np.float64] | None = None,
+    step: float = 1e-5,
+) -> NDArray[np.float64]:
+    """Row-wise :func:`finite_difference_se` for independent scalar objectives.
+
+    ``objective(x)`` evaluates every row at the matching entry of ``x``.
+    ``center`` may supply objective values already known at ``estimate``.
+    """
+    f_plus = objective(estimate + step)
+    f_minus = objective(estimate - step)
+    f_center = objective(estimate) if center is None else center
+    hessian = (f_plus - 2 * f_center + f_minus) / (step**2)
+
+    standard_error = np.full(estimate.shape, np.nan, dtype=np.float64)
+    positive = hessian > 0
+    standard_error[positive] = np.sqrt(1.0 / hessian[positive])
+    return standard_error
+
+
+def supports_row_batched_scoring(model: BaseItemModel) -> bool:
+    """Return whether stacked rows can share one log-likelihood evaluation.
+
+    Optimizer scorers may then evaluate many ``(pattern, theta)`` pairs in a
+    single call. Custom likelihoods and instance-level hook overrides keep the
+    per-pattern path, because they need not treat theta rows independently.
+    """
+    from mirt._model_defaults import uses_original_model_hook
+    from mirt.models.mixed_format import MixedItemModel
+
+    namespace = getattr(model, "__dict__", None)
+    if namespace is None or any(
+        name in namespace for name in ("probability", "log_likelihood", "information")
+    ):
+        return False
+    # A mixed-format likelihood sums its components' likelihoods.
+    if isinstance(model, MixedItemModel) and not all(
+        map(supports_row_batched_scoring, model.component_models)
+    ):
+        return False
+    return uses_original_model_hook(model, "log_likelihood")
+
+
+def score_pattern_chunks(
+    patterns: NDArray[np.int_],
+    score_chunk: Callable[
+        [NDArray[np.int_]], tuple[NDArray[np.float64], NDArray[np.float64]]
+    ],
+    chunk_size: int = BATCHED_SCORING_CHUNK_SIZE,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Run a row-batched scorer over bounded consecutive pattern chunks."""
+    results = [
+        score_chunk(patterns[start : start + chunk_size])
+        for start in range(0, max(patterns.shape[0], 1), chunk_size)
+    ]
+    if len(results) == 1:
+        return results[0]
+    return (
+        np.concatenate([theta for theta, _ in results]),
+        np.concatenate([standard_error for _, standard_error in results]),
+    )
 
 
 def score_responses_parallel(

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 def _check_matplotlib() -> Any:
@@ -38,6 +39,14 @@ def _resolve_axes(ax: Any, figsize: tuple[float, float]) -> Any:
     plt = _check_matplotlib()
     _, created_ax = plt.subplots(figsize=figsize)
     return created_ax
+
+
+def _resolve_model(model: BaseItemModel | FitResult) -> BaseItemModel:
+    """Accept a fitted result wherever an item model is plotted."""
+    from mirt.results._common import resolve_item_model
+
+    resolved: BaseItemModel = resolve_item_model(model)
+    return resolved
 
 
 def _model_size(model: BaseItemModel) -> tuple[int, int]:
@@ -315,7 +324,9 @@ def _names(item_names: list[str] | None, n_items: int) -> list[str]:
     return [str(name) for name in item_names]
 
 
-def _mapping_values(mapping: Mapping[str, Any], key: str) -> NDArray[np.float64]:
+def _mapping_values(
+    mapping: Mapping[str, Any], key: str, *, allow_missing: bool = False
+) -> NDArray[np.float64]:
     import numpy as np
 
     if key not in mapping:
@@ -323,7 +334,8 @@ def _mapping_values(mapping: Mapping[str, Any], key: str) -> NDArray[np.float64]
     values = np.asarray(mapping[key], dtype=np.float64)
     if values.ndim != 1 or values.size == 0:
         raise ValueError(f"{key} must be a nonempty one-dimensional array")
-    if not np.all(np.isfinite(values)):
+    finite = np.isfinite(values) | (allow_missing & np.isnan(values))
+    if not np.all(finite):
         raise ValueError(f"{key} must contain only finite values")
     return values
 
@@ -338,7 +350,7 @@ def _ordered_pair(values: tuple[float, float], name: str) -> tuple[float, float]
 
 
 def plot_icc(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     item_idx: int | list[int] | None = None,
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 100,
@@ -350,6 +362,8 @@ def plot_icc(
 ) -> Any:
     """Plot item response curves, including every category for ordinal items."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     if not isinstance(show_legend, (bool, np.bool_)):
         raise ValueError("show_legend must be boolean")
@@ -390,7 +404,7 @@ def plot_icc(
 
 
 def plot_category_curves(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     item_idx: int,
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 100,
@@ -401,6 +415,8 @@ def plot_category_curves(
 ) -> Any:
     """Plot all response-category curves for one item."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     indices = _item_indices(model, item_idx)
@@ -428,7 +444,7 @@ def plot_category_curves(
 
 
 def plot_information(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     item_idx: int | list[int] | None = None,
     test_info: bool = True,
     theta_range: tuple[float, float] = (-4, 4),
@@ -440,6 +456,8 @@ def plot_information(
 ) -> Any:
     """Plot test information and optional item-information curves."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     if not isinstance(test_info, (bool, np.bool_)):
         raise ValueError("test_info must be boolean")
@@ -657,7 +675,7 @@ def _item_locations(model: BaseItemModel, factor: int) -> NDArray[np.float64]:
 
 
 def plot_person_item_map(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     theta: NDArray[np.float64],
     ax: Any = None,
     bins: int | str = 30,
@@ -668,6 +686,8 @@ def plot_person_item_map(
 ) -> Any:
     """Plot a Wright map for one factor with persons and item locations."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     values = _factor_values(theta, factor, "theta")
     try:
@@ -713,12 +733,16 @@ def plot_dif(
     ax: Any = None,
     **kwargs: Any,
 ) -> Any:
-    """Plot absolute DIF effect sizes using ETS A/B/C classifications."""
+    """Plot absolute DIF effect sizes using ETS A/B/C classifications.
+
+    Untested items, such as DIF anchors, have ``NaN`` effect sizes and are
+    drawn with zero height.
+    """
     import numpy as np
 
     if not isinstance(dif_results, Mapping):
         raise ValueError("dif_results must be a mapping")
-    effect_sizes = _mapping_values(dif_results, effect_size_key)
+    effect_sizes = _mapping_values(dif_results, effect_size_key, allow_missing=True)
     if classification_key not in dif_results:
         raise ValueError(f"results do not contain {classification_key!r}")
     classifications = np.asarray(dif_results[classification_key])
@@ -735,7 +759,9 @@ def plot_dif(
 
     ax = _resolve_axes(ax, (10, 6))
     ax.bar(
-        range(effect_sizes.size), np.abs(effect_sizes), **{"color": colors, **kwargs}
+        range(effect_sizes.size),
+        np.abs(np.nan_to_num(effect_sizes, nan=0.0)),
+        **{"color": colors, **kwargs},
     )
     ax.axhline(y=0.426, color="gold", linestyle="--", alpha=0.7, label="B threshold")
     ax.axhline(y=0.638, color="red", linestyle="--", alpha=0.7, label="C threshold")
@@ -759,7 +785,7 @@ def plot_dif(
 
 
 def plot_expected_score(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 100,
     ax: Any = None,
@@ -769,6 +795,8 @@ def plot_expected_score(
 ) -> Any:
     """Plot a test characteristic curve for dichotomous or ordinal models."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     expected = _expected_score(model, theta)
@@ -786,7 +814,7 @@ def plot_expected_score(
 
 
 def plot_se(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     theta_range: tuple[float, float] = (-4, 4),
     n_points: int = 100,
     ax: Any = None,
@@ -796,6 +824,8 @@ def plot_se(
 ) -> Any:
     """Plot standard error of measurement from total information."""
     import numpy as np
+
+    model = _resolve_model(model)
 
     theta_values, theta, limits = _theta_grid(model, theta_range, n_points, factor)
     information, _ = _full_information(model, theta)

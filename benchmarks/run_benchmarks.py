@@ -73,6 +73,7 @@ SUITE_ORDER = (
     "qmcem-mstep",
     "qmcem-fit",
     "mcem-sampling",
+    "bifactor-fit",
 )
 
 
@@ -1272,7 +1273,7 @@ def bench_kernels(
 def bench_optimization(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Time complete polytomous fits, MAP/ML scoring, and repetitive EM data."""
+    """Time polytomous fits, optimizer and EAPsum scoring, and repetitive EM data."""
     results = []
     for kind in ("GRM", "GPCM", "PCM"):
         data = mirt.simdata(
@@ -1323,6 +1324,43 @@ def bench_optimization(
                 lambda: mirt.fit_mirt(
                     repeated, model="2PL", n_quadpts=21, max_iter=20, tol=1e-12
                 ),
+                repeats=repeats,
+                warmups=warmups,
+            ),
+        )
+    )
+    # Models without compiled scorers use the row-batched optimizers.
+    rng = np.random.default_rng(64)
+    grm = mirt.GradedResponseModel(n_items, n_categories=4)
+    grm.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, n_items),
+        thresholds=np.sort(rng.normal(size=(n_items, 3)), axis=1),
+    )
+    grm._is_fitted = True
+    grm_data = rng.integers(0, 4, (n_persons, n_items))
+    grm_data[rng.random(grm_data.shape) < 0.05] = -1
+    for method in ("MAP", "ML", "WLE", "EAPsum"):
+        results.append(
+            BenchResult(
+                f"grm_{method.lower()}_scoring",
+                _time(
+                    lambda: mirt.fscores(grm, grm_data, method=method),
+                    repeats=repeats,
+                    warmups=warmups,
+                ),
+            )
+        )
+    two_factor = mirt.TwoParameterLogistic(n_items, n_factors=2)
+    two_factor.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, (n_items, 2)),
+        difficulty=rng.normal(size=n_items),
+    )
+    two_factor._is_fitted = True
+    results.append(
+        BenchResult(
+            "map_scoring_2d",
+            _time(
+                lambda: mirt.fscores(two_factor, data, method="MAP"),
                 repeats=repeats,
                 warmups=warmups,
             ),
@@ -2200,7 +2238,8 @@ def bench_multigroup_fit(
     repeats: int,
     warmups: int = 0,
 ) -> list[BenchResult]:
-    """Time pooled, distinct-context, and fixed-anchor multigroup updates."""
+    """Time multigroup updates and the default likelihood-ratio DIF analysis."""
+    from mirt.diagnostics.dif import compute_dif
     from mirt.multigroup import MultigroupEMEstimator, MultigroupModel
 
     rng = np.random.default_rng(9641)
@@ -2241,6 +2280,22 @@ def bench_multigroup_fit(
                 _peak_traced_bytes(run),
             )
         )
+
+    # The default compute_dif path: a baseline and one warm-started refit per
+    # item, each with a fixed EM iteration budget.
+    data = np.vstack(responses[:2])
+    groups = np.repeat([0, 1], [len(response) for response in responses[:2]])
+
+    def dif():
+        return compute_dif(data, groups, model="2PL", max_iter=20)
+
+    results.append(
+        BenchResult(
+            "multigroup_dif_likelihood_ratio",
+            _time(dif, repeats=repeats, warmups=warmups),
+            _peak_traced_bytes(dif),
+        )
+    )
     return results
 
 
@@ -2514,6 +2569,67 @@ def bench_cat(
     )
 
 
+def bench_bifactor_fit(
+    n_persons: int, n_items: int, repeats: int, warmups: int = 0
+) -> list[BenchResult]:
+    """Measure bifactor EM on reduced grids against the product-grid EM.
+
+    Three specific factors at 21 points per factor need 194,481 product-grid
+    nodes, so the product-grid reference uses 7 points (2,401 nodes).
+    """
+    from mirt.estimation.bifactor_em import BifactorEMEstimator
+    from mirt.estimation.em import EMEstimator
+    from mirt.models.bifactor import BifactorModel
+
+    rng = np.random.default_rng(83)
+    template = BifactorModel(n_items, np.arange(n_items) % 3)
+    template.set_parameters(
+        general_loadings=rng.uniform(0.8, 1.6, n_items),
+        specific_loadings=rng.uniform(0.5, 1.2, n_items),
+        intercepts=rng.normal(size=n_items),
+    )
+    theta = rng.standard_normal((n_persons, template.n_factors))
+    responses = (rng.random((n_persons, n_items)) < template.probability(theta)).astype(
+        int
+    )
+
+    def reduced(n_quadpts: int, standard_errors: bool) -> Callable[[], None]:
+        def run() -> None:
+            BifactorEMEstimator(
+                n_quadpts=n_quadpts,
+                max_iter=10,
+                tol=1e-12,
+                compute_standard_errors=standard_errors,
+            ).fit(BifactorModel(n_items, template.specific_factors), responses)
+
+        return run
+
+    def product() -> None:
+        EMEstimator(
+            n_quadpts=7,
+            max_iter=10,
+            tol=1e-12,
+            use_rust=False,
+            use_gpu=False,
+            compute_standard_errors=False,
+        ).fit(BifactorModel(n_items, template.specific_factors), responses)
+
+    workloads = (
+        ("bifactor_fit_reduced_q7", reduced(7, False)),
+        ("bifactor_fit_reduced_q21", reduced(21, False)),
+        ("bifactor_fit_reduced_q21_se", reduced(21, True)),
+        ("bifactor_fit_product_q7", product),
+    )
+    return [
+        BenchResult(
+            name,
+            _time(run, repeats=repeats, warmups=warmups),
+            _peak_traced_bytes(run),
+        )
+        for name, run in workloads
+    ]
+
+
 def _positive_int(value: str) -> int:
     """Parse a strictly positive command-line integer."""
     try:
@@ -2716,6 +2832,8 @@ def run_suites(
         results.extend(bench_qmcem_fit(n_persons, n_items, repeats, warmups))
     if "mcem-sampling" in suites:
         results.extend(bench_mcem_sampling(n_persons, n_items, repeats, warmups))
+    if "bifactor-fit" in suites:
+        results.extend(bench_bifactor_fit(n_persons, n_items, repeats, warmups))
     return results
 
 
@@ -2849,6 +2967,7 @@ def _validate_baseline_compatibility(
         "multigroup_fit_metric",
         "multigroup_fit_scalar",
         "multigroup_fit_fixed",
+        "multigroup_dif_likelihood_ratio",
         "patterns_repeated",
         "patterns_distinct",
         "pairwise_available",
@@ -2871,6 +2990,11 @@ def _validate_baseline_compatibility(
         "em_fit_repeated",
         "map_scoring",
         "ml_scoring",
+        "grm_map_scoring",
+        "grm_ml_scoring",
+        "grm_wle_scoring",
+        "grm_eapsum_scoring",
+        "map_scoring_2d",
         "marginal_information",
         "gaussian_update_1d",
         "gaussian_update_3d",
@@ -2923,6 +3047,7 @@ def _validate_baseline_compatibility(
                 "gpu_likelihood_",
                 "binary_likelihood_",
                 "score_equating_",
+                "bifactor_fit_",
             )
         )
     )

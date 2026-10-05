@@ -1,4 +1,4 @@
-//! Bootstrap sampling, imputation, and QMC functions.
+//! Bootstrap sampling and multiple imputation functions.
 
 use numpy::ndarray::{Array2, Array3};
 use numpy::{PyArray2, PyArray3, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
@@ -179,68 +179,11 @@ pub fn multiple_imputation<'py>(
     result.to_pyarray(py)
 }
 
-/// Generate quasi-Monte Carlo samples
-#[pyfunction]
-pub fn generate_qmc_samples<'py>(
-    py: Python<'py>,
-    n_persons: usize,
-    n_samples: usize,
-    n_factors: usize,
-    _seed: u64,
-) -> Bound<'py, PyArray3<f64>> {
-    let samples: Vec<Vec<Vec<f64>>> = (0..n_persons)
-        .into_par_iter()
-        .map(|_i| {
-            (0..n_samples)
-                .map(|s| {
-                    (0..n_factors)
-                        .map(|f| {
-                            let base = (2 + f) as f64;
-                            let mut result = 0.0;
-                            let mut fraction = 1.0 / base;
-                            let mut n = s + 1;
-                            while n > 0 {
-                                result += fraction * (n as f64 % base);
-                                n /= base as usize;
-                                fraction /= base;
-                            }
-                            let u = result.clamp(0.001, 0.999);
-                            let t = (-2.0 * (1.0 - u).ln()).sqrt();
-                            let c0 = 2.515517;
-                            let c1 = 0.802853;
-                            let c2 = 0.010328;
-                            let d1 = 1.432788;
-                            let d2 = 0.189269;
-                            let d3 = 0.001308;
-                            let z = t
-                                - (c0 + c1 * t + c2 * t * t)
-                                    / (1.0 + d1 * t + d2 * t * t + d3 * t * t * t);
-                            if u < 0.5 { -z } else { z }
-                        })
-                        .collect()
-                })
-                .collect()
-        })
-        .collect();
-
-    let mut result = Array3::zeros((n_persons, n_samples, n_factors));
-    for (i, person_samples) in samples.iter().enumerate() {
-        for (s, sample) in person_samples.iter().enumerate() {
-            for (f, &val) in sample.iter().enumerate() {
-                result[[i, s, f]] = val;
-            }
-        }
-    }
-
-    result.to_pyarray(py)
-}
-
 /// Register bootstrap functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(generate_bootstrap_indices, m)?)?;
     m.add_function(wrap_pyfunction!(resample_responses, m)?)?;
     m.add_function(wrap_pyfunction!(impute_from_probabilities, m)?)?;
     m.add_function(wrap_pyfunction!(multiple_imputation, m)?)?;
-    m.add_function(wrap_pyfunction!(generate_qmc_samples, m)?)?;
     Ok(())
 }

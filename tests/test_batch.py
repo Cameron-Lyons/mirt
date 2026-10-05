@@ -12,6 +12,7 @@ import pytest
 
 import mirt
 import mirt.utils as mirt_utils
+import mirt.utils._parallel as parallel_utils
 import mirt.utils.batch as batch_utils
 import mirt.utils.dataframe as dataframe_utils
 from mirt.exceptions import MirtDataError, MirtValidationError
@@ -79,7 +80,7 @@ def test_process_backend_reports_platform_limit(monkeypatch):
         del args, kwargs
         raise PermissionError("semaphores unavailable")
 
-    monkeypatch.setattr(batch_utils, "ProcessPoolExecutor", unavailable_executor)
+    monkeypatch.setattr(parallel_utils, "ProcessPoolExecutor", unavailable_executor)
     with pytest.raises(RuntimeError, match="process parallel backend is unavailable"):
         fit_models(
             ["1PL", "2PL"],
@@ -121,7 +122,7 @@ def test_process_backend_configures_responses_through_initializer(monkeypatch):
                 future.set_exception(exc)
             return future
 
-    monkeypatch.setattr(batch_utils, "ProcessPoolExecutor", ImmediateProcessPool)
+    monkeypatch.setattr(parallel_utils, "ProcessPoolExecutor", ImmediateProcessPool)
     monkeypatch.setattr(
         mirt,
         "fit_mirt",
@@ -137,8 +138,11 @@ def test_process_backend_configures_responses_through_initializer(monkeypatch):
 
     assert list(batch.results) == ["1PL", "2PL"]
     assert len(initialization_args) == 1
-    assert len(initialization_args[0]) == 1
-    assert initialization_args[0][0] is RESPONSES
+    backend, initializer, initargs = initialization_args[0]
+    assert backend == mirt.get_backend()
+    assert initializer is batch_utils._initialize_process_worker
+    assert len(initargs) == 1
+    assert initargs[0] is RESPONSES
     assert len(submitted_args) == 2
     assert all(len(args) == 1 for args in submitted_args)
     assert all(

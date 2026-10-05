@@ -17,8 +17,8 @@ from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import split_groups
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
 
 SIBTESTMethod: TypeAlias = Literal["original", "crossing"]
@@ -491,13 +491,6 @@ def _effect_size(
     return beta / np.sqrt(pooled_variance)
 
 
-def _adjust_p_values(
-    p_values: NDArray[np.float64], method: PValueAdjustment
-) -> NDArray[np.float64]:
-    """Compatibility wrapper for the shared adjustment utility."""
-    return adjust_p_values(p_values, method)
-
-
 def sibtest_items(
     data: NDArray[np.int_],
     groups: NDArray,
@@ -562,7 +555,7 @@ def sibtest_items(
         raise ValueError("alpha must be finite and between 0 and 1") from exc
     if not np.isfinite(alpha) or not 0.0 < alpha < 1.0:
         raise ValueError("alpha must be finite and between 0 and 1")
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
 
     response_data = _validate_response_data(data)
     group_labels = _validate_groups(groups, response_data.shape[0])

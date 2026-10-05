@@ -305,9 +305,9 @@ def vuong_test(
 
     Notes
     -----
-    Personwise likelihoods are marginalized over a standard-normal latent
-    distribution. This matches the default latent distribution used during
-    model estimation.
+    Personwise likelihoods are marginalized over each fit's latent
+    population: its estimated ``latent_mean`` and ``latent_covariance`` when
+    it has them, and the standard normal otherwise, as during estimation.
     """
     from mirt.results._common import validate_alpha
     from mirt.scoring._common import validate_scoring_responses
@@ -354,8 +354,16 @@ def vuong_test(
                 "responses must contain the observations used to fit both models"
             )
 
-    ll1 = _compute_person_loglik(model1, validated_responses, n_quadpts)
-    ll2 = _compute_person_loglik(model2, validated_responses, n_quadpts)
+    ll1, ll2 = (
+        _compute_person_loglik(
+            result.model,
+            validated_responses,
+            n_quadpts,
+            getattr(result, "latent_covariance", None),
+            getattr(result, "latent_mean", None),
+        )
+        for result in (result1, result2)
+    )
 
     diff = ll1 - ll2
 
@@ -399,16 +407,21 @@ def _compute_person_loglik(
     model: Any,
     responses: NDArray[np.int_],
     n_quadpts: int,
+    prior_cov: NDArray[np.float64] | None = None,
+    prior_mean: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
-    """Compute each person's marginal response-pattern log-likelihood."""
+    """Compute each person's marginal response-pattern log-likelihood.
+
+    Abilities follow ``N(prior_mean, prior_cov)``, standard normal by default.
+    """
     from mirt.scoring._common import build_quadrature
     from mirt.utils.numeric import logsumexp_axis1
 
     quad_points, quad_weights = build_quadrature(
         n_quadpts=n_quadpts,
         n_factors=model.n_factors,
-        prior_mean=None,
-        prior_cov=None,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
     )
     weights = np.asarray(quad_weights, dtype=np.float64)
     if (
@@ -512,50 +525,4 @@ def information_criteria(
         "CAIC": deviance + k * (log(observations) + 1.0),
         "-2LogLik": deviance,
         "npar": k,
-    }
-
-
-def relative_fit(
-    results: list[FitResult],
-    criterion: str = "AIC",
-) -> dict[str, Any]:
-    """Compute relative fit measures across models.
-
-    Parameters
-    ----------
-    results : list of FitResult
-        Fitted models to compare
-    criterion : str
-        Information criterion to use
-
-    Returns
-    -------
-    dict
-        Dictionary with model rankings, evidence ratios, and probabilities
-    """
-    ic_values = []
-    for result in results:
-        ic = information_criteria(result)
-        ic_values.append(ic[criterion])
-
-    ic_values = np.array(ic_values)
-
-    min_ic = ic_values.min()
-    delta_ic = ic_values - min_ic
-
-    weights = np.exp(-0.5 * delta_ic)
-    weights = weights / weights.sum()
-
-    best_idx = int(np.argmin(ic_values))
-    evidence_ratios = weights[best_idx] / weights
-
-    rankings = stats.rankdata(ic_values, method="ordinal").astype(int)
-
-    return {
-        "criterion_values": ic_values.tolist(),
-        "delta": delta_ic.tolist(),
-        "weights": weights.tolist(),
-        "evidence_ratios": evidence_ratios.tolist(),
-        "rankings": rankings.tolist(),
-        "best_model_idx": best_idx,
     }

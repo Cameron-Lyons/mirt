@@ -5,7 +5,10 @@ import pytest
 
 from mirt import compute_dtf
 
-pytestmark = pytest.mark.slow
+pytestmark = [
+    pytest.mark.slow,
+    pytest.mark.filterwarnings("ignore:compute_dtf compares separately:UserWarning"),
+]
 
 
 class TestDTF:

@@ -7,11 +7,16 @@ from typing import Any, cast
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
+from scipy import stats
 from scipy.special import logsumexp
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
-from mirt.estimation.rt_gibbs import ResponseTimeGibbsSampler, RTModelPriors
+from mirt.estimation.rt_gibbs import (
+    _TIME_DISCRIMINATION_MH_STEPS,
+    ResponseTimeGibbsSampler,
+    RTModelPriors,
+)
 from mirt.exceptions import MirtValidationError
 from mirt.models.response_time import ResponseTimeModel
 
@@ -24,7 +29,7 @@ def _scalar_accuracy_update(
     difficulty: np.ndarray,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run the former scalar accuracy update as a reference."""
+    """Run the scalar accuracy update; prior and walk both live on log a."""
     updated_discrimination = discrimination.copy()
     updated_difficulty = difficulty.copy()
     for item_idx in range(len(discrimination)):
@@ -80,8 +85,6 @@ def _scalar_accuracy_update(
             + log_prior_proposed
             - log_like_current
             - log_prior_current
-            + log_disc_proposed
-            - log_disc_current
         )
         if np.log(rng.random()) < log_acceptance:
             updated_discrimination[item_idx] = disc_proposed
@@ -179,6 +182,248 @@ def test_vectorized_item_updates_match_scalar_reference() -> None:
     assert_array_equal(actual_disc, expected_disc)
     assert_array_equal(actual_diff, expected_diff)
     assert_array_equal(actual_guess, expected_guess)
+
+
+def _reference_time_update(
+    priors: RTModelPriors,
+    log_rt: np.ndarray,
+    tau: np.ndarray,
+    time_discrimination: np.ndarray,
+    time_intensity: np.ndarray,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate the time-parameter update one item at a time."""
+    n_items = log_rt.shape[1]
+    n_steps = _TIME_DISCRIMINATION_MH_STEPS
+    intensity_noise = rng.standard_normal(n_items)
+    step_noise = rng.standard_normal((n_steps, n_items))
+    log_uniform = np.log(rng.random((n_steps, n_items)))
+    updated_discrimination = time_discrimination.copy()
+    updated_intensity = time_intensity.copy()
+    for item_idx in range(n_items):
+        valid = ~np.isnan(log_rt[:, item_idx])
+        shifted = log_rt[valid, item_idx] + tau[valid]
+        n_valid = shifted.size
+        precision = time_discrimination[item_idx] ** 2
+        post_var = 1.0 / (1.0 / priors.time_int_var + n_valid * precision)
+        post_mean = post_var * (
+            priors.time_int_mean / priors.time_int_var + precision * shifted.sum()
+        )
+        intensity = post_mean + np.sqrt(post_var) * intensity_noise[item_idx]
+        updated_intensity[item_idx] = intensity
+        residuals = shifted - intensity
+
+        def log_target(eta: float, residuals: np.ndarray = residuals) -> float:
+            log_likelihood = np.sum(stats.norm.logpdf(residuals, scale=np.exp(-eta)))
+            log_prior = stats.norm.logpdf(
+                eta,
+                priors.time_disc_mean,
+                np.sqrt(priors.time_disc_var),
+            )
+            return float(log_likelihood + log_prior)
+
+        eta = np.log(time_discrimination[item_idx])
+        step = 2.4 / np.sqrt(2.0 * n_valid + 1.0 / priors.time_disc_var)
+        for step_idx in range(n_steps):
+            eta_proposed = eta + step * step_noise[step_idx, item_idx]
+            log_ratio = log_target(eta_proposed) - log_target(eta)
+            if log_uniform[step_idx, item_idx] < log_ratio:
+                eta = eta_proposed
+                updated_discrimination[item_idx] = np.exp(eta)
+    return updated_discrimination, updated_intensity
+
+
+def test_time_parameter_update_matches_itemwise_reference() -> None:
+    fixture_rng = np.random.default_rng(5)
+    log_rt = fixture_rng.normal(0.5, 0.6, size=(40, 6))
+    log_rt[fixture_rng.random(log_rt.shape) < 0.15] = np.nan
+    log_rt[:, 4] = np.nan
+    tau = fixture_rng.normal(size=40)
+    time_discrimination = fixture_rng.lognormal(0.0, 0.3, size=6)
+    time_intensity = fixture_rng.normal(0.0, 0.5, size=6)
+    priors = RTModelPriors(time_disc_mean=0.2, time_disc_var=0.5)
+    sampler = ResponseTimeGibbsSampler(n_iter=4, burnin=2, priors=priors)
+
+    expected = _reference_time_update(
+        priors,
+        log_rt,
+        tau,
+        time_discrimination,
+        time_intensity,
+        np.random.default_rng(3),
+    )
+    actual = sampler._sample_time_params(
+        log_rt,
+        tau,
+        time_discrimination,
+        time_intensity,
+        np.random.default_rng(3),
+    )
+
+    assert_allclose(actual[1], expected[1], rtol=1e-13, atol=1e-13)
+    assert_allclose(actual[0], expected[0], rtol=1e-14, atol=0.0)
+    assert np.any(actual[0] != time_discrimination)
+
+
+def test_time_discrimination_prior_is_stationary_without_timing_data() -> None:
+    """With every response time missing the item draws follow their priors."""
+    priors = RTModelPriors(
+        time_disc_mean=0.4,
+        time_disc_var=0.25,
+        time_int_mean=1.0,
+        time_int_var=0.5,
+    )
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1, priors=priors)
+    rng = np.random.default_rng(0)
+    n_items = 200
+    log_rt = np.full((3, n_items), np.nan)
+    tau = np.zeros(3)
+    time_discrimination = np.ones(n_items)
+    time_intensity = np.zeros(n_items)
+    log_discrimination_draws = []
+    intensity_draws = []
+    for iteration in range(1500):
+        time_discrimination, time_intensity = sampler._sample_time_params(
+            log_rt,
+            tau,
+            time_discrimination,
+            time_intensity,
+            rng,
+        )
+        if iteration >= 200:
+            log_discrimination_draws.append(np.log(time_discrimination))
+            intensity_draws.append(time_intensity)
+    log_discrimination = np.asarray(log_discrimination_draws)
+    intensity = np.asarray(intensity_draws)
+
+    assert abs(log_discrimination.mean() - 0.4) < 0.05
+    assert abs(log_discrimination.var() / 0.25 - 1.0) < 0.1
+    assert abs(intensity.mean() - 1.0) < 0.05
+    assert abs(intensity.var() / 0.5 - 1.0) < 0.1
+
+
+def test_accuracy_discrimination_prior_has_no_jacobian_shift() -> None:
+    """Regression: a spurious Jacobian moved the stationary mean to m + v."""
+    priors = RTModelPriors(disc_mean=0.2, disc_var=0.25)
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1, priors=priors)
+    rng = np.random.default_rng(0)
+    n_items = 20
+    responses = np.full((2, n_items), -1, dtype=np.int32)
+    theta = np.zeros(2)
+    discrimination = np.ones(n_items)
+    difficulty = np.zeros(n_items)
+    log_discrimination_draws = []
+    for iteration in range(1000):
+        discrimination, difficulty = sampler._sample_accuracy_params(
+            responses,
+            theta,
+            discrimination,
+            difficulty,
+            rng,
+        )
+        if iteration >= 100:
+            log_discrimination_draws.append(np.log(discrimination))
+
+    assert abs(np.mean(log_discrimination_draws) - 0.2) < 0.12
+
+
+def test_time_parameter_update_ignores_covariance_prior_df() -> None:
+    """Regression: the time-precision draw used sigma_df as its Gamma prior."""
+    fixture_rng = np.random.default_rng(13)
+    log_rt = fixture_rng.normal(0.0, 0.5, size=(25, 4))
+    tau = fixture_rng.normal(size=25)
+    draws = [
+        ResponseTimeGibbsSampler(
+            n_iter=2,
+            burnin=1,
+            priors=RTModelPriors(sigma_df=sigma_df),
+        )._sample_time_params(
+            log_rt,
+            tau,
+            np.ones(4),
+            np.zeros(4),
+            np.random.default_rng(1),
+        )
+        for sigma_df in (2, 50)
+    ]
+
+    assert_array_equal(draws[0][0], draws[1][0])
+    assert_array_equal(draws[0][1], draws[1][1])
+
+
+def test_time_discrimination_update_mixes_within_one_sweep() -> None:
+    """Several cheap Metropolis steps keep successive draws nearly independent.
+
+    A single random-walk step per sweep left a lag-one autocorrelation of
+    about 0.6 here; the direct Gamma draw it replaced mixed almost perfectly.
+    """
+    data_rng = np.random.default_rng(2)
+    alpha = np.linspace(0.8, 2.5, 8)
+    tau = data_rng.normal(size=200)
+    log_rt = (
+        np.linspace(-0.5, 1.0, 8)
+        - tau[:, None]
+        + data_rng.normal(size=(200, 8)) / alpha
+    )
+    sampler = ResponseTimeGibbsSampler(n_iter=2, burnin=1)
+    rng = np.random.default_rng(0)
+    time_discrimination = np.ones(8)
+    time_intensity = np.zeros(8)
+    draws = []
+    for iteration in range(1200):
+        time_discrimination, time_intensity = sampler._sample_time_params(
+            log_rt,
+            tau,
+            time_discrimination,
+            time_intensity,
+            rng,
+        )
+        if iteration >= 200:
+            draws.append(np.log(time_discrimination))
+    centered = np.asarray(draws) - np.mean(draws, axis=0)
+    lag_one = np.sum(centered[1:] * centered[:-1], axis=0) / np.sum(centered**2, axis=0)
+
+    assert np.max(lag_one) < 0.25
+
+
+def test_tight_time_discrimination_prior_moves_posterior_towards_prior() -> None:
+    generating_model = ResponseTimeModel(5, use_rust=False)
+    responses, response_times, _, _ = generating_model.simulate(30, seed=3)
+
+    def posterior_time_discrimination(priors: RTModelPriors) -> np.ndarray:
+        result = ResponseTimeGibbsSampler(
+            n_iter=400,
+            burnin=200,
+            priors=priors,
+            seed=5,
+        ).fit(responses, response_times)
+        return result.model.time_discrimination
+
+    default = posterior_time_discrimination(RTModelPriors())
+    tight = posterior_time_discrimination(
+        RTModelPriors(time_disc_mean=np.log(3.0), time_disc_var=0.01)
+    )
+
+    assert np.all(tight > default + 0.3)
+    assert np.all(tight < 3.0)
+
+
+def test_time_discrimination_is_recovered_at_default_priors() -> None:
+    alpha = np.linspace(0.8, 2.5, 10)
+    generating_model = ResponseTimeModel(
+        10,
+        time_discrimination=alpha,
+        time_intensity=np.linspace(-0.5, 1.0, 10),
+        use_rust=False,
+    )
+    responses, response_times, _, _ = generating_model.simulate(500, seed=11)
+
+    result = ResponseTimeGibbsSampler(n_iter=400, burnin=200, seed=7).fit(
+        responses,
+        response_times,
+    )
+
+    assert_allclose(result.model.time_discrimination, alpha, atol=0.15)
 
 
 @pytest.mark.parametrize(

@@ -22,6 +22,11 @@ Examples
 >>>
 >>> # Compare all invariance levels
 >>> results = compare_invariance(data, groups, model="2PL")
+>>>
+>>> # Likelihood-ratio DIF tests over selected anchor items
+>>> from mirt.multigroup import multigroup_dif, select_dif_anchors
+>>> anchors = select_dif_anchors(data, groups, model="2PL")
+>>> table = multigroup_dif(data, groups, scheme="add", anchors=anchors)
 """
 
 from __future__ import annotations
@@ -30,14 +35,21 @@ import importlib
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
     from numpy.typing import NDArray
 
     from mirt.multigroup.invariance import InvarianceSpec
+    from mirt.multigroup.model import MultigroupModel
     from mirt.multigroup.results import MultigroupFitResult
+
+    _ItemFamily = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 
 
 _LAZY_IMPORTS = {
+    "multigroup_dif": ("mirt.multigroup.dif", "multigroup_dif"),
+    "select_dif_anchors": ("mirt.multigroup.dif", "select_dif_anchors"),
     "MultigroupFitResult": ("mirt.multigroup.results", "MultigroupFitResult"),
     "MultigroupModel": ("mirt.multigroup.model", "MultigroupModel"),
     "MultigroupEMEstimator": (
@@ -64,18 +76,19 @@ _LAZY_IMPORTS = {
 
 
 def fit_multigroup(
-    data: NDArray[np.int_],
+    data: NDArray[np.int_] | Any,
     groups: NDArray,
-    model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
+    model: _ItemFamily | Sequence[_ItemFamily] = "2PL",
     invariance: Literal["configural", "metric", "scalar", "strict"]
     | InvarianceSpec = "configural",
-    n_categories: int | None = None,
+    n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     free_items: dict[str, list[int]] | None = None,
+    item_names: list[str] | None = None,
 ) -> MultigroupFitResult:
     """Fit a multiple group IRT model with measurement invariance constraints.
 
@@ -85,12 +98,15 @@ def fit_multigroup(
 
     Parameters
     ----------
-    data : ndarray of shape (n_persons, n_items)
-        Combined response matrix for all groups.
+    data : ndarray or DataFrame of shape (n_persons, n_items)
+        Combined response matrix for all groups. Missing responses are coded
+        as negative values or ``NaN``.
     groups : ndarray of shape (n_persons,)
         Group membership indicator for each person.
-    model : str
+    model : str or sequence of str
         IRT model type: "1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM".
+        As in ``fit_mirt``, a per-item sequence naming one family fits that
+        family; mixed families raise ``MirtValidationError``.
     invariance : str or InvarianceSpec
         Level of measurement invariance:
 
@@ -99,8 +115,10 @@ def fit_multigroup(
         - 'scalar': Discrimination and intercepts constrained equal
         - 'strict': All item parameters constrained equal
 
-    n_categories : int, optional
-        Number of response categories for polytomous models.
+    n_categories : int or sequence of int, optional
+        Category count for all polytomous items, or one count per item. If
+        None, each item's count is inferred from its largest code observed in
+        any group, with a minimum of two.
     n_quadpts : int
         Number of quadrature points for numerical integration.
     max_iter : int
@@ -109,10 +127,16 @@ def fit_multigroup(
         Convergence tolerance.
     verbose : bool
         Print iteration progress.
-    reference_group : int or str
-        Group to use as reference (mean=0, var=1). Can be index or label.
+    reference_group : int or str, optional
+        Group to use as reference (mean=0, var=1): an index into the sorted
+        group labels, or a label matched against ``str(label)``. An integer
+        that is also the label of another group raises ``ValueError``.
+        Defaults to the first group in sorted order.
     free_items : dict, optional
         For partial invariance: {param_name: [item_indices]} to free.
+    item_names : list of str, optional
+        Names for each item. If None, unique DataFrame column names are used
+        when available.
 
     Returns
     -------
@@ -132,88 +156,18 @@ def fit_multigroup(
     ...     free_items={"discrimination": [5]}
     ... )
     """
-    import numpy as np
-
-    from mirt.models.dichotomous import (
-        FourParameterLogistic,
-        OneParameterLogistic,
-        ThreeParameterLogistic,
-        TwoParameterLogistic,
-    )
-    from mirt.models.polytomous import (
-        GeneralizedPartialCredit,
-        GradedResponseModel,
-        NominalResponseModel,
-        PartialCreditModel,
-    )
     from mirt.multigroup.estimator import MultigroupEMEstimator
     from mirt.multigroup.invariance import parse_invariance
-    from mirt.multigroup.model import MultigroupModel
 
-    data = np.asarray(data)
-    groups = np.asarray(groups)
-
-    if data.ndim != 2:
-        raise ValueError(f"data must be 2D, got {data.ndim}D")
-    if groups.shape[0] != data.shape[0]:
-        raise ValueError(
-            f"groups length ({groups.shape[0]}) must match data rows ({data.shape[0]})"
-        )
-
-    unique_groups = np.unique(groups)
-    n_groups = len(unique_groups)
-
-    if n_groups < 2:
-        raise ValueError("At least 2 groups required for multiple group analysis")
-
-    group_labels = [str(g) for g in unique_groups]
-    if isinstance(reference_group, str):
-        if reference_group not in group_labels:
-            raise ValueError(f"Unknown reference group: {reference_group}")
-        ref_idx = group_labels.index(reference_group)
-    else:
-        ref_idx = reference_group
-
-    n_items = data.shape[1]
-
-    is_polytomous = model in ("GRM", "GPCM", "PCM", "NRM")
-    if is_polytomous:
-        if n_categories is None:
-            n_categories = int(data[data >= 0].max()) + 1
-
-    if model == "1PL":
-        base_model = OneParameterLogistic(n_items=n_items)
-    elif model == "2PL":
-        base_model = TwoParameterLogistic(n_items=n_items)
-    elif model == "3PL":
-        base_model = ThreeParameterLogistic(n_items=n_items)
-    elif model == "4PL":
-        base_model = FourParameterLogistic(n_items=n_items)
-    elif model == "GRM":
-        base_model = GradedResponseModel(n_items=n_items, n_categories=n_categories)
-    elif model == "GPCM":
-        base_model = GeneralizedPartialCredit(
-            n_items=n_items, n_categories=n_categories
-        )
-    elif model == "PCM":
-        base_model = PartialCreditModel(n_items=n_items, n_categories=n_categories)
-    elif model == "NRM":
-        base_model = NominalResponseModel(n_items=n_items, n_categories=n_categories)
-    else:
-        raise ValueError(f"Unknown model: {model}")
-
-    mg_model = MultigroupModel(
-        base_model=base_model,
-        n_groups=n_groups,
-        group_labels=group_labels,
+    mg_model, group_responses, ref_idx = _prepare_multigroup(
+        data,
+        groups,
+        model,
+        n_categories=n_categories,
+        reference_group=reference_group,
+        item_names=item_names,
     )
-
     inv_spec = parse_invariance(invariance, free_items)
-
-    group_responses = []
-    for g_val in unique_groups:
-        mask = groups == g_val
-        group_responses.append(data[mask])
 
     estimator = MultigroupEMEstimator(
         n_quadpts=n_quadpts,
@@ -232,16 +186,101 @@ def fit_multigroup(
     return result
 
 
+def _prepare_multigroup(
+    data: NDArray[np.int_] | Any,
+    groups: NDArray,
+    model: str | Sequence[str],
+    *,
+    n_categories: int | Sequence[int] | None,
+    reference_group: int | str | None,
+    item_names: list[str] | None,
+) -> tuple[MultigroupModel, list[NDArray[np.int_]], int]:
+    """Build an unfitted multigroup model, per-group responses and reference index.
+
+    Groups are ordered by their sorted unique labels. A string
+    ``reference_group`` is matched against ``str(label)``; an integer is a
+    group index and must not be the label of a different group; ``None`` is
+    the first group.
+    """
+    import numpy as np
+
+    from mirt.models._factory import build_item_model, single_item_family
+    from mirt.multigroup.model import MultigroupModel
+    from mirt.utils.data import response_column_names, validate_responses
+
+    if item_names is None:
+        item_names = response_column_names(data)
+    data = validate_responses(data)
+    # Like fit_mirt, a per-item sequence of one family fits that family.
+    model = single_item_family(model, data.shape[1], operation="multigroup models")
+    groups = np.asarray(groups)
+
+    if groups.shape[0] != data.shape[0]:
+        raise ValueError(
+            f"groups length ({groups.shape[0]}) must match data rows ({data.shape[0]})"
+        )
+
+    unique_groups = np.unique(groups)
+    n_groups = len(unique_groups)
+
+    if n_groups < 2:
+        raise ValueError("At least 2 groups required for multiple group analysis")
+
+    group_labels = [str(g) for g in unique_groups]
+    if reference_group is None:
+        ref_idx = 0
+    elif isinstance(reference_group, str):
+        if reference_group not in group_labels:
+            raise ValueError(f"Unknown reference group: {reference_group}")
+        ref_idx = group_labels.index(reference_group)
+    else:
+        ref_idx = reference_group
+        label = str(reference_group)
+        if (
+            not isinstance(reference_group, (bool, np.bool_))
+            and isinstance(reference_group, (int, np.integer))
+            and label in group_labels
+            and group_labels.index(label) != reference_group
+        ):
+            advice = f"pass reference_group={label!r} to select that group by label"
+            if 0 <= reference_group < n_groups:
+                advice += (
+                    f", or reference_group={group_labels[reference_group]!r} for "
+                    f"group index {reference_group}"
+                )
+            raise ValueError(
+                f"reference_group={reference_group} is a group index, but it is "
+                f"also the label of group {group_labels.index(label)}; {advice}"
+            )
+
+    # Categories come from the pooled data so every group shares one structure.
+    base_model = build_item_model(
+        model,
+        data.shape[1],
+        n_categories=n_categories,
+        item_names=item_names,
+        responses=data,
+    )
+
+    mg_model = MultigroupModel(
+        base_model=base_model,
+        n_groups=n_groups,
+        group_labels=group_labels,
+    )
+    group_responses = [data[groups == g_val] for g_val in unique_groups]
+    return mg_model, group_responses, ref_idx
+
+
 def compare_invariance(
     data: NDArray[np.int_],
     groups: NDArray,
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
-    n_categories: int | None = None,
+    n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
 ) -> dict[str, MultigroupFitResult]:
     """Fit and compare different invariance levels.
 
@@ -253,8 +292,8 @@ def compare_invariance(
         Group membership array.
     model : str
         IRT model type.
-    n_categories : int, optional
-        Number of categories for polytomous models.
+    n_categories : int or sequence of int, optional
+        Category count for all polytomous items, or one count per item.
     n_quadpts : int
         Number of quadrature points.
     max_iter : int
@@ -263,8 +302,8 @@ def compare_invariance(
         Convergence tolerance.
     verbose : bool
         Print progress.
-    reference_group : int or str
-        Reference group for identification.
+    reference_group : int or str, optional
+        Reference group for identification, as in :func:`fit_multigroup`.
 
     Returns
     -------
@@ -307,12 +346,12 @@ def test_invariance_hierarchy(
     data: NDArray[np.int_],
     groups: NDArray,
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
-    n_categories: int | None = None,
+    n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     alpha: float = 0.05,
 ) -> dict[str, Any]:
     """Test full invariance hierarchy with likelihood ratio tests.
@@ -325,8 +364,8 @@ def test_invariance_hierarchy(
         Group membership array.
     model : str
         IRT model type.
-    n_categories : int, optional
-        Number of categories for polytomous models.
+    n_categories : int or sequence of int, optional
+        Category count for all polytomous items, or one count per item.
     n_quadpts : int
         Number of quadrature points.
     max_iter : int
@@ -335,8 +374,8 @@ def test_invariance_hierarchy(
         Convergence tolerance.
     verbose : bool
         Print progress.
-    reference_group : int or str
-        Reference group for identification.
+    reference_group : int or str, optional
+        Reference group for identification, as in :func:`fit_multigroup`.
     alpha : float
         Significance level for LRT tests.
 
@@ -404,6 +443,8 @@ __all__ = [
     "fit_multigroup",
     "compare_invariance",
     "test_invariance_hierarchy",
+    "multigroup_dif",
+    "select_dif_anchors",
     "MultigroupFitResult",
     "MultigroupModel",
     "MultigroupEMEstimator",

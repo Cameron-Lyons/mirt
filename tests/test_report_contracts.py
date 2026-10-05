@@ -304,3 +304,142 @@ def test_report_exports_do_not_depend_on_plotting_extra() -> None:
 
     assert "generate_report" in mirt.__all__
     assert "ItemAnalysisReport" in mirt.__all__
+
+
+def _section_rows(html: str, heading: str) -> list[list[str]]:
+    """Return the text cells of the first table after ``heading``."""
+    import re
+
+    start = html.index(f"<h2>{heading}</h2>")
+    table = html[start : html.index("</table>", start)]
+    body = table[table.index("<tbody>") :]
+    return [
+        [re.sub(r"<[^>]+>", "", cell) for cell in re.findall(r"<td>(.*?)</td>", row)]
+        for row in re.findall(r"<tr>(.*?)</tr>", body)
+    ]
+
+
+def _parameter_reports(result: Any, responses: np.ndarray) -> list[Any]:
+    from mirt.reports import FullDiagnosticReport, ItemAnalysisReport
+
+    return [
+        ItemAnalysisReport(result, responses, include_plots=False),
+        FullDiagnosticReport(result, responses, include_ld=False, include_plots=False),
+    ]
+
+
+@pytest.fixture(scope="module")
+def grm_report_data() -> tuple[Any, np.ndarray]:
+    from mirt import fit_mirt
+
+    rng = np.random.default_rng(419)
+    responses = rng.integers(0, 3, size=(120, 4))
+    return fit_mirt(responses, model="GRM", max_iter=5), responses
+
+
+def test_reports_include_every_matrix_parameter_cell(
+    grm_report_data: tuple[Any, np.ndarray],
+) -> None:
+    # Two-dimensional parameters such as GRM thresholds used to be omitted.
+    result, responses = grm_report_data
+    thresholds = result.model.parameters["thresholds"]
+
+    for report in _parameter_reports(result, responses):
+        rows = _section_rows(report.generate(), "Item Parameters")
+        threshold_rows = [row for row in rows if row[1] == "thresholds"]
+        assert len(threshold_rows) == thresholds.size
+        assert threshold_rows[1][0] == f"{result.model.item_names[0]}[1]"
+        assert float(threshold_rows[1][2]) == pytest.approx(thresholds[0, 1], abs=5e-5)
+
+
+def test_reports_include_multidimensional_discriminations() -> None:
+    from mirt import fit_mirt, simdata
+
+    responses = simdata(n_persons=120, n_items=6, seed=420)
+    result = fit_mirt(responses, model="2PL", n_factors=2, n_quadpts=7, max_iter=3)
+
+    for report in _parameter_reports(result, responses):
+        rows = _section_rows(report.generate(), "Item Parameters")
+        labels = [row[0] for row in rows if row[1] == "discrimination"]
+        assert len(labels) == 12
+        assert labels[:2] == ["Item_1[0]", "Item_1[1]"]
+
+
+def test_reports_render_unknown_standard_errors_as_missing(
+    fitted_report_data: tuple[Any, np.ndarray],
+) -> None:
+    from mirt.results import FitResult
+
+    result, responses = fitted_report_data
+    without_errors = FitResult(
+        model=result.model,
+        log_likelihood=result.log_likelihood,
+        n_iterations=result.n_iterations,
+        converged=result.converged,
+        standard_errors={},
+        aic=result.aic,
+        bic=result.bic,
+        n_observations=result.n_observations,
+        n_parameters=result.n_parameters,
+    )
+
+    for report in _parameter_reports(without_errors, responses):
+        rows = _section_rows(report.generate(), "Item Parameters")
+        assert rows
+        # Missing errors used to render as an exact 0.0000.
+        assert all(row[3] == "NA" and row[-1] == "NA" for row in rows)
+
+
+def test_report_inference_matches_fit_result_statistics(
+    fitted_report_data: tuple[Any, np.ndarray],
+) -> None:
+    from mirt.reports import ItemAnalysisReport
+
+    result, responses = fitted_report_data
+    statistics = result.parameter_statistics()
+    rows = _section_rows(
+        ItemAnalysisReport(result, responses, include_plots=False).generate(),
+        "Item Parameters",
+    )
+
+    for name, values in statistics.items():
+        parameter_rows = [row for row in rows if row[1] == name]
+        assert len(parameter_rows) == values["estimate"].size
+        for index, row in enumerate(parameter_rows):
+            assert row[0] == result.model.item_names[index]
+            assert float(row[3]) == pytest.approx(
+                values["standard_error"][index], abs=5e-5
+            )
+            assert float(row[5]) == pytest.approx(values["p_value"][index], abs=5e-5)
+            lower, upper = (float(value) for value in row[6].strip("[]").split(","))
+            assert lower == pytest.approx(values["ci_lower"][index], abs=5e-4)
+            assert upper == pytest.approx(values["ci_upper"][index], abs=5e-4)
+
+
+def test_item_fit_tables_share_flag_rules(
+    fitted_report_data: tuple[Any, np.ndarray],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mirt.diagnostics.itemfit as itemfit_module
+
+    result, responses = fitted_report_data
+    infit = np.array([1.0, 1.25, 1.4, 0.75, 1.0, 1.0, 1.0, np.nan])
+    monkeypatch.setattr(
+        itemfit_module,
+        "compute_itemfit",
+        lambda *args, **kwargs: {"infit": infit, "outfit": np.ones(8)},
+    )
+
+    for report in _parameter_reports(result, responses):
+        rows = _section_rows(report.generate(), "Item Fit Statistics")
+        assert [row[-1] for row in rows] == [
+            "",
+            "Check",
+            "Misfit",
+            "Check",
+            "",
+            "",
+            "",
+            "",
+        ]
+        assert rows[-1][1] == "NA"

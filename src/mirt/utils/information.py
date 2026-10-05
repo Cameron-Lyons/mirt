@@ -4,6 +4,7 @@ Provides functions for computing test and item information,
 area under information curves, and probability traces.
 """
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -32,6 +33,24 @@ _INFORMATION_INTERVAL_THETA_TOLERANCE = 1e-8
 _EXPECTED_SCORE_CHUNK_ELEMENTS = 262_144
 
 
+def _polytomous_item_columns(
+    model: "BaseItemModel",
+) -> Callable[[NDArray[np.float64]], NDArray[np.float64]] | None:
+    """Return the all-item information hook of an unmodified polytomous model.
+
+    Its columns equal ``model.information(theta, item_idx=j)`` whenever the
+    model keeps the shared ``information`` method.
+    """
+    from mirt._model_defaults import uses_original_model_hook
+    from mirt.models.base import PolytomousItemModel
+
+    if isinstance(model, PolytomousItemModel) and uses_original_model_hook(
+        model, "information"
+    ):
+        return model._information_by_item
+    return None
+
+
 def _item_information_matrix(
     model: "BaseItemModel",
     theta: NDArray[np.float64],
@@ -44,9 +63,11 @@ def _item_information_matrix(
     result = np.empty((theta.shape[0], len(indices)))
     if not indices:
         return result
+    item_columns = _polytomous_item_columns(model)
+    all_items = model.information if item_columns is None else item_columns
     individual = (
         single_item
-        or getattr(model, "is_polytomous", False)
+        or (item_columns is None and getattr(model, "is_polytomous", False))
         or (item_indices is not None and len(set(indices)) * 4 < model.n_items)
     )
     # Keep column writes within a bounded output block, including when an
@@ -57,7 +78,7 @@ def _item_information_matrix(
         block = theta[start : start + rows_per_block]
         target = result[start : start + rows_per_block]
         if not individual:
-            values = np.asarray(model.information(block), dtype=np.float64)
+            values = np.asarray(all_items(block), dtype=np.float64)
             if values.shape == (block.shape[0], model.n_items):
                 if item_indices is not None:
                     values = values[:, item_indices]

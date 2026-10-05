@@ -8,9 +8,11 @@ import pytest
 from scipy.optimize import minimize
 from scipy.special import xlog1py, xlogy
 
+import mirt
 from mirt.estimation import em as em_module
 from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
 from mirt.estimation.em import EMEstimator
+from mirt.estimation.priors import NormalPrior
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     OneParameterLogistic,
@@ -241,6 +243,132 @@ def test_custom_dichotomous_models_use_their_public_probability(monkeypatch, cha
         return SimpleNamespace(x=trial)
 
     monkeypatch.setattr(em_module, "minimize", minimize)
-    estimator._optimize_item_params(
-        model, 0, responses, posterior, points, posterior.sum(axis=0)
+    estimator._optimize_item_params(model, 0, responses, posterior, points)
+
+
+@pytest.fixture(scope="module")
+def responses_3pl():
+    rng = np.random.default_rng(21)
+    n_persons, n_items = 1000, 12
+    theta = rng.standard_normal(n_persons)
+    a = rng.uniform(0.8, 2.0, n_items)
+    b = rng.normal(0.0, 1.0, n_items)
+    c = rng.uniform(0.05, 0.25, n_items)
+    probability = c + (1 - c) / (1 + np.exp(-a * (theta[:, None] - b)))
+    responses = (rng.random(probability.shape) < probability).astype(int)
+    responses[rng.random(responses.shape) < 0.03] = -1
+    return responses
+
+
+@pytest.fixture(scope="module")
+def native_3pl(responses_3pl):
+    return EMEstimator(compute_standard_errors=False).fit(
+        ThreeParameterLogistic(12), responses_3pl
     )
+
+
+def _assert_same_fit(result, reference):
+    assert result.converged
+    assert result.log_likelihood == pytest.approx(reference.log_likelihood, abs=1e-3)
+    assert result.n_iterations <= reference.n_iterations + 5
+    for name, values in reference.model.parameters.items():
+        np.testing.assert_allclose(result.model.parameters[name], values, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"n_jobs": 2},
+        {"use_rust": False},
+        {"item_priors": {"difficulty": NormalPrior(0.0, 1e4)}},
+    ],
+    ids=["threads", "numpy", "flat-prior"],
+)
+def test_generic_3pl_m_steps_reach_the_native_optimum(
+    responses_3pl, native_3pl, options
+):
+    # Loosely solved 3PL items jittered between M-steps, which stopped EM
+    # hundreds of iterations later at estimates up to 0.7 away.
+    result = EMEstimator(compute_standard_errors=False, **options).fit(
+        ThreeParameterLogistic(12), responses_3pl
+    )
+    _assert_same_fit(result, native_3pl)
+
+
+def test_coordinate_fixed_at_its_estimate_reproduces_the_fit(responses_3pl, native_3pl):
+    fixed = np.zeros(12, dtype=bool)
+    fixed[0] = True
+    guessing = native_3pl.model.parameters["guessing"]
+    result = mirt.fit_mirt(
+        responses_3pl,
+        model="3PL",
+        compute_standard_errors=False,
+        start_values={"guessing": guessing},
+        fixed={"guessing": fixed},
+    )
+    assert result.model.parameters["guessing"][0] == guessing[0]
+    _assert_same_fit(result, native_3pl)
+
+
+def _item_tolerances(monkeypatch, model, estimator):
+    tolerances = []
+
+    def minimize(objective, x0, **kwargs):
+        tolerances.append(kwargs["options"]["ftol"])
+        return SimpleNamespace(x=x0)
+
+    monkeypatch.setattr(em_module, "minimize", minimize)
+    points = np.array([[-1.0], [0.0], [1.0]])
+    responses = np.array([[0], [1], [1]])
+    estimator._optimize_item_params(model, 0, responses, np.full((3, 3), 1 / 3), points)
+    return tolerances
+
+
+def test_analytic_dichotomous_items_use_the_precise_tolerance(monkeypatch):
+    class Custom(ThreeParameterLogistic):
+        def probability(self, theta, item_idx=None):
+            return super().probability(theta, item_idx)
+
+    estimator = EMEstimator(item_optim_ftol=1e-6)
+    restricted = ThreeParameterLogistic(1)
+    restricted.set_free_parameter_masks({"guessing": np.array([False])})
+    for model in (ThreeParameterLogistic(1), restricted):
+        assert _item_tolerances(monkeypatch, model, estimator) == [1e-10]
+    # Numerical objectives keep the configured tolerance.
+    assert _item_tolerances(monkeypatch, Custom(1), estimator) == [1e-6]
+
+
+def test_fixed_coordinates_keep_the_analytic_item_objective():
+    values = {
+        "discrimination": np.array([1.3, 0.9]),
+        "difficulty": np.array([0.2, -0.4]),
+        "guessing": np.array([0.15, 0.1]),
+    }
+    free = {"difficulty": np.array([True, False]), "guessing": np.array([False, True])}
+    model = ThreeParameterLogistic(2).set_parameters(**values)
+    model.set_free_parameter_masks(free)
+    full = ThreeParameterLogistic(2).set_parameters(**values)
+    rng = np.random.default_rng(7)
+    points = np.linspace(-3.0, 3.0, 9)[:, None]
+    observed = rng.uniform(5.0, 20.0, 9)
+    correct = observed * rng.uniform(0.1, 0.9, 9)
+    responses = np.zeros((1, 2), dtype=int)
+    estimator = EMEstimator()
+    for item in range(2):
+        start, _, objective, analytic = estimator._item_objective(
+            model, item, responses, None, points, r_k=correct, n_k_valid=observed
+        )
+        assert analytic and start.size == 2
+        trial = start + 0.05
+        value, gradient = objective(trial)
+        # The unrestricted objective at the same point, with the fixed
+        # coordinate at its value.
+        mask = np.array([True, free["difficulty"][item], free["guessing"][item]])
+        point = np.array([values[name][item] for name in values])
+        point[mask] = trial
+        _, _, unrestricted, _ = estimator._item_objective(
+            full, item, responses, None, points, r_k=correct, n_k_valid=observed
+        )
+        expected_value, expected_gradient = unrestricted(point)
+        assert value == pytest.approx(expected_value, rel=1e-14)
+        np.testing.assert_allclose(gradient, expected_gradient[mask], rtol=1e-14)

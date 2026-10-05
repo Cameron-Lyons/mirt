@@ -854,6 +854,27 @@ class TestDifPlot:
         assert axes.calls["bar"][0][1]["width"] == 0.6
         assert len(axes.calls["scatter"]) == 3
 
+    def test_untested_items_are_drawn_with_zero_height(self):
+        axes = RecordingAxes()
+
+        plotting.plot_dif(
+            {
+                "effect_size": np.array([0.7, np.nan]),
+                "classification": np.array(["C", "A"]),
+            },
+            ax=axes,
+        )
+
+        np.testing.assert_array_equal(axes.calls["bar"][0][0][1], [0.7, 0.0])
+        with pytest.raises(ValueError, match="finite"):
+            plotting.plot_dif(
+                {
+                    "effect_size": np.array([0.7, np.inf]),
+                    "classification": np.array(["C", "A"]),
+                },
+                ax=RecordingAxes(),
+            )
+
     def test_custom_color_skips_classification_handles(self):
         axes = RecordingAxes()
 
@@ -1030,3 +1051,58 @@ class TestRealModels:
         assert plotting.plot_expected_score(model, factor=1, ax=RecordingAxes())
         assert plotting.plot_se(model, factor=1, ax=RecordingAxes())
         assert plotting.plot_person_item_map(model, theta, factor=1, ax=RecordingAxes())
+
+
+def _assert_same_calls(expected: RecordingAxes, actual: RecordingAxes) -> None:
+    assert expected.calls.keys() == actual.calls.keys()
+    for name, calls in expected.calls.items():
+        assert len(actual.calls[name]) == len(calls)
+        for (args, kwargs), (other_args, other_kwargs) in zip(
+            calls, actual.calls[name], strict=True
+        ):
+            assert len(args) == len(other_args)
+            for value, other in zip(args, other_args, strict=True):
+                if isinstance(value, np.ndarray):
+                    np.testing.assert_array_equal(other, value)
+                else:
+                    assert other == value
+            assert other_kwargs == kwargs
+    if expected.secondary is not None:
+        assert actual.secondary is not None
+        _assert_same_calls(expected.secondary, actual.secondary)
+
+
+@pytest.mark.parametrize(
+    ("plotter", "kwargs"),
+    [
+        ("plot_icc", {}),
+        ("plot_category_curves", {"item_idx": 1}),
+        ("plot_information", {"item_idx": [0, 2]}),
+        ("plot_expected_score", {}),
+        ("plot_se", {}),
+        ("plot_person_item_map", {"theta": np.linspace(-2.0, 2.0, 7)}),
+    ],
+)
+def test_model_plotters_accept_fit_results(plotter: str, kwargs: dict[str, Any]):
+    # A FitResult used to fail with "model.n_items must be a positive integer".
+    from mirt.results import FitResult
+
+    model = TwoParameterLogistic(n_items=3, item_names=["A", "B", "C"])
+    model.set_parameters(difficulty=np.array([-1.0, 0.0, 1.5]))
+    result = FitResult(
+        model=model,
+        log_likelihood=-1.0,
+        n_iterations=1,
+        converged=True,
+        standard_errors={},
+        aic=0.0,
+        bic=0.0,
+    )
+    function = getattr(plotting, plotter)
+    expected = RecordingAxes()
+    actual = RecordingAxes()
+
+    function(model, ax=expected, **kwargs)
+    function(result, ax=actual, **kwargs)
+
+    _assert_same_calls(expected, actual)

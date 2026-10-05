@@ -9,10 +9,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt._correlation import pairwise_correlations
 from mirt.constants import PROB_EPSILON
+from mirt.utils.data import _response_array
 
 _MIN_LD_PAIR_RESPONSES = 5
 _MIN_EXPECTED_CELL = 0.5
@@ -79,7 +80,7 @@ def _coerce_responses_theta(
     theta: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
     """Normalize and validate response/theta inputs."""
-    responses_f = np.asarray(responses, dtype=np.float64)
+    responses_f = np.asarray(_response_array(responses), dtype=np.float64)
     theta_2d = np.asarray(np.atleast_1d(theta), dtype=np.float64)
     if theta_2d.ndim == 1:
         theta_2d = theta_2d.reshape(-1, 1)
@@ -316,7 +317,7 @@ def _residual_summary(
 
 def residuals(
     model: "BaseItemModel",
-    responses: NDArray[np.float64],
+    responses: ArrayLike,
     theta: NDArray[np.float64],
     type: Literal["raw", "standardized", "pearson", "deviance"] = "standardized",
     suppress_abs: float | None = None,
@@ -328,9 +329,9 @@ def residuals(
     ----------
     model : BaseItemModel
         A fitted IRT model.
-    responses : NDArray[np.float64]
-        Integer-coded response matrix. Shape: (n_persons, n_items). Missing
-        responses may be coded as ``-1`` or ``NaN``.
+    responses : array-like of shape (n_persons, n_items)
+        Integer-coded response matrix or DataFrame. Missing responses may be
+        coded as ``-1``, ``NaN`` or the nulls of nullable DataFrame columns.
     theta : NDArray[np.float64]
         Ability estimates. Shape: (n_persons,) or (n_persons, n_dims).
     type : str
@@ -442,7 +443,7 @@ def _compute_ld_matrix(
 
 def Q3(
     model: "BaseItemModel",
-    responses: NDArray[np.float64],
+    responses: ArrayLike,
     theta: NDArray[np.float64],
     use_rust: bool = True,
 ) -> NDArray[np.float64]:
@@ -455,8 +456,9 @@ def Q3(
     ----------
     model : BaseItemModel
         A fitted IRT model.
-    responses : NDArray[np.float64]
-        Integer-coded response matrix. Missing values may be ``-1`` or ``NaN``.
+    responses : array-like of shape (n_persons, n_items)
+        Integer-coded response matrix or DataFrame. Missing values may be
+        ``-1``, ``NaN`` or the nulls of nullable DataFrame columns.
     theta : NDArray[np.float64]
         Ability estimates.
     use_rust : bool
@@ -657,7 +659,7 @@ def _pairwise_polytomous_ld_x2(
 
 def LD_X2(
     model: "BaseItemModel",
-    responses: NDArray[np.float64],
+    responses: ArrayLike,
     theta: NDArray[np.float64],
     use_rust: bool = True,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
@@ -667,8 +669,9 @@ def LD_X2(
     ----------
     model : BaseItemModel
         A fitted IRT model.
-    responses : NDArray[np.float64]
-        Integer-coded response matrix. Missing values may be ``-1`` or ``NaN``.
+    responses : array-like of shape (n_persons, n_items)
+        Integer-coded response matrix or DataFrame. Missing values may be
+        ``-1``, ``NaN`` or the nulls of nullable DataFrame columns.
     theta : NDArray[np.float64]
         Ability estimates.
     use_rust : bool

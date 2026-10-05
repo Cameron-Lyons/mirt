@@ -105,6 +105,20 @@ Fit all item, person, and population parameters with
    print(result.summary())
    print(result.person_summary(5))
 
+Item parameters have independent normal priors on log discrimination,
+difficulty, log time discrimination and time intensity; ``sigma_df`` and
+``sigma_scale`` only shape the inverse-Wishart prior on the ability-speed
+covariance.  Pass :class:`mirt.RTModelPriors` to change them:
+
+.. code-block:: python
+
+   from mirt import RTModelPriors
+
+   priors = RTModelPriors(time_disc_mean=0.0, time_disc_var=0.25)
+   result = ResponseTimeGibbsSampler(priors=priors, seed=42).fit(
+       responses, response_times
+   )
+
 Backend selection
 -----------------
 

@@ -305,7 +305,7 @@ def test_five_parameter_information_bounds_blocks_and_limits_log_fallback(monkey
         fallback_sizes.append(logits.size)
         return original_log(logits, *parameters)
 
-    monkeypatch.setattr(dichotomous, "_FIVE_PL_CURVE_CHUNK_ELEMENTS", 31)
+    monkeypatch.setattr(dichotomous, "_UNIDIMENSIONAL_CURVE_CHUNK_ELEMENTS", 31)
     monkeypatch.setattr(dichotomous, "_five_pl_information", tracked)
     monkeypatch.setattr(dichotomous, "_five_pl_log_information", tracked_log)
     actual = model.information(theta)

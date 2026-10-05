@@ -5,19 +5,126 @@ Parameter draws can propagate item-calibration uncertainty into score curves.
 The workflow uses NumPy arrays throughout and does not require a dataframe or
 plotting package.
 
+Item parameter standard errors
+------------------------------
+
+EM fits of unidimensional 1PL-4PL, GRM, GPCM and PCM models report
+observed-information standard errors by default. The information is the
+negative Hessian of the marginal log-likelihood, computed exactly from Louis's
+(1982) missing-information identity, which is also the target of the Oakes
+(1999) method. The fit also stores the covariance of the free parameters:
+
+.. code-block:: python
+
+   result = mirt.fit_mirt(responses, model="2PL")
+
+   result.se_method      # "oakes"
+   result.vcov           # (n_free, n_free) covariance
+   result.vcov_labels    # ["discrimination[Item_1]", ..., "difficulty[Item_1]", ...]
+
+Select another estimator with ``se_method`` on ``fit_mirt`` or
+``EMEstimator``:
+
+* ``"oakes"``: inverse observed information.
+* ``"crossprod"``: inverse cross-product of the marginal person scores.
+* ``"sandwich"``: observed information around the score cross-product, robust
+  to misspecification of the item response functions.
+* ``"complete_data"``: itemwise curvature of the expected complete-data
+  likelihood. It omits the information lost to the unobserved latent trait
+  and covariances between parameters, so it understates uncertainty, often by
+  20-60%. It does not produce a covariance matrix.
+
+The default ``"auto"`` uses ``"oakes"`` for unidimensional 1PL-4PL, GRM,
+GPCM, PCM, RSM and GRSM items, whose item derivatives have closed forms, and
+``"complete_data"`` for other item models.
+For EM, Bock-Lieberman and MH-RM fits, ``result.se_method`` names the
+estimator used, so check it before relying on the errors; it is ``None`` for
+estimators that do not record one. An explicit ``"oakes"`` also works for
+those models. Every built-in model whose likelihood is a product of item
+curves still gets the exact information by differencing each item's own
+curve: nominal, multidimensional (including model-syntax fits), bifactor,
+5PL, complementary and negative log-log, unipolar log-logistic,
+compensatory-logic, nested-logit, monotone polynomial and spline,
+sequential, continuation-ratio, adjacent-category, GGUM, ideal-point,
+hyperbolic cosine, zero-inflated and hurdle models. Custom, testlet and
+mixture models difference the marginal likelihood instead, which takes
+O(P^2) likelihood evaluations for P parameters. Exploratory
+multidimensional solutions are rotationally unidentified, so their
+information matrix is singular. MH-RM fits report ``"oakes"`` for the
+closed-form families and otherwise ``"mhrm_iterate_sd"``, the spread of the
+Robbins-Monro iterates, which is not a standard error.
+
+The matrix estimators treat the latent density as fixed, which slightly
+understates uncertainty when its mean, variance or shape is estimated.
+Parameters on an optimizer bound, such as a guessing parameter of 0, are held
+fixed: their standard errors and covariance rows are ``NaN`` and the other
+errors are conditional on them. The cost grows as N Q P^2 for N distinct
+response patterns, Q quadrature nodes and P parameters; dichotomous models
+use a factorization that reduces it to N Q J^2 for J items.
+``BLEstimator`` inverts the full Hessian of its marginal likelihood, exact for
+the built-in models above and differenced over every pair of parameters for
+custom models, and labels its results ``"hessian"``.
+
+:func:`mirt.compute_se` recomputes errors from a fitted model and a final
+posterior. Its matrix methods (``"oakes"``, ``"louis"``, ``"sem"``,
+``"crossprod"``, ``"sandwich"`` and ``"fisher"``) hold coordinates on an EM
+optimizer bound fixed as fits do, so they reproduce an EM fit's errors for
+the same method. The lower-level ``compute_oakes_se``, ``compute_crossprod_se``
+and ``compute_sandwich_se`` estimate every free coordinate unless given
+``bounds``, and take ``prior_information`` for Bayes modal fits.
+
+``result.vcov`` serializes with :meth:`FitResult.to_dict`, and Wald tests read
+it directly. Parameter indices follow ``result.model.parameters`` with every
+stored entry, including fixed ones; hypotheses on fixed parameters or on
+parameters at a bound are rejected:
+
+.. code-block:: python
+
+   # H0: the first item's discrimination equals 1.
+   test = mirt.wald(result, param_indices=[0], constraint_values=[1.0])
+
+``wald`` and ``draw_parameters`` also accept an explicit ``vcov``, such as
+``result.vcov`` when no parameter is fixed; its all-``NaN`` rows and columns
+mark parameters held at a bound, which are drawn at their estimates and
+cannot be tested.
+
+A Lagrange (score) test asks whether fixed parameters should be freed
+without refitting. Given the constrained fit, ``lagrange`` frees the tested
+parameters in a copy of the model and evaluates the marginal score and
+observed information at the constrained estimates, with a normal latent
+density on ``n_quadpts`` nodes per factor. The fit must maximize the
+likelihood, so Bayes modal fits are rejected, and equality constraints of the
+fit are not represented:
+
+.. code-block:: python
+
+   import numpy as np
+
+   n_items = responses.shape[1]
+   constrained = mirt.fit_mirt(
+       responses,
+       model="2PL",
+       fixed={"discrimination": np.arange(n_items) == 0},
+       start_values={"discrimination": np.ones(n_items)},
+   )
+   # H0: the first item's discrimination stays at 1.
+   test = mirt.lagrange(constrained, responses, param_indices=[0])
+
 Draw and summarize parameters
 -----------------------------
 
-``draw_parameters`` samples discrimination and difficulty jointly from a
-multivariate-normal approximation. It also carries the asymptote and asymmetry
-parameters used by supported logistic models.
+``draw_parameters`` samples item parameters jointly from the asymptotic
+multivariate-normal approximation defined by ``result.vcov``. Guessing, upper
+and asymmetry parameters of supported logistic models are drawn from the same
+covariance; fixed parameters and parameters on a bound stay at their
+estimates.
 
 .. code-block:: python
 
    import mirt
 
    result = mirt.fit_mirt(responses, model="2PL")
-   samples = mirt.draw_parameters(result.model, n_samples=2_000, seed=42)
+   samples = mirt.draw_parameters(result, n_samples=2_000, seed=42)
    summary = mirt.posterior_summary(samples, credible_level=0.95)
 
    difficulty_mean = summary["difficulty"]["mean"]
@@ -38,8 +145,13 @@ draws, request the narrowest empirical interval containing the target mass:
    difficulty_hdi_lower = density_summary["difficulty"]["ci_lower"]
    difficulty_hdi_upper = density_summary["difficulty"]["ci_upper"]
 
-Pass a full parameter covariance matrix through ``vcov`` when one is available.
-Without it, the sampler uses a documented diagonal approximation.
+A result without ``vcov``, for example an MCMC fit or one using
+``se_method="complete_data"``, is sampled from its standard errors with a
+warning that cross-parameter covariance is ignored. For a bare model, pass a
+covariance through ``vcov``. It lists discrimination (item-major), then
+difficulty, and optionally guessing, slipping, upper and asymmetry. Without a
+covariance, bare models fall back to fixed sampling scales unrelated to the
+data. This fallback emits a ``FutureWarning`` and will be removed.
 
 Propagate uncertainty to scores
 -------------------------------
@@ -121,6 +233,24 @@ covariance matrices.
        seed=42,
    )
 
+Plausible values reproduce population moments only when their prior matches
+the population. A ``FitResult`` supplies its estimated ``latent_mean`` and
+``latent_covariance`` as the default prior; otherwise the prior is standard
+normal. On short tests, draws shrink toward the prior, so pass the population mean and
+covariance on the model's scale when they differ from it. A ``(n_persons, n_factors)`` mean conditions each person's draws, for
+example on latent-regression predictions:
+
+.. code-block:: python
+
+   plausible = mirt.generate_plausible_values(
+       result,
+       responses,
+       n_plausible=10,
+       prior_mean=population_mean,
+       prior_cov=population_cov,
+       seed=42,
+   )
+
 For multiple imputation, pass a fitted model or fit result to reuse the item
 calibration. Missing responses are sampled conditional on the observed cells,
 using joint posterior ability draws before drawing response categories. This
@@ -146,9 +276,40 @@ to empirical item draws.
 Bootstrap confidence intervals
 ------------------------------
 
+``bootstrap_se``, ``bootstrap_ci`` and ``parametric_bootstrap`` refit a
+``FitResult`` like the original fit: with the estimator that produced it
+(``BifactorEMEstimator`` for :func:`mirt.bfactor`, ``MixedFormatEMEstimator``
+for mixed formats), its item priors, latent density, equality constraints and
+quadrature, as recorded in ``FitResult.refit_recipe``. A Bayes modal fit is
+therefore bootstrapped as a Bayes modal estimator, and an estimated factor
+covariance or population mean is re-estimated in every replicate. Parametric
+replicates draw abilities from the fit's ``latent_mean`` and
+``latent_covariance``. Replicates skip standard errors. A bare item model is
+refitted by the default EM estimator of its family.
+
 ``bootstrap_ci(..., method="BCa")`` uses bias ranks that account for ties and
 a complete leave-one-person-out jackknife for acceleration. It requires one
 additional model fit per person. Set ``n_jobs`` to distribute those fits across
 processes. Jackknife samples are generated lazily and their moments accumulated
 without retaining all respondent-level score vectors. A failed jackknife
 produces missing intervals and a warning rather than an approximate BCa result.
+
+Bootstrap likelihood-ratio tests
+--------------------------------
+
+The chi-square reference of a likelihood-ratio test fails when the reduced
+model lies on the boundary of the full model, as for 2PL versus 3PL or ``k``
+versus ``k + 1`` factors. ``bootstrap_lr`` simulates the statistic's null
+distribution from the fitted reduced model instead. Both models are refitted
+to the observed responses and to every replicate with identical estimator
+settings, and replicates keep the observed missing-data pattern. Fit results
+are refitted with their recorded estimators, priors and constraints, and
+their degrees of freedom come from ``FitResult.n_parameters``, which counts
+estimated latent covariances and each equality-constraint group once.
+
+.. code-block:: python
+
+   reduced = mirt.fit_mirt(responses, model="2PL")
+   full = mirt.fit_mirt(responses, model="3PL")
+   test = mirt.bootstrap_lr(reduced, full, responses, n_bootstrap=200, seed=42)
+   test.statistic, test.p_value, test.asymptotic_p_value

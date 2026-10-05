@@ -5,6 +5,8 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
+from mirt.cat.engine import CATEngine
+from mirt.cat.exposure import Randomesque
 from mirt.cat.selection import (
     AStratified,
     KullbackLeibler,
@@ -14,6 +16,7 @@ from mirt.cat.selection import (
     UrryRule,
     create_selection_strategy,
 )
+from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 
 
@@ -441,6 +444,265 @@ class TestCreateSelectionStrategy:
         mfi2 = create_selection_strategy("mfi")
 
         assert type(mfi1) is type(mfi2)
+
+    @pytest.mark.parametrize(
+        "method,expected_class",
+        [
+            ("a_stratified", AStratified),
+            ("A-Stratified", AStratified),
+            ("urry", UrryRule),
+            ("URRY", UrryRule),
+            ("Random", RandomSelection),
+            ("RANDOM", RandomSelection),
+            (" mei ", MaxExpectedInformation),
+            ("kl", KullbackLeibler),
+        ],
+    )
+    def test_documented_aliases_resolve(self, method, expected_class):
+        assert type(create_selection_strategy(method)) is expected_class
+
+    def test_error_lists_canonical_names(self):
+        with pytest.raises(
+            ValueError, match="MFI, MEI, KL, Urry, random, a-stratified"
+        ):
+            create_selection_strategy("b-stratified")
+
+    def test_engine_configures_mei_from_any_spelling(self, fitted_2pl_model):
+        engine = CATEngine(
+            fitted_2pl_model.model,
+            item_selection="mei",
+            n_quadpts=9,
+            theta_bounds=(-3.0, 3.0),
+        )
+        assert isinstance(engine._selection, MaxExpectedInformation)
+        assert engine._selection.n_quadpts == 9
+        assert engine._selection.theta_bounds == (-3.0, 3.0)
+
+
+def _stratified_pool(n_items: int = 300) -> TwoParameterLogistic:
+    """2PL pool with distinct discriminations in shuffled item order."""
+    rng = np.random.default_rng(13)
+    model = TwoParameterLogistic(n_items=n_items)
+    model.set_parameters(
+        discrimination=rng.permutation(np.linspace(0.4, 2.4, n_items)),
+        difficulty=rng.normal(size=n_items),
+    )
+    model._is_fitted = True
+    return model
+
+
+def _stratum_of(strategy: AStratified, item: int) -> int:
+    assert strategy._strata is not None
+    return next(
+        index for index, stratum in enumerate(strategy._strata) if item in stratum
+    )
+
+
+class TestAStratifiedSchedule:
+    """a-stratified selection spreads the test length across strata."""
+
+    @pytest.mark.parametrize("from_string", [True, False])
+    def test_engine_spends_equal_test_shares_in_increasing_strata(self, from_string):
+        model = _stratified_pool()
+        strategy = AStratified(3)
+        engine = CATEngine(
+            model,
+            item_selection="a-stratified" if from_string else strategy,
+            max_items=30,
+            se_threshold=1e-6,
+        )
+
+        result = engine.run_simulation(0.4)
+
+        stages = [
+            _stratum_of(engine._selection, item) for item in result.items_administered
+        ]
+        assert stages == [0] * 10 + [1] * 10 + [2] * 10
+        assert strategy.test_length is None
+        discrimination = model.discrimination[result.items_administered]
+        assert discrimination[:10].max() < discrimination[10:20].min()
+        assert discrimination[10:20].max() < discrimination[20:].min()
+
+    def test_configured_test_length_overrides_engine_horizon(self):
+        model = _stratified_pool()
+        strategy = AStratified(3, test_length=9)
+        engine = CATEngine(
+            model, item_selection=strategy, max_items=12, se_threshold=1e-6
+        )
+
+        result = engine.run_simulation(-0.2)
+
+        stages = [_stratum_of(strategy, item) for item in result.items_administered]
+        assert stages == [0] * 3 + [1] * 3 + [2] * 6
+
+    def test_standalone_schedule_uses_pool_size(self):
+        model = _stratified_pool(30)
+        strategy = AStratified(3)
+
+        assert strategy.current_stratum(model, 9) == 0
+        assert strategy.current_stratum(model, 10) == 1
+        assert strategy.current_stratum(model, 25) == 2
+        assert strategy.current_stratum(model, 3, test_length=6) == 1
+        assert AStratified(3, test_length=12).current_stratum(model, 4) == 1
+
+    def test_exhausted_stratum_moves_to_next_available_stratum(self):
+        model = _stratified_pool(30)
+        strategy = AStratified(3)
+        strategy._initialize_strata(model)
+        middle_and_top = strategy._strata[1] | strategy._strata[2]
+
+        item = strategy.select_item(model, 0.0, middle_and_top, administered_items=[])
+        assert item in strategy._strata[1]
+        item = strategy.select_item(
+            model, 0.0, strategy._strata[0], administered_items=list(range(25))
+        )
+        assert item in strategy._strata[0]
+
+    def test_criteria_cover_only_the_scheduled_stratum(self):
+        model = _stratified_pool(60)
+        strategy = AStratified(3, test_length=30)
+        available = set(range(model.n_items))
+
+        low = strategy.get_item_criteria(model, -2.0, available, [])
+        high = strategy.get_item_criteria(model, 2.0, available, [])
+        later = strategy.get_item_criteria(model, 0.0, available, list(range(12)))
+
+        assert set(low) == set(high) == strategy._strata[0]
+        assert set(later) == strategy._strata[1]
+        assert max(low, key=low.__getitem__) != max(high, key=high.__getitem__)
+
+    def test_randomesque_draws_within_the_current_stratum(self):
+        model = _stratified_pool(60)
+        engine = CATEngine(
+            model,
+            item_selection="a-stratified",
+            exposure_control=Randomesque(k=4, seed=1),
+            max_items=6,
+            se_threshold=1e-6,
+            seed=2,
+        )
+
+        results = [engine.run_simulation(theta) for theta in (-1.5, 0.0, 1.5)]
+
+        strategy = engine._selection
+        for result in results:
+            stages = [_stratum_of(strategy, item) for item in result.items_administered]
+            assert stages == [0, 0, 1, 1, 2, 2]
+        assert max(max(result.items_administered) for result in results) > 13
+
+    def test_b_matching_ranks_by_difficulty_distance(self):
+        model = _stratified_pool(30)
+        strategy = AStratified(3, within="b_matching")
+        available = set(range(model.n_items))
+
+        criteria = strategy.get_item_criteria(model, 0.7, available, [])
+
+        for item, value in criteria.items():
+            assert value == pytest.approx(-abs(0.7 - model.difficulty[item]))
+        assert strategy.within == "b-matching"
+
+    def test_strata_are_rebuilt_for_a_different_pool(self):
+        strategy = AStratified(2)
+        small, large = _stratified_pool(10), _stratified_pool(20)
+
+        strategy.select_item(small, 0.0, set(range(10)), [])
+        strategy.select_item(large, 0.0, set(range(20)), [])
+
+        assert sum(len(stratum) for stratum in strategy._strata) == 20
+
+    def test_strata_follow_model_identity_not_object_ids(self, monkeypatch):
+        # A collected model's id() can be reused by a new pool of equal size.
+        import mirt.cat.selection as selection
+
+        monkeypatch.setattr(selection, "id", lambda value: 0, raising=False)
+        strategy = AStratified(2)
+        first = _stratified_pool(20)
+        second = _stratified_pool(20)
+        second.set_parameters(discrimination=first.discrimination[::-1].copy())
+
+        strategy.select_item(first, 0.0, set(range(20)), [])
+        strategy.select_item(second, 0.0, set(range(20)), [])
+
+        lowest = set(np.argsort(second.discrimination)[:10].tolist())
+        assert strategy._strata is not None
+        assert strategy._strata[0] == lowest
+
+    def test_planned_length_is_capped_at_the_pool_size(self):
+        model = _stratified_pool(30)
+
+        assert AStratified(3, test_length=90).current_stratum(model, 20) == 2
+        assert AStratified(3).current_stratum(model, 10, test_length=60) == 1
+
+    def test_instance_hooks_with_original_signatures_still_run(self):
+        strategy = AStratified(3)
+        original = strategy.select_item
+
+        def select_item(model, theta, available_items, administered=None, resp=None):
+            return original(model, theta, available_items, administered, resp)
+
+        strategy.select_item = select_item
+        engine = CATEngine(
+            _stratified_pool(30),
+            item_selection=strategy,
+            max_items=4,
+            se_threshold=1e-6,
+        )
+
+        assert engine.run_simulation(0.0).n_items_administered == 4
+
+    @pytest.mark.parametrize(
+        "kwargs, message",
+        [
+            ({"n_strata": 0}, "n_strata"),
+            ({"n_strata": 2.0}, "n_strata"),
+            ({"test_length": 0}, "test_length"),
+            ({"test_length": True}, "test_length"),
+            ({"within": "KL"}, "within"),
+        ],
+    )
+    def test_rejects_invalid_configuration(self, kwargs, message):
+        with pytest.raises(ValueError, match=message):
+            AStratified(**kwargs)
+
+    @pytest.mark.parametrize("exposure", [None, "randomesque"])
+    @pytest.mark.parametrize("hook", ["select_item", "get_item_criteria"])
+    def test_subclasses_with_original_signatures_still_run(self, hook, exposure):
+        class LegacySelect(AStratified):
+            def select_item(
+                self,
+                model,
+                theta,
+                available_items,
+                administered_items=None,
+                responses=None,
+            ):
+                return super().select_item(
+                    model, theta, available_items, administered_items, responses
+                )
+
+        class LegacyCriteria(AStratified):
+            def get_item_criteria(
+                self,
+                model,
+                theta,
+                available_items,
+                administered_items=None,
+                responses=None,
+            ):
+                return super().get_item_criteria(
+                    model, theta, available_items, administered_items, responses
+                )
+
+        strategy_class = LegacySelect if hook == "select_item" else LegacyCriteria
+        engine = CATEngine(
+            _stratified_pool(30),
+            item_selection=strategy_class(3),
+            exposure_control=exposure,
+            max_items=6,
+            se_threshold=1e-6,
+            seed=1,
+        )
+        assert engine.run_simulation(0.0).n_items_administered == 6
 
 
 class TestItemSelectionStrategyInterface:

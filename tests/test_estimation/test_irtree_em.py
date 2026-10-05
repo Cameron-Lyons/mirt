@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import mirt.estimation.irtree_em as irtree_em
 from mirt.estimation.irtree_em import IRTreeEMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtDataError, MirtValidationError
@@ -210,3 +211,84 @@ def test_quadrature_size_must_be_a_positive_integer(n_quadpts: object) -> None:
 def test_correlation_option_must_be_boolean() -> None:
     with pytest.raises(MirtValidationError, match="boolean"):
         IRTreeEMEstimator(estimate_correlations=1)  # type: ignore[arg-type]
+
+
+def _full_product_grid(
+    quad_points: np.ndarray,
+    traits: np.ndarray,
+    *counts: np.ndarray,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Reference node layout that keeps every product-grid point."""
+    return quad_points[:, traits].T.copy(), [np.array(values) for values in counts]
+
+
+@pytest.mark.parametrize(
+    ("cov", "widths"),
+    [
+        (None, (4, 4, 4)),
+        # A rotated grid has 4, 16 and 64 distinct coordinates per trait.
+        (np.array([[1.0, 0.5, 0.2], [0.5, 1.0, 0.3], [0.2, 0.3, 1.0]]), (4, 16, 64)),
+    ],
+)
+def test_trait_grid_collapse_preserves_node_sums(
+    cov: np.ndarray | None,
+    widths: tuple[int, int, int],
+) -> None:
+    nodes = GaussHermiteQuadrature(n_points=4, n_dimensions=3, cov=cov).nodes
+    rng = np.random.default_rng(3)
+    traits = np.array([0, 2, 1, 2, 0])
+    counts = rng.random((traits.size, nodes.shape[0]))
+    correct = counts * rng.random(counts.shape)
+
+    points, (collapsed_correct, collapsed) = irtree_em._collapse_to_trait_grids(
+        nodes, traits, correct, counts
+    )
+
+    assert points.shape == collapsed.shape == (traits.size, max(widths))
+    for row, trait in enumerate(traits):
+        values = np.unique(nodes[:, trait])
+        assert values.size == widths[trait]
+        np.testing.assert_array_equal(points[row, : values.size], values)
+        for source, target in ((counts, collapsed), (correct, collapsed_correct)):
+            expected = [source[row, nodes[:, trait] == value].sum() for value in values]
+            np.testing.assert_allclose(target[row, : values.size], expected, rtol=1e-13)
+            np.testing.assert_array_equal(target[row, values.size :], 0.0)
+
+
+@pytest.mark.parametrize("spec", ["bockenholt", "direction_intensity"])
+def test_marginal_grid_m_step_matches_full_product_grid(
+    spec: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generating_model = IRTreeModel(n_items=4, tree_spec=spec)
+    responses = _simulate_responses(generating_model, n_persons=250, seed=17)
+    # A constant extreme column drives several node optimizers onto bounds.
+    responses[:, 0] = 4
+
+    def fit() -> object:
+        return IRTreeEMEstimator(n_quadpts=5, max_iter=20, tol=1e-12).fit(
+            IRTreeModel(n_items=4, tree_spec=spec),
+            responses,
+        )
+
+    collapsed = fit()
+    monkeypatch.setattr(irtree_em, "_collapse_to_trait_grids", _full_product_grid)
+    full = fit()
+
+    assert collapsed.n_iterations == full.n_iterations == 20
+    np.testing.assert_allclose(
+        collapsed.log_likelihood, full.log_likelihood, rtol=0.0, atol=1e-8
+    )
+    for name in collapsed.model._parameters:
+        np.testing.assert_allclose(
+            collapsed.model._parameters[name],
+            full.model._parameters[name],
+            rtol=0.0,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            collapsed.standard_errors[name],
+            full.standard_errors[name],
+            rtol=1e-6,
+            atol=1e-9,
+        )

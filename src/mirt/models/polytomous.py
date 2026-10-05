@@ -1,4 +1,4 @@
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import numpy as np
 from numpy.typing import NDArray
@@ -16,6 +16,8 @@ from mirt.exceptions import MirtValidationError
 from mirt.models.base import PolytomousItemModel
 
 _MAX_PROBABILITY_CHUNK_ENTRIES = 1_000_000
+_MAX_VECTORIZED_INFORMATION_ROWS = 256
+_INFORMATION_HOOKS = ("_item_information", "probability", "_category_probabilities")
 
 
 def _identify_rating_scale_origin(
@@ -75,30 +77,40 @@ def _partial_credit_probabilities(
 
 
 def _score_variance(probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Retain small tail contributions when the expected score is saturated."""
+    """Retain small tail contributions when the expected score is saturated.
+
+    Categories are on the last axis; zero-probability padding adds nothing.
+    """
     categories = np.arange(probabilities.shape[-1])
     mean = probabilities @ categories
-    return np.sum(probabilities * (categories - mean[:, None]) ** 2, axis=1)
+    return np.sum(probabilities * (categories - mean[..., None]) ** 2, axis=-1)
 
 
 def _graded_information(
     probabilities: NDArray[np.float64],
-    discrimination: float,
+    discrimination: float | NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Compute graded-response information from existing category curves."""
-    n_persons, n_categories = probabilities.shape
-    cumulative = np.empty((n_persons, n_categories + 1), dtype=np.float64)
-    cumulative[:, 0] = 1.0
-    cumulative[:, -1] = 0.0
+    """Compute graded-response information from existing category curves.
+
+    Categories are on the last axis. ``discrimination`` broadcasts against
+    the leading axes after a trailing category axis is appended, so a
+    ``(n_items,)`` slope vector scales ``(n_persons, n_items, width)`` curves
+    whose zero-probability padding adds nothing.
+    """
+    cumulative = np.empty(
+        (*probabilities.shape[:-1], probabilities.shape[-1] + 1), dtype=np.float64
+    )
+    cumulative[..., 0] = 1.0
+    cumulative[..., -1] = 0.0
     np.cumsum(
-        probabilities[:, :0:-1],
-        axis=1,
-        out=cumulative[:, -2:0:-1],
+        probabilities[..., :0:-1],
+        axis=-1,
+        out=cumulative[..., -2:0:-1],
     )
 
     np.multiply(cumulative, 1.0 - cumulative, out=cumulative)
-    derivatives = cumulative[:, :-1] - cumulative[:, 1:]
-    derivatives *= discrimination
+    derivatives = cumulative[..., :-1] - cumulative[..., 1:]
+    derivatives *= np.asarray(discrimination)[..., None]
     np.square(derivatives, out=derivatives)
     valid = probabilities > PROB_EPSILON
     np.divide(
@@ -108,7 +120,65 @@ def _graded_information(
         where=valid,
     )
     derivatives[~valid] = 0.0
-    return derivatives.sum(axis=1)
+    return derivatives.sum(axis=-1)
+
+
+def _uses_vectorized_information(
+    model: PolytomousItemModel, owner: type[PolytomousItemModel]
+) -> bool:
+    """Whether ``owner``'s all-item information kernel describes ``model``.
+
+    Instance or class replacements of ``_item_information`` or the curve
+    hooks keep the per-item path. The rating-scale families are not
+    registered built-ins, so only their exact classes qualify.
+    """
+    if not vars(model).keys().isdisjoint(_INFORMATION_HOOKS):
+        return False
+    model_class = type(model)
+    authored = _AUTHORED_INFORMATION_HOOKS[owner]
+    if any(getattr(model_class, name) is not hook for name, hook in authored.items()):
+        return False
+    return uses_builtin_model_hooks(model) or (
+        model_class is owner and owner in (RatingScaleModel, GradedRatingScaleModel)
+    )
+
+
+def _vectorized_item_information(
+    model: PolytomousItemModel,
+    owner: type[PolytomousItemModel],
+    theta: NDArray[np.float64],
+    kernel: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+) -> NDArray[np.float64]:
+    """Evaluate all items at once for small ability batches.
+
+    The all-item kernel removes per-item overhead, which dominates adaptive
+    testing and short grids. Larger batches keep the per-item path, whose
+    curves stay cache resident.
+    """
+    theta = model._ensure_theta_2d(theta)
+    if theta.shape[0] > _MAX_VECTORIZED_INFORMATION_ROWS or (
+        not _uses_vectorized_information(model, owner)
+    ):
+        return PolytomousItemModel._information_by_item(model, theta)
+    information = np.empty((theta.shape[0], model.n_items), dtype=np.float64)
+    width = model.n_items * model.max_categories * model.n_factors
+    rows_per_block = max(1, _MAX_PROBABILITY_CHUNK_ENTRIES // width)
+    for start in range(0, theta.shape[0], rows_per_block):
+        stop = start + rows_per_block
+        information[start:stop] = kernel(theta[start:stop])
+    return information
+
+
+def _sum_item_information_matrices(
+    model: "GradedResponseModel | GeneralizedPartialCredit | NominalResponseModel",
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Sum item Fisher matrices across conditionally independent items."""
+    theta = model._ensure_theta_2d(theta)
+    information = np.zeros((len(theta), model.n_factors, model.n_factors))
+    for item_idx in range(model.n_items):
+        information += model.item_information_matrix(theta, item_idx)
+    return information
 
 
 @_register_builtin_model
@@ -142,10 +212,7 @@ class GradedResponseModel(PolytomousItemModel):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
-        threshold_mask = np.zeros_like(self.thresholds, dtype=np.bool_)
-        for item_idx, n_categories in enumerate(self._n_categories):
-            threshold_mask[item_idx, : n_categories - 1] = True
-        masks["thresholds"] = threshold_mask
+        masks["thresholds"] = self._category_columns(self.thresholds.shape[1], 1)
         return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
@@ -155,8 +222,7 @@ class GradedResponseModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         canonical = super()._canonical_parameter_values(name, values)
         if name == "thresholds":
-            for item_idx, n_categories in enumerate(self._n_categories):
-                canonical[item_idx, n_categories - 1 :] = 0.0
+            canonical[~self._category_columns(canonical.shape[1], 1)] = 0.0
         return canonical
 
     def cumulative_probability(
@@ -166,6 +232,7 @@ class GradedResponseModel(PolytomousItemModel):
         threshold_idx: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
 
         a = self._parameters["discrimination"]
         b = self._parameters["thresholds"][item_idx, threshold_idx]
@@ -185,6 +252,7 @@ class GradedResponseModel(PolytomousItemModel):
         item_idx: int,
         category: int,
     ) -> NDArray[np.float64]:
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -218,7 +286,9 @@ class GradedResponseModel(PolytomousItemModel):
         """Compute all-item GRM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
         n_persons = theta.shape[0]
@@ -300,6 +370,42 @@ class GradedResponseModel(PolytomousItemModel):
         probabilities = self._category_probabilities(theta, item_idx)
         return _graded_information(probabilities, a_val)
 
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        discrimination = self._parameters["discrimination"]
+        if self.n_factors > 1:
+            discrimination = np.linalg.norm(discrimination, axis=1)
+        return _vectorized_item_information(
+            self,
+            GradedResponseModel,
+            theta,
+            lambda block: _graded_information(self.probability(block), discrimination),
+        )
+
+    def item_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return exact Fisher matrices of shape ``(n_persons, n_factors, n_factors)``.
+
+        Every cumulative logit has the slope vector as its ability gradient,
+        so each matrix is the unit-slope graded information times the outer
+        product of that vector. The scalar ``information`` method returns the
+        trace of this matrix.
+        """
+        item_idx = self._validate_item_index(item_idx)
+        theta = self._ensure_theta_2d(theta)
+        slope = np.asarray(self._parameters["discrimination"][item_idx]).reshape(-1)
+        information = _graded_information(self.probability(theta, item_idx), 1.0)
+        return information[:, None, None] * np.outer(slope, slope)
+
+    def test_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Sum item Fisher matrices across conditionally independent items."""
+        return _sum_item_information_matrices(self, theta)
+
     def log_likelihood_batch(
         self,
         responses: NDArray[np.int_],
@@ -358,10 +464,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
-        step_mask = np.zeros_like(self.steps, dtype=np.bool_)
-        for item_idx, n_categories in enumerate(self._n_categories):
-            step_mask[item_idx, : n_categories - 1] = True
-        masks["steps"] = step_mask
+        masks["steps"] = self._category_columns(self.steps.shape[1], 1)
         return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
@@ -371,8 +474,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         canonical = super()._canonical_parameter_values(name, values)
         if name == "steps":
-            for item_idx, n_categories in enumerate(self._n_categories):
-                canonical[item_idx, n_categories - 1 :] = 0.0
+            canonical[~self._category_columns(canonical.shape[1], 1)] = 0.0
         return canonical
 
     def category_probability(
@@ -382,6 +484,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -419,7 +522,9 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         """Compute all-item GPCM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -500,6 +605,16 @@ class GeneralizedPartialCredit(PolytomousItemModel):
             slope_squared = np.dot(a[item_idx], a[item_idx])
         return slope_squared * _score_variance(self.probability(theta, item_idx))
 
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        a = self._parameters["discrimination"]
+        slope_squared = a**2 if self.n_factors == 1 else np.einsum("jf,jf->j", a, a)
+        return _vectorized_item_information(
+            self,
+            GeneralizedPartialCredit,
+            theta,
+            lambda block: slope_squared * _score_variance(self.probability(block)),
+        )
+
     def item_information_matrix(
         self,
         theta: NDArray[np.float64],
@@ -522,11 +637,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         """Sum item Fisher matrices across conditionally independent items."""
-        theta = self._ensure_theta_2d(theta)
-        information = np.zeros((len(theta), self.n_factors, self.n_factors))
-        for item_idx in range(self.n_items):
-            information += self.item_information_matrix(theta, item_idx)
-        return information
+        return _sum_item_information_matrices(self, theta)
 
     def log_likelihood_batch(
         self,
@@ -643,6 +754,7 @@ class RatingScaleModel(PolytomousItemModel):
 
     model_name = "RSM"
     supports_multidimensional = False
+    _shared_parameters = frozenset({"thresholds"})
 
     def __init__(
         self,
@@ -718,6 +830,7 @@ class RatingScaleModel(PolytomousItemModel):
             Probability of category response for each theta
         """
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_cats
 
         if category < 0 or category >= n_cat:
@@ -747,7 +860,9 @@ class RatingScaleModel(PolytomousItemModel):
         """Compute all-item RSM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -794,6 +909,14 @@ class RatingScaleModel(PolytomousItemModel):
         """
         return _score_variance(self.probability(theta, item_idx))
 
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        return _vectorized_item_information(
+            self,
+            RatingScaleModel,
+            theta,
+            lambda block: _score_variance(self.probability(block)),
+        )
+
     def set_parameters(self, **params: NDArray[np.float64]) -> "RatingScaleModel":
         """Set model parameters, preserving curves with the first threshold zero.
 
@@ -825,19 +948,7 @@ class RatingScaleModel(PolytomousItemModel):
         if not all(np.all(np.isfinite(values)) for values in candidates.values()):
             raise ValueError("identified rating-scale parameters must be finite")
         self._parameters = candidates
-
-        self._is_fitted = True
         return self
-
-    def set_item_parameter(
-        self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        if param_name == "thresholds":
-            raise MirtValidationError("thresholds are shared; use set_parameters")
-        super().set_item_parameter(item_idx, param_name, value)
 
 
 class GradedRatingScaleModel(PolytomousItemModel):
@@ -882,6 +993,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
 
     model_name = "GRSM"
     supports_multidimensional = False
+    _shared_parameters = frozenset({"discrimination", "thresholds"})
 
     def __init__(
         self,
@@ -947,6 +1059,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
         theta_1d = theta.ravel()
+        item_idx = self._validate_item_index(item_idx)
 
         a = self._parameters["discrimination"][0]
         b_j = self._parameters["difficulty"][item_idx]
@@ -961,6 +1074,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         item_idx: int,
         category: int,
     ) -> NDArray[np.float64]:
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_cats
 
         if category < 0 or category >= n_cat:
@@ -990,7 +1104,9 @@ class GradedRatingScaleModel(PolytomousItemModel):
         """Compute all-item GRSM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
 
@@ -1034,6 +1150,15 @@ class GradedRatingScaleModel(PolytomousItemModel):
         probabilities = self._category_probabilities(theta, item_idx)
         return _graded_information(probabilities, discrimination)
 
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        discrimination = float(self._parameters["discrimination"][0])
+        return _vectorized_item_information(
+            self,
+            GradedRatingScaleModel,
+            theta,
+            lambda block: _graded_information(self.probability(block), discrimination),
+        )
+
     def set_parameters(
         self,
         discrimination: float | None = None,
@@ -1069,19 +1194,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         if not all(np.all(np.isfinite(values)) for values in candidates.values()):
             raise ValueError("identified rating-scale parameters must be finite")
         self._parameters = candidates
-
-        self._is_fitted = True
         return self
-
-    def set_item_parameter(
-        self,
-        item_idx: int,
-        param_name: str,
-        value: float | NDArray[np.float64],
-    ) -> None:
-        if param_name in {"thresholds", "discrimination"}:
-            raise MirtValidationError(f"{param_name} is shared; use set_parameters")
-        super().set_item_parameter(item_idx, param_name, value)
 
 
 @_register_builtin_model
@@ -1121,11 +1234,10 @@ class NominalResponseModel(PolytomousItemModel):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
+        intercept_mask = self._category_columns(self.intercepts.shape[1])
+        intercept_mask[:, 0] = False
         slope_mask = np.zeros_like(self.slopes, dtype=np.bool_)
-        intercept_mask = np.zeros_like(self.intercepts, dtype=np.bool_)
-        for item_idx, n_categories in enumerate(self._n_categories):
-            slope_mask[item_idx, 1:n_categories, ...] = True
-            intercept_mask[item_idx, 1:n_categories] = True
+        slope_mask[intercept_mask] = True
         masks["slopes"] = slope_mask
         masks["intercepts"] = intercept_mask
         return self._apply_free_parameter_restrictions(masks)
@@ -1139,10 +1251,8 @@ class NominalResponseModel(PolytomousItemModel):
         if name not in {"slopes", "intercepts"}:
             return canonical
 
-        for item_idx, n_categories in enumerate(self._n_categories):
-            reference = canonical[item_idx, 0].copy()
-            canonical[item_idx, :n_categories] -= reference
-            canonical[item_idx, n_categories:] = 0.0
+        canonical -= canonical[:, :1].copy()
+        canonical[~self._category_columns(canonical.shape[1])] = 0.0
         return canonical
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "NominalResponseModel":
@@ -1176,6 +1286,7 @@ class NominalResponseModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
+        item_idx = self._validate_item_index(item_idx)
         n_cat = self._n_categories[item_idx]
 
         if category < 0 or category >= n_cat:
@@ -1213,7 +1324,9 @@ class NominalResponseModel(PolytomousItemModel):
         """Compute all-item NRM probabilities in bounded item chunks."""
         theta = self._ensure_theta_2d(theta)
         if item_idx is not None:
-            return self._category_probabilities(theta, item_idx)
+            return self._category_probabilities(
+                theta, self._validate_item_index(item_idx)
+            )
         if self.n_items == 1:
             return self._category_probabilities(theta, 0)[:, None, :]
         if self.n_items < 8:
@@ -1309,3 +1422,87 @@ class NominalResponseModel(PolytomousItemModel):
                 info += expected_a_sq - expected_a**2
 
         return info
+
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        slopes = self._parameters["slopes"].reshape(
+            self.n_items, self.max_categories, self.n_factors
+        )
+        squared_slopes = slopes**2
+
+        def kernel(block: NDArray[np.float64]) -> NDArray[np.float64]:
+            probabilities = self.probability(block)
+            expected = np.einsum("njc,jcf->njf", probabilities, slopes)
+            expected_squared = np.einsum("njc,jcf->njf", probabilities, squared_slopes)
+            return np.sum(expected_squared - expected**2, axis=2)
+
+        return _vectorized_item_information(self, NominalResponseModel, theta, kernel)
+
+    def item_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+        item_idx: int,
+    ) -> NDArray[np.float64]:
+        """Return exact Fisher matrices of shape ``(n_persons, n_factors, n_factors)``.
+
+        Category ``c`` has the slope vector ``a_c`` as its logit gradient, so
+        each matrix is the covariance of those vectors under the category
+        probabilities. The scalar ``information`` method returns the trace of
+        this matrix.
+        """
+        item_idx = self._validate_item_index(item_idx)
+        theta = self._ensure_theta_2d(theta)
+        n_categories = self._n_categories[item_idx]
+        slopes = self._parameters["slopes"][item_idx, :n_categories].reshape(
+            n_categories, self.n_factors
+        )
+        probabilities = self.probability(theta, item_idx)
+        centered = slopes[None, :, :] - (probabilities @ slopes)[:, None, :]
+        return np.einsum("nc,ncf,ncg->nfg", probabilities, centered, centered)
+
+    def test_information_matrix(
+        self,
+        theta: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Sum item Fisher matrices across conditionally independent items."""
+        return _sum_item_information_matrices(self, theta)
+
+
+# Captured at import so later class-level replacements are detected.
+_AUTHORED_INFORMATION_HOOKS: dict[type[PolytomousItemModel], dict[str, object]] = {
+    owner: {name: getattr(owner, name) for name in _INFORMATION_HOOKS}
+    for owner in (
+        GradedResponseModel,
+        GeneralizedPartialCredit,
+        RatingScaleModel,
+        GradedRatingScaleModel,
+        NominalResponseModel,
+    )
+}
+_RATING_SCALE_HOOKS = (
+    "probability",
+    "_category_probabilities",
+    "_canonical_parameter_values",
+    "free_parameter_masks",
+    "_apply_free_parameter_restrictions",
+    "parameters",
+    "set_parameters",
+    "log_likelihood",
+    "log_likelihood_batch",
+)
+_AUTHORED_RATING_SCALE_HOOKS: dict[type[PolytomousItemModel], dict[str, object]] = {
+    owner: {name: getattr(owner, name) for name in _RATING_SCALE_HOOKS}
+    for owner in (RatingScaleModel, GradedRatingScaleModel)
+}
+
+
+def _uses_authored_rating_scale_hooks(model: object) -> bool:
+    """Whether ``model`` is an exact RSM or GRSM with its authored curves.
+
+    The rating-scale families are not registered built-ins, so closed-form
+    estimation shortcuts require the exact class with no replaced hooks.
+    """
+    model_class = type(model)
+    authored = _AUTHORED_RATING_SCALE_HOOKS.get(model_class)
+    if authored is None or not vars(model).keys().isdisjoint(authored):
+        return False
+    return all(getattr(model_class, name) is hook for name, hook in authored.items())

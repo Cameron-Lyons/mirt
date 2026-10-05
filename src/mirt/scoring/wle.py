@@ -22,11 +22,13 @@ from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import (
     observed_test_information,
     resolve_n_jobs,
+    score_pattern_chunks,
     score_responses_parallel,
+    supports_row_batched_scoring,
     unique_response_patterns,
     validate_scoring_responses,
 )
-from mirt.scoring._optimization import validate_theta_bounds
+from mirt.scoring._optimization import bounded_scalar_minimize, validate_theta_bounds
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:
@@ -56,7 +58,8 @@ class WLEScorer:
         Tolerance for convergence. Default is 1e-6.
     n_jobs : int, optional
         Number of response patterns to optimize in parallel. ``-1`` uses all
-        available CPU cores. Default is 1.
+        available CPU cores. Default is 1. Built-in unidimensional models are
+        scored with one row-batched search that does not use a thread pool.
 
     Attributes
     ----------
@@ -145,6 +148,22 @@ class WLEScorer:
                 method="WLE",
             )
 
+        if (
+            n_factors == 1
+            and type(self) is WLEScorer
+            and not {"_estimate_person", "_test_information"} & vars(self).keys()
+            and supports_row_batched_scoring(model)
+        ):
+            theta_wle, theta_se = score_pattern_chunks(
+                patterns,
+                lambda chunk: self._estimate_unidimensional_batch(model, chunk),
+            )
+            return ScoreResult(
+                theta=theta_wle[inverse],
+                standard_error=theta_se[inverse],
+                method="WLE",
+            )
+
         def score_person(
             index: int,
         ) -> tuple[float | NDArray[np.float64], float | NDArray[np.float64]]:
@@ -209,6 +228,52 @@ class WLEScorer:
             se = np.inf
 
         return theta_hat, se
+
+    def _estimate_unidimensional_batch(
+        self,
+        model: BaseItemModel,
+        patterns: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Estimate every pattern as :meth:`_estimate_person` would.
+
+        All patterns share one bounded Brent search, so each optimizer step
+        needs a single stacked likelihood and information evaluation.
+        """
+        observed = patterns >= 0
+        theta = np.zeros(patterns.shape[0], dtype=np.float64)
+        standard_error = np.full(patterns.shape[0], np.inf, dtype=np.float64)
+        rows = np.flatnonzero(observed.any(axis=1))
+        if rows.size == 0:
+            return theta, standard_error
+        patterns = patterns[rows]
+        observed = observed[rows]
+
+        def neg_weighted_log_likelihood(
+            subset: NDArray[np.intp],
+            values: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
+            theta_arr = values[:, None]
+            ll = np.asarray(
+                model.log_likelihood(patterns[subset], theta_arr), dtype=np.float64
+            )
+            info = observed_test_information(model, theta_arr, observed[subset])
+            weighted = info > PROB_EPSILON
+            log_info = np.log(info, out=np.zeros_like(info), where=weighted)
+            return -np.where(weighted, ll + 0.5 * log_info, ll)
+
+        estimate, _ = bounded_scalar_minimize(
+            neg_weighted_log_likelihood,
+            rows.size,
+            *self.bounds,
+            xatol=self.tol,
+        )
+        info = observed_test_information(model, estimate[:, None], observed)
+        estimate_se = np.full(rows.size, np.inf, dtype=np.float64)
+        informative = info > PROB_EPSILON
+        estimate_se[informative] = 1.0 / np.sqrt(info[informative])
+        theta[rows] = estimate
+        standard_error[rows] = estimate_se
+        return theta, standard_error
 
     def _test_information(
         self,

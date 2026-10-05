@@ -8,7 +8,7 @@ use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-use crate::utils::{EPSILON, log_sigmoid, sigmoid};
+use crate::utils::{EPSILON, sigmoid};
 
 /// Compute the exact complete-data Hessian block for one 2PL item.
 fn compute_item_hessian_block(
@@ -199,120 +199,10 @@ pub fn compute_hessian_block_diagonal<'py>(
     hessian.to_pyarray(py)
 }
 
-/// Compute standard errors from observed information matrix.
-///
-/// Takes the negative inverse of the Hessian and extracts diagonal elements.
-#[pyfunction]
-pub fn compute_se_from_hessian<'py>(
-    py: Python<'py>,
-    hessian: PyReadonlyArray2<f64>,
-) -> Bound<'py, PyArray1<f64>> {
-    let hessian = hessian.as_array();
-    let n_params = hessian.nrows();
-
-    let n_items = n_params / 2;
-
-    let mut se = Array1::zeros(n_params);
-
-    for j in 0..n_items {
-        let idx_a = j * 2;
-        let idx_b = j * 2 + 1;
-
-        let h_aa = -hessian[[idx_a, idx_a]];
-        let h_ab = -hessian[[idx_a, idx_b]];
-        let h_bb = -hessian[[idx_b, idx_b]];
-
-        let det = h_aa * h_bb - h_ab * h_ab;
-
-        if det > EPSILON {
-            let inv_aa = h_bb / det;
-            let inv_bb = h_aa / det;
-
-            se[idx_a] = if inv_aa > 0.0 {
-                inv_aa.sqrt()
-            } else {
-                f64::NAN
-            };
-            se[idx_b] = if inv_bb > 0.0 {
-                inv_bb.sqrt()
-            } else {
-                f64::NAN
-            };
-        } else {
-            se[idx_a] = f64::NAN;
-            se[idx_b] = f64::NAN;
-        }
-    }
-
-    se.to_pyarray(py)
-}
-
-/// Compute complete data log-likelihood for all items.
-///
-/// Used for finite difference Hessian computation.
-#[pyfunction]
-pub fn compute_complete_data_ll<'py>(
-    _py: Python<'py>,
-    responses: PyReadonlyArray2<i32>,
-    posterior_weights: PyReadonlyArray2<f64>,
-    quad_points: PyReadonlyArray1<f64>,
-    discrimination: PyReadonlyArray1<f64>,
-    difficulty: PyReadonlyArray1<f64>,
-) -> f64 {
-    let responses = responses.as_array();
-    let posterior_weights = posterior_weights.as_array();
-    let quad_points = quad_points.as_array();
-    let disc = discrimination.as_array();
-    let diff = difficulty.as_array();
-
-    let n_persons = responses.nrows();
-    let n_items = responses.ncols();
-    let n_quad = quad_points.len();
-
-    let ll: f64 = (0..n_persons)
-        .into_par_iter()
-        .map(|i| {
-            let mut person_ll = 0.0;
-
-            for q in 0..n_quad {
-                let w = posterior_weights[[i, q]];
-                if w < EPSILON {
-                    continue;
-                }
-
-                let theta = quad_points[q];
-                let mut quad_ll = 0.0;
-
-                for j in 0..n_items {
-                    let resp = responses[[i, j]];
-                    if resp < 0 {
-                        continue;
-                    }
-
-                    let z = disc[j] * (theta - diff[j]);
-                    if resp == 1 {
-                        quad_ll += log_sigmoid(z);
-                    } else {
-                        quad_ll += log_sigmoid(-z);
-                    }
-                }
-
-                person_ll += w * quad_ll;
-            }
-
-            person_ll
-        })
-        .sum();
-
-    ll
-}
-
 /// Register standard error functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(compute_item_se_parallel, m)?)?;
     m.add_function(wrap_pyfunction!(compute_hessian_block_diagonal, m)?)?;
-    m.add_function(wrap_pyfunction!(compute_se_from_hessian, m)?)?;
-    m.add_function(wrap_pyfunction!(compute_complete_data_ll, m)?)?;
     Ok(())
 }
 

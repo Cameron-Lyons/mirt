@@ -9,10 +9,10 @@ properly account for measurement error in secondary analyses.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtDataError
 from mirt.utils.data import validate_responses
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 _PV_REGRESSION_TARGET_ELEMENTS = 500_000
+_PV_PERSON_NODE_ELEMENTS = 2_000_000
 
 
 def generate_plausible_values(
@@ -35,6 +36,9 @@ def generate_plausible_values(
     burn_in: int = 0,
     proposal_scale: float = 0.5,
     chunk_size: int = 4096,
+    *,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> NDArray[np.float64]:
     """Generate plausible values for latent abilities.
 
@@ -45,7 +49,9 @@ def generate_plausible_values(
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted IRT model
+        Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
+        ``latent_mean`` and ``latent_covariance`` are then the default
+        population mean and covariance.
     responses : NDArray
         Response matrix (n_persons, n_items)
     n_plausible : int
@@ -72,6 +78,16 @@ def generate_plausible_values(
         Positive number of people evaluated in each likelihood batch. Smaller
         values reduce peak memory use for posterior and MCMC generation.
         Default 4096.
+    prior_mean : array-like, optional
+        Mean of the normal population (prior) distribution of theta, with
+        shape ``(n_factors,)``, or ``(n_persons, n_factors)`` for
+        person-specific conditioning means such as latent-regression
+        predictions. Defaults to the ``latent_mean`` of a ``FitResult`` when
+        it has one, and to zero otherwise.
+    prior_cov : array-like, optional
+        Positive definite ``(n_factors, n_factors)`` population covariance.
+        Defaults to the ``latent_covariance`` of a ``FitResult`` when it has
+        one, and to the identity otherwise.
 
     Returns
     -------
@@ -85,11 +101,22 @@ def generate_plausible_values(
         If the model is unfitted or a generation parameter is invalid.
     MirtDataError
         If the response matrix shape or category codes are invalid.
-    """
-    from mirt.results.fit_result import FitResult
 
-    if isinstance(model, FitResult):
-        model = model.model
+    Notes
+    -----
+    Plausible values reproduce population moments only when the prior matches
+    the population. On short tests, draws under the default standard normal
+    prior shrink toward it, so supply the estimated population mean and
+    covariance, on the model's identified scale, for a population that is
+    not standard normal. The posterior method places its quadrature nodes at
+    ``prior_mean + L z``, where ``L`` is the Cholesky factor of ``prior_cov``
+    and ``z`` are standard Gauss-Hermite nodes, so the prior keeps its
+    resolution. The MCMC method uses the same normal prior and starts every
+    chain at its prior mean.
+    """
+    from mirt.results._common import resolve_latent_prior
+
+    model, prior_mean, prior_cov = resolve_latent_prior(model, prior_mean, prior_cov)
 
     if not model.is_fitted:
         raise ValueError("Model must be fitted before generating plausible values")
@@ -144,6 +171,9 @@ def generate_plausible_values(
     elif np.any(responses[observed] > 1):
         raise MirtDataError("dichotomous responses must be coded as 0 or 1")
 
+    prior = _resolve_population_prior(
+        prior_mean, prior_cov, model.n_factors, responses.shape[0]
+    )
     rng = np.random.default_rng(seed)
 
     if method == "posterior":
@@ -154,6 +184,7 @@ def generate_plausible_values(
             n_quadpts,
             rng,
             int(chunk_size),
+            prior=prior,
         )
     else:
         pvs = _generate_pv_mcmc(
@@ -165,9 +196,63 @@ def generate_plausible_values(
             burn_in,
             float(proposal_scale),
             int(chunk_size),
+            prior=prior,
         )
 
     return pvs
+
+
+class _PopulationPrior(NamedTuple):
+    """Normal population prior with a shared or person-specific mean."""
+
+    mean: NDArray[np.float64]
+    cholesky: NDArray[np.float64]
+
+    @property
+    def person_specific(self) -> bool:
+        return self.mean.ndim == 2
+
+    def log_kernel(
+        self, theta: NDArray[np.float64], rows: slice
+    ) -> NDArray[np.float64]:
+        """Return the log density, up to a constant, of aligned rows."""
+        from scipy.linalg import solve_triangular
+
+        mean = self.mean[rows] if self.person_specific else self.mean
+        standardized = solve_triangular(self.cholesky, (theta - mean).T, lower=True)
+        return -0.5 * np.einsum("ij,ij->j", standardized, standardized)
+
+
+def _resolve_population_prior(
+    prior_mean: ArrayLike | None,
+    prior_cov: ArrayLike | None,
+    n_factors: int,
+    n_persons: int,
+) -> _PopulationPrior | None:
+    """Validate a shared or person-specific normal population prior."""
+    from mirt.scoring._common import resolve_prior_distribution
+
+    if prior_mean is None and prior_cov is None:
+        return None
+    mean = None if prior_mean is None else np.asarray(prior_mean, dtype=np.float64)
+    if mean is not None and mean.shape not in ((n_factors,), (n_persons, n_factors)):
+        raise ValueError(
+            f"prior_mean must have shape ({n_factors},) or ({n_persons}, {n_factors})"
+        )
+    person_means = None
+    if mean is not None and mean.ndim == 2:
+        if not np.all(np.isfinite(mean)):
+            raise ValueError("prior_mean must contain only finite values")
+        person_means, mean = mean, None
+    shared_mean, cov = resolve_prior_distribution(
+        n_factors=n_factors,
+        prior_mean=mean,
+        prior_cov=None if prior_cov is None else np.asarray(prior_cov, np.float64),
+    )
+    return _PopulationPrior(
+        mean=shared_mean if person_means is None else person_means,
+        cholesky=np.linalg.cholesky(cov),
+    )
 
 
 def _generate_pv_posterior(
@@ -177,6 +262,8 @@ def _generate_pv_posterior(
     n_quadpts: int,
     rng: np.random.Generator,
     chunk_size: int,
+    *,
+    prior: _PopulationPrior | None = None,
 ) -> NDArray[np.float64]:
     """Generate PVs from a quadrature posterior in bounded row batches."""
     from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -187,6 +274,13 @@ def _generate_pv_posterior(
     quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=n_factors)
     nodes = quad.nodes
     weights = quad.weights
+    person_specific = prior is not None and prior.person_specific
+    if prior is not None:
+        # Affine Gauss-Hermite nodes integrate N(mean, cov) with unchanged
+        # weights, keeping the prior's resolution wherever it lies.
+        nodes = nodes @ prior.cholesky.T
+        if not person_specific:
+            nodes += prior.mean
 
     # Generate draws before batching likelihood work so the seeded stream is
     # independent of chunk_size. Quadrature nodes already represent posterior
@@ -197,12 +291,21 @@ def _generate_pv_posterior(
     log_weights = np.full_like(weights, -np.inf)
     np.log(weights, out=log_weights, where=weights > 0.0)
     n_nodes = nodes.shape[0]
+    if person_specific:
+        chunk_size = max(1, min(chunk_size, _PV_PERSON_NODE_ELEMENTS // n_nodes))
     for start in range(0, n_persons, chunk_size):
         stop = min(start + chunk_size, n_persons)
-        log_likes = np.asarray(
-            model.log_likelihood_batch(responses[start:stop], nodes),
-            dtype=np.float64,
-        )
+        if person_specific:
+            assert prior is not None
+            means = prior.mean[start:stop]
+            log_likes = _person_node_log_likelihood(
+                model, responses[start:stop], means, nodes
+            )
+        else:
+            log_likes = np.asarray(
+                model.log_likelihood_batch(responses[start:stop], nodes),
+                dtype=np.float64,
+            )
         expected_shape = (stop - start, n_nodes)
         if log_likes.shape != expected_shape:
             raise ValueError(
@@ -223,9 +326,33 @@ def _generate_pv_posterior(
         cumulative = np.cumsum(posterior, axis=1)
         cumulative[:, -1] = 1.0
         indices = _inverse_cdf_rows(cumulative, uniforms[start:stop])
-        pvs[start:stop] = np.moveaxis(nodes[indices], 1, 2)
+        draws = nodes[indices]
+        if person_specific:
+            draws += means[:, None, :]
+        pvs[start:stop] = np.moveaxis(draws, 1, 2)
 
     return pvs
+
+
+def _person_node_log_likelihood(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    means: NDArray[np.float64],
+    offsets: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate every response row at its own nodes ``means[i] + offsets[k]``."""
+    n_rows = responses.shape[0]
+    log_likes = np.empty((n_rows, offsets.shape[0]), dtype=np.float64)
+    for node, offset in enumerate(offsets):
+        values = np.asarray(
+            model.log_likelihood(responses, means + offset), dtype=np.float64
+        )
+        if values.shape != (n_rows,):
+            raise ValueError(
+                "model.log_likelihood must return one value per response row"
+            )
+        log_likes[:, node] = values
+    return log_likes
 
 
 def _inverse_cdf_rows(
@@ -245,6 +372,7 @@ def _paired_log_density(
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
     chunk_size: int,
+    prior: _PopulationPrior | None = None,
 ) -> NDArray[np.float64]:
     """Evaluate paired person/ability log densities in bounded batches."""
     n_persons = responses.shape[0]
@@ -260,9 +388,13 @@ def _paired_log_density(
             raise ValueError(
                 "model.log_likelihood must return one value per response row"
             )
-        density[start:stop] = log_likelihood - 0.5 * np.einsum(
-            "ij,ij->i", theta_chunk, theta_chunk, optimize=True
-        )
+        if prior is None:
+            log_prior = -0.5 * np.einsum(
+                "ij,ij->i", theta_chunk, theta_chunk, optimize=True
+            )
+        else:
+            log_prior = prior.log_kernel(theta_chunk, slice(start, stop))
+        density[start:stop] = log_likelihood + log_prior
     return density
 
 
@@ -275,13 +407,19 @@ def _generate_pv_mcmc(
     burn_in: int = 0,
     proposal_scale: float = 0.5,
     chunk_size: int = 4096,
+    *,
+    prior: _PopulationPrior | None = None,
 ) -> NDArray[np.float64]:
     """Generate PVs using batched random-walk Metropolis sampling."""
     n_persons = responses.shape[0]
     n_factors = model.n_factors
 
     theta = np.zeros((n_persons, n_factors), dtype=np.float64)
-    current_log_density = _paired_log_density(model, responses, theta, chunk_size)
+    if prior is not None:
+        theta += prior.mean
+    current_log_density = _paired_log_density(
+        model, responses, theta, chunk_size, prior
+    )
     pvs = np.empty((n_persons, n_factors, n_plausible), dtype=np.float64)
 
     draw = 0
@@ -289,7 +427,7 @@ def _generate_pv_mcmc(
     for completed in range(1, total_iterations + 1):
         proposal = theta + rng.normal(0.0, proposal_scale, size=theta.shape)
         proposal_log_density = _paired_log_density(
-            model, responses, proposal, chunk_size
+            model, responses, proposal, chunk_size, prior
         )
         accepted = (
             np.log(rng.random(n_persons)) < proposal_log_density - current_log_density
@@ -302,6 +440,53 @@ def _generate_pv_mcmc(
             draw += 1
 
     return pvs
+
+
+class _RubinPool(NamedTuple):
+    """Element-wise Rubin (1987) combination of repeated analyses."""
+
+    estimate: NDArray[np.float64]
+    within_variance: NDArray[np.float64]
+    between_variance: NDArray[np.float64]
+    total_variance: NDArray[np.float64]
+    df: NDArray[np.float64]
+
+
+def _rubin_pool(
+    estimates: NDArray[np.float64],
+    variances: NDArray[np.float64],
+    *,
+    zero_between_df: float,
+) -> _RubinPool:
+    """Pool stacked estimates and variances over their first axis.
+
+    The degrees of freedom are Rubin's large-sample approximation. Where the
+    between-imputation variance is zero, that approximation is unbounded and
+    ``zero_between_df`` is reported instead.
+    """
+    m = estimates.shape[0]
+    estimate = np.mean(estimates, axis=0)
+    within_variance = np.mean(variances, axis=0)
+    between_variance = np.var(estimates, axis=0, ddof=1)
+    extra_variance = (1.0 + 1.0 / m) * between_variance
+    relative_within = np.divide(
+        within_variance,
+        extra_variance,
+        out=np.zeros_like(within_variance),
+        where=extra_variance > 0.0,
+    )
+    df = np.where(
+        extra_variance > 0.0,
+        (m - 1) * (1.0 + relative_within) ** 2,
+        zero_between_df,
+    )
+    return _RubinPool(
+        estimate=estimate,
+        within_variance=within_variance,
+        between_variance=between_variance,
+        total_variance=within_variance + extra_variance,
+        df=df,
+    )
 
 
 def combine_plausible_values(
@@ -370,21 +555,11 @@ def combine_plausible_values(
         if np.any(variance_values < 0.0):
             raise ValueError("variances must be nonnegative")
 
-        within_var = np.mean(variance_values, axis=0)
-        extra_variance = (1.0 + 1.0 / m) * between_var
-        total_var = within_var + extra_variance
+        pooled = _rubin_pool(estimate_values, variance_values, zero_between_df=np.inf)
+        within_var = pooled.within_variance
+        total_var = pooled.total_variance
         standard_error = np.sqrt(total_var)
-        relative_within = np.divide(
-            within_var,
-            extra_variance,
-            out=np.zeros_like(within_var),
-            where=extra_variance > 0.0,
-        )
-        df = np.where(
-            extra_variance > 0.0,
-            (m - 1) * (1.0 + relative_within) ** 2,
-            np.inf,
-        )
+        df = pooled.df
 
         if scalar_results:
             result.update(

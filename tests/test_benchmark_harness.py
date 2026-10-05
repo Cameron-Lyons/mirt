@@ -279,6 +279,11 @@ class TestBenchmarkComparisons:
             "q3_missing",
             "ld_complete",
             "ld_missing",
+            "grm_map_scoring",
+            "grm_ml_scoring",
+            "grm_wle_scoring",
+            "grm_eapsum_scoring",
+            "map_scoring_2d",
         ],
     )
     def test_new_workloads_reject_mismatched_person_counts(self, name: str) -> None:
@@ -382,6 +387,7 @@ class TestBenchmarkCommand:
             "qmcem-mstep",
             "qmcem-fit",
             "mcem-sampling",
+            "bifactor-fit",
         )
         assert benchmark.resolve_suites(["cat", "fit", "cat"]) == ("fit", "cat")
         assert benchmark.resolve_suites(["scoring", "all"]) == (
@@ -434,6 +440,7 @@ class TestBenchmarkCommand:
             "qmcem-mstep",
             "qmcem-fit",
             "mcem-sampling",
+            "bifactor-fit",
         )
 
     def test_binary_likelihood_suite_records_memory_and_checks_person_count(self):
@@ -701,6 +708,24 @@ class TestBenchmarkCommand:
                 _report(*results, persons=8, items=2),
                 _report(*results, persons=9, items=2),
                 max_regression_percent=20,
+            )
+
+    def test_bifactor_fit_suite_records_time_memory_and_checks_person_count(self):
+        results = benchmark.run_suites(
+            ("bifactor-fit",), n_persons=12, n_items=4, repeats=1, warmups=0
+        )
+        assert [result.name for result in results] == [
+            "bifactor_fit_reduced_q7",
+            "bifactor_fit_reduced_q21",
+            "bifactor_fit_reduced_q21_se",
+            "bifactor_fit_product_q7",
+        ]
+        assert all(result.peak_traced_bytes > 0 for result in results)
+        with pytest.raises(ValueError, match="person count"):
+            benchmark.compare_results(
+                _report(*results, persons=12, items=4),
+                _report(*results, persons=13, items=4),
+                max_regression_percent=20.0,
             )
 
     def test_variational_suite_records_time_memory_and_checks_person_count(self):
@@ -1182,6 +1207,7 @@ class TestBenchmarkCommand:
             "multigroup_fit_metric",
             "multigroup_fit_scalar",
             "multigroup_fit_fixed",
+            "multigroup_dif_likelihood_ratio",
         ]
         assert all(result.peak_traced_bytes > 0 for result in results)
         for result in results:

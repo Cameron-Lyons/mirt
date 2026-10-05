@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from mirt import bootstrap_ci, bootstrap_se, parametric_bootstrap
+from mirt._categorical import draw_item_responses
 from mirt.backends.rust import _helpers as rust_helpers
 from mirt.backends.rust import estimation as rust_estimation
 from mirt.estimation.em import EMEstimator
@@ -18,10 +19,12 @@ from mirt.utils.bootstrap import (
     _bca_interval,
     _elementwise_percentile,
     _fit_jackknife_task,
+    _fit_statistic_task,
     _iter_sample_indices,
     _JackknifeMoments,
+    _prepare_bootstrap_model,
     _resample_rng_chunks,
-    _simulate_model_responses,
+    _run_bootstrap_tasks,
     _StatisticFitTask,
 )
 
@@ -85,10 +88,10 @@ def test_jackknife_worker_returns_fixed_size_theta_summaries(monkeypatch):
         fitted_model._parameters["difficulty"][0] = sample.sum()
         return SimpleNamespace(model=fitted_model)
 
-    def fake_scores(fitted_model, original_responses, method):
-        scores = (np.arange(len(original_responses)) + 1) * fitted_model._parameters[
-            "difficulty"
-        ][0]
+    def fake_scores(fitted, original_responses, method):
+        # Replicates are scored through their fit, which carries its population.
+        difficulty = fitted.model._parameters["difficulty"][0]
+        scores = (np.arange(len(original_responses)) + 1) * difficulty
         return SimpleNamespace(theta=scores.astype(float))
 
     monkeypatch.setattr(EMEstimator, "fit", fake_fit)
@@ -836,7 +839,7 @@ class TestParametricBootstrap:
         rng = np.random.default_rng(42)
         for _ in range(3):
             theta = rng.standard_normal((30, model.n_factors))
-            expected.append(_simulate_model_responses(model, theta, rng))
+            expected.append(draw_item_responses(model, theta, rng))
 
         parametric_bootstrap(
             model,
@@ -909,6 +912,8 @@ class TestParametricBootstrap:
         assert all(not np.any(responses) for responses in simulated)
 
     def test_cold_start_reinitializes_parameters(self, monkeypatch):
+        from mirt.estimation.base import _initialize_free_parameters
+
         model = FourParameterLogistic(n_items=2)
         model.set_parameters(
             discrimination=np.full(2, 2.0),
@@ -919,6 +924,9 @@ class TestParametricBootstrap:
         starts = []
 
         def fake_fit(self, fitted_model, responses):
+            # EM reinitializes the free coordinates of an unfitted model.
+            assert not fitted_model.is_fitted
+            _initialize_free_parameters(fitted_model)
             starts.append(fitted_model.parameters)
             return SimpleNamespace(model=fitted_model)
 
@@ -940,3 +948,174 @@ class TestParametricBootstrap:
             np.array_equal(start["guessing"], np.full(2, 0.2)) for start in starts
         )
         assert all(np.array_equal(start["upper"], np.ones(2)) for start in starts)
+
+
+def _worker_backend(_value):
+    """Report the backend preference that a process worker resolved."""
+    import mirt
+
+    return mirt.get_backend()
+
+
+@pytest.fixture(scope="module")
+def fitted_grm():
+    """A converged GRM calibration small enough for repeated refits."""
+    from mirt import fit_mirt, simdata
+
+    responses = simdata("GRM", n_persons=150, n_items=5, n_categories=4, seed=11)
+    result = fit_mirt(
+        responses,
+        model="GRM",
+        n_categories=4,
+        tol=1e-7,
+        compute_standard_errors=False,
+    )
+    return result.model, responses
+
+
+class TestWarmStart:
+    """Replicate fits start from the supplied estimates when requested."""
+
+    def test_warm_start_does_not_reinitialize_estimates(self, fitted_grm, monkeypatch):
+        import mirt.estimation.base as base_module
+
+        model, responses = fitted_grm
+        calls = []
+        original = base_module._initialize_free_parameters
+
+        def record(fitted_model):
+            calls.append(fitted_model.n_items)
+            original(fitted_model)
+
+        monkeypatch.setattr(base_module, "_initialize_free_parameters", record)
+
+        bootstrap_se(model, responses, n_bootstrap=2, seed=1, warm_start=True)
+        assert calls == []
+
+        bootstrap_se(model, responses, n_bootstrap=2, seed=1, warm_start=False)
+        assert len(calls) == 2
+
+    def test_first_em_iterate_evaluates_the_original_estimates(self, fitted_grm):
+        model, responses = fitted_grm
+        sample = responses[np.random.default_rng(3).integers(0, 150, 150)]
+
+        reference_model = model.copy()
+        reference = EMEstimator(max_iter=1, tol=1e-3)
+        reference.fit(reference_model, sample)
+
+        start = _prepare_bootstrap_model(model, model.parameters, warm_start=True)
+        estimator = EMEstimator(max_iter=1, tol=1e-3)
+        estimator.fit(start, sample)
+
+        assert estimator._convergence_history[0] == reference._convergence_history[0]
+
+    def test_jackknife_refit_from_converged_grm_converges_quickly(
+        self, fitted_grm, monkeypatch
+    ):
+        model, responses = fitted_grm
+        outcomes = []
+        original_fit = EMEstimator.fit
+
+        def recording_fit(self, fitted_model, sample, *args, **kwargs):
+            result = original_fit(self, fitted_model, sample, *args, **kwargs)
+            outcomes.append((result.n_iterations, result.converged))
+            return result
+
+        monkeypatch.setattr(EMEstimator, "fit", recording_fit)
+        task = _StatisticFitTask(
+            model=model,
+            original_params=model.parameters,
+            warm_start=True,
+            max_iter=100,
+            responses=responses,
+            statistic="parameters",
+            omitted_indices=[0, 1, 2],
+        )
+
+        results = _fit_statistic_task(task)
+
+        assert all(error is None for _, error in results)
+        assert len(outcomes) == 3
+        assert all(converged and iterations < 8 for iterations, converged in outcomes)
+
+    @pytest.mark.parametrize("warm_start", [True, False])
+    def test_fixed_parameters_keep_their_values_in_replicates(self, warm_start):
+        from mirt import simdata
+
+        responses = simdata("2PL", n_persons=120, n_items=5, seed=4)
+        model = TwoParameterLogistic(5).set_parameters(discrimination=np.full(5, 1.7))
+        masks = model.free_parameter_masks
+        masks["discrimination"][:] = False
+        model.set_free_parameter_masks(masks)
+        task = _StatisticFitTask(
+            model=model,
+            original_params=model.parameters,
+            warm_start=warm_start,
+            max_iter=50,
+            responses=responses,
+            statistic="parameters",
+            sample_indices=[np.arange(120), np.arange(60, 120)],
+        )
+
+        results = _fit_statistic_task(task)
+
+        assert all(error is None for _, error in results)
+        for values, _ in results:
+            np.testing.assert_array_equal(values["discrimination"], np.full(5, 1.7))
+            assert not np.array_equal(values["difficulty"], np.zeros(5))
+
+    def test_native_2pl_bootstrap_is_skipped_for_restricted_models(self, monkeypatch):
+        model = TwoParameterLogistic(2)
+        masks = model.free_parameter_masks
+        masks["discrimination"][0] = False
+        model.set_free_parameter_masks(masks)
+
+        def unexpected_native_call(*args, **kwargs):
+            raise AssertionError("restricted models must not use the native path")
+
+        monkeypatch.setattr(rust_helpers, "rust_enabled", lambda: True)
+        monkeypatch.setattr(
+            rust_estimation, "bootstrap_fit_2pl", unexpected_native_call
+        )
+        responses = np.array([[0, 1], [1, 0], [1, 1], [0, 0]] * 5)
+
+        result = bootstrap_se(model, responses, n_bootstrap=2, seed=42)
+
+        assert result["discrimination"][0] == 0.0
+
+
+class TestProcessWorkers:
+    """Bootstrap workers share the parent's configuration."""
+
+    @pytest.mark.parametrize("backend", ["auto", "numpy"])
+    def test_workers_use_the_parent_backend(self, backend):
+        import mirt
+
+        previous = mirt.get_backend()
+        mirt.set_backend(backend)
+        try:
+            reported = _run_bootstrap_tasks(_worker_backend, [0, 1], n_jobs=2)
+        finally:
+            mirt.set_backend(previous)
+
+        assert reported == [backend, backend]
+
+    def test_seeded_results_match_across_worker_counts_without_native_code(
+        self, fitted_grm
+    ):
+        # The default backend is covered by the parallel tests above; workers
+        # that ignored an explicit NumPy request would refit natively. Every
+        # bootstrap entry point shares this worker pool.
+        import mirt
+
+        model, responses = fitted_grm
+        previous = mirt.get_backend()
+        mirt.set_backend("numpy")
+        try:
+            serial = bootstrap_se(model, responses, n_bootstrap=4, seed=5)
+            parallel = bootstrap_se(model, responses, n_bootstrap=4, seed=5, n_jobs=2)
+        finally:
+            mirt.set_backend(previous)
+
+        for name in serial:
+            np.testing.assert_array_equal(parallel[name], serial[name])

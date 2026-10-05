@@ -9,7 +9,8 @@ Uses fast Rust backend when available for 2PL models.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import pickle
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from numbers import Real
 from typing import TYPE_CHECKING, Any
@@ -19,19 +20,50 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt.constants import PROB_EPSILON
-from mirt.exceptions import MirtEstimationError
+from mirt.exceptions import MirtEstimationError, MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation._graded_order import graded_threshold_constraint
+from mirt.estimation.base import BaseEstimator, _reject_parameter_restrictions
 from mirt.results.fit_result import FitResult
 
 PosteriorValue = NDArray[np.float64] | np.float64
 PosteriorSummary = dict[str, dict[str, PosteriorValue]]
 CredibleIntervals = dict[str, tuple[PosteriorValue, PosteriorValue]]
 
-_MHRM_MAX_PROBABILITY_VALUES = 1_000_000
+_Objective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
+
+_MHRM_GAIN_SEQUENCES = ("standard", "adaptive")
+# Ability sweeps before the first parameter step.
+_MHRM_WARMUP_SWEEPS = 30
+# Largest change of any item coordinate in one cycle; narrower boxes allow
+# a quarter of their width.
+_MHRM_MAX_STEP = 1.0
+_MHRM_MAX_HALVINGS = 10
+# Relative step for differentiating item gradients.
+_MHRM_DIFFERENCE_STEP = 1e-5
+_MHRM_RELATIVE_CURVATURE_FLOOR = 1e-8
+
+
+def _validate_count(value: int, name: str, minimum: int) -> int:
+    """Return an integer sampler control of at least ``minimum``."""
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < minimum
+    ):
+        expected = {0: "non-negative integer", 1: "positive integer"}.get(
+            minimum, f"integer of at least {minimum}"
+        )
+        raise MirtValidationError(
+            f"{name} must be a {expected}",
+            parameter=name,
+            value=value,
+            expected=expected,
+        )
+    return int(value)
 
 
 def _is_2pl_unidimensional(model: BaseItemModel) -> bool:
@@ -229,14 +261,33 @@ class MCMCResult:
 
 
 class MHRMEstimator(BaseEstimator):
-    """Metropolis-Hastings Robbins-Monro estimator.
+    """Metropolis-Hastings Robbins-Monro estimator (Cai, 2010).
 
-    MHRM is a stochastic approximation method that combines:
-    1. Metropolis-Hastings sampling for latent variables (theta)
-    2. Robbins-Monro updates for item parameters
+    Each cycle draws abilities with a random-walk Metropolis step and then
+    moves every item along its complete-data score ``s_k``, preconditioned by
+    a stochastic approximation of the complete-data information:
 
-    This is faster than full MCMC while providing good estimates
-    for complex models where EM may struggle.
+    .. math::
+
+        \\Gamma_k = \\Gamma_{k-1} + g_k (H_k - \\Gamma_{k-1}), \\qquad
+        \\beta_{k+1} = \\beta_k + g_k \\Gamma_k^{-1} s_k,
+
+    where ``H_k`` is the item's complete-data information at the current
+    draw. Burn-in cycles use ``g_k = 1``, Newton steps on the imputed data;
+    later gains decrease (see ``gain_sequence``) and the estimates average the
+    post-burn-in iterates. Items are updated blockwise, so every built-in
+    item family, including polytomous and multidimensional ones, is
+    supported except the rating scale models (RSM and GRSM), whose
+    thresholds are shared by all items.
+
+    Standard errors of unidimensional 1PL-4PL, GRM, GPCM and PCM fits come
+    from the exact observed information of the marginal likelihood at the
+    estimates (Louis, 1982), integrated by Gauss-Hermite quadrature over the
+    standard normal ability prior; they match EM's ``se_method="oakes"`` and
+    fill ``FitResult.vcov``. Other models report the standard deviation of
+    the post-burn-in iterates, labelled ``se_method="mhrm_iterate_sd"``. That
+    measures the Robbins-Monro noise around the estimate, not sampling
+    variability, so it is no substitute for a standard error.
 
     Uses fast parallel Rust backend for 2PL models when available.
 
@@ -245,7 +296,13 @@ class MHRMEstimator(BaseEstimator):
     Cai, L. (2010). Metropolis-Hastings Robbins-Monro algorithm for
     confirmatory item factor analysis. Journal of Educational and
     Behavioral Statistics, 35(3), 307-335.
+
+    Louis, T. A. (1982). Finding the observed information matrix when using
+    the EM algorithm. Journal of the Royal Statistical Society: Series B,
+    44(2), 226-233.
     """
+
+    _holds_fixed_parameters = False
 
     def __init__(
         self,
@@ -257,6 +314,8 @@ class MHRMEstimator(BaseEstimator):
         verbose: bool = False,
         use_rust: bool = True,
         seed: int | None = None,
+        compute_standard_errors: bool = True,
+        n_quadpts: int = 21,
     ) -> None:
         """Initialize MHRM estimator.
 
@@ -265,28 +324,68 @@ class MHRMEstimator(BaseEstimator):
         n_cycles : int
             Number of MHRM cycles
         burnin : int
-            Number of burnin cycles
+            Number of initial unit-gain cycles, which are excluded from the
+            parameter average; the final iterate is used when
+            ``burnin >= n_cycles``
         n_chains : int
             Number of parallel chains
         proposal_sd : float
             Standard deviation for MH proposals
         gain_sequence : str
-            Type of gain sequence ('standard' or 'adaptive')
+            Post-burn-in gains for the ``t``-th cycle after burn-in:
+            ``1 / (t + 1)`` ('standard') or ``min(1, 10 / (t + 10))``
+            ('adaptive')
         verbose : bool
             Whether to print progress
         use_rust : bool
             Whether to use Rust backend when available
         seed : int, optional
             Random seed for reproducibility
+        compute_standard_errors : bool
+            Whether to compute standard errors. Without them the result has
+            an empty standard-error mapping.
+        n_quadpts : int
+            Gauss-Hermite points for the observed-information standard errors.
         """
+        n_cycles = _validate_count(n_cycles, "n_cycles", 1)
+        burnin = _validate_count(burnin, "burnin", 0)
+        n_quadpts = _validate_count(n_quadpts, "n_quadpts", 2)
+        if not isinstance(compute_standard_errors, (bool, np.bool_)):
+            raise MirtValidationError(
+                "compute_standard_errors must be a boolean",
+                parameter="compute_standard_errors",
+                value=compute_standard_errors,
+                expected="bool",
+            )
+        if (
+            isinstance(proposal_sd, (bool, np.bool_))
+            or not isinstance(proposal_sd, (int, float, np.integer, np.floating))
+            or not np.isfinite(proposal_sd)
+            or proposal_sd <= 0
+        ):
+            raise MirtValidationError(
+                "proposal_sd must be finite and positive",
+                parameter="proposal_sd",
+                value=proposal_sd,
+                expected="> 0",
+            )
+        if gain_sequence not in _MHRM_GAIN_SEQUENCES:
+            raise MirtValidationError(
+                "gain_sequence must be 'standard' or 'adaptive'",
+                parameter="gain_sequence",
+                value=gain_sequence,
+                expected="'standard' or 'adaptive'",
+            )
         super().__init__(max_iter=n_cycles, tol=1e-4, verbose=verbose)
         self.n_cycles = n_cycles
         self.burnin = burnin
         self.n_chains = n_chains
-        self.proposal_sd = proposal_sd
+        self.proposal_sd = float(proposal_sd)
         self.gain_sequence = gain_sequence
         self.use_rust = use_rust
         self.seed = seed
+        self.compute_standard_errors = bool(compute_standard_errors)
+        self.n_quadpts = n_quadpts
 
     def fit(
         self,
@@ -308,11 +407,19 @@ class MHRMEstimator(BaseEstimator):
         Returns
         -------
         FitResult
-            Fitted model result
+            Fitted model result. ``se_method`` records how the standard
+            errors were computed (see the class notes).
+
+        Raises
+        ------
+        MirtValidationError
+            If ``set_free_parameter_masks`` fixes parameters, which MHRM
+            cannot hold.
         """
         from mirt._backend_config import should_use_rust
         from mirt.backends.rust.estimation import mhrm_fit_2pl
 
+        _reject_parameter_restrictions(model, "MHRMEstimator")
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 
@@ -323,12 +430,13 @@ class MHRMEstimator(BaseEstimator):
                 else np.random.default_rng().integers(0, 2**31)
             )
 
-            discrimination, difficulty, log_likelihood = mhrm_fit_2pl(
+            discrimination, difficulty, _ = mhrm_fit_2pl(
                 responses,
                 n_cycles=self.n_cycles,
                 burnin=self.burnin,
                 proposal_sd=self.proposal_sd,
                 seed=seed,
+                gain_sequence=self.gain_sequence,
             )
 
             if not model._parameters:
@@ -337,30 +445,18 @@ class MHRMEstimator(BaseEstimator):
             model._parameters["difficulty"] = np.asarray(difficulty)
             model._is_fitted = True
 
+            # Score at MAP abilities as the NumPy path does, so AIC and BIC do
+            # not depend on the backend.
+            theta_map = self._estimate_theta_map(
+                model, responses, np.random.default_rng(seed)
+            )
+            log_likelihood = float(np.sum(model.log_likelihood(responses, theta_map)))
+
             n_params = 2 * n_items
             aic = -2 * log_likelihood + 2 * n_params
             bic = -2 * log_likelihood + np.log(n_persons) * n_params
-
-            from mirt.backends.rust.diagnostics import compute_item_se_parallel
-            from mirt.backends.rust.estep import e_step_complete
-            from mirt.estimation.quadrature import GaussHermiteQuadrature
-
-            disc = np.asarray(discrimination)
-            diff = np.asarray(difficulty)
-            quad = GaussHermiteQuadrature(n_points=21, n_dimensions=1)
-            posterior_weights, _ = e_step_complete(
-                responses,
-                quad.nodes.ravel(),
-                quad.weights.ravel(),
-                disc,
-                diff,
-            )
-            se_a, se_b = compute_item_se_parallel(
-                responses,
-                posterior_weights,
-                quad.nodes.ravel(),
-                disc,
-                diff,
+            standard_errors, se_method, covariance = self._standard_errors(
+                model, responses, None
             )
 
             return FitResult(
@@ -368,30 +464,33 @@ class MHRMEstimator(BaseEstimator):
                 log_likelihood=log_likelihood,
                 n_iterations=self.n_cycles,
                 converged=True,
-                standard_errors={
-                    "discrimination": np.asarray(se_a),
-                    "difficulty": np.asarray(se_b),
-                },
+                standard_errors=standard_errors,
                 aic=aic,
                 bic=bic,
-                n_observations=n_persons * n_items,
+                n_observations=n_persons,
                 n_parameters=n_params,
+                se_method=se_method,
+                vcov=covariance,
             )
 
         if not model._parameters:
             model._initialize_parameters()
 
-        theta = np.zeros((n_persons, model.n_factors))
-
-        param_history: dict[str, list] = {name: [] for name in model.parameters}
-
         rng = np.random.default_rng(self.seed)
+        theta = np.zeros((n_persons, model.n_factors))
+        # Let the ability chain leave its degenerate start before the first
+        # unit-gain step, whose complete-data information needs spread draws.
+        for _ in range(_MHRM_WARMUP_SWEEPS):
+            theta = self._sample_theta(model, responses, theta, rng)
+
+        information: list[NDArray[np.float64] | None] = [None] * n_items
+        param_history: dict[str, list] = {name: [] for name in model.parameters}
 
         for cycle in range(self.n_cycles):
             theta = self._sample_theta(model, responses, theta, rng)
 
             gain = self._compute_gain(cycle)
-            self._update_parameters(model, responses, theta, gain, rng)
+            self._update_parameters(model, responses, theta, gain, information)
 
             if cycle >= self.burnin:
                 for name, values in model.parameters.items():
@@ -409,23 +508,70 @@ class MHRMEstimator(BaseEstimator):
 
         theta_final = self._estimate_theta_map(model, responses, rng)
         ll = float(np.sum(model.log_likelihood(responses, theta_final)))
-
-        se = {}
-        for name, chain in param_history.items():
-            if chain:
-                se[name] = np.std(chain, axis=0)
+        standard_errors, se_method, covariance = self._standard_errors(
+            model, responses, param_history
+        )
 
         return FitResult(
             model=model,
             log_likelihood=ll,
             n_iterations=self.n_cycles,
             converged=True,
-            standard_errors=se,
+            standard_errors=standard_errors,
             aic=-2 * ll + 2 * self._count_parameters(model),
             bic=-2 * ll + np.log(n_persons) * self._count_parameters(model),
-            n_observations=n_persons * n_items,
+            n_observations=n_persons,
             n_parameters=self._count_parameters(model),
+            se_method=se_method,
+            vcov=covariance,
         )
+
+    def _standard_errors(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        history: dict[str, list[NDArray[np.float64]]] | None,
+    ) -> tuple[dict[str, NDArray[np.float64]], str | None, NDArray[np.float64] | None]:
+        """Return standard errors, their method and the parameter covariance.
+
+        Models with exact item derivatives use the observed information at
+        the estimates. Others fall back to the spread of the post-burn-in
+        iterates in ``history``.
+        """
+        from mirt.estimation._louis_information import has_analytic_item_derivatives
+        from mirt.estimation._patterns import (
+            compress_responses,
+            supports_pattern_compression,
+        )
+        from mirt.estimation.base import _parameter_bounds
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+        from mirt.estimation.standard_errors import estimate_covariance
+
+        if not self.compute_standard_errors:
+            return {}, None, None
+        if has_analytic_item_derivatives(model):
+            frequencies = None
+            if supports_pattern_compression(model):
+                responses, frequencies = compress_responses(responses)
+            quadrature = GaussHermiteQuadrature(
+                n_points=self.n_quadpts, n_dimensions=model.n_factors
+            )
+            estimate = estimate_covariance(
+                model,
+                responses,
+                quadrature,
+                quadrature.weights,
+                "oakes",
+                frequencies=frequencies,
+                bounds=lambda name: _parameter_bounds(model, name),
+            )
+            return estimate.standard_errors, "oakes", estimate.covariance
+        errors = {
+            name: np.std(chain, axis=0)
+            for name, chain in (history or {}).items()
+            if chain
+        }
+        return errors, "mhrm_iterate_sd" if errors else None, None
 
     def _sample_theta(
         self,
@@ -454,13 +600,13 @@ class MHRMEstimator(BaseEstimator):
         return theta_new
 
     def _compute_gain(self, cycle: int) -> float:
-        """Compute gain for Robbins-Monro update."""
-        if self.gain_sequence == "standard":
-            return 1.0 / (cycle + 1)
-        elif self.gain_sequence == "adaptive":
-            return min(1.0, 10.0 / (cycle + 10))
-        else:
-            return 1.0 / (cycle + 1)
+        """Return the Robbins-Monro gain: one in burn-in, then decreasing."""
+        if cycle < self.burnin:
+            return 1.0
+        t = cycle - self.burnin
+        if self.gain_sequence == "adaptive":
+            return min(1.0, 10.0 / (t + 10))
+        return 1.0 / (t + 1)
 
     def _update_parameters(
         self,
@@ -468,84 +614,114 @@ class MHRMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         theta: NDArray[np.float64],
         gain: float,
-        rng: np.random.Generator,
+        information: list[NDArray[np.float64] | None],
     ) -> None:
-        """Robbins-Monro update for item parameters."""
-        n_items = model.n_items
+        """Take one preconditioned Robbins-Monro step on every item.
 
-        # Probability and residual matrices are both dense, so keep their
-        # temporary allocation bounded and retain an itemwise path above it.
-        probability_values = responses.shape[0] * n_items
-        if not model.is_polytomous and (
-            probability_values <= _MHRM_MAX_PROBABILITY_VALUES
-        ):
-            probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-            if probabilities.shape == responses.shape:
-                probabilities = np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON)
-                valid = responses >= 0
-                counts = np.sum(valid, axis=0)
-                observed = counts > 0
-                residuals = np.where(valid, responses - probabilities, 0.0)
-
-                # ``parameters`` returns defensive copies; estimation must
-                # update the model-owned arrays so the fitted values persist.
-                discrimination = model._parameters.get("discrimination")
-                if discrimination is not None and discrimination.ndim == 1:
-                    gradient_a = np.zeros(n_items, dtype=np.float64)
-                    np.divide(
-                        np.sum(residuals * theta[:, :1], axis=0),
-                        counts,
-                        out=gradient_a,
-                        where=observed,
-                    )
-                    discrimination[observed] = np.clip(
-                        discrimination[observed] + gain * gradient_a[observed],
-                        0.1,
-                        5.0,
-                    )
-
-                difficulty = model._parameters.get("difficulty")
-                if difficulty is not None and difficulty.ndim == 1:
-                    gradient_b = np.zeros(n_items, dtype=np.float64)
-                    np.divide(
-                        -np.sum(residuals, axis=0),
-                        counts,
-                        out=gradient_b,
-                        where=observed,
-                    )
-                    difficulty[observed] = np.clip(
-                        difficulty[observed] + gain * gradient_b[observed],
-                        -6.0,
-                        6.0,
-                    )
-                return
-
-        discrimination = model._parameters.get("discrimination")
-        difficulty = model._parameters.get("difficulty")
-
-        for j in range(n_items):
-            valid = responses[:, j] >= 0
-            if not valid.any():
+        ``information`` holds each item's running complete-data information
+        and is updated in place. Fixed coordinates never enter the step. A
+        step that would lower the item's complete-data likelihood on the
+        current draw is halved until it does not, which keeps unit-gain
+        burn-in steps from overshooting into degenerate regions; graded
+        thresholds must also stay ordered.
+        """
+        updates: dict[int, NDArray[np.float64]] = {}
+        for item in range(model.n_items):
+            observed = responses[:, item] >= 0
+            if not observed.any():
                 continue
+            params, bounds = self._get_item_params_and_bounds(model, item)
+            if params.size == 0:
+                continue
+            objective = self._item_objective(
+                model, item, theta[observed], responses[observed, item], params, bounds
+            )
+            loss, gradient = objective(params)
+            hessian = _gradient_jacobian(objective, params, gradient, bounds)
+            previous = information[item]
+            current = (
+                hessian if previous is None else previous + gain * (hessian - previous)
+            )
+            information[item] = current
+            lower, upper = np.asarray(bounds, dtype=np.float64).T
+            step = _robbins_monro_step(current, gradient, params, lower, upper, gain)
+            if not np.all(np.isfinite(step)):
+                continue
+            ordering = graded_threshold_constraint(model, item, params.size)
+            for _ in range(_MHRM_MAX_HALVINGS):
+                trial = np.clip(params + step, lower, upper)
+                if (
+                    ordering is None or np.all(ordering.A @ trial >= ordering.lb)
+                ) and objective(trial)[0] <= loss:
+                    updates[item] = trial
+                    break
+                step *= 0.5
+        if updates:
+            _set_item_vectors(model, updates)
 
-            theta_j = theta[valid]
-            resp_j = responses[valid, j]
+    def _item_objective(
+        self,
+        model: BaseItemModel,
+        item: int,
+        theta: NDArray[np.float64],
+        responses: NDArray[np.int_],
+        params: NDArray[np.float64],
+        bounds: list[tuple[float, float]],
+    ) -> _Objective:
+        """Return an item's complete-data loss and gradient on the draws.
 
-            prob = model.probability(theta_j, j)
-            prob = np.clip(prob, PROB_EPSILON, 1 - PROB_EPSILON)
+        Built-in families use their analytic kernels. Custom models evaluate
+        their public probability hook and differentiate it numerically.
+        """
+        from mirt.estimation._mc_objective import _item_kernel
 
-            residual = resp_j - prob
+        # Kernels may skip overflow guards inside their box, so the box must
+        # cover the current values and the differencing steps around them.
+        margin = 4 * _MHRM_DIFFERENCE_STEP * np.maximum(1.0, np.abs(params))
+        box = [
+            (min(low, value - pad), max(high, value + pad))
+            for (low, high), value, pad in zip(bounds, params, margin, strict=True)
+        ]
+        kernel = _item_kernel(
+            model, item, theta, responses, np.ones(len(responses)), box
+        )
+        if kernel is not None:
+            return kernel
 
-            if discrimination is not None:
-                if discrimination.ndim == 1:
-                    gradient_a = np.mean(residual * theta_j.ravel())
-                    discrimination[j] = np.clip(
-                        discrimination[j] + gain * gradient_a, 0.1, 5.0
+        rows = np.arange(len(responses))
+        lower, upper = np.asarray(bounds, dtype=np.float64).T
+
+        def loss(trial: NDArray[np.float64]) -> float:
+            self._set_item_params(model, item, trial)
+            probabilities = np.asarray(model.probability(theta, item), np.float64)
+            if not model.is_polytomous:
+                probabilities = probabilities.reshape(-1)
+                probabilities = np.column_stack((1.0 - probabilities, probabilities))
+            chosen = probabilities[rows, responses]
+            if not np.all(np.isfinite(chosen)):
+                raise MirtEstimationError("model returned invalid item probabilities")
+            return -float(np.sum(np.log(np.clip(chosen, PROB_EPSILON, 1.0))))
+
+        def objective(
+            trial: NDArray[np.float64],
+        ) -> tuple[float, NDArray[np.float64]]:
+            original, _ = self._get_item_params_and_bounds(model, item)
+            try:
+                value = loss(trial)
+                gradient = np.empty_like(trial)
+                for k in range(trial.size):
+                    step = _MHRM_DIFFERENCE_STEP * max(1.0, abs(trial[k]))
+                    forward, backward = trial.copy(), trial.copy()
+                    forward[k] = min(trial[k] + step, max(upper[k], trial[k]))
+                    backward[k] = max(trial[k] - step, min(lower[k], trial[k]))
+                    gradient[k] = (loss(forward) - loss(backward)) / (
+                        forward[k] - backward[k]
                     )
+            finally:
+                self._set_item_params(model, item, original)
+            return value, gradient
 
-            if difficulty is not None:
-                gradient_b = -np.mean(residual)
-                difficulty[j] = np.clip(difficulty[j] + gain * gradient_b, -6.0, 6.0)
+        return objective
 
     def _estimate_theta_map(
         self,
@@ -579,6 +755,99 @@ class MHRMEstimator(BaseEstimator):
         return model.n_parameters
 
 
+def _set_item_vectors(
+    model: BaseItemModel,
+    updates: dict[int, NDArray[np.float64]],
+) -> None:
+    """Write several items' free coordinates with one validated update.
+
+    Vectors use the layout of ``BaseEstimator._get_item_params_and_bounds``.
+    """
+    values = model.parameters
+    masks = model.free_parameter_masks
+    offsets = dict.fromkeys(updates, 0)
+    changed: dict[str, NDArray[np.float64]] = {}
+    for name, array in values.items():
+        if not model._item_indexed(name):
+            continue
+        rows = np.array(array, dtype=np.float64).reshape(model.n_items, -1)
+        free = np.asarray(masks[name], dtype=np.bool_).reshape(model.n_items, -1)
+        for item, vector in updates.items():
+            n_free = int(np.count_nonzero(free[item]))
+            rows[item, free[item]] = vector[offsets[item] : offsets[item] + n_free]
+            offsets[item] += n_free
+        canonical = model._canonical_parameter_values(name, rows.reshape(array.shape))
+        if not np.array_equal(canonical, model._parameters[name]):
+            changed[name] = canonical
+    model.set_parameters(**changed)
+
+
+def _gradient_jacobian(
+    objective: _Objective,
+    params: NDArray[np.float64],
+    gradient: NDArray[np.float64],
+    bounds: list[tuple[float, float]],
+) -> NDArray[np.float64]:
+    """Differentiate a loss gradient by one-sided differences, symmetrized.
+
+    Each coordinate steps toward the inside of its box, so trial values never
+    leave the region where the model is defined.
+    """
+    size = params.size
+    jacobian = np.empty((size, size))
+    for k in range(size):
+        step = _MHRM_DIFFERENCE_STEP * max(1.0, abs(params[k]))
+        if params[k] + step > bounds[k][1]:
+            step = -step
+        trial = params.copy()
+        trial[k] += step
+        jacobian[:, k] = (objective(trial)[1] - gradient) / step
+    return 0.5 * (jacobian + jacobian.T)
+
+
+def _robbins_monro_step(
+    information: NDArray[np.float64],
+    gradient: NDArray[np.float64],
+    params: NDArray[np.float64],
+    lower: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    gain: float,
+) -> NDArray[np.float64]:
+    """Return the preconditioned item step for a loss gradient.
+
+    Coordinates on a bound that the step would push outward are held, and the
+    rest solve their own information block. The step is then shrunk so no
+    coordinate moves farther than a quarter of its box, or one unit.
+    """
+    held = ((params <= lower) & (gradient > 0)) | ((params >= upper) & (gradient < 0))
+    free = ~held
+    step = np.zeros_like(params)
+    step[free] = gain * _precondition(information[np.ix_(free, free)], -gradient[free])
+    limits = np.minimum(_MHRM_MAX_STEP, 0.25 * (upper - lower))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = float(np.max(np.abs(step) / limits, initial=0.0))
+    if ratio > 1.0:
+        step /= ratio
+    return step
+
+
+def _precondition(
+    information: NDArray[np.float64],
+    score: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Solve ``information @ step = score`` with curvature kept positive.
+
+    Eigenvalues are replaced by their magnitudes and floored relative to the
+    largest one, so flat or indefinite directions take bounded descent steps.
+    """
+    values, vectors = np.linalg.eigh(information)
+    scale = float(np.max(np.abs(values), initial=0.0))
+    if not np.isfinite(scale):
+        return np.full_like(score, np.nan)
+    floor = max(_MHRM_RELATIVE_CURVATURE_FLOOR * scale, np.finfo(np.float64).tiny)
+    return vectors @ ((vectors.T @ score) / np.maximum(np.abs(values), floor))
+
+
 class GibbsSampler(BaseEstimator):
     """Full Bayesian estimation via Gibbs sampling.
 
@@ -589,8 +858,11 @@ class GibbsSampler(BaseEstimator):
     This provides full posterior distributions for all parameters.
 
     Uses fast parallel Rust backend for 2PL models when available.
-    Supports multi-chain parallelization when n_chains > 1 and parallel_chains=True.
+    With ``n_chains > 1`` the draws of several seeded chains are stacked;
+    ``parallel_chains=True`` runs NumPy chains in worker processes.
     """
+
+    _holds_fixed_parameters = False
 
     def __init__(
         self,
@@ -611,11 +883,12 @@ class GibbsSampler(BaseEstimator):
         n_iter : int
             Number of iterations
         burnin : int
-            Burnin iterations
+            Burnin iterations; must be less than ``n_iter``
         thin : int
-            Thinning interval
+            Thinning interval; ``ceil((n_iter - burnin) / thin)`` draws are kept
         n_chains : int
-            Number of chains
+            Number of chains; their draws are stacked. Chain ``i`` is seeded
+            with ``seed + 1000 * i``
         priors : dict, optional
             Prior specifications for parameters
         verbose : bool
@@ -625,13 +898,25 @@ class GibbsSampler(BaseEstimator):
         seed : int, optional
             Random seed for reproducibility
         parallel_chains : bool
-            Whether to run multiple chains in parallel (only when n_chains > 1)
+            Whether to run multiple NumPy chains in spawned worker processes;
+            the draws equal those of a serial run. The multithreaded native
+            2PL kernel always runs its chains in turn
         """
+        n_iter = _validate_count(n_iter, "n_iter", 1)
+        burnin = _validate_count(burnin, "burnin", 0)
+        thin = _validate_count(thin, "thin", 1)
+        if burnin >= n_iter:
+            raise MirtValidationError(
+                "burnin must be less than n_iter",
+                parameter="burnin",
+                value=burnin,
+                expected=f"< {n_iter}",
+            )
         super().__init__(max_iter=n_iter, verbose=verbose)
         self.n_iter = n_iter
         self.burnin = burnin
         self.thin = thin
-        self.n_chains = n_chains
+        self.n_chains = _validate_count(n_chains, "n_chains", 1)
         self.priors = priors or {}
         self.use_rust = use_rust
         self.seed = seed
@@ -656,26 +941,35 @@ class GibbsSampler(BaseEstimator):
         -------
         MCMCResult
             MCMC estimation result with chains and diagnostics
+
+        Raises
+        ------
+        MirtValidationError
+            If ``set_free_parameter_masks`` fixes parameters, which the
+            sampler cannot hold.
         """
         from mirt._backend_config import should_use_rust
         from mirt.backends.rust.estimation import gibbs_sample_2pl
 
+        _reject_parameter_restrictions(model, "GibbsSampler")
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 
         if should_use_rust(self.use_rust) and _is_2pl_unidimensional(model):
-            seed = (
-                self.seed
-                if self.seed is not None
-                else np.random.default_rng().integers(0, 2**31)
-            )
-
-            disc_chain, diff_chain, theta_chain, ll_chain = gibbs_sample_2pl(
-                responses,
-                n_iter=self.n_iter,
-                burnin=self.burnin,
-                thin=self.thin,
-                seed=seed,
+            # The native kernel is multithreaded, so its chains run in turn.
+            draws = [
+                gibbs_sample_2pl(
+                    responses,
+                    n_iter=self.n_iter,
+                    burnin=self.burnin,
+                    thin=self.thin,
+                    seed=seed,
+                )
+                for seed in self._chain_seeds()
+            ]
+            disc_chain, diff_chain, theta_chain, ll_chain = (
+                np.concatenate([np.asarray(chain[k]) for chain in draws], axis=0)
+                for k in range(4)
             )
 
             if not model._parameters:
@@ -714,8 +1008,8 @@ class GibbsSampler(BaseEstimator):
         if not model._parameters:
             model._initialize_parameters()
 
-        if self.parallel_chains and self.n_chains > 1:
-            chain_arrays = self._run_parallel_chains(model, responses, n_persons)
+        if self.n_chains > 1:
+            chain_arrays = self._run_chains(model, responses, n_persons)
         else:
             chain_arrays = self._run_single_chain(
                 model, responses, n_persons, self.seed
@@ -778,40 +1072,61 @@ class GibbsSampler(BaseEstimator):
 
         return {name: np.array(chain) for name, chain in chains.items()}
 
-    def _run_parallel_chains(
+    def _run_chains(
         self,
         model: BaseItemModel,
         responses: NDArray[np.int_],
         n_persons: int,
     ) -> dict[str, NDArray]:
-        """Run multiple MCMC chains in parallel and combine results."""
-        from concurrent.futures import ProcessPoolExecutor
+        """Run ``n_chains`` seeded chains from the same start and stack draws.
 
-        base_seed = self.seed if self.seed is not None else 0
-        seeds = [base_seed + i * 1000 for i in range(self.n_chains)]
+        Chain ``i`` uses seed ``seed + 1000 * i``, so worker processes
+        (``parallel_chains=True``) reproduce the serial draws exactly. Workers
+        are spawned with the parent's backend preference rather than forked
+        from a process whose native thread pool may already be running.
+        """
+        from mirt.utils._parallel import _process_pool, resolve_n_jobs
 
-        if self.verbose:
-            print(f"Running {self.n_chains} chains in parallel...")
-
-        with ProcessPoolExecutor(max_workers=self.n_chains) as executor:
-            futures = [
-                executor.submit(
-                    self._run_single_chain, model.copy(), responses, n_persons, seed
-                )
+        seeds = self._chain_seeds()
+        if self.parallel_chains:
+            try:
+                pickle.dumps((self, model))
+            except (AttributeError, pickle.PickleError, TypeError) as exc:
+                raise MirtValidationError(
+                    "parallel chains need a picklable sampler and model; use "
+                    "parallel_chains=False for locally defined models",
+                    parameter="parallel_chains",
+                    value=True,
+                ) from exc
+            if self.verbose:
+                print(f"Running {self.n_chains} chains in parallel...")
+            with _process_pool(resolve_n_jobs(-1, self.n_chains)) as executor:
+                futures = [
+                    executor.submit(
+                        self._run_single_chain, model.copy(), responses, n_persons, seed
+                    )
+                    for seed in seeds
+                ]
+                all_chains = [future.result() for future in futures]
+        else:
+            all_chains = [
+                self._run_single_chain(model.copy(), responses, n_persons, seed)
                 for seed in seeds
             ]
-            all_chains = [f.result() for f in futures]
-
-        combined: dict[str, list[NDArray]] = {}
-        for chain_result in all_chains:
-            for name, values in chain_result.items():
-                if name not in combined:
-                    combined[name] = []
-                combined[name].append(values)
 
         return {
-            name: np.concatenate(arrays, axis=0) for name, arrays in combined.items()
+            name: np.concatenate([chain[name] for chain in all_chains], axis=0)
+            for name in all_chains[0]
         }
+
+    def _chain_seeds(self) -> list[int]:
+        """Return ``seed + 1000 * i`` for each chain, from a random base if unseeded."""
+        base_seed = (
+            self.seed
+            if self.seed is not None
+            else int(np.random.default_rng().integers(0, 2**31))
+        )
+        return [base_seed + 1000 * i for i in range(self.n_chains)]
 
     def _sample_theta_gibbs(
         self,

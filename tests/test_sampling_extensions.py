@@ -5,12 +5,15 @@ import pytest
 
 import mirt
 import mirt.utils.sampling as sampling_utils
+from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import (
     FiveParameterLogistic,
     FourParameterLogistic,
+    ThreeParameterLogistic,
     TwoParameterLogistic,
 )
 from mirt.models.polytomous import GeneralizedPartialCredit
+from mirt.results import FitResult
 from mirt.utils.sampling import (
     ParameterSamples,
     draw_parameters,
@@ -356,8 +359,10 @@ def test_missing_optional_samples_use_fixed_model_parameters():
 
 
 def test_draw_parameters_supports_bounded_and_asymmetric_models():
-    four_pl = draw_parameters(FourParameterLogistic(3), n_samples=20, seed=42)
-    five_pl = draw_parameters(FiveParameterLogistic(3), n_samples=20, seed=42)
+    with pytest.warns(FutureWarning, match="without a covariance"):
+        four_pl = draw_parameters(FourParameterLogistic(3), n_samples=20, seed=42)
+    with pytest.warns(FutureWarning, match="without a covariance"):
+        five_pl = draw_parameters(FiveParameterLogistic(3), n_samples=20, seed=42)
 
     assert four_pl.guessing is not None
     assert four_pl.upper is not None
@@ -372,8 +377,9 @@ def test_draw_parameters_supports_bounded_and_asymmetric_models():
 def test_draw_parameters_is_reproducible_for_multidimensional_models():
     model = TwoParameterLogistic(n_items=3, n_factors=2)
 
-    first = draw_parameters(model, n_samples=8, seed=123)
-    second = draw_parameters(model, n_samples=8, seed=123)
+    vcov = np.eye(9) * 0.02
+    first = draw_parameters(model, n_samples=8, vcov=vcov, seed=123)
+    second = draw_parameters(model, n_samples=8, vcov=vcov, seed=123)
 
     assert first.discrimination.shape == (8, 3, 2)
     assert first.difficulty.shape == (8, 3)
@@ -382,7 +388,8 @@ def test_draw_parameters_is_reproducible_for_multidimensional_models():
 
 
 def test_posterior_summary_includes_new_optional_parameters():
-    samples = draw_parameters(FiveParameterLogistic(2), n_samples=20, seed=5)
+    with pytest.warns(FutureWarning):
+        samples = draw_parameters(FiveParameterLogistic(2), n_samples=20, seed=5)
 
     summary = posterior_summary(samples, credible_level=0.8)
 
@@ -461,6 +468,122 @@ def test_sampling_rejects_invalid_inputs():
     )
     with pytest.raises(ValueError, match="mutually exclusive"):
         sample_expected_scores(model, np.array([0.0]), conflicting)
+
+
+@pytest.fixture(scope="module")
+def two_pl_result():
+    data = mirt.simdata(model="2PL", n_persons=800, n_items=4, seed=21)
+    return mirt.fit_mirt(data, model="2PL", tol=1e-7)
+
+
+def test_draw_parameters_uses_the_fit_covariance(two_pl_result):
+    result = two_pl_result
+    samples = draw_parameters(result, n_samples=40_000, seed=3)
+
+    np.testing.assert_allclose(
+        samples.discrimination.std(axis=0),
+        result.standard_errors["discrimination"],
+        rtol=0.05,
+    )
+    np.testing.assert_allclose(
+        samples.difficulty.std(axis=0), result.standard_errors["difficulty"], rtol=0.05
+    )
+    sampled = np.corrcoef(samples.discrimination[:, 0], samples.difficulty[:, 0])[0, 1]
+    vcov = result.vcov
+    expected = vcov[0, 4] / np.sqrt(vcov[0, 0] * vcov[4, 4])
+    assert abs(expected) > 0.1
+    assert sampled == pytest.approx(expected, abs=0.03)
+
+
+def test_draw_parameters_warns_when_only_standard_errors_exist(two_pl_result):
+    result = FitResult(
+        model=two_pl_result.model,
+        log_likelihood=two_pl_result.log_likelihood,
+        n_iterations=1,
+        converged=True,
+        standard_errors=two_pl_result.standard_errors,
+        aic=0.0,
+        bic=0.0,
+    )
+    with pytest.warns(UserWarning, match="independently"):
+        samples = draw_parameters(result, n_samples=20_000, seed=9)
+    np.testing.assert_allclose(
+        samples.difficulty.std(axis=0), result.standard_errors["difficulty"], rtol=0.05
+    )
+    assert (
+        abs(np.corrcoef(samples.discrimination[:, 0], samples.difficulty[:, 0])[0, 1])
+        < 0.03
+    )
+
+    empty = FitResult(result.model, -1.0, 1, True, {}, 0.0, 0.0)
+    with pytest.raises(MirtValidationError, match="no parameter covariance"):
+        draw_parameters(empty)
+
+
+def test_draw_parameters_samples_asymptotes_from_their_uncertainty():
+    model = ThreeParameterLogistic(3, item_names=["a", "b", "c"]).set_parameters(
+        discrimination=np.array([1.0, 1.4, 0.8]),
+        difficulty=np.array([-0.5, 0.2, 0.9]),
+        guessing=np.array([0.0, 0.2, 0.15]),
+    )
+    # The first guessing coordinate sits on its lower bound.
+    variances = np.array([0.04, 0.05, 0.03, 0.02, 0.03, 0.04, np.nan, 0.004, 0.009])
+    covariance = np.diag(variances)
+    covariance[6, :] = covariance[:, 6] = np.nan
+    result = FitResult(
+        model, -1.0, 1, True, {}, 0.0, 0.0, se_method="oakes", vcov=covariance
+    )
+
+    samples = draw_parameters(result, n_samples=20_000, seed=4)
+
+    np.testing.assert_array_equal(samples.guessing[:, 0], 0.0)
+    np.testing.assert_allclose(samples.guessing[:, 1].std(), np.sqrt(0.004), rtol=0.05)
+    np.testing.assert_allclose(samples.guessing[:, 2].std(), np.sqrt(0.009), rtol=0.06)
+    np.testing.assert_allclose(
+        samples.difficulty.std(axis=0), np.sqrt(variances[3:6]), rtol=0.05
+    )
+
+    core = draw_parameters(model, n_samples=50, vcov=np.eye(6) * 0.01, seed=1)
+    np.testing.assert_array_equal(core.guessing, np.tile(model.guessing, (50, 1)))
+    joint = draw_parameters(model, n_samples=2_000, vcov=np.eye(9) * 0.0004, seed=1)
+    assert joint.guessing[:, 1].std() == pytest.approx(0.02, rel=0.1)
+    with pytest.raises(ValueError, match=r"\(6, 6\) or \(9, 9\)"):
+        draw_parameters(model, vcov=np.eye(7))
+
+
+def test_explicit_vcov_holds_all_nan_rows_like_a_fit_result():
+    # Regression: draw_parameters(model, vcov=result.vcov) rejected the NaN
+    # rows that mark parameters on an optimizer bound.
+    model = ThreeParameterLogistic(3).set_parameters(
+        discrimination=np.array([1.0, 1.4, 0.8]),
+        difficulty=np.array([-0.5, 0.2, 0.9]),
+        guessing=np.array([0.0, 0.2, 0.15]),
+    )
+    covariance = np.diag([0.04, 0.05, 0.03, 0.02, 0.03, 0.04, np.nan, 0.004, 0.009])
+    covariance[0, 3] = covariance[3, 0] = 0.01
+    covariance[6, :] = covariance[:, 6] = np.nan
+    result = FitResult(model, -1.0, 1, True, {}, 0.0, 0.0, vcov=covariance)
+
+    explicit = draw_parameters(model, n_samples=200, vcov=covariance, seed=5)
+    fitted = draw_parameters(result, n_samples=200, seed=5)
+    for name in ("discrimination", "difficulty", "guessing"):
+        np.testing.assert_array_equal(getattr(explicit, name), getattr(fitted, name))
+    np.testing.assert_array_equal(explicit.guessing[:, 0], 0.0)
+
+    covariance[0, 1] = covariance[1, 0] = np.nan
+    with pytest.raises(ValueError, match="only finite values"):
+        draw_parameters(model, vcov=covariance)
+
+
+def test_fit_result_draws_require_stored_item_parameters():
+    from mirt.models.explanatory import LLTM
+
+    # Regression: an LLTM derives difficulty from its feature weights, and
+    # drawing from its fit result raised a bare KeyError.
+    features = np.column_stack([np.ones(4), np.linspace(-1.0, 1.0, 4)])
+    result = FitResult(LLTM(4, features), -1.0, 1, True, {}, 0.0, 0.0)
+    with pytest.raises(MirtValidationError, match="stored discrimination and diff"):
+        draw_parameters(result)
 
 
 def test_sampling_utilities_are_available_from_the_top_level_api():

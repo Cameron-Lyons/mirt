@@ -45,7 +45,7 @@ def test_plain_scoring_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "scipy_loaded": False,
         "scoring_submodules": [],
-        "export_count": 9,
+        "export_count": 11,
         "exports_visible": True,
     }
 
@@ -107,7 +107,7 @@ def test_scoring_symbol_resolution_is_cached_and_scoped() -> None:
             ),
             "unrelated_scorers_loaded": any(
                 name in sys.modules for name in (
-                    "mirt.scoring.eapsum",
+                    "mirt.scoring._eapsum",
                     "mirt.scoring.map",
                     "mirt.scoring.ml",
                     "mirt.scoring.wle",
@@ -152,7 +152,7 @@ def test_fscores_loads_only_the_selected_implementation() -> None:
         )
         implementation_modules = (
             "mirt.scoring.eap",
-            "mirt.scoring.eapsum",
+            "mirt.scoring._eapsum",
             "mirt.scoring.map",
             "mirt.scoring.ml",
             "mirt.scoring.wle",
@@ -196,7 +196,7 @@ def test_star_import_resolves_every_public_scoring_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 9,
+        "export_count": 11,
         "all_cached": True,
     }
 
@@ -226,4 +226,48 @@ def test_submodule_import_fallback_and_unknown_attribute_error() -> None:
     assert result == {
         "submodule_name": "mirt.scoring.ml",
         "error": "module 'mirt.scoring' has no attribute 'NotAScoringMethod'",
+    }
+
+
+def test_eapsum_name_stays_the_function_after_implementation_imports() -> None:
+    # The implementation module used to be ``mirt.scoring.eapsum``; importing
+    # it first replaced the public ``eapsum`` function with the submodule.
+    result = _run_probe(
+        """
+        import json
+        import types
+
+        import numpy as np
+
+        from mirt.scoring import EAPSumScorer, sum_score_to_theta
+        from mirt.scoring import eapsum
+        import mirt.scoring as scoring
+        from mirt.models.dichotomous import TwoParameterLogistic
+
+        def is_function(value):
+            return callable(value) and not isinstance(value, types.ModuleType)
+
+        imported_first = is_function(eapsum)
+        model = TwoParameterLogistic(n_items=2)
+        model.set_parameters(discrimination=np.ones(2), difficulty=np.zeros(2))
+        model._is_fitted = True
+        responses = np.array([[1, 0]], dtype=int)
+        scores = scoring.fscores(model, responses, method="EAPsum", n_quadpts=5)
+
+        print(json.dumps({
+            "imported_first": imported_first,
+            "after_fscores": is_function(scoring.eapsum),
+            "scorer_module": EAPSumScorer.__module__,
+            "same_scores": scoring.eapsum(model, responses, n_quadpts=5).theta.tolist()
+            == scores.theta.tolist()
+            == sum_score_to_theta(model, [1], n_quadpts=5)[0].tolist(),
+        }))
+        """
+    )
+
+    assert result == {
+        "imported_first": True,
+        "after_fscores": True,
+        "scorer_module": "mirt.scoring._eapsum",
+        "same_scores": True,
     }

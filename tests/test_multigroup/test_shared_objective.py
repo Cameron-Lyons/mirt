@@ -52,14 +52,7 @@ def _optimize_shared_discrimination(
         item_optim_maxiter=200,
         item_optim_ftol=1e-12,
     )
-    estimator._optimize_shared_item_param(
-        model,
-        item_idx=0,
-        param_name="discrimination",
-        responses=responses,
-        posterior_weights=POSTERIOR_WEIGHTS,
-        quad_points=QUADRATURE,
-    )
+    estimator._optimize_item(model, 0, responses, POSTERIOR_WEIGHTS, QUADRATURE)
     fitted = [
         float(group_model.parameters["discrimination"][0])
         for group_model in model.group_models
@@ -73,7 +66,10 @@ def test_shared_dichotomous_parameter_uses_each_group_context() -> None:
         np.array([[0], [0], [1], [1]]),
         np.array([[0], [1], [1], [1]]),
     ]
-    model = MultigroupModel(TwoParameterLogistic(1), n_groups=2)
+    base = TwoParameterLogistic(1)
+    # Only the shared slope is free, so the item update maximizes over it alone.
+    base.set_free_parameter_masks({"difficulty": np.array([False])})
+    model = MultigroupModel(base, n_groups=2)
     for group_model, difficulty in zip(model.group_models, (-1.75, 1.25), strict=True):
         group_model.set_parameters(
             discrimination=np.array([1.0]),
@@ -110,7 +106,9 @@ def test_shared_polytomous_parameter_uses_each_group_context() -> None:
         np.array([[0], [0], [1], [2]]),
         np.array([[0], [1], [2], [2]]),
     ]
-    model = MultigroupModel(GeneralizedPartialCredit(1, 3), n_groups=2)
+    base = GeneralizedPartialCredit(1, 3)
+    base.set_free_parameter_masks({"steps": np.zeros((1, 2), dtype=bool)})
+    model = MultigroupModel(base, n_groups=2)
     group_steps = (np.array([[-1.8, 0.2]]), np.array([[-0.2, 1.8]]))
     for group_model, steps in zip(model.group_models, group_steps, strict=True):
         group_model.set_parameters(

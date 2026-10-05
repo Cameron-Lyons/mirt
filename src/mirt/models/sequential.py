@@ -6,15 +6,18 @@ Adjacent-category models instead parameterize neighboring category log odds.
 
 from __future__ import annotations
 
-from typing import Self
-
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    item_category_table,
+)
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
-from mirt.models.base import PolytomousItemModel
+from mirt.models.base import PolytomousItemModel, _AtomicParameterState
 
 
 def _safe_sigmoid(values: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -23,7 +26,7 @@ def _safe_sigmoid(values: NDArray[np.float64]) -> NDArray[np.float64]:
         return sigmoid(values)
 
 
-class _OrdinalLogitModel(PolytomousItemModel):
+class _OrdinalLogitModel(_AtomicParameterState, PolytomousItemModel):
     """Shared validation, likelihood, and summaries for ordinal logits."""
 
     supports_multidimensional = False
@@ -104,7 +107,7 @@ class _OrdinalLogitModel(PolytomousItemModel):
 
     def thresholds_for_item(self, item_idx: int) -> NDArray[np.float64]:
         """Return only the active thresholds for one item."""
-        item_idx = self._validate_item_idx(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         self._validate_parameter_state(self._parameters)
         return self.thresholds[item_idx, : self._n_categories[item_idx] - 1].copy()
 
@@ -140,85 +143,35 @@ class _OrdinalLogitModel(PolytomousItemModel):
                 expected="> 0",
             )
 
-    def set_parameters(self, **params: NDArray[np.float64]) -> Self:
-        """Set parameters atomically after validating their full state."""
-        candidate = {name: values.copy() for name, values in self._parameters.items()}
-        for name, value in params.items():
-            if name not in candidate:
-                valid = ", ".join(candidate)
-                raise MirtValidationError(
-                    f"Unknown parameter: {name}. Valid parameters: {valid}",
-                    parameter=name,
-                    expected=valid,
-                )
-            value_array = np.asarray(value, dtype=np.float64)
-            if value_array.shape != candidate[name].shape:
-                raise MirtValidationError(
-                    f"Shape mismatch for {name}: expected {candidate[name].shape}, "
-                    f"got {value_array.shape}",
-                    parameter=name,
-                    value=value_array.shape,
-                    expected=str(candidate[name].shape),
-                )
-            candidate[name] = value_array.copy()
-        self._validate_parameter_state(candidate)
-        self._parameters = candidate
-        return self
-
     def set_item_parameter(
         self,
         item_idx: int,
         param_name: str,
         value: float | NDArray[np.float64],
     ) -> None:
-        """Set one item parameter and retain a valid model state."""
-        item_idx = self._validate_item_idx(item_idx)
-        if param_name not in self._parameters:
-            valid = ", ".join(self._parameters)
-            raise MirtValidationError(
-                f"Unknown parameter: {param_name}. Valid parameters: {valid}",
-                parameter=param_name,
-                expected=valid,
-            )
-
-        updated = self._parameters[param_name].copy()
-        value_array = np.asarray(value, dtype=np.float64)
-        if param_name == "discrimination":
-            if value_array.ndim != 0:
-                raise MirtValidationError(
-                    "discrimination must be scalar for one item",
-                    parameter=param_name,
-                    value=value_array.shape,
-                    expected="scalar",
-                )
-            updated[item_idx] = float(value_array)
-        else:
+        """Set one item parameter; thresholds may list only the active values."""
+        if param_name == "thresholds":
+            item_idx = self._validate_item_index(item_idx)
             n_active = self._n_categories[item_idx] - 1
-            if value_array.shape == (n_active,):
-                updated[item_idx, :n_active] = value_array
-            elif value_array.shape == (self.max_categories - 1,):
-                updated[item_idx] = value_array
-            else:
+            try:
+                active = np.asarray(value, dtype=np.float64)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"Invalid per-item value for {param_name}",
+                    parameter=param_name,
+                    value=value,
+                ) from exc
+            if active.shape == (n_active,):
+                value = self.thresholds[item_idx].copy()
+                value[:n_active] = active
+            elif active.shape != (self.max_categories - 1,):
                 raise MirtValidationError(
                     f"thresholds for item {item_idx} must have {n_active} active values",
                     parameter=param_name,
-                    value=value_array.shape,
+                    value=active.shape,
                     expected=f"({n_active},)",
                 )
-        self.set_parameters(**{param_name: updated})
-
-    def _validate_item_idx(self, item_idx: int) -> int:
-        if isinstance(item_idx, bool) or not isinstance(item_idx, (int, np.integer)):
-            raise MirtValidationError(
-                "item_idx must be an integer",
-                parameter="item_idx",
-                value=item_idx,
-                expected="integer",
-            )
-        item_idx = int(item_idx)
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return item_idx
+        super().set_item_parameter(item_idx, param_name, value)
 
     def _validate_category(self, item_idx: int, category: int) -> int:
         if isinstance(category, bool) or not isinstance(category, (int, np.integer)):
@@ -282,7 +235,7 @@ class _OrdinalLogitModel(PolytomousItemModel):
         """Compute category probabilities for one item or all items."""
         theta_1d = self._prepare_theta(theta)
         if item_idx is not None:
-            item_idx = self._validate_item_idx(item_idx)
+            item_idx = self._validate_item_index(item_idx)
             return self._item_probabilities(theta_1d, item_idx)
         return self._all_probabilities(theta_1d)
 
@@ -293,7 +246,7 @@ class _OrdinalLogitModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         """Compute one category response curve."""
-        item_idx = self._validate_item_idx(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         category = self._validate_category(item_idx, category)
         return self.probability(theta, item_idx)[:, category]
 
@@ -310,21 +263,10 @@ class _OrdinalLogitModel(PolytomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]:
-        theta_1d = self._prepare_theta(theta)
-        item_idx = self._validate_item_idx(item_idx)
-        return self._all_item_information(theta_1d)[:, item_idx]
+        return self._all_item_information(self._prepare_theta(theta))[:, item_idx]
 
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        """Compute exact Fisher information for one item or the test."""
-        theta_1d = self._prepare_theta(theta)
-        information = self._all_item_information(theta_1d)
-        if item_idx is not None:
-            return information[:, self._validate_item_idx(item_idx)]
-        return np.sum(information, axis=1)
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        return self._all_item_information(self._prepare_theta(theta))
 
     def expected_score(
         self,
@@ -412,16 +354,15 @@ class _OrdinalLogitModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute each response pattern's likelihood over an ability grid."""
         safe_responses, observed = self._validated_responses(responses)
-        probabilities = self.probability(theta)
-        log_probabilities = np.log(np.clip(probabilities, PROB_EPSILON, 1.0))
-        result = np.zeros((safe_responses.shape[0], probabilities.shape[0]))
-        category_mask = np.empty_like(observed)
-        for category in range(self.max_categories):
-            np.equal(safe_responses, category, out=category_mask)
-            np.logical_and(category_mask, observed, out=category_mask)
-            if np.any(category_mask):
-                result += category_mask @ log_probabilities[:, :, category].T
-        return result
+        log_table = item_category_table(self.probability(theta), self._n_categories)
+        np.clip(log_table, PROB_EPSILON, 1.0, out=log_table)
+        np.log(log_table, out=log_table)
+        return categorical_log_likelihood_batch(
+            log_table,
+            category_offsets(self._n_categories),
+            safe_responses,
+            observed,
+        )
 
 
 class _SequentialProcessModel(_OrdinalLogitModel):
@@ -485,7 +426,7 @@ class _SequentialProcessModel(_OrdinalLogitModel):
     ) -> NDArray[np.float64]:
         """Return the conditional probability of passing one reached step."""
         theta_1d = self._prepare_theta(theta)
-        item_idx = self._validate_item_idx(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         step_idx = self._validate_category(item_idx, step_idx)
         if step_idx == self._n_categories[item_idx] - 1:
             raise IndexError(
@@ -510,7 +451,7 @@ class _SequentialProcessModel(_OrdinalLogitModel):
     ) -> NDArray[np.float64]:
         """Compute ``P(X >= category | theta)``."""
         theta_1d = self._prepare_theta(theta)
-        item_idx = self._validate_item_idx(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         category = self._validate_category(item_idx, category)
         if category == 0:
             return np.ones_like(theta_1d)

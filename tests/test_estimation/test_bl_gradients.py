@@ -313,7 +313,8 @@ def test_joint_fit_matches_numerical_optimizer(kind, monkeypatch):
             1, expected_se**2, out=np.zeros_like(expected_se), where=expected_se > 0
         )
         # Compare curvature before its inverse magnifies cancellation in weak
-        # directions. Both estimators retain the existing 1e-5 difference step.
+        # directions. Built-in item models use the exact information on both
+        # paths; others difference the gradient or the likelihood.
         np.testing.assert_allclose(actual_info, expected_info, rtol=1e-3, atol=1e-3)
 
 

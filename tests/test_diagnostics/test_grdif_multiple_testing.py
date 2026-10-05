@@ -34,6 +34,11 @@ def _stub_fit_and_scores(
         "_score_grdif_responses",
         lambda *args, **kwargs: np.zeros((n_rows, 1)),
     )
+    monkeypatch.setattr(
+        dif_module,
+        "_expected_response_matrix",
+        lambda model, theta, n_items: np.zeros((n_rows, n_items)),
+    )
     return model
 
 
@@ -115,11 +120,6 @@ def _stub_pairwise_statistics(
     n_rows: int,
 ) -> None:
     _stub_fit_and_scores(monkeypatch, n_rows)
-    monkeypatch.setattr(
-        dif_module,
-        "_expected_response_matrix",
-        lambda *args, **kwargs: np.zeros((n_rows, 4)),
-    )
     r = np.array([6.63, 5.02, 3.84, 2.71])
     s = np.array([7.88, 5.99, 4.22, 2.71])
     rs = np.array([9.21, 7.38, 5.99, 4.61])

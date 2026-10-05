@@ -37,8 +37,10 @@ class DIFAnalysisReport(HTMLReport):
         Response matrix (n_persons x n_items).
     groups : ndarray
         Group membership array.
-    method : str
+    method : str, optional
         DIF detection method used ('likelihood_ratio', 'wald', 'lord', 'raju').
+        Defaults to ``dif_results['method']`` when present, otherwise
+        'likelihood_ratio'.
     item_names : list of str, optional
         Names for items. If None, uses Item_1, Item_2, etc.
     title : str, optional
@@ -53,7 +55,9 @@ class DIFAnalysisReport(HTMLReport):
     >>> from mirt.reports import DIFAnalysisReport
     >>> import numpy as np
     >>> groups = np.array([0] * 250 + [1] * 250)
-    >>> dif_results = compute_dif(data, groups, model="2PL")
+    >>> # Wald tests need two calibrations; likelihood-ratio tests refit a
+    >>> # multiple-group model once per item.
+    >>> dif_results = compute_dif(data, groups, model="2PL", method="wald")
     >>> report = DIFAnalysisReport(dif_results, data, groups)
     >>> report.save("dif_analysis.html")
     """
@@ -65,9 +69,7 @@ class DIFAnalysisReport(HTMLReport):
         dif_results: dict[str, Any],
         data: NDArray[np.int_],
         groups: NDArray,
-        method: Literal[
-            "likelihood_ratio", "wald", "lord", "raju"
-        ] = "likelihood_ratio",
+        method: Literal["likelihood_ratio", "wald", "lord", "raju"] | None = None,
         item_names: list[str] | None = None,
         title: str | None = None,
         include_plots: bool = True,
@@ -93,6 +95,8 @@ class DIFAnalysisReport(HTMLReport):
                 n_groups=int(unique_groups.size),
             )
         valid_methods = {"likelihood_ratio", "wald", "lord", "raju"}
+        if method is None:
+            method = dif_results.get("method", "likelihood_ratio")
         if method not in valid_methods:
             raise MirtValidationError(
                 "unknown DIF method",

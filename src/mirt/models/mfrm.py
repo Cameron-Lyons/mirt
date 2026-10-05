@@ -41,6 +41,32 @@ class MFRMResult:
         Number of iterations.
     converged : bool
         Whether estimation converged.
+    item_difficulty : ndarray of shape (n_items,), optional
+        Estimated item difficulties.
+    item_se : ndarray of shape (n_items,), optional
+        Standard errors for item difficulties.
+    item_infit, item_outfit : ndarray of shape (n_items,), optional
+        Infit and outfit mean-square statistics per item.
+    thresholds : ndarray, optional
+        Estimated category thresholds of a polytomous model, with the shape of
+        ``PolytomousMFRM.thresholds``; ``None`` for binary models.
+    threshold_se : ndarray, optional
+        Standard errors for ``thresholds``.
+    sigma : float
+        Standard deviation of the person distribution ``N(0, sigma^2)``.
+    sigma_se : float
+        Standard error of ``sigma``; zero when ``sigma`` was held fixed and
+        NaN when the estimate lies on its search bound (``1e-4`` or ``1e3``).
+    theta : ndarray of shape (n_persons,), optional
+        Expected a posteriori person measures.
+    theta_se : ndarray of shape (n_persons,), optional
+        Posterior standard deviations of the person measures.
+    n_parameters : int
+        Number of freely estimated parameters.
+    n_observations : int
+        Number of observed ratings.
+    n_quadpts : int
+        Number of person grid nodes used by the estimator.
     """
 
     model: ManyFacetRaschModel
@@ -51,6 +77,84 @@ class MFRMResult:
     log_likelihood: float
     n_iterations: int
     converged: bool
+    item_difficulty: NDArray[np.float64] | None = None
+    item_se: NDArray[np.float64] | None = None
+    item_infit: NDArray[np.float64] | None = None
+    item_outfit: NDArray[np.float64] | None = None
+    thresholds: NDArray[np.float64] | None = None
+    threshold_se: NDArray[np.float64] | None = None
+    sigma: float = 1.0
+    sigma_se: float = 0.0
+    theta: NDArray[np.float64] | None = None
+    theta_se: NDArray[np.float64] | None = None
+    n_parameters: int = 0
+    n_observations: int = 0
+    n_quadpts: int = 0
+
+    @property
+    def aic(self) -> float:
+        """Akaike information criterion."""
+        return -2.0 * self.log_likelihood + 2.0 * self.n_parameters
+
+    @property
+    def bic(self) -> float:
+        """Bayesian information criterion with the number of persons as ``n``."""
+        n_persons = 0 if self.theta is None else len(self.theta)
+        return -2.0 * self.log_likelihood + self.n_parameters * np.log(
+            max(n_persons, 1)
+        )
+
+    def summary(self) -> str:
+        """Return measure, standard error and fit tables for items and facets."""
+        width = 66
+        lines = [
+            "=" * width,
+            f"{'Many-Facet Rasch Model Results':^{width}}",
+            "=" * width,
+            f"Log-likelihood: {self.log_likelihood:>12.4f}    AIC: {self.aic:>12.4f}",
+            f"Parameters:     {self.n_parameters:>12d}    BIC: {self.bic:>12.4f}",
+            f"Observations:   {self.n_observations:>12d}    "
+            f"Person SD: {self.sigma:.4f} ({self.sigma_se:.4f})",
+            f"Converged:      {self.converged!s:>12}    "
+            f"Iterations: {self.n_iterations}",
+        ]
+        tables: list[tuple[str, list[str], tuple[NDArray[np.float64] | None, ...]]] = [
+            (
+                "Item",
+                self.model.item_names,
+                (self.item_difficulty, self.item_se, self.item_infit, self.item_outfit),
+            )
+        ]
+        tables += [
+            (
+                facet.name,
+                list(facet.labels or []),
+                (
+                    self.facet_parameters.get(facet.name),
+                    self.facet_se.get(facet.name),
+                    self.infit.get(facet.name),
+                    self.outfit.get(facet.name),
+                ),
+            )
+            for facet in self.model.facets
+        ]
+        for title, labels, columns in tables:
+            if columns[0] is None:
+                continue
+            lines.append("-" * width)
+            lines.append(
+                f"{title[:20]:<20}{'Measure':>11}{'S.E.':>11}"
+                f"{'Infit':>11}{'Outfit':>11}"
+            )
+            for index, label in enumerate(labels):
+                values = [
+                    np.nan if column is None else column[index] for column in columns
+                ]
+                lines.append(
+                    f"{label[:20]:<20}" + "".join(f"{value:>11.4f}" for value in values)
+                )
+        lines.append("=" * width)
+        return "\n".join(lines)
 
 
 @dataclass
@@ -540,17 +644,8 @@ class ManyFacetRaschModel:
     def copy(self) -> Self:
         new_model = ManyFacetRaschModel(
             n_items=self._n_items,
-            facets=[
-                Facet(
-                    name=f.name,
-                    n_levels=f.n_levels,
-                    labels=f.labels.copy() if f.labels else None,
-                    is_anchored=f.is_anchored,
-                    anchor_value=f.anchor_value,
-                )
-                for f in self._facets
-            ],
-            item_names=self._item_names.copy(),
+            facets=self._facets,
+            item_names=self._item_names,
         )
         new_model._item_difficulty = self._item_difficulty.copy()
         new_model._facet_parameters = {
@@ -843,18 +938,9 @@ class PolytomousMFRM(ManyFacetRaschModel):
         new_model = PolytomousMFRM(
             n_items=self._n_items,
             n_categories=self._n_categories,
-            facets=[
-                Facet(
-                    name=f.name,
-                    n_levels=f.n_levels,
-                    labels=f.labels.copy() if f.labels else None,
-                    is_anchored=f.is_anchored,
-                    anchor_value=f.anchor_value,
-                )
-                for f in self._facets
-            ],
+            facets=self._facets,
             category_structure=self._category_structure,
-            item_names=self._item_names.copy(),
+            item_names=self._item_names,
         )
         new_model._item_difficulty = self._item_difficulty.copy()
         new_model._facet_parameters = {

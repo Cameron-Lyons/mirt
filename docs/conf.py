@@ -44,6 +44,10 @@ napoleon_use_param = False
 napoleon_use_rtype = False
 napoleon_use_ivar = True
 
+# Attribute types such as "ndarray of shape (n_factors, n_factors)" make every
+# word a cross-reference; names shared by several classes are then ambiguous.
+suppress_warnings = ["ref.python"]
+
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),
     "numpy": ("https://numpy.org/doc/stable/", None),

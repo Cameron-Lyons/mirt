@@ -17,6 +17,7 @@ from mirt.diagnostics.drf import (
     plot_drf,
     reliability_invariance,
 )
+from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 
 
@@ -63,6 +64,20 @@ class _ConstantInformationModel:
 
 def _fit_result(model: Any) -> SimpleNamespace:
     return SimpleNamespace(model=model)
+
+
+def _skip_linking(monkeypatch: pytest.MonkeyPatch) -> list[list[int]]:
+    """Leave parameter-free fake focal models on their own scale."""
+    anchors_seen: list[list[int]] = []
+
+    def identity_link(
+        reference: Any, focal: Any, anchors: list[int], **kwargs: Any
+    ) -> tuple[Any, float, float]:
+        anchors_seen.append(list(anchors))
+        return focal, 1.0, 0.0
+
+    monkeypatch.setattr("mirt.diagnostics.drf.link_focal_to_reference", identity_link)
+    return anchors_seen
 
 
 def test_item_information_uses_matrix_result_without_per_item_calls() -> None:
@@ -114,6 +129,7 @@ def test_compute_item_drf_supports_total_only_polytomous_information(
         return _fit_result(ref_model), _fit_result(focal_model)
 
     monkeypatch.setattr("mirt.diagnostics.drf.fit_group_models", fake_fit)
+    anchors_seen = _skip_linking(monkeypatch)
     data = np.zeros((8, 3), dtype=np.int64)
     groups = np.array(["focal"] * 4 + ["reference"] * 4)
 
@@ -139,6 +155,8 @@ def test_compute_item_drf_supports_total_only_polytomous_information(
     assert result["info_focal"].shape == (3, 11)
     assert result["ref_group"] == "reference"
     assert result["focal_group"] == "focal"
+    assert anchors_seen == [[0, 1, 2]]
+    assert result["anchor_items"] == [0, 1, 2]
 
 
 def test_compute_item_drf_matches_scalar_integration_reference(
@@ -168,6 +186,7 @@ def test_compute_item_drf_matches_scalar_integration_reference(
         )
 
     monkeypatch.setattr("mirt.diagnostics.drf.fit_group_models", fake_fit)
+    _skip_linking(monkeypatch)
     result = compute_item_drf(
         np.zeros((4, n_items), dtype=np.int64),
         np.array([0, 0, 1, 1]),
@@ -315,6 +334,7 @@ def test_compute_item_drf_rejects_mismatched_group_model_shapes(
         return _fit_result(_InformationModel(2)), _fit_result(_InformationModel(3))
 
     monkeypatch.setattr("mirt.diagnostics.drf.fit_group_models", fake_fit)
+    _skip_linking(monkeypatch)
     with pytest.raises(ValueError, match="shapes must match"):
         compute_item_drf(
             np.zeros((4, 2), dtype=np.int64),
@@ -569,3 +589,97 @@ def test_plot_drf_creates_default_pair_of_axes() -> None:
 
     assert len(axes) == 2
     pyplot.close(axes[0].figure)
+
+
+def _impact_calibrations() -> tuple[TwoParameterLogistic, TwoParameterLogistic]:
+    """Reference 2PL and a separate focal calibration of the same items.
+
+    Focal abilities follow N(-1, 1.2**2). Calibrating the focal group alone
+    standardizes them, giving ``a * 1.2`` and ``(b + 1) / 1.2``.
+    """
+    discrimination = np.array([0.8, 1.0, 1.3, 1.6, 2.0, 1.1])
+    difficulty = np.array([-1.5, -0.8, -0.2, 0.3, 0.9, 1.4])
+    reference = TwoParameterLogistic(n_items=6)
+    reference.set_parameters(discrimination=discrimination, difficulty=difficulty)
+    focal = TwoParameterLogistic(n_items=6)
+    focal.set_parameters(
+        discrimination=1.2 * discrimination, difficulty=(difficulty + 1.0) / 1.2
+    )
+    return reference, focal
+
+
+def _install_impact_fits(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    reference, focal = _impact_calibrations()
+    monkeypatch.setattr(
+        "mirt.diagnostics.drf.fit_group_models",
+        lambda *args, **kwargs: (_fit_result(reference), _fit_result(focal)),
+    )
+    return reference, focal
+
+
+def test_compute_drf_links_away_pure_impact(monkeypatch: pytest.MonkeyPatch) -> None:
+    reference, focal = _install_impact_fits(monkeypatch)
+    data = np.zeros((8, 6), dtype=np.int64)
+    groups = np.repeat([0, 1], 4)
+
+    result = compute_drf(data, groups, theta_range=(-3.0, 3.0), n_points=31)
+
+    A, B = result["linking_constants"]
+    assert A == pytest.approx(1.2, rel=1e-4)
+    assert B == pytest.approx(-1.0, abs=1e-4)
+    assert result["anchor_items"] == list(range(6))
+    assert result["DRF"] < 1e-3
+    theta = result["theta_grid"]
+    unlinked = integrate.trapezoid(
+        np.abs(
+            _compute_test_information(reference, theta)
+            - _compute_test_information(focal, theta)
+        ),
+        theta,
+    )
+    assert unlinked > 0.5
+    assert result["reliability_focal"] == pytest.approx(
+        _compute_marginal_reliability(focal, (-3.0, 3.0), n_points=31)
+    )
+
+
+def test_compute_item_drf_links_over_requested_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_impact_fits(monkeypatch)
+    data = np.zeros((8, 6), dtype=np.int64)
+    groups = np.repeat([0, 1], 4)
+
+    result = compute_item_drf(data, groups, anchor_items=[1, 4, 2], n_points=21)
+
+    assert result["anchor_items"] == [1, 2, 4]
+    assert result["linking_constants"][0] == pytest.approx(1.2, rel=1e-4)
+    assert_allclose(result["item_drf"], 0.0, atol=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("anchor_items", "message"),
+    [
+        ([0], "at least 2"),
+        ([0, 0], "duplicate"),
+        ([0, 9], r"\[0, 2\)"),
+        ([0.5, 1], "integer"),
+    ],
+)
+@pytest.mark.parametrize("function", [compute_drf, compute_item_drf])
+def test_drf_validates_anchor_items_before_fitting(
+    monkeypatch: pytest.MonkeyPatch,
+    function: Any,
+    anchor_items: list[Any],
+    message: str,
+) -> None:
+    def unexpected_fit(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("fit should not run for invalid anchors")
+
+    monkeypatch.setattr("mirt.diagnostics.drf.fit_group_models", unexpected_fit)
+    with pytest.raises(ValueError, match=message):
+        function(
+            np.zeros((4, 2), dtype=np.int64),
+            np.array([0, 0, 1, 1]),
+            anchor_items=anchor_items,
+        )

@@ -18,8 +18,10 @@ ScoringMethod = Literal["EAP", "MAP", "ML"]
 
 InvarianceLevel = Literal["configural", "metric", "scalar", "strict"]
 
-ItemFitStatistic = Literal["infit", "outfit", "S_X2"]
-PersonFitStatistic = Literal["Zh", "infit", "outfit", "lz"]
+ItemFitStatistic = Literal[
+    "infit", "outfit", "z_infit", "z_outfit", "S_X2", "X2", "G2", "PV_Q1"
+]
+PersonFitStatistic = Literal["Zh", "infit", "outfit", "lz", "z_infit", "z_outfit"]
 ModelFitIndex = Literal["M2", "RMSEA", "CFI", "TLI", "SRMSR"]
 
 DIFMethod = Literal["likelihood_ratio", "wald", "lord", "raju"]
