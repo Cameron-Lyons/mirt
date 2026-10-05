@@ -16,9 +16,10 @@ from mirt.backends.rust.multigroup import (
     multigroup_e_step_grm,
     multigroup_e_step_nrm,
 )
+from mirt.constants import PROB_EPSILON
 from mirt.estimation._dichotomous_objective import prepare_dichotomous_objective
 from mirt.estimation._em_context import EMFitContext
-from mirt.estimation.base import _initialize_free_parameters
+from mirt.estimation.base import _initialize_free_parameters, _parameter_bounds
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.multigroup._identification import infer_latent_identification
 from mirt.multigroup.invariance import InvarianceSpec, parse_invariance
@@ -44,21 +45,6 @@ _BinaryTerm = tuple[
 # losses are large sums, so looser values stop on flat 3PL/4PL directions
 # long before the item optimum, and EM then crawls toward the maximum.
 _JOINT_ITEM_FTOL = 1e-10
-_PARAMETER_BOUNDS = {
-    "discrimination": (0.1, 5.0),
-    "slopes": (0.1, 5.0),
-    "loadings": (-5.0, 5.0),
-    "general_loadings": (0.1, 5.0),
-    "specific_loadings": (0.1, 5.0),
-    "difficulty": (-6.0, 6.0),
-    "intercepts": (-6.0, 6.0),
-    "location": (-6.0, 6.0),
-    "thresholds": (-6.0, 6.0),
-    "steps": (-6.0, 6.0),
-    "guessing": (0.0, 0.5),
-    "slipping": (0.5, 1.0),
-    "upper": (0.5, 1.0),
-}
 
 
 class MultigroupEMEstimator:
@@ -609,19 +595,165 @@ class MultigroupEMEstimator:
     ) -> None:
         """M-step: update parameters respecting constraints.
 
-        For shared parameters: aggregate expected sufficient statistics
-        across groups and optimize once.
-        For group-specific parameters: optimize independently per group.
+        Shared parameters are fitted to the expected counts of every group at
+        once, and group-specific parameters to each group's own counts.
+        Built-in 1PL/2PL items whose parameters are all shared or all
+        group-specific are solved together by batched Newton steps (see
+        ``_newton_m_step``); the other items are optimized one at a time.
         """
         quad_points = self._quadrature.nodes
         # Item updates never change which coordinates are free.
         masks = [model.effective_free_parameter_masks(g) for g in range(model.n_groups)]
-        for item_idx in range(model.n_items):
+        counts = [
+            self._all_item_counts(group, data, posterior)
+            for group, data, posterior in zip(
+                model.group_models, responses, posterior_weights, strict=True
+            )
+        ]
+        items: Sequence[int] = range(model.n_items)
+        if self._uses_newton_m_step(model):
+            items = self._newton_m_step(model, counts, masks, quad_points)
+        for item_idx in items:
             self._optimize_item(
-                model, item_idx, responses, posterior_weights, quad_points, masks=masks
+                model,
+                item_idx,
+                responses,
+                posterior_weights,
+                quad_points,
+                masks=masks,
+                counts=[group_counts[item_idx] for group_counts in counts],
             )
 
         model.synchronize_shared_parameters()
+
+    def _uses_newton_m_step(self, model: MultigroupModel) -> bool:
+        """Return whether every group holds unrestricted built-in 1PL/2PL items.
+
+        The batched Newton solver maximizes the unclipped item objective,
+        which matches the clipped one only for the default probability
+        clipping. Estimators that customize item optimization keep it.
+        """
+        from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
+
+        first = model.get_group_model(0)
+        return (
+            type(first) in (OneParameterLogistic, TwoParameterLogistic)
+            and 0.0 < self.prob_epsilon <= PROB_EPSILON
+            and not any(
+                name in vars(self)
+                or getattr(type(self), name) is not getattr(MultigroupEMEstimator, name)
+                for name in ("_optimize_item", "_optimize_binary_block")
+            )
+            and all(
+                type(group) is type(first)
+                and uses_builtin_model_hooks(group)
+                and not group._free_parameter_restrictions
+                and tuple(group._parameters) == ("discrimination", "difficulty")
+                for group in model.group_models
+            )
+        )
+
+    def _newton_m_step(
+        self,
+        model: MultigroupModel,
+        counts: Sequence[NDArray[np.float64]],
+        masks: Sequence[Mapping[str, NDArray[np.bool_]]],
+        quad_points: NDArray[np.float64],
+    ) -> list[int]:
+        """Solve 1PL/2PL items by batched Newton steps; return the other items.
+
+        ``counts`` holds each group's expected category counts, of shape
+        ``(n_items, n_points, 2)``. An item whose free parameters are all
+        shared is one logistic regression on the counts pooled over groups,
+        and an item whose parameters are all group-specific is one regression
+        per group that observed it. Items with fixed coordinates or partly
+        shared parameters, and items with a solve that does not converge or
+        leaves the optimizer box, are returned for the itemwise path.
+        """
+        from mirt.estimation._logistic_newton import newton_logistic_items
+        from mirt.models.dichotomous import OneParameterLogistic
+
+        groups = model.group_models
+        n_items = model.n_items
+        estimate_slopes = type(groups[0]) is not OneParameterLogistic
+        names = ("discrimination", "difficulty") if estimate_slopes else ("difficulty",)
+        values = {
+            name: np.stack(
+                [np.reshape(group.parameters[name], (n_items, -1)) for group in groups]
+            )
+            for name in ("discrimination", "difficulty")
+        }
+        group_counts = np.stack(counts)
+        observed = np.any(group_counts, axis=(2, 3))
+        free = np.all(
+            [
+                np.reshape(group_masks[name], (n_items, -1)).all(axis=1)
+                for group_masks in masks
+                for name in names
+            ],
+            axis=0,
+        )
+        shared = np.zeros((len(names), n_items), dtype=np.bool_)
+        for row, name in enumerate(names):
+            shared[row, model.get_shared_items(name)] = True
+        equal = np.all(
+            [np.all(array == array[0], axis=(0, 2)) for array in values.values()],
+            axis=0,
+        )
+        pooled = free & shared.all(axis=0) & equal
+        separate = free & ~shared.any(axis=0)
+        remaining = ~(pooled | separate)
+        pooled &= observed.any(axis=0)
+
+        # One problem per pooled item (group -1) and per observed group of a
+        # group-specific item.
+        separate_groups, separate_items = np.nonzero(separate & observed)
+        items = np.concatenate([np.flatnonzero(pooled), separate_items])
+        members = np.concatenate(
+            [np.full(int(pooled.sum()), -1), separate_groups]
+        ).astype(np.intp)
+        if items.size:
+            source = np.maximum(members, 0)
+            problem_counts = np.where(
+                (members < 0)[:, None, None],
+                group_counts.sum(axis=0)[items],
+                group_counts[source, items],
+            )
+            slopes = values["discrimination"][source, items]
+            difficulty = values["difficulty"][source, items, 0]
+            new_slopes, intercepts, accepted = newton_logistic_items(
+                quad_points,
+                problem_counts[:, :, 1],
+                problem_counts.sum(axis=2),
+                slopes,
+                -slopes.sum(axis=1) * difficulty,
+                estimate_slopes=estimate_slopes,
+            )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                new_difficulty = -intercepts / new_slopes.sum(axis=1)
+            for name, estimates in (
+                ("difficulty", new_difficulty[:, None]),
+                ("discrimination", new_slopes),
+            ):
+                low, high = self._parameter_bound(groups[0], name)
+                accepted &= np.all((estimates >= low) & (estimates <= high), axis=1)
+            remaining[items[~accepted]] = True
+            keep = ~remaining[items]
+            for g, group in enumerate(groups):
+                rows = keep & ((members < 0) | (members == g))
+                if not np.any(rows):
+                    continue
+                updated = {
+                    name: np.array(group.parameters[name], copy=True) for name in names
+                }
+                updated["difficulty"][items[rows]] = new_difficulty[rows]
+                if estimate_slopes:
+                    slope_values = updated["discrimination"]
+                    slope_values[items[rows]] = new_slopes[rows].reshape(
+                        (-1, *slope_values.shape[1:])
+                    )
+                group.set_parameters(**updated)
+        return [int(item) for item in np.flatnonzero(remaining)]
 
     @staticmethod
     def _validate_mean_order(
@@ -765,21 +897,24 @@ class MultigroupEMEstimator:
         quad_points: NDArray[np.float64],
         *,
         masks: Sequence[Mapping[str, NDArray[np.bool_]]] | None = None,
+        counts: Sequence[NDArray[np.float64]] | None = None,
     ) -> None:
         """Optimize parameters for a single item across all groups.
 
         Built-in binary items update every free coordinate in one block (see
         ``_optimize_binary_block``). Other items update one parameter name at
         a time, jointly across groups when it is shared. ``masks`` supplies
-        each group's effective free-parameter masks when already computed.
+        each group's effective free-parameter masks and ``counts`` each
+        group's expected category counts of the item when already computed.
         """
         groups = model.group_models
-        counts = [
-            self._expected_item_counts(group, item_idx, data, posterior)
-            for group, data, posterior in zip(
-                groups, responses, posterior_weights, strict=True
-            )
-        ]
+        if counts is None:
+            counts = [
+                self._expected_item_counts(group, item_idx, data, posterior)
+                for group, data, posterior in zip(
+                    groups, responses, posterior_weights, strict=True
+                )
+            ]
         if masks is None:
             masks = [
                 model.effective_free_parameter_masks(g) for g in range(model.n_groups)
@@ -825,68 +960,21 @@ class MultigroupEMEstimator:
             item_idx, n_categories, posterior
         )
 
-    def _optimize_shared_item_param(
-        self,
-        model: MultigroupModel,
-        item_idx: int,
-        param_name: str,
-        responses: list[NDArray[np.int_]],
-        posterior_weights: list[NDArray[np.float64]],
-        quad_points: NDArray[np.float64],
-        *,
-        counts: list[NDArray[np.float64]] | None = None,
-    ) -> None:
-        """Optimize one shared block against every group's expected likelihood."""
-        models = model.group_models
-        masks = [
-            model.effective_free_parameter_masks(g)[param_name][item_idx].ravel()
-            for g in range(model.n_groups)
-        ]
-        if not np.any(masks):
-            return
-        if counts is None:
-            counts = [
-                self._expected_item_counts(group, item_idx, data, posterior)
-                for group, data, posterior in zip(
-                    models, responses, posterior_weights, strict=True
-                )
-            ]
-        if not self._optimize_binary_block(
-            models, item_idx, {param_name: masks}, {param_name}, counts, quad_points
-        ):
-            self._optimize_parameter_block(
-                models, masks, counts, item_idx, param_name, quad_points
-            )
+    @staticmethod
+    def _all_item_counts(
+        group_model: BaseItemModel,
+        responses: NDArray[np.int_],
+        posterior: NDArray[np.float64],
+    ) -> Sequence[NDArray[np.float64]]:
+        """Return every item's ``_expected_item_counts`` with blocked products.
 
-    def _optimize_group_item_param(
-        self,
-        model: MultigroupModel,
-        group_idx: int,
-        item_idx: int,
-        param_name: str,
-        group_responses: NDArray[np.int_],
-        group_weights: NDArray[np.float64],
-        quad_points: NDArray[np.float64],
-        *,
-        counts: NDArray[np.float64] | None = None,
-    ) -> None:
-        """Optimize only a group's structurally free, unfixed coordinates."""
-        group = model.get_group_model(group_idx)
-        mask = model.effective_free_parameter_masks(group_idx)[param_name][
-            item_idx
-        ].ravel()
-        if not np.any(mask):
-            return
-        if counts is None:
-            counts = self._expected_item_counts(
-                group, item_idx, group_responses, group_weights
-            )
-        if not self._optimize_binary_block(
-            [group], item_idx, {param_name: [mask]}, (), [counts], quad_points
-        ):
-            self._optimize_parameter_block(
-                [group], [mask], [counts], item_idx, param_name, quad_points
-            )
+        Binary counts form one array of shape ``(n_items, n_points, 2)``.
+        """
+        context = EMFitContext(responses)
+        if group_model.is_polytomous:
+            return context.category_counts(group_model._n_categories, posterior)
+        correct, observed = context.expected_counts(posterior)
+        return np.stack((observed - correct, correct), axis=-1)
 
     def _optimize_binary_block(
         self,
@@ -1208,16 +1296,20 @@ class MultigroupEMEstimator:
 
     @staticmethod
     def _parameter_bound(model: BaseItemModel, param_name: str) -> tuple[float, float]:
-        """Return the optimizer box for every coordinate of a parameter."""
-        if param_name == "slopes" and model.model_name == "NRM":
-            return (-5.0, 5.0)
+        """Return the optimizer box for every coordinate of a parameter.
+
+        It is the single-group EM box (``estimation.base._parameter_bounds``),
+        except that multidimensional binary slopes may be negative. Their
+        factors are identified only up to rotation, and a positive lower
+        bound would exclude rotations with zero or negative loadings.
+        """
         if (
             param_name == "discrimination"
             and model.n_factors > 1
             and not model.is_polytomous
         ):
             return (-5.0, 5.0)
-        return _PARAMETER_BOUNDS.get(param_name, (-10.0, 10.0))
+        return _parameter_bounds(model, param_name)
 
     def _get_param_and_bounds(
         self,

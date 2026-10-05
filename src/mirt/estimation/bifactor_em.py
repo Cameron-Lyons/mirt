@@ -383,6 +383,7 @@ default="auto"
         MirtDataError
             If an observed response is not 0 or 1.
         """
+        from mirt.estimation._refit import recipe_for
         from mirt.results.fit_result import FitResult
 
         _require_bifactor_model(model)
@@ -422,6 +423,7 @@ default="auto"
             n_parameters=n_parameters,
             se_method=se_method,
             vcov=covariance,
+            refit_recipe=recipe_for(self),
         )
 
     def _run_em(

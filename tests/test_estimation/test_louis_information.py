@@ -26,12 +26,17 @@ from mirt.estimation.standard_errors import (
     estimate_covariance,
 )
 from mirt.exceptions import MirtValidationError
+from mirt.models.base import PolytomousItemModel
+from mirt.models.bifactor import BifactorModel
 from mirt.models.dichotomous import (
+    ComplementaryLogLog,
     FourParameterLogistic,
+    NegativeLogLog,
     OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
 )
+from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
     GradedResponseModel,
@@ -150,9 +155,110 @@ def test_louis_information_matches_marginal_finite_differences(name):
         rtol=0,
         atol=1e-7 * np.max(np.abs(terms.score_crossproduct)),
     )
+    np.testing.assert_allclose(
+        terms.score, weights @ scores, rtol=0, atol=1e-6 * np.max(np.abs(terms.score))
+    )
     assert louis.has_analytic_item_derivatives(model) == (name not in ("NRM", "2PL-2D"))
     for parameter, values in before.items():
         np.testing.assert_array_equal(model.parameters[parameter], values)
+
+
+# Defaults on the boundary of a parameter's domain, which central differences
+# of the marginal likelihood would cross.
+_INTERIOR = {
+    "IdealPointModel": {"peak_height": np.array([0.7, 0.8, 0.9, 0.95])},
+    "MonotonicSplineModel": {"lower": np.full(4, 0.1), "upper": np.full(4, 0.9)},
+    "ThreePLNestedLogit": {"guessing": np.full(4, 0.15)},
+    "FourPLNestedLogit": {"guessing": np.full(4, 0.15), "upper": np.full(4, 0.9)},
+}
+CURVE_PRODUCT_TYPES = [
+    *louis._curve_product_types(),
+    MultidimensionalModel,
+    BifactorModel,
+]
+
+
+def _curve_product_model(factory, rng):
+    """Return a built-in model with interior, item-specific parameters."""
+    if factory is BifactorModel:
+        model = factory(4, specific_factors=[0, 0, 1, 1])
+    elif issubclass(factory, PolytomousItemModel):
+        model = factory(4, n_categories=3)
+    else:
+        model = factory(4)
+    model.set_parameters(**_INTERIOR.get(factory.__name__, {}))
+    for name, current in model.parameters.items():
+        noise = rng.uniform(-0.15, 0.15, current.shape)
+        values = np.where(model.free_parameter_masks[name], current + noise, current)
+        try:
+            model.set_parameters(**{name: values})
+        except ValueError:
+            # Some domains, such as symmetric GGUM thresholds, reject noise.
+            continue
+    return model
+
+
+@pytest.mark.parametrize("factory", CURVE_PRODUCT_TYPES, ids=lambda cls: cls.__name__)
+def test_curve_product_models_use_exact_item_local_information(factory):
+    # These built-ins previously differenced the marginal likelihood over
+    # every pair of parameters.
+    rng = np.random.default_rng(11)
+    model = _curve_product_model(factory, rng)
+    responses = _responses(model, rng, 200, missing=0.05)
+    quadrature = GaussHermiteQuadrature(
+        9 if model.n_factors == 1 else 5, model.n_factors
+    )
+    mass = quadrature.weights / quadrature.weights.sum()
+    _, layouts = _flatten_parameters(model)
+
+    assert louis.supports_louis_information(model)
+    terms = louis.louis_information(model, responses, quadrature.nodes, mass, layouts)
+    reference, _ = _finite_difference_information(
+        model, responses, quadrature, mass, 1e-4
+    )
+    scores, _ = _finite_difference_scores(model, responses, quadrature, mass, 1e-5)
+
+    scale = np.max(np.abs(reference))
+    np.testing.assert_allclose(terms.information, reference, rtol=0, atol=1e-5 * scale)
+    np.testing.assert_allclose(
+        terms.score_crossproduct,
+        scores.T @ scores,
+        rtol=0,
+        atol=1e-6 * np.max(np.abs(terms.score_crossproduct)),
+    )
+    np.testing.assert_allclose(
+        terms.score,
+        scores.sum(axis=0),
+        rtol=0,
+        atol=1e-6 * max(1.0, np.max(np.abs(terms.score))),
+    )
+
+
+def test_replaced_curve_hooks_use_marginal_differences(monkeypatch):
+    model = ComplementaryLogLog(3)
+    assert louis.supports_louis_information(model)
+
+    class Subclass(ComplementaryLogLog):
+        pass
+
+    assert not louis.supports_louis_information(Subclass(3))
+    shadowed = ComplementaryLogLog(3)
+    shadowed.probability = shadowed.probability
+    assert not louis.supports_louis_information(shadowed)
+
+    original = NegativeLogLog.log_likelihood_batch
+    monkeypatch.setattr(
+        NegativeLogLog,
+        "log_likelihood_batch",
+        lambda self, responses, theta: original(self, responses, theta),
+    )
+    assert not louis.supports_louis_information(NegativeLogLog(3))
+    monkeypatch.setattr(
+        ComplementaryLogLog,
+        "probability",
+        lambda self, theta, item_idx=None: np.full((len(theta), 3), 0.5),
+    )
+    assert not louis.supports_louis_information(model)
 
 
 @pytest.mark.parametrize("name", ["2PL", "4PL", "2PL-2D"])
@@ -353,6 +459,93 @@ def test_coordinates_on_bounds_are_held_fixed():
     np.testing.assert_allclose(
         estimate.covariance[np.ix_(active, active)], expected, rtol=1e-10
     )
+
+
+def _guessing_at_bound_data(n_items=8, n_persons=1500, seed=7):
+    """Simulate 3PL data whose zero guessing values EM fits at their bound."""
+    rng = np.random.default_rng(seed)
+    model = ThreeParameterLogistic(n_items).set_parameters(
+        discrimination=rng.uniform(0.8, 1.8, n_items),
+        difficulty=rng.normal(0.0, 0.8, n_items),
+        guessing=np.where(np.arange(n_items) % 2 == 0, 0.0, 0.2),
+    )
+    return _simulate(model, rng.standard_normal((n_persons, 1)), rng)
+
+
+@pytest.mark.parametrize("method", ["oakes", "crossprod", "sandwich"])
+def test_compute_se_matches_the_fitted_matrix_errors_at_bounds(method):
+    # Regression: compute_se estimated coordinates on an optimizer bound,
+    # so its errors disagreed with the fit's under the same method name.
+    data = _guessing_at_bound_data()
+    result = mirt.fit_mirt(data, model="3PL", se_method=method)
+    guessing = result.model.parameters["guessing"]
+    low = _parameter_bounds(result.model, "guessing")[0]
+    assert np.any(np.abs(guessing - low) <= 1e-6)
+    quadrature = GaussHermiteQuadrature(21)
+    posterior = _posterior_from_model(result.model, data, quadrature)
+
+    errors = compute_se(result.model, data, quadrature, posterior, method=method)
+    for name, values in result.standard_errors.items():
+        np.testing.assert_allclose(errors[name], values, rtol=1e-7)
+    assert np.all(np.isnan(errors["guessing"][np.abs(guessing - low) <= 1e-6]))
+
+
+def test_compute_se_matches_mixed_format_fits_at_bounds():
+    data = _guessing_at_bound_data(seed=2)
+    result = mirt.fit_mirt(data, model=["3PL"] * 4 + ["2PL"] * 4, se_method="oakes")
+    assert np.any(np.isnan(result.standard_errors["3PL.guessing"]))
+    quadrature = GaussHermiteQuadrature(21)
+    posterior = _posterior_from_model(result.model, data, quadrature)
+
+    errors = compute_se(result.model, data, quadrature, posterior, method="oakes")
+    for name, values in result.standard_errors.items():
+        np.testing.assert_allclose(errors[name], values, rtol=1e-7)
+
+
+def test_public_matrix_functions_accept_bounds_and_prior_information():
+    from mirt.estimation._item_priors import ItemPriorPenalty
+    from mirt.estimation.priors import BetaPrior, LogNormalPrior
+
+    rng = np.random.default_rng(13)
+    model = _binary_model(ThreeParameterLogistic, rng)
+    model.set_parameters(guessing=np.array([0.1, 0.0, 0.15, 0.2, 0.12]))
+    responses = _responses(model, rng, 1500)
+    quadrature = GaussHermiteQuadrature(15)
+    posterior = _posterior_from_model(model, responses, quadrature)
+    mass = quadrature.weights / quadrature.weights.sum()
+    priors = ItemPriorPenalty(
+        {"discrimination": LogNormalPrior(0.0, 0.5), "guessing": BetaPrior(2.0, 8.0)}
+    ).information(model)
+
+    def bounds(name):
+        return _parameter_bounds(model, name)
+
+    for method, function in (
+        ("oakes", compute_oakes_se),
+        ("crossprod", compute_crossprod_se),
+        ("sandwich", compute_sandwich_se),
+    ):
+        expected = estimate_covariance(
+            model,
+            responses,
+            quadrature,
+            mass,
+            method,
+            bounds=bounds,
+            prior_information=priors,
+        ).standard_errors
+        actual = function(
+            model,
+            responses,
+            posterior,
+            quadrature,
+            prior_mass=mass,
+            bounds=bounds,
+            prior_information=priors,
+        )
+        for name, values in expected.items():
+            np.testing.assert_allclose(actual[name], values, rtol=1e-12)
+        assert np.isnan(actual["guessing"][1])
 
 
 @pytest.mark.parametrize("use_rust", [False, True])

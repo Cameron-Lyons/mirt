@@ -1,5 +1,7 @@
 """Bayes modal EM with item-parameter priors."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -22,7 +24,7 @@ from mirt.estimation.priors import (
 )
 from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
-from mirt.models.polytomous import GradedResponseModel
+from mirt.models.polytomous import GradedResponseModel, NominalResponseModel
 from mirt.results.fit_result import FitResult
 
 _PRIORS_AND_POINTS = [
@@ -236,6 +238,63 @@ def test_prior_specification_resolution():
     graded = resolve_item_priors(specification, GradedResponseModel(3, n_categories=3))
     assert set(graded) == {"discrimination"}
     assert resolve_item_priors(None, TwoParameterLogistic(2)) == {}
+
+
+def test_prior_specification_must_reach_the_fitted_model():
+    # Regression: fit_mirt and EMEstimator silently ignored a specification
+    # with no matching parameter, which fit_mirt(spec=...) rejected.
+    data = mirt.simdata("GRM", n_persons=150, n_items=3, n_categories=3, seed=4)
+    specification = PriorSpecification(difficulty=NormalPrior(5.0, 0.01))
+    with pytest.raises(MirtValidationError, match="sets no prior on the param"):
+        EMEstimator(max_iter=2, item_priors=specification).fit(
+            NominalResponseModel(3, n_categories=3), data
+        )
+    with pytest.raises(MirtValidationError, match="sets no prior on the param"):
+        mirt.fit_mirt(data, model="NRM", priors=specification, max_iter=2)
+
+
+def test_explicit_priors_on_missing_parameters_warn():
+    data = mirt.simdata("GRM", n_persons=150, n_items=3, n_categories=3, seed=4)
+    explicit = PriorSpecification(difficulty=NormalPrior(5.0, 0.01))
+    with pytest.warns(UserWarning, match="difficulty prior is ignored"):
+        result = EMEstimator(
+            max_iter=2, item_priors=explicit, compute_standard_errors=False
+        ).fit(GradedResponseModel(3, n_categories=3), data)
+    # The default discrimination prior still applies.
+    assert result.log_posterior is not None
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        # Defaults, and guessing priors documented for 3PL and 4PL models.
+        for specification in (
+            PriorSpecification(),
+            PriorSpecification(guessing=BetaPrior(2.0, 8.0)),
+        ):
+            EMEstimator(
+                max_iter=2, item_priors=specification, compute_standard_errors=False
+            ).fit(GradedResponseModel(3, n_categories=3), data)
+
+
+def test_mixed_format_specification_needs_one_matching_component():
+    from mirt.estimation.mixed_format_em import MixedFormatEMEstimator
+    from mirt.models.mixed_format import MixedItemModel
+
+    binary = mirt.simdata("2PL", n_persons=150, n_items=2, seed=5)
+    graded = mirt.simdata("GRM", n_persons=150, n_items=2, n_categories=3, seed=6)
+    data = np.column_stack([binary, graded])
+    model = MixedItemModel.from_itemtypes(["2PL", "2PL", "NRM", "NRM"], n_categories=3)
+    result = MixedFormatEMEstimator(
+        max_iter=2,
+        item_priors=PriorSpecification(),
+        compute_standard_errors=False,
+    ).fit(model, data)
+    assert result.log_posterior is not None
+
+    nominal = MixedItemModel.from_itemtypes(["NRM", "NRM"], n_categories=[3, 4])
+    with pytest.raises(MirtValidationError, match="sets no prior on the param"):
+        MixedFormatEMEstimator(max_iter=2, item_priors=PriorSpecification()).fit(
+            nominal, graded
+        )
 
 
 @pytest.mark.parametrize(

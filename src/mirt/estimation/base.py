@@ -57,8 +57,53 @@ def _parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
     return _ITEM_PARAMETER_BOUNDS.get(name, (-6.0, 6.0))
 
 
+def _stagger_factor_slopes(
+    model: BaseItemModel,
+    name: str,
+    values: NDArray[np.float64],
+    free: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    """Stagger default slopes across factors with identical free coordinates.
+
+    Factors that are free on the same slope coordinates, as in an exploratory
+    model, and start with equal slopes are exchangeable under a standard
+    normal prior. Exact M-steps then keep their slope columns equal, and EM
+    stops at the saddle point where the factors act as one. Item ``j``
+    instead starts at its default slope on factor ``j mod n_factors`` and at
+    half of it on the other factors. Other parameters and confirmatory slope
+    patterns are returned unchanged.
+    """
+    from mirt.models.mixed_format import MixedItemModel
+
+    owner, local = model, name
+    if isinstance(model, MixedItemModel):
+        component, local = model.parameter_component(name)
+        owner = model.component_models[component]
+    n_items, n_factors = owner.n_items, owner.n_factors
+    if (
+        n_factors < 2
+        or local not in ("discrimination", "slopes")
+        or values.ndim < 2
+        or values.shape[0] != n_items
+        or values.shape[-1] != n_factors
+    ):
+        return values
+    columns = np.asarray(free, dtype=np.bool_).reshape(-1, n_factors).T
+    used = columns[columns.any(axis=1)]
+    if len(np.unique(used, axis=0)) == len(used):
+        return values
+    weights = np.full((n_items, n_factors), 0.5)
+    weights[np.arange(n_items), np.arange(n_items) % n_factors] = 1.0
+    return values * weights.reshape((n_items,) + (1,) * (values.ndim - 2) + (-1,))
+
+
 def _initialize_free_parameters(model: BaseItemModel) -> None:
-    """Reset starting values while preserving fixed independent coordinates."""
+    """Reset starting values while preserving fixed independent coordinates.
+
+    Slopes of factors with identical free coordinates start staggered (see
+    ``_stagger_factor_slopes``) so that exploratory multidimensional fits do
+    not stall at the equal-slope saddle point.
+    """
     original = {
         name: model._canonical_parameter_values(name, values)
         for name, values in model.parameters.items()
@@ -68,6 +113,7 @@ def _initialize_free_parameters(model: BaseItemModel) -> None:
     updates = {}
     for name, values in model.parameters.items():
         initial = values.copy()
+        values = _stagger_factor_slopes(model, name, values, masks[name])
         np.copyto(values, original[name], where=~masks[name])
         values = model._canonical_parameter_values(name, values)
         if not np.array_equal(values, initial, equal_nan=True):
@@ -234,6 +280,8 @@ class BaseEstimator(ABC):
     # rating-scale thresholds. Itemwise estimators without that step refuse
     # models whose shared parameters are free rather than leave them unchanged.
     _estimates_shared_parameters: bool = False
+    # Whether the estimator honors coordinates fixed by set_free_parameter_masks.
+    _holds_fixed_parameters: bool = True
 
     def __init__(
         self,
@@ -324,29 +372,9 @@ class BaseEstimator(ABC):
         Raises
         ------
         MirtModelError
-            If ``model`` has free parameters shared by all items and the
-            estimator's M-step updates item parameters only.
-        """
-        if self._estimates_shared_parameters:
-            return
-        shared = _free_shared_parameters(model)
-        if shared:
-            raise MirtModelError(
-                f"{type(self).__name__} cannot estimate {', '.join(shared)}, "
-                f"which {model.model_name} shares across items; use EMEstimator "
-                "or BLEstimator, or hold them fixed with set_free_parameter_masks",
-                model_type=model.model_name,
-            )
-
-    def _get_item_params_and_bounds(
-        self,
-        model: BaseItemModel,
-        item_idx: int,
-    ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
-        """Get current item parameters and their bounds for optimization.
-
-        Parameters shared by all items are left out. Estimators without a
-        shared-parameter step raise ``MirtModelError`` when one is free.
+            If ``model`` is a mixed-format model, or has free parameters
+            shared by all items and the estimator's M-step updates item
+            parameters only.
         """
         from mirt.models.mixed_format import MixedItemModel
 
@@ -358,6 +386,30 @@ class BaseEstimator(ABC):
                 "it with MixedFormatEMEstimator or fit_mirt(model=[...])",
                 model_type=model.model_name,
             )
+        if self._estimates_shared_parameters:
+            return
+        shared = _free_shared_parameters(model)
+        if shared:
+            advice = "use EMEstimator or BLEstimator"
+            if self._holds_fixed_parameters:
+                advice += ", or hold them fixed with set_free_parameter_masks"
+            raise MirtModelError(
+                f"{type(self).__name__} cannot estimate {', '.join(shared)}, "
+                f"which {model.model_name} shares across items; {advice}",
+                model_type=model.model_name,
+            )
+
+    def _get_item_params_and_bounds(
+        self,
+        model: BaseItemModel,
+        item_idx: int,
+    ) -> tuple[NDArray[np.float64], list[tuple[float, float]]]:
+        """Get current item parameters and their bounds for optimization.
+
+        Parameters shared by all items are left out. Estimators without a
+        shared-parameter step raise ``MirtModelError`` when one is free, and
+        every itemwise estimator for a mixed-format model.
+        """
         self._check_shared_parameters(model)
         params_list: list[float] = []
         bounds: list[tuple[float, float]] = []

@@ -78,7 +78,11 @@ maximizes the posterior density (Bayes modal or MAP estimation):
 Keys name stored per-item parameters. A
 :class:`~mirt.estimation.priors.PriorSpecification` applies its
 discrimination, difficulty, guessing and upper priors to whichever of those
-parameters the model has. The same specification is available as
+parameters the model has. A specification that reaches none of them, as for
+a nominal model, raises an error, and an explicit discrimination or
+difficulty prior for a parameter the model lacks, such as ``difficulty`` for
+a graded model, is ignored with a warning; pass a mapping for other
+parameters. The same specification is available as
 ``EMEstimator(item_priors=...)``. Priors apply to free coordinates only, and
 convergence is judged on the log-posterior. ``log_likelihood``, AIC and BIC
 stay likelihood-based. Standard errors include the prior: the negative second
@@ -192,9 +196,10 @@ value receives its prior once per tied item. Constraints are also available as
 :class:`~mirt.estimation.constraints.EqualityConstraint` objects. The native
 full-EM paths are skipped, while the batched 2PL and native polytomous M-steps
 still update the untied items. Constraints are not available for mixed-format
-models or for estimation methods other than EM, and ``FitResult`` does not
-record them: the bootstrap utilities, which refit the model, fit it without
-the constraints.
+models or for estimation methods other than EM. ``FitResult.refit_recipe``
+records them with the other estimator settings, so the bootstrap utilities
+refit with the constraints, and ``bootstrap_lr`` counts each group as one
+parameter.
 
 Monte Carlo EM convergence
 --------------------------
@@ -278,7 +283,9 @@ information. The first ``burnin`` cycles use unit gains, which are Newton
 steps on the imputed data; afterwards gains decrease as ``1 / (t + 1)``
 (``gain_sequence="standard"``) or ``min(1, 10 / (t + 10))`` (``"adaptive"``),
 and the estimates average the post-burn-in iterates. Every built-in item
-family is supported; unidimensional 2PL fits use the native kernel:
+family is supported except the rating scale models (RSM and GRSM), whose
+thresholds are shared by all items; fit those with EM or Bock-Lieberman
+estimation. Unidimensional 2PL fits use the native kernel:
 
 .. code-block:: python
 

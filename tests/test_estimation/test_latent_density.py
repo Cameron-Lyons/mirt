@@ -5,6 +5,8 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy import stats
 
+from mirt import simdata
+from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import (
     CustomDensity,
     DavidianCurve,
@@ -14,6 +16,8 @@ from mirt.estimation.latent_density import (
     MixtureDensity,
     create_density,
 )
+from mirt.exceptions import MirtValidationError
+from mirt.models.dichotomous import TwoParameterLogistic
 
 
 class TestGaussianDensity:
@@ -372,3 +376,61 @@ class TestCreateDensity:
     def test_unknown_raises(self):
         with pytest.raises(ValueError, match="Unknown density type"):
             create_density("unknown_type")
+
+
+_DENSITY_NAMES = {
+    "gaussian": GaussianDensity,
+    "normal": GaussianDensity,
+    "empirical": EmpiricalHistogram,
+    "histogram": EmpiricalHistogram,
+    "eh": EmpiricalHistogram,
+    "ehw": EmpiricalHistogramWoods,
+    "davidian": DavidianCurve,
+    "mixture": MixtureDensity,
+}
+
+
+@pytest.fixture(scope="module")
+def responses_2pl():
+    return simdata("2PL", n_persons=300, n_items=6, seed=12)
+
+
+@pytest.mark.parametrize("name", list(_DENSITY_NAMES))
+def test_em_builds_latent_densities_by_name(name, responses_2pl):
+    # Every name but the Gaussian ones used to raise TypeError.
+    estimator = EMEstimator(
+        latent_density=name, n_quadpts=15, max_iter=20, compute_standard_errors=False
+    )
+    result = estimator.fit(TwoParameterLogistic(6), responses_2pl)
+    density = estimator._latent_density
+    assert type(density) is _DENSITY_NAMES[name]
+    assert np.isfinite(result.log_likelihood)
+    assert result.n_parameters == 12 + density.n_parameters
+    # A name builds a new density for every fit.
+    estimator.fit(TwoParameterLogistic(6), responses_2pl)
+    assert estimator._latent_density is not density
+
+
+def test_gaussian_density_name_uses_the_fit_prior(responses_2pl):
+    estimator = EMEstimator(latent_density=" Gaussian ", max_iter=2)
+    estimator.fit(TwoParameterLogistic(6), responses_2pl, prior_mean=np.array([0.5]))
+    assert_allclose(estimator._latent_density.mean, [0.5])
+
+
+def test_univariate_density_names_require_one_factor(responses_2pl):
+    for name in ("davidian", "mixture", "ehw"):
+        with pytest.raises(MirtValidationError, match="univariate"):
+            EMEstimator(latent_density=name).fit(
+                TwoParameterLogistic(6, n_factors=2), responses_2pl
+            )
+    estimator = EMEstimator(
+        latent_density="empirical",
+        n_quadpts=7,
+        max_iter=5,
+        compute_standard_errors=False,
+    )
+    result = estimator.fit(TwoParameterLogistic(6, n_factors=2), responses_2pl)
+    assert np.isfinite(result.log_likelihood)
+    assert estimator._latent_density.n_parameters == 7**2 - 1
+    with pytest.raises(MirtValidationError, match="Unknown latent density"):
+        EMEstimator(latent_density="lognormal")

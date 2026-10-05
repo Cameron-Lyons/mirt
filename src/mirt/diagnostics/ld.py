@@ -26,7 +26,7 @@ from numbers import Integral, Real
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 from scipy import stats
 
 from mirt._correlation import q3_correlations
@@ -34,9 +34,10 @@ from mirt._local_dependence import ld_pair_statistics
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
+from mirt.utils.data import _missing_coded_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -155,7 +156,7 @@ class LDResult:
 
 def compute_ld_statistics(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     q3_threshold: float = 0.2,
@@ -169,8 +170,9 @@ def compute_ld_statistics(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : NDArray of shape (n_persons, n_items)
-        Response matrix with integer responses
+    responses : array-like of shape (n_persons, n_items)
+        Integer response matrix. Negative codes, ``NaN`` and the nulls of
+        nullable DataFrame columns denote missing responses.
     theta : NDArray of shape (n_persons,) or (n_persons, n_factors), optional
         Ability estimates. If None, EAP estimates are computed.
     n_quadpts : int
@@ -187,8 +189,8 @@ def compute_ld_statistics(
     LDResult
         Object containing all LD statistics and flagged pairs
     """
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = np.asarray(responses)
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
+    responses = _missing_coded_responses(responses)
     n_items = responses.shape[1]
     model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
@@ -264,7 +266,7 @@ def compute_ld_statistics(
 
 def compute_q3(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Compute Yen's Q3 statistics for all item pairs.
@@ -277,8 +279,9 @@ def compute_q3(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : NDArray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Ability estimates
 
@@ -287,7 +290,7 @@ def compute_q3(
     NDArray
         Matrix of Q3 statistics
     """
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     model, theta = _ability_matrix(model, responses, theta)
 
     residuals, _ = _compute_residuals_and_positive_probabilities(
@@ -298,7 +301,7 @@ def compute_q3(
 
 def compute_ld_chi2(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     p_adjust: PValueAdjustment = "none",
@@ -310,8 +313,9 @@ def compute_ld_chi2(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : NDArray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Ability estimates
     n_quadpts : int
@@ -326,8 +330,8 @@ def compute_ld_chi2(
     p_value_matrix : NDArray
         Matrix of raw or adjusted p-values, according to ``p_adjust``.
     """
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = np.asarray(responses)
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
+    responses = _missing_coded_responses(responses)
     n_items = responses.shape[1]
     model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
@@ -520,7 +524,7 @@ def flag_ld_pairs(
         )
         if p_adjust is None:
             p_adjust = ld_result.p_adjustment
-        p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+        p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
 
     rows, columns = np.triu_indices_from(ld_result.q3_matrix, k=1)
     selected = np.zeros(rows.size, dtype=bool)

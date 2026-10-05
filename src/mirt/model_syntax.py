@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1028,7 +1028,7 @@ def _fit_spec(
     responses: NDArray[np.int_],
     spec: ModelSpec | str,
     *,
-    model: str,
+    model: str | Sequence[str],
     n_factors: int,
     n_categories: int | Sequence[int] | None,
     estimation: str,
@@ -1050,15 +1050,11 @@ def _fit_spec(
 
     ``fit_mirt`` has validated the responses, the family, ``n_factors`` and
     the structure of ``constraints``; ``item_names`` are the caller's or the
-    data's names, if any.
+    data's names, if any. A per-item family sequence must name one family.
     """
-    from mirt.estimation._item_priors import (
-        _SPECIFICATION_FIELDS,
-        resolve_item_priors,
-    )
     from mirt.estimation.base import _free_masks_from_fixed
     from mirt.estimation.em import EMEstimator
-    from mirt.estimation.priors import PriorSpecification
+    from mirt.models._factory import single_item_family
 
     if estimation != "EM":
         raise MirtValidationError(
@@ -1068,6 +1064,7 @@ def _fit_spec(
             expected="EM",
         )
     n_items = responses.shape[1]
+    model = single_item_family(model, n_items, operation="model syntax (spec)")
     if item_names is not None and len(item_names) != n_items:
         raise MirtValidationError(
             f"item_names has {len(item_names)} names, but the data have "
@@ -1134,17 +1131,7 @@ def _fit_spec(
             "give priors either in the model syntax or through priors=, not both",
             parameter="priors",
         )
-    if (
-        isinstance(priors, PriorSpecification)
-        and any(getattr(priors, name) is not None for name in _SPECIFICATION_FIELDS)
-        and not resolve_item_priors(priors, irt_model)
-    ):
-        raise MirtValidationError(
-            "the PriorSpecification sets no prior on the parameters of the "
-            f"{irt_model.model_name} model ({', '.join(irt_model.parameters)}); "
-            "pass priors as a mapping of these names or use PRIOR",
-            parameter="priors",
-        )
+    # EMEstimator.fit rejects a PriorSpecification that reaches no parameter.
     density = _factor_density(irt_model, spec, targets, start)
     estimator = EMEstimator(
         n_quadpts=n_quadpts,
@@ -1159,7 +1146,4 @@ def _fit_spec(
         accelerate=accelerate,
         constraints=equality,
     )
-    result = estimator.fit(irt_model, responses, start=start or "default")
-    if density is None:
-        return result
-    return replace(result, latent_covariance=density.cov.copy())
+    return estimator.fit(irt_model, responses, start=start or "default")

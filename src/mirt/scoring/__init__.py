@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     import numpy as np
-    from numpy.typing import NDArray
+    from numpy.typing import ArrayLike, NDArray
 
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
@@ -29,7 +29,7 @@ _LAZY_IMPORTS = {
 
 def fscores(
     model_or_result: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     method: Literal["EAP", "MAP", "ML", "WLE", "EAPsum"] = "EAP",
     n_quadpts: int | None = None,
     prior_mean: NDArray[np.float64] | None = None,
@@ -48,8 +48,10 @@ def fscores(
     ----------
     model_or_result : BaseItemModel | FitResult
         A fitted IRT model or a FitResult from fit_mirt().
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing responses should be coded as -1.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix, as an array or a pandas or polars DataFrame.
+        Negative codes, ``NaN`` and the nulls of nullable DataFrame columns
+        denote missing responses, as in :func:`mirt.fit_mirt`.
     method : {"EAP", "MAP", "ML", "WLE", "EAPsum"}, default="EAP"
         Scoring method to use:
 
@@ -66,9 +68,15 @@ def fscores(
         factors, 21 for three, 9 for four, 7 for five, and 5 for six or more.
         Coarse grids are less accurate when posteriors are concentrated, so
         pass a larger value when precision matters more than run time.
+        Bifactor models, such as :func:`mirt.bfactor` results, are scored by
+        dimension reduction on one two-dimensional (general by specific) grid
+        per specific factor when their prior keeps the specific factors
+        independent given the general factor, as the default prior does, and
+        then default to 49 points for any number of factors.
         EAPsum is unidimensional and defaults to 49 points.
     prior_mean : ndarray, optional
-        Prior mean for Bayesian methods. Default is 0.
+        Prior mean for Bayesian methods. Defaults to the ``latent_mean`` of a
+        ``FitResult`` when it has one, and to zero otherwise.
     prior_cov : ndarray, optional
         Prior covariance for Bayesian methods. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to the
@@ -112,9 +120,8 @@ def fscores(
     >>> scores = fscores(result, data, method="EAP")
     >>> print(scores.theta[:5])
     """
-    import numpy as np
-
     from mirt.results._common import resolve_latent_prior
+    from mirt.utils.data import _missing_coded_responses
 
     model, prior_mean, prior_cov = resolve_latent_prior(
         model_or_result, prior_mean, prior_cov
@@ -123,7 +130,7 @@ def fscores(
     if not model.is_fitted:
         raise ValueError("Model must be fitted before scoring")
 
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     if responses.ndim != 2:
         raise ValueError(f"responses must be 2D, got {responses.ndim}D")
     if responses.shape[1] != model.n_items:

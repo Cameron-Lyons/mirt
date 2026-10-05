@@ -12,9 +12,16 @@ This module provides multiple methods for computing standard errors:
 - Sandwich: observed information bread around the score cross-product
 - Fisher: the marginal expected information, by response-pattern enumeration
 
-Built-in item models whose parameters each belong to one item, or to all
-items, compute the marginal information and scores exactly (Louis, 1982);
-other models use central differences of the marginal log-likelihood.
+The marginal information and scores are exact (Louis, 1982) for the item
+models accepted by
+:func:`~mirt.estimation._louis_information.supports_louis_information`:
+1PL-4PL with any number of factors, GRM, GPCM, PCM, NRM, RSM, GRSM,
+multidimensional and bifactor models, and the other built-in families whose
+likelihood is a product of item curves. Other models, such as custom,
+testlet or mixture models, use central differences of the marginal
+log-likelihood, which cost O(P^2) likelihood evaluations. As in fitted
+results, the matrix methods hold coordinates on an EM optimizer bound fixed
+with ``NaN`` standard errors.
 
 References
 ----------
@@ -54,6 +61,8 @@ SEMethod = Literal[
     "sem",
     "fisher",
 ]
+# Methods built from each item's own expected complete-data likelihood.
+_ITEMWISE_METHODS = frozenset({"numerical", "central", "forward", "richardson"})
 
 
 def _valid_second_derivative(
@@ -129,6 +138,13 @@ def _diagonal_item_standard_errors(
     return np.sqrt(-1.0 / curvature) if curvature < 0 else np.nan
 
 
+def _em_bounds(model: BaseItemModel) -> Callable[[str], tuple[float, float]]:
+    """Return the optimizer boxes that EM fits hold coordinates fixed at."""
+    from mirt.estimation.base import _parameter_bounds
+
+    return lambda name: _parameter_bounds(model, name)
+
+
 def compute_se(
     model: BaseItemModel,
     responses: NDArray[np.int_],
@@ -154,7 +170,12 @@ def compute_se(
     method : str
         Method for SE computation. The default ``"numerical"`` is itemwise
         complete-data curvature; ``"oakes"`` (or its aliases ``"louis"`` and
-        ``"sem"``) gives observed-information standard errors.
+        ``"sem"``) gives observed-information standard errors. The matrix
+        methods (``"oakes"``, ``"louis"``, ``"sem"``, ``"crossprod"``,
+        ``"sandwich"`` and ``"fisher"``) hold coordinates on an EM optimizer
+        bound, such as a guessing parameter of 0, fixed with ``NaN`` standard
+        errors, so they match the fitted ``se_method`` of an EM result
+        without item priors or equality constraints.
     step_size : float
         Step size for numerical differentiation. Matrix-based methods use it
         only for models without exact item derivatives.
@@ -169,7 +190,32 @@ def compute_se(
     -------
     dict
         Standard errors for each parameter.
+
+    Notes
+    -----
+    For a :class:`~mirt.models.mixed_format.MixedItemModel`, the itemwise
+    methods difference each component on its own items and report its
+    errors under qualified names such as ``"3PL.guessing"``.
     """
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel) and method in _ITEMWISE_METHODS:
+        responses = np.asarray(responses)
+        return {
+            f"{prefix}.{name}": errors
+            for prefix, (component, items) in zip(
+                model.component_names, model.components, strict=True
+            )
+            for name, errors in compute_se(
+                component,
+                responses[:, items],
+                quadrature,
+                posterior_weights,
+                method,
+                step_size,
+                n_jobs,
+            ).items()
+        }
     if method in ("numerical", "central"):
         return _se_numerical_central(
             model, responses, quadrature, posterior_weights, step_size, n_jobs
@@ -645,6 +691,7 @@ def _se_sandwich(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -672,6 +719,7 @@ def _se_oakes(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -699,6 +747,7 @@ def _se_crossprod(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -726,6 +775,7 @@ def _se_sem(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=_em_bounds(model),
     )
 
 
@@ -759,4 +809,4 @@ def _se_fisher(
     information, layouts = compute_expected_information(
         model, quadrature, mass, response_array.shape[0], h
     )
-    return _se_from_information(information, layouts, model)
+    return _se_from_information(information, layouts, model, _em_bounds(model))

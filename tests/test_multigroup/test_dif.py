@@ -17,7 +17,7 @@ from mirt.multigroup import (
     select_dif_anchors,
 )
 from mirt.multigroup import dif as dif_module
-from mirt.multigroup.dif import _DIFTestRow, _DIFTestTable, _run_multigroup_dif
+from mirt.multigroup.dif import _DIFTestRow, _DIFTestTable, run_multigroup_dif
 from mirt.multigroup.invariance import InvarianceSpec
 
 FIT = {"n_quadpts": 9, "tol": 1e-3}
@@ -63,7 +63,7 @@ def dif_data() -> tuple[np.ndarray, np.ndarray]:
 @pytest.fixture(scope="module")
 def drop_table(dif_data: tuple[np.ndarray, np.ndarray]) -> _DIFTestTable:
     data, groups = dif_data
-    return _run_multigroup_dif(data, groups, **FIT)
+    return run_multigroup_dif(data, groups, p_adjust="holm", **FIT)
 
 
 class TestDropScheme:
@@ -149,7 +149,7 @@ def test_public_function_tests_selected_items(dif_data, drop_table) -> None:
 def test_add_scheme_constrains_one_studied_item_at_a_time(dif_data) -> None:
     data, groups = dif_data
 
-    table = _run_multigroup_dif(data, groups, scheme="add", anchors=[5, 6, 7], **FIT)
+    table = run_multigroup_dif(data, groups, scheme="add", anchors=[5, 6, 7], **FIT)
 
     assert [row.item for row in table.rows] == [0, 1, 2, 3, 4]
     assert table.flagged() == [0]
@@ -163,7 +163,7 @@ def test_add_scheme_constrains_one_studied_item_at_a_time(dif_data) -> None:
 def test_drop_sequential_retests_with_flagged_items_free(dif_data) -> None:
     data, groups = dif_data
 
-    table = _run_multigroup_dif(data, groups, scheme="drop_sequential", **FIT)
+    table = run_multigroup_dif(data, groups, scheme="drop_sequential", **FIT)
     rows = _rows(table)
 
     assert table.flagged() == [0]
@@ -205,7 +205,7 @@ def test_sequential_scheme_warns_when_rounds_run_out(dif_data) -> None:
     data, groups = dif_data
 
     with pytest.warns(UserWarning, match="did not settle within 1 rounds"):
-        table = _run_multigroup_dif(
+        table = run_multigroup_dif(
             data, groups, items=[0, 1], scheme="drop_sequential", max_rounds=1, **FIT
         )
 
@@ -216,7 +216,7 @@ def test_sequential_scheme_warns_when_rounds_run_out(dif_data) -> None:
 def test_add_sequential_moves_invariant_items_into_the_anchor_set(dif_data) -> None:
     data, groups = dif_data
 
-    table = _run_multigroup_dif(
+    table = run_multigroup_dif(
         data, groups, scheme="add_sequential", anchors=[5, 6, 7], **FIT
     )
     rows = _rows(table)
@@ -239,7 +239,7 @@ def test_df_counts_only_freed_free_parameters(
 ) -> None:
     data, groups = dif_data
 
-    table = _run_multigroup_dif(
+    table = run_multigroup_dif(
         data,
         groups,
         model,
@@ -265,7 +265,7 @@ def test_failed_refit_reports_missing_statistics(
 
     monkeypatch.setattr(dif_module, "_fit", failing_fit)
 
-    table = _run_multigroup_dif(data, groups, items=[0, 1], n_quadpts=7, max_iter=5)
+    table = run_multigroup_dif(data, groups, items=[0, 1], n_quadpts=7, max_iter=5)
     failed = _rows(table)[1]
 
     assert np.isnan(failed.chi2) and np.isnan(failed.p_value)
@@ -289,7 +289,7 @@ def test_refits_run_through_the_parallel_task_runner(
 
     monkeypatch.setattr(dif_module, "_run_bootstrap_tasks", run_inline)
 
-    _run_multigroup_dif(data, groups, items=[0, 2], n_jobs=3, n_quadpts=7, max_iter=3)
+    run_multigroup_dif(data, groups, items=[0, 2], n_jobs=3, n_quadpts=7, max_iter=3)
 
     assert calls == [(2, 3)]
 
@@ -323,7 +323,7 @@ def test_options_are_validated_before_fitting(
     monkeypatch.setattr(dif_module, "_fit", unexpected_fit)
     data, groups = dif_data
     with pytest.raises(ValueError, match=message):
-        _run_multigroup_dif(data, groups, **kwargs)
+        run_multigroup_dif(data, groups, **kwargs)
 
 
 def test_single_group_is_rejected(dif_data) -> None:
@@ -383,7 +383,7 @@ def test_anchor_selection_ranks_unflagged_items(
         schemes.append(scheme)
         return _fake_table([0.9, 0.4, 0.8, 0.7], [True, False, False, False])
 
-    monkeypatch.setattr(dif_module, "_run_multigroup_dif", fake_run)
+    monkeypatch.setattr(dif_module, "run_multigroup_dif", fake_run)
 
     selected = select_dif_anchors(
         np.zeros((4, 4)), np.repeat([0, 1], 2), method=method, n_anchors=n_anchors
@@ -398,7 +398,7 @@ def test_anchor_selection_rank_may_return_flagged_items(
 ) -> None:
     monkeypatch.setattr(
         dif_module,
-        "_run_multigroup_dif",
+        "run_multigroup_dif",
         lambda *args, **kwargs: _fake_table([0.9, 0.4], [True, False]),
     )
 
@@ -412,7 +412,7 @@ def test_anchor_selection_requires_a_candidate(
 ) -> None:
     monkeypatch.setattr(
         dif_module,
-        "_run_multigroup_dif",
+        "run_multigroup_dif",
         lambda *args, **kwargs: _fake_table([0.01, 0.02], [True, True]),
     )
 
@@ -446,10 +446,46 @@ def test_impact_only_type_i_error_and_power() -> None:
     false_positives = 0
     for seed in range(5):
         data, groups = _simulate(100 + seed, n_per_group=500, shift=0.0)
-        false_positives += len(_run_multigroup_dif(data, groups, **FIT).flagged())
+        false_positives += len(
+            run_multigroup_dif(data, groups, p_adjust="holm", **FIT).flagged()
+        )
 
         data, groups = _simulate(200 + seed, n_per_group=500)
-        alternative = _run_multigroup_dif(data, groups, **FIT)
+        alternative = run_multigroup_dif(data, groups, **FIT)
         assert _rows(alternative)[0].p_value < 0.01
 
     assert false_positives <= 1
+
+
+def test_families_without_free_coordinates_are_rejected_before_fitting(
+    dif_data, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected_fit(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("no model should be fitted when nothing can be tested")
+
+    monkeypatch.setattr(dif_module, "_fit", unexpected_fit)
+    data, groups = dif_data
+
+    # 1PL slopes are fixed, so freeing them changes nothing.
+    with pytest.raises(ValueError, match="no free coordinates"):
+        multigroup_dif(data, groups, model="1PL", parameters=("discrimination",))
+
+
+def test_items_without_free_coordinates_warn() -> None:
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.multigroup import MultigroupModel
+
+    base = TwoParameterLogistic(3)
+    base.set_free_parameter_masks({"discrimination": np.array([True, False, True])})
+    model = MultigroupModel(base, 2)
+    families = ("discrimination", "intercepts")
+
+    with pytest.warns(UserWarning, match=r"items \['Item_1'\]"):
+        dif_module._check_testable(model, 0, [0, 1], families[:1], "2PL")
+    dif_module._check_testable(model, 0, [0, 1], families, "2PL")
+
+
+def test_scheme_names_come_from_the_literal() -> None:
+    from typing import get_args
+
+    assert dif_module.DIF_SCHEMES == get_args(dif_module.DIFScheme)

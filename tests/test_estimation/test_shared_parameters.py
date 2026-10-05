@@ -13,6 +13,7 @@ from mirt.estimation._shared_step import (
 from mirt.estimation.base import _free_shared_parameters
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator, StochasticEMEstimator
+from mirt.estimation.mcmc import MHRMEstimator, _set_item_vectors
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import compute_se
 from mirt.estimation.standard_errors import (
@@ -358,12 +359,39 @@ def test_estimators_without_a_shared_step_refuse_free_shared_parameters(
 ):
     _, responses = rating_data["RSM"]
     responses = responses[:200]
-    with pytest.raises(MirtModelError, match="cannot estimate thresholds"):
+    with pytest.raises(
+        MirtModelError, match="cannot estimate thresholds.*set_free_parameter_masks"
+    ):
         estimator.fit(RatingScaleModel(10, 4), responses)
     held = RatingScaleModel(10, 4)
     held.set_free_parameter_masks({"thresholds": np.zeros(3, dtype=bool)})
     result = estimator.fit(held, responses)
     np.testing.assert_array_equal(result.model.thresholds, [0.0, 1.0, 2.0])
+
+
+def test_mhrm_refusal_only_suggests_estimators_it_accepts(rating_data):
+    # MHRM also rejects masks, so advising them led to a second error.
+    _, responses = rating_data["RSM"]
+    estimator = MHRMEstimator(n_cycles=5, burnin=1, seed=1, use_rust=False)
+    with pytest.raises(MirtModelError, match="cannot estimate thresholds") as error:
+        estimator.fit(RatingScaleModel(10, 4), responses[:200])
+    assert "EMEstimator or BLEstimator" in str(error.value)
+    assert "set_free_parameter_masks" not in str(error.value)
+
+
+def test_mhrm_item_vectors_leave_shared_parameters_whole():
+    # Three items share three thresholds; a test of the array length took
+    # the thresholds for an item-indexed parameter.
+    model = RatingScaleModel(3, 4)
+    model.set_parameters(difficulty=np.array([-0.5, 0.0, 0.6]), thresholds=THRESHOLDS)
+    estimator = EMEstimator()
+    vectors = {
+        item: estimator._get_item_params_and_bounds(model, item)[0] + 0.25
+        for item in (0, 2)
+    }
+    _set_item_vectors(model, vectors)
+    np.testing.assert_array_equal(model.thresholds, THRESHOLDS)
+    np.testing.assert_allclose(model.parameters["difficulty"], [-0.25, 0.0, 0.85])
 
 
 def test_monte_carlo_errors_leave_held_shared_parameters_whole():

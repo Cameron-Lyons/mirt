@@ -22,27 +22,64 @@ NODES = np.linspace(-3.0, 3.0, 9)[:, None]
 
 
 class PerParameterEstimator(MultigroupEMEstimator):
-    """Reference M-step: one parameter name at a time, as before the joint path."""
+    """Reference M-step: one parameter name at a time, as before the joint path.
+
+    Overriding ``_optimize_item`` also disables the batched Newton M-step.
+    """
 
     def _optimize_item(
-        self, model, item_idx, responses, posterior_weights, quad_points, *, masks=None
+        self,
+        model,
+        item_idx,
+        responses,
+        posterior_weights,
+        quad_points,
+        *,
+        masks=None,
+        counts=None,
     ):
+        groups = model.group_models
+        if counts is None:
+            counts = [
+                self._expected_item_counts(group, item_idx, data, posterior)
+                for group, data, posterior in zip(
+                    groups, responses, posterior_weights, strict=True
+                )
+            ]
+        if masks is None:
+            masks = [
+                model.effective_free_parameter_masks(g) for g in range(len(groups))
+            ]
         for name in model.parameter_names:
+            name_masks = [group_masks[name][item_idx].ravel() for group_masks in masks]
             if model.is_item_parameter_shared(name, item_idx):
-                self._optimize_shared_item_param(
-                    model, item_idx, name, responses, posterior_weights, quad_points
-                )
-                continue
-            for g in range(model.n_groups):
-                self._optimize_group_item_param(
-                    model,
-                    g,
+                blocks = [(groups, name_masks, counts, {name})]
+            else:
+                blocks = [
+                    ([group], [mask], [group_counts], set())
+                    for group, mask, group_counts in zip(
+                        groups, name_masks, counts, strict=True
+                    )
+                ]
+            for block_groups, block_masks, block_counts, shared in blocks:
+                if not np.any(block_masks):
+                    continue
+                if not self._optimize_binary_block(
+                    block_groups,
                     item_idx,
-                    name,
-                    responses[g],
-                    posterior_weights[g],
+                    {name: block_masks},
+                    shared,
+                    block_counts,
                     quad_points,
-                )
+                ):
+                    self._optimize_parameter_block(
+                        block_groups,
+                        block_masks,
+                        block_counts,
+                        item_idx,
+                        name,
+                        quad_points,
+                    )
 
 
 def _simulate(model: str, n_items: int, n_persons: int, seed: int):

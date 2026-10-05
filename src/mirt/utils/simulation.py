@@ -154,8 +154,8 @@ def simdata(
         or a fit result wrapping one, simulates from its current parameters;
         then only ``n_persons``, ``theta`` and ``seed`` apply, and abilities
         default to standard normal draws on every model factor, or to normal
-        draws with a fit result's estimated ``latent_covariance``. Named
-        models:
+        draws with a fit result's estimated ``latent_mean`` and
+        ``latent_covariance``. Named models:
 
         - "1PL": One-parameter logistic (equal discrimination)
         - "2PL": Two-parameter logistic
@@ -533,7 +533,7 @@ def _simulate_from_model(
     from mirt.models.base import DichotomousItemModel, PolytomousItemModel
     from mirt.results._common import resolve_latent_prior
 
-    item_model, _, latent_cov = resolve_latent_prior(model)
+    item_model, latent_mean, latent_cov = resolve_latent_prior(model)
     if not isinstance(item_model, (DichotomousItemModel, PolytomousItemModel)):
         raise ValueError(
             "model must be a simulation model name, a dichotomous or polytomous "
@@ -557,6 +557,8 @@ def _simulate_from_model(
         theta_values = rng.standard_normal((int(n_persons), item_model.n_factors))
         if latent_cov is not None:
             theta_values = theta_values @ np.linalg.cholesky(latent_cov).T
+        if latent_mean is not None:
+            theta_values += latent_mean
     else:
         theta_values = np.asarray(theta, dtype=np.float64)
         if theta_values.ndim == 1 and item_model.n_factors == 1:

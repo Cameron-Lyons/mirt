@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Self
 
@@ -14,6 +14,7 @@ from mirt.exceptions import MirtModelError, MirtValidationError
 from mirt.results._common import normal_critical_value, validate_alpha
 
 if TYPE_CHECKING:
+    from mirt.estimation._refit import RefitRecipe
     from mirt.models.base import BaseItemModel
 
 ParameterStatistics = dict[str, dict[str, NDArray[np.float64]]]
@@ -29,6 +30,13 @@ _FIT_STATISTIC_FIELDS = (
     "n_iterations",
 )
 _MODEL_FIELDS = {"name", "n_items", "n_factors", "item_names", "n_categories"}
+# Structure that, with the parameters, rebuilds models beyond the families.
+_STRUCTURE_FIELDS = {
+    "MIRT": "loading_pattern",
+    "Bifactor": "specific_factors",
+    "Mixed": "components",
+}
+_OPTIONAL_MODEL_FIELDS = {"free_parameter_masks", *_STRUCTURE_FIELDS.values()}
 
 
 def _payload_error(message: str, *, value: Any = None) -> MirtValidationError:
@@ -91,6 +99,196 @@ def _covariance_from_payload(
     return matrix, labels
 
 
+def _model_structure(model: BaseItemModel) -> dict[str, Any]:
+    """Return the structure ``from_dict`` needs beyond the family metadata.
+
+    Multidimensional models record their loading pattern, bifactor
+    models their specific-factor labels, mixed-format models the
+    family and test items of each component, and any model with
+    ``set_free_parameter_masks`` restrictions its free masks.
+    """
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.mixed_format import MixedItemModel
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    structure: dict[str, Any] = {}
+    if isinstance(model, MultidimensionalModel):
+        structure["loading_pattern"] = model.loading_pattern.tolist()
+    elif isinstance(model, BifactorModel):
+        structure["specific_factors"] = model.specific_factors.tolist()
+    elif isinstance(model, MixedItemModel):
+        structure["components"] = [
+            {"name": str(component.model_name), "items": items.tolist()}
+            for component, items in model.components
+        ]
+    restricted = model._free_parameter_restrictions
+    if restricted:
+        masks = model.free_parameter_masks
+        structure["free_parameter_masks"] = {
+            name: masks[name].tolist() for name in restricted
+        }
+    return structure
+
+
+def _validated_item_names(info: Mapping[str, Any]) -> list[str]:
+    """Return ``model.item_names`` after checking that it lists strings."""
+    item_names = info["item_names"]
+    if not isinstance(item_names, list) or not all(
+        isinstance(item, str) for item in item_names
+    ):
+        raise MirtValidationError(
+            "model.item_names must be a list of strings",
+            parameter="model.item_names",
+            value=item_names,
+        )
+    return item_names
+
+
+def _multidimensional_from_payload(
+    pattern: Any, n_items: int, n_factors: Any, item_names: list[str]
+) -> BaseItemModel:
+    """Rebuild a slope-intercept ``MultidimensionalModel``."""
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    try:
+        loadings = np.asarray(pattern, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "model.loading_pattern must be a numeric matrix",
+            parameter="model.loading_pattern",
+        ) from exc
+    if (
+        isinstance(n_factors, bool)
+        or not isinstance(n_factors, Integral)
+        or n_factors < 2
+        or loadings.shape != (n_items, n_factors)
+        or not np.all((loadings == 0.0) | (loadings == 1.0))
+    ):
+        raise MirtValidationError(
+            "model.loading_pattern must be an (n_items, n_factors) matrix of "
+            "zeros and ones with n_factors >= 2",
+            parameter="model.loading_pattern",
+            value=loadings.shape,
+            expected=f"({n_items}, n_factors >= 2)",
+        )
+    exploratory = bool(np.all(loadings == 1.0))
+    return MultidimensionalModel(
+        n_items,
+        int(n_factors),
+        item_names=item_names,
+        model_type="exploratory" if exploratory else "confirmatory",
+        loading_pattern=None if exploratory else loadings,
+    )
+
+
+def _bifactor_from_payload(
+    labels: Any, n_items: int, n_factors: Any, item_names: list[str]
+) -> BaseItemModel:
+    """Rebuild a ``BifactorModel`` from its specific-factor labels."""
+    from mirt.models.bifactor import BifactorModel
+
+    if not isinstance(labels, list) or not all(
+        isinstance(label, Integral) and not isinstance(label, bool) for label in labels
+    ):
+        raise MirtValidationError(
+            "model.specific_factors must be a list of integer labels",
+            parameter="model.specific_factors",
+            value=labels,
+        )
+    try:
+        model = BifactorModel(n_items, labels, item_names=item_names)
+    except ValueError as exc:
+        raise MirtValidationError(
+            str(exc), parameter="model.specific_factors", value=labels
+        ) from exc
+    if n_factors != model.n_factors:
+        raise MirtValidationError(
+            f"model.n_factors must be {model.n_factors}, one general factor and "
+            "one per specific-factor label",
+            parameter="model.n_factors",
+            value=n_factors,
+            expected=str(model.n_factors),
+        )
+    return model
+
+
+def _mixed_from_payload(
+    entries: Any,
+    n_factors: Any,
+    n_categories: Any,
+    item_names: list[str],
+) -> BaseItemModel:
+    """Rebuild a ``MixedItemModel`` of built-in family components."""
+    from mirt.models._factory import (
+        ITEM_MODEL_FAMILIES,
+        POLYTOMOUS_FAMILIES,
+        build_item_model,
+    )
+    from mirt.models.mixed_format import MixedItemModel
+
+    if not isinstance(entries, list) or not entries:
+        raise MirtValidationError(
+            "model.components must be a non-empty list",
+            parameter="model.components",
+            value=entries,
+        )
+    if not isinstance(n_categories, list) or len(n_categories) != len(item_names):
+        raise MirtValidationError(
+            "model.n_categories must list one category count per item",
+            parameter="model.n_categories",
+            value=n_categories,
+        )
+    components = []
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != {"name", "items"}:
+            raise MirtValidationError(
+                "each model.components entry must map name and items",
+                parameter="model.components",
+                value=entry,
+            )
+        family, items = entry["name"], entry["items"]
+        if not isinstance(family, str) or family not in ITEM_MODEL_FAMILIES:
+            raise MirtValidationError(
+                f"cannot rebuild mixed-format component {family!r}; only "
+                "fit_mirt model families are supported",
+                parameter="model.components",
+                value=family,
+                expected=", ".join(ITEM_MODEL_FAMILIES),
+            )
+        if (
+            not isinstance(items, list)
+            or not items
+            or not all(
+                isinstance(item, Integral)
+                and not isinstance(item, bool)
+                and 0 <= item < len(item_names)
+                for item in items
+            )
+        ):
+            raise MirtValidationError(
+                "model.components items must list test item positions",
+                parameter="model.components",
+                value=items,
+            )
+        components.append(
+            (
+                build_item_model(
+                    family,
+                    len(items),
+                    n_factors=n_factors,
+                    n_categories=(
+                        [n_categories[item] for item in items]
+                        if family in POLYTOMOUS_FAMILIES
+                        else None
+                    ),
+                    item_names=[item_names[item] for item in items],
+                ),
+                items,
+            )
+        )
+    return MixedItemModel(components, item_names=item_names)
+
+
 def _model_from_payload(
     info: Any,
     parameters: dict[str, NDArray[np.float64]],
@@ -104,7 +302,7 @@ def _model_from_payload(
 
     if not isinstance(info, Mapping):
         raise _payload_error("model must be a mapping", value=type(info).__name__)
-    unknown = set(info) - _MODEL_FIELDS
+    unknown = set(info) - _MODEL_FIELDS - _OPTIONAL_MODEL_FIELDS
     if unknown:
         names = ", ".join(sorted(str(name) for name in unknown))
         raise _payload_error(f"model contains unknown fields: {names}", value=names)
@@ -114,14 +312,26 @@ def _model_from_payload(
         raise _payload_error(f"model is missing required fields: {names}", value=names)
 
     name = info["name"]
-    if not isinstance(name, str) or name not in ITEM_MODEL_FAMILIES:
+    if not isinstance(name, str) or (
+        name not in ITEM_MODEL_FAMILIES and name not in _STRUCTURE_FIELDS
+    ):
         raise MirtValidationError(
-            f"cannot rebuild model {name!r}; only fit_mirt model families are "
+            f"cannot rebuild model {name!r}; only fit_mirt model families and "
+            "multidimensional ('MIRT'), bifactor and mixed-format models are "
             "supported",
             parameter="model.name",
             value=name,
-            expected=", ".join(ITEM_MODEL_FAMILIES),
+            expected=", ".join([*ITEM_MODEL_FAMILIES, *_STRUCTURE_FIELDS]),
         )
+    structure = _STRUCTURE_FIELDS.get(name)
+    for key in _STRUCTURE_FIELDS.values():
+        if (key in info) != (key == structure):
+            message = (
+                f"model.{key} is required for {name!r} models"
+                if key == structure
+                else f"model.{key} does not apply to {name!r} models"
+            )
+            raise MirtValidationError(message, parameter=f"model.{key}", value=name)
     n_items = info["n_items"]
     if isinstance(n_items, bool) or not isinstance(n_items, Integral) or n_items < 1:
         raise MirtValidationError(
@@ -130,17 +340,12 @@ def _model_from_payload(
             value=n_items,
             expected=">= 1",
         )
-    item_names = info["item_names"]
-    if not isinstance(item_names, list) or not all(
-        isinstance(item, str) for item in item_names
-    ):
-        raise MirtValidationError(
-            "model.item_names must be a list of strings",
-            parameter="model.item_names",
-            value=item_names,
-        )
+    n_items = int(n_items)
+    item_names = _validated_item_names(info)
+    n_factors = info.get("n_factors", 1)
     n_categories = info.get("n_categories")
-    if (name in POLYTOMOUS_FAMILIES) != (n_categories is not None):
+    polytomous = name in POLYTOMOUS_FAMILIES or name == "Mixed"
+    if polytomous != (n_categories is not None):
         raise MirtValidationError(
             "model.n_categories must list category counts for polytomous models "
             "and be null for dichotomous models",
@@ -149,15 +354,38 @@ def _model_from_payload(
         )
 
     try:
-        model = build_item_model(
-            name,
-            int(n_items),
-            n_factors=info.get("n_factors", 1),
-            n_categories=n_categories,
-            item_names=item_names,
-        )
+        if name == "MIRT":
+            model = _multidimensional_from_payload(
+                info["loading_pattern"], n_items, n_factors, item_names
+            )
+        elif name == "Bifactor":
+            model = _bifactor_from_payload(
+                info["specific_factors"], n_items, n_factors, item_names
+            )
+        elif name == "Mixed":
+            model = _mixed_from_payload(
+                info["components"], n_factors, n_categories, item_names
+            )
+        else:
+            model = build_item_model(
+                name,
+                n_items,
+                n_factors=n_factors,
+                n_categories=n_categories,
+                item_names=item_names,
+            )
     except MirtModelError as exc:
         raise MirtValidationError(exc.message, parameter="model", value=name) from exc
+    if (
+        model.n_items != n_items
+        or model.n_factors != n_factors
+        or (name == "Mixed" and _category_counts(model) != n_categories)
+    ):
+        raise MirtValidationError(
+            "model.n_items, n_factors and n_categories must match the model structure",
+            parameter="model",
+            value=name,
+        )
 
     stored = model.parameters
     if set(parameters) != set(stored):
@@ -183,8 +411,39 @@ def _model_from_payload(
                 expected=str(stored[parameter].tolist()),
             )
     model.set_parameters(**free)
+    if name == "MIRT" and not np.array_equal(
+        model.parameters["slopes"], parameters["slopes"]
+    ):
+        raise MirtValidationError(
+            "slopes must be zero where model.loading_pattern is zero",
+            parameter="slopes",
+        )
+    masks = info.get("free_parameter_masks")
+    if masks is not None:
+        model.set_free_parameter_masks(_masks_from_payload(masks))
     model._is_fitted = True
     return model
+
+
+def _masks_from_payload(masks: Any) -> dict[str, NDArray[np.bool_]]:
+    """Read ``to_dict()['model']['free_parameter_masks']`` as Boolean arrays."""
+    if not isinstance(masks, Mapping):
+        raise MirtValidationError(
+            "model.free_parameter_masks must map parameter names to masks",
+            parameter="model.free_parameter_masks",
+            value=type(masks).__name__,
+        )
+    arrays = {}
+    for name, values in masks.items():
+        try:
+            arrays[str(name)] = np.asarray(values)
+        except ValueError as exc:
+            raise MirtValidationError(
+                f"model.free_parameter_masks[{name!r}] must be a Boolean array",
+                parameter="model.free_parameter_masks",
+                value=name,
+            ) from exc
+    return arrays
 
 
 def _item_labels(model: BaseItemModel) -> list[str]:
@@ -345,10 +604,30 @@ class FitResult:
         model's free parameters when ``vcov`` is given without labels.
     latent_covariance : ndarray of shape (n_factors, n_factors), optional
         Estimated covariance of the latent factors, for example from a
-        confirmatory ``fit_mirt(spec=...)`` fit with ``COV`` terms. ``None``
-        when the factors are standard normal and uncorrelated. Scoring,
-        plausible values, simulation and the fit diagnostics that accept a
-        ``FitResult`` use it as the default latent population.
+        confirmatory ``fit_mirt(spec=...)`` fit with ``COV`` terms, an
+        ``EMEstimator`` whose Gaussian latent density estimates its
+        covariance, or fixed-item calibration. An ``EMEstimator`` fit also
+        records a fixed non-standard population, such as a ``prior_cov``
+        passed to :meth:`~mirt.estimation.em.EMEstimator.fit`, because its
+        items were estimated on that scale. ``None`` when the factors are
+        standard normal and uncorrelated. Scoring, plausible values,
+        simulation and the fit diagnostics that accept a ``FitResult`` use it
+        as the default latent population.
+    latent_mean : ndarray of shape (n_factors,), optional
+        Mean of the latent factors, for example the population mean that
+        fixed-item calibration estimates on the anchor scale, or a fixed
+        ``prior_mean`` passed to
+        :meth:`~mirt.estimation.em.EMEstimator.fit`. ``None`` for a zero
+        mean. It is the default population mean wherever
+        ``latent_covariance`` is the default covariance.
+    refit_recipe : RefitRecipe, optional
+        How the fit can be repeated: the estimator class and its settings,
+        including the latent density, item priors and equality constraints.
+        ``refit_recipe.build(**overrides)`` returns a new estimator. The
+        bootstrap utilities and ``bootstrap_lr`` refit with it. ``None`` for
+        estimators that do not record one, in which case refits use the
+        default estimator of the model family. It is not part of
+        :meth:`to_dict`.
     """
 
     model: BaseItemModel
@@ -365,6 +644,8 @@ class FitResult:
     vcov: NDArray[np.float64] | None = None
     vcov_labels: list[str] | None = None
     latent_covariance: NDArray[np.float64] | None = None
+    latent_mean: NDArray[np.float64] | None = None
+    refit_recipe: RefitRecipe | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         for name in ("n_iterations", "n_observations", "n_parameters"):
@@ -421,6 +702,29 @@ class FitResult:
             )
         self._validate_covariance()
         self._validate_latent_covariance()
+        self._validate_latent_mean()
+
+    def _validate_latent_mean(self) -> None:
+        if self.latent_mean is None:
+            return
+        n_factors = self.model.n_factors
+        try:
+            mean = np.array(self.latent_mean, dtype=np.float64, copy=True)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "latent_mean must be a numeric vector", parameter="latent_mean"
+            ) from exc
+        if mean.shape != (n_factors,):
+            raise MirtValidationError(
+                f"latent_mean must have shape ({n_factors},)",
+                parameter="latent_mean",
+                value=mean.shape,
+            )
+        if not np.all(np.isfinite(mean)):
+            raise MirtValidationError(
+                "latent_mean must be finite", parameter="latent_mean"
+            )
+        self.latent_mean = mean
 
     def _validate_latent_covariance(self) -> None:
         if self.latent_covariance is None:
@@ -713,8 +1017,14 @@ class FitResult:
                     f"{values['ci_upper'][index]:>8.4f}"
                 )
 
+        labels = [f"F{index + 1}" for index in range(self.model.n_factors)]
+        if self.latent_mean is not None:
+            lines.append("\nLatent mean:")
+            lines.append(f"{'':<15}" + "".join(f"{label:>10}" for label in labels))
+            lines.append(
+                f"{'':<15}" + "".join(f"{value:>10.4f}" for value in self.latent_mean)
+            )
         if self.latent_covariance is not None:
-            labels = [f"F{index + 1}" for index in range(len(self.latent_covariance))]
             lines.append("\nLatent covariance:")
             lines.append(f"{'':<15}" + "".join(f"{label:>10}" for label in labels))
             for label, row in zip(labels, self.latent_covariance, strict=True):
@@ -770,7 +1080,16 @@ class FitResult:
         return data
 
     def coef(self) -> Any:
-        """Return per-item coefficients using the configured dataframe backend."""
+        """Return per-item coefficients using the configured dataframe backend.
+
+        Raises
+        ------
+        MirtValidationError
+            If a parameter is not laid out per item.
+        MirtModelError
+            If a mixed-format component shares a parameter across its items,
+            such as rating-scale thresholds; use :meth:`parameter_statistics`.
+        """
         from mirt.utils.dataframe import create_dataframe
 
         return create_dataframe(
@@ -816,9 +1135,17 @@ class FitResult:
         """Return a dependency-free, JSON-compatible result representation.
 
         ``model`` records the family name, dimensions, item names, and
-        per-item category counts (``None`` for dichotomous models), which
-        together with the parameters let :meth:`from_dict` rebuild the model.
-        Parameters include ``latent_covariance`` when it was estimated.
+        per-item category counts (``None`` for dichotomous models). A
+        multidimensional (``"MIRT"``) model adds its ``loading_pattern``, a
+        bifactor model its ``specific_factors``, a mixed-format model its
+        ``components`` (each family with its test items), and a model
+        restricted by ``set_free_parameter_masks`` its
+        ``free_parameter_masks``. Together with the parameters these let
+        :meth:`from_dict` rebuild models of the ``fit_mirt`` families,
+        multidimensional ``fit_mirt(spec=...)`` and ``bfactor`` models, and
+        mixed-format models of those families.
+        Parameters include ``latent_covariance`` and ``latent_mean`` when
+        they were estimated; ``refit_recipe`` is not serialized.
         With standard errors, ``se_method`` and a ``vcov`` mapping of row
         ``labels`` and ``matrix`` are included when recorded. Unknown standard
         errors and covariances serialize as ``NaN``, which Python's ``json``
@@ -831,6 +1158,7 @@ class FitResult:
                 "n_factors": self.model.n_factors,
                 "item_names": list(self.model.item_names),
                 "n_categories": _category_counts(self.model),
+                **_model_structure(self.model),
             },
             **self.fit_statistics(),
         }
@@ -840,6 +1168,8 @@ class FitResult:
             }
             if self.latent_covariance is not None:
                 result["latent_covariance"] = self.latent_covariance.tolist()
+            if self.latent_mean is not None:
+                result["latent_mean"] = self.latent_mean.tolist()
         if include_standard_errors:
             result["standard_errors"] = {
                 name: values.tolist() for name, values in self.standard_errors.items()
@@ -878,11 +1208,15 @@ class FitResult:
         The payload must include parameters, so exports written with
         ``include_parameters=False`` cannot be reloaded. Models from the
         built-in ``fit_mirt`` families ("1PL", "2PL", "3PL", "4PL", "GRM",
-        "GPCM", "PCM", "NRM") are reconstructed and marked fitted, so the
-        result can be scored with :func:`mirt.fscores` directly. Omitted
-        standard errors are restored as unknown. Unknown fields, including
-        standard errors for parameters the model does not have, are rejected so
-        that misspelled input does not silently disappear. Parameters that the
+        "GPCM", "PCM", "NRM"), multidimensional ``fit_mirt(spec=...)`` 2PL
+        models ("MIRT"), ``bfactor`` models ("Bifactor") and mixed-format
+        models of those families ("Mixed") are reconstructed and marked
+        fitted, so the result can be scored with :func:`mirt.fscores`
+        directly. Free-parameter restrictions, such as ``fixed`` coordinates
+        or a confirmatory loading pattern, are restored. Omitted standard
+        errors are restored as unknown. Unknown fields, including standard
+        errors for parameters the model does not have, are rejected so that
+        misspelled input does not silently disappear. Parameters that the
         family fixes (1PL and PCM discriminations) must equal their fixed
         values.
 
@@ -894,14 +1228,16 @@ class FitResult:
         Returns
         -------
         FitResult
-            The reconstructed result. Free-parameter restrictions applied
-            with ``set_free_parameter_masks`` are not part of the payload.
+            The reconstructed result. Without a ``refit_recipe``, which is
+            not serialized, refits use the default estimator of the model
+            family.
 
         Raises
         ------
         MirtValidationError
             If the payload is malformed, incomplete, or describes a model that
-            cannot be rebuilt.
+            cannot be rebuilt, such as a custom item type or a mixed-format
+            model with a rating-scale component.
         """
         if not isinstance(payload, Mapping):
             raise _payload_error(
@@ -915,6 +1251,7 @@ class FitResult:
             "se_method",
             "vcov",
             "latent_covariance",
+            "latent_mean",
             *_FIT_STATISTIC_FIELDS,
         }
         unknown = set(payload) - allowed
@@ -976,6 +1313,7 @@ class FitResult:
             vcov=vcov,
             vcov_labels=vcov_labels,
             latent_covariance=payload.get("latent_covariance"),
+            latent_mean=payload.get("latent_mean"),
         )
 
     @classmethod

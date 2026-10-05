@@ -77,9 +77,10 @@ Data frames and missing responses
 ``fit_mirt`` and ``fit_multigroup`` also accept pandas and polars data frames.
 Unique column names become the item names unless ``item_names`` is given.
 ``NaN`` (R's ``NA``), pandas' ``pd.NA`` and polars nulls mark missing
-responses, as do negative codes. ``fscores``, ``ability_posterior`` and
-``personfit`` still require missing responses coded as negative numbers, so
-convert ``NaN`` before scoring:
+responses, as do negative codes. ``fscores``, ``ability_posterior``,
+``personfit``, ``itemfit``, ``compute_m2`` and the residual and local
+dependence diagnostics read the same data the same way, so a frame scores
+exactly like its ``-1``-coded array:
 
 .. code-block:: python
 
@@ -94,8 +95,9 @@ convert ``NaN`` before scoring:
    result = mirt.fit_mirt(frame, model="2PL")
    print(result.model.item_names)  # ['Q1', 'Q2', 'Q3', 'Q4', 'Q5']
 
+   scores = mirt.fscores(result, frame)
    coded = np.where(np.isnan(data), -1, data).astype(int)
-   scores = mirt.fscores(result, coded)
+   assert np.array_equal(scores.theta, mirt.fscores(result, coded).theta)
 
 Infinite, non-integer and text codes are rejected.
 
@@ -218,6 +220,10 @@ thresholds are excluded using the model's free parameter masks. Supply
 RSM, GRSM, explanatory item-feature models, and testlet models. A global array
 whose length happens to equal the item count still requires this explicit
 allocation. For externally known item parameters, supply one zero per item.
+For a fit with equality ``constraints``, pass the same ``constraints`` to
+``itemfit()``, ``compute_m2()`` and ``compute_fit_indices()``: a group of
+``k`` tied coordinates is one parameter, of which each of its items counts
+``1/k``, and M2 projects out one direction per group.
 Nonpositive degrees of freedom appear as ``df=0`` and ``p_value=NaN``; a
 remaining expected cell below the requested minimum also gives ``NaN``.
 An ordinal item whose maximum score exceeds the remaining test's maximum
@@ -265,11 +271,16 @@ Standardized and ability-grouped item fit
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``z_infit`` and ``z_outfit`` (items and persons) are Wilson-Hilferty
-standardized mean squares, approximately standard normal under the model.
-Their variances use the second and fourth central moments of each modeled
-score (Wright and Masters, 1982). ``compute_outfit_infit`` reports them with
-``include_standardized=True`` and follows the same mean-square rules as
-``itemfit()`` and ``personfit()``.
+standardized mean squares. Their variances use the second and fourth central
+moments of each modeled score (Wright and Masters, 1982). They are
+approximately standard normal only when the abilities are known or do not
+depend on the tested responses, for example ``theta=`` estimates from an
+independent calibration. With the default EAP abilities, item z statistics
+are strongly biased toward overfit (about half of well-fitting items fall
+below -1.96 on a 20-item test), so ``itemfit()`` warns and they are only
+descriptive; person z statistics are mildly conservative.
+``compute_outfit_infit`` reports them with ``include_standardized=True`` and
+follows the same mean-square rules as ``itemfit()`` and ``personfit()``.
 
 ``X2`` (Bock/Yen Q1) and ``G2`` group respondents into ``n_groups`` quantiles
 of their abilities (default 10) and compare category counts with the model at

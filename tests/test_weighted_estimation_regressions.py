@@ -434,3 +434,24 @@ def test_weighted_fit_matches_scalar_e_step(kind, backend):
             atol=1e-4,
             rtol=1e-3,
         )
+
+
+def test_weighted_fit_reports_its_standard_error_method():
+    responses = mirt.simdata("2PL", n_persons=200, n_items=4, seed=5)
+    weights = np.random.default_rng(5).uniform(0.5, 2.0, 200)
+    result = WeightedEMEstimator(max_iter=50).fit(
+        TwoParameterLogistic(4), responses, weights
+    )
+    assert result.se_method == "complete_data"
+    assert result.vcov is None
+    assert np.all(result.standard_errors["discrimination"] > 0)
+
+    estimator = WeightedEMEstimator(
+        max_iter=50, compute_standard_errors=False, item_optim_ftol=1e-9
+    )
+    assert estimator.item_optim_ftol == 1e-9
+    plain = estimator.fit(TwoParameterLogistic(4), responses, weights)
+    assert plain.standard_errors == {}
+    assert plain.se_method is None
+    with pytest.raises(mirt.MirtValidationError, match="compute_standard_errors"):
+        WeightedEMEstimator(compute_standard_errors="yes")

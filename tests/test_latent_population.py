@@ -130,6 +130,7 @@ class TestResolveLatentPrior:
 class TestItemFit:
     STATISTICS = ["S_X2", "infit", "outfit", "z_infit", "z_outfit"]
 
+    @pytest.mark.filterwarnings("ignore:z_infit and z_outfit with EAP")
     def test_fit_result_equals_explicit_covariance(self, correlated):
         data, result = correlated
         fitted = compute_itemfit(result, data, self.STATISTICS)

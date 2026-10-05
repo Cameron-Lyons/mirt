@@ -145,16 +145,19 @@ def resolve_latent_prior(
 ) -> LatentPrior:
     """Return the item model and the latent population a consumer assumes.
 
-    A ``FitResult`` supplies its estimated ``latent_covariance`` (for example
-    the factor correlations of a confirmatory fit) as the default
-    ``prior_cov``. Explicit arguments take precedence. A bare model, or a fit
-    without an estimated covariance, keeps the standard-normal default, so
-    every consumer integrates over the same population as ``fscores``.
-    Consumers validate the returned arrays.
+    A ``FitResult`` supplies its estimated ``latent_mean`` and
+    ``latent_covariance`` (for example the factor correlations of a
+    confirmatory fit, or the population of fixed-item calibration) as the
+    default ``prior_mean`` and ``prior_cov``. Explicit arguments take
+    precedence. A bare model, or a fit without an estimated population, keeps
+    the standard-normal default, so every consumer integrates over the same
+    population as ``fscores``. Consumers validate the returned arrays.
     """
     from mirt.results.fit_result import FitResult
 
     if isinstance(model_or_result, FitResult):
+        if prior_mean is None:
+            prior_mean = model_or_result.latent_mean
         if prior_cov is None:
             prior_cov = model_or_result.latent_covariance
         model = model_or_result.model

@@ -359,8 +359,10 @@ class MCEMEstimator(BaseEstimator):
         try:
             for iteration in range(self.max_iter):
                 self.n_samples = next_samples
-                theta_samples, weights, current_ll = self._e_step_and_marginal_ll(
-                    model, responses, prior_mean, cholesky, n_factors
+                theta_samples, weights, current_ll, sample_ll = (
+                    self._e_step_and_marginal_ll(
+                        model, responses, prior_mean, cholesky, n_factors
+                    )
                 )
                 self._convergence_history.append(current_ll)
                 self._sample_size_history.append(self.n_samples)
@@ -377,6 +379,7 @@ class MCEMEstimator(BaseEstimator):
                         weights,
                         free_parameters,
                         previous,
+                        current_values=sample_ll,
                     )
                     converged = self._monte_carlo_converged(change, error)
                     if change - _ASCENT_Z * error > 0.0:
@@ -388,6 +391,8 @@ class MCEMEstimator(BaseEstimator):
                         )
                     else:
                         stalled += 1
+                # The draws' likelihoods only serve the change estimate.
+                del sample_ll
 
                 if converged:
                     if self.verbose:
@@ -451,13 +456,20 @@ class MCEMEstimator(BaseEstimator):
         weights: NDArray[np.float64],
         free_parameters: FreeItemParameters,
         previous: NDArray[np.float64],
+        *,
+        current_values: NDArray[np.float64] | None = None,
     ) -> tuple[float, float]:
         """Estimate the log-likelihood gain over ``previous`` on the current draws.
 
-        Returns the estimated change from the previous iterate to the current
-        parameters and its Monte Carlo standard error.
+        ``current_values`` are the draws' log-likelihoods at the current
+        parameters when the E-step has already computed them. Returns the
+        estimated change from the previous iterate to the current parameters
+        and its Monte Carlo standard error.
         """
-        current_values = self._sample_log_likelihoods(model, responses, theta_samples)
+        if current_values is None:
+            current_values = self._sample_log_likelihoods(
+                model, responses, theta_samples
+            )
         current = free_parameters.get(model)
         if not free_parameters.set(model, previous):
             raise ValueError("the previous MCEM iterate is not a valid parameter set")
@@ -655,7 +667,7 @@ class MCEMEstimator(BaseEstimator):
             return self._draw_posterior_samples(
                 model, responses, prior_mean, L, n_factors
             )
-        samples, weights, _ = self._e_step_mc_state(
+        samples, weights, _, _ = self._e_step_mc_state(
             model, responses, prior_mean, L, n_factors
         )
         return samples, weights
@@ -667,12 +679,23 @@ class MCEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         L: NDArray[np.float64],
         n_factors: int,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        """Return draws, weights, and importance normalizers or posterior likelihoods."""
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return draws, weights, evidence and the draws' log-likelihoods.
+
+        The evidence is the importance normalizers, or the log-likelihoods
+        themselves for posterior draws. The log-likelihoods, of shape
+        ``(n_persons, n_samples)``, are at the current parameters.
+        """
         if not self.importance_sampling:
-            return self._draw_posterior_state(
+            samples, weights, log_likes = self._draw_posterior_state(
                 model, responses, prior_mean, L, n_factors
             )
+            return samples, weights, log_likes, log_likes
         n_persons = responses.shape[0]
         rng = self._random_generator()
         z = rng.standard_normal((n_persons, self.n_samples, n_factors))
@@ -681,7 +704,7 @@ class MCEMEstimator(BaseEstimator):
         del z
         log_likes = self._sample_log_likelihoods(model, responses, theta_samples)
         weights, log_normalizer = self._normalized_importance_weights(log_likes)
-        return theta_samples, weights, log_normalizer
+        return theta_samples, weights, log_normalizer, log_likes
 
     def _uses_default_sampling_methods(self, model: BaseItemModel) -> bool:
         """Reuse E-step evidence only when existing sampling hooks are unchanged."""
@@ -711,22 +734,29 @@ class MCEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         cholesky: NDArray[np.float64],
         n_factors: int,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
-        """Evaluate one E-step, reusing fresh evidence for ordinary fit reporting."""
+    ) -> tuple[
+        NDArray[np.float64], NDArray[np.float64], float, NDArray[np.float64] | None
+    ]:
+        """Evaluate one E-step, reusing fresh evidence for ordinary fit reporting.
+
+        Returns the draws, their weights, the marginal log-likelihood estimate
+        and the draws' log-likelihoods at the current parameters. The last is
+        None when custom sampling hooks may compute them differently.
+        """
         if not self._uses_default_sampling_methods(model):
             samples, weights = self._e_step_mc(
                 model, responses, prior_mean, cholesky, n_factors
             )
             marginal_ll = self._estimate_marginal_ll(model, responses, samples, weights)
-            return samples, weights, marginal_ll
-        samples, weights, evidence = self._e_step_mc_state(
+            return samples, weights, marginal_ll, None
+        samples, weights, evidence, log_likes = self._e_step_mc_state(
             model, responses, prior_mean, cholesky, n_factors
         )
         if self.importance_sampling:
             log_marginal = evidence.ravel() - np.log(self.n_samples)
         else:
             log_marginal = -(logsumexp(-evidence, axis=1) - np.log(self.n_samples))
-        return samples, weights, float(np.sum(log_marginal))
+        return samples, weights, float(np.sum(log_marginal)), log_likes
 
     def _estimate_marginal_ll(
         self,
@@ -1052,7 +1082,7 @@ class QMCEMEstimator(MCEMEstimator):
         n_factors: int,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """E-step using Quasi-Monte Carlo sampling."""
-        samples, weights, _ = self._e_step_mc_state(
+        samples, weights, _, _ = self._e_step_mc_state(
             model, responses, prior_mean, L, n_factors
         )
         return samples, weights
@@ -1064,8 +1094,13 @@ class QMCEMEstimator(MCEMEstimator):
         prior_mean: NDArray[np.float64],
         L: NDArray[np.float64],
         n_factors: int,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-        """Return shared QMC draws, weights, and their importance normalizers."""
+    ) -> tuple[
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+        NDArray[np.float64],
+    ]:
+        """Return shared QMC draws, weights, importance normalizers and likelihoods."""
         n_persons = responses.shape[0]
 
         if self.sequence == "sobol":
@@ -1098,7 +1133,7 @@ class QMCEMEstimator(MCEMEstimator):
             log_likes = self._sample_log_likelihoods(model, responses, theta_samples)
         weights, log_normalizer = self._normalized_importance_weights(log_likes)
 
-        return theta_samples, weights, log_normalizer
+        return theta_samples, weights, log_normalizer, log_likes
 
     def _sample_log_likelihoods(
         self,

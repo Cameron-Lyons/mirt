@@ -421,6 +421,20 @@ class MixedItemModel(PolytomousItemModel):
                 expected=valid,
             ) from None
 
+    @property
+    def _shared_parameters(self) -> frozenset[str]:
+        """Qualified parameters that a component shares across its items."""
+        return frozenset(
+            f"{prefix}{_SEPARATOR}{name}"
+            for prefix, model in zip(self._prefixes, self._models, strict=True)
+            for name in model._shared_parameters
+        )
+
+    def _item_indexed(self, name: str) -> bool:
+        """Whether a qualified parameter has one row per item of its component."""
+        component, local = self.parameter_component(name)
+        return self._models[component]._item_indexed(local)
+
     def parameter_items(self, name: str) -> NDArray[np.intp]:
         """Return the test positions of a qualified parameter's component items.
 
@@ -506,14 +520,17 @@ class MixedItemModel(PolytomousItemModel):
         Raises
         ------
         MirtModelError
-            If a component shares a parameter across its items.
+            If a component shares a parameter across its items, such as the
+            thresholds of a rating-scale component; use
+            ``FitResult.parameter_statistics()`` or the component's own
+            parameters instead.
         """
         source = self.parameters if values is None else values
         blocks: dict[str, list[tuple[NDArray[np.intp], NDArray[np.float64]]]] = {}
         for qualified, (component, local) in self._parameter_index.items():
             model, items = self._models[component], self._items[component]
             stored = model._parameters[local]
-            if stored.ndim not in (1, 2) or stored.shape[0] != model.n_items:
+            if stored.ndim not in (1, 2) or not model._item_indexed(local):
                 raise MirtModelError(
                     f"{qualified} is shared by the items of its component and "
                     "has no per-item value",

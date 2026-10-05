@@ -195,7 +195,7 @@ def test_eapsum_detects_direct_parameter_array_mutation():
         np.array([[0, 2, 0, 1]]),
         np.array([[0.0, 0.5, 0.0, 1.0]]),
         np.array([[0.0, -0.5, 0.0, 1.0]]),
-        np.array([[0.0, np.nan, 0.0, 1.0]]),
+        np.array([[0.0, np.inf, 0.0, 1.0]]),
     ],
 )
 def test_eapsum_rejects_invalid_response_codes(responses):

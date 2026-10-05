@@ -114,6 +114,43 @@ def test_affine_gradient_matches_public_clipped_likelihood(kind, item, epsilon):
 
 
 @pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
+def test_fixed_coordinates_keep_the_affine_objective(kind):
+    # A masked loading used to send the item to numerical differentiation.
+    model = _model(kind)
+    masks = model.free_parameter_masks
+    loadings = "slopes" if "slopes" in masks else "general_loadings"
+    row = masks[loadings].reshape(model.n_items, -1)[1]
+    row[np.flatnonzero(row)[0]] = False
+    model.set_free_parameter_masks(masks)
+    rng = np.random.default_rng(615)
+    theta = rng.normal(size=(29, model.n_factors)) * 3.0
+    observed = rng.uniform(0.0, 10.0, 29)
+    correct = observed * rng.random(29)
+    estimator = EMEstimator()
+    params, _, objective, analytic = estimator._item_objective(
+        model, 1, np.zeros((1, 3), dtype=int), None, theta, None, correct, observed
+    )
+    assert analytic
+    params = params + 0.1
+    actual, gradient = objective(params)
+    expected = _public_objective(model, 1, theta, observed, correct, 1e-10, params)
+    np.testing.assert_allclose(actual, expected, rtol=1e-13)
+    numerical = np.empty_like(params)
+    for coordinate in range(len(params)):
+        offset = np.zeros_like(params)
+        offset[coordinate] = 1e-5
+        numerical[coordinate] = (
+            _public_objective(
+                model, 1, theta, observed, correct, 1e-10, params + offset
+            )
+            - _public_objective(
+                model, 1, theta, observed, correct, 1e-10, params - offset
+            )
+        ) / 2e-5
+    np.testing.assert_allclose(gradient, numerical, rtol=3e-7, atol=2e-8)
+
+
+@pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
 def test_affine_clipped_tails_have_zero_gradient(kind):
     model = _model(kind)
     item = 0

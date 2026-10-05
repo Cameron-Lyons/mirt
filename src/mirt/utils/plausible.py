@@ -50,7 +50,8 @@ def generate_plausible_values(
     ----------
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
-        ``latent_covariance`` is then the default population covariance.
+        ``latent_mean`` and ``latent_covariance`` are then the default
+        population mean and covariance.
     responses : NDArray
         Response matrix (n_persons, n_items)
     n_plausible : int
@@ -81,7 +82,8 @@ def generate_plausible_values(
         Mean of the normal population (prior) distribution of theta, with
         shape ``(n_factors,)``, or ``(n_persons, n_factors)`` for
         person-specific conditioning means such as latent-regression
-        predictions. Defaults to zero.
+        predictions. Defaults to the ``latent_mean`` of a ``FitResult`` when
+        it has one, and to zero otherwise.
     prior_cov : array-like, optional
         Positive definite ``(n_factors, n_factors)`` population covariance.
         Defaults to the ``latent_covariance`` of a ``FitResult`` when it has

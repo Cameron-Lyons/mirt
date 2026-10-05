@@ -7,14 +7,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.estimation._graded_order import THRESHOLD_GAP
 from mirt.estimation.base import _parameter_bounds
 
 if TYPE_CHECKING:
     from mirt.estimation._shared_step import TiedCoordinates
     from mirt.models.base import BaseItemModel
-
-# Smallest gap the generic GRM M-step keeps between movable thresholds.
-_THRESHOLD_GAP = 1e-6
 
 
 def squarem_step_length(
@@ -155,5 +153,5 @@ def _keeps_threshold_order(
     current = np.diff(model.parameters["thresholds"], axis=1)
     proposed = np.diff(updates["thresholds"], axis=1)
     used = np.arange(current.shape[1]) < n_gaps[:, None]
-    required = np.minimum(_THRESHOLD_GAP, current)
+    required = np.minimum(THRESHOLD_GAP, current)
     return bool(np.all(proposed[used] >= required[used]))

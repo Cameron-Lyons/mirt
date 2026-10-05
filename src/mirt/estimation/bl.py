@@ -34,6 +34,18 @@ if TYPE_CHECKING:
 # tolerates a smaller step than second differences of the likelihood.
 _GRADIENT_STEP = 1e-5
 _LIKELIHOOD_STEP = 1e-4
+# Optimizer boxes by stored parameter name; other parameters get (-10, 10).
+_BL_BOUNDS = {
+    "discrimination": (0.1, 5.0),
+    "slopes": (0.1, 5.0),
+    "difficulty": (-6.0, 6.0),
+    "intercepts": (-6.0, 6.0),
+    "thresholds": (-6.0, 6.0),
+    "steps": (-6.0, 6.0),
+    "guessing": (0.0, 0.5),
+    "upper": (0.5, 1.0),
+    "asymmetry": (0.1, 5.0),
+}
 
 
 class BLEstimator(BaseEstimator):
@@ -62,11 +74,17 @@ class BLEstimator(BaseEstimator):
     Notes
     -----
     Standard errors invert the full Hessian of the marginal log-likelihood.
-    Built-in unidimensional and multidimensional item models compute it
-    exactly by Louis's identity; other models with analytic gradients
-    difference the gradient, and the remaining models difference the
-    likelihood. Coordinates on an optimizer bound are held fixed and receive
-    ``NaN`` standard errors. The covariance is stored in ``FitResult.vcov``.
+    Built-in item models whose likelihood is a product of item curves
+    (1PL-4PL, GRM, GPCM, PCM, NRM, RSM, GRSM, multidimensional, bifactor and
+    the other built-in families such as 5PL, log-log, nested-logit,
+    sequential, unfolding and zero-inflated models) compute it exactly by
+    Louis's identity, which differences at most each item's own curve.
+    Other models with analytic gradients difference the gradient, and the
+    remaining models, such as custom ones, difference the likelihood over
+    every pair of parameters, which takes 2P^2 + 1 likelihood evaluations
+    for P parameters. Coordinates on an optimizer bound are held fixed and
+    receive ``NaN`` standard errors. The covariance is stored in
+    ``FitResult.vcov``.
 
     The BL method directly maximizes:
 
@@ -276,18 +294,6 @@ class BLEstimator(BaseEstimator):
         bounds_list = []
         structure = {}
 
-        bounds_map = {
-            "discrimination": (0.1, 5.0),
-            "slopes": (0.1, 5.0),
-            "difficulty": (-6.0, 6.0),
-            "intercepts": (-6.0, 6.0),
-            "thresholds": (-6.0, 6.0),
-            "steps": (-6.0, 6.0),
-            "guessing": (0.0, 0.5),
-            "upper": (0.5, 1.0),
-            "asymmetry": (0.1, 5.0),
-        }
-
         idx = 0
         free_masks = model.free_parameter_masks
         for name, values in model.parameters.items():
@@ -311,13 +317,7 @@ class BLEstimator(BaseEstimator):
             }
 
             params_list.append(flat)
-
-            bound = (
-                (-5.0, 5.0)
-                if name == "slopes" and model.model_name == "NRM"
-                else bounds_map.get(name, (-10.0, 10.0))
-            )
-            bounds_list.extend([bound] * n_params)
+            bounds_list.extend([_bl_parameter_bounds(model, name)] * n_params)
 
             idx += n_params
 
@@ -392,11 +392,13 @@ class BLEstimator(BaseEstimator):
     ) -> NDArray[np.float64]:
         """Return the Hessian of the negative marginal log-likelihood.
 
-        Built-in item models on the estimator's own likelihood use the exact
-        Louis observed information, whichever optimizer produced ``params``.
-        Other analytic ``gradient`` objectives are differenced once per
-        coordinate, and the remaining models, or a caller-supplied
-        ``objective``, difference the likelihood over every coordinate pair.
+        Item models accepted by
+        :func:`~mirt.estimation._louis_information.supports_louis_information`
+        on the estimator's own likelihood use the exact Louis observed
+        information, whichever optimizer produced ``params``. Other analytic
+        ``gradient`` objectives are differenced once per coordinate, and the
+        remaining models, or a caller-supplied ``objective``, difference the
+        likelihood over every coordinate pair.
         """
         if objective is None:
             exact = self._exact_information(model, responses, params, structure)
@@ -516,6 +518,21 @@ class BLEstimator(BaseEstimator):
             bounds=bounds,
         )
         return self._unflatten_standard_errors(model, covariance, structure)
+
+
+def _bl_parameter_bounds(model: BaseItemModel, name: str) -> tuple[float, float]:
+    """Optimizer box of every free coordinate of a stored parameter.
+
+    Qualified parameters of a mixed-format model use their component's box.
+    """
+    from mirt.models.mixed_format import MixedItemModel
+
+    if isinstance(model, MixedItemModel):
+        component, local = model.parameter_component(name)
+        return _bl_parameter_bounds(model.component_models[component], local)
+    if name == "slopes" and model.model_name == "NRM":
+        return (-5.0, 5.0)
+    return _BL_BOUNDS.get(name, (-10.0, 10.0))
 
 
 def _uses_free_layout(model: BaseItemModel, structure: dict) -> bool:

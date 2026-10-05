@@ -12,7 +12,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import numpy as np
@@ -24,6 +24,7 @@ from mirt.utils._parallel import _process_pool, ensure_picklable, resolve_n_jobs
 from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
+    from mirt.estimation._refit import RefitRecipe
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -40,6 +41,8 @@ _TaskInput = TypeVar("_TaskInput")
 _TaskResult = TypeVar("_TaskResult")
 # Bootstrap-based diagnostics resolve their worker counts through this name.
 _validate_n_jobs = resolve_n_jobs
+# Convergence tolerance of parameter bootstrap replicates.
+_REPLICATE_TOL = 1e-3
 
 
 @dataclass(slots=True)
@@ -55,6 +58,105 @@ class _StatisticFitTask:
     resample_rng_state: dict[str, Any] | None = None
     n_resamples: int = 0
     statistic_shapes: dict[str, tuple[int, ...]] | None = None
+    recipe: RefitRecipe | None = None
+
+
+def _refit_source(
+    model_or_result: BaseItemModel | FitResult,
+) -> tuple[BaseItemModel, RefitRecipe | None]:
+    """Return the item model and the recipe its refits follow, if recorded.
+
+    A fit without a recipe, for example one rebuilt by ``FitResult.from_dict``,
+    is refitted by the default estimator of its model family; a warning says
+    so when that drops the fit's item priors or latent population.
+    """
+    from mirt.results.fit_result import FitResult
+
+    if not isinstance(model_or_result, FitResult):
+        return model_or_result, None
+    recipe = model_or_result.refit_recipe
+    if recipe is None and (
+        model_or_result.log_posterior is not None
+        or model_or_result.latent_mean is not None
+        or model_or_result.latent_covariance is not None
+    ):
+        warnings.warn(
+            "the fit records no refit settings, so refits use the default "
+            "estimator of its model family, without item priors and with "
+            "standard normal abilities",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return model_or_result.model, recipe
+
+
+def _uses_default_estimator(recipe: RefitRecipe | None) -> bool:
+    """Whether refits estimate what the native 2PL bootstrap estimates."""
+    from mirt.estimation.em import EMEstimator
+
+    return recipe is None or (
+        recipe.estimator is EMEstimator
+        and recipe.latent_density is None
+        and recipe.options.get("item_priors") is None
+        and not recipe.options.get("constraints")
+    )
+
+
+def _replicate_estimator(
+    model: BaseItemModel, recipe: RefitRecipe | None, max_iter: int
+) -> Any:
+    """Return the estimator of one parameter replicate.
+
+    Replicates keep the original fit's estimator and settings but use their
+    own iteration limit and tolerance, and skip standard errors, which no
+    bootstrap statistic uses.
+    """
+    from mirt.estimation._refit import em_estimator_for
+
+    return em_estimator_for(
+        model,
+        recipe=recipe,
+        max_iter=max_iter,
+        tol=_REPLICATE_TOL,
+        verbose=False,
+        compute_standard_errors=False,
+    )
+
+
+def _population_factors(
+    model_or_result: BaseItemModel | FitResult,
+) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
+    """Return the mean and Cholesky factor of a fit's latent population.
+
+    ``None`` entries mean the standard-normal default.
+    """
+    from mirt.results._common import resolve_latent_prior
+
+    _, mean, cov = resolve_latent_prior(model_or_result)
+    return (
+        None if mean is None else np.asarray(mean, dtype=np.float64),
+        None if cov is None else np.linalg.cholesky(np.asarray(cov, dtype=np.float64)),
+    )
+
+
+def _draw_abilities(
+    rng: np.random.Generator,
+    n_persons: int,
+    n_factors: int,
+    mean: NDArray[np.float64] | None,
+    cholesky: NDArray[np.float64] | None,
+) -> NDArray[np.float64]:
+    """Draw abilities from ``N(mean, cholesky @ cholesky.T)``.
+
+    The standard-normal draws are the same for every population, so seeded
+    simulations of a standard-normal population keep their random stream.
+    """
+    theta = rng.standard_normal((n_persons, n_factors))
+    if cholesky is not None:
+        theta = theta @ cholesky.T
+    if mean is not None:
+        theta += mean
+    return theta
 
 
 @dataclass(slots=True)
@@ -181,6 +283,9 @@ class _ParametricFitTask:
     max_iter: int
     n_persons: int
     rng_states: list[dict[str, Any]]
+    recipe: RefitRecipe | None = None
+    latent_mean: NDArray[np.float64] | None = None
+    latent_cholesky: NDArray[np.float64] | None = None
 
 
 def _validate_resample_count(n_bootstrap: int) -> None:
@@ -281,6 +386,7 @@ def _resample_fit_tasks(
     rng: np.random.Generator,
     n_resamples: int,
     n_jobs: int,
+    recipe: RefitRecipe | None = None,
 ) -> list[_StatisticFitTask]:
     """Build constant-size worker tasks for nonparametric resampling."""
     return [
@@ -293,6 +399,7 @@ def _resample_fit_tasks(
             statistic=statistic,
             resample_rng_state=rng_state,
             n_resamples=chunk_size,
+            recipe=recipe,
         )
         for rng_state, chunk_size in _resample_rng_chunks(
             rng,
@@ -390,8 +497,6 @@ def _iter_statistic_fits(
     task: _StatisticFitTask,
 ) -> Iterator[tuple[dict[str, NDArray[np.float64]] | None, str | None]]:
     """Yield fit results so jackknife statistics can be reduced immediately."""
-    from mirt.estimation.mixed_format_em import em_estimator_for
-
     for indices in _iter_sample_indices(task):
         fit_responses = task.responses[indices]
         boot_model = _prepare_bootstrap_model(
@@ -400,9 +505,7 @@ def _iter_statistic_fits(
             task.warm_start,
         )
         try:
-            estimator = em_estimator_for(
-                boot_model, max_iter=task.max_iter, tol=1e-3, verbose=False
-            )
+            estimator = _replicate_estimator(boot_model, task.recipe, task.max_iter)
             result = estimator.fit(boot_model, fit_responses)
 
             if task.statistic == "parameters":
@@ -413,7 +516,8 @@ def _iter_statistic_fits(
             elif task.statistic == "theta":
                 from mirt.scoring import fscores
 
-                scores = fscores(result.model, task.responses, method="EAP")
+                # Each replicate scores against its own estimated population.
+                scores = fscores(result, task.responses, method="EAP")
                 values_by_name = {
                     "theta": np.asarray(scores.theta, dtype=np.float64).copy()
                 }
@@ -522,9 +626,13 @@ def _fit_parametric_replicate(
     replicate_rng: np.random.Generator,
 ) -> tuple[dict[str, NDArray[np.float64]] | None, str | None]:
     """Simulate and fit one parametric-bootstrap replicate."""
-    from mirt.estimation.mixed_format_em import em_estimator_for
-
-    theta = replicate_rng.standard_normal((task.n_persons, task.model.n_factors))
+    theta = _draw_abilities(
+        replicate_rng,
+        task.n_persons,
+        task.model.n_factors,
+        task.latent_mean,
+        task.latent_cholesky,
+    )
     sim_data = draw_item_responses(task.model, theta, replicate_rng)
     boot_model = _prepare_bootstrap_model(
         task.model,
@@ -532,9 +640,7 @@ def _fit_parametric_replicate(
         task.warm_start,
     )
     try:
-        estimator = em_estimator_for(
-            boot_model, max_iter=task.max_iter, tol=1e-3, verbose=False
-        )
+        estimator = _replicate_estimator(boot_model, task.recipe, task.max_iter)
         result = estimator.fit(boot_model, sim_data)
         return (
             {
@@ -565,8 +671,14 @@ def _native_2pl_bootstrap_samples(
     n_bootstrap: int,
     seed: int | None,
     warm_start: bool,
+    recipe: RefitRecipe | None = None,
 ) -> dict[str, NDArray[np.float64]] | None:
-    """Return native parallel parameter samples for eligible 2PL models."""
+    """Return native parallel parameter samples for eligible 2PL models.
+
+    The native kernel fits plain marginal maximum likelihood under a standard
+    normal population, so fits with item priors, another latent density or
+    equality constraints are refitted by their own estimator instead.
+    """
     from mirt.backends.rust._helpers import rust_enabled
     from mirt.backends.rust.estimation import bootstrap_fit_2pl
     from mirt.models.dichotomous import TwoParameterLogistic
@@ -575,6 +687,7 @@ def _native_2pl_bootstrap_samples(
         not rust_enabled()
         or not isinstance(model, TwoParameterLogistic)
         or model.model_name != "2PL"
+        or not _uses_default_estimator(recipe)
     ):
         return None
     # The native kernel estimates every parameter, so fixed ones need EM.
@@ -589,7 +702,7 @@ def _native_2pl_bootstrap_samples(
     discrimination, difficulty = bootstrap_fit_2pl(
         responses,
         n_bootstrap=n_bootstrap,
-        n_quadpts=21,
+        n_quadpts=21 if recipe is None else recipe.options.get("n_quadpts", 21),
         max_iter=100 if warm_start else 200,
         tol=1e-3,
         seed=native_seed,
@@ -628,7 +741,9 @@ def bootstrap_se(
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted model or fit result
+        Fitted model or fit result. Replicates of a ``FitResult`` are refitted
+        like the original fit (see Notes); a bare model is refitted by the
+        default EM estimator of its family.
     responses : NDArray
         Response matrix (n_persons, n_items)
     n_bootstrap : int
@@ -660,16 +775,23 @@ def bootstrap_se(
 
     Notes
     -----
-    Parameter bootstraps for unidimensional 2PL models use the native parallel
-    implementation when that backend is enabled. Other models and statistics
-    retain the general Python implementation. Parallel custom models and
-    statistic callables must be picklable; define them at module scope. Seeded
-    results are deterministic and retain input order across worker counts.
-    """
-    from mirt.results.fit_result import FitResult
+    Each replicate of a ``FitResult`` is refitted by the estimator that
+    produced the fit (``FitResult.refit_recipe``), with the same item priors,
+    latent density, equality constraints and quadrature, so the replicates
+    estimate the same quantities as the original fit; for example, a
+    ``bfactor`` fit is refitted by ``BifactorEMEstimator`` and a Bayes modal
+    fit keeps its priors. Replicates use their own iteration limit and a
+    tolerance of 1e-3 and skip standard errors. ``statistic='theta'`` scores
+    with each replicate's estimated latent population.
 
-    if isinstance(model, FitResult):
-        model = model.model
+    Parameter bootstraps for unidimensional 2PL models fitted by plain
+    marginal maximum likelihood use the native parallel implementation when
+    that backend is enabled. Other models and statistics retain the general
+    Python implementation. Parallel custom models and statistic callables
+    must be picklable; define them at module scope. Seeded results are
+    deterministic and retain input order across worker counts.
+    """
+    model, recipe = _refit_source(model)
 
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
@@ -678,7 +800,7 @@ def bootstrap_se(
     responses = validate_responses(responses, n_items=model.n_items)
     if statistic == "parameters":
         native_samples = _native_2pl_bootstrap_samples(
-            model, responses, n_bootstrap, seed, warm_start
+            model, responses, n_bootstrap, seed, warm_start, recipe
         )
         if native_samples is not None:
             return {
@@ -703,6 +825,7 @@ def bootstrap_se(
         rng,
         n_bootstrap,
         n_jobs,
+        recipe,
     )
     chunk_results = _run_bootstrap_tasks(
         _fit_statistic_task,
@@ -753,7 +876,8 @@ def bootstrap_ci(
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted model or fit result
+        Fitted model or fit result. Replicates of a ``FitResult`` are refitted
+        like the original fit, as in :func:`bootstrap_se`.
     responses : NDArray
         Response matrix
     n_bootstrap : int
@@ -789,23 +913,23 @@ def bootstrap_ci(
 
     Notes
     -----
-    Parameter bootstraps for unidimensional 2PL models use the native parallel
-    implementation when that backend is enabled. Other models and statistics
-    retain the general Python implementation. Parallel custom models and
-    statistic callables must be picklable; define them at module scope. Seeded
-    results are deterministic and retain input order across worker counts.
+    Bootstrap and jackknife fits of a ``FitResult`` use the estimator, item
+    priors, latent density, equality constraints and quadrature of the
+    original fit (see :func:`bootstrap_se`), and skip standard errors.
+    Parameter bootstraps for unidimensional 2PL models fitted by plain
+    marginal maximum likelihood use the native parallel implementation when
+    that backend is enabled. Other models and statistics retain the general
+    Python implementation. Parallel custom models and statistic callables
+    must be picklable; define them at module scope. Seeded results are
+    deterministic and retain input order across worker counts.
     BCa acceleration uses the full leave-one-person-out jackknife. It requires
     one additional fit per person; process workers share those fits. Jackknife
     samples are generated lazily, and workers reduce jackknife statistics into
     fixed-size central moments. The jackknife uses storage proportional to
     workers times statistic size, including when scoring every person's theta.
     """
-    from mirt.results.fit_result import FitResult
-
-    if isinstance(model, FitResult):
-        original_model = model.model
-    else:
-        original_model = model
+    source = model
+    original_model, recipe = _refit_source(model)
 
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
@@ -827,7 +951,7 @@ def bootstrap_ci(
     elif statistic == "theta":
         from mirt.scoring import fscores
 
-        scores = fscores(original_model, responses, method="EAP")
+        scores = fscores(source, responses, method="EAP")
         original_estimates["theta"] = np.asarray(scores.theta, dtype=np.float64)
     elif callable(statistic):
         original_estimates = _as_statistic_mapping(statistic(original_model, responses))
@@ -843,7 +967,7 @@ def bootstrap_ci(
     native_samples = None
     if statistic == "parameters":
         native_samples = _native_2pl_bootstrap_samples(
-            original_model, responses, n_bootstrap, seed, warm_start
+            original_model, responses, n_bootstrap, seed, warm_start, recipe
         )
     if native_samples is not None:
         for name, samples in native_samples.items():
@@ -863,6 +987,7 @@ def bootstrap_ci(
             rng,
             n_bootstrap,
             n_jobs,
+            recipe,
         )
         chunk_results = _run_bootstrap_tasks(
             _fit_statistic_task,
@@ -905,6 +1030,7 @@ def bootstrap_ci(
                 statistic_shapes={
                     name: values.shape for name, values in original_estimates.items()
                 },
+                recipe=recipe,
             )
             for index_chunk in _chunk_values(list(range(n_persons)), n_jobs)
         ]
@@ -990,7 +1116,9 @@ def parametric_bootstrap(
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted model
+        Fitted model. Abilities are drawn from the latent population of a
+        ``FitResult`` (``latent_mean`` and ``latent_covariance``) and from
+        the standard normal for a bare model.
     n_bootstrap : int
         Number of bootstrap samples
     n_persons : int, optional
@@ -1016,13 +1144,14 @@ def parametric_bootstrap(
 
     Notes
     -----
-    Seeded simulations are deterministic and retain replicate order across
-    worker counts.
+    Replicates of a ``FitResult`` are refitted like the original fit, with
+    its estimator, item priors, latent density, equality constraints and
+    quadrature (see :func:`bootstrap_se`), and skip standard errors. Seeded
+    simulations are deterministic and retain replicate order across worker
+    counts.
     """
-    from mirt.results.fit_result import FitResult
-
-    if isinstance(model, FitResult):
-        model = model.model
+    latent_mean, latent_cholesky = _population_factors(model)
+    model, recipe = _refit_source(model)
 
     _validate_resample_count(n_bootstrap)
     n_jobs = resolve_n_jobs(n_jobs)
@@ -1052,6 +1181,9 @@ def parametric_bootstrap(
         max_iter=max_iter,
         n_persons=int(n_persons),
         rng_states=[],
+        recipe=recipe,
+        latent_mean=latent_mean,
+        latent_cholesky=latent_cholesky,
     )
     if n_jobs == 1:
         replicate_results = [
@@ -1064,14 +1196,7 @@ def parametric_bootstrap(
             rng.standard_normal((n_persons, model.n_factors))
             rng.random((n_persons, model.n_items))
         replicate_tasks = [
-            _ParametricFitTask(
-                model=model,
-                original_params=original_params,
-                warm_start=warm_start,
-                max_iter=max_iter,
-                n_persons=int(n_persons),
-                rng_states=state_chunk,
-            )
+            replace(task_context, rng_states=state_chunk)
             for state_chunk in _chunk_values(replicate_rng_states, n_jobs)
         ]
         chunk_results = _run_bootstrap_tasks(
@@ -1154,6 +1279,10 @@ class _LRFitTask:
     warm_start: bool
     estimator_options: dict[str, Any]
     seeds: list[np.random.SeedSequence]
+    reduced_recipe: RefitRecipe | None = None
+    full_recipe: RefitRecipe | None = None
+    latent_mean: NDArray[np.float64] | None = None
+    latent_cholesky: NDArray[np.float64] | None = None
 
 
 def _refit_log_likelihood(
@@ -1161,16 +1290,42 @@ def _refit_log_likelihood(
     responses: NDArray[np.int_],
     warm_start: bool,
     estimator_options: Mapping[str, Any],
-) -> tuple[float, BaseItemModel]:
-    """Refit a model copy from its current estimates and return its LL."""
-    from mirt.estimation.mixed_format_em import em_estimator_for
+    recipe: RefitRecipe | None = None,
+) -> FitResult:
+    """Refit a model copy from its current estimates.
+
+    Raises
+    ------
+    ArithmeticError
+        If the refit has a non-finite log-likelihood.
+    """
+    from mirt.estimation._refit import em_estimator_for
 
     start = _prepare_bootstrap_model(model, model.parameters, warm_start)
-    result = em_estimator_for(start, **estimator_options).fit(start, responses)
-    log_likelihood = float(result.log_likelihood)
-    if not np.isfinite(log_likelihood):
+    estimator = em_estimator_for(start, recipe=recipe, **estimator_options)
+    result = estimator.fit(start, responses)
+    if not np.isfinite(result.log_likelihood):
         raise ArithmeticError("fit returned a non-finite log-likelihood")
-    return log_likelihood, result.model
+    return result
+
+
+def _free_parameter_count(
+    model_or_result: BaseItemModel | FitResult, recipe: RefitRecipe | None
+) -> int:
+    """Return the number of parameters that refits estimate.
+
+    A fit refitted with its recipe counts what its estimator counted:
+    estimated latent (co)variances, and each equality-constraint group once.
+    Otherwise refits use the default estimator, which estimates the model's
+    free item parameters.
+    """
+    from mirt.results.fit_result import FitResult
+
+    if isinstance(model_or_result, FitResult):
+        if recipe is not None:
+            return model_or_result.n_parameters
+        return model_or_result.model.n_parameters
+    return model_or_result.n_parameters
 
 
 def _fit_lr_task(task: _LRFitTask) -> list[tuple[float, str | None]]:
@@ -1179,16 +1334,30 @@ def _fit_lr_task(task: _LRFitTask) -> list[tuple[float, str | None]]:
     outcomes: list[tuple[float, str | None]] = []
     for seed in task.seeds:
         rng = np.random.default_rng(seed)
-        theta = rng.standard_normal((n_persons, task.reduced.n_factors))
+        theta = _draw_abilities(
+            rng,
+            n_persons,
+            task.reduced.n_factors,
+            task.latent_mean,
+            task.latent_cholesky,
+        )
         simulated = draw_item_responses(task.reduced, theta, rng)
         simulated[task.missing] = -1
         try:
-            reduced_ll, _ = _refit_log_likelihood(
-                task.reduced, simulated, task.warm_start, task.estimator_options
-            )
-            full_ll, _ = _refit_log_likelihood(
-                task.full, simulated, task.warm_start, task.estimator_options
-            )
+            reduced_ll = _refit_log_likelihood(
+                task.reduced,
+                simulated,
+                task.warm_start,
+                task.estimator_options,
+                task.reduced_recipe,
+            ).log_likelihood
+            full_ll = _refit_log_likelihood(
+                task.full,
+                simulated,
+                task.warm_start,
+                task.estimator_options,
+                task.full_recipe,
+            ).log_likelihood
         except _BOOTSTRAP_EXCEPTIONS as exc:
             outcomes.append((np.nan, f"{type(exc).__name__}: {exc}"))
             continue
@@ -1223,7 +1392,11 @@ def bootstrap_lr(
     reduced : BaseItemModel or FitResult
         Fitted model of the null hypothesis.
     full : BaseItemModel or FitResult
-        Fitted model that nests ``reduced`` and has more free parameters.
+        Fitted model that nests ``reduced`` and has more free parameters. The
+        parameter count of a ``FitResult`` with a ``refit_recipe``
+        (``n_parameters``) includes its estimated latent (co)variances and
+        counts each equality-constraint group once; a bare model, or a fit
+        without a recipe, counts its model's free item parameters.
     responses : ndarray of shape (n_persons, n_items)
         Observed responses used to fit both models. Negative codes are
         missing.
@@ -1232,7 +1405,8 @@ def bootstrap_lr(
     seed : int, optional
         Random seed for reproducible simulations.
     n_quadpts : int, default=21
-        Quadrature points per latent dimension for every refit.
+        Quadrature points per latent dimension for every refit (per dimension
+        of the two-dimensional grids of a bifactor fit).
     tol : float, default=1e-5
         EM convergence tolerance for every refit. Statistics near zero need
         tighter tolerances than parameter bootstraps.
@@ -1257,14 +1431,16 @@ def bootstrap_lr(
     supplied estimates, with exactly the estimator settings used for the
     replicates. The observed statistic comes from these refits rather than
     from the supplied fits, so differing quadrature or tolerance settings
-    cannot bias the comparison. Each replicate draws standard normal
-    abilities for every person, simulates responses from the refitted
-    reduced model, applies the observed missing-data pattern, and refits both
-    models. Every fit uses the default EM estimator of its model family,
-    including any built-in regularization such as the native 3PL guessing
-    prior, so observed and replicate statistics are computed alike.
-    Replicates that fail to fit are excluded and counted in ``n_failed``.
-    Seeded results are identical for every worker count.
+    cannot bias the comparison. Each replicate draws every person's
+    abilities from the latent population of the refitted reduced model
+    (standard normal unless it estimates a mean or covariance), simulates
+    responses from that model, applies the observed missing-data pattern,
+    and refits both models. A ``FitResult`` is refitted by the estimator that
+    produced it, with its item priors, latent density and equality
+    constraints (see :func:`bootstrap_se`), and a bare model by the default
+    EM estimator of its model family, so observed and replicate statistics
+    are computed alike. Replicates that fail to fit are excluded and counted
+    in ``n_failed``. Seeded results are identical for every worker count.
 
     Examples
     --------
@@ -1282,15 +1458,17 @@ def bootstrap_lr(
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
-    reduced_model = reduced.model if isinstance(reduced, FitResult) else reduced
-    full_model = full.model if isinstance(full, FitResult) else full
-    for name, candidate in (("reduced", reduced_model), ("full", full_model)):
+    for name, candidate in (("reduced", reduced), ("full", full)):
+        if isinstance(candidate, FitResult):
+            candidate = candidate.model
         if not isinstance(candidate, BaseItemModel):
             raise MirtValidationError(
                 f"{name} must be an item model or a FitResult wrapping one",
                 parameter=name,
                 value=type(candidate).__name__,
             )
+    reduced_model, reduced_recipe = _refit_source(reduced)
+    full_model, full_recipe = _refit_source(full)
     _validate_resample_count(n_bootstrap)
     n_jobs = resolve_n_jobs(n_jobs)
     if reduced_model.n_items != full_model.n_items:
@@ -1300,13 +1478,15 @@ def bootstrap_lr(
             value=full_model.n_items,
             expected=str(reduced_model.n_items),
         )
-    df = full_model.n_parameters - reduced_model.n_parameters
+    reduced_count = _free_parameter_count(reduced, reduced_recipe)
+    full_count = _free_parameter_count(full, full_recipe)
+    df = full_count - reduced_count
     if df < 1:
         raise MirtValidationError(
             "the full model must have more free parameters than the reduced model",
             parameter="full",
-            value=full_model.n_parameters,
-            expected=f"> {reduced_model.n_parameters}",
+            value=full_count,
+            expected=f"> {reduced_count}",
         )
     responses = validate_responses(responses, n_items=reduced_model.n_items)
     estimator_options: dict[str, Any] = {
@@ -1318,23 +1498,34 @@ def bootstrap_lr(
     }
     EMEstimator(**estimator_options)  # Validate settings before any fitting.
 
-    reduced_ll, reduced_refit = _refit_log_likelihood(
-        reduced_model, responses, reduced_model.is_fitted, estimator_options
+    reduced_refit = _refit_log_likelihood(
+        reduced_model,
+        responses,
+        reduced_model.is_fitted,
+        estimator_options,
+        reduced_recipe,
     )
-    full_ll, full_refit = _refit_log_likelihood(
-        full_model, responses, full_model.is_fitted, estimator_options
+    full_refit = _refit_log_likelihood(
+        full_model, responses, full_model.is_fitted, estimator_options, full_recipe
     )
+    reduced_ll = float(reduced_refit.log_likelihood)
+    full_ll = float(full_refit.log_likelihood)
     statistic = max(0.0, 2.0 * (full_ll - reduced_ll))
+    latent_mean, latent_cholesky = _population_factors(reduced_refit)
 
     seeds = np.random.SeedSequence(seed).spawn(n_bootstrap)
     tasks = [
         _LRFitTask(
-            reduced=reduced_refit,
-            full=full_refit,
+            reduced=reduced_refit.model,
+            full=full_refit.model,
             missing=responses < 0,
             warm_start=warm_start,
             estimator_options=estimator_options,
             seeds=seed_chunk,
+            reduced_recipe=reduced_recipe,
+            full_recipe=full_recipe,
+            latent_mean=latent_mean,
+            latent_cholesky=latent_cholesky,
         )
         for seed_chunk in _chunk_values(seeds, n_jobs)
     ]

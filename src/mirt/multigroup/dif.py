@@ -15,7 +15,7 @@ import copy
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import numpy as np
 from numpy.typing import NDArray
@@ -23,11 +23,15 @@ from scipy import stats
 
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
 from mirt.multigroup.estimator import MultigroupEMEstimator
-from mirt.multigroup.invariance import InvarianceSpec
+from mirt.multigroup.invariance import (
+    DISCRIMINATION_PARAMS,
+    INTERCEPT_PARAMS,
+    InvarianceSpec,
+)
 from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
 
 if TYPE_CHECKING:
@@ -40,8 +44,12 @@ DIFScheme = Literal["drop", "add", "drop_sequential", "add_sequential"]
 DIFParameterFamily = Literal["discrimination", "intercepts"]
 AnchorSelectionMethod = Literal["aoaa_iterative", "rank"]
 
-_SCHEMES = ("drop", "add", "drop_sequential", "add_sequential")
-_PARAMETER_FAMILIES = ("discrimination", "intercepts")
+DIF_SCHEMES: tuple[str, ...] = get_args(DIFScheme)
+_PARAMETER_FAMILIES: tuple[str, ...] = get_args(DIFParameterFamily)
+_FAMILY_PARAMETERS = {
+    "discrimination": DISCRIMINATION_PARAMS,
+    "intercepts": INTERCEPT_PARAMS,
+}
 _FIT_EXCEPTIONS = (
     ValueError,
     RuntimeError,
@@ -141,13 +149,13 @@ def multigroup_dif(
     anchors: Sequence[int | str] | None = None,
     scheme: DIFScheme = "drop",
     parameters: Sequence[DIFParameterFamily] = ("discrimination", "intercepts"),
-    p_adjust: PValueAdjustment = "holm",
+    p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
 ) -> Any:
@@ -185,16 +193,20 @@ def multigroup_dif(
     parameters : sequence of {"discrimination", "intercepts"}
         Parameter families tested for each studied item. ``"intercepts"``
         covers difficulties, thresholds and step parameters.
-    p_adjust : {"holm", "bonferroni", "fdr_bh", "none"}
+    p_adjust : {"none", "holm", "bonferroni", "fdr_bh"}
         Multiple-testing adjustment over the items tested in each round.
+        Default ``"none"``, as in :func:`mirt.dif` and R's ``mirt::DIF``.
     alpha : float
         Significance level for flagging and sequential decisions.
     n_categories : int or sequence of int, optional
         Category counts for polytomous items.
     n_quadpts, max_iter, tol : int, int, float
         EM settings for every fit.
-    reference_group : int or str
-        Reference group index, or label matched against ``str(label)``.
+    reference_group : int or str, optional
+        Reference group index, or label matched against ``str(label)``. An
+        integer that is also the label of another group raises
+        ``ValueError``; pass such a label as a string. Defaults to the first
+        group in sorted order.
     max_rounds : int
         Maximum rounds of the sequential schemes.
     n_jobs : int
@@ -213,11 +225,23 @@ def multigroup_dif(
         Sequential schemes report each item's test from the last round in
         which it was tested. Failed refits give ``NaN`` statistics.
 
+    Raises
+    ------
+    ValueError
+        If an option is invalid, or if ``parameters`` has no free
+        coordinate in any studied item, as with ``"discrimination"`` for a
+        1PL model. Studied items without one are tested with ``df=0`` and
+        ``NaN`` p-values after a ``UserWarning``.
+
     Notes
     -----
     A drop analysis needs one baseline fit plus one refit per studied item;
     sequential schemes repeat this for each round. Refits are warm-started
-    from the baseline estimates. :func:`mirt.diagnostics.compute_grdif`
+    from the baseline estimates and run in ``n_jobs`` worker processes.
+    Built-in 1PL and 2PL items take batched Newton M-steps, so a drop
+    analysis of 30 binary items with 1,000 persons per group takes one to
+    two seconds; 3PL and polytomous items take an itemwise optimizer and are
+    several times slower per item. :func:`mirt.diagnostics.compute_grdif`
     offers a faster residual-based screen that does not refit models.
 
     References
@@ -234,7 +258,7 @@ def multigroup_dif(
     >>> from mirt.multigroup import multigroup_dif
     >>> table = multigroup_dif(data, groups, model="2PL", scheme="drop")
     """
-    table = _run_multigroup_dif(
+    table = run_multigroup_dif(
         data,
         groups,
         model,
@@ -263,13 +287,13 @@ def select_dif_anchors(
     method: AnchorSelectionMethod = "aoaa_iterative",
     n_anchors: int | None = 4,
     parameters: Sequence[DIFParameterFamily] = ("discrimination", "intercepts"),
-    p_adjust: PValueAdjustment = "holm",
+    p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
 ) -> list[int]:
@@ -313,7 +337,7 @@ def select_dif_anchors(
     ):
         raise ValueError("n_anchors must be a positive integer or None")
 
-    table = _run_multigroup_dif(
+    table = run_multigroup_dif(
         data,
         groups,
         model,
@@ -339,7 +363,7 @@ def select_dif_anchors(
     return sorted(row.item for row in selected)
 
 
-def _run_multigroup_dif(
+def run_multigroup_dif(
     data: NDArray[np.int_] | Any,
     groups: NDArray[Any],
     model: str = "2PL",
@@ -348,27 +372,28 @@ def _run_multigroup_dif(
     anchors: Sequence[int | str] | None = None,
     scheme: DIFScheme = "drop",
     parameters: Sequence[DIFParameterFamily] = ("discrimination", "intercepts"),
-    p_adjust: PValueAdjustment = "holm",
+    p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
     n_quadpts: int = 21,
     max_iter: int = 500,
     tol: float = 1e-4,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
 ) -> _DIFTestTable:
     """Run :func:`multigroup_dif` and return rows with group parameters.
 
-    The per-item ``group_parameters`` come from the model in which the
-    studied item is free, ordered like ``group_labels``.
+    This is the entry point of :func:`mirt.diagnostics.compute_dif`. The
+    per-item ``group_parameters`` come from the model in which the studied
+    item is free, ordered like ``group_labels``.
     """
     from mirt.multigroup import _prepare_multigroup
 
-    if scheme not in _SCHEMES:
-        raise ValueError(f"scheme must be one of: {', '.join(_SCHEMES)}")
+    if scheme not in DIF_SCHEMES:
+        raise ValueError(f"scheme must be one of: {', '.join(DIF_SCHEMES)}")
     families = _validate_parameter_families(parameters)
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     if (
         isinstance(alpha, (bool, np.bool_))
         or not isinstance(alpha, (int, float, np.integer, np.floating))
@@ -399,8 +424,8 @@ def _run_multigroup_dif(
         raise ValueError("reference_group must be a valid group index or label")
     n_items = start_model.n_items
     item_names = list(start_model.item_names)
-    anchor_set = _resolve_items(anchors, item_names, "anchors") or []
-    tested = _resolve_items(items, item_names, "items")
+    anchor_set = resolve_items(anchors, item_names, "anchors") or []
+    tested = resolve_items(items, item_names, "items")
     if tested is None:
         tested = [item for item in range(n_items) if item not in anchor_set]
     if not tested:
@@ -411,6 +436,7 @@ def _run_multigroup_dif(
     adding = scheme.startswith("add")
     if adding and not anchor_set:
         raise ValueError(f"scheme={scheme!r} requires at least one anchor item")
+    _check_testable(start_model, int(ref_idx), tested, families, model)
 
     settings = _FitSettings(
         n_quadpts=n_quadpts,
@@ -531,6 +557,37 @@ def _run_rounds(
             stacklevel=4,
         )
     return rows
+
+
+def _check_testable(
+    model: MultigroupModel,
+    reference: int,
+    tested: list[int],
+    families: tuple[str, ...],
+    name: Any,
+) -> None:
+    """Reject tests that free nothing, and warn about items that free nothing."""
+    masks = model.effective_free_parameter_masks(reference)
+    free = np.zeros(model.n_items, dtype=np.bool_)
+    for family in families:
+        for parameter in _FAMILY_PARAMETERS[family] & masks.keys():
+            mask = masks[parameter]
+            if mask.ndim and mask.shape[0] == model.n_items:
+                free |= mask.reshape(model.n_items, -1).any(axis=1)
+    untestable = [item for item in tested if not free[item]]
+    if len(untestable) == len(tested):
+        raise ValueError(
+            f"parameters {list(families)} have no free coordinates in the tested "
+            f"items of model {name!r}; nothing to test"
+        )
+    if untestable:
+        warnings.warn(
+            f"parameters {list(families)} have no free coordinates in items "
+            f"{[model.item_names[item] for item in untestable]}; their tests "
+            "have df=0 and NaN p-values",
+            UserWarning,
+            stacklevel=4,
+        )
 
 
 def _fit(
@@ -657,12 +714,15 @@ def _validate_parameter_families(
     return values
 
 
-def _resolve_items(
+def resolve_items(
     values: Sequence[int | str] | None,
     item_names: list[str],
     name: str,
 ) -> list[int] | None:
-    """Resolve item indices or names into unique in-range indices."""
+    """Resolve item indices or names into unique in-range indices.
+
+    ``None`` passes through. Shared with :func:`mirt.diagnostics.compute_dif`.
+    """
     if values is None:
         return None
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):

@@ -12,11 +12,12 @@ from scipy.special import chdtrc
 
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
 from mirt.exceptions import MirtValidationError
 from mirt.typing import ItemFitStatistic
+from mirt.utils.data import _missing_coded_responses
 from mirt.utils.numeric import (
     _FitStatsAccumulator,
     _fourth_central_moment,
@@ -24,6 +25,7 @@ from mirt.utils.numeric import (
 )
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityConstraints
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -33,13 +35,14 @@ _SPARSE_RELATIVE_TOLERANCE = 1e-10
 _ITEMFIT_TARGET_CHUNK_ELEMENTS = 262_144
 _ITEMFIT_STATISTICS: tuple[str, ...] = get_args(ItemFitStatistic)
 _MEAN_SQUARE_STATISTICS = frozenset({"infit", "outfit", "z_infit", "z_outfit"})
+_STANDARDIZED_STATISTICS = frozenset({"z_infit", "z_outfit"})
 _BINNED_STATISTICS = ("X2", "G2", "PV_Q1")
 _DEFAULT_THETA_GROUPS = 10
 
 
 def compute_itemfit(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_] | None = None,
+    responses: ArrayLike | None = None,
     statistics: Sequence[str] | str | None = None,
     theta: NDArray[np.float64] | None = None,
     n_groups: int | None = None,
@@ -55,6 +58,7 @@ def compute_itemfit(
     seed: int | None = None,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute mean-square, theta-binned and Orlando-Thissen S-X2 item fit.
 
@@ -63,9 +67,9 @@ def compute_itemfit(
     model : BaseItemModel or FitResult
         Fitted item response model, or the ``FitResult`` of a fit, whose
         estimated ``latent_covariance`` then defines the latent population.
-    responses : ndarray of shape (n_persons, n_items)
-        Integer category codes. Negative codes and NaN denote missing
-        responses.
+    responses : array-like of shape (n_persons, n_items)
+        Integer category codes. Negative codes, ``NaN`` and the nulls of
+        nullable DataFrame columns denote missing responses.
     statistics : list of str, optional
         Any of ``"infit"``, ``"outfit"``, ``"z_infit"``, ``"z_outfit"``,
         ``"S_X2"``, ``"X2"``, ``"G2"`` and ``"PV_Q1"``. Defaults to
@@ -73,7 +77,8 @@ def compute_itemfit(
         :class:`~mirt.exceptions.MirtValidationError`.
     theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
         Person abilities for the mean-square and X2/G2 statistics. EAP scores
-        are computed when omitted.
+        are computed when omitted, which biases ``z_infit`` and ``z_outfit``
+        (see Notes).
     n_groups : int, optional
         Number of ability groups for X2, G2 and PV_Q1 (default 10). It is
         deprecated for S-X2, which conditions on exact total scores.
@@ -100,6 +105,12 @@ def compute_itemfit(
         Covariance of the normal latent population. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to the
         identity otherwise.
+    constraints : sequence, optional
+        Equality constraints of the fit, in any form that
+        ``fit_mirt(constraints=...)`` accepts. A group of tied coordinates is
+        one estimated parameter, so each of its ``k`` items counts ``1/k`` of
+        it in the S-X2, X2, G2 and PV_Q1 degrees of freedom. Ignored when
+        ``item_parameter_counts`` is given.
 
     Returns
     -------
@@ -115,7 +126,16 @@ def compute_itemfit(
     Wilson-Hilferty standardizations, ``(MS^(1/3) - 1)(3/q) + q/3``, with the
     mean-square variance ``q^2`` taken from the second and fourth central
     moments of each modeled score (Wright & Masters, 1982). They are
-    approximately standard normal under the model.
+    approximately standard normal under the model only when ``theta`` holds
+    the true abilities or estimates that do not depend on these responses.
+    The EAP abilities that replace an omitted ``theta`` shrink toward the
+    mean and adapt to each person's own responses, so every item appears to
+    overfit: in a correctly specified 20-item 2PL with 1,000 persons,
+    ``z_infit`` averages about -1.9 and about half of the items fall below
+    -1.96. A ``UserWarning`` flags this case, in which the z statistics are
+    only descriptive. One plausible-value draw per person
+    (:func:`mirt.generate_plausible_values`) as ``theta`` centers them near
+    zero, but they stay conservative (standard deviation about 0.5).
 
     S-X2 compares observed category counts with model-implied counts
     conditional on the *exact total score*, integrating over the latent
@@ -168,13 +188,13 @@ def compute_itemfit(
     from mirt.results._common import resolve_latent_prior
 
     model, prior_mean, prior_cov = resolve_latent_prior(model, prior_mean, prior_cov)
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     requested = _validate_statistics(
         statistics, _ITEMFIT_STATISTICS, default=("infit", "outfit")
     )
     if responses is None:
         raise ValueError("responses required for item fit statistics")
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     if responses.ndim != 2 or not all(responses.shape):
         raise ValueError("responses must be a nonempty two-dimensional matrix")
     n_persons, n_items = responses.shape
@@ -184,6 +204,17 @@ def compute_itemfit(
     binned = [name for name in _BINNED_STATISTICS if name in requested]
     n_factors = getattr(model, "n_factors", 1)
 
+    standardized = sorted(_STANDARDIZED_STATISTICS.intersection(requested))
+    if theta is None and standardized:
+        warnings.warn(
+            f"{' and '.join(standardized)} with EAP abilities estimated from the "
+            "same responses are biased toward overfit (about half of well-fitting "
+            "items fall below -1.96 on a 20-item test) and are only descriptive; "
+            "pass theta that does not depend on these responses for a standard "
+            "normal reference",
+            UserWarning,
+            stacklevel=2,
+        )
     if theta is not None:
         theta = np.asarray(theta, dtype=np.float64)
         if theta.ndim == 1:
@@ -226,6 +257,7 @@ def compute_itemfit(
                 na_rm=na_rm,
                 prior_mean=prior_mean,
                 prior_cov=prior_cov,
+                constraints=constraints,
             )
         )
         if p_adjust != "none":
@@ -234,8 +266,6 @@ def compute_itemfit(
     if not mean_squares and not binned:
         return result
 
-    if responses.dtype.kind == "f":
-        responses = np.where(np.isnan(responses), -1.0, responses)
     posterior: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
     if theta is None or "PV_Q1" in binned:
         from mirt.scoring import fscores
@@ -272,6 +302,7 @@ def compute_itemfit(
                 seed=seed,
                 item_parameter_counts=item_parameter_counts,
                 p_adjust=p_adjust,
+                constraints=constraints,
             )
         )
     return result
@@ -380,7 +411,7 @@ def _sx2_response_counts(
         block = responses[start : start + chunk_rows]
         if np.any(np.isinf(block)):
             raise ValueError("S-X2 responses must not contain infinite values")
-        missing = np.isnan(block) | (block < 0)
+        missing = block < 0
         if np.any(missing) and not na_rm:
             raise ValueError(
                 "S-X2 requires complete responses; set na_rm=True to exclude incomplete persons"
@@ -407,8 +438,19 @@ def _sx2_response_counts(
 
 
 def _sx2_parameter_counts(
-    model: BaseItemModel, counts: ArrayLike | None, *, statistic: str = "S-X2"
-) -> NDArray[np.int64]:
+    model: BaseItemModel,
+    counts: ArrayLike | None,
+    *,
+    statistic: str = "S-X2",
+    constraints: EqualityConstraints | None = None,
+) -> NDArray[np.float64]:
+    """Return each item's share of the estimated parameters.
+
+    Explicit ``counts`` are used as given. Otherwise every free coordinate of
+    an item counts once, except that a group of ``k`` coordinates tied by
+    ``constraints`` is one parameter, of which each of its items counts
+    ``1/k``.
+    """
     if counts is not None:
         values = np.asarray(counts)
         if (
@@ -419,14 +461,27 @@ def _sx2_parameter_counts(
             raise ValueError(
                 "item_parameter_counts must contain one nonnegative integer per item"
             )
-        return values.astype(np.int64, copy=False)
+        return values.astype(np.float64)
+    result = _free_coordinate_counts(model, statistic).astype(np.float64)
+    if constraints is not None:
+        from mirt.estimation._shared_step import resolve_equality_constraints
+
+        tied = resolve_equality_constraints(constraints, model)
+        for name, flats in () if tied is None else tied.groups:
+            row_size = int(np.prod(model.parameters[name].shape[1:], dtype=np.intp))
+            result[flats // row_size] -= 1.0 - 1.0 / flats.size
+    return result
+
+
+def _free_coordinate_counts(model: BaseItemModel, statistic: str) -> NDArray[np.int64]:
+    """Count each item's free stored coordinates."""
     result = np.zeros(model.n_items, dtype=np.int64)
     from mirt.models.mixed_format import MixedItemModel
 
     if isinstance(model, MixedItemModel):
         # Component arrays are indexed by each component's own items.
         for component, items in model.components:
-            result[items] = _sx2_parameter_counts(component, None, statistic=statistic)
+            result[items] = _free_coordinate_counts(component, statistic)
         return result
     shared_design = (
         bool(getattr(model, "_shared_parameters", ()))
@@ -713,9 +768,9 @@ def _chi_square_terms(
 def _sx2_from_tables(
     observed: NDArray[np.float64],
     expected: NDArray[np.float64],
-    n_parameters: int,
+    n_parameters: float,
     minimum: float,
-) -> tuple[float, int, float]:
+) -> tuple[float, float, float]:
     """Apply ordered pooling and count remaining independent category contrasts."""
     # A pooled row's expected total equals its integer person count only up to
     # rounding, so relax the threshold slightly; otherwise a one-person row at
@@ -792,6 +847,7 @@ def _compute_s_x2(
     na_rm: bool,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     from mirt.models.cdm_advanced import HigherOrderCDM
     from mirt.models.mixture import MixtureIRT
@@ -818,7 +874,9 @@ def _compute_s_x2(
         raise ValueError("na_rm must be boolean")
     categories = _sx2_categories(model)
     observed, score_counts = _sx2_response_counts(responses, categories, na_rm=na_rm)
-    parameter_counts = _sx2_parameter_counts(model, item_parameter_counts)
+    parameter_counts = _sx2_parameter_counts(
+        model, item_parameter_counts, constraints=constraints
+    )
     nodes, weights = _sx2_quadrature(
         model, n_quadpts, quadrature_points, quadrature_weights, prior_mean, prior_cov
     )
@@ -833,7 +891,7 @@ def _compute_s_x2(
         _sx2_from_tables(
             table,
             conditional[item] * score_counts[:, None],
-            int(parameter_counts[item]),
+            float(parameter_counts[item]),
             minimum,
         )
         for item, table in enumerate(observed)
@@ -857,13 +915,14 @@ def compute_s_x2(
     na_rm: bool = False,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute exact-total-score conditional Orlando-Thissen S-X2 item fit.
 
     Binary and ordinal expected counts are integrated over the latent ability
     distribution by score recursion. See :func:`compute_itemfit` for pooling,
-    quadrature, latent-population, parameter-count, missing-response, and
-    multiplicity controls.
+    quadrature, latent-population, parameter-count, equality-constraint,
+    missing-response, and multiplicity controls.
     ``theta`` is accepted and validated for compatibility; S-X2 does not use
     plug-in respondent ability estimates. ``n_groups`` is deprecated.
     """
@@ -882,4 +941,5 @@ def compute_s_x2(
         na_rm=na_rm,
         prior_mean=prior_mean,
         prior_cov=prior_cov,
+        constraints=constraints,
     )

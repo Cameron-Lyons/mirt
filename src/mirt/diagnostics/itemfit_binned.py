@@ -28,6 +28,7 @@ from scipy.special import chdtrc
 from mirt.diagnostics.multiple_testing import PValueAdjustment, adjust_p_values
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityConstraints
     from mirt.models.base import BaseItemModel
 
 
@@ -46,6 +47,7 @@ def _compute_binned_itemfit(
     seed: int | None,
     item_parameter_counts: ArrayLike | None,
     p_adjust: PValueAdjustment,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute the requested X2, G2 and PV_Q1 item-fit statistics.
 
@@ -69,6 +71,9 @@ def _compute_binned_itemfit(
         Seed for the plausible-value draws.
     item_parameter_counts : array-like or None
         Estimated parameters per item; defaults to the free parameter masks.
+    constraints : sequence, optional
+        Equality constraints of the fit; see
+        :func:`~mirt.diagnostics.itemfit.compute_itemfit`.
     p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}
         Multiple-testing adjustment across items.
 
@@ -92,7 +97,10 @@ def _compute_binned_itemfit(
     categories = _sx2_categories(model)
     codes = _response_codes(responses, categories)
     parameters = _sx2_parameter_counts(
-        model, item_parameter_counts, statistic="X2, G2 and PV_Q1"
+        model,
+        item_parameter_counts,
+        statistic="X2, G2 and PV_Q1",
+        constraints=constraints,
     )
 
     result: dict[str, NDArray[np.float64]] = {}

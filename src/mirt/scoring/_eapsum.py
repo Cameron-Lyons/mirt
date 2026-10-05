@@ -25,6 +25,7 @@ from numpy.typing import ArrayLike, NDArray
 from mirt.exceptions import MirtValidationError
 from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import build_quadrature
+from mirt.utils.data import _missing_coded_responses
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -171,8 +172,9 @@ class EAPSumScorer:
         ----------
         model : BaseItemModel
             Fitted IRT model
-        responses : ndarray
-            Response matrix (n_persons x n_items)
+        responses : array-like of shape (n_persons, n_items)
+            Response matrix. Negative codes and ``NaN`` denote missing
+            responses.
 
         Returns
         -------
@@ -182,10 +184,7 @@ class EAPSumScorer:
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
 
-        responses = np.asarray(responses)
-        n_factors = model.n_factors
-
-        if n_factors > 1:
+        if model.n_factors > 1:
             raise ValueError("EAPsum only supports unidimensional models")
 
         responses = self._validate_responses(model, responses)
@@ -242,9 +241,13 @@ class EAPSumScorer:
     @staticmethod
     def _validate_responses(
         model: BaseItemModel,
-        responses: NDArray,
+        responses: ArrayLike,
     ) -> NDArray[np.int_]:
-        """Validate response codes without changing negative missing values."""
+        """Validate response codes, reading ``NaN`` as a missing response.
+
+        Negative missing codes are kept as given.
+        """
+        responses = _missing_coded_responses(responses)
         if responses.ndim != 2:
             raise ValueError(f"responses must be 2D, got {responses.ndim}D")
         if responses.shape[1] != model.n_items:
@@ -526,8 +529,9 @@ class EAPSumScorer:
         Raises
         ------
         MirtValidationError
-            If ``responses`` contain missing values, since observed
-            frequencies of full-form sum scores are then undefined.
+            If ``responses`` contain missing values (negative codes or
+            ``NaN``), since observed frequencies of full-form sum scores are
+            then undefined.
         """
         theta_values, se_values, log_marginal = self._full_form_arrays(model)
         expected_proportion = np.exp(log_marginal)
@@ -542,7 +546,7 @@ class EAPSumScorer:
                 expected_proportion=expected_proportion,
             )
 
-        validated = self._validate_responses(model, np.asarray(responses))
+        validated = self._validate_responses(model, responses)
         if np.any(validated < 0):
             raise MirtValidationError(
                 "score_table requires complete responses; sum-score "
@@ -742,7 +746,7 @@ def _validated_sum_scores(
 
 def eapsum(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     n_quadpts: int = 49,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
@@ -754,12 +758,13 @@ def eapsum(
     model : BaseItemModel | FitResult
         Fitted IRT model, or the ``FitResult`` returned by
         :func:`mirt.fit_mirt`.
-    responses : ndarray
-        Response matrix (n_persons x n_items)
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes and ``NaN`` denote missing responses.
     n_quadpts : int
         Number of quadrature points
     prior_mean : ndarray, optional
-        Prior mean. Default zero.
+        Prior mean. Defaults to the ``latent_mean`` of a
+        ``FitResult`` when it has one, and to zero otherwise.
     prior_cov : ndarray, optional
         Prior variance, as a ``(1, 1)`` matrix. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to one
@@ -794,7 +799,8 @@ def eapsum_table(
     n_quadpts : int, default=49
         Number of quadrature points.
     prior_mean : ndarray, optional
-        Prior mean for theta. Default zero.
+        Prior mean for theta. Defaults to the ``latent_mean`` of a
+        ``FitResult`` when it has one, and to zero otherwise.
     prior_cov : ndarray, optional
         Prior variance for theta, as a ``(1, 1)`` matrix. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to one
@@ -840,7 +846,8 @@ def sum_score_to_theta(
     n_quadpts : int
         Number of quadrature points
     prior_mean : ndarray, optional
-        Prior mean for theta. Default zero.
+        Prior mean for theta. Defaults to the ``latent_mean`` of a
+        ``FitResult`` when it has one, and to zero otherwise.
     prior_cov : ndarray, optional
         Prior variance for theta, as a ``(1, 1)`` matrix. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to one

@@ -19,8 +19,8 @@ from mirt.diagnostics._utils import (
 )
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
 from mirt.utils.bootstrap import _validate_n_jobs
 
@@ -31,7 +31,6 @@ if TYPE_CHECKING:
 
 _DIF_METHODS = frozenset({"likelihood_ratio", "wald", "lord", "raju"})
 _DIF_MODELS = frozenset({"1PL", "2PL", "3PL", "GRM", "GPCM"})
-_DIF_SCHEMES = frozenset({"drop", "add", "drop_sequential", "add_sequential"})
 _SLOPE_PARAMETERS = frozenset({"discrimination", "slopes"})
 _LOCATION_PARAMETERS = ("difficulty", "thresholds", "steps")
 _ETS_ALPHA = 0.05
@@ -54,7 +53,7 @@ def compute_dif(
     focal_group: str | int | None = None,
     p_adjust: PValueAdjustment = "none",
     *,
-    anchors: Sequence[int] | None = None,
+    anchors: Sequence[int | str] | None = None,
     scheme: DIFScheme = "drop",
     n_jobs: int = 1,
 ) -> dict[str, Any]:
@@ -64,6 +63,13 @@ def compute_dif(
     after controlling for ability. Every method compares the groups on one
     latent scale, so a difference in group ability (impact) is not reported
     as DIF.
+
+    The default likelihood-ratio method fits one baseline multiple-group
+    model plus one refit per tested item. For 30 binary 2PL items and 1,000
+    persons per group this takes one to two seconds; 3PL and polytomous
+    items are several times slower per item. ``n_jobs=-1`` runs the refits
+    in parallel, and ``method="wald"`` or
+    :func:`mirt.diagnostics.compute_grdif` are fast screens without refits.
 
     Args:
         data: Response matrix (n_persons x n_items).
@@ -96,13 +102,15 @@ def compute_dif(
         focal_group: Which group to use as focal (default: second unique group).
         p_adjust: Multiple-testing adjustment across tested items. Supported
             values are 'none', 'bonferroni', 'holm', and 'fdr_bh'. Default
-            'none'.
-        anchors: Items assumed free of DIF. They are not tested and get
-            ``NaN`` statistics. Likelihood-ratio tests constrain them in every
-            model; the other methods link the groups over them. ``None``
-            treats every other item as an anchor in a likelihood-ratio test
-            and links on all items otherwise, which assumes DIF that
-            balances across items.
+            'none', as in :func:`mirt.multigroup.multigroup_dif` and R's
+            ``mirt::DIF``.
+        anchors: Items assumed free of DIF, by index or name (column names
+            of a DataFrame, otherwise ``Item_0``, ``Item_1``, ...). They are
+            not tested and get ``NaN`` statistics. Likelihood-ratio tests
+            constrain them in every model; the other methods link the groups
+            over them. ``None`` treats every other item as an anchor in a
+            likelihood-ratio test and links on all items otherwise, which
+            assumes DIF that balances across items.
         scheme: Likelihood-ratio scheme: 'drop', 'add', 'drop_sequential' or
             'add_sequential' (see :func:`mirt.multigroup.multigroup_dif`).
             The 'add' schemes require ``anchors``.
@@ -131,21 +139,30 @@ def compute_dif(
     Raises:
         ValueError: If the method, model, scheme or anchors are invalid.
     """
+    from mirt.multigroup.dif import DIF_SCHEMES, resolve_items
+    from mirt.utils.data import response_column_names
+
     if method not in _DIF_METHODS:
         raise ValueError(f"Unknown DIF method: {method}")
     if model not in _DIF_MODELS:
         raise ValueError(f"model must be one of: {', '.join(sorted(_DIF_MODELS))}")
-    if scheme not in _DIF_SCHEMES:
-        raise ValueError(f"scheme must be one of: {', '.join(sorted(_DIF_SCHEMES))}")
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    if scheme not in DIF_SCHEMES:
+        raise ValueError(f"scheme must be one of: {', '.join(sorted(DIF_SCHEMES))}")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     n_jobs = _validate_n_jobs(n_jobs)
 
+    item_names = response_column_names(data)
     data = np.asarray(data)
     groups = np.asarray(groups)
     n_items = data.shape[1]
+    if item_names is None:
+        item_names = [f"Item_{item}" for item in range(n_items)]
     likelihood_ratio = method == "likelihood_ratio"
     anchor_items = resolve_anchor_items(
-        anchors, n_items, name="anchors", minimum=1 if likelihood_ratio else 2
+        resolve_items(anchors, item_names, "anchors"),
+        n_items,
+        name="anchors",
+        minimum=1 if likelihood_ratio else 2,
     )
     tested = np.ones(n_items, dtype=np.bool_)
     if anchor_items is not None:
@@ -218,11 +235,11 @@ def _dif_likelihood_ratio(
     tol: float,
 ) -> dict[str, Any]:
     """Nested multiple-group likelihood-ratio tests for two groups."""
-    from mirt.multigroup.dif import _run_multigroup_dif
+    from mirt.multigroup.dif import run_multigroup_dif
 
     labels = np.unique(groups)
     reference_index = int(np.flatnonzero(labels == reference_group)[0])
-    table = _run_multigroup_dif(
+    table = run_multigroup_dif(
         data,
         groups,
         model,
@@ -234,7 +251,8 @@ def _dif_likelihood_ratio(
         n_quadpts=n_quadpts,
         max_iter=max_iter,
         tol=tol,
-        reference_group=reference_index,
+        # A label string is unambiguous when labels are integers too.
+        reference_group=str(labels[reference_index]),
         n_jobs=n_jobs,
     )
 
@@ -471,7 +489,7 @@ def flag_dif_items(
     if classification not in {None, "B", "C"}:
         raise ValueError("classification must be 'B', 'C', or None")
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     effect_sizes = np.asarray(dif_results["effect_size"], dtype=np.float64)
     if dif_results.get("method") == "raju":
         significant = np.isfinite(effect_sizes)
@@ -806,7 +824,7 @@ def compute_grdif(
     """
     from mirt import fit_mirt
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,
@@ -1147,7 +1165,7 @@ def compute_pairwise_rdif(
     """
     from mirt import fit_mirt
 
-    p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
+    p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
     data, groups, unique_groups = _validate_grdif_inputs(
         data=data,
         groups=groups,

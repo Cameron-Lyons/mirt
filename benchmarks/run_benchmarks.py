@@ -2238,7 +2238,8 @@ def bench_multigroup_fit(
     repeats: int,
     warmups: int = 0,
 ) -> list[BenchResult]:
-    """Time pooled, distinct-context, and fixed-anchor multigroup updates."""
+    """Time multigroup updates and the default likelihood-ratio DIF analysis."""
+    from mirt.diagnostics.dif import compute_dif
     from mirt.multigroup import MultigroupEMEstimator, MultigroupModel
 
     rng = np.random.default_rng(9641)
@@ -2279,6 +2280,22 @@ def bench_multigroup_fit(
                 _peak_traced_bytes(run),
             )
         )
+
+    # The default compute_dif path: a baseline and one warm-started refit per
+    # item, each with a fixed EM iteration budget.
+    data = np.vstack(responses[:2])
+    groups = np.repeat([0, 1], [len(response) for response in responses[:2]])
+
+    def dif():
+        return compute_dif(data, groups, model="2PL", max_iter=20)
+
+    results.append(
+        BenchResult(
+            "multigroup_dif_likelihood_ratio",
+            _time(dif, repeats=repeats, warmups=warmups),
+            _peak_traced_bytes(dif),
+        )
+    )
     return results
 
 
@@ -2950,6 +2967,7 @@ def _validate_baseline_compatibility(
         "multigroup_fit_metric",
         "multigroup_fit_scalar",
         "multigroup_fit_fixed",
+        "multigroup_dif_likelihood_ratio",
         "patterns_repeated",
         "patterns_distinct",
         "pairwise_available",

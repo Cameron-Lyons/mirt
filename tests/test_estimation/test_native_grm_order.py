@@ -9,14 +9,11 @@ import pytest
 from scipy.special import logsumexp
 
 import mirt
-from mirt import mirt_rs
 from mirt.backends.rust.polytomous_mstep import try_polytomous_m_step
 from mirt.estimation.em import EMEstimator
 from mirt.models.polytomous import GradedResponseModel
 
-pytestmark = pytest.mark.skipif(
-    not mirt.is_rust_available(), reason="native backend unavailable"
-)
+mirt_rs = pytest.importorskip("mirt.mirt_rs", reason="native backend unavailable")
 
 
 @pytest.fixture(autouse=True)
@@ -116,12 +113,51 @@ def test_native_fits_never_return_disordered_thresholds(seed):
     data = true.simulate(rng.standard_normal((n_persons, 1)), seed=seed)
     fit = mirt.fit_mirt(data, model="GRM", verbose=False)
     _assert_ordered(fit.model)
-    # The ordered maximum likelihood fit beats the generating parameters. The
-    # generic SLSQP fit of these tied thresholds sits within roundoff of its
-    # ordering check, so it is no reliable reference here.
+    # The ordered maximum likelihood fit beats the generating parameters.
     assert _marginal_log_likelihood(fit.model, data) >= _marginal_log_likelihood(
         true, data
     )
+
+
+def _empty_category_responses(seed):
+    """Graded responses in which every other item never uses a middle category."""
+    rng = np.random.default_rng(seed)
+    n_items, n_categories = 6, 5
+    gaps = rng.uniform(0.2, 0.8, (n_items, n_categories - 2))
+    first = rng.uniform(-1.5, 0.0, n_items)
+    thresholds = first[:, None] + np.column_stack(
+        [np.zeros(n_items), np.cumsum(gaps, axis=1)]
+    )
+    true = GradedResponseModel(n_items, n_categories=n_categories)
+    true.set_parameters(
+        discrimination=rng.uniform(0.8, 2.0, n_items), thresholds=thresholds
+    )
+    data = true.simulate(rng.standard_normal((500, 1)), seed=seed)
+    for item in range(0, n_items, 2):
+        middle = 1 + (item // 2 + seed) % (n_categories - 2)
+        data[data[:, item] == middle, item] = middle + 1
+    data[rng.random(data.shape) < 0.05] = -1
+    return data
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_generic_fit_ties_thresholds_of_empty_categories_like_the_native_fit(seed):
+    # The generic SLSQP M-step used to raise when its tied thresholds came
+    # out closer than the ordering gap; they are now projected, as natively.
+    data = _empty_category_responses(seed)
+    native, generic = (
+        mirt.fit_mirt(
+            data, model="GRM", use_rust=use_rust, compute_standard_errors=False
+        )
+        for use_rust in (True, False)
+    )
+    gaps = np.diff(generic.model.parameters["thresholds"], axis=1)
+    assert np.all(gaps >= 1e-6 * (1 - 1e-6)), gaps
+    assert np.min(gaps) < 1e-5
+    assert generic.converged
+    assert generic.log_likelihood == pytest.approx(native.log_likelihood, abs=1e-3)
+    for name, values in native.model.parameters.items():
+        np.testing.assert_allclose(generic.model.parameters[name], values, atol=5e-3)
 
 
 def test_m_step_projects_a_disordered_start_onto_ordered_thresholds():

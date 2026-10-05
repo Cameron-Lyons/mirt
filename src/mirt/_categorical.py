@@ -195,6 +195,18 @@ def _response_category_counts(model: BaseItemModel, width: int) -> NDArray[np.in
     return np.asarray(declared, dtype=np.intp)
 
 
+def _binary_columns(model: BaseItemModel) -> NDArray[np.intp] | None:
+    """Items of a mixed-format model's dichotomous components, if any."""
+    from mirt.models.mixed_format import MixedItemModel
+
+    if not isinstance(model, MixedItemModel):
+        return None
+    columns = [
+        items for component, items in model.components if not component.is_polytomous
+    ]
+    return np.concatenate(columns) if columns else None
+
+
 def draw_item_responses(
     model: BaseItemModel,
     theta: NDArray[np.float64],
@@ -225,7 +237,10 @@ def draw_item_responses(
     -------
     ndarray of shape (n_persons, n_items)
         Simulated responses. A binary response is 1 when its uniform draw is
-        below the success probability; categories use the inverse CDF.
+        below the success probability; categories use the inverse CDF. The
+        binary items of a mixed-format model, whose probabilities read
+        ``[1 - p, p]``, follow the binary rule on ``p`` as their dichotomous
+        component does.
 
     Notes
     -----
@@ -238,6 +253,7 @@ def draw_item_responses(
     step = max(1, n_persons if chunk_size is None else int(chunk_size))
     responses = np.empty((n_persons, n_items), dtype=dtype)
     category_counts: dict[int, NDArray[np.intp]] = {}
+    binary = _binary_columns(model)
     for start in range(0, n_persons, step):
         stop = min(start + step, n_persons)
         probabilities = np.asarray(
@@ -274,7 +290,12 @@ def draw_item_responses(
         width = probabilities.shape[2]
         if width not in category_counts:
             category_counts[width] = _response_category_counts(model, width)
-        responses[start:stop] = sample_categorical_tensor(
+        draws = sample_categorical_tensor(
             probabilities, category_counts[width], uniforms
         )
+        if binary is not None:
+            # The inverse CDF of [1 - p, p] codes 1 for u > 1 - p, not u < p.
+            success = np.clip(probabilities[:, binary, 1], 0.0, 1.0)
+            draws[:, binary] = uniforms[:, binary] < success
+        responses[start:stop] = draws
     return responses

@@ -25,6 +25,7 @@ from mirt.exceptions import MirtEstimationError, MirtValidationError
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
+from mirt.estimation._graded_order import graded_threshold_constraint
 from mirt.estimation.base import BaseEstimator, _reject_parameter_restrictions
 from mirt.results.fit_result import FitResult
 
@@ -274,8 +275,10 @@ class MHRMEstimator(BaseEstimator):
     where ``H_k`` is the item's complete-data information at the current
     draw. Burn-in cycles use ``g_k = 1``, Newton steps on the imputed data;
     later gains decrease (see ``gain_sequence``) and the estimates average the
-    post-burn-in iterates. Items are updated blockwise, so any built-in item
-    family, including polytomous and multidimensional ones, is supported.
+    post-burn-in iterates. Items are updated blockwise, so every built-in
+    item family, including polytomous and multidimensional ones, is
+    supported except the rating scale models (RSM and GRSM), whose
+    thresholds are shared by all items.
 
     Standard errors of unidimensional 1PL-4PL, GRM, GPCM and PCM fits come
     from the exact observed information of the marginal likelihood at the
@@ -298,6 +301,8 @@ class MHRMEstimator(BaseEstimator):
     the EM algorithm. Journal of the Royal Statistical Society: Series B,
     44(2), 226-233.
     """
+
+    _holds_fixed_parameters = False
 
     def __init__(
         self,
@@ -620,8 +625,6 @@ class MHRMEstimator(BaseEstimator):
         burn-in steps from overshooting into degenerate regions; graded
         thresholds must also stay ordered.
         """
-        from mirt.estimation.em import _graded_threshold_constraint
-
         updates: dict[int, NDArray[np.float64]] = {}
         for item in range(model.n_items):
             observed = responses[:, item] >= 0
@@ -644,7 +647,7 @@ class MHRMEstimator(BaseEstimator):
             step = _robbins_monro_step(current, gradient, params, lower, upper, gain)
             if not np.all(np.isfinite(step)):
                 continue
-            ordering = _graded_threshold_constraint(model, item, params.size)
+            ordering = graded_threshold_constraint(model, item, params.size)
             for _ in range(_MHRM_MAX_HALVINGS):
                 trial = np.clip(params + step, lower, upper)
                 if (
@@ -765,7 +768,7 @@ def _set_item_vectors(
     offsets = dict.fromkeys(updates, 0)
     changed: dict[str, NDArray[np.float64]] = {}
     for name, array in values.items():
-        if array.ndim == 0 or array.shape[0] != model.n_items:
+        if not model._item_indexed(name):
             continue
         rows = np.array(array, dtype=np.float64).reshape(model.n_items, -1)
         free = np.asarray(masks[name], dtype=np.bool_).reshape(model.n_items, -1)
@@ -858,6 +861,8 @@ class GibbsSampler(BaseEstimator):
     With ``n_chains > 1`` the draws of several seeded chains are stacked;
     ``parallel_chains=True`` runs NumPy chains in worker processes.
     """
+
+    _holds_fixed_parameters = False
 
     def __init__(
         self,

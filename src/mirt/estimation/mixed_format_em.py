@@ -12,14 +12,19 @@ import warnings
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._backend_config import should_use_rust
 from mirt.estimation._em_context import EMFitContext
-from mirt.estimation._item_priors import ItemPriorPenalty, resolve_item_priors
+from mirt.estimation._item_priors import (
+    ItemPriorPenalty,
+    check_prior_specification,
+    resolve_item_priors,
+)
+from mirt.estimation._refit import recipe_for
 from mirt.estimation.base import StartValues
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.priors import Prior, PriorSpecification
@@ -41,18 +46,35 @@ class _ComponentFit:
 
 
 class _ComponentPriorPenalty(ItemPriorPenalty):
-    """Sum of the component log-priors of a mixed-format model."""
+    """Item priors of a mixed-format model, held by its components.
+
+    ``components`` lists each component with priors as ``(prefix, model,
+    penalty)``. The log-prior sums the components', and the curvature of
+    each component's prior is reported under the qualified parameter names
+    of the mixed-format model.
+    """
 
     def __init__(
-        self, components: list[tuple[BaseItemModel, ItemPriorPenalty]]
+        self, components: list[tuple[str, BaseItemModel, ItemPriorPenalty]]
     ) -> None:
         super().__init__({})
         self.components = components
 
     def log_prior(self, model: BaseItemModel) -> float:
         return float(
-            sum(penalty.log_prior(component) for component, penalty in self.components)
+            sum(
+                penalty.log_prior(component)
+                for _, component, penalty in self.components
+            )
         )
+
+    def information(self, model: BaseItemModel) -> dict[str, NDArray[np.float64]]:
+        """Return each component's prior curvature under qualified names."""
+        return {
+            f"{prefix}.{name}": curvature
+            for prefix, component, penalty in self.components
+            for name, curvature in penalty.information(component).items()
+        }
 
 
 def _component_priors(
@@ -68,7 +90,11 @@ def _component_priors(
     """
     components = model.component_models
     if priors is None or isinstance(priors, PriorSpecification):
-        return [resolve_item_priors(priors, component) for component in components]
+        check_prior_specification(priors, components, model.model_name)
+        return [
+            resolve_item_priors(priors, component, check_specification=False)
+            for component in components
+        ]
     resolved: list[dict[str, Prior]] = [{} for _ in components]
     qualified = {name: prior for name, prior in priors.items() if "." in name}
     for name, prior in priors.items():
@@ -117,10 +143,11 @@ class MixedFormatEMEstimator(EMEstimator):
 
     With ``se_method="auto"``, standard errors come from the observed
     information (``"oakes"``) when every component is a unidimensional
-    built-in 1PL-4PL, GRM, GPCM or PCM model, and from itemwise
+    built-in 1PL-4PL, GRM, GPCM, PCM, RSM or GRSM model, and from itemwise
     complete-data curvature otherwise. The observed information, score
     cross-product and sandwich estimators treat all components jointly, so
-    ``FitResult.vcov`` includes covariances between components.
+    ``FitResult.vcov`` includes covariances between components. Item priors
+    add their curvature to the information of every estimator.
 
     SQUAREM acceleration is not available for mixed-format models, which
     fall back to plain EM with a warning.
@@ -167,10 +194,13 @@ class MixedFormatEMEstimator(EMEstimator):
         item_priors, self.item_priors = self.item_priors, None
         self._component_penalties = penalties
         try:
-            return super().fit(model, responses, prior_mean, prior_cov, start=start)
+            result = super().fit(model, responses, prior_mean, prior_cov, start=start)
         finally:
             self.item_priors = item_priors
             self._component_penalties = None
+        # Refits must resolve the component priors from the original setting.
+        result.refit_recipe = recipe_for(self)
+        return result
 
     def _fit_prepared(self, model: BaseItemModel, context: EMFitContext) -> FitResult:
         from mirt.estimation._patterns import supports_pattern_compression
@@ -207,8 +237,10 @@ class MixedFormatEMEstimator(EMEstimator):
                 )
             ]
             priors = [
-                (fit.model, fit.penalty)
-                for fit in self._component_fits
+                (prefix, fit.model, fit.penalty)
+                for prefix, fit in zip(
+                    model.component_names, self._component_fits, strict=True
+                )
                 if fit.penalty is not None
             ]
             self._prior_penalty = _ComponentPriorPenalty(priors) if priors else None
@@ -231,20 +263,30 @@ class MixedFormatEMEstimator(EMEstimator):
     def _component_parts(
         self, model: MixedItemModel, responses: NDArray[np.int_], stack: ExitStack
     ) -> list[_ComponentFit]:
-        """Return the fit's components, or temporary ones for other responses."""
+        """Return the fit's components, or temporary ones for other responses.
+
+        Temporary components keep the item priors of the fit.
+        """
         fits = self._component_fits
         context = self._fit_context
         if fits is not None and context is not None and context.responses is responses:
             return fits
+        penalties = (
+            [fit.penalty for fit in fits]
+            if fits is not None
+            else [None] * len(model.component_models)
+        )
         return [
             _ComponentFit(
                 component,
                 stack.enter_context(
                     EMFitContext(np.ascontiguousarray(responses[:, items]))
                 ),
-                None,
+                penalty,
             )
-            for component, items in model.components
+            for (component, items), penalty in zip(
+                model.components, penalties, strict=True
+            )
         ]
 
     def _m_step(
@@ -305,14 +347,14 @@ class MixedFormatEMEstimator(EMEstimator):
                 model, responses, posterior_weights, person_weights=person_weights
             )
         # Complete-data curvature is itemwise, so each component supplies its
-        # own errors from its response columns.
+        # own errors, with its own prior curvature, from its response columns.
         errors: dict[str, NDArray[np.float64]] = {}
-        context = self._fit_context
+        context, penalty = self._fit_context, self._prior_penalty
         with ExitStack() as stack:
             try:
                 fits = self._component_parts(model, responses, stack)
                 for prefix, fit in zip(model.component_names, fits, strict=True):
-                    self._fit_context = fit.context
+                    self._fit_context, self._prior_penalty = fit.context, fit.penalty
                     component_errors = self._complete_data_standard_errors(
                         fit.model,
                         fit.context.responses,
@@ -324,19 +366,6 @@ class MixedFormatEMEstimator(EMEstimator):
                         for name, values in component_errors.items()
                     )
             finally:
-                self._fit_context = context
+                self._fit_context, self._prior_penalty = context, penalty
         self._se_details = ("complete_data", None)
         return errors
-
-
-def em_estimator_for(model: BaseItemModel, **options: Any) -> EMEstimator:
-    """Return an EM estimator for ``model`` built with ``options``.
-
-    Mixed-format models get :class:`MixedFormatEMEstimator`; other models
-    get :class:`~mirt.estimation.em.EMEstimator`.
-    """
-    from mirt.models.mixed_format import MixedItemModel
-
-    if isinstance(model, MixedItemModel):
-        return MixedFormatEMEstimator(**options)
-    return EMEstimator(**options)

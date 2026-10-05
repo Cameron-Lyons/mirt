@@ -230,12 +230,16 @@ def test_newton_em_fits_reach_the_itemwise_fixed_point(kind):
     options = dict(n_quadpts=7, tol=1e-9, max_iter=2000, use_gpu=False)
     newton = _model(kind, 5)
     itemwise = _model(kind, 5)
+    # Both fits start from the model's values, which give the two factors
+    # equal slopes. Default starts would stagger them, and this five-item
+    # two-factor model then creeps toward slopes at their bounds without
+    # meeting tol=1e-9 within max_iter.
     newton_fit = EMEstimator(compute_standard_errors=False, **options).fit(
-        newton, responses
+        newton, responses, start="model"
     )
     itemwise_fit = _ItemwiseEM(
         item_optim_ftol=1e-15, item_optim_maxiter=2000, **options
-    ).fit(itemwise, responses)
+    ).fit(itemwise, responses, start="model")
     assert newton_fit.converged and itemwise_fit.converged
     assert newton_fit.log_likelihood == pytest.approx(
         itemwise_fit.log_likelihood, abs=1e-6

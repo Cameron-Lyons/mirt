@@ -34,17 +34,24 @@ Select another estimator with ``se_method`` on ``fit_mirt`` or
   and covariances between parameters, so it understates uncertainty, often by
   20-60%. It does not produce a covariance matrix.
 
-The default ``"auto"`` uses ``"oakes"`` where the exact computation applies
-and ``"complete_data"`` for nominal, multidimensional and custom item models.
+The default ``"auto"`` uses ``"oakes"`` for unidimensional 1PL-4PL, GRM,
+GPCM, PCM, RSM and GRSM items, whose item derivatives have closed forms, and
+``"complete_data"`` for other item models.
 For EM, Bock-Lieberman and MH-RM fits, ``result.se_method`` names the
 estimator used, so check it before relying on the errors; it is ``None`` for
 estimators that do not record one. An explicit ``"oakes"`` also works for
-those models: built-in nominal and multidimensional models difference each
-item's curve, and custom models difference the marginal likelihood, which
-takes O(P^2) likelihood evaluations for P parameters. Exploratory
+those models. Every built-in model whose likelihood is a product of item
+curves still gets the exact information by differencing each item's own
+curve: nominal, multidimensional (including model-syntax fits), bifactor,
+5PL, complementary and negative log-log, unipolar log-logistic,
+compensatory-logic, nested-logit, monotone polynomial and spline,
+sequential, continuation-ratio, adjacent-category, GGUM, ideal-point,
+hyperbolic cosine, zero-inflated and hurdle models. Custom, testlet and
+mixture models difference the marginal likelihood instead, which takes
+O(P^2) likelihood evaluations for P parameters. Exploratory
 multidimensional solutions are rotationally unidentified, so their
-information matrix is singular. MH-RM fits report ``"oakes"`` where the exact
-computation applies and otherwise ``"mhrm_iterate_sd"``, the spread of the
+information matrix is singular. MH-RM fits report ``"oakes"`` for the
+closed-form families and otherwise ``"mhrm_iterate_sd"``, the spread of the
 Robbins-Monro iterates, which is not a standard error.
 
 The matrix estimators treat the latent density as fixed, which slightly
@@ -55,8 +62,16 @@ errors are conditional on them. The cost grows as N Q P^2 for N distinct
 response patterns, Q quadrature nodes and P parameters; dichotomous models
 use a factorization that reduces it to N Q J^2 for J items.
 ``BLEstimator`` inverts the full Hessian of its marginal likelihood, exact for
-built-in item models and numerical otherwise, and labels its results
-``"hessian"``.
+the built-in models above and differenced over every pair of parameters for
+custom models, and labels its results ``"hessian"``.
+
+:func:`mirt.compute_se` recomputes errors from a fitted model and a final
+posterior. Its matrix methods (``"oakes"``, ``"louis"``, ``"sem"``,
+``"crossprod"``, ``"sandwich"`` and ``"fisher"``) hold coordinates on an EM
+optimizer bound fixed as fits do, so they reproduce an EM fit's errors for
+the same method. The lower-level ``compute_oakes_se``, ``compute_crossprod_se``
+and ``compute_sandwich_se`` estimate every free coordinate unless given
+``bounds``, and take ``prior_information`` for Bayes modal fits.
 
 ``result.vcov`` serializes with :meth:`FitResult.to_dict`, and Wald tests read
 it directly. Parameter indices follow ``result.model.parameters`` with every
@@ -67,6 +82,33 @@ parameters at a bound are rejected:
 
    # H0: the first item's discrimination equals 1.
    test = mirt.wald(result, param_indices=[0], constraint_values=[1.0])
+
+``wald`` and ``draw_parameters`` also accept an explicit ``vcov``, such as
+``result.vcov`` when no parameter is fixed; its all-``NaN`` rows and columns
+mark parameters held at a bound, which are drawn at their estimates and
+cannot be tested.
+
+A Lagrange (score) test asks whether fixed parameters should be freed
+without refitting. Given the constrained fit, ``lagrange`` frees the tested
+parameters in a copy of the model and evaluates the marginal score and
+observed information at the constrained estimates, with a normal latent
+density on ``n_quadpts`` nodes per factor. The fit must maximize the
+likelihood, so Bayes modal fits are rejected, and equality constraints of the
+fit are not represented:
+
+.. code-block:: python
+
+   import numpy as np
+
+   n_items = responses.shape[1]
+   constrained = mirt.fit_mirt(
+       responses,
+       model="2PL",
+       fixed={"discrimination": np.arange(n_items) == 0},
+       start_values={"discrimination": np.ones(n_items)},
+   )
+   # H0: the first item's discrimination stays at 1.
+   test = mirt.lagrange(constrained, responses, param_indices=[0])
 
 Draw and summarize parameters
 -----------------------------
@@ -192,9 +234,9 @@ covariance matrices.
    )
 
 Plausible values reproduce population moments only when their prior matches
-the population. A ``FitResult`` supplies its estimated ``latent_covariance``
-as the default prior covariance; otherwise the prior is standard normal. On
-short tests, draws shrink toward the prior, so pass the population mean and
+the population. A ``FitResult`` supplies its estimated ``latent_mean`` and
+``latent_covariance`` as the default prior; otherwise the prior is standard
+normal. On short tests, draws shrink toward the prior, so pass the population mean and
 covariance on the model's scale when they differ from it. A ``(n_persons, n_factors)`` mean conditions each person's draws, for
 example on latent-regression predictions:
 
@@ -234,6 +276,17 @@ to empirical item draws.
 Bootstrap confidence intervals
 ------------------------------
 
+``bootstrap_se``, ``bootstrap_ci`` and ``parametric_bootstrap`` refit a
+``FitResult`` like the original fit: with the estimator that produced it
+(``BifactorEMEstimator`` for :func:`mirt.bfactor`, ``MixedFormatEMEstimator``
+for mixed formats), its item priors, latent density, equality constraints and
+quadrature, as recorded in ``FitResult.refit_recipe``. A Bayes modal fit is
+therefore bootstrapped as a Bayes modal estimator, and an estimated factor
+covariance or population mean is re-estimated in every replicate. Parametric
+replicates draw abilities from the fit's ``latent_mean`` and
+``latent_covariance``. Replicates skip standard errors. A bare item model is
+refitted by the default EM estimator of its family.
+
 ``bootstrap_ci(..., method="BCa")`` uses bias ranks that account for ties and
 a complete leave-one-person-out jackknife for acceleration. It requires one
 additional model fit per person. Set ``n_jobs`` to distribute those fits across
@@ -249,7 +302,10 @@ model lies on the boundary of the full model, as for 2PL versus 3PL or ``k``
 versus ``k + 1`` factors. ``bootstrap_lr`` simulates the statistic's null
 distribution from the fitted reduced model instead. Both models are refitted
 to the observed responses and to every replicate with identical estimator
-settings, and replicates keep the observed missing-data pattern.
+settings, and replicates keep the observed missing-data pattern. Fit results
+are refitted with their recorded estimators, priors and constraints, and
+their degrees of freedom come from ``FitResult.n_parameters``, which counts
+estimated latent covariances and each equality-constraint group once.
 
 .. code-block:: python
 

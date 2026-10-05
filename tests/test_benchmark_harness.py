@@ -1207,6 +1207,7 @@ class TestBenchmarkCommand:
             "multigroup_fit_metric",
             "multigroup_fit_scalar",
             "multigroup_fit_fixed",
+            "multigroup_dif_likelihood_ratio",
         ]
         assert all(result.peak_traced_bytes > 0 for result in results)
         for result in results:

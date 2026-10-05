@@ -377,7 +377,7 @@ class TestVuongTest:
             (np.array([0, 1]), "responses must be 2D"),
             (np.array([[0]]), "at least two persons"),
             (np.array([[0], [2]]), "dichotomous responses"),
-            (np.array([[0.0], [np.nan]]), "finite values"),
+            (np.array([[0.0], [np.inf]]), "finite values"),
         ],
     )
     def test_rejects_invalid_responses(self, responses, message):

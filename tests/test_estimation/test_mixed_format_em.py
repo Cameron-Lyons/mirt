@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import warnings
 
 import numpy as np
@@ -10,10 +11,12 @@ import pytest
 import mirt
 import mirt.estimation._louis_information as louis
 from mirt.diagnostics.itemfit import _sx2_parameter_counts
+from mirt.estimation._refit import em_estimator_for
 from mirt.estimation.base import _parameter_bounds
+from mirt.estimation.bl import BLEstimator
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.mcem import MCEMEstimator
-from mirt.estimation.mixed_format_em import MixedFormatEMEstimator, em_estimator_for
+from mirt.estimation.mixed_format_em import MixedFormatEMEstimator
 from mirt.estimation.priors import (
     BetaPrior,
     LogNormalPrior,
@@ -21,10 +24,13 @@ from mirt.estimation.priors import (
     PriorSpecification,
 )
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.se_methods import compute_se
 from mirt.estimation.standard_errors import (
     _finite_difference_information,
     _finite_difference_scores,
     _flatten_parameters,
+    _posterior_from_model,
+    estimate_covariance,
 )
 from mirt.exceptions import MirtModelError, MirtValidationError
 from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
@@ -137,7 +143,7 @@ def test_recovers_three_pl_and_graded_parameters() -> None:
     rng = np.random.default_rng(2026)
     types = ["3PL"] * 20 + ["GRM"] * 5
     true = _true_model(types, rng)
-    responses = true.simulate(rng.standard_normal((3000, 1)), seed=7)
+    responses = true.simulate(rng.standard_normal((3000, 1)), seed=9)
 
     result = mirt.fit_mirt(responses, model=types, tol=1e-3)
     model = result.model
@@ -213,6 +219,64 @@ def test_mixed_louis_information_matches_marginal_differences(reordered) -> None
     assert np.max(np.abs(terms.information[:n_first, n_first:])) > 1e-3 * scale
 
 
+@pytest.mark.parametrize("masked", [False, True])
+def test_mixed_louis_information_covers_shared_component_parameters(masked) -> None:
+    # Regression: shared coordinates of rating-scale components were not
+    # supported, so their observed information fell back to O(P^2)
+    # differences of the marginal likelihood.
+    two_pl = TwoParameterLogistic(2)
+    two_pl.set_parameters(
+        discrimination=np.array([1.2, 0.8]), difficulty=np.array([-0.3, 0.4])
+    )
+    rating = RatingScaleModel(2, 4)
+    rating.set_parameters(
+        difficulty=np.array([0.2, -0.4]), thresholds=np.array([-1.0, 0.1, 0.9])
+    )
+    graded = GradedRatingScaleModel(2, 3)
+    graded.set_parameters(
+        discrimination=np.array([1.3]),
+        difficulty=np.array([-0.1, 0.5]),
+        thresholds=np.array([-0.6, 0.7]),
+    )
+    mixed = MixedItemModel(
+        [
+            (two_pl, [0, 3]),
+            (rating, [1, 4]),
+            (GradedResponseModel(1, n_categories=3), [5]),
+            (graded, [2, 6]),
+        ]
+    )
+    if masked:
+        mixed.set_free_parameter_masks(
+            {
+                "RSM.thresholds": np.array([False, True, False]),
+                "GRSM.discrimination": np.array([False]),
+            }
+        )
+    rng = np.random.default_rng(7)
+    responses = mixed.simulate(rng.standard_normal((200, 1)), seed=8)
+    responses[rng.random(responses.shape) < 0.1] = -1
+    quadrature = GaussHermiteQuadrature(11)
+    mass = quadrature.weights / quadrature.weights.sum()
+    _, layouts = _flatten_parameters(mixed)
+    assert louis.supports_louis_information(mixed)
+
+    terms = louis.louis_information(mixed, responses, quadrature.nodes, mass, layouts)
+    reference, _ = _finite_difference_information(
+        mixed, responses, quadrature, mass, 1e-4
+    )
+    scores, _ = _finite_difference_scores(mixed, responses, quadrature, mass, 1e-5)
+
+    scale = np.max(np.abs(reference))
+    np.testing.assert_allclose(terms.information, reference, rtol=0, atol=2e-6 * scale)
+    np.testing.assert_allclose(
+        terms.score_crossproduct,
+        scores.T @ scores,
+        rtol=0,
+        atol=1e-7 * np.max(np.abs(terms.score_crossproduct)),
+    )
+
+
 def test_complete_data_errors_are_componentwise(data) -> None:
     _, responses = data
     oakes = mirt.fit_mirt(responses, model=TYPES, tol=1e-3)
@@ -253,8 +317,61 @@ def test_fit_result_reports_and_coefficients(fitted) -> None:
     payload = fitted.to_dict()
     assert payload["model"]["name"] == "Mixed"
     assert payload["model"]["n_categories"] == model.n_categories
-    with pytest.raises(MirtValidationError, match="cannot rebuild model 'Mixed'"):
-        FitResult.from_dict(payload)
+    assert [entry["name"] for entry in payload["model"]["components"]] == [
+        "3PL",
+        "GRM",
+        "2PL",
+    ]
+
+
+def test_json_round_trip_rebuilds_mixed_results(data, fitted) -> None:
+    # Regression: from_dict rejected every mixed-format result.
+    _, responses = data
+    restored = FitResult.from_json(fitted.to_json())
+
+    assert isinstance(restored.model, MixedItemModel)
+    assert restored.model.is_fitted
+    assert restored.model.item_types == fitted.model.item_types
+    assert restored.model.n_categories == fitted.model.n_categories
+    for name, values in fitted.model.parameters.items():
+        np.testing.assert_array_equal(restored.model.parameters[name], values)
+    assert restored.vcov_labels == fitted.vcov_labels
+    np.testing.assert_array_equal(restored.vcov, fitted.vcov)
+    assert restored.to_json() == fitted.to_json()
+    expected = mirt.fscores(fitted, responses)
+    np.testing.assert_array_equal(
+        mirt.fscores(restored, responses).theta, expected.theta
+    )
+
+    # Fixed coordinates survive the round trip.
+    held = MixedItemModel.from_itemtypes(TYPES, n_categories=4)
+    held.set_free_parameter_masks({"3PL.guessing": np.zeros(6, dtype=bool)})
+    result = _identity_vcov_result(held)
+    restored = FitResult.from_dict(result.to_dict())
+    assert restored.model.n_parameters == held.n_parameters
+    assert not np.any(restored.model.free_parameter_masks["3PL.guessing"])
+    assert restored.vcov_labels == result.vcov_labels
+
+
+def test_from_dict_rejects_unbuildable_mixed_components(fitted) -> None:
+    rating = MixedItemModel(
+        [(TwoParameterLogistic(2), range(2)), (RatingScaleModel(3, 4), range(2, 5))]
+    )
+    with pytest.raises(MirtValidationError, match="component 'RSM'"):
+        FitResult.from_dict(_identity_vcov_result(rating).to_dict())
+
+    payload = fitted.to_dict()
+    for change, message in (
+        (lambda info: info.pop("components"), "components is required"),
+        (lambda info: info["components"][0].update(name="Bogus"), "'Bogus'"),
+        (lambda info: info["components"][1].update(items=[0, 1]), "cover positions"),
+        (lambda info: info.update(n_categories=None), "n_categories"),
+        (lambda info: info.update(loading_pattern=[[1.0]]), "does not apply"),
+    ):
+        changed = copy.deepcopy(payload)
+        change(changed["model"])
+        with pytest.raises(MirtValidationError, match=message):
+            FitResult.from_dict(changed)
 
 
 def _identity_vcov_result(
@@ -395,6 +512,245 @@ def test_item_priors_resolve_per_component(data) -> None:
         )
 
 
+TIGHT_SLOPES = {"discrimination": LogNormalPrior(0.0, 0.01)}
+
+
+@pytest.mark.parametrize(
+    "se_method", ["oakes", "crossprod", "sandwich", "complete_data"]
+)
+def test_item_prior_curvature_enters_mixed_standard_errors(data, se_method) -> None:
+    # Regression: mixed-format errors left out the prior's curvature for every
+    # se_method although the estimates are posterior modes.
+    responses = data[1][:400, 6:9]
+    options = {"se_method": se_method, "item_priors": TIGHT_SLOPES, "tol": 1e-4}
+    graded = GradedResponseModel(3, n_categories=4)
+
+    reference = EMEstimator(**options).fit(graded.copy(), responses)
+    result = MixedFormatEMEstimator(**options).fit(
+        MixedItemModel([(graded.copy(), range(3))]), responses
+    )
+
+    assert result.se_method == reference.se_method == se_method
+    assert result.log_posterior == pytest.approx(reference.log_posterior, abs=1e-8)
+    for name, errors in reference.standard_errors.items():
+        np.testing.assert_allclose(
+            result.standard_errors[f"GRM.{name}"], errors, atol=1e-8
+        )
+    if reference.vcov is not None:
+        np.testing.assert_allclose(result.vcov, reference.vcov, atol=1e-10)
+
+
+@pytest.mark.parametrize("se_method", ["oakes", "complete_data"])
+def test_mixed_errors_stay_below_the_prior_bound(data, se_method) -> None:
+    responses = data[1][:400]
+    result = mirt.fit_mirt(
+        responses, model=TYPES, priors=TIGHT_SLOPES, se_method=se_method, tol=1e-3
+    )
+
+    prior = TIGHT_SLOPES["discrimination"]
+    for name in ("3PL.discrimination", "GRM.discrimination", "2PL.discrimination"):
+        estimate = result.model.parameters[name]
+        # The log-posterior is at least as curved as the log-prior.
+        bound = 1.0 / np.sqrt(-prior.hess_log_pdf(estimate))
+        errors = result.standard_errors[name]
+        finite = np.isfinite(errors)
+        assert np.count_nonzero(finite) >= errors.size - 1
+        assert np.all(errors[finite] <= bound[finite] * (1.0 + 1e-6))
+
+
+def test_mixed_bayes_modal_errors_invert_the_log_posterior_hessian() -> None:
+    rng = np.random.default_rng(23)
+    types = ["2PL"] * 3 + ["GRM"] * 2
+    responses = _true_model(types, rng).simulate(rng.standard_normal((300, 1)), seed=4)
+    priors = {"discrimination": LogNormalPrior(0.0, 0.3), "difficulty": NormalPrior()}
+    result = MixedFormatEMEstimator(
+        n_quadpts=15, tol=1e-7, item_priors=priors, se_method="oakes"
+    ).fit(MixedItemModel.from_itemtypes(types, n_categories=4), responses)
+
+    model = result.model
+    quadrature = GaussHermiteQuadrature(15)
+    mass = quadrature.weights / quadrature.weights.sum()
+    likelihood, _ = _finite_difference_information(
+        model, responses, quadrature, mass, 1e-4
+    )
+    values, layouts = _flatten_parameters(model)
+    # Second differences of the log-prior, independent of hess_log_pdf.
+    step = 1e-4
+    curvature = np.zeros_like(values)
+    offset = 0
+    for name, layout in layouts.items():
+        size = layout.free_indices.size
+        prior = priors.get(name.split(".")[1])
+        if prior is not None:
+            x = values[offset : offset + size]
+            curvature[offset : offset + size] = (
+                -(
+                    prior.log_pdf(x + step)
+                    - 2 * prior.log_pdf(x)
+                    + prior.log_pdf(x - step)
+                )
+                / step**2
+            )
+        offset += size
+    assert np.count_nonzero(curvature) == 3 * 2 + 2
+    covariance = np.linalg.inv(likelihood + np.diag(curvature))
+    # The reference differences the likelihood (h=1e-4), so allow its error.
+    np.testing.assert_allclose(result.vcov, covariance, rtol=1e-4, atol=1e-7)
+
+
+def test_estimate_covariance_rejects_unknown_prior_names(data, fitted) -> None:
+    # Unqualified names silently dropped the prior of mixed-format models.
+    quadrature = GaussHermiteQuadrature(21)
+    mass = quadrature.weights / quadrature.weights.sum()
+    with pytest.raises(MirtValidationError, match="unknown parameters: discrim"):
+        estimate_covariance(
+            fitted.model,
+            data[1],
+            quadrature,
+            mass,
+            "oakes",
+            prior_information={"discrimination": np.ones(6)},
+        )
+
+
+def _rating_scale_test(
+    rng: np.random.Generator, family: type = RatingScaleModel
+) -> tuple[MixedItemModel, np.ndarray]:
+    rating = family(3, 4)
+    rating.set_parameters(
+        difficulty=rng.normal(0.0, 0.5, 3), thresholds=np.array([-1.0, 0.2, 1.1])
+    )
+    true = MixedItemModel(
+        [(TwoParameterLogistic(2), range(2)), (rating, range(2, 5))],
+        item_names=[f"Q{item}" for item in range(5)],
+    )
+    responses = true.simulate(rng.standard_normal((600, 1)), seed=17)
+    model = MixedItemModel(
+        [(TwoParameterLogistic(2), range(2)), (family(3, 4), range(2, 5))],
+        item_names=true.item_names,
+    )
+    return model, responses
+
+
+def test_shared_component_parameters_are_not_labeled_per_item() -> None:
+    # Regression: a component's shared thresholds, whose length equals the
+    # component's item count, were labeled and tabulated per item.
+    model, responses = _rating_scale_test(np.random.default_rng(16))
+    assert model._shared_parameters == frozenset({"RSM.thresholds"})
+    assert not model._item_indexed("RSM.thresholds")
+    assert model._item_indexed("2PL.discrimination")
+
+    result = MixedFormatEMEstimator(se_method="crossprod", tol=1e-3).fit(
+        model, responses
+    )
+    assert result.vcov_labels[-3:] == [
+        "RSM.difficulty[Q4]",
+        "RSM.thresholds[1]",
+        "RSM.thresholds[2]",
+    ]
+    summary = result.summary()
+    thresholds = summary[summary.index("RSM.thresholds:") :]
+    assert "RSM.thresholds[1]" in thresholds
+    assert "Q3" not in thresholds
+    with pytest.raises(MirtModelError, match="RSM.thresholds is shared"):
+        model.item_parameter_arrays()
+    with pytest.raises(MirtModelError, match="RSM.thresholds is shared"):
+        result.coef()
+
+    graded = MixedItemModel(
+        [(TwoParameterLogistic(2), range(2)), (GradedRatingScaleModel(1, 4), [2])]
+    )
+    labels = _identity_vcov_result(graded).vcov_labels
+    assert "GRSM.discrimination[0]" in labels
+    assert "GRSM.thresholds[1]" in labels
+
+
+@pytest.mark.parametrize("family", [RatingScaleModel, GradedRatingScaleModel])
+def test_auto_errors_of_shared_components_use_exact_information(
+    monkeypatch, family
+) -> None:
+    # Regression: "auto" chose "oakes", whose shared coordinates fell back
+    # to O(P^2) differences of the marginal likelihood.
+    model, responses = _rating_scale_test(np.random.default_rng(18), family)
+    single = EMEstimator(se_method="oakes", tol=1e-6).fit(
+        family(3, 4), responses[:, 2:]
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("finite differences were used")
+
+    for name in ("_finite_difference_information", "_finite_difference_scores"):
+        monkeypatch.setattr(f"mirt.estimation.standard_errors.{name}", forbidden)
+    result = MixedFormatEMEstimator(tol=1e-3).fit(model, responses)
+    wrapped = MixedFormatEMEstimator(tol=1e-6).fit(
+        MixedItemModel([(family(3, 4), range(3))]), responses[:, 2:]
+    )
+
+    assert result.se_method == wrapped.se_method == "oakes"
+    errors = result.standard_errors[f"{family.model_name}.thresholds"]
+    assert np.all(np.isfinite(errors[1:]) & (errors[1:] > 0.0))
+    # A one-component wrapper reproduces the family's exact information.
+    for name, values in single.standard_errors.items():
+        np.testing.assert_allclose(
+            wrapped.standard_errors[f"{family.model_name}.{name}"],
+            values,
+            rtol=1e-7,
+            atol=1e-12,
+        )
+    np.testing.assert_allclose(wrapped.vcov, single.vcov, rtol=1e-7, atol=1e-12)
+
+
+def test_bl_estimator_uses_component_parameter_boxes() -> None:
+    # Regression: qualified names fell back to (-10, 10), so guessing could
+    # leave [0, 0.5].
+    rng = np.random.default_rng(5)
+    types = ["3PL"] * 6 + ["2PL"] * 4
+    responses = _true_model(types, rng).simulate(rng.standard_normal((500, 1)), seed=3)
+    model = MixedItemModel.from_itemtypes(types)
+    estimator = BLEstimator(max_iter=200)
+
+    _, bounds, _ = estimator._flatten_parameters(model)
+    expected = [
+        BLEstimator()._flatten_parameters(component)[1]
+        for component in model.component_models
+    ]
+    assert bounds == expected[0] + expected[1]
+    assert bounds[12] == (0.0, 0.5)
+
+    result = estimator.fit(model, responses)
+    guessing = result.model.parameters["3PL.guessing"]
+    assert np.all((guessing >= 0.0) & (guessing <= 0.5))
+    assert result.se_method == "hessian"
+    assert len(result.vcov_labels) == model.n_parameters
+
+
+@pytest.mark.parametrize("method", ["numerical", "forward", "richardson"])
+def test_compute_se_differences_mixed_components(data, fitted, method) -> None:
+    # Regression: itemwise methods indexed component arrays by test item.
+    _, responses = data
+    model = fitted.model
+    quadrature = GaussHermiteQuadrature(21)
+    posterior = _posterior_from_model(model, responses, quadrature)
+
+    errors = compute_se(model, responses, quadrature, posterior, method=method)
+
+    assert errors.keys() == model.parameters.keys()
+    for (component, items), prefix in zip(
+        model.components, model.component_names, strict=True
+    ):
+        own = compute_se(
+            component, responses[:, items], quadrature, posterior, method=method
+        )
+        for name, values in own.items():
+            np.testing.assert_array_equal(errors[f"{prefix}.{name}"], values)
+    if method == "numerical":
+        complete = mirt.fit_mirt(
+            responses, model=TYPES, tol=1e-3, se_method="complete_data"
+        )
+        for name, values in complete.standard_errors.items():
+            np.testing.assert_allclose(errors[name], values, rtol=0.02)
+
+
 def test_parallel_m_step_and_missing_responses_match_serial(data) -> None:
     _, responses = data
     model = MixedItemModel.from_itemtypes(TYPES, n_categories=4)
@@ -516,6 +872,11 @@ def test_single_family_estimators_reject_mixed_models(data, estimator) -> None:
         estimator().fit(model, responses)
     for name, values in model.parameters.items():
         np.testing.assert_array_equal(values, before[name])
+
+    # Shared component parameters do not change the advice.
+    rating, rating_responses = _rating_scale_test(np.random.default_rng(3))
+    with pytest.raises(MirtModelError, match="cannot optimize a MixedItemModel"):
+        estimator().fit(rating, rating_responses)
 
 
 def test_em_estimator_for_selects_by_model() -> None:

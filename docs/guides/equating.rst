@@ -353,12 +353,8 @@ coded as missing:
    )
    print(calibration.latent_mean, calibration.latent_cov)
    new_items = calibration.new_item_parameters
-   scores = mirt.fscores(
-       calibration.model,
-       responses,
-       prior_mean=calibration.latent_mean,
-       prior_cov=calibration.latent_cov,
-   )
+   # The fit result carries the estimated population for scoring.
+   scores = mirt.fscores(calibration.fit_result, responses)
 
 ``anchor_parameters`` may be a model or fit result containing exactly the
 anchor items, in ``anchor_items`` order, or a mapping from parameter names to

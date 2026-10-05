@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import warnings
 from collections.abc import Callable, Iterable, Sequence
 from numbers import Integral, Real
@@ -7,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.optimize import LinearConstraint, minimize
+from scipy.optimize import minimize
 from scipy.special import xlog1py, xlogy
 
 from mirt._backend_config import should_use_rust
@@ -23,6 +24,11 @@ from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.backends.rust.estimation import em_iteration_3pl
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._em_context import EMFitContext
+from mirt.estimation._graded_order import (
+    GradedOrder,
+    graded_order,
+    graded_threshold_constraint,
+)
 from mirt.estimation._item_priors import (
     ItemPriorPenalty,
     ItemPriors,
@@ -46,7 +52,7 @@ from mirt.estimation.base import (
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.se_methods import _compute_item_se_curvature
 from mirt.estimation.standard_errors import StandardErrorMethod, validate_se_method
-from mirt.exceptions import MirtEstimationError, MirtValidationError
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.estimation.latent_density import LatentDensity
@@ -54,13 +60,28 @@ if TYPE_CHECKING:
     from mirt.results.fit_result import FitResult
 
 # Relative function-change tolerance for precise M-steps: the native graded
-# optimizer and every item optimizer under SQUAREM. Item objectives are large
-# sums, so looser values can stop with parameter errors near 1e-3, and the
-# resulting noisy M-steps slow EM and defeat extrapolation.
+# optimizer, analytic dichotomous items, shared and tied-item steps, and every
+# item optimizer under SQUAREM. Item objectives are large sums, so looser
+# values can stop with parameter errors near 1e-3, and the resulting noisy
+# M-steps slow EM and defeat extrapolation.
 _PRECISE_ITEM_FTOL = 1e-10
 # Product quadrature grids beyond this many nodes trigger a warning.
 _LARGE_GRID_NODES = 1_000_000
 _ACCELERATIONS = ("none", "squarem")
+# Latent densities that ``EMEstimator(latent_density=...)`` builds by name,
+# and those of them defined for several factors.
+_DENSITY_NAMES = (
+    "gaussian",
+    "normal",
+    "empirical",
+    "histogram",
+    "eh",
+    "ehw",
+    "empiricalhist_woods",
+    "davidian",
+    "mixture",
+)
+_MULTIVARIATE_DENSITY_NAMES = ("gaussian", "normal", "empirical", "histogram", "eh")
 # SQUAREM grows the maximum step length by this factor after a successful
 # step at the maximum and shrinks it after a rejected one.
 _SQUAREM_STEP_FACTOR = 4.0
@@ -121,58 +142,94 @@ def _add_prior_curvature(
     return np.where(curvature != 0, combined, errors)
 
 
-def _graded_threshold_constraint(
-    model: BaseItemModel, item_idx: int, n_parameters: int
-) -> LinearConstraint | None:
-    """Keep adjacent GRM thresholds ordered in the estimator's free layout.
+def _ordered_step(
+    order: GradedOrder,
+    objective: Callable[[NDArray[np.float64]], Any],
+    bounds: list[tuple[float, float]],
+    start: NDArray[np.float64],
+    proposal: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return an ordered graded M-step that does not raise the item objective.
 
-    Fixed thresholds contribute constants, while padded threshold storage is
-    excluded. A small positive gap for movable thresholds keeps roundoff and
-    numerical derivative probes from creating negative category probabilities.
+    SLSQP meets its constraints only up to its tolerance, so thresholds tied
+    by an empty category can end up slightly closer than the ordering gap.
+    Such a proposal is projected onto the ordered box, like the native graded
+    M-step's iterates, and kept unless its objective exceeds that of the
+    start, which is projected as well.
     """
-    from mirt.models.polytomous import GradedResponseModel
+    lower, upper = np.asarray(bounds, dtype=np.float64).reshape(-1, 2).T
+    projected = None
+    if np.all(np.isfinite(proposal)):
+        projected = order.project(proposal, lower, upper)
+        if np.array_equal(projected, proposal):
+            return projected
+    start = order.project(start, lower, upper)
+    if projected is None:
+        return start
 
-    if not isinstance(model, GradedResponseModel):
-        return None
-    n_thresholds = model.n_categories[item_idx] - 1
-    if n_thresholds < 2:
-        return None
-    free_masks = model.free_parameter_masks
-    offset = 0
-    positions = {}
-    values = None
+    def value(point: NDArray[np.float64]) -> float:
+        result = objective(point)
+        return float(result[0] if isinstance(result, tuple) else result)
+
+    return projected if value(projected) <= value(start) else start
+
+
+def _family_item_layout(
+    model: BaseItemModel, item_idx: int
+) -> tuple[
+    BaseItemModel, NDArray[np.float64], NDArray[np.bool_], list[tuple[float, float]]
+]:
+    """Return one item's coordinates in its family's free layout.
+
+    Returns a shallow view of ``model`` without user free-parameter masks,
+    the item's values in that layout, which of them the masks leave free, and
+    a box that also covers the fixed values, which may lie outside the
+    optimizer bounds.
+    """
+    view = copy.copy(model)
+    view._free_parameter_restrictions = {}
+    family_masks = view.free_parameter_masks
+    masks = model.free_parameter_masks
+    values: list[float] = []
+    free: list[bool] = []
+    bounds: list[tuple[float, float]] = []
     for name, array in model.parameters.items():
         if not model._item_indexed(name):
             continue
-        mask = np.asarray(free_masks[name][item_idx]).reshape(-1)
-        indices = np.flatnonzero(mask)
-        if name == "thresholds":
-            values = np.asarray(array[item_idx]).reshape(-1)[:n_thresholds]
-            positions = {
-                int(index): offset + column for column, index in enumerate(indices)
-            }
-        offset += len(indices)
-    if values is None:
-        return None
-    rows = []
-    lower = []
-    for first in range(n_thresholds - 1):
-        row = np.zeros(n_parameters)
-        fixed_difference = 0.0
-        for index, sign in ((first, -1.0), (first + 1, 1.0)):
-            if index in positions:
-                row[positions[index]] = sign
-            else:
-                fixed_difference += sign * values[index]
-        if not np.any(row):
-            if fixed_difference < 0:
-                raise MirtValidationError("fixed GRM thresholds must be ordered")
-            continue
-        rows.append(row)
-        lower.append(1e-6 - fixed_difference)
+        family = np.asarray(family_masks[name][item_idx], dtype=np.bool_).reshape(-1)
+        row = np.asarray(model._canonical_parameter_values(name, array)[item_idx])
+        item_free = np.asarray(masks[name][item_idx], dtype=np.bool_).reshape(-1)
+        low, high = _parameter_bounds(model, name)
+        for value, is_free in zip(
+            row.reshape(-1)[family], item_free[family], strict=True
+        ):
+            values.append(float(value))
+            free.append(bool(is_free))
+            bounds.append(
+                (low, high) if is_free else (min(low, value), max(high, value))
+            )
     return (
-        LinearConstraint(np.asarray(rows), np.asarray(lower), np.inf) if rows else None
+        view,
+        np.asarray(values, dtype=np.float64),
+        np.asarray(free, dtype=np.bool_),
+        bounds,
     )
+
+
+def _fix_coordinates(
+    objective: Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]],
+    values: NDArray[np.float64],
+    free: NDArray[np.bool_],
+) -> Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]:
+    """Restrict an objective and its gradient to the ``free`` coordinates."""
+
+    def restricted(params: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
+        point = values.copy()
+        point[free] = params
+        value, gradient = objective(point)
+        return value, gradient[free]
+
+    return restricted
 
 
 class EMEstimator(BaseEstimator):
@@ -196,19 +253,29 @@ class EMEstimator(BaseEstimator):
         Print the log-likelihood at each recorded iterate.
     latent_density : LatentDensity or str, optional
         Latent density specification. Defaults to a fixed Gaussian density
-        with the prior mean and covariance passed to :meth:`fit`.
+        with the prior mean and covariance passed to :meth:`fit`, which
+        ``"gaussian"`` (or ``"normal"``) also selects. ``"empirical"`` (or
+        ``"histogram"``/``"eh"``) estimates a histogram over the quadrature
+        nodes, for any number of factors. The univariate ``"davidian"``
+        (Davidian curve of degree 4), ``"mixture"`` (two Gaussian components)
+        and ``"ehw"`` (Woods' extrapolated histogram) require one factor.
+        Each fit builds a new density from a name, while a
+        :class:`~mirt.estimation.latent_density.LatentDensity` instance is
+        used, and updated, as given.
     prob_epsilon : float, default=1e-10
         Probability clipping bound used by item objectives.
     item_optim_maxiter : int, default=50
         Iteration limit for itemwise numerical optimizers.
     item_optim_ftol : float, default=1e-6
         Relative function-change tolerance for itemwise numerical optimizers.
-        The native graded response M-step uses at most ``1e-10``, because
-        looser relative criteria make its EM iterations jitter. Built-in 1PL
-        and 2PL items without parameter restrictions are solved jointly by
-        Newton's method to a tight tolerance. They use the numerical optimizer
-        only as a fallback, for example when an estimate reaches a parameter
-        bound.
+        Built-in dichotomous items with analytic gradients (1PL-4PL and the
+        logistic items of multidimensional and bifactor models) and the
+        native graded response M-step use at most ``1e-10``, because looser
+        relative criteria make their EM iterations jitter and stall short of
+        the optimum. Built-in 1PL and 2PL items without parameter
+        restrictions are solved jointly by Newton's method to a tight
+        tolerance. They use the numerical optimizer only as a fallback, for
+        example when an estimate reaches a parameter bound.
     se_step_size : float, default=1e-5
         Finite-difference step for itemwise complete-data standard errors of
         custom item models, and for marginal-likelihood differences of models
@@ -245,10 +312,7 @@ default="auto"
         and Roland, 2008) with step-length adaptation, projection onto the
         item parameter bounds and a monotone fallback to the plain EM step.
         Extrapolation needs precise M-steps, so item optimizers then use a
-        relative tolerance of at most ``1e-10``. Precise M-steps keep the
-        equal default starting slopes of an exploratory multidimensional
-        model equal, so such a fit can stop at that symmetric stationary
-        point, which inexact plain EM M-steps sometimes leave by chance.
+        relative tolerance of at most ``1e-10``.
         SQUAREM uses the generic E- and M-steps and so bypasses the fused
         native 3PL iteration. A latent density other than a fixed Gaussian
         falls back to plain EM with a warning. With acceleration,
@@ -316,7 +380,7 @@ default="auto"
         tol: float = 1e-4,
         verbose: bool = False,
         latent_density: LatentDensity
-        | Literal["gaussian", "empirical", "davidian", "mixture"]
+        | Literal["gaussian", "empirical", "davidian", "mixture", "ehw"]
         | None = None,
         prob_epsilon: float = 1e-10,
         item_optim_maxiter: int = 50,
@@ -374,6 +438,16 @@ default="auto"
         # Method and free-parameter covariance behind the latest standard errors.
         self._se_details: tuple[str, NDArray[np.float64] | None] | None = None
         self._quadrature: GaussHermiteQuadrature | None = None
+        if isinstance(latent_density, str):
+            name = latent_density.strip().lower()
+            if name not in _DENSITY_NAMES:
+                raise MirtValidationError(
+                    f"Unknown latent density: {latent_density!r}",
+                    parameter="latent_density",
+                    value=latent_density,
+                    expected=", ".join(repr(known) for known in _DENSITY_NAMES),
+                )
+            latent_density = name
         self._latent_density_spec = latent_density
         self._latent_density: LatentDensity | None = None
         self._pattern_frequencies: NDArray[np.float64] | None = None
@@ -420,6 +494,12 @@ default="auto"
         -------
         FitResult
             Fitted model, log-likelihood, standard errors and fit statistics.
+            The final mean and covariance of a Gaussian latent density, for
+            example the correlations estimated by a
+            :class:`~mirt.estimation.latent_density.FactorCovarianceDensity`,
+            are its ``latent_mean`` and ``latent_covariance`` (``None`` for a
+            zero mean and an identity covariance), and ``refit_recipe``
+            records the estimator settings and the final density.
 
         Raises
         ------
@@ -444,19 +524,25 @@ default="auto"
         if prior_cov is None:
             prior_cov = np.eye(model.n_factors)
 
-        if self._latent_density_spec is None:
+        spec = self._latent_density_spec
+        if spec is None or spec in ("gaussian", "normal"):
             self._latent_density = GaussianDensity(
                 mean=prior_mean,
                 cov=prior_cov,
                 n_dimensions=model.n_factors,
             )
-        elif isinstance(self._latent_density_spec, str):
-            self._latent_density = create_density(
-                self._latent_density_spec,
-                n_dimensions=model.n_factors,
-            )
+        elif isinstance(spec, str):
+            if model.n_factors != 1 and spec not in _MULTIVARIATE_DENSITY_NAMES:
+                raise MirtValidationError(
+                    f"latent_density={spec!r} is univariate, but the model has "
+                    f"{model.n_factors} factors; use 'gaussian' or 'empirical'",
+                    parameter="latent_density",
+                    value=spec,
+                    expected="'gaussian' or 'empirical'",
+                )
+            self._latent_density = create_density(spec)
         else:
-            self._latent_density = self._latent_density_spec
+            self._latent_density = spec
 
         priors = resolve_item_priors(self.item_priors, model)
         _apply_starting_values(model, start)
@@ -479,6 +565,7 @@ default="auto"
                 self._prior_penalty = None
 
     def _fit_prepared(self, model: BaseItemModel, context: EMFitContext) -> FitResult:
+        from mirt.estimation._refit import gaussian_population, recipe_for
         from mirt.results.fit_result import FitResult
 
         responses = context.responses
@@ -515,6 +602,7 @@ default="auto"
             n_params -= self._tied.n_redundant
         aic = self._compute_aic(current_ll, n_params)
         bic = self._compute_bic(current_ll, n_params, n_persons)
+        latent_mean, latent_covariance = gaussian_population(self._latent_density)
 
         return FitResult(
             model=model,
@@ -529,6 +617,9 @@ default="auto"
             log_posterior=None if self._prior_penalty is None else objective,
             se_method=se_method,
             vcov=covariance,
+            latent_covariance=latent_covariance,
+            latent_mean=latent_mean,
+            refit_recipe=recipe_for(self),
         )
 
     def _evaluate(
@@ -1214,7 +1305,7 @@ default="auto"
                         start,
                         bounds,
                         objective,
-                        _graded_threshold_constraint(model, item, start.size),
+                        graded_threshold_constraint(model, item, start.size),
                     )
                     parts.append(part)
                     if not analytic:
@@ -1365,29 +1456,28 @@ default="auto"
         if objective is None:
             return current_params
 
-        constraint = _graded_threshold_constraint(model, item_idx, current_params.size)
-        constrained = {"constraints": (constraint,)} if constraint is not None else {}
+        order = graded_order(model, item_idx, current_params.size)
+        constrained = {} if order is None else {"constraints": (order.constraint,)}
         try:
             result = minimize(
                 objective,
                 x0=current_params,
-                method="SLSQP" if constraint is not None else "L-BFGS-B",
+                method="L-BFGS-B" if order is None else "SLSQP",
                 jac=analytic,
                 bounds=bounds,
                 options={
                     "maxiter": self.item_optim_maxiter,
-                    "ftol": self._item_optim_ftol(),
+                    # Loosely solved 3PL/4PL items jitter between M-steps,
+                    # which stalls EM short of the optimum.
+                    "ftol": self._item_optim_ftol(
+                        precise=analytic and not model.is_polytomous
+                    ),
                 },
                 **constrained,
             )
-            if constraint is not None and (
-                not np.all(np.isfinite(result.x))
-                or np.any(constraint.A @ result.x < constraint.lb - 1e-8)
-            ):
-                raise MirtEstimationError(
-                    f"GRM item {item_idx} optimization did not preserve threshold ordering"
-                )
-            return result.x
+            if order is None:
+                return result.x
+            return _ordered_step(order, objective, bounds, current_params, result.x)
         finally:
             if not analytic:
                 self._set_item_params(model, item_idx, current_params)
@@ -1424,6 +1514,12 @@ default="auto"
         current_params, bounds = self._get_item_params_and_bounds(model, item_idx)
         if not current_params.size:
             return current_params, bounds, None, True
+        # Prepared objectives use the model family's free layout, so items
+        # with coordinates fixed by user masks fill those in.
+        target, layout_bounds, layout = model, bounds, None
+        if model._free_parameter_restrictions:
+            target, values, free, layout_bounds = _family_item_layout(model, item_idx)
+            layout = None if free.all() else (values, free)
 
         objective: Callable[
             [NDArray[np.float64]], float | tuple[float, NDArray[np.float64]]
@@ -1446,7 +1542,7 @@ default="auto"
             if not np.any(r_kc):
                 return current_params, bounds, None, True
             prepared = prepare_polytomous_objective(
-                model, item_idx, quad_points, r_kc, self.prob_epsilon
+                target, item_idx, quad_points, r_kc, self.prob_epsilon
             )
             if prepared is None:
 
@@ -1477,17 +1573,23 @@ default="auto"
             )
 
             prepared = prepare_dichotomous_objective(
-                model, item_idx, quad_points, n_k_valid, r_k, self.prob_epsilon, bounds
+                target,
+                item_idx,
+                quad_points,
+                n_k_valid,
+                r_k,
+                self.prob_epsilon,
+                layout_bounds,
             )
             if prepared is None:
                 prepared = prepare_affine_objective(
-                    model,
+                    target,
                     item_idx,
                     quad_points,
                     n_k_valid,
                     r_k,
                     self.prob_epsilon,
-                    bounds,
+                    layout_bounds,
                 )
             if prepared is None:
 
@@ -1506,7 +1608,9 @@ default="auto"
 
         analytic = prepared is not None
         if prepared is not None:
-            objective = prepared
+            objective = (
+                prepared if layout is None else _fix_coordinates(prepared, *layout)
+            )
         if self._prior_penalty is not None:
             objective, bounds = self._prior_penalty.penalize(
                 model, item_idx, objective, bounds, analytic=analytic

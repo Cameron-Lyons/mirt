@@ -4,7 +4,7 @@ import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.results.ability_posterior import AbilityPosteriorResult
 from mirt.results.score_result import ScoreResult
@@ -18,6 +18,7 @@ from mirt.utils.numeric import logsumexp_axis1
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+    from mirt.scoring._bifactor import ReducedBifactorGrid
 
 
 _TARGET_WORKING_BYTES = 32 * 1024 * 1024
@@ -33,6 +34,12 @@ _DEFAULT_QUADPTS_HIGH_DIMENSIONAL = 5
 # Larger grids still run, with a warning; 21 points in five dimensions is the
 # largest grid the package requests internally.
 _LARGE_GRID_NODES = 21**5
+# Bifactor EAP integrates two-dimensional (general by specific) grids, so it
+# keeps the two-factor default whatever the number of specific factors.
+_DEFAULT_BIFACTOR_QUADPTS = _DEFAULT_QUADPTS_BY_FACTORS[2]
+# Automatic product grids coarser than this per dimension visibly bias the
+# posterior summaries of bifactor models (by up to 0.4 at five points).
+_MIN_ACCURATE_BIFACTOR_QUADPTS = 11
 
 
 def _default_n_quadpts(n_factors: int) -> int:
@@ -75,12 +82,32 @@ class EAPScorer:
         Quadrature points per latent dimension. ``None`` chooses a size from
         the model's factor count when scoring: 49 points for one or two
         factors, 21 for three, 9 for four, 7 for five, and 5 for six or more.
+        Bifactor models that :meth:`score` integrates by dimension reduction
+        (see Notes) default to 49 points whatever their factor count.
     prior_mean : ndarray, optional
         Prior mean for theta. Default zeros.
     prior_cov : ndarray, optional
         Prior covariance for theta. Default identity.
     batch_size : int, optional
         Maximum response rows per likelihood batch.
+
+    Notes
+    -----
+    EAP integrates over a tensor-product grid of ``n_quadpts ** n_factors``
+    nodes. For a :class:`~mirt.models.BifactorModel` whose prior makes the
+    specific factors conditionally independent given the general factor (any
+    diagonal covariance, for example), :meth:`score` instead integrates each
+    specific factor jointly with the general factor on its own
+    ``n_quadpts ** 2`` grid (Gibbons & Hedeker, 1992). This reproduces the
+    product-grid estimates at the same ``n_quadpts`` to rounding error, at a
+    cost linear rather than exponential in the number of specific factors.
+    Bifactor models scored on an automatic product grid coarser than 11 points
+    per dimension emit a ``RuntimeWarning``.
+
+    References
+    ----------
+    Gibbons, R. D., & Hedeker, D. R. (1992). Full-information item bi-factor
+        analysis. Psychometrika, 57(3), 423-436.
     """
 
     def __init__(
@@ -118,9 +145,12 @@ class EAPScorer:
 
     def _quadrature(
         self,
-        n_factors: int,
+        model: BaseItemModel,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Build the scoring grid, resolving the automatic grid size."""
+        """Build the product grid, resolving the automatic grid size."""
+        from mirt.models.bifactor import BifactorModel
+
+        n_factors = model.n_factors
         default = _default_n_quadpts(n_factors)
         n_quadpts = default if self.n_quadpts is None else self.n_quadpts
         n_nodes = n_quadpts**n_factors
@@ -137,12 +167,43 @@ class EAPScorer:
                 RuntimeWarning,
                 stacklevel=3,
             )
+        if (
+            self.n_quadpts is None
+            and n_quadpts < _MIN_ACCURATE_BIFACTOR_QUADPTS
+            and isinstance(model, BifactorModel)
+        ):
+            advice = (
+                "; fscores(method='EAP') integrates this model by dimension "
+                "reduction instead"
+                if self._bifactor_grid(model) is not None
+                else ""
+            )
+            warnings.warn(
+                f"EAP for this {n_factors}-factor bifactor model uses a product "
+                f"grid of only {n_quadpts} points per dimension, which biases "
+                f"posterior summaries; pass n_quadpts to choose a finer grid{advice}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
         return build_quadrature(
             n_quadpts=n_quadpts,
             n_factors=n_factors,
             prior_mean=self.prior_mean,
             prior_cov=self.prior_cov,
         )
+
+    def _bifactor_grid(self, model: BaseItemModel) -> ReducedBifactorGrid | None:
+        """Return the dimension-reduced bifactor grid when it applies."""
+        from mirt.models.bifactor import BifactorModel
+
+        if not isinstance(model, BifactorModel):
+            return None
+        from mirt.scoring._bifactor import reduced_bifactor_grid
+
+        n_quadpts = (
+            _DEFAULT_BIFACTOR_QUADPTS if self.n_quadpts is None else self.n_quadpts
+        )
+        return reduced_bifactor_grid(model, n_quadpts, self.prior_mean, self.prior_cov)
 
     def _resolve_batch_size(
         self,
@@ -190,34 +251,20 @@ class EAPScorer:
         np.exp(posterior, out=posterior)
         return posterior, log_marginal
 
-    def score(
+    def _product_grid_moments(
         self,
         model: BaseItemModel,
-        responses: NDArray[np.int_],
-    ) -> ScoreResult:
-        if not model.is_fitted:
-            raise ValueError("Model must be fitted before scoring")
-
-        responses = validate_scoring_responses(model, responses)
-        n_factors = model.n_factors
-
-        quad_points, quad_weights = self._quadrature(n_factors)
-        if responses.shape[0] == 0:
-            shape = (0,) if n_factors == 1 else (0, n_factors)
-            return ScoreResult(
-                theta=np.empty(shape, dtype=np.float64),
-                standard_error=np.empty(shape, dtype=np.float64),
-                method="EAP",
-            )
-
-        patterns, inverse = _eap_response_patterns(responses)
-
+        patterns: NDArray[np.int_],
+        quad_points: NDArray[np.float64],
+        quad_weights: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return posterior means and SDs of patterns on the product grid."""
         center = quad_weights @ quad_points
         centered_points = quad_points - center
         centered_points_squared = centered_points**2
         log_weights = np.log(quad_weights + 1e-300)
         n_patterns = patterns.shape[0]
-        pattern_theta = np.empty((n_patterns, n_factors), dtype=np.float64)
+        pattern_theta = np.empty((n_patterns, model.n_factors), dtype=np.float64)
         pattern_se = np.empty_like(pattern_theta)
         batch_size = self._resolve_batch_size(
             n_patterns=n_patterns,
@@ -239,6 +286,47 @@ class EAPScorer:
             variance = posterior @ centered_points_squared - centered_mean**2
             np.maximum(variance, 0.0, out=variance)
             np.sqrt(variance, out=pattern_se[start:stop])
+        return pattern_theta, pattern_se
+
+    def score(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+    ) -> ScoreResult:
+        if not model.is_fitted:
+            raise ValueError("Model must be fitted before scoring")
+
+        responses = validate_scoring_responses(model, responses)
+        n_factors = model.n_factors
+
+        bifactor_grid = self._bifactor_grid(model)
+        quadrature = None if bifactor_grid is not None else self._quadrature(model)
+        if responses.shape[0] == 0:
+            shape = (0,) if n_factors == 1 else (0, n_factors)
+            return ScoreResult(
+                theta=np.empty(shape, dtype=np.float64),
+                standard_error=np.empty(shape, dtype=np.float64),
+                method="EAP",
+            )
+
+        patterns, inverse = _eap_response_patterns(responses)
+        if bifactor_grid is not None:
+            from mirt.scoring._bifactor import bifactor_eap
+
+            pattern_theta, pattern_se = bifactor_eap(
+                bifactor_grid,
+                patterns,
+                lambda n_nodes: self._resolve_batch_size(
+                    n_patterns=patterns.shape[0],
+                    n_items=model.n_items,
+                    n_quad=n_nodes,
+                ),
+            )
+        else:
+            assert quadrature is not None
+            pattern_theta, pattern_se = self._product_grid_moments(
+                model, patterns, *quadrature
+            )
 
         theta_eap = pattern_theta[inverse]
         theta_se = pattern_se[inverse]
@@ -266,6 +354,12 @@ class EAPScorer:
         retains one probability per respondent and grid point; callers should
         account for the returned ``n_persons * n_points`` array when choosing
         ``n_quadpts`` for multidimensional models.
+
+        The joint posterior always uses the full product grid, also for
+        bifactor models, which :meth:`score` integrates by dimension
+        reduction. An automatic bifactor grid coarser than 11 points per
+        dimension emits a ``RuntimeWarning``, since it biases the posterior
+        summaries.
         """
         if not model.is_fitted:
             raise ValueError("Model must be fitted before scoring")
@@ -274,7 +368,7 @@ class EAPScorer:
         person_ids = AbilityPosteriorResult._validated_person_ids(
             person_ids, responses.shape[0]
         )
-        quad_points, quad_weights = self._quadrature(model.n_factors)
+        quad_points, quad_weights = self._quadrature(model)
         n_persons = responses.shape[0]
         posterior_weights = np.empty(
             (n_persons, quad_points.shape[0]),
@@ -332,7 +426,7 @@ class EAPScorer:
 
 def ability_posterior(
     model_or_result: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     *,
     n_quadpts: int | None = None,
     prior_mean: NDArray[np.float64] | None = None,
@@ -342,12 +436,21 @@ def ability_posterior(
 ) -> AbilityPosteriorResult:
     """Compute normalized posterior ability distributions for respondents.
 
+    ``responses`` may be an array or a pandas or polars DataFrame; negative
+    codes, ``NaN`` and the nulls of nullable DataFrame columns denote missing
+    responses, as in :func:`mirt.fit_mirt`. The posterior always lives on the
+    full product grid. Coarse grids bias posterior summaries, so for a
+    bifactor model an automatic grid coarser than 11 points per dimension
+    warns; :func:`mirt.fscores` scores bifactor models by dimension reduction
+    on a fine grid instead.
+
     ``model_or_result`` may be either a fitted item model or the ``FitResult``
     returned by :func:`mirt.fit_mirt`. ``n_quadpts`` is the number of grid
     points per latent dimension; by default it is 49 for one or two factors,
     21 for three, 9 for four, 7 for five, and 5 for six or more.
-    ``prior_cov`` defaults to the ``latent_covariance`` of a ``FitResult``
-    when it has one, and to the identity otherwise.
+    ``prior_mean`` and ``prior_cov`` default to the ``latent_mean`` and
+    ``latent_covariance`` of a ``FitResult`` when it has them, and to the
+    standard normal otherwise.
     """
     from mirt.results._common import resolve_latent_prior
 

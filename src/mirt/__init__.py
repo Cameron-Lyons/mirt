@@ -151,6 +151,8 @@ default="auto"
         (priors only from one source). Multiple factors are supported for
         "2PL" (fitted as a slope-intercept :class:`MultidimensionalModel`),
         "GRM" and "GPCM"; one factor for every family. Requires EM estimation.
+        A per-item ``model`` sequence must name one family; mixed families
+        raise ``MirtValidationError``.
     accelerate : {"none", "squarem"}, default="none"
         EM acceleration (see :class:`EMEstimator`). ``"squarem"`` extrapolates
         consecutive EM steps by SQUAREM, which usually needs far fewer
@@ -217,6 +219,7 @@ default="auto"
     from mirt.backends.rust.estimation import _em_fit_2pl_prepared
     from mirt.estimation._em_context import EMFitContext
     from mirt.estimation._item_priors import validate_item_priors
+    from mirt.estimation._refit import RefitRecipe
     from mirt.estimation._shared_step import validate_equality_constraints
     from mirt.estimation.base import _apply_starting_values, _free_masks_from_fixed
     from mirt.estimation.em import _ACCELERATIONS, EMEstimator
@@ -408,6 +411,17 @@ default="auto"
                 n_parameters=n_params,
                 se_method=used_se_method,
                 vcov=covariance,
+                # Refits use the equivalent EM settings.
+                refit_recipe=RefitRecipe(
+                    EMEstimator,
+                    {
+                        "n_quadpts": n_quadpts,
+                        "max_iter": max_iter,
+                        "tol": tol,
+                        "use_rust": use_rust,
+                        "se_method": se_method,
+                    },
+                ),
             )
 
     if estimation_method == "EM":
@@ -552,7 +566,7 @@ def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
 
 def itemfit(
     result: FitResult,
-    responses: NDArray[np.int_] | None = None,
+    responses: ArrayLike | None = None,
     statistics: list[str] | None = None,
     n_groups: int | None = None,
     p_adjust: Literal["bonferroni", "holm", "fdr_bh", "none"] = "none",
@@ -567,6 +581,8 @@ def itemfit(
     seed: int | None = None,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
+    theta: NDArray[np.float64] | None = None,
+    constraints: Sequence[Any] | None = None,
 ) -> Any:
     """Compute item fit statistics for a fitted IRT model.
 
@@ -578,8 +594,10 @@ def itemfit(
     ----------
     result : FitResult
         A fitted IRT model result from fit_mirt().
-    responses : ndarray of shape (n_persons, n_items), optional
+    responses : array-like of shape (n_persons, n_items), optional
         Response data used for fit calculation. Required for all statistics.
+        Negative codes, ``NaN`` and the nulls of nullable DataFrame columns
+        denote missing responses, as in :func:`fit_mirt`.
     statistics : list of str, optional
         Fit statistics to compute. Options include:
 
@@ -587,7 +605,9 @@ def itemfit(
           unexpected responses near ability level)
         - "outfit": Unweighted mean square (sensitive to outliers)
         - "z_infit", "z_outfit": Wilson-Hilferty standardized mean squares,
-          approximately standard normal under the model
+          approximately standard normal only with ``theta`` independent of
+          these responses; with the default EAP abilities they are biased
+          toward overfit and descriptive (a warning is issued)
         - "S_X2": Orlando-Thissen S-X2 statistic
         - "X2", "G2": Bock/Yen chi-square and likelihood-ratio statistics
           over ability groups (approximate p-values, liberal on short tests)
@@ -623,12 +643,21 @@ def itemfit(
     seed : int, optional
         Seed for the PV_Q1 plausible-value draws.
     prior_mean : ndarray of shape (n_factors,), optional
-        Mean of the normal latent population. Default zero.
+        Mean of the normal latent population. Defaults to
+        ``result.latent_mean`` when the fit has one, and to zero otherwise.
     prior_cov : ndarray of shape (n_factors, n_factors), optional
         Covariance of the normal latent population, which S-X2 integrates
         over and which is the prior of the EAP abilities behind the other
         statistics. Defaults to ``result.latent_covariance`` when the fit
         estimated one, and to the identity otherwise.
+    theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
+        Abilities for the mean-square and X2/G2 statistics, such as estimates
+        from an independent calibration. EAP scores of ``responses`` by
+        default. See :func:`mirt.diagnostics.compute_itemfit`.
+    constraints : sequence, optional
+        The ``constraints`` of a ``fit_mirt`` fit. A group of ``k`` tied
+        coordinates counts as one parameter, ``1/k`` per item, in the
+        chi-square degrees of freedom.
 
     Returns
     -------
@@ -652,6 +681,8 @@ def itemfit(
 
     if statistics is None:
         statistics = ["infit", "outfit"]
+    if prior_mean is None:
+        prior_mean = getattr(result, "latent_mean", None)
     if prior_cov is None:
         prior_cov = getattr(result, "latent_covariance", None)
 
@@ -659,6 +690,7 @@ def itemfit(
         result.model,
         responses,
         statistics,
+        theta=theta,
         n_groups=n_groups,
         p_adjust=p_adjust,
         min_expected=min_expected,
@@ -671,6 +703,7 @@ def itemfit(
         seed=seed,
         prior_mean=prior_mean,
         prior_cov=prior_cov,
+        constraints=constraints,
     )
 
     return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")
@@ -678,7 +711,7 @@ def itemfit(
 
 def personfit(
     result: FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     statistics: list[str] | None = None,
     *,
@@ -696,8 +729,9 @@ def personfit(
     ----------
     result : FitResult
         A fitted IRT model result from fit_mirt().
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing responses should be coded as -1.
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses, as in :func:`fit_mirt`.
     theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
         Ability estimates. If None, computed using EAP scoring.
     statistics : list of str, optional
@@ -783,7 +817,7 @@ def dif(
     focal_group: str | int | None = None,
     p_adjust: Literal["none", "bonferroni", "holm", "fdr_bh"] = "none",
     *,
-    anchors: Sequence[int] | None = None,
+    anchors: Sequence[int | str] | None = None,
     scheme: Literal["drop", "add", "drop_sequential", "add_sequential"] = "drop",
     n_jobs: int = 1,
 ) -> Any:
@@ -791,8 +825,14 @@ def dif(
 
     DIF analysis tests whether items function differently across groups
     after controlling for ability level. Groups are compared on a common
-    latent scale, so group impact is not reported as DIF. See
-    :func:`mirt.diagnostics.compute_dif` for the methods and their cost.
+    latent scale, so group impact is not reported as DIF.
+
+    The default likelihood-ratio test refits a multiple-group model once per
+    tested item: one to two seconds for 30 binary 2PL items and 1,000
+    persons per group, and several times longer per item for 3PL and
+    polytomous items. ``n_jobs=-1`` parallelizes the refits; ``method="wald"``
+    and :func:`mirt.diagnostics.compute_grdif` are fast screens. See
+    :func:`mirt.diagnostics.compute_dif` for the methods.
 
     Args:
         data: Response matrix (n_persons x n_items).
@@ -810,10 +850,12 @@ def dif(
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
-        p_adjust: Multiple-testing adjustment across items. Default 'none'.
-        anchors: Items assumed free of DIF; they are not tested. They anchor
-            the likelihood-ratio models or define the linking for the other
-            methods.
+        p_adjust: Multiple-testing adjustment across items. Default 'none',
+            as in :func:`mirt.multigroup.multigroup_dif` and R's
+            ``mirt::DIF``.
+        anchors: Items assumed free of DIF, by index or name; they are not
+            tested. They anchor the likelihood-ratio models or define the
+            linking for the other methods.
         scheme: Likelihood-ratio scheme: 'drop', 'add', 'drop_sequential' or
             'add_sequential'. The 'add' schemes require anchors.
         n_jobs: Worker processes for likelihood-ratio refits.

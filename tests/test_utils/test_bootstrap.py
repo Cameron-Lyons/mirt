@@ -88,10 +88,10 @@ def test_jackknife_worker_returns_fixed_size_theta_summaries(monkeypatch):
         fitted_model._parameters["difficulty"][0] = sample.sum()
         return SimpleNamespace(model=fitted_model)
 
-    def fake_scores(fitted_model, original_responses, method):
-        scores = (np.arange(len(original_responses)) + 1) * fitted_model._parameters[
-            "difficulty"
-        ][0]
+    def fake_scores(fitted, original_responses, method):
+        # Replicates are scored through their fit, which carries its population.
+        difficulty = fitted.model._parameters["difficulty"][0]
+        scores = (np.arange(len(original_responses)) + 1) * difficulty
         return SimpleNamespace(theta=scores.astype(float))
 
     monkeypatch.setattr(EMEstimator, "fit", fake_fit)

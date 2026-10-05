@@ -13,6 +13,14 @@ difference in group ability (impact) is not reported as DIF.
    result = mirt.dif(data, groups, model="2PL", method="likelihood_ratio")
    print(result)
 
+The likelihood-ratio default fits one baseline multiple-group model plus one
+warm-started refit per tested item. Built-in 1PL and 2PL items take batched
+Newton M-steps, so 30 binary items with 1,000 persons per group take one to
+two seconds. 3PL and polytomous items use an itemwise optimizer and are
+several times slower per item. ``n_jobs=-1`` runs the refits in parallel,
+and ``method="wald"`` and :func:`mirt.diagnostics.compute_grdif` are fast
+screens that need no refits.
+
 Methods
 -------
 
@@ -45,9 +53,10 @@ report ``df``, ``tested`` and ``converged`` for every item.
 Anchors and schemes
 -------------------
 
-``anchors`` lists items assumed free of DIF. They are not tested. Likelihood
-ratio tests hold them equal across groups in every model; ``wald`` and
-``raju`` link the groups over them. Without anchors, a likelihood-ratio test
+``anchors`` lists items assumed free of DIF, by index or by name (DataFrame
+column names, otherwise ``Item_0``, ``Item_1``, ...). They are not tested.
+Likelihood ratio tests hold them equal across groups in every model; ``wald``
+and ``raju`` link the groups over them. Without anchors, a likelihood-ratio test
 uses every other item as an anchor, and ``wald`` and ``raju`` link on all
 items. Both assume that any DIF balances across items.
 
@@ -67,7 +76,16 @@ two or more groups and returns one row per studied item with ``chi2``,
 
 ``parameters`` selects the tested families (``"discrimination"`` and
 ``"intercepts"``); other parameters, such as 3PL guessing, stay equal across
-groups.
+groups. A family without free coordinates in any studied item, such as
+``"discrimination"`` for a 1PL model, raises ``ValueError``.
+
+:func:`mirt.dif` and :func:`mirt.multigroup.multigroup_dif` run the same
+tests with the same defaults: ``p_adjust="none"``, as in ``mirt::DIF``, so
+the same data give the same flags. ``multigroup_dif`` names the reference
+group by index or label (``reference_group``), ``mirt.dif`` names the focal
+group by label (``focal_group``). An integer ``reference_group`` that is also
+the label of another group is rejected as ambiguous; pass the label as a
+string.
 
 .. code-block:: python
 
@@ -205,12 +223,12 @@ Related utilities
 -----------------
 
 * :func:`mirt.sibtest` — SIBTEST
-* :func:`mirt.compute_grdif` — multi-group GRDIF with robust scaling and
-  itemwise multiplicity control; a fast residual screen that does not refit
-  models per item
+* :func:`mirt.diagnostics.compute_grdif` — multi-group GRDIF with robust
+  scaling and itemwise multiplicity control; a fast residual screen that does
+  not refit models per item
 * :func:`mirt.diagnostics.grdif_effect_size` — spread of the GRDIF residual
   moments across groups, from the calibration and final abilities of
-  :func:`mirt.compute_grdif` (no refit)
+  :func:`mirt.diagnostics.compute_grdif` (no refit)
 * :func:`mirt.compute_dtf` / :func:`mirt.compute_drf` — test/response functioning
 * :doc:`multigroup` — multiple-group models and invariance testing
 

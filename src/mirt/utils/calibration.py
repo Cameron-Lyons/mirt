@@ -637,7 +637,9 @@ class FixedItemCalibrationResult:
     ----------
     fit_result : FitResult
         EM fit of the calibration model. Anchor parameters keep their supplied
-        values and report zero standard errors.
+        values and report zero standard errors. Its ``latent_mean`` and
+        ``latent_covariance`` hold the estimated population, which scoring,
+        simulation and the bootstrap utilities use by default.
     latent_mean : ndarray of shape (n_factors,)
         Estimated mean of the calibration population on the anchor scale.
     latent_cov : ndarray of shape (n_factors, n_factors)
@@ -826,10 +828,12 @@ def fixed_item_calibration(
     -----
     Parameters shared by all items, such as rating-scale thresholds, belong to
     the anchored scale and remain fixed. Standard errors are conditional on
-    the estimated latent mean and covariance. To score people on the anchor
-    scale, pass the estimated population as the scoring prior, for example
-    ``fscores(result.model, responses, prior_mean=result.latent_mean,
-    prior_cov=result.latent_cov)``.
+    the estimated latent mean and covariance. ``result.fit_result`` records
+    that population, so ``fscores(result.fit_result, responses)`` scores
+    people on the anchor scale, like ``fscores(result.model, responses,
+    prior_mean=result.latent_mean, prior_cov=result.latent_cov)``, and
+    ``bootstrap_ci(result.fit_result, responses)`` re-estimates it in every
+    replicate.
 
     Examples
     --------

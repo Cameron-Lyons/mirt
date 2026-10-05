@@ -94,6 +94,11 @@ class WeightedEMEstimator(EMEstimator):
         Whether to print iteration progress.
     normalize_weights : bool
         Whether to normalize weights to sum to sample size.
+    compute_standard_errors : bool, default=True
+        Whether to compute item parameter standard errors after fitting.
+    prob_epsilon, item_optim_maxiter, item_optim_ftol, se_step_size
+        Item-optimizer and standard-error controls, as for
+        :class:`~mirt.estimation.em.EMEstimator`.
 
     Notes
     -----
@@ -103,7 +108,12 @@ class WeightedEMEstimator(EMEstimator):
     where w_i is the weight for person i and L_i is their marginal likelihood.
 
     Standard errors use itemwise complete-data curvature with survey-weighted
-    posterior counts. They do not account for clustering or stratification.
+    posterior counts (``FitResult.se_method="complete_data"``, without a
+    parameter covariance). They do not account for clustering or
+    stratification. The other options of
+    :class:`~mirt.estimation.em.EMEstimator` (item priors, equality
+    constraints, latent densities, acceleration, ``n_jobs`` and
+    ``use_rust``) are not available for weighted fits.
     """
 
     def __init__(
@@ -113,8 +123,24 @@ class WeightedEMEstimator(EMEstimator):
         tol: float = 1e-4,
         verbose: bool = False,
         normalize_weights: bool = True,
+        *,
+        compute_standard_errors: bool = True,
+        prob_epsilon: float = 1e-10,
+        item_optim_maxiter: int = 50,
+        item_optim_ftol: float = 1e-6,
+        se_step_size: float = 1e-5,
     ) -> None:
-        super().__init__(n_quadpts, max_iter, tol, verbose)
+        super().__init__(
+            n_quadpts,
+            max_iter,
+            tol,
+            verbose,
+            prob_epsilon=prob_epsilon,
+            item_optim_maxiter=item_optim_maxiter,
+            item_optim_ftol=item_optim_ftol,
+            se_step_size=se_step_size,
+            compute_standard_errors=compute_standard_errors,
+        )
         if not isinstance(normalize_weights, (bool, np.bool_)):
             raise ValueError("normalize_weights must be a boolean")
         self.normalize_weights = bool(normalize_weights)
@@ -233,9 +259,15 @@ class WeightedEMEstimator(EMEstimator):
 
         model._is_fitted = True
 
-        standard_errors = self._compute_weighted_standard_errors(
-            model, responses, posterior_weights, weights
+        self._se_details = None
+        standard_errors = (
+            self._compute_weighted_standard_errors(
+                model, responses, posterior_weights, weights
+            )
+            if self.compute_standard_errors
+            else {}
         )
+        se_method, covariance = self._se_details or (None, None)
 
         n_params = model.n_parameters
         effective_n = _effective_sample_size(weights)
@@ -252,6 +284,8 @@ class WeightedEMEstimator(EMEstimator):
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+            se_method=se_method,
+            vcov=covariance,
         )
 
     def _e_step_weighted(

@@ -49,9 +49,9 @@ def test_replicates_simulate_the_reduced_model_with_observed_missingness(
     fitted = []
     original = bootstrap_module._refit_log_likelihood
 
-    def recording_refit(model, data, warm_start, options):
+    def recording_refit(model, data, warm_start, options, recipe=None):
         fitted.append((type(model), data.copy(), warm_start, dict(options)))
-        return original(model, data, warm_start, options)
+        return original(model, data, warm_start, options, recipe)
 
     monkeypatch.setattr(bootstrap_module, "_refit_log_likelihood", recording_refit)
 
@@ -83,12 +83,12 @@ def test_failed_replicates_are_counted_and_excluded(nested_fits, monkeypatch):
     calls = 0
     original = bootstrap_module._refit_log_likelihood
 
-    def flaky_refit(model, data, warm_start, options):
+    def flaky_refit(model, data, warm_start, options, recipe=None):
         nonlocal calls
         calls += 1
         if calls in (3, 8):
             raise RuntimeError("replicate failed")
-        return original(model, data, warm_start, options)
+        return original(model, data, warm_start, options, recipe)
 
     monkeypatch.setattr(bootstrap_module, "_refit_log_likelihood", flaky_refit)
 

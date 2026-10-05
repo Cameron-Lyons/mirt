@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import warnings
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.estimation.priors import Prior, PriorSpecification
+from mirt.estimation.priors import _SPECIFICATION_DEFAULTS, Prior, PriorSpecification
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -52,21 +53,109 @@ def validate_item_priors(
     return validated or None
 
 
+def _item_parameters(model: BaseItemModel) -> list[str]:
+    return [name for name in model._parameters if model._item_indexed(name)]
+
+
+def _is_default_prior(name: str, prior: Prior) -> bool:
+    """Whether ``prior`` is the one ``PriorSpecification`` fills in for ``name``."""
+    default = _SPECIFICATION_DEFAULTS.get(name)
+    if default is None:
+        return False
+    family, mu, sigma = default
+    return type(prior) is family and (
+        getattr(prior, "mu", None),
+        getattr(prior, "sigma", None),
+    ) == (mu, sigma)
+
+
+def check_prior_specification(
+    priors: PriorSpecification | Mapping[str, Prior] | None,
+    models: Sequence[BaseItemModel],
+    model_name: str,
+) -> None:
+    """Require a ``PriorSpecification`` to reach the item parameters of a fit.
+
+    Parameters
+    ----------
+    priors : PriorSpecification, mapping or None
+        Item priors. Only a ``PriorSpecification`` is checked; mapping keys
+        are validated by :func:`resolve_item_priors`.
+    models : sequence of BaseItemModel
+        The fitted model, or every component of a mixed-format model.
+    model_name : str
+        Model name used in messages.
+
+    Raises
+    ------
+    MirtValidationError
+        If none of the specification's discrimination, difficulty, guessing
+        and upper priors names a per-item parameter of ``models``.
+
+    Warns
+    -----
+    UserWarning
+        If a discrimination or difficulty prior other than the
+        specification's default names a parameter that none of ``models``
+        has, such as ``difficulty`` for a graded model, which stores
+        ``thresholds``. That prior is ignored. Guessing and upper priors
+        apply only to models with those parameters, as documented.
+    """
+    if not isinstance(priors, PriorSpecification):
+        return
+    available = sorted({name for model in models for name in _item_parameters(model)})
+    fields = [
+        name for name in _SPECIFICATION_FIELDS if getattr(priors, name) is not None
+    ]
+    if fields and not set(fields).intersection(available):
+        parameters = sorted({name for model in models for name in model.parameters})
+        raise MirtValidationError(
+            "the PriorSpecification sets no prior on the parameters of the "
+            f"{model_name} model ({', '.join(parameters)}); pass priors as a "
+            "mapping of parameter names to priors",
+            parameter="priors",
+            expected=", ".join(available),
+        )
+    ignored = [
+        name
+        for name in _SPECIFICATION_DEFAULTS
+        if name in fields
+        and name not in available
+        and not _is_default_prior(name, getattr(priors, name))
+    ]
+    if ignored:
+        warnings.warn(
+            f"the PriorSpecification's {' and '.join(ignored)} prior is ignored "
+            f"because the {model_name} model has no such item parameter (it has "
+            f"{', '.join(available)}); pass priors as a mapping of parameter "
+            "names to priors",
+            UserWarning,
+            stacklevel=4,
+        )
+
+
 def resolve_item_priors(
     priors: PriorSpecification | Mapping[str, Prior] | None,
     model: BaseItemModel,
+    *,
+    check_specification: bool = True,
 ) -> dict[str, Prior]:
     """Map priors to the model's stored item parameters.
 
     A ``PriorSpecification`` contributes its discrimination, difficulty,
     guessing and upper priors to the parameters of those names that the model
-    has; its ``theta`` prior does not apply to item parameters. Mapping keys
+    has; its ``theta`` prior does not apply to item parameters. Unless
+    ``check_specification`` is false, :func:`check_prior_specification`
+    first rejects a specification that reaches none of them and warns about
+    non-default discrimination or difficulty priors it drops. Mapping keys
     must name per-item parameters of the model.
     """
     if priors is None:
         return {}
-    item_parameters = [name for name in model._parameters if model._item_indexed(name)]
+    item_parameters = _item_parameters(model)
     if isinstance(priors, PriorSpecification):
+        if check_specification:
+            check_prior_specification(priors, [model], model.model_name)
         resolved = {}
         for name in _SPECIFICATION_FIELDS:
             prior = getattr(priors, name)

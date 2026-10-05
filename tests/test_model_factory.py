@@ -189,3 +189,35 @@ def test_fit_multigroup_rejects_codes_outside_dichotomous_range(
 
     with pytest.raises(MirtDataError, match="coded as 0 or 1"):
         fit_multigroup(data, np.repeat([0, 1], 60), max_iter=2)
+
+
+def test_factory_rejects_family_sequences_with_a_clear_error() -> None:
+    # Regression: an unhashable list was reported as "Unknown model: [...]".
+    for value in (["2PL", "2PL"], ("GRM",), np.array(["2PL"])):
+        with pytest.raises(MirtValidationError, match="per-item family sequences"):
+            item_model_class(value)  # type: ignore[arg-type]
+    with pytest.raises(MirtModelError, match="Unknown model"):
+        item_model_class("6PL")
+    # A nested sequence inside fit_mirt's per-item list is an unknown family.
+    data = np.zeros((10, 2), dtype=int)
+    with pytest.raises(MirtModelError, match=r"Unknown model: \['2PL'\]"):
+        fit_mirt(data, model=[["2PL"], ["2PL"]])  # type: ignore[list-item]
+
+
+def test_fit_multigroup_accepts_single_family_sequences(
+    dichotomous: np.ndarray,
+) -> None:
+    # Regression: a per-item sequence reached the factory as "Unknown model".
+    groups = np.repeat([0, 1], 60)
+    named = fit_multigroup(dichotomous, groups, model="2PL", max_iter=3)
+    listed = fit_multigroup(dichotomous, groups, model=["2PL"] * 5, max_iter=3)
+
+    assert listed.log_likelihood == pytest.approx(named.log_likelihood)
+    for group in range(2):
+        expected = named.model.get_group_model(group).parameters
+        for name, values in listed.model.get_group_model(group).parameters.items():
+            np.testing.assert_allclose(values, expected[name])
+    with pytest.raises(MirtValidationError, match="does not support mixed item"):
+        fit_multigroup(dichotomous, groups, model=["2PL"] * 4 + ["3PL"])
+    with pytest.raises(MirtValidationError, match="names 4 items"):
+        fit_multigroup(dichotomous, groups, model=["2PL"] * 4)

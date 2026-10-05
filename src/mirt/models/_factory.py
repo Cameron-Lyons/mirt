@@ -40,7 +40,17 @@ def item_model_class(name: str) -> type[BaseItemModel]:
     ------
     MirtModelError
         If ``name`` is not one of :data:`ITEM_MODEL_FAMILIES`.
+    MirtValidationError
+        If ``name`` is a sequence of per-item families.
     """
+    if isinstance(name, (list, tuple, np.ndarray)):
+        raise MirtValidationError(
+            "model must name one family here; per-item family sequences are "
+            "supported by fit_mirt and MixedFormatEMEstimator",
+            parameter="model",
+            value=type(name).__name__,
+            expected=", ".join(ITEM_MODEL_FAMILIES),
+        )
     try:
         module_name, class_name = ITEM_MODEL_FAMILIES[name]
     except (KeyError, TypeError):
@@ -240,6 +250,13 @@ def validate_item_types(item_types: Any, n_items: int | None = None) -> str | li
             value=names,
         )
     for name in names:
+        if not isinstance(name, str):
+            # A nested sequence is not a family, nor a sequence of them.
+            raise MirtModelError(
+                f"Unknown model: {name!r}",
+                model_type=str(name),
+                expected=", ".join(ITEM_MODEL_FAMILIES),
+            )
         item_model_class(name)
     if n_items is not None and len(names) != n_items:
         raise MirtValidationError(
@@ -249,6 +266,36 @@ def validate_item_types(item_types: Any, n_items: int | None = None) -> str | li
             expected=str(n_items),
         )
     return names
+
+
+def single_item_family(item_types: Any, n_items: int, *, operation: str) -> str:
+    """Return the one family named by a family name or per-item sequence.
+
+    A sequence that names one family for every item is that family, as in
+    ``fit_mirt``.
+
+    Raises
+    ------
+    MirtModelError
+        If a family is unknown.
+    MirtValidationError
+        If the sequence has the wrong length or names several families,
+        which ``operation`` does not support.
+    """
+    names = validate_item_types(item_types, n_items)
+    if isinstance(names, str):
+        return names
+    families = list(dict.fromkeys(names))
+    if len(families) > 1:
+        raise MirtValidationError(
+            f"{operation} does not support mixed item families "
+            f"({', '.join(families)}); fit a mixed-format test with "
+            "fit_mirt(data, model=[...]) without it",
+            parameter="model",
+            value=families,
+            expected="one family for every item",
+        )
+    return families[0]
 
 
 def build_mixed_item_model(

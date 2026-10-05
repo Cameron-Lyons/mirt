@@ -290,6 +290,24 @@ def test_simulate_draws_valid_reproducible_categories(mixed) -> None:
     np.testing.assert_allclose(first.mean(axis=0), expected.mean(axis=0), atol=0.06)
 
 
+@pytest.mark.parametrize("seed", [0, 7, 2026])
+@pytest.mark.parametrize("chunk_size", [None, 1, 333])
+def test_binary_components_simulate_like_their_component(
+    parts, seed, chunk_size
+) -> None:
+    # Regression: padded [1 - p, p] categories coded 1 for u > 1 - p, so
+    # wrapping a component changed its seeded responses.
+    three_pl, graded = parts
+    theta = np.random.default_rng(3).standard_normal((1000, 1))
+
+    for component in (three_pl, graded):
+        wrapped = MixedItemModel([(component, range(component.n_items))])
+        np.testing.assert_array_equal(
+            wrapped.simulate(theta, seed=seed, chunk_size=chunk_size),
+            component.simulate(theta, seed=seed, chunk_size=chunk_size),
+        )
+
+
 def test_item_parameter_arrays_pad_missing_parameters(mixed, parts) -> None:
     three_pl, graded = parts
     arrays = mixed.item_parameter_arrays()

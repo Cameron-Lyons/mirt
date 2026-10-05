@@ -160,13 +160,12 @@ def test_fixed_slope_item_difficulty_matches_independent_conditional_likelihood(
     )
     assert optimum.success
     estimator = MultigroupEMEstimator(item_optim_ftol=1e-12)
-    estimator._optimize_group_item_param(
-        model, 1, 0, "difficulty", responses, posterior, nodes
+    estimator._optimize_item(
+        model, 0, [responses, responses], [posterior, posterior], nodes
     )
-    assert model.get_group_model(1).parameters["difficulty"][0] == pytest.approx(
-        optimum.x, abs=1e-6
-    )
-    assert model.get_group_model(1).parameters["discrimination"][0] == 1.73
+    for group in model.group_models:
+        assert group.parameters["difficulty"][0] == pytest.approx(optimum.x, abs=1e-6)
+        assert group.parameters["discrimination"][0] == 1.73
 
 
 def test_nominal_multidimensional_parameter_rows_are_flattened_without_freeing_reference():
@@ -177,9 +176,7 @@ def test_nominal_multidimensional_parameter_rows_are_flattened_without_freeing_r
     weights = rng.dirichlet(np.ones(9), 50)
     nodes = GaussHermiteQuadrature(3, 2).nodes
     estimator = MultigroupEMEstimator()
-    estimator._optimize_group_item_param(
-        model, 1, 1, "slopes", responses, weights, nodes
-    )
+    estimator._optimize_item(model, 1, [responses] * 2, [weights] * 2, nodes)
     fitted = model.get_group_model(1)
     np.testing.assert_array_equal(fitted.parameters["slopes"][1, 0], [0, 0])
     assert np.any(
@@ -215,9 +212,7 @@ def test_grm_m_step_retains_ordered_thresholds_and_zero_padding():
     nodes = np.linspace(-4, 4, 9)[:, None]
     estimator = MultigroupEMEstimator(item_optim_maxiter=100)
     for item in range(2):
-        estimator._optimize_group_item_param(
-            model, 1, item, "thresholds", responses, weights, nodes
-        )
+        estimator._optimize_item(model, item, [responses] * 2, [weights] * 2, nodes)
     group = model.get_group_model(1)
     assert np.all(np.diff(group.parameters["thresholds"][1]) >= 0)
     np.testing.assert_array_equal(group.parameters["thresholds"][0, 1:], [0, 0])
@@ -238,7 +233,9 @@ def test_numerical_optimizer_failure_restores_custom_model_state(monkeypatch, fa
         return original_probability(self, theta, item_idx)
 
     group.probability = MethodType(custom_probability, group)
-    before = group.parameters
+    # The custom curve sends the item, in both groups, to the per-parameter
+    # path, whose trials go through the models' setters.
+    before = [member.parameters for member in model.group_models]
     responses = np.array([[0], [1], [0], [1]])
     posterior = np.full((4, 5), 0.2)
     nodes = np.linspace(-2, 2, 5)[:, None]
@@ -253,15 +250,12 @@ def test_numerical_optimizer_failure_restores_custom_model_state(monkeypatch, fa
     estimator = MultigroupEMEstimator()
     if failure == "raise":
         with pytest.raises(RuntimeError, match="trial callback"):
-            estimator._optimize_group_item_param(
-                model, 1, 0, "difficulty", responses, posterior, nodes
-            )
+            estimator._optimize_item(model, 0, [responses] * 2, [posterior] * 2, nodes)
     else:
-        estimator._optimize_group_item_param(
-            model, 1, 0, "difficulty", responses, posterior, nodes
-        )
-    for name, value in before.items():
-        np.testing.assert_array_equal(group.parameters[name], value)
+        estimator._optimize_item(model, 0, [responses] * 2, [posterior] * 2, nodes)
+    for member, parameters in zip(model.group_models, before, strict=True):
+        for name, value in parameters.items():
+            np.testing.assert_array_equal(member.parameters[name], value)
 
 
 @pytest.mark.parametrize("order", [[0], [0, 0], [False, 1], [0, 2], "01"])
@@ -365,8 +359,8 @@ def test_multigroup_partial_grm_thresholds_respect_fixed_neighbors():
     responses = np.array([[0]] * 90 + [[1]] * 5 + [[3]] * 5)
     nodes = np.linspace(-4, 4, 9)[:, None]
     posterior = np.full((100, 9), 1 / 9)
-    MultigroupEMEstimator(item_optim_maxiter=100)._optimize_group_item_param(
-        model, 1, 0, "thresholds", responses, posterior, nodes
+    MultigroupEMEstimator(item_optim_maxiter=100)._optimize_item(
+        model, 0, [responses] * 2, [posterior] * 2, nodes
     )
     group = model.get_group_model(1)
     np.testing.assert_array_equal(group.parameters["thresholds"][0, :2], [-1, 0])
@@ -445,8 +439,8 @@ def test_shared_coordinate_fixed_in_one_group_is_known_everywhere():
     rng = np.random.default_rng(965)
     responses = [rng.integers(0, 2, (40, 2)) for _ in range(2)]
     posterior = [rng.dirichlet(np.ones(7), 40) for _ in range(2)]
-    MultigroupEMEstimator()._optimize_shared_item_param(
-        model, 0, "difficulty", responses, posterior, np.linspace(-3, 3, 7)[:, None]
+    MultigroupEMEstimator()._optimize_item(
+        model, 0, responses, posterior, np.linspace(-3, 3, 7)[:, None]
     )
     for group in model.group_models:
         assert group.parameters["difficulty"][0] == 0.37

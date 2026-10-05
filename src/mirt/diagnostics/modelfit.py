@@ -21,8 +21,10 @@ from scipy import stats
 from scipy.linalg import lapack, solve_triangular
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.data import _response_array
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityConstraints
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -122,12 +124,13 @@ class _FitMoments:
 
 def compute_m2(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     *,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute M2 limited-information fit statistic.
 
@@ -143,8 +146,9 @@ def compute_m2(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
         ``latent_covariance`` then defines the latent population.
-    responses : NDArray
-        Response matrix (n_persons, n_items)
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : NDArray, optional
         Fixed person abilities defining a conditional response model. If
         omitted, moments are integrated against the normal latent population.
@@ -158,6 +162,11 @@ def compute_m2(
         Covariance of the normal latent population. Defaults to the
         ``latent_covariance`` of a ``FitResult`` when it has one, and to the
         identity otherwise.
+    constraints : sequence, optional
+        Equality constraints of the fit, in any form that
+        ``fit_mirt(constraints=...)`` accepts. Each group of tied coordinates
+        is one estimated parameter: its derivative columns are summed into
+        one tangent direction, which removes one degree of freedom.
 
     Returns
     -------
@@ -187,18 +196,25 @@ def compute_m2(
         latent=latent,
     )
     return _m2_from_moments(
-        model, moments, response_values, theta, n_quadpts, latent=latent
+        model,
+        moments,
+        response_values,
+        theta,
+        n_quadpts,
+        latent=latent,
+        constraints=constraints,
     )
 
 
 def compute_fit_indices(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     n_quadpts: int = 21,
     *,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute model fit indices (RMSEA, CFI, TLI, SRMSR).
 
@@ -207,8 +223,8 @@ def compute_fit_indices(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
         ``latent_covariance`` then defines the latent population.
-    responses : NDArray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix, with missing responses as in :func:`compute_m2`.
     theta : NDArray, optional
         Fixed person abilities defining a conditional response model. If
         omitted, moments are integrated against the normal latent population.
@@ -218,6 +234,8 @@ def compute_fit_indices(
         Number of quadrature points
     prior_mean, prior_cov : array-like, optional
         Normal latent population, as in :func:`compute_m2`.
+    constraints : sequence, optional
+        Equality constraints of the fit, as in :func:`compute_m2`.
 
     Returns
     -------
@@ -243,7 +261,14 @@ def compute_fit_indices(
     )
     design = _moment_design(response_values)
     m2_result = _m2_from_moments(
-        model, moments, response_values, theta, n_quadpts, design, latent=latent
+        model,
+        moments,
+        response_values,
+        theta,
+        n_quadpts,
+        design,
+        latent=latent,
+        constraints=constraints,
     )
     M2 = m2_result["M2"]
     df = m2_result["df"]
@@ -379,7 +404,7 @@ def _validate_diagnostic_inputs(
             "M2 does not support HigherOrderCDM: shared mastery-pattern "
             "integration is required for the joint response moments"
         )
-    values = np.asarray(responses)
+    values = _response_array(responses)
     if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] == 0:
         raise ValueError(
             "responses must be a two-dimensional matrix with at least "
@@ -902,6 +927,32 @@ def _model_moment_jacobian(
     return jacobian if theta is None else _safe_divide(jacobian, design.counts[:, None])
 
 
+def _tie_columns(
+    model: BaseItemModel,
+    jacobian: NDArray[np.float64],
+    constraints: EqualityConstraints | None,
+) -> NDArray[np.float64]:
+    """Sum the derivative columns of coordinates tied by equality constraints.
+
+    Columns follow the free coordinates of ``model.free_parameter_masks``, as
+    in :func:`_model_moment_jacobian`. A tied group moves as one parameter.
+    """
+    if constraints is None:
+        return jacobian
+    from mirt.estimation._shared_step import resolve_equality_constraints
+
+    tied = resolve_equality_constraints(constraints, model)
+    if tied is None:
+        return jacobian
+    tying = tied.tying(
+        {
+            name: np.flatnonzero(mask)
+            for name, mask in model.free_parameter_masks.items()
+        }
+    )
+    return jacobian @ np.eye(int(tying.max(initial=-1)) + 1)[tying]
+
+
 def _latent_moment_jacobian(
     model: BaseItemModel,
     n_quadpts: int,
@@ -1057,6 +1108,7 @@ def _m2_from_moments(
     design: _MomentDesign | None = None,
     *,
     latent: _LatentNormal | None = None,
+    constraints: EqualityConstraints | None = None,
 ) -> dict[str, float]:
     """Compute a genuinely covariance-weighted limited-information test."""
     if design is None:
@@ -1067,8 +1119,12 @@ def _m2_from_moments(
     covariance = _model_sample_covariance(
         model, responses, theta, n_quadpts, design, latent=latent
     )
-    jacobian = _model_moment_jacobian(
-        model, responses, theta, n_quadpts, design, latent=latent
+    jacobian = _tie_columns(
+        model,
+        _model_moment_jacobian(
+            model, responses, theta, n_quadpts, design, latent=latent
+        ),
+        constraints,
     )
     if theta is None and latent is not None and latent.estimated:
         jacobian = np.column_stack(

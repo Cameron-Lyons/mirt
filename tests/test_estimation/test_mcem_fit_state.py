@@ -97,8 +97,9 @@ def test_fit_evaluates_and_normalizes_each_importance_draw_once(method, monkeypa
     assert result.n_iterations == 3
     importance = method not in ("posterior", "stochastic")
     # MCEM's ascent check evaluates the draws of iterations two and three at
-    # both the current and the previous iterate, without normalizing them.
-    ascent = 4 if method in ("importance", "posterior") else 0
+    # the previous iterate, without normalizing them; their likelihoods at the
+    # current iterate come from the E-step.
+    ascent = 2 if method in ("importance", "posterior") else 0
     assert calls["probability"] == (4 if importance else 64) + ascent
     assert calls["normalization"] == (4 if importance else 0)
 

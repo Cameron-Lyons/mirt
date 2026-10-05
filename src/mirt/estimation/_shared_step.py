@@ -30,6 +30,7 @@ from scipy.optimize import LinearConstraint, minimize
 from scipy.special import xlogy
 
 from mirt._core import sigmoid
+from mirt.estimation._graded_order import THRESHOLD_GAP as _THRESHOLD_GAP
 from mirt.estimation.base import _free_shared_parameters, _parameter_bounds
 from mirt.exceptions import MirtEstimationError, MirtModelError, MirtValidationError
 
@@ -38,8 +39,6 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 _Objective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
-# Smallest gap kept between movable graded thresholds, as for GRM items.
-_THRESHOLD_GAP = 1e-6
 # Relative step of the central differences that give numerical item
 # objectives a gradient in the joint tied-item step.
 _DIFFERENCE_STEP = 1e-5

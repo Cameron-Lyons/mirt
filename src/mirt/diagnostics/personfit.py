@@ -11,9 +11,10 @@ from mirt.constants import PROB_EPSILON
 from mirt.diagnostics.itemfit import _validate_statistics
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
-    _validate_p_value_adjustment,
     adjust_p_values,
+    validate_p_value_adjustment,
 )
+from mirt.scoring._common import validate_scoring_responses
 from mirt.typing import PersonFitStatistic
 from mirt.utils.numeric import (
     _FitStatsAccumulator,
@@ -34,7 +35,7 @@ _PERSONFIT_STATISTICS: tuple[str, ...] = get_args(PersonFitStatistic)
 
 def compute_personfit(
     model: BaseItemModel,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64],
     statistics: Sequence[str] | str | None = None,
     *,
@@ -48,8 +49,9 @@ def compute_personfit(
     ----------
     model : BaseItemModel
         Fitted item response model.
-    responses : ndarray of shape (n_persons, n_items)
-        Category codes; negative codes denote missing responses.
+    responses : array-like of shape (n_persons, n_items)
+        Category codes. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray of shape (n_persons,) or (n_persons, n_factors)
         Person abilities.
     statistics : list of str, optional
@@ -78,9 +80,13 @@ def compute_personfit(
     Notes
     -----
     ``z_infit`` and ``z_outfit`` are Wilson-Hilferty standardized mean
-    squares (see :func:`mirt.diagnostics.itemfit.compute_itemfit`). Model
-    probabilities and intermediate statistics are evaluated in bounded row
-    blocks. Multiplicity corrections use the full respondent population.
+    squares (see :func:`mirt.diagnostics.itemfit.compute_itemfit`). Their
+    standard normal reference assumes known abilities; with EAP abilities
+    estimated from the same responses they are mildly conservative (in a
+    20-item 2PL, ``z_infit`` has mean about -0.3 and standard deviation
+    about 0.9). Model probabilities and intermediate statistics are
+    evaluated in bounded row blocks. Multiplicity corrections use the full
+    respondent population.
     """
     statistics = _validate_statistics(
         statistics, _PERSONFIT_STATISTICS, default=("infit", "outfit", "Zh")
@@ -88,14 +94,14 @@ def compute_personfit(
 
     validated_adjustment: PValueAdjustment | None = None
     if p_adjust is not None:
-        validated_adjustment = _validate_p_value_adjustment(
+        validated_adjustment = validate_p_value_adjustment(
             p_adjust,
             name="p_adjust",
         )
         alpha = _validate_alpha(alpha)
         alternative = _validate_alternative(alternative)
 
-    responses = np.asarray(responses)
+    responses = validate_scoring_responses(model, responses)
     theta = np.asarray(theta)
 
     if theta.ndim == 1:
@@ -204,7 +210,7 @@ def compute_personfit_significance(
     values = _coerce_zh(zh)
     validated_alpha = _validate_alpha(alpha)
     validated_alternative = _validate_alternative(alternative)
-    validated_adjustment = _validate_p_value_adjustment(
+    validated_adjustment = validate_p_value_adjustment(
         p_adjust,
         name="p_adjust",
     )

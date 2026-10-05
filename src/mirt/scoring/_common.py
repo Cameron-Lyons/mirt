@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.utils.data import _missing_coded_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -158,10 +159,14 @@ def resolve_n_jobs(n_jobs: int) -> int:
 
 def validate_scoring_responses(
     model: BaseItemModel,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
 ) -> NDArray[np.int_]:
-    """Validate a scoring matrix and normalize every missing code to -1."""
-    raw = np.asarray(responses)
+    """Validate a scoring matrix and normalize every missing code to -1.
+
+    Negative codes, ``NaN`` and the missing entries of nullable DataFrame
+    columns are missing responses, as in :func:`mirt.fit_mirt`.
+    """
+    raw = _missing_coded_responses(responses)
     if raw.ndim != 2:
         raise ValueError(f"responses must be 2D, got {raw.ndim}D")
     if raw.shape[1] != model.n_items:

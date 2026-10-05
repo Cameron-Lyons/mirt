@@ -551,6 +551,41 @@ def test_draw_parameters_samples_asymptotes_from_their_uncertainty():
         draw_parameters(model, vcov=np.eye(7))
 
 
+def test_explicit_vcov_holds_all_nan_rows_like_a_fit_result():
+    # Regression: draw_parameters(model, vcov=result.vcov) rejected the NaN
+    # rows that mark parameters on an optimizer bound.
+    model = ThreeParameterLogistic(3).set_parameters(
+        discrimination=np.array([1.0, 1.4, 0.8]),
+        difficulty=np.array([-0.5, 0.2, 0.9]),
+        guessing=np.array([0.0, 0.2, 0.15]),
+    )
+    covariance = np.diag([0.04, 0.05, 0.03, 0.02, 0.03, 0.04, np.nan, 0.004, 0.009])
+    covariance[0, 3] = covariance[3, 0] = 0.01
+    covariance[6, :] = covariance[:, 6] = np.nan
+    result = FitResult(model, -1.0, 1, True, {}, 0.0, 0.0, vcov=covariance)
+
+    explicit = draw_parameters(model, n_samples=200, vcov=covariance, seed=5)
+    fitted = draw_parameters(result, n_samples=200, seed=5)
+    for name in ("discrimination", "difficulty", "guessing"):
+        np.testing.assert_array_equal(getattr(explicit, name), getattr(fitted, name))
+    np.testing.assert_array_equal(explicit.guessing[:, 0], 0.0)
+
+    covariance[0, 1] = covariance[1, 0] = np.nan
+    with pytest.raises(ValueError, match="only finite values"):
+        draw_parameters(model, vcov=covariance)
+
+
+def test_fit_result_draws_require_stored_item_parameters():
+    from mirt.models.explanatory import LLTM
+
+    # Regression: an LLTM derives difficulty from its feature weights, and
+    # drawing from its fit result raised a bare KeyError.
+    features = np.column_stack([np.ones(4), np.linspace(-1.0, 1.0, 4)])
+    result = FitResult(LLTM(4, features), -1.0, 1, True, {}, 0.0, 0.0)
+    with pytest.raises(MirtValidationError, match="stored discrimination and diff"):
+        draw_parameters(result)
+
+
 def test_sampling_utilities_are_available_from_the_top_level_api():
     assert mirt.ParameterSamples is ParameterSamples
     assert mirt.posterior_summary is posterior_summary

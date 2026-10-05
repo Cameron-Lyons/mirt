@@ -597,7 +597,7 @@ class TestCommonScaleDIF:
 
         def fake_run(data, groups, model, **kwargs):
             calls.append(kwargs)
-            reference = kwargs["reference_group"]
+            reference = ["x", "y"].index(kwargs["reference_group"])
             parameters = [{"difficulty": 0.2}, {"difficulty": 0.2}]
             parameters[1 - reference] = {"difficulty": 1.0}
             row = _DIFTestRow(
@@ -622,7 +622,7 @@ class TestCommonScaleDIF:
                 p_adjust=kwargs["p_adjust"],
             )
 
-        monkeypatch.setattr(multigroup_dif_module, "_run_multigroup_dif", fake_run)
+        monkeypatch.setattr(multigroup_dif_module, "run_multigroup_dif", fake_run)
         data = np.zeros((4, 3), dtype=int)
         groups = np.array(["x", "x", "y", "y"])
 
@@ -636,7 +636,8 @@ class TestCommonScaleDIF:
             n_jobs=2,
         )
 
-        assert calls[0]["reference_group"] == 1
+        # The reference group goes by label, never by an ambiguous index.
+        assert calls[0]["reference_group"] == "y"
         assert calls[0]["anchors"] == [1, 2]
         assert calls[0]["scheme"] == "add"
         assert calls[0]["p_adjust"] == "holm"
@@ -726,3 +727,120 @@ def test_wald_impact_only_holm_false_positives_stay_rare():
         )
         result = compute_dif(data, groups, method="wald", p_adjust="holm")
         assert np.count_nonzero(result["p_value_adjusted"] < 0.05) <= 1
+
+
+def test_likelihood_ratio_entry_points_share_the_adjustment_default():
+    import inspect
+
+    import mirt
+    from mirt.multigroup import multigroup_dif, select_dif_anchors
+
+    defaults = {
+        function.__name__: inspect.signature(function).parameters["p_adjust"].default
+        for function in (compute_dif, mirt.dif, multigroup_dif, select_dif_anchors)
+    }
+
+    assert set(defaults.values()) == {"none"}, defaults
+
+
+def test_compute_dif_and_multigroup_dif_flag_the_same_items():
+    from mirt.multigroup import multigroup_dif
+
+    data, groups = _simulate_two_groups(3, n_per_group=200, n_items=6)
+    options = {"model": "1PL", "n_quadpts": 7, "tol": 1e-2}
+
+    result = compute_dif(data, groups, method="likelihood_ratio", **options)
+    table = multigroup_dif(data, groups, **options)
+
+    np.testing.assert_allclose(result["p_value"], table["p_value"])
+    np.testing.assert_array_equal(
+        result["p_value_adjusted"] < 0.05, np.asarray(table["flagged"])
+    )
+
+
+def test_anchors_may_be_item_names(monkeypatch):
+    from mirt.multigroup import dif as multigroup_dif_module
+
+    calls: list[dict] = []
+
+    def fake_run(data, groups, model, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop after the anchors are resolved")
+
+    monkeypatch.setattr(multigroup_dif_module, "run_multigroup_dif", fake_run)
+    data, groups = _simulate_two_groups(4, n_per_group=60, n_items=5)
+
+    with pytest.raises(RuntimeError, match="stop"):
+        compute_dif(data, groups, anchors=["Item_3", 1])
+    assert calls[0]["anchors"] == [1, 3]
+    with pytest.raises(ValueError, match="unknown item name"):
+        compute_dif(data, groups, anchors=["Item_9"])
+
+    linked = compute_dif(data, groups, method="raju", anchors=["Item_2", "Item_4"])
+    assert linked["anchors"] == [2, 4]
+
+
+@pytest.mark.skipif(not HAS_DATAFRAME, reason="Requires pandas or polars")
+def test_anchor_names_follow_dataframe_columns():
+    from mirt.utils.dataframe import create_dataframe
+
+    data, groups = _simulate_two_groups(4, n_per_group=60, n_items=5)
+    frame = create_dataframe({f"q{item}": data[:, item] for item in range(5)})
+
+    result = compute_dif(frame, groups, method="raju", anchors=["q0", "q2", "q3"])
+
+    assert result["anchors"] == [0, 2, 3]
+
+
+def test_likelihood_ratio_passes_integer_labels_unambiguously(monkeypatch):
+    from mirt.multigroup import dif as multigroup_dif_module
+
+    calls: list[dict] = []
+
+    def fake_run(data, groups, model, **kwargs):
+        calls.append(kwargs)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(multigroup_dif_module, "run_multigroup_dif", fake_run)
+    data, _ = _simulate_two_groups(4, n_per_group=60, n_items=5)
+    # Labels 1 and 2: the reference group is label 2, which is index 1.
+    groups = np.repeat([1, 2], 60)
+
+    with pytest.raises(RuntimeError):
+        compute_dif(data, groups, focal_group=1)
+    assert calls[0]["reference_group"] == "2"
+
+
+def test_integer_reference_group_that_names_another_group_is_rejected():
+    from mirt.multigroup import _prepare_multigroup
+
+    data, _ = _simulate_two_groups(4, n_per_group=30, n_items=4)
+    groups = np.repeat([1, 2], 30)
+    prepare = {"n_categories": None, "item_names": None}
+
+    with pytest.raises(ValueError, match="also the label of group 0"):
+        _prepare_multigroup(data, groups, "2PL", reference_group=1, **prepare)
+    by_label = _prepare_multigroup(data, groups, "2PL", reference_group="1", **prepare)
+    by_index = _prepare_multigroup(data, groups, "2PL", reference_group=0, **prepare)
+    assert by_label[2] == by_index[2] == 0
+    labeled = np.repeat([0, 1], 30)
+    same = _prepare_multigroup(data, labeled, "2PL", reference_group=1, **prepare)
+    assert same[2] == 1
+
+
+def test_default_reference_group_is_the_first_group_for_any_labels():
+    import mirt
+    from mirt.multigroup import _prepare_multigroup
+
+    data, _ = _simulate_two_groups(4, n_per_group=30, n_items=4)
+    # Label 0 sorts second, so an explicit 0 is ambiguous, but the default
+    # still selects the first group.
+    groups = np.repeat([-1, 0], 30)
+    prepare = {"n_categories": None, "item_names": None}
+
+    default = _prepare_multigroup(data, groups, "2PL", reference_group=None, **prepare)
+    assert default[2] == 0
+    with pytest.raises(ValueError, match="reference_group='-1' for group index 0"):
+        _prepare_multigroup(data, groups, "2PL", reference_group=0, **prepare)
+    result = mirt.fit_multigroup(data, groups, n_quadpts=7, max_iter=2)
+    assert result.group_labels == ["-1", "0"]

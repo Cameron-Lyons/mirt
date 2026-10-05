@@ -108,6 +108,11 @@ struct Em2plFit {
 }
 
 /// Logit-scale starting difficulties from (weighted) proportions correct.
+///
+/// An item answered correctly with proportion `p` starts at `-logit(p)`, the
+/// difficulty of a unit-slope item with that success probability at
+/// `theta = 0`. Clamping `p` to `[0.01, 0.99]` keeps starts within
+/// `+-ln(99)`, inside the difficulty bounds.
 fn starting_difficulty(responses: ArrayView2<'_, i32>, weights: Option<&[f64]>) -> Vec<f64> {
     responses
         .columns()
@@ -124,7 +129,7 @@ fn starting_difficulty(responses: ArrayView2<'_, i32>, weights: Option<&[f64]>) 
             }
             if count > 0.0 {
                 let p = (sum / count).clamp(0.01, 0.99);
-                -p.ln() / (1.0 - p).ln().abs().max(0.01)
+                ((1.0 - p) / p).ln()
             } else {
                 0.0
             }
@@ -1361,7 +1366,7 @@ mod tests {
     use super::{
         Newton3plControls, NewtonControls, complete_data_2pl_item, expected_log_likelihood_3pl,
         mhrm_2pl_item, newton_2pl_item, newton_3pl_item, precondition_2x2,
-        score_and_information_3pl,
+        score_and_information_3pl, starting_difficulty,
     };
     use crate::utils::{gauss_hermite_quadrature, sigmoid};
     use numpy::ndarray::Array2;
@@ -1380,6 +1385,31 @@ mod tests {
         let n_k: Vec<f64> = weights.iter().map(|w| 2000.0 * w).collect();
         let r_k = points.iter().zip(&n_k).map(|(&t, &n)| n * p(t)).collect();
         (points, r_k, n_k)
+    }
+
+    #[test]
+    fn starting_difficulties_are_negative_logits_of_proportions_correct() {
+        // Columns: p = 0.5, 0.8, 0.2 after skipping missing responses, then
+        // an always-correct item clamped to p = 0.99 and an unanswered item.
+        let responses = Array2::from_shape_vec(
+            (5, 5),
+            vec![
+                1, 1, 0, 1, -1, //
+                0, 1, 0, 1, -1, //
+                1, 1, 1, 1, -1, //
+                0, 1, 0, 1, -1, //
+                -1, 0, 0, 1, -1,
+            ],
+        )
+        .unwrap();
+        let start = starting_difficulty(responses.view(), None);
+        let expected = [0.0, -4.0f64.ln(), 4.0f64.ln(), -99.0f64.ln(), 0.0];
+        for (value, target) in start.iter().zip(expected) {
+            assert!((value - target).abs() < 1e-12, "{start:?}");
+        }
+        // Weights scale each person's contribution: p = 3 / 4 for item 0.
+        let weighted = starting_difficulty(responses.view(), Some(&[3.0, 1.0, 0.0, 0.0, 1.0]));
+        assert!((weighted[0] + 3.0f64.ln()).abs() < 1e-12, "{weighted:?}");
     }
 
     #[test]

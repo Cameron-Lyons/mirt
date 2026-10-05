@@ -587,6 +587,22 @@ def test_fit_rejects_unsupported_settings(small_data) -> None:
         )
 
 
+def test_per_item_family_sequences_follow_fit_mirt(small_data) -> None:
+    # Regression: the raw sequence reached the model factory as "Unknown model".
+    options = {"spec": TWO_FACTORS, "n_quadpts": 7, "max_iter": 5}
+    named = fit_mirt(small_data, "2PL", **options)
+    listed = fit_mirt(small_data, ["2PL"] * 10, **options)
+
+    assert type(listed.model) is type(named.model)
+    assert listed.log_likelihood == pytest.approx(named.log_likelihood)
+    for name, values in named.model.parameters.items():
+        assert_allclose(listed.model.parameters[name], values)
+    with pytest.raises(MirtValidationError, match="does not support mixed item"):
+        fit_mirt(small_data, ["2PL"] * 5 + ["3PL"] * 5, spec="F = 1-10")
+    with pytest.raises(MirtValidationError, match="names 9 items"):
+        fit_mirt(small_data, ["2PL"] * 9, spec="F = 1-10")
+
+
 # Results
 
 

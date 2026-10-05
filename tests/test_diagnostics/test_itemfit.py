@@ -1,5 +1,7 @@
 """Tests for item fit statistics."""
 
+import warnings
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -494,6 +496,7 @@ class TestStandardizedMeanSquares:
             assert abs(np.mean(result[name])) < 0.3
             assert 0.7 < np.std(result[name]) < 1.3
 
+    @pytest.mark.filterwarnings("ignore:z_infit and z_outfit with EAP")
     def test_nan_codes_missing_responses_like_negative_codes(self):
         from mirt.models import TwoParameterLogistic
 
@@ -580,3 +583,63 @@ class TestStatisticNames:
             "G2",
             "PV_Q1",
         }
+
+
+def _two_parameter_sample(seed=21, n_items=20, n_persons=1000):
+    from mirt.models import TwoParameterLogistic
+
+    rng = np.random.default_rng(seed)
+    model = TwoParameterLogistic(n_items=n_items)
+    model.set_parameters(
+        discrimination=rng.uniform(0.8, 2.0, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+    )
+    model._is_fitted = True
+    theta = rng.normal(size=(n_persons, 1))
+    probabilities = model.probability(theta)
+    responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+    return model, responses, theta
+
+
+def test_standardized_fit_with_eap_abilities_warns_about_its_bias():
+    model, responses, theta = _two_parameter_sample()
+
+    with pytest.warns(UserWarning, match="biased toward overfit"):
+        eap = compute_itemfit(model, responses, ["z_infit", "z_outfit"])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        known = compute_itemfit(model, responses, ["z_infit", "z_outfit"], theta=theta)
+        compute_itemfit(model, responses, ["infit", "outfit"])
+
+    # The documented calibration: centered with true abilities, strongly
+    # negative with EAP abilities from the same responses.
+    assert abs(np.mean(known["z_infit"])) < 0.4
+    assert np.mean(eap["z_infit"]) < -1.0
+    assert np.mean(eap["z_infit"] < -1.96) > 0.25
+
+
+def test_top_level_itemfit_accepts_external_abilities():
+    import mirt
+    from mirt.results.fit_result import FitResult
+
+    model, responses, theta = _two_parameter_sample(n_persons=300)
+    result = FitResult(
+        model=model,
+        log_likelihood=-1.0,
+        n_iterations=1,
+        converged=True,
+        standard_errors={},
+        aic=0.0,
+        bic=0.0,
+        n_observations=responses.shape[0],
+        n_parameters=40,
+    )
+    statistics = ["infit", "z_infit"]
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        frame = mirt.itemfit(result, responses, statistics, theta=theta)
+    expected = compute_itemfit(model, responses, statistics, theta=theta)
+
+    for name in statistics:
+        assert_allclose(np.asarray(frame[name]), expected[name])

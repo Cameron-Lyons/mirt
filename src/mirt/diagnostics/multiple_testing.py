@@ -12,7 +12,7 @@ PValueAdjustment: TypeAlias = Literal["bonferroni", "holm", "fdr_bh", "none"]
 _P_VALUE_ADJUSTMENTS = frozenset({"bonferroni", "holm", "fdr_bh", "none"})
 
 
-def _validate_p_value_adjustment(
+def validate_p_value_adjustment(
     method: object,
     *,
     name: str = "method",
@@ -132,7 +132,7 @@ def adjust_p_values(
     ValueError
         If the method, axis, or p-values are invalid.
     """
-    validated_method = _validate_p_value_adjustment(method)
+    validated_method = validate_p_value_adjustment(method)
     values = _coerce_p_values(p_values)
 
     if axis is None:

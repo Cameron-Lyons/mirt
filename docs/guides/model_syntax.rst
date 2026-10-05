@@ -132,8 +132,10 @@ residual and local-dependence statistics, ``vuong_test`` and the reliability
 summaries. Pass the item model instead (``result.model``) for the standard
 normal, or ``prior_cov`` to choose another population. M2 projects out the
 estimated correlations like the free item parameters, so each costs one degree
-of freedom. Standard errors treat the latent covariance as fixed, and the
-bootstrap utilities still refit with uncorrelated standard normal factors.
+of freedom. Standard errors treat the latent covariance as fixed. The
+bootstrap utilities and ``bootstrap_lr`` refit the same structure, priors and
+constraints and re-estimate the covariance each time, and parametric
+replicates draw abilities from the estimated population.
 
 ``COV = F1*F1`` frees the variance of ``F1``. The variance is identified only
 when ``FIXED`` holds a nonzero slope on ``F1``, as in a marker-item model,
@@ -167,7 +169,11 @@ slopes follow a loading pattern:
    result = mirt.EMEstimator(n_quadpts=15, latent_density=density).fit(
        model, responses
    )
-   print(density.correlation)
+   print(density.correlation)  # result.latent_covariance holds the same matrix
+
+``EMEstimator`` reports the final mean and covariance of any Gaussian latent
+density as ``FitResult.latent_mean`` and ``FitResult.latent_covariance``, so
+the consumers above treat both routes alike.
 
 Limitations
 -----------
@@ -178,5 +184,7 @@ Limitations
 * The quadrature grid has ``n_quadpts ** n_factors`` nodes. Lower
   ``n_quadpts`` (for example to 9) for three or more factors.
 * Several factors are available for "2PL", "GRM" and "GPCM" models.
+* A per-item ``model`` sequence must name one family, which is then fitted
+  as that family; mixed item formats raise ``MirtValidationError``.
 * EM keeps free slopes between 0.1 and 5, so loadings must be positive;
   reverse-score items that load negatively before fitting.

@@ -78,7 +78,7 @@ def _reference_em_fit_2pl(
         (correct * weights).sum(axis=0) / (observed * weights).sum(axis=0), 0.01, 0.99
     )
     a = np.ones(responses.shape[1])
-    b = -np.log(proportion) / np.maximum(np.abs(np.log(1 - proportion)), 0.01)
+    b = np.log((1 - proportion) / proportion)
 
     def e_step(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         logits = a * (points[:, None] - b)
@@ -144,6 +144,32 @@ def test_converged_em_fit_reports_likelihood_at_returned_parameters() -> None:
 
     assert converged and iterations < 500
     assert log_likelihood == pytest.approx(np.log(marginal).sum(), abs=1e-10)
+
+
+def test_default_2pl_fit_starts_from_logit_difficulties() -> None:
+    import mirt
+
+    rng = np.random.default_rng(2)
+    discrimination = rng.uniform(0.8, 2.0, 15)
+    difficulty = np.concatenate(
+        [np.linspace(-3, -1.5, 5), np.linspace(-0.5, 0.5, 5), np.linspace(1.5, 3, 5)]
+    )
+    responses = mirt.simdata(
+        theta=rng.standard_normal(3000),
+        discrimination=discrimination,
+        difficulty=difficulty,
+        seed=4,
+    )
+    native, generic = (
+        mirt.fit_mirt(
+            responses, model="2PL", use_rust=use_rust, compute_standard_errors=False
+        )
+        for use_rust in (True, False)
+    )
+    # Starts of -ln(p) / |ln(1 - p)|, up to 115 for the hardest items, took
+    # the native fit 30 iterations against the NumPy fit's 18.
+    assert native.n_iterations <= generic.n_iterations + 2
+    assert native.log_likelihood == pytest.approx(generic.log_likelihood, abs=1e-3)
 
 
 def test_em_iteration_2pl_m_step_matches_numpy_counts_and_newton() -> None:

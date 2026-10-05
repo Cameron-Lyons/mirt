@@ -134,7 +134,7 @@ class TestEAPScorerScoring:
             ([0, 1], "2D"),
             ([[0, 1, 0]], "items, expected"),
             ([[0.0, 0.5]], "integer-valued"),
-            ([[0.0, np.nan]], "finite"),
+            ([[0.0, np.inf]], "finite"),
             ([[0, 2]], "only 0, 1"),
             ([["yes", "no"]], "numeric"),
         ],

@@ -33,6 +33,17 @@ standardized. Information criteria count only the estimated latent components.
 These conventions prevent an arbitrary affine change of item and population
 parameters from being reported as estimated group impact.
 
+Groups are ordered by their sorted labels. ``reference_group`` is an index
+into that order or a label string, and defaults to the first group; an
+integer that is also the label of another group raises ``ValueError``.
+
+Built-in 1PL and 2PL items whose parameters are all shared or all
+group-specific are updated together by batched Newton steps; other items,
+such as the group-specific intercepts of a metric fit, use an itemwise
+optimizer. Exploratory multidimensional models start with slopes staggered
+across factors: equal starting slopes would keep the factors identical, and
+EM would stop at that saddle point.
+
 Fixed calibration and ordered means
 -----------------------------------
 

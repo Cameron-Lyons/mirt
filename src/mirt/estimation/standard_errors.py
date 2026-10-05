@@ -5,11 +5,23 @@ log-likelihood. Keeping that objective in one place makes the observed,
 cross-product, and sandwich estimators consistent and ensures that a fitted
 latent density is not silently replaced by the quadrature's default mass.
 
-Built-in item models whose parameters each belong to one item, or to all
-items as rating-scale thresholds do, use the exact Louis observed
-information and marginal scores from
-:mod:`mirt.estimation._louis_information`. Other models difference the
-marginal log-likelihood, which costs O(P^2) likelihood evaluations.
+Item models accepted by
+:func:`~mirt.estimation._louis_information.supports_louis_information` use
+the exact Louis observed information and marginal scores: 1PL-4PL with any
+number of factors, GRM, GPCM, PCM, NRM, RSM, GRSM, ``MultidimensionalModel``,
+``BifactorModel``, the other built-in families whose likelihood is a product
+of item curves (5PL, log-log, nested-logit, sequential, unfolding,
+zero-inflated, ...), and mixed-format combinations of them without shared
+parameters. Unidimensional 1PL-4PL, GRM, GPCM, PCM, RSM and GRSM items have
+closed-form item derivatives; the others difference one item curve at a
+time. Remaining models, such as custom, testlet or mixture models,
+difference the marginal log-likelihood, which costs O(P^2) likelihood
+evaluations for P parameters.
+
+The public ``compute_*`` functions estimate every free coordinate unless
+they receive ``bounds``. Fits pass the optimizer boxes, so coordinates on a
+bound are held fixed there; :func:`mirt.compute_se` does the same for its
+matrix methods.
 """
 
 from __future__ import annotations
@@ -433,6 +445,43 @@ def _information_and_meat(
     return information, weighted.T @ scores, layouts
 
 
+def _score_and_information(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    quadrature: GaussHermiteQuadrature,
+    prior_mass: NDArray[np.float64],
+    h: float,
+    *,
+    observed: bool = True,
+) -> tuple[
+    NDArray[np.float64], NDArray[np.float64] | None, dict[str, _ParameterLayout]
+]:
+    """Return the marginal score and observed information of the free parameters.
+
+    The score is the gradient of the summed marginal log-likelihood. Models
+    without exact item derivatives difference the marginal likelihood. The
+    information is omitted when ``observed`` is false.
+    """
+    from mirt.estimation._louis_information import (
+        louis_information,
+        supports_louis_information,
+    )
+
+    _, layouts = _flatten_parameters(model)
+    if supports_louis_information(model):
+        terms = louis_information(
+            model, responses, quadrature.nodes, prior_mass, layouts, observed=observed
+        )
+        return terms.score, terms.information if observed else None, layouts
+    information = None
+    if observed:
+        information, _ = _finite_difference_information(
+            model, responses, quadrature, prior_mass, h
+        )
+    scores, _ = _finite_difference_scores(model, responses, quadrature, prior_mass, h)
+    return scores.sum(axis=0), information, layouts
+
+
 def _symmetric(matrix: NDArray[np.float64]) -> NDArray[np.float64]:
     return (matrix + matrix.T) / 2.0
 
@@ -497,15 +546,88 @@ def _se_from_covariance(
     return _unflatten_se(se, layouts, model)
 
 
+def _active_coordinates(
+    layouts: dict[str, _ParameterLayout],
+    bounds: Callable[[str], tuple[float, float]] | None,
+) -> NDArray[np.bool_]:
+    """Return the free coordinates that are not held at an optimizer bound."""
+    size = sum(layout.free_indices.size for layout in layouts.values())
+    active = np.ones(size, dtype=np.bool_)
+    if bounds is not None:
+        active &= ~_coordinates_at_bounds(layouts, bounds)
+    return active
+
+
+def _with_prior_information(
+    method: Literal["oakes", "crossprod", "sandwich"],
+    information: NDArray[np.float64] | None,
+    meat: NDArray[np.float64],
+    layouts: dict[str, _ParameterLayout],
+    prior_information: Mapping[str, NDArray[np.float64]] | None,
+) -> tuple[NDArray[np.float64] | None, NDArray[np.float64]]:
+    """Add an item log-prior's curvature to the matrix that ``method`` inverts.
+
+    The curvature joins the observed information, which is also the bread of
+    the sandwich, and the score cross-product that ``"crossprod"`` inverts.
+    """
+    if prior_information is None:
+        return information, meat
+    curvature = np.diag(_free_values(prior_information, layouts))
+    if information is not None:
+        information = information + curvature
+    if method == "crossprod":
+        meat = meat + curvature
+    return information, meat
+
+
 def _se_from_information(
     information: NDArray[np.float64],
     layouts: dict[str, _ParameterLayout],
     model: BaseItemModel | None = None,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     if information.size == 0:
         return _unflatten_se(np.empty(0, dtype=np.float64), layouts, model)
-    active = np.ones(information.shape[0], dtype=np.bool_)
+    active = _active_coordinates(layouts, bounds)
     covariance = _covariance("oakes", information, None, active)
+    return _se_from_covariance(covariance, layouts, model)
+
+
+def _matrix_standard_errors(
+    method: Literal["oakes", "crossprod", "sandwich"],
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    posterior_weights: NDArray[np.float64],
+    quadrature: GaussHermiteQuadrature,
+    h: float,
+    prior_mass: NDArray[np.float64] | None,
+    *,
+    person_weights: NDArray[np.float64] | None = None,
+    meat_weights: NDArray[np.float64] | None = None,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
+) -> dict[str, NDArray[np.float64]]:
+    """Standard errors of the public matrix estimators."""
+    step = _validate_step_size(h)
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    information, meat, layouts = _information_and_meat(
+        model,
+        response_array,
+        quadrature,
+        mass,
+        step,
+        person_weights=person_weights,
+        meat_weights=meat_weights,
+        observed=method != "crossprod",
+    )
+    information, meat = _with_prior_information(
+        method, information, meat, layouts, prior_information
+    )
+    active = _active_coordinates(layouts, bounds)
+    covariance = _covariance(method, information, meat, active)
     return _se_from_covariance(covariance, layouts, model)
 
 
@@ -519,9 +641,15 @@ def compute_observed_information(
 ) -> NDArray[np.float64]:
     """Return the negative Hessian of the marginal log-likelihood.
 
-    Built-in item models use the exact Louis identity, for which ``h`` is
-    unused; other models use central differences with step ``h``. Rows and
-    columns follow the free parameters in ``model.parameters`` order.
+    Built-in item models whose person likelihood is a product of item
+    curves (1PL-4PL, GRM, GPCM, PCM, NRM, RSM, GRSM, multidimensional,
+    bifactor and the other built-in families such as 5PL, log-log,
+    nested-logit, sequential, unfolding and zero-inflated models, and
+    mixed-format combinations of them) use the exact Louis identity, for
+    which ``h`` is unused. Other models, such as custom, testlet or mixture
+    models, use central differences of the marginal log-likelihood with step
+    ``h``, at a cost of O(P^2) likelihood evaluations for P parameters. Rows
+    and columns follow the free parameters in ``model.parameters`` order.
     """
     step = _validate_step_size(h)
     response_array = np.asarray(responses)
@@ -542,23 +670,56 @@ def compute_crossprod_se(
     quadrature: GaussHermiteQuadrature,
     h: float = 1e-5,
     prior_mass: NDArray[np.float64] | None = None,
+    *,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute standard errors from the outer product of person scores.
 
-    Built-in item models use exact marginal scores; others use central
-    differences with step ``h``.
+    Built-in item models with exact item derivatives (see
+    :func:`compute_observed_information`) use exact marginal scores; others
+    use central differences with step ``h``.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted model.
+    responses : ndarray of shape (n_persons, n_items)
+        Responses, with negative codes for missing cells.
+    posterior_weights : ndarray of shape (n_persons, n_points)
+        Final E-step posterior weights.
+    quadrature : GaussHermiteQuadrature
+        Quadrature used in fitting.
+    h : float, default=1e-5
+        Finite-difference step for models without exact item derivatives.
+    prior_mass : ndarray of shape (n_points,), optional
+        Latent prior mass at the nodes, recovered from ``posterior_weights``
+        when omitted.
+    bounds : callable, optional
+        Maps a parameter name to its optimizer box ``(low, high)``. Free
+        coordinates on a bound are then held fixed and receive ``NaN``
+        standard errors, as in fitted results; :func:`mirt.compute_se` passes
+        the boxes of EM fits. By default every free coordinate is estimated.
+    prior_information : mapping of str to ndarray, optional
+        Negative second derivative of an independent item log-prior in the
+        stored parameter shapes, for Bayes modal estimates. It is added to
+        the score cross-product, as in :func:`estimate_covariance`.
+
+    Returns
+    -------
+    dict
+        Standard errors in the stored parameter shapes.
     """
-    step = _validate_step_size(h)
-    response_array = np.asarray(responses)
-    mass = _resolve_prior_mass(
-        model, response_array, posterior_weights, quadrature, prior_mass
-    )
-    _, meat, layouts = _information_and_meat(
-        model, response_array, quadrature, mass, step, observed=False
-    )
-    active = np.ones(meat.shape[0], dtype=np.bool_)
-    return _se_from_covariance(
-        _covariance("crossprod", None, meat, active), layouts, model
+    return _matrix_standard_errors(
+        "crossprod",
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h,
+        prior_mass,
+        bounds=bounds,
+        prior_information=prior_information,
     )
 
 
@@ -570,16 +731,37 @@ def compute_sandwich_se(
     survey_weights: NDArray[np.float64] | None = None,
     h: float = 1e-5,
     prior_mass: NDArray[np.float64] | None = None,
+    *,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute robust bread-meat-bread standard errors.
 
     The bread is the survey-weighted observed information and the meat the
-    cross-product of survey-weighted person scores. Built-in item models use
-    exact Louis terms; others use central differences with step ``h``.
+    cross-product of survey-weighted person scores. Built-in item models
+    with exact item derivatives (see :func:`compute_observed_information`)
+    use exact Louis terms; others use central differences with step ``h``.
+
+    Parameters
+    ----------
+    model, responses, posterior_weights, quadrature
+        As for :func:`compute_crossprod_se`.
+    survey_weights : ndarray of shape (n_persons,), optional
+        Non-negative person weights. The bread weights each person's
+        information by ``w`` and the meat each score outer product by
+        ``w**2``.
+    h, prior_mass, bounds
+        As for :func:`compute_crossprod_se`.
+    prior_information : mapping of str to ndarray, optional
+        Negative second derivative of an independent item log-prior in the
+        stored parameter shapes. It is added to the bread.
+
+    Returns
+    -------
+    dict
+        Standard errors in the stored parameter shapes.
     """
-    step = _validate_step_size(h)
-    response_array = np.asarray(responses)
-    n_persons = response_array.shape[0]
+    n_persons = np.shape(responses)[0]
     if survey_weights is None:
         weights = np.ones(n_persons, dtype=np.float64)
     else:
@@ -592,22 +774,19 @@ def compute_sandwich_se(
             raise ValueError("survey_weights must contain finite non-negative values")
         if not np.any(weights > 0.0):
             raise ValueError("survey_weights must contain positive total weight")
-
-    mass = _resolve_prior_mass(
-        model, response_array, posterior_weights, quadrature, prior_mass
-    )
-    bread, meat, layouts = _information_and_meat(
+    return _matrix_standard_errors(
+        "sandwich",
         model,
-        response_array,
+        responses,
+        posterior_weights,
         quadrature,
-        mass,
-        step,
+        h,
+        prior_mass,
         person_weights=weights,
         meat_weights=weights**2,
+        bounds=bounds,
+        prior_information=prior_information,
     )
-    active = np.ones(meat.shape[0], dtype=np.bool_)
-    covariance = _covariance("sandwich", bread, meat, active)
-    return _se_from_covariance(covariance, layouts, model)
 
 
 def compute_oakes_se(
@@ -617,18 +796,42 @@ def compute_oakes_se(
     quadrature: GaussHermiteQuadrature,
     h: float = 1e-5,
     prior_mass: NDArray[np.float64] | None = None,
+    *,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute observed-information standard errors at an EM solution.
 
-    Built-in item models use the exact Louis observed information, which is
-    the target of the Oakes (1999) identity; other models difference the
-    marginal log-likelihood with step ``h``.
+    Built-in item models with exact item derivatives (see
+    :func:`compute_observed_information`) use the exact Louis observed
+    information, which is the target of the Oakes (1999) identity; other
+    models difference the marginal log-likelihood with step ``h``, at a cost
+    of O(P^2) likelihood evaluations.
+
+    Parameters
+    ----------
+    model, responses, posterior_weights, quadrature, h, prior_mass, bounds
+        As for :func:`compute_crossprod_se`.
+    prior_information : mapping of str to ndarray, optional
+        Negative second derivative of an independent item log-prior in the
+        stored parameter shapes. It is added to the observed information.
+
+    Returns
+    -------
+    dict
+        Standard errors in the stored parameter shapes.
     """
-    information = compute_observed_information(
-        model, responses, posterior_weights, quadrature, h=h, prior_mass=prior_mass
+    return _matrix_standard_errors(
+        "oakes",
+        model,
+        responses,
+        posterior_weights,
+        quadrature,
+        h,
+        prior_mass,
+        bounds=bounds,
+        prior_information=prior_information,
     )
-    _, layouts = _flatten_parameters(model)
-    return _se_from_information(information, layouts, model)
 
 
 def compute_sem_se(
@@ -641,11 +844,13 @@ def compute_sem_se(
     *,
     h: float = 1e-5,
     prior_mass: NDArray[np.float64] | None = None,
+    bounds: Callable[[str], tuple[float, float]] | None = None,
+    prior_information: Mapping[str, NDArray[np.float64]] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Compute deterministic observed-information SEs for an EM solution.
 
-    ``n_bootstrap`` and ``seed`` remain accepted for API compatibility with
-    the former stochastic approximation.
+    This is :func:`compute_oakes_se`. ``n_bootstrap`` and ``seed`` remain
+    accepted for API compatibility with the former stochastic approximation.
     """
     del n_bootstrap, seed
     return compute_oakes_se(
@@ -655,6 +860,8 @@ def compute_sem_se(
         quadrature,
         h=h,
         prior_mass=prior_mass,
+        bounds=bounds,
+        prior_information=prior_information,
     )
 
 
@@ -799,7 +1006,8 @@ def estimate_covariance(
         Negative second derivative of an independent item log-prior, in the
         stored parameter shapes, for Bayes modal estimates. It is added to the
         observed information, to the bread of the sandwich, and to the score
-        cross-product that ``"crossprod"`` inverts.
+        cross-product that ``"crossprod"`` inverts. Its keys must name stored
+        parameters of ``model``.
     tied : TiedCoordinates, optional
         Coordinates held equal by equality constraints. The information and
         cross-product of the constrained parameters are ``J' I J`` and
@@ -811,8 +1019,23 @@ def estimate_covariance(
     -------
     CovarianceEstimate
         Standard errors and the free-parameter covariance.
+
+    Raises
+    ------
+    MirtValidationError
+        If ``prior_information`` names a parameter that ``model`` lacks.
     """
     mass = _validate_prior_mass(prior_mass, quadrature.nodes.shape[0])
+    # A misnamed prior would otherwise drop out of the information.
+    names = list(model._parameters)
+    unknown = sorted(set(prior_information or ()) - set(names))
+    if unknown:
+        raise MirtValidationError(
+            f"prior_information names unknown parameters: {', '.join(unknown)}",
+            parameter="prior_information",
+            value=unknown,
+            expected=", ".join(names),
+        )
     information, meat, layouts = _information_and_meat(
         model,
         np.asarray(responses),
@@ -822,15 +1045,10 @@ def estimate_covariance(
         person_weights=frequencies,
         observed=method != "crossprod",
     )
-    if prior_information is not None:
-        curvature = np.diag(_free_values(prior_information, layouts))
-        if information is not None:
-            information = information + curvature
-        if method == "crossprod":
-            meat = meat + curvature
-    active = np.ones(meat.shape[0], dtype=np.bool_)
-    if bounds is not None:
-        active &= ~_coordinates_at_bounds(layouts, bounds)
+    information, meat = _with_prior_information(
+        method, information, meat, layouts, prior_information
+    )
+    active = _active_coordinates(layouts, bounds)
     if tied is None:
         covariance = _covariance(method, information, meat, active)
     else:

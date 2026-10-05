@@ -5,7 +5,11 @@ import pytest
 from scipy.special import expit, logsumexp
 
 from mirt import MHRMEstimator, TwoParameterLogistic, fit_mirt, simdata
-from mirt.estimation.mcmc import _precondition, _robbins_monro_step
+from mirt.estimation.mcmc import (
+    _precondition,
+    _robbins_monro_step,
+    _set_item_vectors,
+)
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.models.dichotomous import OneParameterLogistic, ThreeParameterLogistic
 from mirt.models.polytomous import (
@@ -119,6 +123,38 @@ def test_graded_thresholds_stay_ordered():
         estimator._update_parameters(model, responses, theta, 1.0, information)
         thresholds = model.parameters["thresholds"][0]
         assert thresholds[1] - thresholds[0] >= 1e-6 - 1e-12
+
+
+def test_item_vectors_round_trip_partially_fixed_layouts():
+    model = GradedResponseModel(3, n_categories=4)
+    model.set_parameters(
+        discrimination=np.array([1.0, 1.4, 0.8]),
+        thresholds=np.array([[-1.0, 0.0, 1.0], [-0.5, 0.2, 0.9], [-1.5, -0.4, 0.6]]),
+    )
+    model.set_free_parameter_masks(
+        {
+            "discrimination": np.array([True, True, False]),
+            "thresholds": np.array(
+                [[True, True, True], [True, False, True], [False, True, True]]
+            ),
+        }
+    )
+    before = model.parameters
+    estimator = MHRMEstimator(use_rust=False)
+    vectors = {
+        item: estimator._get_item_params_and_bounds(model, item)[0] + 0.05 * item
+        for item in (1, 2)
+    }
+    _set_item_vectors(model, vectors)
+    for item, vector in vectors.items():
+        np.testing.assert_array_equal(
+            estimator._get_item_params_and_bounds(model, item)[0], vector
+        )
+    after = model.parameters
+    np.testing.assert_array_equal(after["thresholds"][0], before["thresholds"][0])
+    assert after["thresholds"][1, 1] == before["thresholds"][1, 1]
+    assert after["discrimination"][2] == before["discrimination"][2]
+    assert after["thresholds"][2, 0] == before["thresholds"][2, 0]
 
 
 def test_step_holds_coordinates_a_bound_would_cut():

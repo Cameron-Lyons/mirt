@@ -44,6 +44,8 @@ if TYPE_CHECKING:
     from mirt.multigroup.model import MultigroupModel
     from mirt.multigroup.results import MultigroupFitResult
 
+    _ItemFamily = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+
 
 _LAZY_IMPORTS = {
     "multigroup_dif": ("mirt.multigroup.dif", "multigroup_dif"),
@@ -76,7 +78,7 @@ _LAZY_IMPORTS = {
 def fit_multigroup(
     data: NDArray[np.int_] | Any,
     groups: NDArray,
-    model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
+    model: _ItemFamily | Sequence[_ItemFamily] = "2PL",
     invariance: Literal["configural", "metric", "scalar", "strict"]
     | InvarianceSpec = "configural",
     n_categories: int | Sequence[int] | None = None,
@@ -84,7 +86,7 @@ def fit_multigroup(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     free_items: dict[str, list[int]] | None = None,
     item_names: list[str] | None = None,
 ) -> MultigroupFitResult:
@@ -101,8 +103,10 @@ def fit_multigroup(
         as negative values or ``NaN``.
     groups : ndarray of shape (n_persons,)
         Group membership indicator for each person.
-    model : str
+    model : str or sequence of str
         IRT model type: "1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM".
+        As in ``fit_mirt``, a per-item sequence naming one family fits that
+        family; mixed families raise ``MirtValidationError``.
     invariance : str or InvarianceSpec
         Level of measurement invariance:
 
@@ -123,8 +127,11 @@ def fit_multigroup(
         Convergence tolerance.
     verbose : bool
         Print iteration progress.
-    reference_group : int or str
-        Group to use as reference (mean=0, var=1). Can be index or label.
+    reference_group : int or str, optional
+        Group to use as reference (mean=0, var=1): an index into the sorted
+        group labels, or a label matched against ``str(label)``. An integer
+        that is also the label of another group raises ``ValueError``.
+        Defaults to the first group in sorted order.
     free_items : dict, optional
         For partial invariance: {param_name: [item_indices]} to free.
     item_names : list of str, optional
@@ -182,27 +189,30 @@ def fit_multigroup(
 def _prepare_multigroup(
     data: NDArray[np.int_] | Any,
     groups: NDArray,
-    model: str,
+    model: str | Sequence[str],
     *,
     n_categories: int | Sequence[int] | None,
-    reference_group: int | str,
+    reference_group: int | str | None,
     item_names: list[str] | None,
 ) -> tuple[MultigroupModel, list[NDArray[np.int_]], int]:
     """Build an unfitted multigroup model, per-group responses and reference index.
 
     Groups are ordered by their sorted unique labels. A string
     ``reference_group`` is matched against ``str(label)``; an integer is a
-    group index.
+    group index and must not be the label of a different group; ``None`` is
+    the first group.
     """
     import numpy as np
 
-    from mirt.models._factory import build_item_model
+    from mirt.models._factory import build_item_model, single_item_family
     from mirt.multigroup.model import MultigroupModel
     from mirt.utils.data import response_column_names, validate_responses
 
     if item_names is None:
         item_names = response_column_names(data)
     data = validate_responses(data)
+    # Like fit_mirt, a per-item sequence of one family fits that family.
+    model = single_item_family(model, data.shape[1], operation="multigroup models")
     groups = np.asarray(groups)
 
     if groups.shape[0] != data.shape[0]:
@@ -217,12 +227,31 @@ def _prepare_multigroup(
         raise ValueError("At least 2 groups required for multiple group analysis")
 
     group_labels = [str(g) for g in unique_groups]
-    if isinstance(reference_group, str):
+    if reference_group is None:
+        ref_idx = 0
+    elif isinstance(reference_group, str):
         if reference_group not in group_labels:
             raise ValueError(f"Unknown reference group: {reference_group}")
         ref_idx = group_labels.index(reference_group)
     else:
         ref_idx = reference_group
+        label = str(reference_group)
+        if (
+            not isinstance(reference_group, (bool, np.bool_))
+            and isinstance(reference_group, (int, np.integer))
+            and label in group_labels
+            and group_labels.index(label) != reference_group
+        ):
+            advice = f"pass reference_group={label!r} to select that group by label"
+            if 0 <= reference_group < n_groups:
+                advice += (
+                    f", or reference_group={group_labels[reference_group]!r} for "
+                    f"group index {reference_group}"
+                )
+            raise ValueError(
+                f"reference_group={reference_group} is a group index, but it is "
+                f"also the label of group {group_labels.index(label)}; {advice}"
+            )
 
     # Categories come from the pooled data so every group shares one structure.
     base_model = build_item_model(
@@ -251,7 +280,7 @@ def compare_invariance(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
 ) -> dict[str, MultigroupFitResult]:
     """Fit and compare different invariance levels.
 
@@ -273,8 +302,8 @@ def compare_invariance(
         Convergence tolerance.
     verbose : bool
         Print progress.
-    reference_group : int or str
-        Reference group for identification.
+    reference_group : int or str, optional
+        Reference group for identification, as in :func:`fit_multigroup`.
 
     Returns
     -------
@@ -322,7 +351,7 @@ def test_invariance_hierarchy(
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
-    reference_group: int | str = 0,
+    reference_group: int | str | None = None,
     alpha: float = 0.05,
 ) -> dict[str, Any]:
     """Test full invariance hierarchy with likelihood ratio tests.
@@ -345,8 +374,8 @@ def test_invariance_hierarchy(
         Convergence tolerance.
     verbose : bool
         Print progress.
-    reference_group : int or str
-        Reference group for identification.
+    reference_group : int or str, optional
+        Reference group for identification, as in :func:`fit_multigroup`.
     alpha : float
         Significance level for LRT tests.
 

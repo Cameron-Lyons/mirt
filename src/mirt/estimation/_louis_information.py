@@ -5,9 +5,10 @@ posterior expectation of the complete-data information minus the posterior
 variance of the complete-data score. On a quadrature grid with a fixed prior
 mass both terms are finite sums, so the identity is exact. Only derivatives
 of each item's category log-probabilities at the nodes are needed. Built-in
-unidimensional logistic, graded, partial-credit and rating-scale items use
-closed forms. Other built-in item models difference one item's curve at a
-time, which costs a few dozen curve evaluations per item rather than O(P^2)
+unidimensional 1PL-4PL, graded, partial-credit and rating-scale items use
+closed forms. The other supported built-ins, listed in
+:func:`supports_louis_information`, difference one item's curve at a time,
+which costs a few dozen curve evaluations per item rather than O(P^2)
 marginal likelihood evaluations. Parameters shared by all items, such as
 rating-scale thresholds, enter every item's derivatives and are accumulated
 once. Latent-density parameters are treated as fixed.
@@ -28,7 +29,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt._model_defaults import uses_builtin_model_hooks
+from mirt._model_defaults import (
+    _KERNEL_HOOKS,
+    _LIKELIHOOD_HOOKS,
+    uses_builtin_model_hooks,
+)
 from mirt.constants import PROB_EPSILON
 from mirt.estimation._posterior import normalize_log_posterior
 
@@ -72,10 +77,14 @@ class LouisInformation:
     score_crossproduct : ndarray of shape (P, P)
         ``sum_i m_i s_i s_i'`` of the exact marginal person scores, where
         ``m`` is ``meat_weights`` or, by default, the person weights.
+    score : ndarray of shape (P,)
+        ``sum_i w_i s_i``, the gradient of the weighted marginal
+        log-likelihood.
     """
 
     information: NDArray[np.float64]
     score_crossproduct: NDArray[np.float64]
+    score: NDArray[np.float64]
 
 
 def _analytic_model_types() -> tuple[type, ...]:
@@ -113,31 +122,128 @@ def has_analytic_item_derivatives(model: BaseItemModel) -> bool:
     return _uses_authored_rating_scale_hooks(model)
 
 
-def supports_louis_information(model: BaseItemModel) -> bool:
-    """Whether each free parameter belongs to one item or to all items.
+def _curve_product_types() -> tuple[type, ...]:
+    """Unregistered built-ins whose person likelihood is a product of curves.
 
-    Exact built-in types keep the person likelihood a product of item curves
-    evaluated by ``probability``, which item-local derivatives require. Of
-    those, only the rating-scale families have parameters shared by all
-    items. A mixed-format model qualifies when each of its components does
-    and none has shared parameters.
+    Each type's ``log_likelihood_batch`` sums the clipped log ``probability``
+    of every observed response, and every stored parameter belongs to one
+    item, so item-local differences of ``probability`` give the exact
+    marginal information.
+    """
+    from mirt.models.compensatory import (
+        DisjunctiveModel,
+        NoncompensatoryModel,
+        PartiallyCompensatoryModel,
+    )
+    from mirt.models.dichotomous import (
+        ComplementaryLogLog,
+        FiveParameterLogistic,
+        NegativeLogLog,
+        UnipolarLogLogistic,
+    )
+    from mirt.models.nested import (
+        FourPLNestedLogit,
+        ThreePLNestedLogit,
+        TwoPLNestedLogit,
+    )
+    from mirt.models.nonparametric import (
+        MonotonicPolynomialModel,
+        MonotonicSplineModel,
+    )
+    from mirt.models.sequential import (
+        AdjacentCategoryModel,
+        ContinuationRatioModel,
+        SequentialResponseModel,
+    )
+    from mirt.models.unfolding import (
+        GeneralizedGradedUnfolding,
+        HyperbolicCosineModel,
+        IdealPointModel,
+    )
+    from mirt.models.zeroinflated import HurdleIRT, ZeroInflated2PL, ZeroInflated3PL
+
+    return (
+        ComplementaryLogLog,
+        NegativeLogLog,
+        FiveParameterLogistic,
+        UnipolarLogLogistic,
+        PartiallyCompensatoryModel,
+        NoncompensatoryModel,
+        DisjunctiveModel,
+        TwoPLNestedLogit,
+        ThreePLNestedLogit,
+        FourPLNestedLogit,
+        MonotonicPolynomialModel,
+        MonotonicSplineModel,
+        SequentialResponseModel,
+        ContinuationRatioModel,
+        AdjacentCategoryModel,
+        GeneralizedGradedUnfolding,
+        IdealPointModel,
+        HyperbolicCosineModel,
+        ZeroInflated2PL,
+        ZeroInflated3PL,
+        HurdleIRT,
+    )
+
+
+def _uses_curve_product_hooks(model: BaseItemModel) -> bool:
+    """Whether ``model`` is a curve-product built-in with its authored hooks.
+
+    ``MultidimensionalModel`` and ``BifactorModel`` are registered built-ins.
+    The types of :func:`_curve_product_types` are not registered, so their
+    curve and likelihood hooks qualify when :mod:`mirt` defines them and the
+    instance does not shadow them. Subclasses never qualify.
+    """
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    model_class = type(model)
+    if model_class in (BifactorModel, MultidimensionalModel):
+        return uses_builtin_model_hooks(model, likelihood=True)
+    if model_class not in _curve_product_types():
+        return False
+    namespace = vars(model)
+    for name in _KERNEL_HOOKS + _LIKELIHOOD_HOOKS:
+        hook = getattr(model_class, name, None)
+        if hook is None:
+            continue
+        function = getattr(hook, "fget", None) or getattr(hook, "__func__", hook)
+        if name in namespace or not getattr(function, "__module__", "").startswith(
+            "mirt."
+        ):
+            return False
+    return True
+
+
+def supports_louis_information(model: BaseItemModel) -> bool:
+    """Whether item-local derivatives give the exact marginal information.
+
+    The person likelihood must be a product of the item curves evaluated by
+    ``probability``, and each free parameter must belong to one item or, for
+    the rating-scale families, to all items. Qualifying built-ins are 1PL-4PL
+    with any number of factors, GRM, GPCM, PCM, NRM, RSM and GRSM,
+    ``MultidimensionalModel`` and ``BifactorModel``, and the 5PL,
+    complementary and negative log-log, unipolar log-logistic, partially
+    compensatory, noncompensatory, disjunctive, nested-logit, monotone
+    polynomial and spline, sequential, continuation-ratio, adjacent-category,
+    GGUM, ideal-point, hyperbolic cosine, zero-inflated and hurdle models.
+    Subclasses and models with replaced curve or likelihood hooks do not
+    qualify. A mixed-format model qualifies when each of its components does;
+    a component's shared parameters belong to all of its own items. Other
+    models difference the marginal likelihood.
     """
     from mirt.estimation._patterns import supports_pattern_compression
     from mirt.models.mixed_format import MixedItemModel, uses_component_likelihoods
     from mirt.models.polytomous import _uses_authored_rating_scale_hooks
 
     if isinstance(model, MixedItemModel):
-        return (
-            uses_component_likelihoods(model)
-            and all(map(supports_louis_information, model.component_models))
-            and not any(
-                getattr(component, "_shared_parameters", frozenset())
-                for component in model.component_models
-            )
+        return uses_component_likelihoods(model) and all(
+            map(supports_louis_information, model.component_models)
         )
     if _uses_authored_rating_scale_hooks(model):
         return True
-    if not supports_pattern_compression(model):
+    if not (supports_pattern_compression(model) or _uses_curve_product_hooks(model)):
         return False
     return all(model._item_indexed(name) for name in model._parameters)
 
@@ -457,7 +563,11 @@ def _mixed_item_terms(
 
     Every component's coordinates keep their columns in the mixed-format
     layout. Cross-component information then comes from the posterior
-    covariance of the scores, as for any two items.
+    covariance of the scores, as for any two items. Coordinates that a
+    component shares across its items, such as rating-scale thresholds,
+    trail every item's terms, with zero derivatives for the items of other
+    components, so all items carry the one shared block that the score
+    accumulators expect.
     """
     parts: dict[int, dict[str, _ParameterLayout]] = {}
     columns: dict[int, list[NDArray[np.intp]]] = {}
@@ -469,17 +579,42 @@ def _mixed_item_terms(
         columns.setdefault(component, []).append(np.arange(offset, offset + size))
         offset += size
 
-    terms: list[_ItemTerms | None] = [None] * model.n_items
     components = model.components
+    placed = []
+    shared: list[NDArray[np.intp]] = []
+    n_shared = 0
     for component, local_layouts in parts.items():
         part, items = components[component]
         # Component columns follow ``local_layouts``; map them to the model's.
         placement = np.concatenate(columns[component])
-        for position, term in enumerate(item_terms(part, nodes, local_layouts)):
-            if term is not None:
-                terms[items[position]] = _ItemTerms(
-                    placement[term.columns], term.first, term.second
-                )
+        part_terms = item_terms(part, nodes, local_layouts)
+        own_shared = next((t.n_shared for t in part_terms if t is not None), 0)
+        if own_shared:
+            first = next(t for t in part_terms if t is not None)
+            shared.append(placement[first.columns[-own_shared:]])
+        placed.append((items, placement, part_terms, n_shared))
+        n_shared += own_shared
+    shared_columns = np.concatenate(shared) if shared else np.empty(0, np.intp)
+
+    terms: list[_ItemTerms | None] = [None] * model.n_items
+    for items, placement, part_terms, start in placed:
+        for position, term in enumerate(part_terms):
+            if term is None:
+                continue
+            mapped = placement[term.columns]
+            if not n_shared:
+                terms[items[position]] = _ItemTerms(mapped, term.first, term.second)
+                continue
+            n_own = term.columns.size - term.n_shared
+            rows = np.r_[np.arange(n_own), n_own + start + np.arange(term.n_shared)]
+            size = n_own + n_shared
+            first = np.zeros((size, *term.first.shape[1:]))
+            first[rows] = term.first
+            second = np.zeros((size, size, *term.second.shape[2:]))
+            second[np.ix_(rows, rows)] = term.second
+            terms[items[position]] = _ItemTerms(
+                np.r_[mapped[:n_own], shared_columns], first, second, n_shared
+            )
     return terms
 
 
@@ -534,9 +669,9 @@ class _Scores:
         self.shared_start = offset
 
     def to_flat(self, matrix: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Reorder an item-major matrix to the free-parameter layout."""
-        result = np.zeros((self.n_parameters, self.n_parameters))
-        result[np.ix_(self.order, self.order)] = matrix
+        """Reorder an item-major matrix or vector to the free-parameter layout."""
+        result = np.zeros((self.n_parameters,) * matrix.ndim)
+        result[np.ix_(*(self.order,) * matrix.ndim)] = matrix
         return result
 
     def item_columns(self, position: int) -> NDArray[np.intp]:
@@ -764,6 +899,7 @@ def louis_information(
     meat = None if meat_weights is None else np.asarray(meat_weights, np.float64)
     log_mass = _log_prior(prior_mass)
 
+    score_sum = np.zeros(scores.n_parameters)
     score_outer = np.zeros((scores.n_parameters, scores.n_parameters))
     meat_outer = None if meat is None else np.zeros_like(score_outer)
     step = scores.block_size(nodes.shape[0])
@@ -773,17 +909,19 @@ def louis_information(
         posterior, _ = _posterior_block(model, rows, nodes, log_mass)
         block_weights = weights[start:stop]
         person = scores.accumulate(rows, posterior, block_weights, observed)
+        score_sum += block_weights @ person
         score_outer += (person * block_weights[:, None]).T @ person
         if meat_outer is not None:
             meat_outer += (person * meat[start:stop, None]).T @ person
 
     crossproduct = scores.to_flat(score_outer if meat_outer is None else meat_outer)
+    score = scores.to_flat(score_sum)
     if not observed:
-        return LouisInformation(np.zeros_like(crossproduct), crossproduct)
+        return LouisInformation(np.zeros_like(crossproduct), crossproduct, score)
     information = scores.to_flat(
         scores.complete_information() - (scores.missing_information() - score_outer)
     )
-    return LouisInformation((information + information.T) / 2.0, crossproduct)
+    return LouisInformation((information + information.T) / 2.0, crossproduct, score)
 
 
 def enumerated_patterns(model: BaseItemModel) -> NDArray[np.int_] | None:

@@ -9,13 +9,15 @@ import pytest
 
 import mirt
 import mirt.estimation.bl as bl_module
+from mirt.estimation._louis_information import louis_information
 from mirt.estimation.bl import BLEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.standard_errors import (
+    _flatten_parameters,
     _posterior_from_model,
     compute_observed_information,
 )
-from mirt.models.dichotomous import TwoParameterLogistic
+from mirt.models.dichotomous import ComplementaryLogLog, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 
 
@@ -90,6 +92,32 @@ def test_bl_without_gradients_still_uses_exact_information(monkeypatch):
     )
 
 
+def test_bl_curve_product_models_use_exact_information():
+    # Built-ins outside the pattern-compressible families previously
+    # differenced the likelihood over every pair of parameters, 2P^2 + 1
+    # likelihood evaluations.
+    data = mirt.simdata(model="2PL", n_persons=800, n_items=6, seed=4)
+    result = BLEstimator(n_quadpts=15, tol=1e-10).fit(ComplementaryLogLog(6), data)
+    quadrature = GaussHermiteQuadrature(15)
+    mass = quadrature.weights / quadrature.weights.sum()
+    _, layouts = _flatten_parameters(result.model)
+    information = louis_information(
+        result.model, data, quadrature.nodes, mass, layouts
+    ).information
+    assert result.se_method == "hessian"
+    np.testing.assert_allclose(
+        result.vcov, np.linalg.inv(information), rtol=1e-10, atol=1e-14
+    )
+
+    pairwise = _OverriddenLikelihood(n_quadpts=15, tol=1e-10).fit(
+        ComplementaryLogLog(6), data
+    )
+    for name, values in result.model.parameters.items():
+        np.testing.assert_array_equal(pairwise.model.parameters[name], values)
+    for name, values in result.standard_errors.items():
+        np.testing.assert_allclose(pairwise.standard_errors[name], values, rtol=1e-3)
+
+
 def test_bl_holds_bound_coordinates_fixed():
     estimator, model, data = _fit("2PL")
     result = estimator.fit(model, data)
@@ -105,3 +133,30 @@ def test_bl_holds_bound_coordinates_fixed():
     assert np.all(np.isnan(covariance[0]))
     assert np.isnan(errors["discrimination"][0])
     assert np.all(np.isfinite(np.diag(covariance)[1:]))
+
+
+@pytest.mark.performance
+def test_bl_curve_product_errors_outpace_pairwise_differences():
+    import time
+
+    data = mirt.simdata(model="2PL", n_persons=1000, n_items=20, seed=3)
+    estimator = BLEstimator(n_quadpts=21)
+    model = estimator.fit(ComplementaryLogLog(20), data).model
+    params, _, structure = estimator._flatten_parameters(model)
+
+    def objective(candidate):
+        estimator._unflatten_parameters(model, candidate, structure)
+        return -estimator._compute_marginal_log_likelihood(model, data)
+
+    start = time.perf_counter()
+    exact = estimator._marginal_hessian(model, data, params, structure)
+    exact_time = time.perf_counter() - start
+    start = time.perf_counter()
+    pairwise = estimator._marginal_hessian(
+        model, data, params, structure, objective=objective
+    )
+    pairwise_time = time.perf_counter() - start
+    estimator._unflatten_parameters(model, params, structure)
+
+    np.testing.assert_allclose(exact, pairwise, rtol=0, atol=1e-3 * np.abs(exact).max())
+    assert exact_time * 10 < pairwise_time

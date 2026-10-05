@@ -64,6 +64,10 @@ def em_fit_2pl(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float, int, bool]:
     """Fit 2PL model using EM algorithm in Rust.
 
+    The fit starts from unit slopes and difficulties ``log((1 - p) / p)``,
+    where ``p`` is each item's (frequency-weighted) proportion correct
+    clipped to ``[0.01, 0.99]``.
+
     Returns
     -------
     tuple

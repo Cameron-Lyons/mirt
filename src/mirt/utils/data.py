@@ -171,6 +171,23 @@ def _response_array(responses: Any) -> NDArray[Any]:
         return array
 
 
+def _missing_coded_responses(responses: Any, missing_code: int = -1) -> NDArray[Any]:
+    """Read responses as an array whose ``NaN`` entries are ``missing_code``.
+
+    This is the missing-data convention of :func:`validate_responses` for
+    callers that check response codes themselves: nullable DataFrame columns
+    are read as floats and every ``NaN`` becomes ``missing_code``. Other
+    values, including infinities and non-numeric entries, are returned
+    unchanged for the caller to validate.
+    """
+    array = _response_array(responses)
+    if array.dtype.kind == "f":
+        missing = np.isnan(array)
+        if np.any(missing):
+            array = np.where(missing, float(missing_code), array)
+    return array
+
+
 def response_column_names(responses: Any) -> list[str] | None:
     """Return the column labels of a DataFrame-like response matrix.
 

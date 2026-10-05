@@ -12,6 +12,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -96,6 +97,33 @@ def _legacy_draws(
     return core, draws
 
 
+def _held_coordinates(
+    covariance: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Separate coordinates held fixed, which have all-NaN rows and columns.
+
+    ``FitResult.vcov`` marks parameters on an optimizer bound, or without an
+    estimable variance, this way. Returns a copy of the square matrix with
+    those rows and columns zeroed, and the mask of held coordinates.
+
+    Raises
+    ------
+    ValueError
+        If any other entry is not finite.
+    """
+    matrix = np.array(covariance, dtype=np.float64)
+    missing = np.isnan(matrix)
+    held = missing.all(axis=1) & missing.all(axis=0)
+    if not np.all(np.isfinite(matrix[np.ix_(~held, ~held)])):
+        raise ValueError(
+            "vcov must contain only finite values, apart from all-NaN rows and "
+            "columns that mark parameters held fixed"
+        )
+    matrix[held, :] = 0.0
+    matrix[:, held] = 0.0
+    return matrix, held
+
+
 def _normal_draws(
     rng: np.random.Generator,
     mean: NDArray[np.float64],
@@ -155,8 +183,10 @@ def draw_parameters(
     model : FitResult or BaseItemModel
         A fit result, or a fitted model exposing discrimination and one
         difficulty per item. Without ``vcov``, a fit result supplies its
-        free-parameter covariance (``result.vcov``). When the result has only
-        standard errors, parameters are drawn independently with a
+        free-parameter covariance (``result.vcov``); its model must store
+        ``discrimination`` and ``difficulty`` rather than derive them, as an
+        LLTM derives difficulty from feature weights. When the result has
+        only standard errors, parameters are drawn independently with a
         ``UserWarning``. Fixed parameters, and parameters on an optimizer
         bound or without a standard error, are held at their estimates.
     n_samples : int
@@ -166,9 +196,12 @@ def draw_parameters(
         factors varying fastest), difficulty, then guessing, slipping, upper,
         and asymmetry for the parameters the model has. A matrix covering
         discrimination and difficulty only holds the other parameters at
-        their estimates. A bare model without ``vcov`` or ``model.vcov``
-        falls back, with a ``FutureWarning``, to fixed sampling scales that
-        do not reflect estimation uncertainty and will be removed.
+        their estimates, as do rows and columns that are entirely ``NaN``,
+        which ``FitResult.vcov`` uses for parameters on an optimizer bound.
+        When nothing is fixed, the ``result.vcov`` of a unidimensional 2PL,
+        3PL or 4PL fit is in this layout. A bare model without ``vcov`` or
+        ``model.vcov`` falls back, with a ``FutureWarning``, to fixed sampling
+        scales that do not reflect estimation uncertainty and will be removed.
     method : str
         Sampling method. Currently only "mvn" (asymptotic multivariate
         normal sampling) is supported.
@@ -245,12 +278,18 @@ def draw_parameters(
         elif vcov.shape != (n_core, n_core):
             alternative = f" or {(n_joint, n_joint)}" if optional else ""
             raise ValueError(f"vcov must have shape {(n_core, n_core)}{alternative}")
-        if not np.all(np.isfinite(vcov)):
-            raise ValueError("vcov must contain only finite values")
-        mean = joint_mean(sampled)
-        draws = _normal_draws(rng, mean, vcov, np.ones(mean.size, bool), n_samples)
+        vcov, held = _held_coordinates(vcov)
+        draws = _normal_draws(rng, joint_mean(sampled), vcov, ~held, n_samples)
     elif result is not None:
-        sampled = [name for name in optional if name in item_model.parameters]
+        stored = item_model.parameters
+        if "discrimination" not in stored or "difficulty" not in stored:
+            raise MirtValidationError(
+                "draw_parameters(result) requires stored discrimination and "
+                f"difficulty parameters, but the {item_model.model_name} model "
+                f"stores {', '.join(stored)}; pass vcov in the sampling layout",
+                parameter="model",
+            )
+        sampled = [name for name in optional if name in stored]
         draws = _result_draws(
             rng,
             result,
@@ -261,12 +300,8 @@ def draw_parameters(
     else:
         model_vcov = getattr(item_model, "vcov", None)
         if model_vcov is not None and np.shape(model_vcov) == (n_core, n_core):
-            model_vcov = np.asarray(model_vcov, dtype=np.float64)
-            if not np.all(np.isfinite(model_vcov)):
-                raise ValueError("vcov must contain only finite values")
-            draws = _normal_draws(
-                rng, core, model_vcov, np.ones(n_core, bool), n_samples
-            )
+            model_vcov, held = _held_coordinates(model_vcov)
+            draws = _normal_draws(rng, core, model_vcov, ~held, n_samples)
         else:
             draws, legacy = _legacy_draws(rng, core, optional, n_samples)
 

@@ -97,6 +97,36 @@ def test_iterate_change_restores_the_current_parameters():
     assert np.isfinite(change) and error > 0.0
 
 
+@pytest.mark.parametrize("importance_sampling", [True, False])
+def test_change_estimate_reuses_the_e_step_likelihoods(
+    responses, importance_sampling, monkeypatch
+):
+    original = MCEMEstimator._iterate_change
+    checked = []
+
+    def iterate_change(self, model, data, samples, *args, current_values=None):
+        # The E-step's likelihoods equal a fresh evaluation at the current
+        # parameters on the same draws.
+        expected = self._sample_log_likelihoods(model, data, samples)
+        np.testing.assert_array_equal(current_values, expected)
+        checked.append(current_values.shape)
+        return original(
+            self, model, data, samples, *args, current_values=current_values
+        )
+
+    monkeypatch.setattr(MCEMEstimator, "_iterate_change", iterate_change)
+    estimator = MCEMEstimator(
+        n_samples=60,
+        max_iter=15,
+        tol=1e-2,
+        seed=4,
+        importance_sampling=importance_sampling,
+    )
+    result = estimator.fit(TwoParameterLogistic(8), responses)
+    assert len(checked) == result.n_iterations - 1 > 0
+    assert checked[-1] == (len(responses), estimator.sample_size_history[-1])
+
+
 def test_max_samples_must_cover_the_initial_sample():
     with pytest.raises(ValueError, match="max_samples"):
         MCEMEstimator(n_samples=100, max_samples=99)

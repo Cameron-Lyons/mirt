@@ -123,6 +123,114 @@ def test_export_repeats_a_shared_category_count() -> None:
         FitResult.from_dict(result.to_dict())
 
 
+def _assert_round_trip(original: FitResult, data: np.ndarray) -> FitResult:
+    restored = FitResult.from_json(original.to_json())
+
+    assert type(restored.model) is type(original.model)
+    assert restored.model.is_fitted
+    assert restored.model.n_parameters == original.model.n_parameters
+    for name, values in original.model.parameters.items():
+        np.testing.assert_array_equal(restored.model.parameters[name], values)
+        np.testing.assert_array_equal(
+            restored.model.free_parameter_masks[name],
+            original.model.free_parameter_masks[name],
+        )
+    assert restored.vcov_labels == original.vcov_labels
+    if original.latent_covariance is None:
+        assert restored.latent_covariance is None
+    else:
+        np.testing.assert_array_equal(
+            restored.latent_covariance, original.latent_covariance
+        )
+    assert restored.to_json() == original.to_json()
+    expected = fscores(original, data)
+    np.testing.assert_array_equal(fscores(restored, data).theta, expected.theta)
+    return restored
+
+
+@pytest.mark.parametrize(
+    ("model", "spec", "name"),
+    [
+        ("2PL", "F1 = 1-3\nF2 = 4-6\nCOV = F1*F2", "MIRT"),
+        ("2PL", "F1 = 1-4\nF2 = 3-6", "MIRT"),
+        ("GRM", "F1 = 1-3\nF2 = 4-6\nCOV = F1*F2", "GRM"),
+        (
+            "2PL",
+            "F = 1-6\nFIXED = (1, a1), (2, difficulty)\nSTART = (1, a1, 1.0)",
+            "2PL",
+        ),
+    ],
+)
+def test_json_round_trip_rebuilds_confirmatory_fits(
+    model: str, spec: str, name: str, responses: dict[str, np.ndarray]
+) -> None:
+    # Regression: multi-factor 2PL fits were rejected, and FIXED masks of
+    # rebuilt families were lost.
+    data = responses["polytomous" if model == "GRM" else "dichotomous"]
+    original = fit_mirt(data, model=model, spec=spec, n_quadpts=7, max_iter=3)  # type: ignore[arg-type]
+    exported = original.to_dict()["model"]
+
+    assert exported["name"] == name
+    assert ("loading_pattern" in exported) == (name == "MIRT")
+    restored = _assert_round_trip(original, data)
+    if "FIXED" in spec:
+        assert restored.model.n_parameters == 6 * 2 - 2
+
+
+def test_json_round_trip_rebuilds_bifactor_fits() -> None:
+    from mirt import bfactor
+
+    rng = np.random.default_rng(4)
+    labels = [3, 3, 3, 5, 5, 5]
+    theta = rng.standard_normal((200, 3))
+    logits = theta[:, :1] + 0.7 * theta[:, [1, 1, 1, 2, 2, 2]] - 0.2
+    data = (rng.random(logits.shape) < 1 / (1 + np.exp(-logits))).astype(int)
+    original = bfactor(
+        data,
+        labels,
+        n_quadpts=7,
+        max_iter=3,
+        fixed={"specific_loadings": np.array([True] + [False] * 5)},
+    )
+
+    assert original.to_dict()["model"]["specific_factors"] == labels
+    restored = _assert_round_trip(original, data)
+    np.testing.assert_array_equal(restored.model.specific_factors, labels)
+
+
+def test_from_dict_validates_structured_models(
+    responses: dict[str, np.ndarray],
+) -> None:
+    data = responses["dichotomous"]
+    payload = fit_mirt(
+        data, spec="F1 = 1-3\nF2 = 4-6", n_quadpts=7, max_iter=2
+    ).to_dict()
+
+    def rejected(change: Any, message: str) -> None:
+        changed = copy.deepcopy(payload)
+        change(changed)
+        with pytest.raises(MirtValidationError, match=message):
+            FitResult.from_dict(changed)
+
+    rejected(lambda p: p["model"].pop("loading_pattern"), "is required for 'MIRT'")
+    rejected(
+        lambda p: p["model"].update(loading_pattern=[[0.5, 1.0]] * 6), "zeros and ones"
+    )
+    rejected(lambda p: p["model"].update(n_factors=3), "n_factors")
+    rejected(lambda p: p["model"].update(specific_factors=[0] * 6), "does not apply")
+    rejected(
+        lambda p: p["parameters"]["slopes"][0].__setitem__(1, 0.7),
+        "zero where model.loading_pattern is zero",
+    )
+
+    def short_bifactor(changed: dict[str, Any]) -> None:
+        info = changed["model"]
+        del info["loading_pattern"]
+        info.update(name="Bifactor", specific_factors=[0, 0, 0, 1, 1], n_factors=3)
+
+    rejected(short_bifactor, "specific_factors")
+
+
 def test_round_trip_keeps_covariance_of_fitted_coordinates(
     responses: dict[str, np.ndarray],
 ) -> None:
@@ -179,7 +287,12 @@ _DELETE = object()
         (("aic",), "bad", "aic must be a number"),
         (("n_iterations",), 1.5, "non-negative integer"),
         (("converged",), "yes", "converged must be a boolean"),
-        (("model", "name"), "MIRT", "only fit_mirt model families"),
+        (("model", "name"), "RSM", "only fit_mirt model families"),
+        (("model", "name"), "MIRT", "loading_pattern is required"),
+        (("model", "loading_pattern"), [[1.0]] * 6, "does not apply to '2PL'"),
+        (("model", "free_parameter_masks"), [True], "map parameter names"),
+        (("model", "free_parameter_masks"), {"slope": [True] * 6}, "Unknown"),
+        (("model", "free_parameter_masks"), {"difficulty": [1] * 6}, "Boolean"),
         (("model", "color"), "red", "unknown fields: color"),
         (("model", "n_items"), 0, "positive integer"),
         (("model", "n_items"), 5, "item_names"),

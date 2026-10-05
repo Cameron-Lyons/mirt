@@ -255,6 +255,7 @@ def test_multi_start_fit_applies_starts_before_fitting(monkeypatch):
         np.array([[0, 1, 0], [1, 0, 1]]),
         n_starts=2,
         seed=23,
+        compute_standard_errors=False,
     )
 
     assert result.log_likelihood == 2.0
@@ -273,6 +274,7 @@ def test_multi_start_fit_breaks_likelihood_ties_by_start_order(monkeypatch):
         np.array([[0, 1], [1, 0]]),
         n_starts=3,
         seed=3,
+        compute_standard_errors=False,
     )
 
     assert result.index == 0

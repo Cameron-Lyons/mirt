@@ -15,6 +15,7 @@ from scipy import stats
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
+from mirt.utils.sampling import _held_coordinates
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -165,8 +166,12 @@ def _resolve_vcov(
     model: "BaseItemModel",
     vcov: NDArray[np.float64] | None,
     n_parameters: int,
-) -> NDArray[np.float64]:
-    """Resolve a real parameter covariance matrix without fabricated defaults."""
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Resolve a real parameter covariance matrix without fabricated defaults.
+
+    Returns the covariance and the mask of coordinates held fixed, whose
+    all-NaN rows and columns (as in ``FitResult.vcov``) are zeroed.
+    """
     covariance = vcov
     if covariance is None:
         model_vcov = getattr(model, "vcov", None)
@@ -190,13 +195,25 @@ def _resolve_vcov(
                     "information matrix"
                 )
 
-    result = _validate_symmetric_matrix(
-        covariance,
-        (n_parameters, n_parameters),
-        "vcov",
-    )
+    array = np.asarray(covariance, dtype=np.float64)
+    expected_shape = (n_parameters, n_parameters)
+    if array.shape != expected_shape:
+        raise ValueError(f"vcov must have shape {expected_shape}, got {array.shape}")
+    array, held = _held_coordinates(array)
+    result = _validate_symmetric_matrix(array, expected_shape, "vcov")
     _validate_positive_semidefinite(result, "vcov")
-    return result
+    return result, held
+
+
+def _reject_held(involved: NDArray[np.bool_], held: NDArray[np.bool_]) -> None:
+    """Reject a hypothesis on coordinates that a covariance holds fixed."""
+    if np.any(involved & held):
+        raise MirtValidationError(
+            "the hypothesis involves parameters whose vcov rows and columns are "
+            "NaN, which marks parameters on an optimizer bound or without a "
+            "standard error",
+            parameter="param_indices",
+        )
 
 
 def _result_vcov(
@@ -282,7 +299,10 @@ def wald(
         Values under null hypothesis. Default is zeros.
     vcov : NDArray[np.float64], optional
         Full parameter variance-covariance matrix in ``model.parameters``
-        order. Required for a bare model unless it exposes ``vcov`` or an
+        order. Rows and columns that are entirely ``NaN``, which
+        ``FitResult.vcov`` uses for parameters on an optimizer bound, mark
+        parameters held fixed that the hypothesis cannot involve. Required
+        for a bare model unless it exposes ``vcov`` or an
         ``information_matrix()`` method.
     contrast_matrix : ndarray, optional
         Linear hypothesis matrix R for testing ``R @ parameters = values``.
@@ -338,7 +358,8 @@ def wald(
     if vcov is None and result is not None:
         full_vcov = _result_vcov(result, contrast)
     else:
-        full_vcov = _resolve_vcov(model, vcov, n_total_parameters)
+        full_vcov, held = _resolve_vcov(model, vcov, n_total_parameters)
+        _reject_held(np.any(contrast != 0.0, axis=0), held)
     hypothesis_vcov = contrast @ full_vcov @ contrast.T
     hypothesis_vcov = (hypothesis_vcov + hypothesis_vcov.T) / 2
     _validate_positive_definite(hypothesis_vcov, "hypothesis covariance")
@@ -547,13 +568,144 @@ def _numerical_score_subset(
     return scores
 
 
-def lagrange(
+def _response_matrix(
     model: "BaseItemModel",
     responses: NDArray[np.float64],
+) -> NDArray[np.int_]:
+    """Validate responses and code missing cells as -1."""
+    values = np.asarray(responses, dtype=np.float64)
+    if values.ndim != 2 or values.shape[0] == 0:
+        raise ValueError("responses must be a non-empty 2D matrix")
+    if values.shape[1] != model.n_items:
+        raise ValueError(
+            f"responses must contain {model.n_items} items, got {values.shape[1]}"
+        )
+    if np.any(np.isinf(values)):
+        raise ValueError("responses must not contain infinite values")
+    observed = values[~np.isnan(values)]
+    if np.any(observed != np.floor(observed)):
+        raise ValueError("observed responses must be integer-valued")
+    matrix = np.where(np.isnan(values), -1, values).astype(np.int_)
+    _validate_response_categories(model, matrix)
+    return matrix
+
+
+def _conditional_scores(
+    model: "BaseItemModel",
+    responses: NDArray[np.int_],
     theta: NDArray[np.float64],
-    param_indices: list[int] | NDArray[np.intp],
+    indices: NDArray[np.intp],
+    n_parameters: int,
+    step: float,
+) -> NDArray[np.float64]:
+    """Return the tested scores of the conditional likelihood at ``theta``."""
+    score_function = getattr(model, "score_function", None)
+    if callable(score_function):
+        raw_scores = np.asarray(score_function(responses, theta), dtype=np.float64)
+        if raw_scores.shape == (responses.shape[0], n_parameters):
+            score_vector = np.sum(raw_scores, axis=0)
+        elif raw_scores.shape == (n_parameters,):
+            score_vector = raw_scores
+        else:
+            raise ValueError(
+                "score_function must return shape "
+                f"({n_parameters},) or ({responses.shape[0]}, {n_parameters})"
+            )
+        if not np.all(np.isfinite(score_vector)):
+            raise ValueError("score_function returned non-finite values")
+        return score_vector[indices]
+    score_vector = _analytic_score_vector(model, responses, theta)
+    if score_vector is None:
+        return _numerical_score_subset(model, responses, theta, indices, step)
+    if score_vector.shape != (n_parameters,) or not np.all(np.isfinite(score_vector)):
+        raise ValueError("analytic score calculation returned invalid values")
+    return score_vector[indices]
+
+
+def _marginal_lagrange_terms(
+    result: "FitResult",
+    responses: NDArray[np.int_],
+    indices: NDArray[np.intp],
+    step: float,
+    n_quadpts: int,
+    *,
+    information: bool,
+) -> tuple[NDArray[np.float64], NDArray[np.float64] | None]:
+    """Return marginal scores and covariance of tested coordinates once freed.
+
+    The tested coordinates are freed in a copy of the fitted model, whose
+    marginal score and, if ``information``, observed information are
+    evaluated at the constrained estimates. Free coordinates on an EM
+    optimizer bound stay held fixed.
+    """
+    from mirt.estimation.base import _parameter_bounds
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _coordinates_at_bounds,
+        _covariance,
+        _score_and_information,
+        _validate_prior_mass,
+    )
+
+    model = result.model
+    free = model.free_parameter_masks
+    family = model.copy().set_free_parameter_masks(None).free_parameter_masks
+    names = list(free)
+    flat_free = np.concatenate([free[name].ravel() for name in names])
+    if not np.all(np.concatenate([family[name].ravel() for name in names])[indices]):
+        raise MirtValidationError(
+            "param_indices include parameters that the model family fixes, "
+            "such as reference-category coefficients or loadings outside a "
+            "confirmatory pattern, which cannot be freed",
+            parameter="param_indices",
+        )
+    if np.any(flat_free[indices]):
+        raise MirtValidationError(
+            "param_indices must name fixed parameters; the Lagrange test asks "
+            "whether freeing them improves the fit",
+            parameter="param_indices",
+        )
+    alternative_free = flat_free.copy()
+    alternative_free[indices] = True
+    sizes = np.cumsum([free[name].size for name in names])[:-1]
+    alternative = model.copy()
+    alternative.set_free_parameter_masks(
+        {
+            name: chunk.reshape(free[name].shape)
+            for name, chunk in zip(
+                names, np.split(alternative_free, sizes), strict=True
+            )
+        }
+    )
+
+    quadrature = GaussHermiteQuadrature(
+        n_quadpts, model.n_factors, cov=result.latent_covariance
+    )
+    mass = _validate_prior_mass(quadrature.weights, quadrature.nodes.shape[0])
+    score, observed, layouts = _score_and_information(
+        alternative, responses, quadrature, mass, step, observed=information
+    )
+    columns = (np.cumsum(alternative_free) - 1)[indices]
+    if observed is None:
+        return score[columns], None
+    tested = np.zeros(score.size, dtype=np.bool_)
+    tested[columns] = True
+    bounded = _coordinates_at_bounds(
+        layouts, lambda name: _parameter_bounds(model, name)
+    )
+    covariance = _covariance("oakes", observed, None, tested | ~bounded)
+    return score[columns], covariance[np.ix_(columns, columns)]
+
+
+def lagrange(
+    model: "BaseItemModel | FitResult",
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64] | None = None,
+    param_indices: list[int] | NDArray[np.intp] | None = None,
     vcov: NDArray[np.float64] | None = None,
     step: float = 1e-5,
+    *,
+    n_quadpts: int = 21,
 ) -> LagrangeTestResult:
     """Perform Lagrange (score) test for parameter constraints.
 
@@ -561,27 +713,47 @@ def lagrange(
     the score statistic:
         LM = S' V S
 
-    where S is the score (gradient) vector evaluated at the constrained
-    estimates.
+    where S is the score (gradient) vector of the tested parameters and V
+    their block of the inverse information of the model with them freed,
+    both evaluated at the constrained estimates.
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model (under constraints).
+    model : FitResult or BaseItemModel
+        A fit of the constrained model, or the fitted model itself. For a
+        fit result, the tested parameters are freed in a copy of the model
+        and S and the information come from its marginal likelihood, as in
+        a likelihood-ratio test against the freed model; ``theta`` is not
+        used. The latent density is normal with the result's
+        ``latent_covariance``, or standard normal, on ``n_quadpts``
+        Gauss-Hermite nodes per factor, and free parameters on an EM
+        optimizer bound stay fixed. The fit must maximize the likelihood:
+        Bayes modal fits with item priors are rejected, and equality
+        constraints or a non-normal latent density of the fit are not
+        represented. For a bare model, S is the score of the likelihood
+        conditional on ``theta``.
     responses : NDArray[np.float64]
         Response matrix. Shape: (n_persons, n_items).
-    theta : NDArray[np.float64]
-        Ability estimates. Shape: (n_persons, n_dims).
+    theta : NDArray[np.float64], optional
+        Ability estimates for a bare model. Shape: (n_persons, n_dims).
     param_indices : array-like of int
         Indices of constrained parameters to test, in the insertion order
-        returned by ``model.parameters``.
+        returned by ``model.parameters``, each array raveled row-major. For
+        a fit result they must be fixed parameters that the model family
+        allows to be free.
     vcov : NDArray[np.float64], optional
         Inverse Fisher information (the full-model parameter covariance) in
-        ``model.parameters`` order. Required unless the model exposes
-        ``vcov`` or an ``information_matrix()`` method.
+        ``model.parameters`` order. Rows and columns that are entirely
+        ``NaN`` mark parameters held fixed, which cannot be tested. Required
+        for a bare model unless it exposes ``vcov`` or an
+        ``information_matrix()`` method; a fit result computes it when
+        omitted.
     step : float
-        Relative central-difference step used when the model does not expose
-        a compatible score function. Default 1e-5.
+        Central-difference step for models without exact score derivatives:
+        relative to each parameter for a bare model, and absolute in the
+        marginal likelihood for a fit result. Default 1e-5.
+    n_quadpts : int, default=21
+        Quadrature points per factor for a fit result.
 
     Returns
     -------
@@ -590,40 +762,52 @@ def lagrange(
 
     Examples
     --------
-    >>> # Fit constrained model (e.g., Rasch with equal discriminations)
-    >>> result = fit_mirt(responses, model="1PL")
-    >>> # Test if discriminations should be freed
-    >>> test = lagrange(
-    ...     result.model,
+    >>> # Fit the 2PL with the first item's discrimination fixed at 1.
+    >>> constrained = fit_mirt(
     ...     responses,
-    ...     result.theta,
-    ...     param_indices=[0, 2, 4],
-    ...     vcov=parameter_covariance,
+    ...     model="2PL",
+    ...     fixed={"discrimination": np.arange(n_items) == 0},
+    ...     start_values={"discrimination": np.ones(n_items)},
     ... )
+    >>> # Test whether that discrimination should be freed.
+    >>> test = lagrange(constrained, responses, param_indices=[0])
     >>> print(f"LM chi-sq = {test.statistic:.3f}, p = {test.p_value:.4f}")
     """
-    responses = np.asarray(responses, dtype=np.float64)
-    if responses.ndim != 2 or responses.shape[0] == 0:
-        raise ValueError("responses must be a non-empty 2D matrix")
-    if responses.shape[1] != model.n_items:
-        raise ValueError(
-            f"responses must contain {model.n_items} items, got {responses.shape[1]}"
-        )
-    if np.any(np.isinf(responses)):
-        raise ValueError("responses must not contain infinite values")
-    observed_responses = responses[~np.isnan(responses)]
-    if np.any(observed_responses != np.floor(observed_responses)):
-        raise ValueError("observed responses must be integer-valued")
-    response_matrix = np.where(np.isnan(responses), -1, responses).astype(np.int_)
-    _validate_response_categories(model, response_matrix)
+    from mirt.results.fit_result import FitResult
 
-    theta_array = _coerce_theta(
-        theta,
-        n_persons=responses.shape[0],
-        n_factors=model.n_factors,
-    )
-    all_params = _flatten_model_parameters(model)
-    n_total_parameters = all_params.size
+    result = model if isinstance(model, FitResult) else None
+    if result is not None:
+        model = result.model
+    response_matrix = _response_matrix(model, responses)
+    if result is None:
+        if theta is None:
+            raise ValueError("theta is required unless model is a fit result")
+        theta_array = _coerce_theta(
+            theta,
+            n_persons=response_matrix.shape[0],
+            n_factors=model.n_factors,
+        )
+    elif theta is not None:
+        raise ValueError(
+            "theta is not used with a fit result, whose test uses marginal "
+            "scores; pass result.model to score at fixed abilities"
+        )
+    elif result.log_posterior is not None:
+        raise MirtValidationError(
+            "lagrange needs a maximum-likelihood fit, but this result maximized "
+            "a posterior with item priors, where the likelihood score of the "
+            "free parameters is not zero",
+            parameter="model",
+        )
+    elif (
+        isinstance(n_quadpts, (bool, np.bool_))
+        or not isinstance(n_quadpts, (int, np.integer))
+        or n_quadpts < 1
+    ):
+        raise ValueError("n_quadpts must be a positive integer")
+    n_total_parameters = _flatten_model_parameters(model).size
+    if param_indices is None:
+        raise ValueError("param_indices is required")
     indices = _validate_parameter_indices(param_indices, n_total_parameters)
 
     if (
@@ -634,43 +818,40 @@ def lagrange(
     ):
         raise ValueError("step must be a finite positive value")
 
-    score_function = getattr(model, "score_function", None)
-    if callable(score_function):
-        raw_scores = np.asarray(
-            score_function(response_matrix, theta_array), dtype=np.float64
+    marginal_vcov = None
+    if result is None:
+        score_subset = _conditional_scores(
+            model,
+            response_matrix,
+            theta_array,
+            indices,
+            n_total_parameters,
+            float(step),
         )
-        if raw_scores.shape == (responses.shape[0], n_total_parameters):
-            score_vector = np.sum(raw_scores, axis=0)
-        elif raw_scores.shape == (n_total_parameters,):
-            score_vector = raw_scores
-        else:
-            raise ValueError(
-                "score_function must return shape "
-                f"({n_total_parameters},) or "
-                f"({responses.shape[0]}, {n_total_parameters})"
-            )
-        if not np.all(np.isfinite(score_vector)):
-            raise ValueError("score_function returned non-finite values")
-        score_subset = score_vector[indices]
     else:
-        score_vector = _analytic_score_vector(model, response_matrix, theta_array)
-        if score_vector is None:
-            score_subset = _numerical_score_subset(
-                model,
-                response_matrix,
-                theta_array,
-                indices,
-                float(step),
-            )
-        else:
-            if score_vector.shape != (n_total_parameters,) or not np.all(
-                np.isfinite(score_vector)
-            ):
-                raise ValueError("analytic score calculation returned invalid values")
-            score_subset = score_vector[indices]
-
-    full_vcov = _resolve_vcov(model, vcov, n_total_parameters)
-    vcov_subset = full_vcov[np.ix_(indices, indices)]
+        score_subset, marginal_vcov = _marginal_lagrange_terms(
+            result,
+            response_matrix,
+            indices,
+            float(step),
+            int(n_quadpts),
+            information=vcov is None,
+        )
+    if marginal_vcov is None:
+        full_vcov, held = _resolve_vcov(model, vcov, n_total_parameters)
+        involved = np.zeros(n_total_parameters, dtype=np.bool_)
+        involved[indices] = True
+        _reject_held(involved, held)
+        vcov_subset = full_vcov[np.ix_(indices, indices)]
+    elif np.all(np.isfinite(marginal_vcov)):
+        vcov_subset = marginal_vcov
+    else:
+        raise MirtValidationError(
+            "the observed information of the freed model is not positive "
+            "definite in the tested parameters at the constrained estimates; "
+            "pass vcov to supply their covariance",
+            parameter="param_indices",
+        )
     _validate_positive_definite(vcov_subset, "tested parameter covariance")
 
     statistic = max(float(score_subset @ vcov_subset @ score_subset), 0.0)

@@ -21,9 +21,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON
+from mirt.utils.data import _missing_coded_responses
 from mirt.utils.numeric import (
     _fit_cell_terms,
     _FitStatsAccumulator,
@@ -320,7 +321,7 @@ def _compute_batched_residual_arrays(
         residuals["pearson"] = raw / np.sqrt(expected + PROB_EPSILON)
     if "deviance" in residual_types:
         if probabilities.ndim == 3:
-            safe_responses = np.where(valid, responses, 0)
+            safe_responses = np.where(valid, responses, 0).astype(np.intp)
             observed_probability = np.take_along_axis(
                 probabilities,
                 safe_responses[:, :, None],
@@ -404,7 +405,7 @@ def _compute_residual_arrays(
         if "deviance" in residuals:
             with np.errstate(divide="ignore", invalid="ignore"):
                 if probs.ndim == 2:
-                    p_obs = probs[valid, observed]
+                    p_obs = probs[valid, observed.astype(np.intp)]
                 else:
                     p_obs = np.where(observed == 1, probs[valid], 1 - probs[valid])
                 p_obs = np.clip(p_obs, PROB_EPSILON, 1 - PROB_EPSILON)
@@ -417,7 +418,7 @@ def _compute_residual_arrays(
 
 def compute_residuals(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     residual_type: str = "standardized",
 ) -> NDArray[np.float64]:
@@ -428,8 +429,9 @@ def compute_residuals(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates. If None, EAP estimates are computed.
     residual_type : str
@@ -440,7 +442,7 @@ def compute_residuals(
     ndarray
         Residual matrix of same shape as responses
     """
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     if residual_type not in _RESIDUAL_TYPES:
         raise ValueError(f"Unknown residual type: {residual_type}")
 
@@ -456,7 +458,7 @@ def compute_residuals(
 
 def analyze_residuals(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
 ) -> ResidualAnalysisResult:
     """Comprehensive residual analysis for IRT model.
@@ -466,8 +468,9 @@ def analyze_residuals(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : ndarray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
 
@@ -476,7 +479,7 @@ def analyze_residuals(
     ResidualAnalysisResult
         Complete residual analysis results
     """
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
@@ -568,8 +571,6 @@ def _stream_fit_statistics(
             item_index,
         )
         column = responses[:, item_index]
-        if column.dtype.kind == "f":
-            column = np.where(np.isnan(column), -1.0, column)
         totals.add(
             column[:, None],
             expected[:, None],
@@ -587,7 +588,7 @@ def _stream_fit_statistics(
 
 def compute_outfit_infit(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     *,
     include_counts: bool = False,
@@ -603,8 +604,9 @@ def compute_outfit_infit(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : ndarray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
     include_counts : bool, default=False
@@ -612,7 +614,9 @@ def compute_outfit_infit(
     include_standardized : bool, default=False
         Include Wilson-Hilferty standardized mean squares as
         ``item_z_outfit``, ``item_z_infit``, ``person_z_outfit`` and
-        ``person_z_infit``.
+        ``person_z_infit``. With the default EAP abilities the item z
+        statistics are biased toward overfit and only descriptive (see
+        :func:`~mirt.diagnostics.itemfit.compute_itemfit`).
 
     Returns
     -------
@@ -634,7 +638,7 @@ def compute_outfit_infit(
         raise ValueError("include_counts must be boolean")
     if not isinstance(include_standardized, (bool, np.bool_)):
         raise ValueError("include_standardized must be boolean")
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     if responses.ndim != 2:
         raise ValueError("responses must be a two-dimensional matrix")
     model, theta_array = _resolve_theta(model, responses, theta)
@@ -652,7 +656,7 @@ def compute_outfit_infit(
 
 def identify_misfitting_patterns(
     model: BaseItemModel | FitResult,
-    responses: NDArray[np.int_],
+    responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
     z_threshold: float = 2.0,
     outfit_threshold: float = 1.5,
@@ -670,8 +674,9 @@ def identify_misfitting_patterns(
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
         are then EAP scores under its estimated latent covariance.
-    responses : ndarray
-        Response matrix
+    responses : array-like of shape (n_persons, n_items)
+        Response matrix. Negative codes, ``NaN`` and the nulls of nullable
+        DataFrame columns denote missing responses.
     theta : ndarray, optional
         Ability estimates
     z_threshold : float
@@ -684,7 +689,7 @@ def identify_misfitting_patterns(
     dict
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
-    responses = np.asarray(responses)
+    responses = _missing_coded_responses(responses)
     model, theta_array = _resolve_theta(model, responses, theta)
     n_persons, n_items = responses.shape
     totals = _ItemPersonFit(n_persons, n_items)

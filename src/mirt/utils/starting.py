@@ -495,8 +495,12 @@ def _fit_single_start(
         dict[str, Any],
     ],
 ) -> tuple[int, float, FitResult | None, str | None]:
-    """Fit one starting-value set and preserve its original ordering."""
-    from mirt.estimation.mixed_format_em import em_estimator_for
+    """Fit one starting-value set and preserve its original ordering.
+
+    Returns the start's index, its objective (the log-posterior of a Bayes
+    modal fit and the log-likelihood otherwise), the fit and any error.
+    """
+    from mirt.estimation._refit import em_estimator_for
 
     start_index, model, responses, start_params, fit_kwargs = args
     try:
@@ -504,10 +508,13 @@ def _fit_single_start(
         trial_model.set_parameters(**start_params)
         estimator = em_estimator_for(trial_model, **fit_kwargs)
         result = estimator.fit(trial_model, responses, start="model")
-        log_likelihood = float(result.log_likelihood)
-        if not np.isfinite(log_likelihood):
+        log_posterior = getattr(result, "log_posterior", None)
+        objective = float(
+            result.log_likelihood if log_posterior is None else log_posterior
+        )
+        if not np.isfinite(objective):
             raise ArithmeticError("fit returned a non-finite log-likelihood")
-        return start_index, log_likelihood, result, None
+        return start_index, objective, result, None
     except (
         TypeError,
         ValueError,
@@ -531,7 +538,8 @@ def multi_start_fit(
     """Fit model with multiple random starting values.
 
     Performs multiple fits with different random starting values and
-    returns the best result based on log-likelihood.
+    returns the best result based on log-likelihood, or on the log-posterior
+    when ``fit_kwargs`` include ``item_priors``.
 
     Parameters
     ----------
@@ -552,12 +560,24 @@ def multi_start_fit(
         and scripts must guard their entry point with
         ``if __name__ == "__main__":``.
     **fit_kwargs
-        Additional arguments passed to the estimator.
+        Additional arguments passed to the estimator: ``EMEstimator``,
+        ``MixedFormatEMEstimator`` for mixed-format models, or
+        ``BifactorEMEstimator`` for built-in bifactor models when it takes
+        every argument. Each start gets its own copy of a ``latent_density``
+        instance.
 
     Returns
     -------
     FitResult
         Best fit result across all starts.
+
+    Notes
+    -----
+    The starts are fitted without standard errors. Unless
+    ``compute_standard_errors=False``, the best start then takes one more EM
+    iteration from its estimates, which yields the posterior at which its
+    standard errors are computed, so they are computed once rather than for
+    every start; ``n_iterations`` includes that iteration.
 
     Examples
     --------
@@ -580,9 +600,18 @@ def multi_start_fit(
     n_jobs = resolve_n_jobs(n_jobs, n_starts)
     validated = _validate_model_responses(model, responses)
     random_starts = gen_random_pars(model, n_sets=n_starts, seed=seed)
+    compute_errors = fit_kwargs.get("compute_standard_errors", True)
+    if not isinstance(compute_errors, (bool, np.bool_)):
+        raise MirtValidationError(
+            "compute_standard_errors must be a boolean",
+            parameter="compute_standard_errors",
+            value=compute_errors,
+            expected="bool",
+        )
+    start_kwargs = {**fit_kwargs, "compute_standard_errors": False}
 
     args_list = [
-        (index, model, validated, start_params, fit_kwargs)
+        (index, model, validated, start_params, start_kwargs)
         for index, start_params in enumerate(random_starts)
     ]
     outcomes: list[tuple[int, float, FitResult | None, str | None]] = []
@@ -604,11 +633,14 @@ def multi_start_fit(
 
     outcomes.sort(key=lambda outcome: outcome[0])
     if verbose:
-        for start_index, ll, result, error in outcomes:
+        for start_index, _, result, error in outcomes:
             if result is None:
                 print(f"Start {start_index + 1}/{n_starts}: Failed ({error})")
             else:
-                print(f"Start {start_index + 1}/{n_starts}: LL = {ll:.4f}")
+                print(
+                    f"Start {start_index + 1}/{n_starts}: "
+                    f"LL = {result.log_likelihood:.4f}"
+                )
 
     successful = [outcome for outcome in outcomes if outcome[2] is not None]
     if not successful:
@@ -620,4 +652,42 @@ def multi_start_fit(
     best_result = best[2]
     if best_result is None:  # Narrow the optional type for static checkers.
         raise RuntimeError("No successful starting value set was retained")
-    return best_result
+    if not compute_errors:
+        return best_result
+    return _with_standard_errors(best_result, validated, fit_kwargs)
+
+
+def _with_standard_errors(
+    result: FitResult,
+    responses: NDArray[np.int_],
+    fit_kwargs: dict[str, Any],
+) -> FitResult:
+    """Add standard errors to a start's fit by one more EM iteration."""
+    from dataclasses import replace
+
+    from mirt.estimation._refit import em_estimator_for
+
+    recipe = result.refit_recipe
+    overrides = {"max_iter": 1, "compute_standard_errors": True}
+    if recipe is None:
+        options = {**fit_kwargs, **overrides}
+    else:
+        # The recipe holds the start's settings and its fitted latent density.
+        options = {**overrides, "verbose": fit_kwargs.get("verbose", False)}
+    estimator = em_estimator_for(result.model, recipe=recipe, **options)
+    final = estimator.fit(result.model, responses, start="model")
+    final_recipe = final.refit_recipe
+    if recipe is None or final_recipe is None:
+        final_recipe = recipe
+    else:
+        # Later refits keep the start's iteration limit and the final density.
+        settings = dict(final_recipe.options)
+        settings.pop("max_iter", None)
+        if "max_iter" in recipe.options:
+            settings["max_iter"] = recipe.options["max_iter"]
+        final_recipe = replace(final_recipe, options=settings)
+    return replace(
+        final,
+        n_iterations=result.n_iterations + final.n_iterations,
+        refit_recipe=final_recipe,
+    )

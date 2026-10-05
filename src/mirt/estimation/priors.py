@@ -615,6 +615,16 @@ class CustomPrior(Prior):
         return f"CustomPrior(mean={self._mean}, variance={self._variance})"
 
 
+# Item priors that ``PriorSpecification`` fills in for omitted fields, as
+# (family, mu, sigma).
+_SPECIFICATION_DEFAULTS: dict[
+    str, tuple[type[LogNormalPrior] | type[NormalPrior], float, float]
+] = {
+    "discrimination": (LogNormalPrior, 0, 0.5),
+    "difficulty": (NormalPrior, 0, 2),
+}
+
+
 @dataclass
 class PriorSpecification:
     """Complete prior specification for IRT model parameters.
@@ -622,15 +632,29 @@ class PriorSpecification:
     Attributes
     ----------
     discrimination : Prior
-        Prior for discrimination parameters
+        Prior for discrimination parameters. Defaults to
+        ``LogNormalPrior(0, 0.5)``.
     difficulty : Prior
-        Prior for difficulty parameters
+        Prior for difficulty parameters. Defaults to ``NormalPrior(0, 2)``.
     guessing : Prior or None
         Prior for guessing parameters (3PL, 4PL)
     upper : Prior or None
         Prior for upper asymptote (4PL)
     theta : Prior
         Prior for latent abilities
+
+    Notes
+    -----
+    As item priors for EM (``fit_mirt(priors=...)`` or
+    ``EMEstimator(item_priors=...)``), each field applies to the stored
+    per-item parameter of the same name, and ``theta`` is not used. A
+    specification that reaches no parameter of the fitted model, such as one
+    for a nominal model, which stores ``slopes`` and ``intercepts``, raises
+    ``MirtValidationError``. A discrimination or difficulty prior other than
+    the defaults above for a parameter the model lacks, such as
+    ``difficulty`` for a graded model, which stores ``thresholds``, is
+    ignored with a ``UserWarning``. Pass a mapping of parameter names to
+    priors for other parameters.
     """
 
     discrimination: Prior | None = None
@@ -640,10 +664,9 @@ class PriorSpecification:
     theta: Prior | None = None
 
     def __post_init__(self) -> None:
-        if self.discrimination is None:
-            self.discrimination = LogNormalPrior(mu=0, sigma=0.5)
-        if self.difficulty is None:
-            self.difficulty = NormalPrior(mu=0, sigma=2)
+        for name, (family, mu, sigma) in _SPECIFICATION_DEFAULTS.items():
+            if getattr(self, name) is None:
+                setattr(self, name, family(mu=mu, sigma=sigma))
         if self.theta is None:
             self.theta = NormalPrior(mu=0, sigma=1)
 
