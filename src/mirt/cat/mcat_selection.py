@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._logistic import _sigmoid_derivative
+from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtModelError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -119,17 +123,180 @@ class MCATSelectionStrategy(ABC):
         return 0.0
 
 
+def _validate_ability_vector(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return ``theta`` as a finite vector with one value per factor."""
+    theta = np.asarray(theta, dtype=np.float64)
+    if theta.shape != (model.n_factors,) or not np.all(np.isfinite(theta)):
+        raise ValueError(f"theta must contain {model.n_factors} finite factor values")
+    return theta
+
+
+def _slope_rows(model: BaseItemModel) -> NDArray[np.float64]:
+    """Return one slope vector per item for the compensatory fallback.
+
+    ``discrimination`` takes precedence over ``slopes``. Scalar item slopes
+    apply to every factor, and parameters without a recognizable per-factor
+    shape fall back to unit slopes.
+    """
+    n_items, n_factors = model.n_items, model.n_factors
+    parameters = model.parameters
+    name = next(
+        (key for key in ("discrimination", "slopes") if key in parameters), None
+    )
+    if name is not None:
+        values = np.asarray(parameters[name], dtype=np.float64)
+        if values.ndim == 1 and values.shape[0] == n_items:
+            return np.repeat(values[:, None], n_factors, axis=1)
+        if values.shape == (n_items, n_factors):
+            return values
+    return np.ones((n_items, n_factors))
+
+
+def _affine_logistic_matrices(
+    model: BaseItemModel,
+    theta_2d: NDArray[np.float64],
+    indices: NDArray[np.intp],
+) -> NDArray[np.float64] | None:
+    """Batch an unmodified ``MultidimensionalModel``'s native item matrices.
+
+    The model's ``item_information_matrix`` is ``sigma'(z_j) a_j a_j^T``, so
+    one logit evaluation for the whole bank serves every candidate. Items
+    whose variance or slope products need the model's log-space recovery are
+    evaluated by its own method. Returns None for any other model.
+    """
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    if (
+        type(model) is not MultidimensionalModel
+        or not uses_builtin_model_hooks(model)
+        or not uses_original_model_hook(model, "item_information_matrix")
+    ):
+        return None
+
+    logits = np.asarray(model._logits(theta_2d), dtype=np.float64)
+    logits = logits.reshape(-1)[indices]
+    slopes = np.asarray(model.slopes, dtype=np.float64)[indices]
+    variance = _sigmoid_derivative(logits)
+    tiny = np.finfo(np.float64).tiny
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        coefficients = slopes[:, :, None] * slopes[:, None, :]
+        matrices = variance[:, None, None] * coefficients
+        active = (slopes[:, :, None] != 0.0) & (slopes[:, None, :] != 0.0)
+        unsafe = active & (~np.isfinite(coefficients) | (np.abs(coefficients) < tiny))
+    recover = np.any(unsafe, axis=(1, 2)) | ((variance < tiny) & np.isfinite(logits))
+    for position in np.flatnonzero(recover).tolist():
+        matrices[position] = model.item_information_matrix(
+            theta_2d, int(indices[position])
+        )[0]
+    return matrices
+
+
+def _item_information_matrices(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    items: list[int] | NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Compute Fisher information matrices for several items at one ability.
+
+    A model's native ``item_information_matrix`` is used whenever it exists,
+    so noncompensatory and polytomous response functions keep their true
+    probability gradients. The built-in compensatory ``MultidimensionalModel``
+    evaluates it for all candidates at once. Dichotomous models without that
+    method use the compensatory logistic matrix ``p_j * q_j * a_j @ a_j.T``
+    from one probability call for the whole candidate set. Polytomous models
+    must define the native method, because no single response probability
+    determines their information.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted multidimensional IRT model.
+    theta : NDArray[np.float64]
+        Ability vector, shape (n_factors,).
+    items : list[int] | NDArray[np.int_]
+        Item indices.
+
+    Returns
+    -------
+    NDArray[np.float64]
+        Information matrices of shape (n_items_requested, n_factors, n_factors).
+
+    Raises
+    ------
+    MirtModelError
+        If a polytomous model does not define ``item_information_matrix``.
+    """
+    theta = _validate_ability_vector(model, theta)
+    indices = np.asarray(items)
+    if indices.size and not np.issubdtype(indices.dtype, np.integer):
+        raise ValueError("item indices must be integers")
+    indices = indices.astype(np.intp).reshape(-1)
+    invalid = (indices < 0) | (indices >= model.n_items)
+    if np.any(invalid):
+        item_idx = int(indices[np.argmax(invalid)])
+        raise IndexError(f"item_idx {item_idx} out of range [0, {model.n_items})")
+
+    theta_2d = theta.reshape(1, -1)
+    n_factors = model.n_factors
+    native_information = getattr(model, "item_information_matrix", None)
+    if callable(native_information):
+        batched = _affine_logistic_matrices(model, theta_2d, indices)
+        if batched is not None:
+            if not np.all(np.isfinite(batched)):
+                raise ValueError("item_information_matrix must return finite values")
+            return batched
+        matrices = np.empty((indices.size, n_factors, n_factors))
+        for position, item_idx in enumerate(indices.tolist()):
+            information = np.asarray(
+                native_information(theta_2d, item_idx), dtype=np.float64
+            )
+            if information.shape == (1, n_factors, n_factors):
+                information = information[0]
+            elif information.shape != (n_factors, n_factors):
+                raise ValueError(
+                    "item_information_matrix must return shape "
+                    f"({n_factors}, {n_factors}) or "
+                    f"(1, {n_factors}, {n_factors}), got {information.shape}"
+                )
+            matrices[position] = information
+        if not np.all(np.isfinite(matrices)):
+            raise ValueError("item_information_matrix must return finite values")
+        return matrices
+
+    if model.is_polytomous:
+        model_type = type(model).__name__
+        raise MirtModelError(
+            f"{model_type} does not define item_information_matrix; MCAT "
+            "selection requires exact item information matrices for "
+            "polytomous models",
+            model_type=model_type,
+        )
+
+    probabilities = np.asarray(model.probability(theta_2d), dtype=np.float64)
+    if probabilities.size == model.n_items:
+        p = probabilities.reshape(-1)[indices]
+    else:
+        p = np.array(
+            [
+                np.asarray(model.probability(theta_2d, item_idx=item_idx)).ravel()[0]
+                for item_idx in indices.tolist()
+            ],
+            dtype=np.float64,
+        )
+    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
+    slopes = _slope_rows(model)[indices]
+    return (p * (1 - p))[:, None, None] * (slopes[:, :, None] * slopes[:, None, :])
+
+
 def _compute_item_information_matrix(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     item_idx: int,
 ) -> NDArray[np.float64]:
     """Compute the Fisher information matrix for a single item.
-
-    Prefer a model's native matrix implementation so noncompensatory response
-    functions use their true probability gradients. Models without that API
-    fall back to the compensatory approximation
-    ``I_j(theta) = p_j * q_j * a_j @ a_j.T``.
 
     Parameters
     ----------
@@ -145,54 +312,15 @@ def _compute_item_information_matrix(
     NDArray[np.float64]
         Information matrix of shape (n_factors, n_factors).
     """
-    theta = np.asarray(theta, dtype=np.float64)
-    expected_theta_shape = (model.n_factors,)
-    if theta.shape != expected_theta_shape or not np.all(np.isfinite(theta)):
-        raise ValueError(f"theta must contain {model.n_factors} finite factor values")
-    if item_idx < 0 or item_idx >= model.n_items:
-        raise IndexError(f"item_idx {item_idx} out of range [0, {model.n_items})")
+    return _item_information_matrices(model, theta, [item_idx])[0]
 
-    theta_2d = theta.reshape(1, -1)
-    n_factors = model.n_factors
 
-    native_information = getattr(model, "item_information_matrix", None)
-    if callable(native_information):
-        information = np.asarray(
-            native_information(theta_2d, item_idx),
-            dtype=np.float64,
-        )
-        if information.shape == (1, n_factors, n_factors):
-            information = information[0]
-        elif information.shape != (n_factors, n_factors):
-            raise ValueError(
-                "item_information_matrix must return shape "
-                f"({n_factors}, {n_factors}) or "
-                f"(1, {n_factors}, {n_factors}), got {information.shape}"
-            )
-        if not np.all(np.isfinite(information)):
-            raise ValueError("item_information_matrix must return finite values")
-        return information
-
-    p = model.probability(theta_2d, item_idx=item_idx)
-    p = np.asarray(p).ravel()
-    p_val = float(p[0])
-    p_val = np.clip(p_val, PROB_EPSILON, 1 - PROB_EPSILON)
-    q = 1 - p_val
-
-    params = model.get_item_parameters(item_idx)
-    if "discrimination" in params:
-        a = np.asarray(params["discrimination"])
-        if a.ndim == 0:
-            a = np.array([float(a)] * n_factors)
-    elif "slopes" in params:
-        a = np.asarray(params["slopes"])
-    else:
-        a = np.ones(n_factors)
-
-    if len(a) != n_factors:
-        a = np.ones(n_factors)
-
-    return p_val * q * np.outer(a, a)
+def _candidate_batches(model: BaseItemModel, items: list[int]) -> list[list[int]]:
+    """Split candidates to bound candidate x factor x factor working arrays."""
+    batch_size = max(1, _SELECTION_WORKING_BYTES // (32 * model.n_factors**2))
+    return [
+        items[start : start + batch_size] for start in range(0, len(items), batch_size)
+    ]
 
 
 def _compute_posterior_covariance_update(
@@ -265,6 +393,23 @@ class _PosteriorCovarianceCriterion(_CriterionSelectionStrategy):
     def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
         """Map posterior covariance to selection criterion value."""
 
+    def _criteria_from_post_covs(
+        self, post_covs: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        """Map stacked posterior covariances to criterion values.
+
+        Built-in criteria evaluate the whole stack at once unless a subclass
+        overrides their per-matrix ``_criterion_from_post_cov``.
+        """
+        return np.array(
+            [self._criterion_from_post_cov(post_cov) for post_cov in post_covs],
+            dtype=np.float64,
+        )
+
+    def _uses_criterion_of(self, cls: type[_PosteriorCovarianceCriterion]) -> bool:
+        """Return whether ``cls`` authored this strategy's per-matrix criterion."""
+        return type(self)._criterion_from_post_cov is cls._criterion_from_post_cov
+
     def get_item_criteria(
         self,
         model: BaseItemModel,
@@ -283,19 +428,13 @@ class _PosteriorCovarianceCriterion(_CriterionSelectionStrategy):
         items = sorted(available_items)
         regularization = np.eye(model.n_factors) * 1e-8
         prior_precision = np.linalg.inv(covariance + regularization)
-        # Bound the candidate x factor x factor working arrays for large pools.
-        batch_size = max(1, _SELECTION_WORKING_BYTES // (32 * model.n_factors**2))
-        criteria = {}
-        for start in range(0, len(items), batch_size):
-            batch = items[start : start + batch_size]
-            information = np.stack(
-                [_compute_item_information_matrix(model, theta, item) for item in batch]
-            )
+        criteria: dict[int, float] = {}
+        for batch in _candidate_batches(model, items):
+            information = _item_information_matrices(model, theta, batch)
             information += prior_precision
             information += regularization
-            post_covariance = np.linalg.inv(information)
-            for item, post_cov in zip(batch, post_covariance, strict=True):
-                criteria[item] = self._criterion_from_post_cov(post_cov)
+            values = self._criteria_from_post_covs(np.linalg.inv(information))
+            criteria.update(zip(batch, values.tolist(), strict=True))
         return criteria
 
     def _compute_criterion(
@@ -330,6 +469,13 @@ class DOptimality(_PosteriorCovarianceCriterion):
     def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
         return float(-np.linalg.det(post_cov))
 
+    def _criteria_from_post_covs(
+        self, post_covs: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if not self._uses_criterion_of(DOptimality):
+            return super()._criteria_from_post_covs(post_covs)
+        return -np.linalg.det(post_covs)
+
 
 class AOptimality(_PosteriorCovarianceCriterion):
     """A-optimality item selection for MCAT.
@@ -347,6 +493,13 @@ class AOptimality(_PosteriorCovarianceCriterion):
 
     def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
         return float(-np.trace(post_cov))
+
+    def _criteria_from_post_covs(
+        self, post_covs: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if not self._uses_criterion_of(AOptimality):
+            return super()._criteria_from_post_covs(post_covs)
+        return -np.trace(post_covs, axis1=1, axis2=2)
 
 
 class COptimality(_PosteriorCovarianceCriterion):
@@ -382,18 +535,31 @@ class COptimality(_PosteriorCovarianceCriterion):
         composite_var = float(weights @ post_cov @ weights)
         return -composite_var
 
+    def _criteria_from_post_covs(
+        self, post_covs: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        if not self._uses_criterion_of(COptimality):
+            return super()._criteria_from_post_covs(post_covs)
+        weights = self._normalized_weights(post_covs.shape[-1])
+        return -((weights @ post_covs) @ weights)
+
 
 class KullbackLeiblerMCAT(_CriterionSelectionStrategy):
-    """Kullback-Leibler divergence item selection for MCAT.
+    """Kullback-Leibler information item selection for MCAT.
 
-    Selects the item that maximizes the expected KL divergence between
-    the posterior distributions before and after observing the item.
-    This is equivalent to maximizing expected information gain.
+    Ranks items by the posterior-weighted Kullback-Leibler information
+    around the current estimate. Under the local quadratic approximation used
+    here, the KL information of item ``j`` averaged over the posterior is
+    ``trace(I_j(theta) @ Sigma) / 2``, so items are ranked by
+    ``trace(I_j(theta) @ Sigma)``, where ``Sigma`` is the current posterior
+    covariance. Information matrices are evaluated in bounded candidate
+    batches.
 
     Parameters
     ----------
-    n_integration_points : int
-        Number of points per dimension for numerical integration.
+    n_integration_points : int | None
+        Deprecated and ignored. The quadratic approximation needs no
+        numerical integration.
 
     References
     ----------
@@ -402,8 +568,50 @@ class KullbackLeiblerMCAT(_CriterionSelectionStrategy):
     Psychometrika, 76(1), 13-39.
     """
 
-    def __init__(self, n_integration_points: int = 5):
+    def __init__(self, n_integration_points: int | None = None):
+        if n_integration_points is not None:
+            warnings.warn(
+                "n_integration_points is deprecated and ignored; "
+                "KullbackLeiblerMCAT uses a closed-form quadratic approximation",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.n_integration_points = n_integration_points
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        available_items: set[int],
+    ) -> dict[int, float]:
+        """Evaluate ``trace(I_j(theta) @ Sigma)`` for all candidates in batches.
+
+        Subclasses that override the per-item ``_compute_criterion`` are
+        evaluated one item at a time through it instead.
+        """
+        if type(self)._compute_criterion is not KullbackLeiblerMCAT._compute_criterion:
+            return super().get_item_criteria(model, theta, covariance, available_items)
+        if not available_items:
+            return {}
+        items = sorted(available_items)
+        criteria: dict[int, float] = {}
+        for batch in _candidate_batches(model, items):
+            values = self._trace_criteria(model, theta, covariance, batch)
+            criteria.update(zip(batch, values.tolist(), strict=True))
+        return criteria
+
+    @staticmethod
+    def _trace_criteria(
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        items: list[int],
+    ) -> NDArray[np.float64]:
+        """Return ``trace(I_j(theta) @ Sigma)`` for each item."""
+        information = _item_information_matrices(model, theta, items)
+        sigma = np.asarray(covariance, dtype=np.float64)
+        return np.einsum("jab,ba->j", information, sigma)
 
     def _compute_criterion(
         self,
@@ -412,18 +620,19 @@ class KullbackLeiblerMCAT(_CriterionSelectionStrategy):
         covariance: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        item_info = _compute_item_information_matrix(model, theta, item_idx)
-        trace_info_cov = np.trace(item_info @ covariance)
-        return trace_info_cov
+        return float(self._trace_criteria(model, theta, covariance, [item_idx])[0])
 
 
-class BayesianMCAT(_PosteriorCovarianceCriterion):
+class BayesianMCAT(AOptimality):
     """Bayesian (minimum expected posterior variance) selection for MCAT.
 
-    Selects the item that minimizes the expected posterior variance,
-    integrating over possible responses weighted by their probabilities.
-
-    This method explicitly accounts for the uncertainty in the response.
+    Selects the item that minimizes the expected total posterior variance
+    after the response. With the Fisher (Laplace) posterior update used by
+    the D-, A-, and C-optimality strategies, the updated covariance
+    ``(Sigma^-1 + I_j(theta))^-1`` does not depend on the observed response
+    for canonical-link models such as the compensatory logistic and
+    partial-credit families. The expectation over responses is therefore the
+    A-optimality criterion, which this class shares.
 
     References
     ----------
@@ -431,9 +640,6 @@ class BayesianMCAT(_PosteriorCovarianceCriterion):
     response in the context of adaptive mental testing. Journal of the
     American Statistical Association, 70(350), 351-356.
     """
-
-    def _criterion_from_post_cov(self, post_cov: NDArray[np.float64]) -> float:
-        return float(-np.trace(post_cov))
 
 
 class RandomMCATSelection(MCATSelectionStrategy):
@@ -466,6 +672,21 @@ class RandomMCATSelection(MCATSelectionStrategy):
         items_list = list(available_items)
         return items_list[self.rng.integers(len(items_list))]
 
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: NDArray[np.float64],
+        covariance: NDArray[np.float64],
+        available_items: set[int],
+    ) -> dict[int, float]:
+        """Return independent uniform scores from this strategy's generator.
+
+        Ranking these scores, as randomesque exposure control does, yields a
+        seeded uniformly random choice instead of a fixed item order.
+        """
+        items = sorted(available_items)
+        return dict(zip(items, self.rng.random(len(items)).tolist(), strict=True))
+
 
 def create_mcat_selection_strategy(
     method: str,
@@ -477,7 +698,9 @@ def create_mcat_selection_strategy(
     ----------
     method : str
         Selection method name. One of: "D-optimality", "A-optimality",
-        "C-optimality", "KL", "Bayesian", "random".
+        "C-optimality", "KL", "Bayesian", "random". Names match regardless
+        of case and surrounding whitespace, and ``"_"`` is accepted for
+        ``"-"``.
     **kwargs
         Additional keyword arguments passed to the strategy constructor.
 
@@ -500,11 +723,11 @@ def create_mcat_selection_strategy(
         "random": RandomMCATSelection,
     }
 
-    method_normalized = method.replace("_", "-")
-    if method_normalized not in strategies:
-        valid = ", ".join(strategies.keys())
-        raise ValueError(
-            f"Unknown MCAT selection method '{method}'. Valid options: {valid}"
-        )
-
-    return strategies[method_normalized](**kwargs)
+    normalized = method.strip().lower().replace("_", "-")
+    for name, strategy_class in strategies.items():
+        if name.lower() == normalized:
+            return strategy_class(**kwargs)
+    valid = ", ".join(strategies.keys())
+    raise ValueError(
+        f"Unknown MCAT selection method '{method}'. Valid options: {valid}"
+    )

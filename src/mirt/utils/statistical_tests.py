@@ -4,6 +4,7 @@ Provides Wald and Lagrange (score) tests for parameter constraints
 and model comparison.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,9 +14,11 @@ from scipy import stats
 
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 @dataclass
@@ -196,6 +199,30 @@ def _resolve_vcov(
     return result
 
 
+def _result_vcov(
+    result: "FitResult",
+    contrast: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Embed a fit result's covariance in the full parameter layout."""
+    covariance, random, joint = result._parameter_covariance(
+        list(result.model.parameters)
+    )
+    if np.any(contrast[:, ~random] != 0.0):
+        raise MirtValidationError(
+            "the hypothesis involves parameters that are fixed, on an optimizer "
+            "bound, or without a standard error",
+            parameter="param_indices",
+        )
+    if not joint:
+        warnings.warn(
+            "the fit result has no parameter covariance (vcov); the Wald test "
+            "uses squared standard errors and ignores cross-parameter covariance",
+            UserWarning,
+            stacklevel=3,
+        )
+    return covariance
+
+
 def _validate_constraint_values(
     constraint_values: NDArray[np.float64] | list[float] | None,
     n_constraints: int,
@@ -225,7 +252,7 @@ def _quadratic_form(
 
 
 def wald(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     param_indices: list[int] | NDArray[np.intp] | None = None,
     constraint_values: NDArray[np.float64] | list[float] | None = None,
     vcov: NDArray[np.float64] | None = None,
@@ -241,17 +268,21 @@ def wald(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : FitResult or BaseItemModel
+        A fit result or a fitted IRT model. A fit result supplies its
+        parameter covariance (``result.vcov``) when ``vcov`` is omitted;
+        hypotheses on fixed parameters, or on parameters at an optimizer
+        bound, are then rejected. A result with standard errors but no
+        covariance uses squared standard errors with a ``UserWarning``.
     param_indices : array-like of int, optional
         Indices of parameters to test. Parameters follow the insertion order
-        returned by ``model.parameters``. Mutually exclusive with
-        ``contrast_matrix``.
+        returned by ``model.parameters``, each array raveled row-major, and
+        include fixed entries. Mutually exclusive with ``contrast_matrix``.
     constraint_values : array-like of float, optional
         Values under null hypothesis. Default is zeros.
     vcov : NDArray[np.float64], optional
         Full parameter variance-covariance matrix in ``model.parameters``
-        order. Required unless the model exposes ``vcov`` or an
+        order. Required for a bare model unless it exposes ``vcov`` or an
         ``information_matrix()`` method.
     contrast_matrix : ndarray, optional
         Linear hypothesis matrix R for testing ``R @ parameters = values``.
@@ -266,14 +297,14 @@ def wald(
     --------
     >>> result = fit_mirt(responses, model="2PL")
     >>> # Test if discrimination of item 0 equals 1.0
-    >>> test = wald(
-    ...     result.model,
-    ...     param_indices=[0],
-    ...     constraint_values=[1.0],
-    ...     vcov=parameter_covariance,
-    ... )
+    >>> test = wald(result, param_indices=[0], constraint_values=[1.0])
     >>> print(f"Wald chi-sq = {test.statistic:.3f}, p = {test.p_value:.4f}")
     """
+    from mirt.results.fit_result import FitResult
+
+    result = model if isinstance(model, FitResult) else None
+    if result is not None:
+        model = result.model
     all_params = _flatten_model_parameters(model)
     n_total_parameters = all_params.size
 
@@ -304,7 +335,10 @@ def wald(
     n_constraints = contrast.shape[0]
     constraints = _validate_constraint_values(constraint_values, n_constraints)
     estimates = contrast @ all_params
-    full_vcov = _resolve_vcov(model, vcov, n_total_parameters)
+    if vcov is None and result is not None:
+        full_vcov = _result_vcov(result, contrast)
+    else:
+        full_vcov = _resolve_vcov(model, vcov, n_total_parameters)
     hypothesis_vcov = contrast @ full_vcov @ contrast.T
     hypothesis_vcov = (hypothesis_vcov + hypothesis_vcov.T) / 2
     _validate_positive_definite(hypothesis_vcov, "hypothesis covariance")

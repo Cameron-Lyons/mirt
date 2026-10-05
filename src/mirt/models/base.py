@@ -5,12 +5,19 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    draw_item_responses,
+)
 from mirt._model_defaults import record_model_base as _record_model_base
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
 
 _DICHOTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
+_POLYTOMOUS_MAX_PROBABILITY_VALUES = 1_000_000
 _DICHOTOMOUS_MAX_LIKELIHOOD_VALUES = 131_072
+_POLYTOMOUS_MAX_INFORMATION_VALUES = 1_000_000
 
 
 def _dichotomous_batch_fallback(
@@ -40,6 +47,33 @@ def _dichotomous_batch_fallback(
                 np.copyto(terms, 0.0, where=~observed)
                 result[start:stop, first:last] += terms
     return result
+
+
+def _simulate_responses(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    seed: int | None,
+    chunk_size: int | None,
+    default_rows: int,
+) -> NDArray[np.int32]:
+    """Draw responses in person chunks from one seeded stream."""
+    theta_values = model._ensure_theta_2d(theta)
+    n_persons = theta_values.shape[0]
+    if chunk_size is None:
+        chunk_size = max(1, min(n_persons, default_rows))
+    elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
+        chunk_size, (int, np.integer)
+    ):
+        raise ValueError("chunk_size must be a positive integer")
+    elif chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer")
+    return draw_item_responses(
+        model,
+        theta_values,
+        np.random.default_rng(seed),
+        chunk_size=int(chunk_size),
+        dtype=np.int32,
+    )
 
 
 @_record_model_base
@@ -594,30 +628,13 @@ class DichotomousItemModel(BaseItemModel):
         -----
         A fixed seed produces identical responses for every valid chunk size.
         """
-        theta_values = self._ensure_theta_2d(theta)
-        n_persons = theta_values.shape[0]
-        if chunk_size is None:
-            chunk_size = max(
-                1,
-                min(
-                    n_persons,
-                    _DICHOTOMOUS_MAX_PROBABILITY_VALUES // self.n_items,
-                ),
-            )
-        elif isinstance(chunk_size, (bool, np.bool_)) or not isinstance(
-            chunk_size, (int, np.integer)
-        ):
-            raise ValueError("chunk_size must be a positive integer")
-        elif chunk_size <= 0:
-            raise ValueError("chunk_size must be a positive integer")
-
-        rng = np.random.default_rng(seed)
-        responses = np.empty((n_persons, self.n_items), dtype=np.int32)
-        for start in range(0, n_persons, int(chunk_size)):
-            stop = min(start + int(chunk_size), n_persons)
-            probabilities = self.probability(theta_values[start:stop])
-            responses[start:stop] = rng.random(probabilities.shape) < probabilities
-        return responses
+        return _simulate_responses(
+            self,
+            theta,
+            seed,
+            chunk_size,
+            _DICHOTOMOUS_MAX_PROBABILITY_VALUES // self.n_items,
+        )
 
 
 @_record_model_base
@@ -660,6 +677,11 @@ class PolytomousItemModel(BaseItemModel):
     def max_categories(self) -> int:
         return max(self._n_categories)
 
+    def _category_columns(self, width: int, offset: int = 0) -> NDArray[np.bool_]:
+        """Return a fresh ``(n_items, width)`` mask of columns below ``count - offset``."""
+        counts = np.asarray(self._n_categories, dtype=np.intp)
+        return np.arange(width) < (counts - offset)[:, None]
+
     def copy(self) -> Self:
         new_model = self.__class__(
             n_items=self.n_items,
@@ -671,6 +693,46 @@ class PolytomousItemModel(BaseItemModel):
         self._copy_parameter_restrictions_to(new_model)
         new_model._is_fitted = self._is_fitted
         return new_model
+
+    def simulate(
+        self,
+        theta: NDArray[np.float64],
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate category responses conditional on latent trait values.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Latent trait values with shape ``(n_persons, n_factors)``. A
+            one-dimensional array is also accepted for unidimensional models.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Category codes ``0, ..., n_categories[j] - 1`` with shape
+            ``(n_persons, n_items)``.
+
+        Notes
+        -----
+        Each response is drawn by inverse CDF from ``probability(theta)``
+        with one uniform per person and item. A fixed seed produces identical
+        responses for every valid chunk size.
+        """
+        return _simulate_responses(
+            self,
+            theta,
+            seed,
+            chunk_size,
+            _POLYTOMOUS_MAX_PROBABILITY_VALUES // (self.n_items * self.max_categories),
+        )
 
     @abstractmethod
     def category_probability(
@@ -720,16 +782,17 @@ class PolytomousItemModel(BaseItemModel):
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
-        n_persons = theta.shape[0]
-
         if item_idx is not None:
             return self._item_information(theta, item_idx)
-
-        info = np.zeros(n_persons)
-        for i in range(self.n_items):
-            info += self._item_information(theta, i)
-
-        return info
+        rows_per_block = max(1, _POLYTOMOUS_MAX_INFORMATION_VALUES // self.n_items)
+        if theta.shape[0] <= rows_per_block:
+            return self._information_by_item(theta).sum(axis=1)
+        # Long batches keep the per-item columns within a bounded block.
+        information = np.empty(theta.shape[0], dtype=np.float64)
+        for start in range(0, theta.shape[0], rows_per_block):
+            columns = self._information_by_item(theta[start : start + rows_per_block])
+            information[start : start + rows_per_block] = columns.sum(axis=1)
+        return information
 
     @abstractmethod
     def _item_information(
@@ -737,6 +800,18 @@ class PolytomousItemModel(BaseItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]: ...
+
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        """Return every item's information with shape ``(n_theta, n_items)``.
+
+        Column ``j`` equals ``_item_information(theta, j)``. Families with
+        closed-form curves override this with an all-item kernel.
+        """
+        theta = self._ensure_theta_2d(theta)
+        information = np.empty((theta.shape[0], self.n_items), dtype=np.float64)
+        for item_idx in range(self.n_items):
+            information[:, item_idx] = self._item_information(theta, item_idx)
+        return information
 
     def expected_score(
         self,
@@ -860,21 +935,14 @@ class PolytomousItemModel(BaseItemModel):
         responses = self._validate_polytomous_responses(responses)
         curve_theta = theta
         theta = self._ensure_theta_2d(theta)
-        n_persons = responses.shape[0]
-        n_theta = theta.shape[0]
-
-        ll = np.zeros((n_persons, n_theta))
-
-        for item_idx in range(self.n_items):
-            probs = self.probability(curve_theta, item_idx)
-            probs = np.clip(probs, PROB_EPSILON, 1 - PROB_EPSILON)
-            log_probs = np.log(probs)
-
-            item_resp = responses[:, item_idx]
-            valid_mask = item_resp >= 0
-
-            if np.any(valid_mask):
-                response_indices = item_resp[valid_mask].astype(np.intp, copy=False)
-                ll[valid_mask, :] += log_probs[:, response_indices].T
-
-        return ll
+        offsets = category_offsets(self._n_categories)
+        log_table = np.empty((sum(self._n_categories), theta.shape[0]))
+        # Per-item curves keep overridden probability hooks authoritative.
+        for item_idx, (offset, n_categories) in enumerate(
+            zip(offsets, self._n_categories, strict=True)
+        ):
+            probabilities = self.probability(curve_theta, item_idx)[:, :n_categories]
+            log_table[offset : offset + n_categories] = np.log(
+                np.clip(probabilities, PROB_EPSILON, 1 - PROB_EPSILON)
+            ).T
+        return categorical_log_likelihood_batch(log_table, offsets, responses)

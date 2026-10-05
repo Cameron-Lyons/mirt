@@ -1,0 +1,198 @@
+"""Shared construction of the built-in item-model families.
+
+``fit_mirt``, ``fit_multigroup``, vertical calibration, and
+``FitResult.from_dict`` build their models here so that factor counts, category
+counts, and item names are validated identically everywhere.
+"""
+
+from __future__ import annotations
+
+import importlib
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+from numpy.typing import NDArray
+
+from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
+
+if TYPE_CHECKING:
+    from mirt.models.base import BaseItemModel
+
+ITEM_MODEL_FAMILIES: dict[str, tuple[str, str]] = {
+    "1PL": ("mirt.models.dichotomous", "OneParameterLogistic"),
+    "2PL": ("mirt.models.dichotomous", "TwoParameterLogistic"),
+    "3PL": ("mirt.models.dichotomous", "ThreeParameterLogistic"),
+    "4PL": ("mirt.models.dichotomous", "FourParameterLogistic"),
+    "GRM": ("mirt.models.polytomous", "GradedResponseModel"),
+    "GPCM": ("mirt.models.polytomous", "GeneralizedPartialCredit"),
+    "PCM": ("mirt.models.polytomous", "PartialCreditModel"),
+    "NRM": ("mirt.models.polytomous", "NominalResponseModel"),
+}
+POLYTOMOUS_FAMILIES = frozenset({"GRM", "GPCM", "PCM", "NRM"})
+
+
+def item_model_class(name: str) -> type[BaseItemModel]:
+    """Return the class implementing a built-in model family.
+
+    Raises
+    ------
+    MirtModelError
+        If ``name`` is not one of :data:`ITEM_MODEL_FAMILIES`.
+    """
+    try:
+        module_name, class_name = ITEM_MODEL_FAMILIES[name]
+    except (KeyError, TypeError):
+        raise MirtModelError(
+            f"Unknown model: {name}",
+            model_type=str(name),
+            expected=", ".join(ITEM_MODEL_FAMILIES),
+        ) from None
+    model_class: type[BaseItemModel] = getattr(
+        importlib.import_module(module_name), class_name
+    )
+    return model_class
+
+
+def validate_n_factors(n_factors: Any) -> int:
+    """Return ``n_factors`` as a Python integer of at least one."""
+    if (
+        isinstance(n_factors, (bool, np.bool_))
+        or not isinstance(n_factors, (int, np.integer))
+        or n_factors < 1
+    ):
+        raise MirtValidationError(
+            "n_factors must be a positive integer",
+            parameter="n_factors",
+            value=n_factors,
+            expected="integer >= 1",
+        )
+    return int(n_factors)
+
+
+def resolve_category_counts(
+    n_items: int,
+    n_categories: int | Sequence[int] | None,
+    responses: NDArray[np.int_] | None = None,
+) -> int | list[int]:
+    """Validate declared category counts or infer one count per item.
+
+    A declared scalar is preserved; sequences and inferred counts become a list
+    of Python integers. Inference uses each item's largest observed code with a
+    minimum of two categories.
+    """
+    if n_categories is None:
+        maxima = None if responses is None else responses.max(axis=0)
+        if maxima is None or np.any(maxima < 0):
+            raise MirtValidationError(
+                "n_categories is required for items with no observed responses",
+                parameter="n_categories",
+                expected="one category count per item, each >= 2",
+            )
+        n_categories = np.maximum(maxima + 1, 2).tolist()
+    try:
+        counts = np.asarray(n_categories)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "n_categories must be an integer or one integer count per item",
+            parameter="n_categories",
+            value=n_categories,
+        ) from exc
+    if counts.ndim > 1 or (counts.ndim == 1 and counts.size != n_items):
+        raise MirtValidationError(
+            f"n_categories must be a scalar or have shape ({n_items},)",
+            parameter="n_categories",
+            value=n_categories,
+        )
+    if counts.dtype.kind not in "iu":
+        raise MirtValidationError(
+            "n_categories must contain integer category counts",
+            parameter="n_categories",
+            value=n_categories,
+        )
+    if np.any(counts < 2):
+        raise MirtValidationError(
+            "n_categories must be at least 2 for each item",
+            parameter="n_categories",
+            value=n_categories,
+            expected=">= 2",
+        )
+    return int(counts) if counts.ndim == 0 else counts.tolist()
+
+
+def build_item_model(
+    name: str,
+    n_items: int,
+    *,
+    n_factors: Any = 1,
+    n_categories: int | Sequence[int] | None = None,
+    item_names: Sequence[str] | None = None,
+    responses: NDArray[np.int_] | None = None,
+) -> BaseItemModel:
+    """Construct a built-in item model with validated structure.
+
+    Parameters
+    ----------
+    name : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}
+        Model family.
+    n_items : int
+        Number of items.
+    n_factors : int, default=1
+        Number of latent factors. Families without multidimensional support
+        reject values above one instead of silently fitting one factor.
+    n_categories : int or sequence of int, optional
+        Polytomous category counts. When omitted they are inferred from
+        ``responses``. Ignored for dichotomous families.
+    item_names : sequence of str, optional
+        Item labels.
+    responses : ndarray of shape (n_persons, n_items), optional
+        Validated responses with missing values coded as negative numbers.
+        When supplied, observed codes are checked against the model family.
+
+    Returns
+    -------
+    BaseItemModel
+        An unfitted model.
+
+    Raises
+    ------
+    MirtModelError
+        If the family is unknown or does not support ``n_factors``.
+    MirtValidationError
+        If ``n_factors`` or ``n_categories`` is invalid.
+    MirtDataError
+        If ``responses`` contains codes outside the model's categories.
+    """
+    model_class = item_model_class(name)
+    n_factors = validate_n_factors(n_factors)
+    if n_factors > 1 and not model_class.supports_multidimensional:
+        raise MirtModelError(
+            f"{name} does not support multidimensional models",
+            model_type=name,
+            n_factors=n_factors,
+        )
+
+    kwargs: dict[str, Any] = {
+        "n_items": n_items,
+        "item_names": None if item_names is None else list(item_names),
+    }
+    if model_class.supports_multidimensional:
+        kwargs["n_factors"] = n_factors
+
+    if name in POLYTOMOUS_FAMILIES:
+        counts = resolve_category_counts(n_items, n_categories, responses)
+        if responses is not None and np.any(responses >= np.asarray(counts)):
+            raise MirtDataError(
+                "polytomous response codes must be below n_categories for each item",
+                n_persons=responses.shape[0],
+                n_items=responses.shape[1],
+            )
+        kwargs["n_categories"] = counts
+    elif responses is not None and np.any(responses > 1):
+        raise MirtDataError(
+            "dichotomous responses must be coded as 0 or 1",
+            n_persons=responses.shape[0],
+            n_items=responses.shape[1],
+        )
+
+    return model_class(**kwargs)

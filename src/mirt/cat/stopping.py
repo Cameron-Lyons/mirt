@@ -4,45 +4,25 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any, Literal
 
 from scipy.special import ndtri
 
 from mirt.cat._native import register_native_defaults as _register_native_defaults
+from mirt.cat._stopping_common import (
+    ChangeTracker,
+    combination_operator,
+    finite_real,
+    integer,
+    positive_real,
+    stable_count,
+    triggered_rule,
+)
+from mirt.cat.selection import MaxFisherInformation
 
 if TYPE_CHECKING:
     from mirt.cat.results import CATState
-
-
-def _finite_real(value: Real, name: str) -> float:
-    """Validate and normalize a finite real-valued rule parameter."""
-    if isinstance(value, bool) or not isinstance(value, Real):
-        raise ValueError(f"{name} must be finite")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
-
-def _positive_real(value: Real, name: str) -> float:
-    """Validate and normalize a finite positive rule parameter."""
-    result = _finite_real(value, name)
-    if result <= 0.0:
-        raise ValueError(f"{name} must be positive")
-    return result
-
-
-def _integer(value: Integral, name: str, *, minimum: int) -> int:
-    """Validate and normalize an integer rule parameter."""
-    if isinstance(value, bool) or not isinstance(value, Integral):
-        requirement = "positive" if minimum == 1 else "non-negative"
-        raise ValueError(f"{name} must be a {requirement} integer")
-    result = int(value)
-    if result < minimum:
-        requirement = "positive" if minimum == 1 else "non-negative"
-        raise ValueError(f"{name} must be {requirement}")
-    return result
+    from mirt.models.base import BaseItemModel
 
 
 class StoppingRule(ABC):
@@ -97,21 +77,13 @@ class StandardErrorStop(StoppingRule):
     """
 
     def __init__(self, threshold: float = 0.3):
-        self.threshold = _positive_real(threshold, "SE threshold")
-        self._triggered = False
+        self.threshold = positive_real(threshold, "SE threshold")
 
     def should_stop(self, state: CATState) -> bool:
-        if state.standard_error <= self.threshold:
-            self._triggered = True
-            return True
-        return False
+        return bool(state.standard_error <= self.threshold)
 
     def get_reason(self) -> str:
         return f"SE threshold reached (SE <= {self.threshold})"
-
-    def reset(self) -> None:
-        """Clear the prior session's trigger state."""
-        self._triggered = False
 
 
 @_register_native_defaults
@@ -128,21 +100,13 @@ class MaxItemsStop(StoppingRule):
     """
 
     def __init__(self, max_items: int):
-        self.max_items = _integer(max_items, "max_items", minimum=1)
-        self._triggered = False
+        self.max_items = integer(max_items, "max_items", minimum=1)
 
     def should_stop(self, state: CATState) -> bool:
-        if state.n_items >= self.max_items:
-            self._triggered = True
-            return True
-        return False
+        return state.n_items >= self.max_items
 
     def get_reason(self) -> str:
         return f"Maximum items reached ({self.max_items})"
-
-    def reset(self) -> None:
-        """Clear the prior session's trigger state."""
-        self._triggered = False
 
 
 class MinItemsStop(StoppingRule):
@@ -159,7 +123,7 @@ class MinItemsStop(StoppingRule):
     """
 
     def __init__(self, min_items: int):
-        self.min_items = _integer(min_items, "min_items", minimum=0)
+        self.min_items = integer(min_items, "min_items", minimum=0)
 
     def should_stop(self, state: CATState) -> bool:
         return False
@@ -198,46 +162,155 @@ class ThetaChangeStop(StoppingRule):
     """
 
     def __init__(self, threshold: float = 0.01, n_stable: int = 3):
-        self.threshold: float = _positive_real(threshold, "threshold")
-        if (
-            isinstance(n_stable, bool)
-            or not isinstance(n_stable, Integral)
-            or n_stable < 1
-        ):
-            raise ValueError("n_stable must be an integer of at least 1")
-        self.n_stable: int = int(n_stable)
-        self._stable_count: int = 0
-        self._last_theta: float | None = None
-        self._triggered: bool = False
+        self.threshold: float = positive_real(threshold, "threshold")
+        self.n_stable: int = stable_count(n_stable)
+        self._changes = ChangeTracker()
 
     def should_stop(self, state: CATState) -> bool:
-        if self._last_theta is None:
-            self._last_theta = state.theta
-            return False
-
-        change = abs(state.theta - self._last_theta)
-        self._last_theta = state.theta
-
-        if change <= self.threshold:
-            self._stable_count += 1
-        else:
-            self._stable_count = 0
-
-        if self._stable_count >= self.n_stable:
-            self._triggered = True
-            return True
-        return False
+        return self._changes.update(state.theta, self.threshold) >= self.n_stable
 
     def reset(self) -> None:
         """Reset the rule for a new examinee."""
-        self._stable_count = 0
-        self._last_theta = None
-        self._triggered = False
+        self._changes.reset()
 
     def get_reason(self) -> str:
         return (
             f"Theta stabilized (change <= {self.threshold} for {self.n_stable} items)"
         )
+
+
+class SEChangeStop(StoppingRule):
+    """Stop when the standard error stops improving.
+
+    Stops once the absolute change in the standard error between consecutive
+    items is at most ``threshold`` for ``n_stable`` items in a row, so further
+    items no longer buy appreciable precision. A non-finite standard error
+    never counts as stable.
+
+    Parameters
+    ----------
+    threshold : float, optional
+        Maximum change in the standard error that counts as stable.
+        Default is 0.01.
+    n_stable : int, optional
+        Number of consecutive stable changes required. Default is 1.
+    """
+
+    def __init__(self, threshold: float = 0.01, n_stable: int = 1):
+        self.threshold: float = positive_real(threshold, "threshold")
+        self.n_stable: int = stable_count(n_stable)
+        self._changes = ChangeTracker()
+
+    def should_stop(self, state: CATState) -> bool:
+        changes = self._changes.update(state.standard_error, self.threshold)
+        return changes >= self.n_stable
+
+    def reset(self) -> None:
+        """Reset the rule for a new examinee."""
+        self._changes.reset()
+
+    def get_reason(self) -> str:
+        return f"SE stabilized (change <= {self.threshold} for {self.n_stable} items)"
+
+
+class _RemainingInformationRule(StoppingRule):
+    """Base for rules using the best remaining item's Fisher information.
+
+    Every unadministered item of ``model`` counts as remaining; exposure and
+    content filters are not applied. ``model`` must be the engine's model.
+    """
+
+    def __init__(self, model: BaseItemModel) -> None:
+        if getattr(model, "n_factors", None) != 1:
+            raise ValueError(
+                f"{type(self).__name__} requires a unidimensional item model"
+            )
+        n_items = getattr(model, "n_items", None)
+        integer(n_items, "model.n_items", minimum=1)
+        self.model = model
+
+    def _best_remaining_information(self, state: CATState) -> float | None:
+        """Return the largest remaining information, or None for an empty pool."""
+        remaining = set(range(self.model.n_items)).difference(state.items_administered)
+        if not remaining:
+            return None
+        criteria = MaxFisherInformation().get_item_criteria(
+            self.model, float(state.theta), remaining
+        )
+        return max(criteria.values())
+
+
+class MinInformationStop(_RemainingInformationRule):
+    """Stop when no remaining item is informative at the current estimate.
+
+    This is the ``"minInfo"`` rule of catR: the test ends once the maximum
+    Fisher information among unadministered items at the current ability
+    estimate falls below ``threshold``. It ends tests early for examinees
+    whom the pool cannot measure well, typically at extreme abilities.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        The engine's unidimensional item model.
+    threshold : float, optional
+        Minimum useful item information. Default is 0.1.
+    """
+
+    def __init__(self, model: BaseItemModel, threshold: float = 0.1) -> None:
+        super().__init__(model)
+        self.threshold: float = positive_real(threshold, "threshold")
+
+    def should_stop(self, state: CATState) -> bool:
+        best = self._best_remaining_information(state)
+        return best is not None and best < self.threshold
+
+    def get_reason(self) -> str:
+        return f"Remaining item information below threshold ({self.threshold})"
+
+
+class PredictedSEReductionStop(_RemainingInformationRule):
+    """Stop when the next item is predicted to barely reduce the SE.
+
+    The predicted standard error after administering the most informative
+    remaining item ``j`` is approximated by adding its Fisher information at
+    the current estimate to the current precision,
+    ``1 / sqrt(SE**-2 + I_j(theta))``. The test ends
+    once the predicted reduction ``SE - predicted`` falls below
+    ``min_reduction`` (Choi, Grady, & Dodd, 2011). A non-finite standard
+    error never stops the test.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        The engine's unidimensional item model.
+    min_reduction : float, optional
+        Smallest worthwhile reduction in the standard error. Default is 0.01.
+
+    References
+    ----------
+    Choi, S. W., Grady, M. W., & Dodd, B. G. (2011). A new stopping rule for
+    computerized adaptive testing. Educational and Psychological
+    Measurement, 71(1), 37-53.
+    """
+
+    def __init__(self, model: BaseItemModel, min_reduction: float = 0.01) -> None:
+        super().__init__(model)
+        self.min_reduction: float = positive_real(min_reduction, "min_reduction")
+
+    def should_stop(self, state: CATState) -> bool:
+        standard_error = float(state.standard_error)
+        if not math.isfinite(standard_error) or standard_error < 0.0:
+            return False
+        if standard_error == 0.0:
+            return True
+        best = self._best_remaining_information(state)
+        if best is None:
+            return False
+        predicted = 1.0 / math.sqrt(standard_error**-2 + max(best, 0.0))
+        return standard_error - predicted < self.min_reduction
+
+    def get_reason(self) -> str:
+        return f"Predicted SE reduction below threshold ({self.min_reduction})"
 
 
 class ClassificationStop(StoppingRule):
@@ -255,14 +328,13 @@ class ClassificationStop(StoppingRule):
     """
 
     def __init__(self, cut_score: float, confidence: float = 0.95):
-        cut_score_value = _finite_real(cut_score, "cut_score")
-        confidence_value = _finite_real(confidence, "confidence")
+        cut_score_value = finite_real(cut_score, "cut_score")
+        confidence_value = finite_real(confidence, "confidence")
         if not 0.0 < confidence_value < 1.0:
             raise ValueError("confidence must be between 0 and 1")
         self.cut_score = cut_score_value
         self.confidence = confidence_value
         self._critical_z = float(ndtri(confidence_value))
-        self._triggered = False
         self._classification: str | None = None
 
     def should_stop(self, state: CATState) -> bool:
@@ -282,7 +354,6 @@ class ClassificationStop(StoppingRule):
             confident = distance >= self._critical_z * standard_error
 
         if confident:
-            self._triggered = True
             self._classification = "above" if theta > self.cut_score else "below"
             return True
         return False
@@ -296,7 +367,6 @@ class ClassificationStop(StoppingRule):
 
     def reset(self) -> None:
         """Clear classification details from the prior session."""
-        self._triggered = False
         self._classification = None
 
 
@@ -310,8 +380,9 @@ class CombinedStop(StoppingRule):
         List of stopping rules to combine.
     operator : {"and", "or"}, optional
         Logical operator for combining rules. Default is "or".
-        - "or": Stop when ANY rule is satisfied
-        - "and": Stop when ALL rules are satisfied
+        - "or": Stop when ANY rule is satisfied; later rules are not
+          evaluated once one stops.
+        - "and": Stop when ALL rules are satisfied; every rule is evaluated.
     min_items : int, optional
         Minimum items before stopping rules are evaluated. Default is 0.
     """
@@ -324,31 +395,17 @@ class CombinedStop(StoppingRule):
     ):
         if not rules:
             raise ValueError("At least one rule is required")
-        if operator not in ("and", "or"):
-            raise ValueError("operator must be 'and' or 'or'")
-
+        self.operator = combination_operator(operator)
         self.rules = list(rules)
-        self.operator = operator
-        self.min_items = _integer(min_items, "min_items", minimum=0)
+        self.min_items = integer(min_items, "min_items", minimum=0)
         self._triggered_rule: StoppingRule | None = None
 
     def should_stop(self, state: CATState) -> bool:
         self._triggered_rule = None
         if state.n_items < self.min_items:
             return False
-
-        if self.operator == "or":
-            for rule in self.rules:
-                if rule.should_stop(state):
-                    self._triggered_rule = rule
-                    return True
-            return False
-
-        results = [rule.should_stop(state) for rule in self.rules]
-        if all(results):
-            self._triggered_rule = self.rules[0]
-            return True
-        return False
+        self._triggered_rule = triggered_rule(self.rules, self.operator, state)
+        return self._triggered_rule is not None
 
     def get_reason(self) -> str:
         if self._triggered_rule is not None:
@@ -372,7 +429,9 @@ def create_stopping_rule(
     ----------
     method : str
         Stopping rule name. One of: "SE", "max_items", "min_items",
-        "theta_change", "classification", "combined".
+        "theta_change", "se_change", "classification", "combined". Rules
+        that need the item model, such as :class:`MinInformationStop`, are
+        constructed directly.
     **kwargs
         Additional keyword arguments passed to the rule constructor.
 
@@ -386,11 +445,12 @@ def create_stopping_rule(
     ValueError
         If the method is not recognized.
     """
-    rules = {
+    rules: dict[str, type[StoppingRule]] = {
         "SE": StandardErrorStop,
         "max_items": MaxItemsStop,
         "min_items": MinItemsStop,
         "theta_change": ThetaChangeStop,
+        "se_change": SEChangeStop,
         "classification": ClassificationStop,
         "combined": CombinedStop,
     }

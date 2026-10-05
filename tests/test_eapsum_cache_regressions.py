@@ -11,7 +11,7 @@ from mirt import (
     set_backend,
 )
 from mirt._rust_backend import lord_wingersky_recursion
-from mirt.scoring.eapsum import EAPSumScorer
+from mirt.scoring import EAPSumScorer
 
 
 def _fitted_model() -> TwoParameterLogistic:
@@ -139,7 +139,7 @@ def test_eapsum_partitions_cache_by_observed_item_mask():
 
     scorer.score(model, responses)
 
-    assert set(scorer._lookup_tables) == {(), (0, 2), (0, 1, 2, 3)}
+    assert set(scorer._lookup_values) == {(), (0, 2), (0, 1, 2, 3)}
 
 
 def test_eapsum_reuses_cache_until_model_parameters_change(monkeypatch):

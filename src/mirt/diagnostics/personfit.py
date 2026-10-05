@@ -1,18 +1,25 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, TypeAlias, cast
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Literal, TypeAlias, cast, get_args
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.special import ndtr
 
 from mirt.constants import PROB_EPSILON
+from mirt.diagnostics.itemfit import _validate_statistics
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
     _validate_p_value_adjustment,
     adjust_p_values,
 )
-from mirt.utils.numeric import compute_fit_stats, compute_probability_moments
+from mirt.typing import PersonFitStatistic
+from mirt.utils.numeric import (
+    _FitStatsAccumulator,
+    _fourth_central_moment,
+    compute_probability_moments,
+)
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -22,13 +29,14 @@ _ZH_TARGET_CHUNK_ELEMENTS = 2_000_000
 _PERSONFIT_TARGET_CHUNK_ELEMENTS = 262_144
 PersonFitAlternative: TypeAlias = Literal["lower", "two-sided", "upper"]
 _PERSON_FIT_ALTERNATIVES = frozenset({"lower", "two-sided", "upper"})
+_PERSONFIT_STATISTICS: tuple[str, ...] = get_args(PersonFitStatistic)
 
 
 def compute_personfit(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
-    statistics: list[str] | None = None,
+    statistics: Sequence[str] | str | None = None,
     *,
     p_adjust: PValueAdjustment | None = None,
     alpha: float = 0.05,
@@ -36,17 +44,47 @@ def compute_personfit(
 ) -> dict[str, NDArray[np.float64] | NDArray[np.bool_]]:
     """Compute person-fit statistics and optional calibrated significance.
 
-    Passing ``p_adjust`` enables respondent-level p-values derived from the
-    standardized log-likelihood statistic. The default lower-tail test targets
-    unexpectedly improbable response patterns. ``None`` preserves the legacy
-    output; ``"none"`` adds unadjusted significance columns without correcting
-    across respondents.
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted item response model.
+    responses : ndarray of shape (n_persons, n_items)
+        Category codes; negative codes denote missing responses.
+    theta : ndarray of shape (n_persons,) or (n_persons, n_factors)
+        Person abilities.
+    statistics : list of str, optional
+        Any of ``"infit"``, ``"outfit"``, ``"z_infit"``, ``"z_outfit"``,
+        ``"Zh"`` and its alias ``"lz"``. Defaults to
+        ``["infit", "outfit", "Zh"]``. Unknown names raise
+        :class:`~mirt.exceptions.MirtValidationError`.
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, optional
+        Enables respondent-level p-values derived from the standardized
+        log-likelihood statistic. ``None`` preserves the legacy output;
+        ``"none"`` adds unadjusted significance columns without correcting
+        across respondents.
+    alpha : float, default=0.05
+        Significance threshold for the ``aberrant`` flag.
+    alternative : {"lower", "two-sided", "upper"}, default="lower"
+        Normal tail for the p-values. The lower tail targets unexpectedly
+        improbable response patterns.
 
-    Model probabilities and intermediate statistics are evaluated in bounded
-    row blocks. Multiplicity corrections use the full respondent population.
+    Returns
+    -------
+    dict of str to ndarray
+        One array of length ``n_persons`` per requested statistic, plus
+        ``p_value``, ``p_value_adjusted`` and ``aberrant`` when ``p_adjust``
+        is given.
+
+    Notes
+    -----
+    ``z_infit`` and ``z_outfit`` are Wilson-Hilferty standardized mean
+    squares (see :func:`mirt.diagnostics.itemfit.compute_itemfit`). Model
+    probabilities and intermediate statistics are evaluated in bounded row
+    blocks. Multiplicity corrections use the full respondent population.
     """
-    if statistics is None:
-        statistics = ["infit", "outfit", "Zh"]
+    statistics = _validate_statistics(
+        statistics, _PERSONFIT_STATISTICS, default=("infit", "outfit", "Zh")
+    )
 
     validated_adjustment: PValueAdjustment | None = None
     if p_adjust is not None:
@@ -66,12 +104,13 @@ def compute_personfit(
     n_persons, n_items = responses.shape
 
     result: dict[str, NDArray[np.float64] | NDArray[np.bool_]] = {}
-    compute_mean_squares = "outfit" in statistics or "infit" in statistics
+    standardized = "z_infit" in statistics or "z_outfit" in statistics
+    compute_mean_squares = standardized or any(
+        name in statistics for name in ("infit", "outfit")
+    )
     compute_zh = (
         "Zh" in statistics or "lz" in statistics or validated_adjustment is not None
     )
-    if not compute_mean_squares and not compute_zh:
-        return result
 
     if theta.ndim != 2 or theta.shape[0] != n_persons or n_persons == 0:
         raise ValueError("theta must be a non-empty matrix with one row per person")
@@ -80,8 +119,11 @@ def compute_personfit(
     rows_per_chunk = max(
         1, _PERSONFIT_TARGET_CHUNK_ELEMENTS // max(n_items * category_width, 1)
     )
-    infit = np.empty(n_persons) if compute_mean_squares else None
-    outfit = np.empty(n_persons) if compute_mean_squares else None
+    accumulator = (
+        _FitStatsAccumulator(n_persons, standardized=standardized)
+        if compute_mean_squares
+        else None
+    )
     zh = np.empty(n_persons) if compute_zh else None
     for start in range(0, n_persons, rows_per_chunk):
         stop = min(start + rows_per_chunk, n_persons)
@@ -89,21 +131,28 @@ def compute_personfit(
         probabilities, expected, variance = compute_probability_moments(
             model, theta[start:stop], n_items
         )
-        if infit is not None and outfit is not None:
-            infit[start:stop], outfit[start:stop] = compute_fit_stats(
-                block_responses, expected, variance, axis=1
+        if accumulator is not None:
+            accumulator.add(
+                block_responses,
+                expected,
+                variance,
+                axis=1,
+                target=slice(start, stop),
+                fourth_moment=(
+                    _fourth_central_moment(probabilities, expected)
+                    if standardized
+                    else None
+                ),
             )
         if zh is not None:
             zh[start:stop] = _compute_zh_vectorized(
                 model, block_responses, probabilities, block_responses >= 0
             )
 
-    if infit is not None and outfit is not None:
-        if "outfit" in statistics:
-            result["outfit"] = outfit
-
-        if "infit" in statistics:
-            result["infit"] = infit
+    if accumulator is not None:
+        for name, values in accumulator.statistics().items():
+            if name in statistics:
+                result[name] = values
 
     if zh is not None:
         if "Zh" in statistics:

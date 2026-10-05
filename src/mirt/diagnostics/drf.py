@@ -1,11 +1,14 @@
 """Differential Response Functioning (DRF) analysis.
 
 DRF examines differences in reliability and information functions
-across groups, complementing DIF and DTF analyses.
+across groups, complementing DIF and DTF analyses. Information curves are
+compared after linking the focal calibration onto the reference scale;
+marginal reliabilities stay within-group quantities.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -15,10 +18,15 @@ from scipy import integrate, stats
 
 from mirt.constants import PROB_EPSILON
 from mirt.diagnostics._utils import (
+    BootstrapSummary,
     create_paired_resample_chunks,
     create_theta_grid,
     fit_group_models,
+    link_focal_to_reference,
+    resolve_anchor_items,
     split_groups,
+    summarize_bootstrap,
+    validate_two_group_inputs,
 )
 from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
 
@@ -35,15 +43,6 @@ _BOOTSTRAP_EXCEPTIONS = (
     FloatingPointError,
     np.linalg.LinAlgError,
 )
-
-
-@dataclass(frozen=True)
-class _ReliabilityBootstrapSummary:
-    standard_error: float
-    p_value: float
-    confidence_interval: tuple[float, float]
-    n_successful: int
-    n_failed: int
 
 
 @dataclass(slots=True)
@@ -66,12 +65,16 @@ def compute_drf(
     n_points: int = 49,
     *,
     focal_group: Any | None = None,
+    anchor_items: Sequence[int] | None = None,
     **fit_kwargs: Any,
 ) -> dict[str, Any]:
     """Compute Differential Response Functioning statistics.
 
     DRF examines whether the test provides different levels of measurement
-    precision (information/reliability) for different groups.
+    precision (information/reliability) for different groups. Each group is
+    calibrated separately, then the focal calibration is linked onto the
+    reference scale (Stocking-Lord) before the information curves are
+    compared, so a difference in group ability does not shift the curves.
 
     Parameters
     ----------
@@ -87,6 +90,9 @@ def compute_drf(
         Number of theta points
     focal_group : optional
         Label to treat as focal. By default, the second sorted group is focal.
+    anchor_items : sequence of int, optional
+        At least two items that define the link. Defaults to all items,
+        which assumes no DIF or DIF that balances across items.
     **fit_kwargs
         Additional arguments for fit_mirt()
 
@@ -95,12 +101,17 @@ def compute_drf(
     dict
         Dictionary with:
         - 'information_ref': Test information for reference group
-        - 'information_focal': Test information for focal group
+        - 'information_focal': Test information for focal group on the
+          reference scale
         - 'information_diff': Difference in information
         - 'DRF': Overall DRF statistic (integrated difference)
-        - 'theta_grid': Theta values used
+        - 'theta_grid': Theta values used (reference scale)
         - 'reliability_ref': Marginal reliability for reference group
-        - 'reliability_focal': Marginal reliability for focal group
+        - 'reliability_focal': Marginal reliability for focal group, within
+          its own standard-normal ability distribution
+        - 'anchor_items': Items used for linking
+        - 'linking_constants': ``(A, B)`` with
+          ``theta_reference = A * theta_focal + B``
     """
     values, labels, theta_limits = _validate_drf_inputs(
         data=data,
@@ -109,6 +120,7 @@ def compute_drf(
         theta_range=theta_range,
         n_points=n_points,
     )
+    anchors = _linking_anchors(anchor_items, values.shape[1])
 
     ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
         values, labels, focal_group=focal_group
@@ -116,10 +128,13 @@ def compute_drf(
     ref_result, focal_result = fit_group_models(
         ref_data, focal_data, model=model, **fit_kwargs
     )
+    linked_focal, A, B = link_focal_to_reference(
+        ref_result.model, focal_result.model, anchors
+    )
     theta_grid, _ = create_theta_grid(theta_limits, n_points)
 
     info_ref = _compute_test_information(ref_result.model, theta_grid)
-    info_focal = _compute_test_information(focal_result.model, theta_grid)
+    info_focal = _compute_test_information(linked_focal, theta_grid)
 
     info_diff = info_ref - info_focal
 
@@ -143,7 +158,14 @@ def compute_drf(
         "reliability_diff": rel_ref - rel_focal,
         "ref_group": ref_group,
         "focal_group": selected_focal,
+        "anchor_items": anchors,
+        "linking_constants": (A, B),
     }
+
+
+def _linking_anchors(anchor_items: Sequence[int] | None, n_items: int) -> list[int]:
+    """Validated linking anchors, defaulting to every item."""
+    return resolve_anchor_items(anchor_items, n_items) or list(range(n_items))
 
 
 def _validate_drf_inputs(
@@ -162,30 +184,7 @@ def _validate_drf_inputs(
         raise ValueError("n_points must be an integer of at least 2")
     if n_points < 2:
         raise ValueError("n_points must be an integer of at least 2")
-
-    limits = np.asarray(theta_range, dtype=np.float64)
-    if limits.shape != (2,) or not np.all(np.isfinite(limits)):
-        raise ValueError("theta_range must contain two finite values")
-    if limits[0] >= limits[1]:
-        raise ValueError("theta_range must be strictly increasing")
-
-    values = np.asarray(data)
-    labels = np.asarray(groups)
-    if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] == 0:
-        raise ValueError("data must be a nonempty two-dimensional response matrix")
-    if labels.ndim != 1:
-        raise ValueError("groups must be one-dimensional")
-    if labels.shape[0] != values.shape[0]:
-        raise ValueError("groups length must match the number of response-matrix rows")
-    if labels.dtype.kind in "fc" and not np.all(np.isfinite(labels)):
-        raise ValueError("groups must not contain missing or non-finite labels")
-    if labels.dtype.kind == "O" and any(
-        label is None
-        or (isinstance(label, (float, np.floating)) and not np.isfinite(label))
-        for label in labels
-    ):
-        raise ValueError("groups must not contain missing labels")
-    return values, labels, (float(limits[0]), float(limits[1]))
+    return validate_two_group_inputs(data, groups, theta_range)
 
 
 def _validate_information(
@@ -317,9 +316,13 @@ def compute_item_drf(
     n_points: int = 49,
     *,
     focal_group: Any | None = None,
+    anchor_items: Sequence[int] | None = None,
     **fit_kwargs: Any,
 ) -> dict[str, Any]:
     """Compute DRF for each item individually.
+
+    Item information curves are compared after linking the focal
+    calibration onto the reference scale, as in :func:`compute_drf`.
 
     Parameters
     ----------
@@ -335,6 +338,8 @@ def compute_item_drf(
         Number of theta points
     focal_group : optional
         Label to treat as focal. By default, the second sorted group is focal.
+    anchor_items : sequence of int, optional
+        At least two items that define the link. Defaults to all items.
     **fit_kwargs
         Additional arguments for fit_mirt()
 
@@ -354,6 +359,7 @@ def compute_item_drf(
         theta_range=theta_range,
         n_points=n_points,
     )
+    anchors = _linking_anchors(anchor_items, values.shape[1])
 
     ref_data, focal_data, _, _, ref_group, selected_focal = split_groups(
         values, labels, focal_group=focal_group
@@ -361,10 +367,13 @@ def compute_item_drf(
     ref_result, focal_result = fit_group_models(
         ref_data, focal_data, model=model, **fit_kwargs
     )
+    linked_focal, A, B = link_focal_to_reference(
+        ref_result.model, focal_result.model, anchors
+    )
     theta_grid, _ = create_theta_grid(theta_limits, n_points)
 
     info_ref_all = _compute_item_information(ref_result.model, theta_grid)
-    info_focal_all = _compute_item_information(focal_result.model, theta_grid)
+    info_focal_all = _compute_item_information(linked_focal, theta_grid)
     if info_ref_all.shape != info_focal_all.shape:
         raise ValueError("reference and focal information shapes must match")
 
@@ -382,6 +391,8 @@ def compute_item_drf(
         "theta_grid": theta_grid,
         "ref_group": ref_group,
         "focal_group": selected_focal,
+        "anchor_items": anchors,
+        "linking_constants": (A, B),
     }
 
 
@@ -473,9 +484,9 @@ def _bootstrap_reliability_differences(
     seed: int | np.random.Generator | None,
     fit_kwargs: dict[str, Any],
     n_jobs: int = 1,
-) -> _ReliabilityBootstrapSummary:
+) -> BootstrapSummary:
     if n_bootstrap == 0:
-        return _ReliabilityBootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
+        return BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
 
     rng = np.random.default_rng(seed)
     n_jobs = _validate_n_jobs(n_jobs)
@@ -499,36 +510,11 @@ def _bootstrap_reliability_differences(
         )
     ]
     task_results = _run_bootstrap_tasks(_fit_reliability_bootstrap_task, tasks, n_jobs)
-    differences = [
-        difference
-        for task_result in task_results
-        for difference in task_result
-        if np.isfinite(difference)
-    ]
-
-    n_successful = len(differences)
-    n_failed = n_bootstrap - n_successful
-    if n_successful < 2:
-        return _ReliabilityBootstrapSummary(
-            np.nan, np.nan, (np.nan, np.nan), n_successful, n_failed
-        )
-
-    estimates = np.asarray(differences, dtype=np.float64)
-    standard_error = float(np.std(estimates, ddof=1))
-    if standard_error <= PROB_EPSILON:
-        p_value = 1.0 if abs(observed_difference) <= PROB_EPSILON else 0.0
-    else:
-        z_value = abs(observed_difference) / standard_error
-        p_value = float(2.0 * stats.norm.sf(z_value))
-
-    tail_probability = (1.0 - confidence_level) / 2.0
-    lower, upper = np.quantile(estimates, [tail_probability, 1.0 - tail_probability])
-    return _ReliabilityBootstrapSummary(
-        standard_error,
-        p_value,
-        (float(lower), float(upper)),
-        n_successful,
-        n_failed,
+    return summarize_bootstrap(
+        [value for task_result in task_results for value in task_result],
+        observed=observed_difference,
+        n_requested=n_bootstrap,
+        confidence_level=confidence_level,
     )
 
 

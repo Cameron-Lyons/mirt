@@ -1,9 +1,10 @@
-"""Mean-square item fit and summed-score conditional S-X2 diagnostics."""
+"""Mean-square, theta-binned and summed-score conditional S-X2 item fit."""
 
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING
+from collections.abc import Collection, Sequence
+from typing import TYPE_CHECKING, get_args
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -14,20 +15,31 @@ from mirt.diagnostics.multiple_testing import (
     _validate_p_value_adjustment,
     adjust_p_values,
 )
-from mirt.utils.numeric import _FitStatsAccumulator, compute_expected_variance
+from mirt.exceptions import MirtValidationError
+from mirt.typing import ItemFitStatistic
+from mirt.utils.numeric import (
+    _FitStatsAccumulator,
+    _fourth_central_moment,
+    compute_probability_moments,
+)
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
 
 _SX2_TARGET_CHUNK_ELEMENTS = 1_000_000
+_SPARSE_RELATIVE_TOLERANCE = 1e-10
 _ITEMFIT_TARGET_CHUNK_ELEMENTS = 262_144
+_ITEMFIT_STATISTICS: tuple[str, ...] = get_args(ItemFitStatistic)
+_MEAN_SQUARE_STATISTICS = frozenset({"infit", "outfit", "z_infit", "z_outfit"})
+_BINNED_STATISTICS = ("X2", "G2", "PV_Q1")
+_DEFAULT_THETA_GROUPS = 10
 
 
 def compute_itemfit(
     model: BaseItemModel,
     responses: NDArray[np.int_] | None = None,
-    statistics: list[str] | None = None,
+    statistics: Sequence[str] | str | None = None,
     theta: NDArray[np.float64] | None = None,
     n_groups: int | None = None,
     p_adjust: PValueAdjustment = "none",
@@ -38,16 +50,68 @@ def compute_itemfit(
     quadrature_weights: ArrayLike | None = None,
     item_parameter_counts: ArrayLike | None = None,
     na_rm: bool = False,
+    n_plausible: int = 100,
+    seed: int | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Compute mean-square statistics and Orlando-Thissen S-X2 item fit.
+    """Compute mean-square, theta-binned and Orlando-Thissen S-X2 item fit.
+
+    Parameters
+    ----------
+    model : BaseItemModel
+        Fitted item response model.
+    responses : ndarray of shape (n_persons, n_items)
+        Integer category codes. Negative codes and NaN denote missing
+        responses.
+    statistics : list of str, optional
+        Any of ``"infit"``, ``"outfit"``, ``"z_infit"``, ``"z_outfit"``,
+        ``"S_X2"``, ``"X2"``, ``"G2"`` and ``"PV_Q1"``. Defaults to
+        ``["infit", "outfit"]``. Unknown names raise
+        :class:`~mirt.exceptions.MirtValidationError`.
+    theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
+        Person abilities for the mean-square and X2/G2 statistics. EAP scores
+        are computed when omitted.
+    n_groups : int, optional
+        Number of ability groups for X2, G2 and PV_Q1 (default 10). It is
+        deprecated for S-X2, which conditions on exact total scores.
+    p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, default="none"
+        Multiple-testing adjustment across items for every chi-square test.
+    min_expected : float, default=1.0
+        Minimum expected S-X2 cell count for sparse-cell pooling.
+    n_quadpts : int, default=41
+        Standard-normal quadrature points per model factor for S-X2.
+    quadrature_points, quadrature_weights : array-like, optional
+        Explicit latent grid and probability masses for S-X2.
+    item_parameter_counts : array-like, optional
+        Estimated parameters per item for chi-square degrees of freedom.
+    na_rm : bool, default=False
+        Exclude incomplete persons from S-X2.
+    n_plausible : int, default=100
+        Plausible-value draws for PV_Q1.
+    seed : int, optional
+        Seed for the PV_Q1 plausible-value draws.
+
+    Returns
+    -------
+    dict of str to ndarray
+        One array of length ``n_items`` per requested statistic and its
+        companion degrees of freedom and p-values.
+
+    Notes
+    -----
+    Infit and outfit are information-weighted and unweighted mean squares.
+    Outfit excludes near-deterministic entries whose modeled variance is at
+    most ``PROB_EPSILON``. ``z_infit`` and ``z_outfit`` are their
+    Wilson-Hilferty standardizations, ``(MS^(1/3) - 1)(3/q) + q/3``, with the
+    mean-square variance ``q^2`` taken from the second and fourth central
+    moments of each modeled score (Wright & Masters, 1982). They are
+    approximately standard normal under the model.
 
     S-X2 compares observed category counts with model-implied counts
     conditional on the *exact total score*, integrating over the latent
     distribution. It supports complete binary or consecutively scored ordinal
     responses with conditionally independent items. MixtureIRT and
     HigherOrderCDM require joint integration over shared classes or mastery
-    patterns and are not supported by S-X2. Negative codes and NaN denote
-    missing S-X2 responses.
+    patterns and are not supported by S-X2.
     ``na_rm=True`` excludes incomplete persons from S-X2;
     otherwise missing responses raise an error. Infit and outfit use all
     available responses regardless of ``na_rm``.
@@ -55,8 +119,7 @@ def compute_itemfit(
     ``theta`` supplies person abilities for mean-square statistics, but does
     not define S-X2 expected counts. S-X2 uses standard-normal quadrature by
     default; explicit points and probability-mass weights can specify a
-    different fitted latent distribution. ``n_groups`` is deprecated because
-    score quantiles are not the conditioning groups in S-X2.
+    different fitted latent distribution.
 
     ``min_expected`` controls sparse-cell pooling, with zero disabling it.
     Binary items pool adjacent score rows; ordinal items pool extreme score
@@ -72,10 +135,26 @@ def compute_itemfit(
     The S-X2 result keys are ``S_X2``, ``df``, and ``p_value``; requesting a
     multiplicity correction adds ``p_value_adjusted``. Probability evaluation,
     response counting, and score recursion use bounded row blocks.
+
+    ``X2`` (Bock, 1972; Yen, 1981), its likelihood-ratio analogue ``G2`` and
+    ``PV_Q1`` (Chalmers & Ng, 2017) group persons into ``n_groups`` ability
+    quantiles and compare observed category counts with the model's
+    probabilities at each group's mean ability. They support unidimensional
+    models only. Each adds ``<name>_df`` and ``<name>_p`` (and
+    ``<name>_p_adjusted`` under ``p_adjust``). Because X2 and G2 group on
+    estimated abilities, their p-values are approximate and liberal, severely
+    so on short tests where an ability estimate depends heavily on the item's
+    own response. Sparse cells are not pooled, so rare categories in small
+    groups inflate the statistics further. PV_Q1 instead recomputes X2 on
+    ``n_plausible`` plausible-value draws from the normal approximation
+    ``N(EAP, PSD^2)`` of each person's posterior (independently of ``theta``)
+    and reports the median statistic, which keeps closer to the nominal error
+    rate.
     """
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
-    if statistics is None:
-        statistics = ["infit", "outfit"]
+    requested = _validate_statistics(
+        statistics, _ITEMFIT_STATISTICS, default=("infit", "outfit")
+    )
     if responses is None:
         raise ValueError("responses required for item fit statistics")
     responses = np.asarray(responses)
@@ -84,28 +163,34 @@ def compute_itemfit(
     n_persons, n_items = responses.shape
     if n_items != model.n_items:
         raise ValueError(f"responses must contain {model.n_items} model items")
-    compute_mean_squares = "infit" in statistics or "outfit" in statistics
-    compute_sx2 = "S_X2" in statistics
-    if not compute_mean_squares and not compute_sx2:
-        return {}
+    mean_squares = _MEAN_SQUARE_STATISTICS.intersection(requested)
+    binned = [name for name in _BINNED_STATISTICS if name in requested]
+    n_factors = getattr(model, "n_factors", 1)
 
     if theta is not None:
         theta = np.asarray(theta, dtype=np.float64)
         if theta.ndim == 1:
             theta = theta.reshape(-1, 1)
-        if theta.ndim != 2 or theta.shape != (
-            n_persons,
-            getattr(model, "n_factors", 1),
-        ):
+        if theta.ndim != 2 or theta.shape != (n_persons, n_factors):
             raise ValueError(
                 "theta must be a matrix with one row per person and model factor"
             )
         if not np.all(np.isfinite(theta)):
             raise ValueError("theta must contain only finite values")
 
+    if binned:
+        from mirt.diagnostics.itemfit_binned import _validate_binned_options
+
+        n_groups = _validate_binned_options(
+            model,
+            _DEFAULT_THETA_GROUPS if n_groups is None else n_groups,
+            n_plausible,
+            plausible="PV_Q1" in binned,
+        )
+
     result: dict[str, NDArray[np.float64]] = {}
-    if compute_sx2:
-        if n_groups is not None:
+    if "S_X2" in requested:
+        if n_groups is not None and not binned:
             _validate_n_groups(n_groups)
             warnings.warn(
                 "n_groups is deprecated for S-X2; exact total scores and sparse-cell pooling define its groups",
@@ -127,31 +212,107 @@ def compute_itemfit(
         if p_adjust != "none":
             result["p_value_adjusted"] = adjust_p_values(result["p_value"], p_adjust)
 
-    if compute_mean_squares:
-        if theta is None:
-            from mirt.scoring import fscores
+    if not mean_squares and not binned:
+        return result
 
-            theta = fscores(model, responses, method="EAP").theta
-            theta = np.asarray(theta, dtype=np.float64).reshape(
-                n_persons, getattr(model, "n_factors", 1)
+    if responses.dtype.kind == "f":
+        responses = np.where(np.isnan(responses), -1.0, responses)
+    posterior: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
+    if theta is None or "PV_Q1" in binned:
+        from mirt.scoring import fscores
+
+        scores = fscores(model, responses, method="EAP")
+        eap = np.asarray(scores.theta, dtype=np.float64).reshape(n_persons, n_factors)
+        if "PV_Q1" in binned:
+            spread = np.asarray(scores.standard_error, dtype=np.float64)
+            posterior = (eap[:, 0], spread.reshape(n_persons, n_factors)[:, 0])
+        if theta is None:
+            theta = eap
+
+    if mean_squares:
+        result.update(_mean_square_fit(model, responses, theta, mean_squares))
+
+    if binned:
+        from mirt.diagnostics.itemfit_binned import _compute_binned_itemfit
+
+        result.update(
+            _compute_binned_itemfit(
+                model,
+                responses,
+                binned,
+                theta=theta[:, 0],
+                posterior=posterior,
+                n_groups=int(n_groups),
+                n_plausible=n_plausible,
+                seed=seed,
+                item_parameter_counts=item_parameter_counts,
+                p_adjust=p_adjust,
             )
-        category_width = max(model.n_categories) if model.is_polytomous else 1
-        rows_per_chunk = max(
-            1, _ITEMFIT_TARGET_CHUNK_ELEMENTS // (n_items * category_width)
         )
-        accumulator = _FitStatsAccumulator(n_items)
-        for start in range(0, n_persons, rows_per_chunk):
-            stop = min(start + rows_per_chunk, n_persons)
-            expected, variance = compute_expected_variance(
-                model, theta[start:stop], n_items
-            )
-            accumulator.add(responses[start:stop], expected, variance)
-        infit, outfit = accumulator.finish()
-        if "outfit" in statistics:
-            result["outfit"] = outfit
-        if "infit" in statistics:
-            result["infit"] = infit
     return result
+
+
+def _validate_statistics(
+    statistics: Sequence[str] | str | None,
+    allowed: Collection[str],
+    *,
+    default: Sequence[str],
+) -> list[str]:
+    """Return requested fit statistic names, rejecting unknown names."""
+    if statistics is None:
+        return list(default)
+    names = [statistics] if isinstance(statistics, str) else list(statistics)
+    if not names:
+        raise MirtValidationError(
+            "statistics must name at least one statistic",
+            parameter="statistics",
+            expected=", ".join(allowed),
+        )
+    unknown = [name for name in names if name not in allowed]
+    if unknown:
+        raise MirtValidationError(
+            f"Unknown fit statistic(s) {unknown}; choose from {list(allowed)}",
+            parameter="statistics",
+            value=unknown,
+            expected=", ".join(allowed),
+        )
+    return names
+
+
+def _mean_square_fit(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+    statistics: Collection[str],
+) -> dict[str, NDArray[np.float64]]:
+    """Accumulate item infit/outfit (and their z statistics) in row blocks."""
+    n_persons, n_items = responses.shape
+    standardized = "z_infit" in statistics or "z_outfit" in statistics
+    category_width = max(model.n_categories) if model.is_polytomous else 1
+    rows_per_chunk = max(
+        1, _ITEMFIT_TARGET_CHUNK_ELEMENTS // (n_items * category_width)
+    )
+    accumulator = _FitStatsAccumulator(n_items, standardized=standardized)
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        probabilities, expected, variance = compute_probability_moments(
+            model, theta[start:stop], n_items
+        )
+        accumulator.add(
+            responses[start:stop],
+            expected,
+            variance,
+            fourth_moment=(
+                _fourth_central_moment(probabilities, expected)
+                if standardized
+                else None
+            ),
+        )
+    return {
+        name: values
+        for name, values in accumulator.statistics().items()
+        if name in statistics
+    }
 
 
 def _validate_n_groups(n_groups: int) -> int:
@@ -221,7 +382,7 @@ def _sx2_response_counts(
 
 
 def _sx2_parameter_counts(
-    model: BaseItemModel, counts: ArrayLike | None
+    model: BaseItemModel, counts: ArrayLike | None, *, statistic: str = "S-X2"
 ) -> NDArray[np.int64]:
     if counts is not None:
         values = np.asarray(counts)
@@ -243,14 +404,14 @@ def _sx2_parameter_counts(
     )
     if shared_design:
         raise ValueError(
-            "shared parameters require explicit item_parameter_counts for S-X2"
+            f"shared parameters require explicit item_parameter_counts for {statistic}"
         )
     masks = getattr(model, "free_parameter_masks", {})
     for mask in masks.values():
         values = np.asarray(mask, dtype=bool)
         if values.ndim == 0 or values.shape[0] != model.n_items:
             raise ValueError(
-                "shared parameters require explicit item_parameter_counts for S-X2"
+                f"shared parameters require explicit item_parameter_counts for {statistic}"
             )
         result += np.count_nonzero(values.reshape(model.n_items, -1), axis=1)
     return result
@@ -308,43 +469,52 @@ def _sx2_quadrature(
     return nodes, masses / masses.sum()
 
 
-def _score_distribution(
-    probabilities: NDArray[np.float64], categories: NDArray[np.int64], skip: int = -1
+def _add_item_to_distribution(
+    distribution: NDArray[np.float64], probabilities: NDArray[np.float64]
 ) -> NDArray[np.float64]:
-    """Lord-Wingersky score recursion, avoiding unstable polynomial division."""
-    distribution = np.ones((probabilities.shape[0], 1))
-    for item, count in enumerate(categories):
-        if item == skip:
-            continue
-        updated = np.zeros(
-            (probabilities.shape[0], distribution.shape[1] + int(count) - 1)
+    """Add one item to per-node score distributions (Lord-Wingersky step)."""
+    width = distribution.shape[1]
+    updated = np.zeros((distribution.shape[0], width + probabilities.shape[1] - 1))
+    for category in range(probabilities.shape[1]):
+        updated[:, category : category + width] += (
+            distribution * probabilities[:, category, None]
         )
-        for category in range(int(count)):
-            updated[:, category : category + distribution.shape[1]] += (
-                distribution * probabilities[:, item, category, None]
-            )
-        distribution = updated
-    return distribution
+    return updated
 
 
-def _conditional_category_probabilities(
-    model: BaseItemModel,
-    categories: NDArray[np.int64],
-    nodes: NDArray[np.float64],
-    weights: NDArray[np.float64],
-) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]]:
-    """Integrate joint item-category/total-score probabilities over latent mass."""
-    n_scores = int(np.sum(categories - 1)) + 1
-    n_categories = int(np.max(categories))
-    joint = [np.zeros((n_scores, int(count))) for count in categories]
-    marginal = np.zeros(n_scores)
-    block_rows = max(
-        1,
-        _ITEMFIT_TARGET_CHUNK_ELEMENTS
-        // max(model.n_items * n_categories, n_scores * 3),
+def _antidiagonal_sums(matrices: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Return ``out[..., s] = sum(matrices[..., a, b] for a + b == s)``."""
+    if matrices.shape[-2] > matrices.shape[-1]:
+        matrices = matrices.swapaxes(-1, -2)
+    rows, columns = matrices.shape[-2:]
+    padded = np.zeros((*matrices.shape[:-2], rows, rows + columns - 1))
+    row_stride, column_stride = padded.strides[-2:]
+    # Shift row a right by a places; the shifted cells never overlap.
+    sheared = np.lib.stride_tricks.as_strided(
+        padded,
+        shape=matrices.shape,
+        strides=(*padded.strides[:-2], row_stride + column_stride, column_stride),
     )
-    for start in range(0, len(nodes), block_rows):
-        stop = min(start + block_rows, len(nodes))
+    sheared[...] = matrices
+    return padded.sum(axis=-2)
+
+
+def _node_category_probabilities(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    categories: NDArray[np.int64],
+) -> NDArray[np.float64]:
+    """Validate zero-padded category probabilities at quadrature nodes.
+
+    Probabilities are evaluated in node batches of bounded size.
+    """
+    n_categories = int(np.max(categories))
+    batch_rows = max(
+        1, _ITEMFIT_TARGET_CHUNK_ELEMENTS // (model.n_items * n_categories)
+    )
+    batches = []
+    for start in range(0, len(nodes), batch_rows):
+        stop = min(start + batch_rows, len(nodes))
         raw = np.asarray(model.probability(nodes[start:stop]), dtype=np.float64)
         if not model.is_polytomous:
             if raw.shape != (stop - start, model.n_items):
@@ -367,14 +537,58 @@ def _conditional_category_probabilities(
                 raise ValueError(
                     "model category probabilities must sum to one with zero padding"
                 )
+        batches.append(raw)
+    return batches[0] if len(batches) == 1 else np.concatenate(batches)
+
+
+def _conditional_category_probabilities(
+    model: BaseItemModel,
+    categories: NDArray[np.int64],
+    nodes: NDArray[np.float64],
+    weights: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]]:
+    """Integrate joint item-category/total-score probabilities over latent mass.
+
+    The rest-score distribution of every item is the convolution of the
+    score distributions of the items before it (prefix) and after it
+    (suffix), so one forward and one backward recursion replace a full
+    leave-one-out recursion per item. Each item's joint table then takes one
+    matrix product over the nodes followed by antidiagonal sums.
+    """
+    n_scores = int(np.sum(categories - 1)) + 1
+    n_items = len(categories)
+    joint = [np.zeros((n_scores, int(count))) for count in categories]
+    marginal = np.zeros(n_scores)
+    # Suffix distributions hold about n_items * n_scores / 2 values per node.
+    # Larger node blocks keep the matrix products efficient on long forms.
+    block_rows = max(1, _SX2_TARGET_CHUNK_ELEMENTS // (n_items * n_scores))
+    for start in range(0, len(nodes), block_rows):
+        stop = min(start + block_rows, len(nodes))
+        raw = _node_category_probabilities(model, nodes[start:stop], categories)
         block_weights = weights[start:stop]
-        marginal += block_weights @ _score_distribution(raw, categories)
+
+        suffixes: list[NDArray[np.float64]] = []
+        distribution = np.ones((stop - start, 1))
+        for item in range(n_items - 1, -1, -1):
+            suffixes.append(distribution)
+            distribution = _add_item_to_distribution(
+                distribution, raw[:, item, : categories[item]]
+            )
+        marginal += block_weights @ distribution
+
+        prefix = np.ones((stop - start, 1))
         for item, count in enumerate(categories):
-            rest = _score_distribution(raw, categories, skip=item)
+            item_probabilities = raw[:, item, :count]
+            suffix = suffixes.pop()
+            weighted = (block_weights[:, None] * item_probabilities)[:, :, None]
+            weighted = (weighted * prefix[:, None, :]).reshape(stop - start, -1)
+            products = (weighted.T @ suffix).reshape(int(count), prefix.shape[1], -1)
+            sums = _antidiagonal_sums(products)
             for category in range(int(count)):
-                joint[item][category : category + rest.shape[1], category] += (
-                    block_weights * raw[:, item, category]
-                ) @ rest
+                joint[item][category : category + sums.shape[1], category] += sums[
+                    category
+                ]
+            prefix = _add_item_to_distribution(prefix, item_probabilities)
     conditional = [
         np.divide(
             table,
@@ -390,7 +604,11 @@ def _conditional_category_probabilities(
 def _pool_score_rows(
     observed: NDArray[np.float64], expected: NDArray[np.float64], minimum: float
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Pool binary score rows into their less populated adjacent neighbor."""
+    """Pool binary score rows into their less populated adjacent neighbor.
+
+    Row populations are the observed person counts. Expected row totals equal
+    them only up to rounding, which must not break ties between neighbors.
+    """
     observed = observed.copy()
     expected = expected.copy()
     while len(expected) > 1:
@@ -405,7 +623,7 @@ def _pool_score_rows(
         else:
             neighbor = (
                 row - 1
-                if expected[row - 1].sum() <= expected[row + 1].sum()
+                if observed[row - 1].sum() <= observed[row + 1].sum()
                 else row + 1
             )
         observed[neighbor] += observed[row]
@@ -416,13 +634,13 @@ def _pool_score_rows(
 
 
 def _pool_categories(
-    observed: NDArray[np.float64], expected: NDArray[np.float64], minimum: float
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    observed: list[float], expected: list[float], minimum: float
+) -> tuple[list[float], list[float]]:
     """Pool sparse adjacent ordinal response categories within one score row."""
-    observed = observed.copy()
-    expected = expected.copy()
-    while len(expected) > 1 and np.min(expected) < minimum:
-        category = int(np.argmin(expected))
+    observed = list(observed)
+    expected = list(expected)
+    while len(expected) > 1 and min(expected) < minimum:
+        category = expected.index(min(expected))
         if category == 0:
             neighbor = 1
         elif category == len(expected) - 1:
@@ -435,9 +653,23 @@ def _pool_categories(
             )
         observed[neighbor] += observed[category]
         expected[neighbor] += expected[category]
-        observed = np.delete(observed, category)
-        expected = np.delete(expected, category)
+        del observed[category], expected[category]
     return observed, expected
+
+
+def _chi_square_terms(
+    observed: NDArray[np.float64], expected: NDArray[np.float64], minimum: float
+) -> tuple[float, int, bool, bool]:
+    """Sum Pearson terms and contrasts over score rows without pooling."""
+    positive = expected > 0
+    safe_expected = np.where(positive, expected, 1.0)
+    statistic = float(
+        np.sum(np.where(positive, (observed - expected) ** 2 / safe_expected, 0.0))
+    )
+    contrasts = int(np.sum(np.maximum(np.count_nonzero(positive, axis=-1) - 1, 0)))
+    impossible = bool(np.any(~positive & (observed > 0)))
+    sparse = bool(np.any(positive & (expected < minimum)))
+    return statistic, contrasts, impossible, sparse
 
 
 def _sx2_from_tables(
@@ -447,6 +679,10 @@ def _sx2_from_tables(
     minimum: float,
 ) -> tuple[float, int, float]:
     """Apply ordered pooling and count remaining independent category contrasts."""
+    # A pooled row's expected total equals its integer person count only up to
+    # rounding, so relax the threshold slightly; otherwise a one-person row at
+    # min_expected=1 is "sparse" or not depending on summation order.
+    minimum *= 1.0 - _SPARSE_RELATIVE_TOLERANCE
     n_categories = observed.shape[1]
     n_scores = observed.shape[0]
     # Perfect and zero total scores are deterministic and supply no item-fit
@@ -473,25 +709,30 @@ def _sx2_from_tables(
     observed, expected = observed[populated], expected[populated]
     if n_categories == 2 and minimum > 0:
         observed, expected = _pool_score_rows(observed, expected, minimum)
-    statistic = 0.0
-    contrasts = 0
-    sparse_remaining = False
-    for observed_row, expected_row in zip(observed, expected, strict=True):
-        if n_categories > 2 and minimum > 0:
-            observed_row, expected_row = _pool_categories(
-                observed_row, expected_row, minimum
-            )
-        positive = expected_row > 0
-        contrasts += max(int(np.count_nonzero(positive)) - 1, 0)
-        if np.any((~positive) & (observed_row > 0)):
-            statistic = np.inf
-        statistic += float(
-            np.sum(
-                (observed_row[positive] - expected_row[positive]) ** 2
-                / expected_row[positive]
-            )
-        )
-        sparse_remaining |= bool(np.any(expected_row[positive] < minimum))
+    sparse_rows = np.zeros(len(expected), dtype=bool)
+    if n_categories > 2 and minimum > 0 and len(expected):
+        sparse_rows = np.min(expected, axis=1) < minimum
+    # Rows without sparse categories need no pooling and reduce together.
+    statistic, contrasts, impossible, sparse_remaining = _chi_square_terms(
+        observed[~sparse_rows], expected[~sparse_rows], minimum
+    )
+    # Sparse rows pool a few cells each, which plain Python handles fastest.
+    for observed_row, expected_row in zip(
+        observed[sparse_rows].tolist(), expected[sparse_rows].tolist(), strict=True
+    ):
+        positive = 0
+        for observed_cell, expected_cell in zip(
+            *_pool_categories(observed_row, expected_row, minimum), strict=True
+        ):
+            if expected_cell > 0:
+                positive += 1
+                statistic += (observed_cell - expected_cell) ** 2 / expected_cell
+                sparse_remaining |= expected_cell < minimum
+            elif observed_cell > 0:
+                impossible = True
+        contrasts += max(positive - 1, 0)
+    if impossible:
+        statistic = np.inf
     degrees = max(contrasts - n_parameters, 0)
     p_value = (
         float(chdtrc(degrees, statistic))

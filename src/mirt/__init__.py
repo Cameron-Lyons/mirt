@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import importlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 from mirt._api_registry import MODULE_EXPORTS, build_all_exports, build_lazy_imports
@@ -9,14 +9,17 @@ from mirt._version import __version__
 
 if TYPE_CHECKING:
     import numpy as np
-    from numpy.typing import NDArray
+    from numpy.typing import ArrayLike, NDArray
 
+    from mirt.estimation._em_context import EMFitContext
     from mirt.estimation.mcmc import MCMCResult
+    from mirt.estimation.priors import Prior, PriorSpecification
+    from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
 
 def fit_mirt(
-    data: NDArray[np.int_],
+    data: NDArray[np.int_] | Any,
     model: Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"] = "2PL",
     n_factors: int = 1,
     n_categories: int | Sequence[int] | None = None,
@@ -28,6 +31,12 @@ def fit_mirt(
     item_names: list[str] | None = None,
     use_rust: bool = True,
     compute_standard_errors: bool = True,
+    start_values: Mapping[str, ArrayLike] | None = None,
+    fixed: Mapping[str, ArrayLike] | None = None,
+    priors: PriorSpecification | Mapping[str, Prior] | None = None,
+    se_method: Literal[
+        "auto", "oakes", "crossprod", "sandwich", "complete_data"
+    ] = "auto",
 ) -> FitResult:
     """Fit an Item Response Theory model to response data.
 
@@ -37,8 +46,9 @@ def fit_mirt(
 
     Parameters
     ----------
-    data : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing responses should be coded as -1.
+    data : ndarray or DataFrame of shape (n_persons, n_items)
+        Response matrix. Missing responses are coded as any negative value or
+        ``NaN`` (including pandas/polars nulls).
         For dichotomous models, responses should be 0 or 1.
         For polytomous models, responses should be 0, 1, ..., n_categories-1.
     model : {"1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"}, default="2PL"
@@ -54,7 +64,8 @@ def fit_mirt(
         - "NRM": Nominal Response Model (polytomous)
 
     n_factors : int, default=1
-        Number of latent factors for multidimensional models.
+        Number of latent factors. Only "2PL", "GRM", "GPCM" and "NRM" support
+        more than one factor; other families raise ``MirtModelError``.
     n_categories : int or sequence of int, optional
         Category count for all polytomous items, or one count per item.
         If None, each item's count is inferred from its largest observed code,
@@ -73,13 +84,41 @@ def fit_mirt(
     verbose : bool, default=False
         Print iteration progress.
     item_names : list of str, optional
-        Names for each item. If None, items are named Item_1, Item_2, etc.
+        Names for each item. If None, unique DataFrame column names are used
+        when available; otherwise items are named Item_1, Item_2, etc.
     use_rust : bool, default=True
         Use high-performance Rust backend if available.
     compute_standard_errors : bool, default=True
         Compute parameter standard errors. Set to ``False`` for parameter-only
         fits such as bootstrap replicates, where skipping inference reduces
         repeated work. The result then contains an empty standard-error mapping.
+    start_values : mapping of str to array_like, optional
+        Starting values by stored parameter name, for example
+        ``{"discrimination": a0}``. Parameters left out start from the family
+        defaults. Values also set the coordinates held fixed by ``fixed``.
+    fixed : mapping of str to bool or array of bool, optional
+        Coordinates to hold at their starting values, by parameter name.
+        ``True`` fixes a coordinate; a scalar applies to the whole parameter.
+        Supported by EM; MHRM and Gibbs sampling raise ``MirtValidationError``.
+    priors : PriorSpecification or mapping of str to Prior, optional
+        Item-parameter priors for Bayes modal estimation with EM, for example
+        ``{"guessing": BetaPrior(5, 17)}``. See ``EMEstimator(item_priors=...)``.
+        The result reports ``log_posterior``; standard errors ignore the prior.
+        Starting values, fixed coordinates and priors bypass the native 2PL EM
+        fast path, and ``start_values`` runs MHRM and Gibbs sampling with the
+        NumPy samplers.
+    se_method : {"auto", "oakes", "crossprod", "sandwich", "complete_data"}, \
+default="auto"
+        Standard-error estimator for EM fits (see :class:`EMEstimator`).
+        ``"oakes"`` uses the observed information of the marginal likelihood,
+        ``"crossprod"`` the outer product of person scores, ``"sandwich"``
+        their robust combination, and ``"complete_data"`` itemwise
+        complete-data curvature, which understates uncertainty. ``"auto"``
+        selects ``"oakes"`` for unidimensional 1PL-4PL, GRM, GPCM and PCM fits
+        and ``"complete_data"`` otherwise. The matrix methods also store the
+        parameter covariance in ``FitResult.vcov``, and ``FitResult.se_method``
+        records the estimator used. Other estimation methods accept only
+        ``"auto"``.
 
     Returns
     -------
@@ -96,12 +135,12 @@ def fit_mirt(
     Raises
     ------
     MirtDataError
-        If data is not 2D.
+        If data is not 2D or contains invalid response codes.
     MirtValidationError
-        If model type or estimation method is unknown, or polytomous
-        category count is invalid.
+        If ``n_factors`` is not a positive integer, the estimation method is
+        unknown, or a polytomous category count is invalid.
     MirtModelError
-        If the requested model cannot be constructed.
+        If the model type is unknown or does not support ``n_factors``.
 
     Examples
     --------
@@ -116,25 +155,18 @@ def fit_mirt(
     import numpy as np
 
     from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import compute_item_se_parallel
-    from mirt.backends.rust.estep import e_step_complete
     from mirt.backends.rust.estimation import _em_fit_2pl_prepared
     from mirt.estimation._em_context import EMFitContext
+    from mirt.estimation._item_priors import validate_item_priors
+    from mirt.estimation.base import _apply_starting_values, _free_masks_from_fixed
     from mirt.estimation.em import EMEstimator
     from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
-    from mirt.estimation.quadrature import GaussHermiteQuadrature
-    from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
-    from mirt.models.dichotomous import (
-        FourParameterLogistic,
-        OneParameterLogistic,
-        ThreeParameterLogistic,
-        TwoParameterLogistic,
-    )
-    from mirt.models.polytomous import (
-        GeneralizedPartialCredit,
-        GradedResponseModel,
-        NominalResponseModel,
-        PartialCreditModel,
+    from mirt.estimation.standard_errors import validate_se_method
+    from mirt.exceptions import MirtValidationError
+    from mirt.models._factory import (
+        build_item_model,
+        item_model_class,
+        validate_n_factors,
     )
 
     if not isinstance(compute_standard_errors, (bool, np.bool_)):
@@ -145,14 +177,24 @@ def fit_mirt(
             expected="bool",
         )
     compute_standard_errors = bool(compute_standard_errors)
+    se_method = validate_se_method(se_method)
+    if se_method != "auto" and estimation != "EM":
+        raise MirtValidationError(
+            "se_method applies only to EM estimation",
+            parameter="se_method",
+            value=se_method,
+            expected="'auto' for MHRM, MCMC and Gibbs",
+        )
     from mirt.results.fit_result import FitResult
     from mirt.typing import EstimationMethod
-    from mirt.utils.data import validate_responses
+    from mirt.utils.data import response_column_names, validate_responses
 
-    supported_models = ("1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM")
-    if model not in supported_models:
-        raise MirtModelError(f"Unknown model: {model}", model_type=str(model))
+    # Reject unknown families and factor counts before reading the data.
+    item_model_class(model)
+    n_factors = validate_n_factors(n_factors)
 
+    if item_names is None:
+        item_names = response_column_names(data)
     data = validate_responses(data)
 
     n_persons, n_items = data.shape
@@ -160,68 +202,44 @@ def fit_mirt(
     if item_names is None:
         item_names = [f"Item_{i + 1}" for i in range(n_items)]
 
-    is_polytomous = model in ("GRM", "GPCM", "PCM", "NRM")
-
-    if is_polytomous:
-        if n_categories is None:
-            maxima = data.max(axis=0)
-            if np.any(maxima < 0):
-                raise MirtValidationError(
-                    "n_categories is required for items with no observed responses",
-                    parameter="n_categories",
-                    expected="one category count per item, each >= 2",
-                )
-            n_categories = np.maximum(maxima + 1, 2).tolist()
-        try:
-            counts = np.asarray(n_categories)
-        except (TypeError, ValueError) as exc:
-            raise MirtValidationError(
-                "n_categories must be an integer or one integer count per item",
-                parameter="n_categories",
-                value=n_categories,
-            ) from exc
-        if counts.ndim > 1 or (counts.ndim == 1 and counts.size != n_items):
-            raise MirtValidationError(
-                f"n_categories must be a scalar or have shape ({n_items},)",
-                parameter="n_categories",
-                value=n_categories,
-            )
-        if counts.dtype.kind not in "iu":
-            raise MirtValidationError(
-                "n_categories must contain integer category counts",
-                parameter="n_categories",
-                value=n_categories,
-            )
-        if np.any(counts < 2):
-            raise MirtValidationError(
-                "n_categories must be at least 2 for each item",
-                parameter="n_categories",
-                value=n_categories,
-                expected=">= 2",
-            )
-        # Preserve a declared scalar; sequences and inferred per-item counts
-        # are normalized to Python integers for the model constructors.
-        n_categories = int(counts) if counts.ndim == 0 else counts.tolist()
-        if np.any(data >= counts):
-            raise MirtDataError(
-                "polytomous response codes must be below n_categories for each item",
-                n_persons=n_persons,
-                n_items=n_items,
-            )
-    elif np.any(data[data >= 0] > 1):
-        raise MirtDataError(
-            "dichotomous responses must be coded as 0 or 1",
-            n_persons=n_persons,
-            n_items=n_items,
-        )
+    irt_model = build_item_model(
+        model,
+        n_items,
+        n_factors=n_factors,
+        n_categories=n_categories,
+        item_names=item_names,
+        responses=data,
+    )
 
     estimation_method: EstimationMethod = estimation
+
+    item_priors = validate_item_priors(priors)
+    if item_priors is not None and estimation_method in ("MHRM", "MCMC", "Gibbs"):
+        raise MirtValidationError(
+            "priors are supported only with estimation='EM'",
+            parameter="priors",
+            value=estimation,
+            expected="EM",
+        )
+    if fixed is not None:
+        irt_model.set_free_parameter_masks(_free_masks_from_fixed(irt_model, fixed))
+    if start_values is not None and estimation_method != "EM":
+        # The native samplers do not accept starting values.
+        _apply_starting_values(irt_model, start_values)
+        use_rust = False
+    # The native 2PL path starts from its own values and ignores masks and priors.
+    customized = (
+        start_values is not None
+        or bool(irt_model._free_parameter_restrictions)
+        or item_priors is not None
+    )
 
     if (
         should_use_rust(use_rust)
         and model == "2PL"
         and n_factors == 1
         and estimation_method == "EM"
+        and not customized
     ):
         with EMFitContext(data, compress=True, native=True) as context:
             discrimination, difficulty, log_likelihood, n_iterations, converged = (
@@ -230,9 +248,6 @@ def fit_mirt(
                 )
             )
 
-            irt_model = TwoParameterLogistic(
-                n_items=n_items, n_factors=n_factors, item_names=item_names
-            )
             discrimination = np.asarray(discrimination)
             difficulty = np.asarray(difficulty)
             irt_model._parameters = {
@@ -242,28 +257,11 @@ def fit_mirt(
             irt_model._is_fitted = True
 
             standard_errors: dict[str, NDArray[np.float64]] = {}
+            used_se_method = covariance = None
             if compute_standard_errors:
-                quad = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
-                posterior_weights, _ = e_step_complete(
-                    context.responses,
-                    quad.nodes.ravel(),
-                    quad.weights.ravel(),
-                    discrimination,
-                    difficulty,
+                standard_errors, used_se_method, covariance = _native_2pl_errors(
+                    irt_model, context, n_quadpts, se_method
                 )
-                if context.frequencies is not None:
-                    posterior_weights *= context.frequencies[:, None]
-                se_a, se_b = compute_item_se_parallel(
-                    context.responses,
-                    posterior_weights,
-                    quad.nodes.ravel(),
-                    discrimination,
-                    difficulty,
-                )
-                standard_errors = {
-                    "discrimination": np.asarray(se_a),
-                    "difficulty": np.asarray(se_b),
-                }
 
             n_params = 2 * n_items
             aic = -2 * log_likelihood + 2 * n_params
@@ -279,49 +277,10 @@ def fit_mirt(
                 bic=bic,
                 n_observations=n_persons,
                 n_parameters=n_params,
+                se_method=used_se_method,
+                vcov=covariance,
             )
 
-    if model == "1PL":
-        irt_model = OneParameterLogistic(n_items=n_items, item_names=item_names)
-    elif model == "2PL":
-        irt_model = TwoParameterLogistic(
-            n_items=n_items, n_factors=n_factors, item_names=item_names
-        )
-    elif model == "3PL":
-        irt_model = ThreeParameterLogistic(n_items=n_items, item_names=item_names)
-    elif model == "4PL":
-        irt_model = FourParameterLogistic(n_items=n_items, item_names=item_names)
-    elif model == "GRM":
-        assert n_categories is not None
-        irt_model = GradedResponseModel(
-            n_items=n_items,
-            n_categories=n_categories,
-            n_factors=n_factors,
-            item_names=item_names,
-        )
-    elif model == "GPCM":
-        assert n_categories is not None
-        irt_model = GeneralizedPartialCredit(
-            n_items=n_items,
-            n_categories=n_categories,
-            n_factors=n_factors,
-            item_names=item_names,
-        )
-    elif model == "PCM":
-        assert n_categories is not None
-        irt_model = PartialCreditModel(
-            n_items=n_items,
-            n_categories=n_categories,
-            item_names=item_names,
-        )
-    elif model == "NRM":
-        assert n_categories is not None
-        irt_model = NominalResponseModel(
-            n_items=n_items,
-            n_categories=n_categories,
-            n_factors=n_factors,
-            item_names=item_names,
-        )
     if estimation_method == "EM":
         estimator = EMEstimator(
             n_quadpts=n_quadpts,
@@ -330,12 +289,17 @@ def fit_mirt(
             verbose=verbose,
             use_rust=use_rust,
             compute_standard_errors=compute_standard_errors,
+            item_priors=item_priors,
+            se_method=se_method,
         )
-        return estimator.fit(irt_model, data)
+        if start_values is None:
+            return estimator.fit(irt_model, data)
+        return estimator.fit(irt_model, data, start=start_values)
 
     if estimation_method == "MHRM":
         result = MHRMEstimator(
             n_cycles=max_iter,
+            burnin=min(500, max(max_iter // 4, 1)),
             verbose=verbose,
             use_rust=use_rust,
         ).fit(irt_model, data)
@@ -363,6 +327,53 @@ def fit_mirt(
         value=estimation,
         expected="EM, MHRM, MCMC, or Gibbs",
     )
+
+
+def _native_2pl_errors(
+    model: BaseItemModel,
+    context: EMFitContext,
+    n_quadpts: int,
+    se_method: str,
+) -> tuple[dict[str, NDArray[np.float64]], str, NDArray[np.float64] | None]:
+    """Standard errors for the native 2PL fit, matching ``EMEstimator``.
+
+    Returns the errors, the method used, and the free-parameter covariance
+    (``None`` for complete-data curvature).
+    """
+    from mirt.constants import PROB_EPSILON
+    from mirt.estimation._item_information import item_standard_errors
+    from mirt.estimation.base import _parameter_bounds
+    from mirt.estimation.em import _weight_posterior
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.estimation.standard_errors import (
+        _posterior_from_model,
+        estimate_covariance,
+    )
+
+    quadrature = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
+    if se_method == "complete_data":
+        posterior = _posterior_from_model(model, context.responses, quadrature)
+        errors = item_standard_errors(
+            model,
+            context.responses,
+            _weight_posterior(posterior, context.frequencies),
+            quadrature.nodes,
+            PROB_EPSILON,
+            context=context,
+        )
+        assert errors is not None
+        return errors, "complete_data", None
+    method = "oakes" if se_method == "auto" else se_method
+    estimate = estimate_covariance(
+        model,
+        context.responses,
+        quadrature,
+        quadrature.weights,
+        method,
+        frequencies=context.frequencies,
+        bounds=lambda name: _parameter_bounds(model, name),
+    )
+    return estimate.standard_errors, method, estimate.covariance
 
 
 def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
@@ -417,6 +428,8 @@ def itemfit(
     quadrature_weights: NDArray[np.float64] | None = None,
     item_parameter_counts: NDArray[np.int_] | None = None,
     na_rm: bool = False,
+    n_plausible: int = 100,
+    seed: int | None = None,
 ) -> Any:
     """Compute item fit statistics for a fitted IRT model.
 
@@ -436,15 +449,23 @@ def itemfit(
         - "infit": Information-weighted mean square (sensitive to
           unexpected responses near ability level)
         - "outfit": Unweighted mean square (sensitive to outliers)
+        - "z_infit", "z_outfit": Wilson-Hilferty standardized mean squares,
+          approximately standard normal under the model
         - "S_X2": Orlando-Thissen S-X2 statistic
+        - "X2", "G2": Bock/Yen chi-square and likelihood-ratio statistics
+          over ability groups (approximate p-values, liberal on short tests)
+        - "PV_Q1": Chalmers-Ng plausible-value Q1 statistic
 
-        Default is ["infit", "outfit"].
+        Default is ["infit", "outfit"]. Unknown names raise
+        ``MirtValidationError``.
     n_groups : int, optional
+        Number of ability groups for X2, G2 and PV_Q1 (default 10).
         Deprecated and ignored by S-X2, which conditions on exact total scores.
     p_adjust : {"bonferroni", "holm", "fdr_bh", "none"}, default="none"
-        Multiple-testing adjustment across item-level S-X2 p-values. When an
-        adjustment is requested, the result includes a
-        ``p_value_adjusted`` column while retaining the raw ``p_value``.
+        Multiple-testing adjustment across item-level chi-square p-values. When
+        an adjustment is requested, the result includes a
+        ``p_value_adjusted`` column (``<name>_p_adjusted`` for X2, G2 and
+        PV_Q1) while retaining the raw p-values.
     min_expected : float, default=1.0
         Minimum expected S-X2 cell count for adjacent score/category pooling.
         Zero disables sparse-cell pooling.
@@ -460,12 +481,17 @@ def itemfit(
     na_rm : bool, default=False
         Exclude incomplete persons from S-X2. Otherwise S-X2 requires complete
         responses. Mean-square statistics always use available responses.
+    n_plausible : int, default=100
+        Plausible-value draws for PV_Q1.
+    seed : int, optional
+        Seed for the PV_Q1 plausible-value draws.
 
     Returns
     -------
     DataFrame
         Item fit statistics with items as rows and statistics as columns.
-        S-X2 includes ``df`` and ``p_value``. An unestimable chi-square test
+        S-X2 includes ``df`` and ``p_value``; X2, G2 and PV_Q1 include
+        ``<name>_df`` and ``<name>_p``. An unestimable chi-square test
         has ``p_value=NaN``; nonpositive degrees of freedom are reported as zero.
 
     Examples
@@ -495,6 +521,8 @@ def itemfit(
         quadrature_weights=quadrature_weights,
         item_parameter_counts=item_parameter_counts,
         na_rm=na_rm,
+        n_plausible=n_plausible,
+        seed=seed,
     )
 
     return create_dataframe(fit_stats, index=result.model.item_names, index_name="item")
@@ -529,10 +557,12 @@ def personfit(
 
         - "infit": Information-weighted mean square
         - "outfit": Unweighted mean square
+        - "z_infit", "z_outfit": Wilson-Hilferty standardized mean squares
         - "Zh": Standardized log-likelihood (Drasgow et al.)
         - "lz": Log-likelihood z-score
 
-        Default is ["infit", "outfit", "Zh"].
+        Default is ["infit", "outfit", "Zh"]. Unknown names raise
+        ``MirtValidationError``.
     p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, optional
         Enable person-fit p-values and flags, optionally correcting across
         respondents. ``None`` keeps the default output unchanged; ``"none"``
@@ -567,12 +597,14 @@ def personfit(
     >>> aberrant = pfit[pfit['aberrant']]
     >>> print(f"Flagged {len(aberrant)} aberrant responders")
     """
-    from mirt.diagnostics.personfit import compute_personfit
+    from mirt.diagnostics.itemfit import _validate_statistics
+    from mirt.diagnostics.personfit import _PERSONFIT_STATISTICS, compute_personfit
     from mirt.scoring import fscores
     from mirt.utils.dataframe import create_dataframe
 
-    if statistics is None:
-        statistics = ["infit", "outfit", "Zh"]
+    statistics = _validate_statistics(
+        statistics, _PERSONFIT_STATISTICS, default=("infit", "outfit", "Zh")
+    )
 
     if theta is None:
         score_result = fscores(result, responses, method="EAP")
@@ -602,36 +634,52 @@ def dif(
     tol: float = 1e-4,
     focal_group: str | int | None = None,
     p_adjust: Literal["none", "bonferroni", "holm", "fdr_bh"] = "none",
+    *,
+    anchors: Sequence[int] | None = None,
+    scheme: Literal["drop", "add", "drop_sequential", "add_sequential"] = "drop",
+    n_jobs: int = 1,
 ) -> Any:
     """Compute Differential Item Functioning (DIF) statistics.
 
     DIF analysis tests whether items function differently across groups
-    after controlling for ability level.
+    after controlling for ability level. Groups are compared on a common
+    latent scale, so group impact is not reported as DIF. See
+    :func:`mirt.diagnostics.compute_dif` for the methods and their cost.
 
     Args:
         data: Response matrix (n_persons x n_items).
         groups: Group membership array (n_persons,). Must have exactly 2 groups.
         model: IRT model type.
         method: DIF detection method:
-            - 'likelihood_ratio': Likelihood ratio test (recommended)
-            - 'wald': Wald test on parameter differences
-            - 'lord': Lord's chi-square test
-            - 'raju': Raju's area measures
+            - 'likelihood_ratio': Nested multiple-group LR test (one baseline
+              fit plus one refit per tested item)
+            - 'wald': Wald test on linked parameter differences
+            - 'lord': Lord's chi-square test, an alias of 'wald'
+            - 'raju': Raju's area measures between linked curves (no p-value)
         n_categories: Number of categories for polytomous models.
         n_quadpts: Number of quadrature points for EM.
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
         p_adjust: Multiple-testing adjustment across items. Default 'none'.
+        anchors: Items assumed free of DIF; they are not tested. They anchor
+            the likelihood-ratio models or define the linking for the other
+            methods.
+        scheme: Likelihood-ratio scheme: 'drop', 'add', 'drop_sequential' or
+            'add_sequential'. The 'add' schemes require anchors.
+        n_jobs: Worker processes for likelihood-ratio refits.
 
     Returns:
         DataFrame with DIF statistics for each item:
             - statistic: Test statistic
+            - df: Degrees of freedom
             - p_value: P-value
             - p_value_adjusted: Multiplicity-adjusted P-value
-            - effect_size: Effect size measure
+            - effect_size: Focal-minus-reference location difference
             - classification: ETS classification using adjusted P-values
             - adjustment: Multiple-testing method
+            - tested: Whether the item was tested
+            - converged: Whether the underlying fits converged
     """
     from mirt.diagnostics.dif import compute_dif
     from mirt.utils.dataframe import create_dataframe
@@ -647,9 +695,15 @@ def dif(
         tol=tol,
         focal_group=focal_group,
         p_adjust=p_adjust,
+        anchors=anchors,
+        scheme=scheme,
+        n_jobs=n_jobs,
     )
-
-    return create_dataframe(dif_results, index_name="item")
+    metadata = {"method", "anchors", "linking_constants"}
+    columns = {
+        name: values for name, values in dif_results.items() if name not in metadata
+    }
+    return create_dataframe(columns, index_name="item")
 
 
 __all__ = build_all_exports()

@@ -242,9 +242,10 @@ def test_multi_start_fit_validates_codes_against_model():
 def test_multi_start_fit_applies_starts_before_fitting(monkeypatch):
     seen_difficulties: list[np.ndarray] = []
 
-    def fake_fit(self, model, responses):
+    def fake_fit(self, model, responses, *, start):
         del self, responses
-        assert model.is_fitted
+        # The supplied values must be the starting point, not reinitialized.
+        assert start == "model"
         seen_difficulties.append(model.parameters["difficulty"])
         return SimpleNamespace(log_likelihood=float(len(seen_difficulties)))
 
@@ -332,3 +333,58 @@ def test_starting_utilities_are_available_from_public_namespaces():
 def test_starting_module_doctests():
     failures, _ = doctest.testmod(starting)
     assert failures == 0
+
+
+def test_parallel_multi_start_fit_spawns_workers_with_the_parent_backend():
+    import mirt
+    from mirt import simdata
+
+    responses = simdata("2PL", n_persons=120, n_items=4, seed=6)
+    previous = mirt.get_backend()
+    mirt.set_backend("numpy")
+    try:
+        options = {"n_starts": 2, "seed": 9, "max_iter": 30, "use_gpu": False}
+        serial = multi_start_fit(TwoParameterLogistic(4), responses, **options)
+        parallel = multi_start_fit(
+            TwoParameterLogistic(4), responses, n_jobs=2, **options
+        )
+    finally:
+        mirt.set_backend(previous)
+
+    assert parallel.log_likelihood == serial.log_likelihood
+    for name, values in serial.model.parameters.items():
+        np.testing.assert_array_equal(parallel.model.parameters[name], values)
+
+
+def test_parallel_multi_start_fit_uses_spawned_workers(monkeypatch):
+    import mirt.utils._parallel as parallel_utils
+
+    contexts = []
+
+    def recording_pool(*, mp_context, **kwargs):
+        contexts.append(mp_context.get_start_method())
+        raise OSError("stop before starting workers")
+
+    monkeypatch.setattr(parallel_utils, "ProcessPoolExecutor", recording_pool)
+    with pytest.raises(OSError, match="stop before starting workers"):
+        multi_start_fit(
+            TwoParameterLogistic(2),
+            np.array([[0, 1], [1, 0]]),
+            n_starts=2,
+            n_jobs=2,
+        )
+
+    assert contexts == ["spawn"]
+
+
+def test_parallel_multi_start_fit_rejects_unpicklable_models():
+    class LocalModel(TwoParameterLogistic):
+        pass
+
+    with pytest.raises(MirtValidationError, match="picklable"):
+        multi_start_fit(
+            LocalModel(2),
+            np.array([[0, 1], [1, 0]]),
+            n_starts=2,
+            n_jobs=2,
+        )

@@ -112,7 +112,7 @@ def test_true_score_equating_supports_polytomous_forms(graded_model) -> None:
     )
 
     np.testing.assert_array_equal(result.old_scores, np.arange(8, dtype=float))
-    np.testing.assert_allclose(result.new_scores, result.old_scores, atol=2e-3)
+    np.testing.assert_allclose(result.new_scores, result.old_scores, atol=1e-10)
 
 
 def test_true_score_equating_includes_unreached_endpoint_scores() -> None:
@@ -125,7 +125,8 @@ def test_true_score_equating_includes_unreached_endpoint_scores() -> None:
     result = true_score_equating(model, model, theta_range=(-4.0, 4.0))
 
     np.testing.assert_array_equal(result.old_scores, np.arange(6, dtype=float))
-    assert len(result.new_scores) == 6
+    # Abilities for high scores lie beyond theta_range but are still solved.
+    np.testing.assert_allclose(result.new_scores, result.old_scores, atol=1e-10)
 
 
 def test_true_score_equating_rejects_invalid_linking_constants(three_pl) -> None:
@@ -324,3 +325,26 @@ def test_multidimensional_models_are_rejected() -> None:
         theta_to_score(model, np.array([0.0]))
     with pytest.raises(ValueError, match="unidimensional"):
         observed_score_equating(model, model)
+
+
+@pytest.mark.parametrize(
+    ("function", "inverse"),
+    [
+        (lambda x: x**3, np.cbrt),
+        (lambda x: np.expm1(8.0 * x), lambda y: np.log1p(y) / 8.0),
+        (lambda x: np.tanh(40.0 * x), lambda y: np.arctanh(y) / 40.0),
+    ],
+)
+def test_bracketed_root_solves_steep_and_flat_monotone_curves(function, inverse):
+    from mirt.equating.score_equating import _bracketed_root
+
+    targets = np.array([-0.9, -1e-6, 0.0, 0.3, 0.999])
+    lower = np.full(len(targets), -1.0)
+    upper = np.full(len(targets), 1.0)
+
+    roots = _bracketed_root(
+        function, targets, lower, upper, function(lower), function(upper)
+    )
+
+    np.testing.assert_allclose(function(roots), targets, atol=1e-13)
+    np.testing.assert_allclose(roots, inverse(targets), rtol=1e-9, atol=1e-12)

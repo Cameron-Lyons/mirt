@@ -10,6 +10,7 @@ powered by a Rust backend for computational efficiency.
 
    installation
    quickstart
+   guides/estimation
    guides/cat
    guides/dynamic
    guides/response_time

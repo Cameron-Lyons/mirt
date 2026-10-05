@@ -321,7 +321,6 @@ class BKTGibbsSampler:
             "p_forget": [],
             "p_slip": [],
             "p_guess": [],
-            "log_likelihood": [],
         }
 
         for iteration in range(self.n_iter):
@@ -367,9 +366,6 @@ class BKTGibbsSampler:
                 chains["p_slip"].append(model.p_slip.copy())
                 chains["p_guess"].append(model.p_guess.copy())
 
-                ll = self._compute_log_likelihood(responses, skill_assignments, model)
-                chains["log_likelihood"].append(ll)
-
             if self.verbose and (iteration + 1) % 200 == 0:
                 ll = self._compute_log_likelihood(responses, skill_assignments, model)
                 print(f"Iteration {iteration + 1}/{self.n_iter}: LL = {ll:.4f}")
@@ -382,7 +378,9 @@ class BKTGibbsSampler:
 
         learning_curves = np.zeros((n_persons, n_skills))
         skill_mastery = np.zeros((n_persons, n_skills))
-        gamma, _ = model.forward_backward_batch(responses, skill_assignments)
+        gamma, log_likelihoods = model.forward_backward_batch(
+            responses, skill_assignments
+        )
 
         for skill_idx in range(n_skills):
             skill_mask = skill_assignments == skill_idx
@@ -391,7 +389,7 @@ class BKTGibbsSampler:
                 skill_mastery[:, skill_idx] = learned[:, -1]
                 learning_curves[:, skill_idx] = learned.mean(axis=1)
 
-        ll_final = self._compute_log_likelihood(responses, skill_assignments, model)
+        ll_final = float(log_likelihoods.sum())
         n_params = 4 * n_skills if not allow_forgetting else 5 * n_skills
         n_obs = np.sum(responses >= 0)
         aic = -2 * ll_final + 2 * n_params
@@ -667,11 +665,13 @@ class BKTGibbsSampler:
 class LongitudinalGibbsSampler:
     """Gibbs sampler for Longitudinal IRT with growth curves.
 
-    Samples:
-    1. Growth factors (η₀, η₁) given θ trajectories
-    2. Item parameters given responses and θ
-    3. Residual variance
+    Each sweep samples:
+    1. θ trajectories by one Metropolis-Hastings step from the current chain
+       state, with prior N(growth-curve prediction, residual variance)
+    2. Growth factors (η₀, η₁) given θ trajectories
+    3. Item parameters given responses and θ
     4. Population parameters
+    5. Residual variance
     """
 
     def __init__(
@@ -791,12 +791,16 @@ class LongitudinalGibbsSampler:
             "growth_mean": [],
             "growth_cov": [],
             "residual_variance": [],
-            "log_likelihood": [],
         }
 
         for iteration in range(self.n_iter):
             theta_trajectories = self._sample_theta(
-                responses, model, growth_factors, time_values, rng
+                responses,
+                model,
+                theta_trajectories,
+                growth_factors,
+                time_values,
+                rng,
             )
 
             growth_factors = self._sample_growth_factors(
@@ -818,9 +822,6 @@ class LongitudinalGibbsSampler:
                 chains["growth_mean"].append(model.growth_mean.copy())
                 chains["growth_cov"].append(model.growth_cov.copy())
                 chains["residual_variance"].append(model.residual_variance)
-
-                ll = self._compute_log_likelihood(responses, theta_trajectories, model)
-                chains["log_likelihood"].append(ll)
 
             if self.verbose and (iteration + 1) % 200 == 0:
                 ll = self._compute_log_likelihood(responses, theta_trajectories, model)
@@ -921,21 +922,21 @@ class LongitudinalGibbsSampler:
         self,
         responses: NDArray[np.int_],
         model: LongitudinalIRTModel,
+        theta_current: NDArray[np.float64],
         growth_factors: NDArray[np.float64],
         time_values: NDArray[np.float64],
         rng: np.random.Generator,
     ) -> NDArray[np.float64]:
-        """Sample theta trajectories using MH."""
-        theta_pred = model.compute_theta(growth_factors, time_values)
-        proposal_sd = 0.3
-        current = theta_pred.reshape(-1).copy()
-        proposed = np.empty_like(current)
-        log_uniform = np.empty_like(current)
+        """Advance every theta trajectory by one random-walk MH step.
 
-        # Keep proposal and acceptance draws interleaved for seeded compatibility.
-        for index, value in enumerate(current):
-            proposed[index] = value + rng.normal(0, proposal_sd)
-            log_uniform[index] = np.log(rng.random())
+        The chain state ``theta_current`` is the starting point and the
+        growth-curve prediction is the mean of the conditional prior
+        ``N(theta_pred, residual_variance)``.
+        """
+        theta_pred = model.compute_theta(growth_factors, time_values).reshape(-1)
+        current = np.asarray(theta_current, dtype=np.float64).reshape(-1)
+        proposed = current + rng.normal(0.0, 0.3, size=current.shape)
+        log_uniform = np.log(rng.random(current.shape))
 
         flat_responses = responses.reshape(-1, model.n_items)
         ll_current = _longitudinal_log_likelihood_rows(
@@ -948,14 +949,13 @@ class LongitudinalGibbsSampler:
             proposed,
             model,
         )
-        residual_sd = np.sqrt(model.residual_variance)
-        prior_current = stats.norm.logpdf(current, current, residual_sd)
-        prior_proposed = stats.norm.logpdf(proposed, current, residual_sd)
-        accepted = log_uniform < (
-            ll_proposed + prior_proposed - ll_current - prior_current
+        log_prior_ratio = (
+            -0.5
+            / model.residual_variance
+            * ((proposed - theta_pred) ** 2 - (current - theta_pred) ** 2)
         )
-        current[accepted] = proposed[accepted]
-        return current.reshape(theta_pred.shape)
+        accepted = log_uniform < ll_proposed - ll_current + log_prior_ratio
+        return np.where(accepted, proposed, current).reshape(theta_current.shape)
 
     def _sample_growth_factors(
         self,

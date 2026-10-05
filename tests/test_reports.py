@@ -223,15 +223,37 @@ class TestDIFAnalysisReport:
         data = simdata(n_persons=400, n_items=10)
         groups = np.array([0] * 200 + [1] * 200)
 
-        dif_results = compute_dif(data, groups, model="2PL", max_iter=50)
+        # Wald DIF needs two calibrations; the likelihood-ratio default refits
+        # a multiple-group model for every item.
+        dif_results = compute_dif(data, groups, model="2PL", method="wald", max_iter=50)
         report = DIFAnalysisReport(dif_results, data, groups)
         html = report.generate()
 
+        assert report.method == "wald"
         assert "<!DOCTYPE html>" in html
         assert "DIF" in html
         assert "Analysis Summary" in html
         assert "DIF Statistics" in html
         assert "ETS Classification" in html
+
+    def test_untested_anchor_items_are_plotted_and_listed(self):
+        """Regression: NaN anchor effect sizes broke the effect-size plot."""
+        from mirt.diagnostics import compute_dif
+        from mirt.reports import DIFAnalysisReport
+        from mirt.utils.simulation import simdata
+
+        np.random.seed(42)
+        data = simdata(n_persons=400, n_items=10)
+        groups = np.array([0] * 200 + [1] * 200)
+
+        dif_results = compute_dif(
+            data, groups, method="wald", anchors=[5, 6, 7, 8, 9], max_iter=50
+        )
+        html = DIFAnalysisReport(dif_results, data, groups).generate()
+
+        assert np.isnan(dif_results["effect_size"][5:]).all()
+        assert "DIF Effect Sizes" in html
+        assert "NA" in html
 
 
 @requires_matplotlib

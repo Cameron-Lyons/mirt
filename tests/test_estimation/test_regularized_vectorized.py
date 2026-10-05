@@ -216,7 +216,7 @@ def test_estimator_requires_boolean_adaptive_flag() -> None:
     [
         (np.array([[0.5, 1.0], [0.0, 1.0]]), "integer response codes"),
         (np.array([[2, 1], [0, 1]]), "binary responses"),
-        (np.array([[np.nan, 1.0], [0.0, 1.0]]), "finite response codes"),
+        (np.array([[np.inf, 1.0], [0.0, 1.0]]), "finite response codes"),
     ],
 )
 def test_fit_rejects_invalid_binary_responses(

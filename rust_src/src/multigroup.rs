@@ -1,78 +1,126 @@
 //! Multigroup IRT E-step computations.
+//!
+//! Each group's person-by-grid log-likelihoods come from the shared
+//! `cached_likelihoods` table, the same kernel the single-group likelihoods use,
+//! and the rows are then normalized in place into posterior weights.
 
-use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, ToPyArray};
+use numpy::ndarray::{Array2, ArrayView, ArrayView1, ArrayView2, Dimension};
+use numpy::{
+    Element, IntoPyArray, PyArray1, PyArray2, PyReadonlyArray, PyReadonlyArray1, PyReadonlyArray2,
+};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::sync::Arc;
 
-use crate::utils::{grm_category_probability, logsumexp, normalized_log_gaussian_adjustment};
+use crate::counts::binary_item_counts;
+use crate::likelihood::{log_2pl_row, log_3pl_row};
+use crate::likelihood_cache::{cached_likelihoods, normalize_log_posterior_rows};
+use crate::polytomous::{
+    adjacent_log_row, category_counts, grm_log_row, log_softmax_floor,
+    validate_category_parameters, validate_response_categories,
+};
+use crate::utils::{compute_log_weights, normalized_log_gaussian_adjustment};
 
-fn compute_log_prior(
-    quad_points: &[f64],
-    quad_weights: &[f64],
-    prior_mean: f64,
-    prior_var: f64,
-) -> Vec<f64> {
-    normalized_log_gaussian_adjustment(quad_points, quad_weights, prior_mean, prior_var)
+type GroupPosteriors<'py> = (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>);
+
+/// Borrow every per-group array as an ndarray view.
+fn views<'a, T: Element, D: Dimension>(
+    arrays: &'a [PyReadonlyArray<'_, T, D>],
+) -> Vec<ArrayView<'a, T, D>> {
+    arrays.iter().map(|array| array.as_array()).collect()
 }
 
-fn compute_log_quad_weights(quad_weights: &[f64]) -> Vec<f64> {
-    quad_weights.iter().map(|&w| (w + 1e-300).ln()).collect()
-}
-
-fn compute_posterior_from_log_joint(log_joint: &[f64]) -> (Vec<f64>, f64) {
-    let log_marginal = logsumexp(log_joint);
-    let posterior: Vec<f64> = log_joint
-        .iter()
-        .map(|&lj| (lj - log_marginal).exp())
-        .collect();
-    (posterior, log_marginal)
-}
-
-fn compute_log_likelihoods_2pl_single(
-    responses: &[i32],
-    n_items: usize,
-    quad_points: &[f64],
-    discrimination: &[f64],
-    difficulty: &[f64],
-    log_likes: &mut [f64],
-) {
-    for (q, &theta) in quad_points.iter().enumerate() {
-        let mut ll = 0.0;
-        for j in 0..n_items {
-            let resp = responses[j];
-            if resp >= 0 {
-                let z = discrimination[j] * (theta - difficulty[j]);
-                let p = 1.0 / (1.0 + (-z).exp());
-                let p_clamped = p.clamp(1e-10, 1.0 - 1e-10);
-                if resp == 1 {
-                    ll += p_clamped.ln();
-                } else {
-                    ll += (1.0 - p_clamped).ln();
-                }
-            }
-        }
-        log_likes[q] = ll;
+/// Require one entry per group in every per-group argument list.
+fn check_group_counts(n_groups: usize, lengths: &[usize]) -> PyResult<()> {
+    if lengths.iter().any(|&length| length != n_groups) {
+        return Err(PyValueError::new_err(
+            "every per-group argument needs one entry per response matrix",
+        ));
     }
+    Ok(())
 }
 
-/// Compute multigroup E-step for 2PL models
+/// Require one parameter per item in each group.
+fn check_item_vectors(
+    responses: &[ArrayView2<'_, i32>],
+    vectors: &[ArrayView1<'_, f64>],
+) -> PyResult<()> {
+    if responses
+        .iter()
+        .zip(vectors)
+        .any(|(responses, vector)| vector.len() != responses.ncols())
+    {
+        return Err(PyValueError::new_err(
+            "item parameter vectors need one entry per item",
+        ));
+    }
+    Ok(())
+}
+
+/// Posterior weights and summed marginal log-likelihood for every group.
 ///
-/// Processes all groups in parallel using Rayon.
+/// `log_likelihoods(g, points)` returns group `g`'s person-by-grid log-likelihood
+/// table on the quadrature points.
+/// The Gaussian prior of each group is applied as normalized quadrature mass.
+fn grouped_e_step<'py>(
+    py: Python<'py>,
+    quad_points: PyReadonlyArray1<f64>,
+    quad_weights: PyReadonlyArray1<f64>,
+    prior_means: PyReadonlyArray1<f64>,
+    prior_vars: PyReadonlyArray1<f64>,
+    n_groups: usize,
+    log_likelihoods: impl Fn(usize, &[f64]) -> Array2<f64> + Sync,
+) -> PyResult<GroupPosteriors<'py>> {
+    let quad_points = quad_points.as_array().to_vec();
+    let quad_weights = quad_weights.as_array().to_vec();
+    let prior_means = prior_means.as_array();
+    let prior_vars = prior_vars.as_array();
+    if quad_points.len() != quad_weights.len() {
+        return Err(PyValueError::new_err(
+            "quad_points and quad_weights must have the same length",
+        ));
+    }
+    check_group_counts(n_groups, &[prior_means.len(), prior_vars.len()])?;
+    if prior_means.iter().any(|mean| !mean.is_finite())
+        || prior_vars
+            .iter()
+            .any(|variance| !variance.is_finite() || *variance <= 0.0)
+    {
+        return Err(PyValueError::new_err(
+            "group prior means must be finite and variances finite and positive",
+        ));
+    }
+
+    let (posteriors, group_lls): (Vec<Array2<f64>>, Vec<f64>) = py.detach(|| {
+        let log_weights = compute_log_weights(&quad_weights);
+        (0..n_groups)
+            .map(|g| {
+                let log_prior = normalized_log_gaussian_adjustment(
+                    &quad_points,
+                    &quad_weights,
+                    prior_means[g],
+                    prior_vars[g],
+                );
+                let mut posterior = log_likelihoods(g, &quad_points);
+                let marginal =
+                    normalize_log_posterior_rows(&mut posterior, Some(&log_prior), &log_weights);
+                (posterior, marginal.iter().sum::<f64>())
+            })
+            .unzip()
+    });
+    Ok((
+        posteriors
+            .into_iter()
+            .map(|posterior| posterior.into_pyarray(py))
+            .collect(),
+        group_lls.into_pyarray(py),
+    ))
+}
+
+/// Compute the multigroup E-step for 2PL models.
 ///
-/// Parameters:
-/// - responses_list: List of response matrices, one per group (n_persons_g, n_items)
-/// - quad_points: Quadrature points (n_quad,)
-/// - quad_weights: Quadrature weights (n_quad,)
-/// - disc_list: List of discrimination arrays, one per group (n_items,)
-/// - diff_list: List of difficulty arrays, one per group (n_items,)
-/// - prior_means: Prior means per group (n_groups,)
-/// - prior_vars: Prior variances per group (n_groups,)
-///
-/// Returns:
-/// - posterior_weights: List of (n_persons_g, n_quad) arrays
-/// - group_log_likelihoods: (n_groups,) array
+/// Returns each group's `(n_persons_g, n_quad)` posterior weights and the
+/// `(n_groups,)` marginal log-likelihoods.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (responses_list, quad_points, quad_weights, disc_list, diff_list, prior_means, prior_vars))]
@@ -85,127 +133,37 @@ pub fn multigroup_e_step_2pl<'py>(
     diff_list: Vec<PyReadonlyArray1<f64>>,
     prior_means: PyReadonlyArray1<f64>,
     prior_vars: PyReadonlyArray1<f64>,
-) -> (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>) {
-    let quad_points = quad_points.as_array().to_vec();
-    let quad_weights = quad_weights.as_array().to_vec();
-    let prior_means = prior_means.as_array().to_vec();
-    let prior_vars = prior_vars.as_array().to_vec();
-    let n_quad = quad_points.len();
-    let _n_groups = responses_list.len();
-
-    let log_quad_weights = compute_log_quad_weights(&quad_weights);
-
-    let log_quad_weights_arc = Arc::new(log_quad_weights);
-    let quad_points_arc = Arc::new(quad_points.clone());
-
-    let group_n_persons: Vec<usize> = responses_list
-        .iter()
-        .map(|r| r.as_array().nrows())
-        .collect();
-    let n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(disc_list.iter())
-        .zip(diff_list.iter())
-        .enumerate()
-        .map(|(g, ((resp, disc), diff))| {
-            let resp_arr = resp.as_array();
-            let disc_arr = disc.as_array();
-            let diff_arr = diff.as_array();
-
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-
-            let resp_vec: Vec<Vec<i32>> =
-                (0..n_persons).map(|i| resp_arr.row(i).to_vec()).collect();
-
-            let disc_vec = Arc::new(disc_arr.to_vec());
-            let diff_vec = Arc::new(diff_arr.to_vec());
-            let log_prior = Arc::new(compute_log_prior(
-                &quad_points,
-                &quad_weights,
-                prior_means[g],
-                prior_vars[g],
-            ));
-
-            (g, n_items, resp_vec, disc_vec, diff_vec, log_prior)
-        })
-        .collect();
-
-    let all_persons: Vec<_> = group_data
-        .into_iter()
-        .flat_map(|(g, n_items, resp_vec, disc_vec, diff_vec, log_prior)| {
-            resp_vec.into_iter().enumerate().map(move |(i, resp)| {
-                (
-                    g,
-                    i,
-                    resp,
-                    n_items,
-                    Arc::clone(&disc_vec),
-                    Arc::clone(&diff_vec),
-                    Arc::clone(&log_prior),
-                )
-            })
-        })
-        .collect();
-
-    let log_qw = Arc::clone(&log_quad_weights_arc);
-    let qp = Arc::clone(&quad_points_arc);
-
-    let person_results: Vec<_> = all_persons
-        .into_par_iter()
-        .map(
-            |(g, person_idx, person_resp, n_items, disc_vec, diff_vec, log_prior)| {
-                let mut log_likes = vec![0.0; n_quad];
-                compute_log_likelihoods_2pl_single(
-                    &person_resp,
-                    n_items,
-                    &qp,
-                    &disc_vec,
-                    &diff_vec,
-                    &mut log_likes,
-                );
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| log_likes[q] + log_prior[q] + log_qw[q])
-                    .collect();
-
-                let (posterior, log_marginal) = compute_posterior_from_log_joint(&log_joint);
-                (g, person_idx, posterior, log_marginal)
-            },
-        )
-        .collect();
-
-    let mut group_posteriors: Vec<Array2<f64>> = group_n_persons
-        .iter()
-        .map(|&n| Array2::zeros((n, n_quad)))
-        .collect();
-    let mut group_lls: Vec<f64> = vec![0.0; n_groups];
-
-    for (g, person_idx, posterior, log_marginal) in person_results {
-        for (q, &p) in posterior.iter().enumerate() {
-            group_posteriors[g][[person_idx, q]] = p;
-        }
-        group_lls[g] += log_marginal;
-    }
-
-    let sorted_results: Vec<_> = (0..n_groups)
-        .map(|g| (g, group_posteriors[g].clone(), group_lls[g]))
-        .collect();
-
-    let posterior_weights_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, pw, _)| pw.clone().to_pyarray(py))
-        .collect();
-
-    let group_lls: Vec<f64> = sorted_results.iter().map(|(_, _, ll)| *ll).collect();
-    let group_lls_py = Array1::from_vec(group_lls).to_pyarray(py);
-
-    (posterior_weights_py, group_lls_py)
+) -> PyResult<GroupPosteriors<'py>> {
+    let responses = views(&responses_list);
+    let discrimination = views(&disc_list);
+    let difficulty = views(&diff_list);
+    check_group_counts(responses.len(), &[discrimination.len(), difficulty.len()])?;
+    check_item_vectors(&responses, &discrimination)?;
+    check_item_vectors(&responses, &difficulty)?;
+    grouped_e_step(
+        py,
+        quad_points,
+        quad_weights,
+        prior_means,
+        prior_vars,
+        responses.len(),
+        |g, points| {
+            let (a, b) = (&discrimination[g], &difficulty[g]);
+            let categories = vec![2; a.len()];
+            cached_likelihoods(
+                responses[g],
+                points.len(),
+                &categories,
+                true,
+                |q, j, row| {
+                    log_2pl_row(a[j] * (points[q] - b[j]), row);
+                },
+            )
+        },
+    )
 }
 
-/// Compute multigroup E-step for 3PL models
+/// Compute the multigroup E-step for 3PL models.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (responses_list, quad_points, quad_weights, disc_list, diff_list, guess_list, prior_means, prior_vars))]
@@ -219,259 +177,71 @@ pub fn multigroup_e_step_3pl<'py>(
     guess_list: Vec<PyReadonlyArray1<f64>>,
     prior_means: PyReadonlyArray1<f64>,
     prior_vars: PyReadonlyArray1<f64>,
-) -> (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>) {
-    let quad_points = quad_points.as_array().to_vec();
-    let quad_weights = quad_weights.as_array().to_vec();
-    let prior_means = prior_means.as_array().to_vec();
-    let prior_vars = prior_vars.as_array().to_vec();
-    let n_quad = quad_points.len();
-    let _n_groups = responses_list.len();
-
-    let log_quad_weights = compute_log_quad_weights(&quad_weights);
-
-    let log_quad_weights_arc = Arc::new(log_quad_weights);
-    let quad_points_arc = Arc::new(quad_points.clone());
-
-    let group_n_persons: Vec<usize> = responses_list
-        .iter()
-        .map(|r| r.as_array().nrows())
-        .collect();
-    let n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(disc_list.iter())
-        .zip(diff_list.iter())
-        .zip(guess_list.iter())
-        .enumerate()
-        .map(|(g, (((resp, disc), diff), guess))| {
-            let resp_arr = resp.as_array();
-            let disc_arr = disc.as_array();
-            let diff_arr = diff.as_array();
-            let guess_arr = guess.as_array();
-
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-
-            let resp_vec: Vec<Vec<i32>> =
-                (0..n_persons).map(|i| resp_arr.row(i).to_vec()).collect();
-
-            let disc_vec = Arc::new(disc_arr.to_vec());
-            let diff_vec = Arc::new(diff_arr.to_vec());
-            let guess_vec = Arc::new(guess_arr.to_vec());
-            let log_prior = Arc::new(compute_log_prior(
-                &quad_points,
-                &quad_weights,
-                prior_means[g],
-                prior_vars[g],
-            ));
-
-            (
-                g, n_items, resp_vec, disc_vec, diff_vec, guess_vec, log_prior,
+) -> PyResult<GroupPosteriors<'py>> {
+    let responses = views(&responses_list);
+    let discrimination = views(&disc_list);
+    let difficulty = views(&diff_list);
+    let guessing = views(&guess_list);
+    check_group_counts(
+        responses.len(),
+        &[discrimination.len(), difficulty.len(), guessing.len()],
+    )?;
+    check_item_vectors(&responses, &discrimination)?;
+    check_item_vectors(&responses, &difficulty)?;
+    check_item_vectors(&responses, &guessing)?;
+    grouped_e_step(
+        py,
+        quad_points,
+        quad_weights,
+        prior_means,
+        prior_vars,
+        responses.len(),
+        |g, points| {
+            let (a, b, c) = (&discrimination[g], &difficulty[g], &guessing[g]);
+            let categories = vec![2; a.len()];
+            cached_likelihoods(
+                responses[g],
+                points.len(),
+                &categories,
+                true,
+                |q, j, row| {
+                    log_3pl_row(a[j] * (points[q] - b[j]), c[j], row);
+                },
             )
-        })
-        .collect();
+        },
+    )
+}
 
-    let all_persons: Vec<_> = group_data
-        .into_iter()
-        .flat_map(
-            |(g, n_items, resp_vec, disc_vec, diff_vec, guess_vec, log_prior)| {
-                resp_vec.into_iter().enumerate().map(move |(i, resp)| {
-                    (
-                        g,
-                        i,
-                        resp,
-                        n_items,
-                        Arc::clone(&disc_vec),
-                        Arc::clone(&diff_vec),
-                        Arc::clone(&guess_vec),
-                        Arc::clone(&log_prior),
-                    )
-                })
-            },
-        )
-        .collect();
-
-    let log_qw = Arc::clone(&log_quad_weights_arc);
-    let qp = Arc::clone(&quad_points_arc);
-
-    let person_results: Vec<_> = all_persons
-        .into_par_iter()
-        .map(
-            |(g, person_idx, person_resp, n_items, disc_vec, diff_vec, guess_vec, log_prior)| {
-                let mut log_likes = vec![0.0; n_quad];
-
-                for (q, &theta) in qp.iter().enumerate() {
-                    let mut ll = 0.0;
-                    for j in 0..n_items {
-                        let resp = person_resp[j];
-                        if resp >= 0 {
-                            let z = disc_vec[j] * (theta - diff_vec[j]);
-                            let p_star = 1.0 / (1.0 + (-z).exp());
-                            let p = guess_vec[j] + (1.0 - guess_vec[j]) * p_star;
-                            let p_clamped = p.clamp(1e-10, 1.0 - 1e-10);
-                            if resp == 1 {
-                                ll += p_clamped.ln();
-                            } else {
-                                ll += (1.0 - p_clamped).ln();
-                            }
-                        }
-                    }
-                    log_likes[q] = ll;
-                }
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| log_likes[q] + log_prior[q] + log_qw[q])
-                    .collect();
-
-                let (posterior, log_marginal) = compute_posterior_from_log_joint(&log_joint);
-                (g, person_idx, posterior, log_marginal)
-            },
-        )
-        .collect();
-
-    let mut group_posteriors: Vec<Array2<f64>> = group_n_persons
-        .iter()
-        .map(|&n| Array2::zeros((n, n_quad)))
-        .collect();
-    let mut group_lls: Vec<f64> = vec![0.0; n_groups];
-
-    for (g, person_idx, posterior, log_marginal) in person_results {
-        for (q, &p) in posterior.iter().enumerate() {
-            group_posteriors[g][[person_idx, q]] = p;
+/// Validated category counts of every group, one per item.
+fn group_categories(
+    responses: &[ArrayView2<'_, i32>],
+    n_categories_list: Vec<PyReadonlyArray1<i32>>,
+    parameters: &[&[ArrayView2<'_, f64>]],
+    n_parameters: impl Fn(usize) -> usize,
+    includes_zero: bool,
+) -> PyResult<Vec<Vec<usize>>> {
+    let categories: Vec<Vec<usize>> = n_categories_list.into_iter().map(category_counts).collect();
+    let mut lengths = vec![categories.len()];
+    lengths.extend(parameters.iter().map(|list| list.len()));
+    check_group_counts(responses.len(), &lengths)?;
+    for (g, (responses, categories)) in responses.iter().zip(&categories).enumerate() {
+        for list in parameters {
+            validate_category_parameters(
+                responses.ncols(),
+                categories,
+                n_parameters(g),
+                list[g],
+                includes_zero,
+            )?;
         }
-        group_lls[g] += log_marginal;
+        validate_response_categories(*responses, categories)?;
     }
-
-    let sorted_results: Vec<_> = (0..n_groups)
-        .map(|g| (g, group_posteriors[g].clone(), group_lls[g]))
-        .collect();
-
-    let posterior_weights_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, pw, _)| pw.clone().to_pyarray(py))
-        .collect();
-
-    let group_lls: Vec<f64> = sorted_results.iter().map(|(_, _, ll)| *ll).collect();
-    let group_lls_py = Array1::from_vec(group_lls).to_pyarray(py);
-
-    (posterior_weights_py, group_lls_py)
+    Ok(categories)
 }
 
-/// Compute expected counts for all groups in parallel (for M-step)
+/// Compute the multigroup E-step for GRM models.
 ///
-/// Returns r_k (expected correct) and n_k (expected total) per group per item
-#[allow(clippy::type_complexity)]
-#[pyfunction]
-#[pyo3(signature = (responses_list, posterior_weights_list))]
-pub fn multigroup_expected_counts<'py>(
-    py: Python<'py>,
-    responses_list: Vec<PyReadonlyArray2<i32>>,
-    posterior_weights_list: Vec<PyReadonlyArray2<f64>>,
-) -> (
-    Vec<Bound<'py, PyArray2<f64>>>,
-    Vec<Bound<'py, PyArray2<f64>>>,
-) {
-    let _n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(posterior_weights_list.iter())
-        .enumerate()
-        .map(|(g, (resp, weights))| {
-            let resp_arr = resp.as_array();
-            let weights_arr = weights.as_array();
-            (g, resp_arr.to_owned(), weights_arr.to_owned())
-        })
-        .collect();
-
-    let results: Vec<_> = group_data
-        .into_par_iter()
-        .map(|(g, resp_arr, weights_arr)| {
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-            let n_quad = weights_arr.ncols();
-
-            let mut r_k_all = Array2::zeros((n_items, n_quad));
-            let mut n_k_all = Array2::zeros((n_items, n_quad));
-
-            for j in 0..n_items {
-                for i in 0..n_persons {
-                    let resp = resp_arr[[i, j]];
-                    if resp >= 0 {
-                        for q in 0..n_quad {
-                            let w = weights_arr[[i, q]];
-                            n_k_all[[j, q]] += w;
-                            if resp == 1 {
-                                r_k_all[[j, q]] += w;
-                            }
-                        }
-                    }
-                }
-            }
-
-            (g, r_k_all, n_k_all)
-        })
-        .collect();
-
-    let mut sorted_results = results;
-    sorted_results.sort_by_key(|(g, _, _)| *g);
-
-    let r_k_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, r_k, _)| r_k.clone().to_pyarray(py))
-        .collect();
-
-    let n_k_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, _, n_k)| n_k.clone().to_pyarray(py))
-        .collect();
-
-    (r_k_py, n_k_py)
-}
-
-fn compute_grm_log_likelihood_single(
-    responses: &[i32],
-    n_items: usize,
-    theta: f64,
-    discrimination: &[f64],
-    thresholds: &[Vec<f64>],
-    n_categories: &[usize],
-) -> f64 {
-    let mut ll = 0.0;
-    for j in 0..n_items {
-        let resp = responses[j];
-        if resp >= 0 {
-            let prob = grm_category_probability(
-                theta,
-                discrimination[j],
-                &thresholds[j],
-                resp as usize,
-                n_categories[j],
-            );
-            ll += prob.ln();
-        }
-    }
-    ll
-}
-
-/// Compute multigroup E-step for GRM models
-///
-/// Processes all groups in parallel using Rayon.
-///
-/// Parameters:
-/// - responses_list: List of response matrices, one per group (n_persons_g, n_items)
-/// - quad_points: Quadrature points (n_quad,)
-/// - quad_weights: Quadrature weights (n_quad,)
-/// - disc_list: List of discrimination arrays, one per group (n_items,)
-/// - thresh_list: List of threshold matrices, one per group (n_items, max_categories-1)
-/// - n_categories_list: List of n_categories arrays, one per group (n_items,)
-/// - prior_means: Prior means per group (n_groups,)
-/// - prior_vars: Prior variances per group (n_groups,)
-///
-/// Returns:
-/// - posterior_weights: List of (n_persons_g, n_quad) arrays
-/// - group_log_likelihoods: (n_groups,) array
+/// `thresh_list` holds `(n_items, max_categories - 1)` threshold matrices.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (responses_list, quad_points, quad_weights, disc_list, thresh_list, n_categories_list, prior_means, prior_vars))]
@@ -485,244 +255,48 @@ pub fn multigroup_e_step_grm<'py>(
     n_categories_list: Vec<PyReadonlyArray1<i32>>,
     prior_means: PyReadonlyArray1<f64>,
     prior_vars: PyReadonlyArray1<f64>,
-) -> (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>) {
-    let quad_points = quad_points.as_array().to_vec();
-    let quad_weights = quad_weights.as_array().to_vec();
-    let prior_means = prior_means.as_array().to_vec();
-    let prior_vars = prior_vars.as_array().to_vec();
-    let n_quad = quad_points.len();
-    let _n_groups = responses_list.len();
-
-    let log_quad_weights = compute_log_quad_weights(&quad_weights);
-
-    let log_quad_weights_arc = Arc::new(log_quad_weights);
-    let quad_points_arc = Arc::new(quad_points.clone());
-
-    let group_n_persons: Vec<usize> = responses_list
+) -> PyResult<GroupPosteriors<'py>> {
+    let responses = views(&responses_list);
+    let discrimination = views(&disc_list);
+    let thresholds = views(&thresh_list);
+    check_group_counts(responses.len(), &[discrimination.len()])?;
+    let categories = group_categories(
+        &responses,
+        n_categories_list,
+        &[thresholds.as_slice()],
+        |g| discrimination[g].len(),
+        false,
+    )?;
+    let thresholds: Vec<Vec<Vec<f64>>> = thresholds
         .iter()
-        .map(|r| r.as_array().nrows())
+        .map(|matrix| matrix.rows().into_iter().map(|row| row.to_vec()).collect())
         .collect();
-    let n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(disc_list.iter())
-        .zip(thresh_list.iter())
-        .zip(n_categories_list.iter())
-        .enumerate()
-        .map(|(g, (((resp, disc), thresh), n_cats))| {
-            let resp_arr = resp.as_array();
-            let disc_arr = disc.as_array();
-            let thresh_arr = thresh.as_array();
-            let n_cats_arr = n_cats.as_array();
-
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-
-            let resp_vec: Vec<Vec<i32>> =
-                (0..n_persons).map(|i| resp_arr.row(i).to_vec()).collect();
-
-            let disc_vec = Arc::new(disc_arr.to_vec());
-            let n_cats_vec: Vec<usize> = n_cats_arr.iter().map(|&x| x as usize).collect();
-
-            let thresh_vecs: Vec<Vec<f64>> = (0..n_items)
-                .map(|j| {
-                    let n_thresh = n_cats_vec[j] - 1;
-                    (0..n_thresh).map(|k| thresh_arr[[j, k]]).collect()
-                })
-                .collect();
-
-            let thresh_vecs_arc = Arc::new(thresh_vecs);
-            let n_cats_vec_arc = Arc::new(n_cats_vec);
-            let log_prior = Arc::new(compute_log_prior(
-                &quad_points,
-                &quad_weights,
-                prior_means[g],
-                prior_vars[g],
-            ));
-
-            (
-                g,
-                n_items,
-                resp_vec,
-                disc_vec,
-                thresh_vecs_arc,
-                n_cats_vec_arc,
-                log_prior,
+    grouped_e_step(
+        py,
+        quad_points,
+        quad_weights,
+        prior_means,
+        prior_vars,
+        responses.len(),
+        |g, points| {
+            let (a, b) = (&discrimination[g], &thresholds[g]);
+            cached_likelihoods(
+                responses[g],
+                points.len(),
+                &categories[g],
+                false,
+                |q, j, row| {
+                    grm_log_row(points[q], a[j], &b[j], row);
+                },
             )
-        })
-        .collect();
-
-    let all_persons: Vec<_> = group_data
-        .into_iter()
-        .flat_map(
-            |(g, n_items, resp_vec, disc_vec, thresh_vecs, n_cats_vec, log_prior)| {
-                resp_vec.into_iter().enumerate().map(move |(i, resp)| {
-                    (
-                        g,
-                        i,
-                        resp,
-                        n_items,
-                        Arc::clone(&disc_vec),
-                        Arc::clone(&thresh_vecs),
-                        Arc::clone(&n_cats_vec),
-                        Arc::clone(&log_prior),
-                    )
-                })
-            },
-        )
-        .collect();
-
-    let log_qw = Arc::clone(&log_quad_weights_arc);
-    let qp = Arc::clone(&quad_points_arc);
-
-    let person_results: Vec<_> = all_persons
-        .into_par_iter()
-        .map(
-            |(
-                g,
-                person_idx,
-                person_resp,
-                n_items,
-                disc_vec,
-                thresh_vecs,
-                n_cats_vec,
-                log_prior,
-            )| {
-                let log_likes: Vec<f64> = qp
-                    .iter()
-                    .map(|&theta| {
-                        compute_grm_log_likelihood_single(
-                            &person_resp,
-                            n_items,
-                            theta,
-                            &disc_vec,
-                            &thresh_vecs,
-                            &n_cats_vec,
-                        )
-                    })
-                    .collect();
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| log_likes[q] + log_prior[q] + log_qw[q])
-                    .collect();
-
-                let (posterior, log_marginal) = compute_posterior_from_log_joint(&log_joint);
-                (g, person_idx, posterior, log_marginal)
-            },
-        )
-        .collect();
-
-    let mut group_posteriors: Vec<Array2<f64>> = group_n_persons
-        .iter()
-        .map(|&n| Array2::zeros((n, n_quad)))
-        .collect();
-    let mut group_lls: Vec<f64> = vec![0.0; n_groups];
-
-    for (g, person_idx, posterior, log_marginal) in person_results {
-        for (q, &p) in posterior.iter().enumerate() {
-            group_posteriors[g][[person_idx, q]] = p;
-        }
-        group_lls[g] += log_marginal;
-    }
-
-    let sorted_results: Vec<_> = (0..n_groups)
-        .map(|g| (g, group_posteriors[g].clone(), group_lls[g]))
-        .collect();
-
-    let posterior_weights_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, pw, _)| pw.clone().to_pyarray(py))
-        .collect();
-
-    let group_lls: Vec<f64> = sorted_results.iter().map(|(_, _, ll)| *ll).collect();
-    let group_lls_py = Array1::from_vec(group_lls).to_pyarray(py);
-
-    (posterior_weights_py, group_lls_py)
+        },
+    )
 }
 
-fn compute_gpcm_log_likelihood_single(
-    responses: &[i32],
-    n_items: usize,
-    theta: f64,
-    discrimination: &[f64],
-    steps: &[Vec<f64>],
-    n_categories: &[usize],
-) -> f64 {
-    let mut ll = 0.0;
-    for j in 0..n_items {
-        let resp = responses[j];
-        if resp < 0 {
-            continue;
-        }
-
-        let a = discrimination[j];
-        let n_cat = n_categories[j];
-
-        let mut numerators = vec![0.0; n_cat];
-        for k in 1..n_cat {
-            numerators[k] = numerators[k - 1] + a * (theta - steps[j][k]);
-        }
-
-        let max_num = numerators.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let sum_exp: f64 = numerators.iter().map(|&x| (x - max_num).exp()).sum();
-        let log_denom = max_num + sum_exp.ln();
-
-        let prob = (numerators[resp as usize] - log_denom).exp().max(1e-10);
-        ll += prob.ln();
-    }
-    ll
-}
-
-fn compute_nrm_log_likelihood_single(
-    responses: &[i32],
-    n_items: usize,
-    theta: f64,
-    slopes: &[Vec<f64>],
-    intercepts: &[Vec<f64>],
-    n_categories: &[usize],
-) -> f64 {
-    let mut ll = 0.0;
-    for j in 0..n_items {
-        let resp = responses[j];
-        if resp < 0 {
-            continue;
-        }
-
-        let n_cat = n_categories[j];
-
-        let mut logits = vec![0.0; n_cat];
-        for k in 0..n_cat {
-            logits[k] = slopes[j][k] * theta + intercepts[j][k];
-        }
-
-        let max_logit = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let sum_exp: f64 = logits.iter().map(|&x| (x - max_logit).exp()).sum();
-        let log_denom = max_logit + sum_exp.ln();
-
-        let prob = (logits[resp as usize] - log_denom).exp().max(1e-10);
-        ll += prob.ln();
-    }
-    ll
-}
-
-/// Compute multigroup E-step for GPCM models
+/// Compute the multigroup E-step for GPCM and PCM models.
 ///
-/// Processes all groups in parallel using Rayon.
-///
-/// Parameters:
-/// - responses_list: List of response matrices, one per group (n_persons_g, n_items)
-/// - quad_points: Quadrature points (n_quad,)
-/// - quad_weights: Quadrature weights (n_quad,)
-/// - disc_list: List of discrimination arrays, one per group (n_items,)
-/// - steps_list: List of step matrices, one per group (n_items, max_categories)
-/// - n_categories_list: List of n_categories arrays, one per group (n_items,)
-/// - prior_means: Prior means per group (n_groups,)
-/// - prior_vars: Prior variances per group (n_groups,)
-///
-/// Returns:
-/// - posterior_weights: List of (n_persons_g, n_quad) arrays
-/// - group_log_likelihoods: (n_groups,) array
+/// `steps_list` holds `(n_items, max_categories)` step matrices whose column 0
+/// belongs to category 0 and is ignored.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (responses_list, quad_points, quad_weights, disc_list, steps_list, n_categories_list, prior_means, prior_vars))]
@@ -736,170 +310,44 @@ pub fn multigroup_e_step_gpcm<'py>(
     n_categories_list: Vec<PyReadonlyArray1<i32>>,
     prior_means: PyReadonlyArray1<f64>,
     prior_vars: PyReadonlyArray1<f64>,
-) -> (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>) {
-    let quad_points = quad_points.as_array().to_vec();
-    let quad_weights = quad_weights.as_array().to_vec();
-    let prior_means = prior_means.as_array().to_vec();
-    let prior_vars = prior_vars.as_array().to_vec();
-    let n_quad = quad_points.len();
-    let _n_groups = responses_list.len();
-
-    let log_quad_weights = compute_log_quad_weights(&quad_weights);
-
-    let log_quad_weights_arc = Arc::new(log_quad_weights);
-    let quad_points_arc = Arc::new(quad_points.clone());
-
-    let group_n_persons: Vec<usize> = responses_list
-        .iter()
-        .map(|r| r.as_array().nrows())
-        .collect();
-    let n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(disc_list.iter())
-        .zip(steps_list.iter())
-        .zip(n_categories_list.iter())
-        .enumerate()
-        .map(|(g, (((resp, disc), steps), n_cats))| {
-            let resp_arr = resp.as_array();
-            let disc_arr = disc.as_array();
-            let steps_arr = steps.as_array();
-            let n_cats_arr = n_cats.as_array();
-
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-
-            let resp_vec: Vec<Vec<i32>> =
-                (0..n_persons).map(|i| resp_arr.row(i).to_vec()).collect();
-
-            let disc_vec = Arc::new(disc_arr.to_vec());
-            let n_cats_vec: Vec<usize> = n_cats_arr.iter().map(|&x| x as usize).collect();
-
-            let steps_vecs: Vec<Vec<f64>> = (0..n_items)
-                .map(|j| {
-                    let n_cat = n_cats_vec[j];
-                    (0..n_cat).map(|k| steps_arr[[j, k]]).collect()
-                })
-                .collect();
-
-            let steps_vecs_arc = Arc::new(steps_vecs);
-            let n_cats_vec_arc = Arc::new(n_cats_vec);
-            let log_prior = Arc::new(compute_log_prior(
-                &quad_points,
-                &quad_weights,
-                prior_means[g],
-                prior_vars[g],
-            ));
-
-            (
-                g,
-                n_items,
-                resp_vec,
-                disc_vec,
-                steps_vecs_arc,
-                n_cats_vec_arc,
-                log_prior,
+) -> PyResult<GroupPosteriors<'py>> {
+    let responses = views(&responses_list);
+    let discrimination = views(&disc_list);
+    let steps = views(&steps_list);
+    check_group_counts(responses.len(), &[discrimination.len()])?;
+    let categories = group_categories(
+        &responses,
+        n_categories_list,
+        &[steps.as_slice()],
+        |g| discrimination[g].len(),
+        true,
+    )?;
+    grouped_e_step(
+        py,
+        quad_points,
+        quad_weights,
+        prior_means,
+        prior_vars,
+        responses.len(),
+        |g, points| {
+            let (a, steps) = (&discrimination[g], &steps[g]);
+            cached_likelihoods(
+                responses[g],
+                points.len(),
+                &categories[g],
+                false,
+                |q, j, row| {
+                    adjacent_log_row(row, |k| a[j] * (points[q] - steps[[j, k]]));
+                },
             )
-        })
-        .collect();
-
-    let all_persons: Vec<_> = group_data
-        .into_iter()
-        .flat_map(
-            |(g, n_items, resp_vec, disc_vec, steps_vecs, n_cats_vec, log_prior)| {
-                resp_vec.into_iter().enumerate().map(move |(i, resp)| {
-                    (
-                        g,
-                        i,
-                        resp,
-                        n_items,
-                        Arc::clone(&disc_vec),
-                        Arc::clone(&steps_vecs),
-                        Arc::clone(&n_cats_vec),
-                        Arc::clone(&log_prior),
-                    )
-                })
-            },
-        )
-        .collect();
-
-    let log_qw = Arc::clone(&log_quad_weights_arc);
-    let qp = Arc::clone(&quad_points_arc);
-
-    let person_results: Vec<_> = all_persons
-        .into_par_iter()
-        .map(
-            |(g, person_idx, person_resp, n_items, disc_vec, steps_vecs, n_cats_vec, log_prior)| {
-                let log_likes: Vec<f64> = qp
-                    .iter()
-                    .map(|&theta| {
-                        compute_gpcm_log_likelihood_single(
-                            &person_resp,
-                            n_items,
-                            theta,
-                            &disc_vec,
-                            &steps_vecs,
-                            &n_cats_vec,
-                        )
-                    })
-                    .collect();
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| log_likes[q] + log_prior[q] + log_qw[q])
-                    .collect();
-
-                let (posterior, log_marginal) = compute_posterior_from_log_joint(&log_joint);
-                (g, person_idx, posterior, log_marginal)
-            },
-        )
-        .collect();
-
-    let mut group_posteriors: Vec<Array2<f64>> = group_n_persons
-        .iter()
-        .map(|&n| Array2::zeros((n, n_quad)))
-        .collect();
-    let mut group_lls: Vec<f64> = vec![0.0; n_groups];
-
-    for (g, person_idx, posterior, log_marginal) in person_results {
-        for (q, &p) in posterior.iter().enumerate() {
-            group_posteriors[g][[person_idx, q]] = p;
-        }
-        group_lls[g] += log_marginal;
-    }
-
-    let sorted_results: Vec<_> = (0..n_groups)
-        .map(|g| (g, group_posteriors[g].clone(), group_lls[g]))
-        .collect();
-
-    let posterior_weights_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, pw, _)| pw.clone().to_pyarray(py))
-        .collect();
-
-    let group_lls: Vec<f64> = sorted_results.iter().map(|(_, _, ll)| *ll).collect();
-    let group_lls_py = Array1::from_vec(group_lls).to_pyarray(py);
-
-    (posterior_weights_py, group_lls_py)
+        },
+    )
 }
 
-/// Compute multigroup E-step for NRM models
+/// Compute the multigroup E-step for nominal response models.
 ///
-/// Processes all groups in parallel using Rayon.
-///
-/// Parameters:
-/// - responses_list: List of response matrices, one per group (n_persons_g, n_items)
-/// - quad_points: Quadrature points (n_quad,)
-/// - quad_weights: Quadrature weights (n_quad,)
-/// - slopes_list: List of slope matrices, one per group (n_items, max_categories)
-/// - intercepts_list: List of intercept matrices, one per group (n_items, max_categories)
-/// - n_categories_list: List of n_categories arrays, one per group (n_items,)
-/// - prior_means: Prior means per group (n_groups,)
-/// - prior_vars: Prior variances per group (n_groups,)
-///
-/// Returns:
-/// - posterior_weights: List of (n_persons_g, n_quad) arrays
-/// - group_log_likelihoods: (n_groups,) array
+/// Category `k` of item `j` has logit `slopes[j, k] * theta + intercepts[j, k]`;
+/// both matrices are `(n_items, max_categories)`.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (responses_list, quad_points, quad_weights, slopes_list, intercepts_list, n_categories_list, prior_means, prior_vars))]
@@ -913,167 +361,94 @@ pub fn multigroup_e_step_nrm<'py>(
     n_categories_list: Vec<PyReadonlyArray1<i32>>,
     prior_means: PyReadonlyArray1<f64>,
     prior_vars: PyReadonlyArray1<f64>,
-) -> (Vec<Bound<'py, PyArray2<f64>>>, Bound<'py, PyArray1<f64>>) {
-    let quad_points = quad_points.as_array().to_vec();
-    let quad_weights = quad_weights.as_array().to_vec();
-    let prior_means = prior_means.as_array().to_vec();
-    let prior_vars = prior_vars.as_array().to_vec();
-    let n_quad = quad_points.len();
-    let _n_groups = responses_list.len();
-
-    let log_quad_weights = compute_log_quad_weights(&quad_weights);
-
-    let log_quad_weights_arc = Arc::new(log_quad_weights);
-    let quad_points_arc = Arc::new(quad_points.clone());
-
-    let group_n_persons: Vec<usize> = responses_list
-        .iter()
-        .map(|r| r.as_array().nrows())
-        .collect();
-    let n_groups = responses_list.len();
-
-    let group_data: Vec<_> = responses_list
-        .iter()
-        .zip(slopes_list.iter())
-        .zip(intercepts_list.iter())
-        .zip(n_categories_list.iter())
-        .enumerate()
-        .map(|(g, (((resp, slopes), intercepts), n_cats))| {
-            let resp_arr = resp.as_array();
-            let slopes_arr = slopes.as_array();
-            let intercepts_arr = intercepts.as_array();
-            let n_cats_arr = n_cats.as_array();
-
-            let n_persons = resp_arr.nrows();
-            let n_items = resp_arr.ncols();
-
-            let resp_vec: Vec<Vec<i32>> =
-                (0..n_persons).map(|i| resp_arr.row(i).to_vec()).collect();
-
-            let n_cats_vec: Vec<usize> = n_cats_arr.iter().map(|&x| x as usize).collect();
-
-            let slopes_vecs: Vec<Vec<f64>> = (0..n_items)
-                .map(|j| {
-                    let n_cat = n_cats_vec[j];
-                    (0..n_cat).map(|k| slopes_arr[[j, k]]).collect()
-                })
-                .collect();
-
-            let intercepts_vecs: Vec<Vec<f64>> = (0..n_items)
-                .map(|j| {
-                    let n_cat = n_cats_vec[j];
-                    (0..n_cat).map(|k| intercepts_arr[[j, k]]).collect()
-                })
-                .collect();
-
-            let slopes_vecs_arc = Arc::new(slopes_vecs);
-            let intercepts_vecs_arc = Arc::new(intercepts_vecs);
-            let n_cats_vec_arc = Arc::new(n_cats_vec);
-            let log_prior = Arc::new(compute_log_prior(
-                &quad_points,
-                &quad_weights,
-                prior_means[g],
-                prior_vars[g],
-            ));
-
-            (
-                g,
-                n_items,
-                resp_vec,
-                slopes_vecs_arc,
-                intercepts_vecs_arc,
-                n_cats_vec_arc,
-                log_prior,
+) -> PyResult<GroupPosteriors<'py>> {
+    let responses = views(&responses_list);
+    let slopes = views(&slopes_list);
+    let intercepts = views(&intercepts_list);
+    let categories = group_categories(
+        &responses,
+        n_categories_list,
+        &[slopes.as_slice(), intercepts.as_slice()],
+        |g| responses[g].ncols(),
+        true,
+    )?;
+    grouped_e_step(
+        py,
+        quad_points,
+        quad_weights,
+        prior_means,
+        prior_vars,
+        responses.len(),
+        |g, points| {
+            let (slopes, intercepts) = (&slopes[g], &intercepts[g]);
+            cached_likelihoods(
+                responses[g],
+                points.len(),
+                &categories[g],
+                false,
+                |q, j, row| {
+                    for (k, value) in row.iter_mut().enumerate() {
+                        *value = slopes[[j, k]] * points[q] + intercepts[[j, k]];
+                    }
+                    log_softmax_floor(row);
+                },
             )
-        })
-        .collect();
+        },
+    )
+}
 
-    let all_persons: Vec<_> = group_data
-        .into_iter()
-        .flat_map(
-            |(g, n_items, resp_vec, slopes_vecs, intercepts_vecs, n_cats_vec, log_prior)| {
-                resp_vec.into_iter().enumerate().map(move |(i, resp)| {
-                    (
-                        g,
-                        i,
-                        resp,
-                        n_items,
-                        Arc::clone(&slopes_vecs),
-                        Arc::clone(&intercepts_vecs),
-                        Arc::clone(&n_cats_vec),
-                        Arc::clone(&log_prior),
-                    )
-                })
-            },
-        )
-        .collect();
-
-    let log_qw = Arc::clone(&log_quad_weights_arc);
-    let qp = Arc::clone(&quad_points_arc);
-
-    let person_results: Vec<_> = all_persons
-        .into_par_iter()
-        .map(
-            |(
-                g,
-                person_idx,
-                person_resp,
-                n_items,
-                slopes_vecs,
-                intercepts_vecs,
-                n_cats_vec,
-                log_prior,
-            )| {
-                let log_likes: Vec<f64> = qp
-                    .iter()
-                    .map(|&theta| {
-                        compute_nrm_log_likelihood_single(
-                            &person_resp,
-                            n_items,
-                            theta,
-                            &slopes_vecs,
-                            &intercepts_vecs,
-                            &n_cats_vec,
-                        )
-                    })
-                    .collect();
-
-                let log_joint: Vec<f64> = (0..n_quad)
-                    .map(|q| log_likes[q] + log_prior[q] + log_qw[q])
-                    .collect();
-
-                let (posterior, log_marginal) = compute_posterior_from_log_joint(&log_joint);
-                (g, person_idx, posterior, log_marginal)
-            },
-        )
-        .collect();
-
-    let mut group_posteriors: Vec<Array2<f64>> = group_n_persons
+/// Compute expected dichotomous counts for every group (for the M-step).
+///
+/// Returns per-group `(n_items, n_quad)` matrices of expected correct (`r_k`)
+/// and expected observed (`n_k`) responses.
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+#[pyo3(signature = (responses_list, posterior_weights_list))]
+pub fn multigroup_expected_counts<'py>(
+    py: Python<'py>,
+    responses_list: Vec<PyReadonlyArray2<i32>>,
+    posterior_weights_list: Vec<PyReadonlyArray2<f64>>,
+) -> PyResult<(
+    Vec<Bound<'py, PyArray2<f64>>>,
+    Vec<Bound<'py, PyArray2<f64>>>,
+)> {
+    let responses = views(&responses_list);
+    let posteriors = views(&posterior_weights_list);
+    check_group_counts(responses.len(), &[posteriors.len()])?;
+    if responses
         .iter()
-        .map(|&n| Array2::zeros((n, n_quad)))
-        .collect();
-    let mut group_lls: Vec<f64> = vec![0.0; n_groups];
-
-    for (g, person_idx, posterior, log_marginal) in person_results {
-        for (q, &p) in posterior.iter().enumerate() {
-            group_posteriors[g][[person_idx, q]] = p;
-        }
-        group_lls[g] += log_marginal;
+        .zip(&posteriors)
+        .any(|(responses, posterior)| responses.nrows() != posterior.nrows())
+    {
+        return Err(PyValueError::new_err(
+            "each posterior needs one row per response row",
+        ));
     }
 
-    let sorted_results: Vec<_> = (0..n_groups)
-        .map(|g| (g, group_posteriors[g].clone(), group_lls[g]))
-        .collect();
-
-    let posterior_weights_py: Vec<_> = sorted_results
-        .iter()
-        .map(|(_, pw, _)| pw.clone().to_pyarray(py))
-        .collect();
-
-    let group_lls: Vec<f64> = sorted_results.iter().map(|(_, _, ll)| *ll).collect();
-    let group_lls_py = Array1::from_vec(group_lls).to_pyarray(py);
-
-    (posterior_weights_py, group_lls_py)
+    let counts: Vec<(Array2<f64>, Array2<f64>)> = py.detach(|| {
+        responses
+            .iter()
+            .zip(&posteriors)
+            .map(|(&responses, posterior)| {
+                let posterior = posterior.as_standard_layout();
+                let rows = posterior.as_slice().expect("standard layout posterior");
+                let (n_items, n_quad) = (responses.ncols(), posterior.ncols());
+                let (r_k, n_k): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (0..n_items)
+                    .into_par_iter()
+                    .map(|j| binary_item_counts(responses, rows, n_quad, j, None))
+                    .unzip();
+                let matrix = |rows: Vec<Vec<f64>>| {
+                    Array2::from_shape_vec((n_items, n_quad), rows.concat())
+                        .expect("one count row per item")
+                };
+                (matrix(r_k), matrix(n_k))
+            })
+            .collect()
+    });
+    Ok(counts
+        .into_iter()
+        .map(|(r_k, n_k)| (r_k.into_pyarray(py), n_k.into_pyarray(py)))
+        .unzip())
 }
 
 /// Register multigroup functions with the Python module

@@ -7,20 +7,24 @@ that ideal point.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from numbers import Integral
 from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    item_category_table,
+)
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
+from mirt.models.polytomous import _category_count_chunks
 
 _SATURATED_LOGIT = 750.0
 _LOG_MAX_FLOAT = float(np.log(np.finfo(np.float64).max))
-_MAX_GGUM_PROBABILITY_CHUNK_ENTRIES = 1_000_000
 
 
 def _ggum_subjective_thresholds(
@@ -35,23 +39,6 @@ def _ggum_subjective_thresholds(
         ),
         axis=-1,
     )
-
-
-def _ggum_category_chunks(
-    category_counts: list[int],
-    n_persons: int,
-) -> Iterator[tuple[int, NDArray[np.intp]]]:
-    """Group equal-width GGUM items into bounded probability chunks."""
-    counts = np.asarray(category_counts, dtype=np.intp)
-    for n_categories in np.unique(counts):
-        item_indices = np.flatnonzero(counts == n_categories)
-        chunk_size = max(
-            1,
-            _MAX_GGUM_PROBABILITY_CHUNK_ENTRIES
-            // max(1, n_persons * int(n_categories)),
-        )
-        for start in range(0, item_indices.size, chunk_size):
-            yield int(n_categories), item_indices[start : start + chunk_size]
 
 
 def _saturate_logit(values: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -279,10 +266,8 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         masks = {
             "discrimination": np.ones(self.n_items, dtype=np.bool_),
             "location": np.ones(self.n_items, dtype=np.bool_),
-            "thresholds": np.zeros(self.thresholds.shape, dtype=np.bool_),
+            "thresholds": self._category_columns(self.thresholds.shape[1], 1),
         }
-        for item, categories in enumerate(self._n_categories):
-            masks["thresholds"][item, : categories - 1] = True
         return self._apply_free_parameter_restrictions(masks)
 
     def _canonical_parameter_values(
@@ -291,12 +276,19 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         """Reconstruct dependent threshold storage after coordinate updates."""
         canonical = super()._canonical_parameter_values(name, values)
         if name == "thresholds":
-            for item, categories in enumerate(self._n_categories):
-                independent = canonical[item, : categories - 1].copy()
-                canonical[item] = 0.0
-                canonical[item, : 2 * categories - 1] = _ggum_subjective_thresholds(
-                    independent
-                )
+            # Column k keeps independent value k below the center c and
+            # mirrors value 2c - k with opposite sign above it.
+            centers = np.asarray(self._n_categories, dtype=np.intp)[:, None] - 1
+            columns = np.arange(canonical.shape[1])
+            independent = columns < centers
+            reflected = (columns > centers) & (columns <= 2 * centers)
+            sources = np.where(
+                independent, columns, np.where(reflected, 2 * centers - columns, 0)
+            )
+            gathered = np.take_along_axis(canonical, sources, axis=1)
+            canonical = np.where(
+                independent, gathered, np.where(reflected, -gathered, 0.0)
+            )
         return canonical
 
     def _expand_parameter_standard_errors(
@@ -522,7 +514,7 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
         probabilities = np.zeros(
             (len(values), self.n_items, max(self._n_categories)), dtype=np.float64
         )
-        for n_categories, item_indices in _ggum_category_chunks(
+        for n_categories, item_indices in _category_count_chunks(
             self._n_categories, len(values)
         ):
             chunk_probabilities = None
@@ -675,18 +667,15 @@ class GeneralizedGradedUnfolding(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute log likelihood for every person and theta point."""
         response_codes, observed = self._validated_responses(responses)
-        probabilities = np.clip(self.probability(theta), PROB_EPSILON, 1.0)
-        log_probabilities = np.log(probabilities)
-        likelihood = np.zeros(
-            (response_codes.shape[0], log_probabilities.shape[0]), dtype=np.float64
+        log_table = item_category_table(self.probability(theta), self._n_categories)
+        np.clip(log_table, PROB_EPSILON, 1.0, out=log_table)
+        np.log(log_table, out=log_table)
+        return categorical_log_likelihood_batch(
+            log_table,
+            category_offsets(self._n_categories),
+            response_codes,
+            observed,
         )
-        for item in range(self.n_items):
-            valid = observed[:, item]
-            if np.any(valid):
-                likelihood[valid] += log_probabilities[
-                    :, item, response_codes[valid, item]
-                ].T
-        return likelihood
 
     def _validate_threshold_matrix(self, values: NDArray[np.float64]) -> None:
         for item, n_categories in enumerate(self._n_categories):

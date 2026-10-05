@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
+from scipy.linalg import lapack, solve_triangular
 
 from mirt.constants import PROB_EPSILON
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
 
 _MOMENT_CHUNK_ELEMENTS = 262_144
+_CHOLESKY_MIN_RECIPROCAL_CONDITION = 1e-8
 
 
 @dataclass(frozen=True)
@@ -536,17 +538,19 @@ def _moment_design(responses: NDArray[np.float64]) -> _MomentDesign:
     n_moments = n_items * (n_items + 1) // 2
     counts = np.zeros(n_moments)
     overlap = np.zeros((n_moments, n_moments))
+    complete_rows = 0
     chunk_rows = max(1, _MOMENT_CHUNK_ELEMENTS // n_moments)
     for start in range(0, len(responses), chunk_rows):
         block = responses[start : start + chunk_rows]
         valid = np.isfinite(block) & (block >= 0)
         if np.all(valid):
-            counts += len(block)
-            overlap += len(block)
+            complete_rows += len(block)
         else:
             present = _score_features(valid.astype(np.float64))
             counts += present.sum(axis=0)
             overlap += present.T @ present
+    counts += complete_rows
+    overlap += complete_rows
     return _MomentDesign(counts, overlap)
 
 
@@ -813,14 +817,35 @@ def _projected_chi_square(
     standardized = covariance[np.ix_(active, active)] / np.outer(
         scales[active], scales[active]
     )
-    values, vectors = np.linalg.eigh(standardized)
-    threshold = max(float(np.max(values)), 1.0) * 1e-10
-    if np.any(values < -threshold):
-        raise ValueError("model moment covariance is not positive semidefinite")
-    positive = values > threshold
-    whitening = (vectors[:, positive] / np.sqrt(values[positive])).T
-    whitened = whitening @ (residual[active] / scales[active])
-    tangent = whitening @ (jacobian[active] / scales[active, None])
+    scaled_residual = residual[active] / scales[active]
+    scaled_jacobian = jacobian[active] / scales[active, None]
+    factor = _well_conditioned_cholesky(standardized)
+    if factor is not None:
+        # Cholesky and eigenvector whitening differ by an orthogonal rotation,
+        # which leaves the statistic, tangent rank and degrees unchanged.
+        whitened_columns = solve_triangular(
+            factor,
+            np.column_stack((scaled_residual, scaled_jacobian)),
+            lower=True,
+            check_finite=False,
+        )
+        whitened = whitened_columns[:, 0]
+        tangent = whitened_columns[:, 1:]
+        n_supported = len(scaled_residual)
+        null_residual_norm = 0.0
+    else:
+        values, vectors = np.linalg.eigh(standardized)
+        threshold = max(float(np.max(values)), 1.0) * 1e-10
+        if np.any(values < -threshold):
+            raise ValueError("model moment covariance is not positive semidefinite")
+        positive = values > threshold
+        whitening = (vectors[:, positive] / np.sqrt(values[positive])).T
+        whitened = whitening @ scaled_residual
+        tangent = whitening @ scaled_jacobian
+        n_supported = int(np.count_nonzero(positive))
+        null_residual_norm = float(
+            np.linalg.norm(vectors[:, ~positive].T @ scaled_residual)
+        )
     norms = np.linalg.norm(tangent, axis=0)
     nonzero = norms > 1e-9
     if np.any(nonzero):
@@ -831,17 +856,36 @@ def _projected_chi_square(
         whitened -= basis[:, :rank] @ (basis[:, :rank].T @ whitened)
     else:
         rank = 0
-    degrees = int(np.count_nonzero(positive)) - rank
+    degrees = n_supported - rank
     if degrees <= 0:
         return np.nan, 0
     # A residual outside covariance support is impossible under the null;
     # pseudoinverse weighting must not silently erase this evidence of misfit.
-    null_residual = vectors[:, ~positive].T @ (residual[active] / scales[active])
-    impossible = np.linalg.norm(null_residual) > 1e-6 or np.any(
-        np.abs(residual[~active]) > 1e-10
-    )
+    impossible = null_residual_norm > 1e-6 or np.any(np.abs(residual[~active]) > 1e-10)
     statistic = np.inf if impossible else float(whitened @ whitened)
     return statistic, degrees
+
+
+def _well_conditioned_cholesky(
+    matrix: NDArray[np.float64],
+) -> NDArray[np.float64] | None:
+    """Return the lower Cholesky factor when no eigenvalue is near the rank cut.
+
+    The eigenvalue path drops dimensions with eigenvalues at most
+    ``1e-10 * max(lambda_max, 1)``. A correlation matrix has
+    ``lambda_max >= 1`` and ``kappa_2 <= kappa_1``, so a reciprocal 1-norm
+    condition estimate above ``1e-8`` keeps every eigenvalue above that cut
+    even if the LAPACK estimate understates ``||A^-1||_1`` a hundredfold.
+    Otherwise ``None`` selects the eigenvalue path and its rank checks.
+    """
+    factor, info = lapack.dpotrf(matrix, lower=1, clean=1)
+    if info != 0:
+        return None
+    norm = float(np.max(np.sum(np.abs(matrix), axis=0)))
+    reciprocal_condition, info = lapack.dpocon(factor, norm, uplo="L")
+    if info != 0 or not reciprocal_condition > _CHOLESKY_MIN_RECIPROCAL_CONDITION:
+        return None
+    return factor
 
 
 def _m2_from_moments(
@@ -971,69 +1015,3 @@ def _compute_tli(chi2: float, df: int, chi2_0: float, df_0: int) -> float:
 
     tli = (ratio_0 - ratio) / (ratio_0 - 1)
     return float(tli)
-
-
-def _compute_srmsr(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    n_quadpts: int,
-    theta: NDArray[np.float64] | None = None,
-) -> float:
-    """Compute Standardized Root Mean Square Residual."""
-    response_values, max_observed = _validate_diagnostic_inputs(model, responses)
-    moments = _prepare_fit_moments(
-        model,
-        response_values,
-        max_observed,
-        theta,
-        n_quadpts,
-    )
-    return _srmsr_from_moments(moments)
-
-
-def model_fit_summary(
-    model: BaseItemModel,
-    responses: NDArray[np.int_],
-    theta: NDArray[np.float64] | None = None,
-) -> str:
-    """Generate a formatted summary of model fit statistics.
-
-    Parameters
-    ----------
-    model : BaseItemModel
-        Fitted IRT model
-    responses : NDArray
-        Response matrix
-    theta : NDArray, optional
-        Ability estimates
-
-    Returns
-    -------
-    str
-        Formatted summary string
-    """
-    fit = compute_fit_indices(model, responses, theta)
-
-    lines = [
-        "Model Fit Summary",
-        "=" * 50,
-        "",
-        f"M2 statistic:     {fit['M2']:.3f}",
-        f"Degrees of freedom: {fit['M2_df']}",
-        f"P-value:          {fit['M2_p']:.4f}",
-        "",
-        f"RMSEA:            {fit['RMSEA']:.4f}",
-        f"  90% CI:         [{fit['RMSEA_CI_lower']:.4f}, {fit['RMSEA_CI_upper']:.4f}]",
-        f"CFI:              {fit['CFI']:.4f}",
-        f"TLI:              {fit['TLI']:.4f}",
-        f"SRMSR:            {fit['SRMSR']:.4f}",
-        "",
-        "Interpretation guidelines:",
-        "  RMSEA < 0.05: Good fit",
-        "  RMSEA < 0.08: Acceptable fit",
-        "  CFI > 0.95: Good fit",
-        "  TLI > 0.95: Good fit",
-        "  SRMSR < 0.08: Good fit",
-    ]
-
-    return "\n".join(lines)

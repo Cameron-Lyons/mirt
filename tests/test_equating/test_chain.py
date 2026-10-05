@@ -477,6 +477,186 @@ class TestConcurrentLink:
 
         assert selected_calls == [[2, 7], [3, 8]]
 
+    def test_batches_dense_anchor_subsets(self, linked_models, monkeypatch):
+        """Anchors covering a quarter of the bank use one batched evaluation."""
+        from scipy import optimize
+
+        models, _ = linked_models
+        selected_calls: list[list[int | None]] = [[], []]
+        for model_index, model in enumerate(models[:2]):
+            probability = model.probability
+
+            def counted_probability(
+                theta, item_idx=None, *, _index=model_index, _fn=probability
+            ):
+                selected_calls[_index].append(item_idx)
+                return _fn(theta, item_idx)
+
+            monkeypatch.setattr(model, "probability", counted_probability)
+
+        def evaluate_once(function, x0, **kwargs):
+            return SimpleNamespace(x=x0, fun=function(x0), success=True)
+
+        monkeypatch.setattr(optimize, "minimize", evaluate_once)
+
+        concurrent_link(models[:2], [[[(2, 3), (7, 8), (4, 1)]]])
+
+        assert selected_calls == [[None], [None]]
+
+    def test_gradient_probes_reevaluate_only_the_perturbed_form(
+        self, linked_models, monkeypatch
+    ):
+        """A coordinate probe touches one form's curves, not every free form."""
+        from scipy import optimize
+
+        models, _ = linked_models
+        calls = [0, 0, 0]
+        for model_index, model in enumerate(models):
+            probability = model.probability
+
+            def counted_probability(
+                theta, item_idx=None, *, _index=model_index, _fn=probability
+            ):
+                calls[_index] += 1
+                return _fn(theta, item_idx)
+
+            monkeypatch.setattr(model, "probability", counted_probability)
+
+        captured = {}
+
+        def evaluate_value_and_gradient(function, x0, *, jac, **kwargs):
+            x = np.array([0.1, -0.2, 0.3, 0.05])
+            captured["fun"] = function
+            captured["value"] = function(x)
+            captured["gradient"] = jac(x)
+            return SimpleNamespace(x=x0, fun=captured["value"], success=True)
+
+        monkeypatch.setattr(optimize, "minimize", evaluate_value_and_gradient)
+        anchor_matrices = [
+            [[(index, index) for index in range(5)]],
+            [[(index, index) for index in range(5)]],
+        ]
+
+        concurrent_link(models, anchor_matrices)
+
+        # One value evaluation per free form plus two coordinate probes each.
+        assert calls == [1, 3, 3]
+        x = np.array([0.1, -0.2, 0.3, 0.05])
+        expected = np.array(
+            [
+                (captured["fun"](x + 1e-8 * unit) - captured["value"])
+                / ((x + 1e-8 * unit) - x)[position]
+                for position, unit in enumerate(np.eye(4))
+            ]
+        )
+        assert_allclose(captured["gradient"], expected, rtol=1e-12, atol=1e-15)
+
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    @pytest.mark.parametrize("family", ["3PL", "GRM"])
+    def test_matches_numerical_gradient_lbfgs_oracle(self, family, method):
+        """The separable gradient reproduces whole-objective L-BFGS-B fits."""
+        from scipy import optimize
+
+        from mirt.models.dichotomous import ThreeParameterLogistic
+        from mirt.models.polytomous import GradedResponseModel
+
+        rng = np.random.default_rng(20)
+        n_items, n_forms = 8, 4
+        slopes = rng.uniform(0.7, 1.8, n_items)
+        locations = np.sort(rng.normal(0.0, 1.0, (n_items, 4)), axis=1)
+        guessing = rng.uniform(0.05, 0.2, n_items)
+        models = []
+        for scale, shift in zip(
+            [1.0, 1.3, 0.8, 1.1], [0.0, 0.4, -0.3, 0.2], strict=True
+        ):
+            # Noisy affine copies of one calibration keep the fit well posed.
+            form_slopes = slopes / scale * np.exp(rng.normal(0.0, 0.05, n_items))
+            form_locations = scale * locations + shift
+            form_locations += rng.normal(0.0, 0.05, (n_items, 1))
+            if family == "3PL":
+                model = ThreeParameterLogistic(n_items)
+                model.set_parameters(
+                    discrimination=form_slopes,
+                    difficulty=form_locations[:, 0],
+                    guessing=guessing,
+                )
+            else:
+                model = GradedResponseModel(n_items, [3, 4, 3, 5] * 2)
+                thresholds = model.thresholds.copy()
+                for item, count in enumerate(model.n_categories):
+                    thresholds[item, : count - 1] = form_locations[item, : count - 1]
+                model.set_parameters(discrimination=form_slopes, thresholds=thresholds)
+            models.append(model)
+        assert len(models) == n_forms
+        anchor_matrices = [
+            [[(item, item) for item in range(5)], [(6, 6), (7, 7)]],
+            [[(item, item) for item in range(5)]],
+            [[(item, item) for item in range(5)]],
+        ]
+        relations = [(0, 1, range(5)), (0, 2, [6, 7]), (1, 2, range(5))]
+        relations.append((2, 3, range(5)))
+        theta = np.linspace(-4.0, 4.0, 61)
+        weights = np.exp(-0.5 * theta**2)
+        weights /= weights.sum()
+
+        def item_curves(model, grid, item):
+            values = np.asarray(model.probability(grid[:, None], item))
+            if values.ndim == 1:
+                return values, None
+            return values @ np.arange(values.shape[1]), values
+
+        def objective(parameters):
+            scales = np.r_[1.0, np.exp(parameters[:3])]
+            shifts = np.r_[0.0, parameters[3:]]
+            loss = 0.0
+            for left, right, items in relations:
+                left_grid = (theta - shifts[left]) / scales[left]
+                right_grid = (theta - shifts[right]) / scales[right]
+                left_curves = [item_curves(models[left], left_grid, i) for i in items]
+                right_curves = [
+                    item_curves(models[right], right_grid, i) for i in items
+                ]
+                if method == "stocking_lord":
+                    difference = sum(c[0] for c in left_curves) - sum(
+                        c[0] for c in right_curves
+                    )
+                    loss += float(weights @ difference**2)
+                    continue
+                for (left_score, left_cat), (right_score, right_cat) in zip(
+                    left_curves, right_curves, strict=True
+                ):
+                    if left_cat is None:
+                        loss += float(weights @ (left_score - right_score) ** 2)
+                    else:
+                        loss += float(
+                            np.sum(weights[:, None] * (left_cat - right_cat) ** 2)
+                        )
+            return loss
+
+        max_log_slope = np.log(100.0)
+        oracle = optimize.minimize(
+            objective,
+            np.zeros(6),
+            method="L-BFGS-B",
+            bounds=[(-max_log_slope, max_log_slope)] * 3 + [(None, None)] * 3,
+            options={"maxiter": 200, "ftol": 1e-10, "gtol": 1e-10},
+        )
+        assert oracle.success
+
+        result = concurrent_link(
+            models, anchor_matrices, method=method, max_iter=200, tol=1e-10
+        )
+
+        fitted = np.r_[
+            np.log([constants[0] for constants in result[1:]]),
+            [constants[1] for constants in result[1:]],
+        ]
+        assert result[0] == (1.0, 0.0)
+        assert objective(fitted) == pytest.approx(oracle.fun, rel=1e-10, abs=1e-15)
+        # Batched and per-item curves differ in the last bit; the FD gradient
+        # turns that into ~1e-8 drift along the flat optimum.
+        assert_allclose(fitted, oracle.x, atol=1e-6)
+
     def test_stocking_lord_and_haebara_use_distinct_losses(self, monkeypatch):
         from scipy import optimize
 
@@ -537,6 +717,134 @@ class TestConcurrentLink:
 
         with pytest.raises(ValueError, match="connect every model"):
             concurrent_link(models, anchor_matrices)
+
+
+def _polytomous_chain(family):
+    """Exact affine copies of one polytomous calibration on four metrics."""
+    from mirt.equating.polytomous import transform_polytomous_parameters
+    from mirt.models.polytomous import (
+        GeneralizedPartialCredit,
+        GradedResponseModel,
+        NominalResponseModel,
+    )
+
+    categories = [3, 4, 3, 5, 4, 3]
+    slopes = np.array([0.7, 0.9, 1.1, 1.3, 1.5, 1.8])
+    if family == "NRM":
+        base = NominalResponseModel(6, categories)
+        rng = np.random.default_rng(8)
+        base.set_parameters(
+            slopes=np.sort(rng.uniform(-1.5, 2.0, (6, 5)), axis=1),
+            intercepts=rng.normal(0.0, 0.7, (6, 5)),
+        )
+        model_type = "nrm"
+    else:
+        model_type = "grm" if family == "GRM" else "gpcm"
+        base = (GradedResponseModel if family == "GRM" else GeneralizedPartialCredit)(
+            6, categories
+        )
+        locations = np.zeros((6, 4))
+        for item, count in enumerate(categories):
+            locations[item, : count - 1] = np.linspace(-1.2, 1.4, count - 1) + (
+                0.15 * item - 0.4
+            )
+        key = "thresholds" if family == "GRM" else "steps"
+        base.set_parameters(discrimination=slopes, **{key: locations})
+    scales = np.array([1.0, 1.3, 0.72, 1.65])
+    shifts = np.array([0.0, 0.4, -0.8, 0.25])
+    models = [
+        transform_polytomous_parameters(base, scale, shift, model_type=model_type)
+        for scale, shift in zip(scales, shifts, strict=True)
+    ]
+    return base, models, scales, shifts
+
+
+class TestPolytomousChainLink:
+    """chain_link dispatches each adjacent pair to its family's linker."""
+
+    @pytest.mark.parametrize("reference_index", [0, 2])
+    @pytest.mark.parametrize("family", ["GRM", "GPCM", "NRM"])
+    def test_recovers_calibrations_and_category_probabilities(
+        self, family, reference_index
+    ):
+        base, models, scales, shifts = _polytomous_chain(family)
+        pairs = [([0, 1, 2, 3, 4], [0, 1, 2, 3, 4]), ([1, 2, 3, 4, 5], [1, 2, 3, 4, 5])]
+        pairs.append(([0, 2, 3, 5], [0, 2, 3, 5]))
+
+        result = chain_link(models, pairs, reference_index=reference_index)
+
+        expected_scales = scales[reference_index] / scales
+        expected_shifts = shifts[reference_index] - expected_scales * shifts
+        assert_allclose(result.cumulative_A, expected_scales, atol=1e-7)
+        assert_allclose(result.cumulative_B, expected_shifts, atol=1e-7)
+        canonical_theta = np.array([-2.0, -0.5, 0.0, 1.1, 2.4])
+        reference_theta = (
+            scales[reference_index] * canonical_theta + shifts[reference_index]
+        )
+        expected_probabilities = base.probability(canonical_theta[:, None])
+        for index, model in enumerate(models):
+            linked = transform_to_reference(model, result, index)
+            assert_allclose(
+                linked.probability(reference_theta[:, None]),
+                expected_probabilities,
+                atol=1e-6,
+            )
+            assert linked is not model
+
+    @pytest.mark.parametrize("family", ["GRM", "GPCM"])
+    def test_ordered_drift_uses_reference_location_changes(self, family):
+        _, models, _, _ = _polytomous_chain(family)
+        pairs = [([0, 1, 2, 3, 4], [0, 1, 2, 3, 4])] * 3
+
+        result = chain_link(models, pairs, method="haebara")
+
+        assert result.drift_accumulation.shape == (3, 5)
+        assert np.all(np.isfinite(result.drift_difficulty_changes))
+        assert_allclose(result.drift_difficulty_changes, 0.0, atol=1e-6)
+
+    def test_nrm_drift_reports_z_scores_without_location_changes(self):
+        """NRM intercept contrasts are logits, so no theta change is implied."""
+        _, models, _, _ = _polytomous_chain("NRM")
+        drifted = models[2].parameters["intercepts"].copy()
+        drifted[0, 1:3] += np.array([1.5, -1.0])
+        models[2].set_parameters(intercepts=drifted)
+        pairs = [([0, 1, 2, 3, 4], [0, 1, 2, 3, 4])] * 3
+
+        result = chain_link(models, pairs)
+
+        assert not np.any(np.isnan(result.drift_accumulation))
+        assert np.all(np.isnan(result.drift_difficulty_changes))
+        flagged = detect_longitudinal_drift(result)
+        assert (0, 0) in flagged["flagged_item_ids"]
+        assert set(flagged["drift_direction"]) == {"unknown"}
+
+    def test_tcc_uses_polytomous_expected_score_matching(self):
+        _, models, _, _ = _polytomous_chain("GRM")
+        pairs = [([0, 1, 2, 3, 4], [0, 1, 2, 3, 4])] * 3
+
+        tcc = chain_link(models, pairs, method="tcc")
+        stocking_lord = chain_link(models, pairs, method="stocking_lord")
+
+        assert tcc.cumulative_A == stocking_lord.cumulative_A
+        assert tcc.cumulative_B == stocking_lord.cumulative_B
+
+    @pytest.mark.parametrize(
+        ("family", "method"),
+        [("GRM", "bisector"), ("GPCM", "orthogonal"), ("NRM", "mean_sigma")],
+    )
+    def test_rejects_methods_the_family_cannot_use(self, family, method):
+        _, models, _, _ = _polytomous_chain(family)
+        pairs = [([0, 1, 2], [0, 1, 2])] * 3
+
+        with pytest.raises(ValueError, match="not available"):
+            chain_link(models, pairs, method=method)
+
+    def test_rejects_mixed_response_families(self, linked_models):
+        dichotomous, _ = linked_models
+        _, polytomous, _, _ = _polytomous_chain("GRM")
+
+        with pytest.raises(ValueError, match="different response families"):
+            chain_link([dichotomous[0], polytomous[1]], [([0, 1, 2], [0, 1, 2])])
 
 
 class TestDetectLongitudinalDrift:

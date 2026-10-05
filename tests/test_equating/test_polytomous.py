@@ -394,6 +394,41 @@ class TestTransformPolytomous:
             transform_polytomous_parameters(model_old, 1.0, 0.0, model_type="pcm")
 
 
+class TestLinkerDispatch:
+    """One family-to-linker mapping serves chain and vertical workflows."""
+
+    def test_linker_for_dispatches_by_family(self):
+        from mirt.equating.linking import link
+        from mirt.equating.polytomous import _linker_for
+        from mirt.models.dichotomous import ThreeParameterLogistic
+        from mirt.models.polytomous import PartialCreditModel
+
+        assert _linker_for(GradedResponseModel(3, n_categories=3)) is link_grm
+        assert _linker_for(GeneralizedPartialCredit(3, n_categories=3)) is link_gpcm
+        assert _linker_for(PartialCreditModel(3, n_categories=3)) is link_gpcm
+        assert _linker_for(NominalResponseModel(3, n_categories=3)) is link_nrm
+        assert _linker_for(ThreeParameterLogistic(3)) is link
+
+    def test_ordered_linkers_share_one_kernel(self, grm_model_pair, gpcm_model_pair):
+        """GRM thresholds and GPCM steps transform with the same constants."""
+        for linker, (model_old, model_new, A_true, B_true) in (
+            (link_grm, grm_model_pair),
+            (link_gpcm, gpcm_model_pair),
+        ):
+            for method in ("mean_sigma", "mean_mean", "stocking_lord", "haebara"):
+                result = linker(
+                    model_old,
+                    model_new,
+                    [0, 1, 2, 3, 4],
+                    [0, 1, 2, 3, 4],
+                    method=method,
+                )
+                # The fixtures move the new form forward by (A_true, B_true).
+                assert result.constants.A == pytest.approx(1.0 / A_true, abs=1e-6)
+                assert result.constants.B == pytest.approx(-B_true / A_true, abs=1e-6)
+                assert result.anchor_diagnostics.item_indices == [0, 1, 2, 3, 4]
+
+
 class TestPolytomousValidation:
     """Validation tests for polytomous linking."""
 

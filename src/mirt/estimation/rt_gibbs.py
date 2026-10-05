@@ -16,10 +16,20 @@ from mirt.exceptions import MirtValidationError
 if TYPE_CHECKING:
     from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
 
+# Random-walk steps per sweep for log time discrimination. Each step only
+# touches per-item sufficient statistics, and five steps recover most of the
+# mixing of a direct draw.
+_TIME_DISCRIMINATION_MH_STEPS = 5
+
 
 @dataclass
 class RTModelPriors:
     """Prior distributions for response time model parameters.
+
+    Item parameters have independent normal priors: ``log a_j`` and ``b_j``
+    for accuracy, ``log alpha_j`` (time discrimination) and ``beta_j`` (time
+    intensity) for speed. The person ability-speed pairs share a
+    normal/inverse-Wishart population prior.
 
     Attributes
     ----------
@@ -44,7 +54,8 @@ class RTModelPriors:
     mu_cov : NDArray
         Prior covariance for population mean
     sigma_df : int
-        Degrees of freedom for inverse-Wishart prior on Σ
+        Degrees of freedom for inverse-Wishart prior on Σ. It only affects
+        the ability-speed covariance, not the item parameters.
     sigma_scale : NDArray
         Scale matrix for inverse-Wishart prior on Σ
     """
@@ -765,12 +776,9 @@ class ResponseTimeGibbsSampler:
                 - 0.5 * (diff_prop - self.priors.diff_mean) ** 2 / self.priors.diff_var
             )
 
-            jacobian = log_disc_prop - log_disc_curr
-
-            log_accept = (
-                (log_like_prop + log_prior_prop)
-                - (log_like_curr + log_prior_curr)
-                + jacobian
+            # The walk and the prior both live on log a, so no Jacobian term.
+            log_accept = (log_like_prop + log_prior_prop) - (
+                log_like_curr + log_prior_curr
             )
 
             if np.log(rng.random()) < log_accept:
@@ -840,42 +848,59 @@ class ResponseTimeGibbsSampler:
         time_int: NDArray[np.float64],
         rng: np.random.Generator,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Sample time item parameters via conjugate updates."""
-        n_items = log_rt.shape[1]
+        """Sample the lognormal time item parameters for every item at once.
 
-        new_time_disc = time_disc.copy()
-        new_time_int = time_int.copy()
+        Given speed ``tau`` the shifted log times ``log t_ij + tau_i`` are
+        ``N(beta_j, 1 / alpha_j**2)``. Time intensity ``beta_j`` gets an exact
+        conjugate normal draw. Log time discrimination ``eta_j = log alpha_j``
+        has the non-conjugate ``N(time_disc_mean, time_disc_var)`` prior and is
+        updated by a few random-walk Metropolis steps whose scale follows the
+        conditional posterior precision ``2 n_j + 1 / time_disc_var``. The
+        conditional depends on the data only through ``n_j`` and the residual
+        sum of squares, so the extra steps cost ``O(n_items)`` each.
+        """
+        valid = ~np.isnan(log_rt)
+        n_valid = np.count_nonzero(valid, axis=0)
+        shifted = np.where(valid, log_rt + tau[:, None], 0.0)
 
-        for j in range(n_items):
-            valid = ~np.isnan(log_rt[:, j])
-            if not np.any(valid):
-                continue
+        intensity_var = self.priors.time_int_var
+        precision = time_disc**2
+        post_var = 1.0 / (1.0 / intensity_var + n_valid * precision)
+        post_mean = post_var * (
+            self.priors.time_int_mean / intensity_var
+            + precision * np.sum(shifted, axis=0)
+        )
+        new_time_int = post_mean + np.sqrt(post_var) * rng.standard_normal(
+            time_int.shape
+        )
 
-            rt_valid = log_rt[valid, j]
-            tau_valid = tau[valid]
-            n_valid = np.sum(valid)
+        residuals = np.where(valid, shifted - new_time_int, 0.0)
+        half_ss = 0.5 * np.sum(residuals**2, axis=0)
+        prior_mean = self.priors.time_disc_mean
+        prior_var = self.priors.time_disc_var
 
-            prior_mean = self.priors.time_int_mean
-            prior_var = self.priors.time_int_var
-            alpha = time_disc[j]
-            obs_var = 1.0 / (alpha**2)
-
-            residual_mean = np.mean(rt_valid + tau_valid)
-            post_var = 1.0 / (1.0 / prior_var + n_valid / obs_var)
-            post_mean = post_var * (
-                prior_mean / prior_var + n_valid * residual_mean / obs_var
+        def log_conditional(eta: NDArray[np.float64]) -> NDArray[np.float64]:
+            return (
+                n_valid * eta
+                - half_ss * np.exp(2.0 * eta)
+                - 0.5 * (eta - prior_mean) ** 2 / prior_var
             )
 
-            new_time_int[j] = rng.normal(post_mean, np.sqrt(post_var))
-
-            residuals = rt_valid - (new_time_int[j] - tau_valid)
-            ss = np.sum(residuals**2)
-
-            shape = self.priors.sigma_df / 2 + n_valid / 2
-            scale = 1.0 / (self.priors.sigma_df / 2 + ss / 2)
-            precision = rng.gamma(shape, scale)
-            new_time_disc[j] = np.sqrt(precision)
-
+        draw_shape = (_TIME_DISCRIMINATION_MH_STEPS,) + time_disc.shape
+        step = 2.4 / np.sqrt(2.0 * n_valid + 1.0 / prior_var)
+        offsets = step * rng.standard_normal(draw_shape)
+        log_uniform = np.log(rng.random(draw_shape))
+        eta_initial = np.log(time_disc)
+        eta = eta_initial
+        log_target = log_conditional(eta)
+        for offset, threshold in zip(offsets, log_uniform, strict=True):
+            proposal = eta + offset
+            proposal_target = log_conditional(proposal)
+            accepted = threshold < proposal_target - log_target
+            eta = np.where(accepted, proposal, eta)
+            log_target = np.where(accepted, proposal_target, log_target)
+        # Items that rejected every proposal keep their exact previous value.
+        new_time_disc = np.where(eta == eta_initial, time_disc, np.exp(eta))
         return new_time_disc, new_time_int
 
     def _sample_population_params(

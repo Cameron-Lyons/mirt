@@ -29,22 +29,40 @@ Models
    TwoParameterLogistic
    ThreeParameterLogistic
    FourParameterLogistic
+   FiveParameterLogistic
+   ComplementaryLogLog
+   NegativeLogLog
    GradedResponseModel
    GeneralizedPartialCredit
    PartialCreditModel
    NominalResponseModel
+   SequentialResponseModel
+   ContinuationRatioModel
+   AdjacentCategoryModel
    TwoPLNestedLogit
    ThreePLNestedLogit
    FourPLNestedLogit
    BifactorModel
+   PartiallyCompensatoryModel
+   NoncompensatoryModel
+   DisjunctiveModel
+   MonotonicSplineModel
+   MonotonicPolynomialModel
+   KernelSmoothingModel
+   ExplanatoryIRT
+   RaschLLTM
    MixtureIRT
    TestletModel
+   BifactorTestletModel
+   RandomTestletEffectsModel
    models.MultilevelIRTModel
    models.ThreeLevelIRTModel
    models.CrossedRandomEffectsModel
    ResponseTimeModel
    DINA
    DINO
+   GDINA
+   HigherOrderCDM
    IRTreeModel
 
 Custom Models
@@ -88,6 +106,7 @@ Estimation
    MCMCResult
    BLEstimator
    ResponseTimeGibbsSampler
+   RTModelPriors
    IRTreeEMEstimator
    IRTreeResult
 
@@ -144,6 +163,8 @@ Scoring
 
    fscores
    ability_posterior
+   scoring.eapsum_table
+   scoring.SumScoreTable
 
 Cross-validation
 ----------------
@@ -192,6 +213,8 @@ Equating
    true_score_equating
    observed_score_equating
    equipercentile_equating
+   kernel_equating
+   irt_kernel_equating
    chain_link
    link_mirt
    transform_mirt_theta
@@ -207,6 +230,8 @@ Multigroup
 
    fit_multigroup
    compare_invariance
+   multigroup_dif
+   select_dif_anchors
 
 Reports
 -------
@@ -239,6 +264,10 @@ Utils
    combine_plausible_values
    plausible_value_regression
    plausible_value_statistics
+   bootstrap_lr
+   BootstrapLRResult
+   fixed_item_calibration
+   FixedItemCalibrationResult
    draw_parameters
    posterior_summary
    sample_expected_scores

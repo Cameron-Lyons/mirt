@@ -50,6 +50,19 @@ def _enumerated_distribution(probabilities, weights):
     return result
 
 
+def _kolen_brennan_equivalents(old, new):
+    """Transcribe Kolen and Brennan (2014, eqs. 2.14-2.18) score by score."""
+    cumulative_new = np.cumsum(new)
+    equivalents = []
+    for score in range(len(old)):
+        rank = np.sum(old[:score]) + old[score] / 2
+        (above,) = np.nonzero(cumulative_new > rank)
+        cell = above[0]
+        below = cumulative_new[cell - 1] if cell else 0.0
+        equivalents.append(cell - 0.5 + (rank - below) / new[cell])
+    return np.array(equivalents)
+
+
 def _equivalent_forms(model_type):
     a = np.array([0.7, 1.1, 1.4, 1.8])
     b = np.array([-1.5, -0.3, 0.6, 1.4])
@@ -163,8 +176,7 @@ def test_observed_linking_preserves_reference_population_masses(backend):
         )
         for probability in (probability_old, probability_new)
     ]
-    ranks = [np.cumsum(d) - 0.5 * d for d in distributions]
-    expected = np.interp(ranks[0], ranks[1], np.arange(len(distributions[1])))
+    expected = _kolen_brennan_equivalents(*distributions)
 
     result = observed_score_equating(
         old,

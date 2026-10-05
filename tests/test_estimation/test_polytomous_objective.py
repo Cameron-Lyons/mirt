@@ -240,7 +240,6 @@ def test_item_counts_respect_explicit_observation_mask(monkeypatch):
         responses,
         posterior,
         theta,
-        posterior.sum(axis=0),
         valid_mask=observed,
     )
 

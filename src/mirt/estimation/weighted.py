@@ -22,6 +22,11 @@ from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._patterns import supports_pattern_compression
 from mirt.estimation._posterior import normalize_log_posterior
+from mirt.estimation.base import (
+    StartValues,
+    _apply_starting_values,
+    _validate_start,
+)
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 
@@ -120,13 +125,16 @@ class WeightedEMEstimator(EMEstimator):
         weights: NDArray[np.float64] | None = None,
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
+        *,
+        start: StartValues = "default",
     ) -> FitResult:
         """Fit model with survey weights.
 
         Parameters
         ----------
         model : BaseItemModel
-            IRT model to fit
+            IRT model to fit. Coordinates fixed with
+            ``set_free_parameter_masks`` keep their values.
         responses : ndarray of shape (n_persons, n_items)
             Response matrix
         weights : ndarray of shape (n_persons,), optional
@@ -135,19 +143,22 @@ class WeightedEMEstimator(EMEstimator):
             Prior mean for latent abilities
         prior_cov : ndarray, optional
             Prior covariance for latent abilities
+        start : {"default", "model"} or mapping, default="default"
+            Starting values, as for :meth:`EMEstimator.fit`.
 
         Returns
         -------
         FitResult
             Fitted model with estimates and diagnostics
         """
+        start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
         previous_context = self._fit_context
         with EMFitContext(responses) as context:
             self._fit_context = context
             try:
                 return self._fit_weighted_prepared(
-                    model, responses, weights, prior_mean, prior_cov
+                    model, responses, weights, prior_mean, prior_cov, start
                 )
             finally:
                 self._fit_context = previous_context
@@ -159,6 +170,7 @@ class WeightedEMEstimator(EMEstimator):
         weights: NDArray[np.float64] | None,
         prior_mean: NDArray[np.float64] | None,
         prior_cov: NDArray[np.float64] | None,
+        start: StartValues = "default",
     ) -> FitResult:
         from mirt.results.fit_result import FitResult
 
@@ -184,8 +196,7 @@ class WeightedEMEstimator(EMEstimator):
         if prior_cov is None:
             prior_cov = np.eye(model.n_factors)
 
-        if not model._is_fitted:
-            model._initialize_parameters()
+        _apply_starting_values(model, start)
 
         self._convergence_history = []
         prev_ll = -np.inf
@@ -319,7 +330,6 @@ class WeightedEMEstimator(EMEstimator):
                 responses,
                 posterior_weights,
                 quad_points,
-                item_observed,
                 r_k=item_correct,
                 n_k_valid=item_observed,
                 r_kc=category_counts,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -24,6 +25,25 @@ _PATTERN_SAMPLE_SIZE = 1_024
 # Require a projected fourfold reduction so sorting also pays off for the
 # fastest native likelihood implementations.
 _MAX_SAMPLE_UNIQUE_FRACTION = 0.25
+# EAP integrates over a full tensor-product grid, so its size grows as
+# n_quadpts ** n_factors. These per-dimension defaults keep three or more
+# factors tractable; one and two factors keep the historical 49 points.
+_DEFAULT_QUADPTS_BY_FACTORS = {1: 49, 2: 49, 3: 21, 4: 9, 5: 7}
+_DEFAULT_QUADPTS_HIGH_DIMENSIONAL = 5
+# Larger grids still run, with a warning; 21 points in five dimensions is the
+# largest grid the package requests internally.
+_LARGE_GRID_NODES = 21**5
+
+
+def _default_n_quadpts(n_factors: int) -> int:
+    """Return the default EAP quadrature points per latent dimension.
+
+    The defaults are 49 points for one or two factors, 21 for three, 9 for
+    four, 7 for five, and 5 for six or more.
+    """
+    return _DEFAULT_QUADPTS_BY_FACTORS.get(
+        int(n_factors), _DEFAULT_QUADPTS_HIGH_DIMENSIONAL
+    )
 
 
 def _eap_response_patterns(
@@ -47,21 +67,37 @@ def _eap_response_patterns(
 
 
 class EAPScorer:
+    """Expected a posteriori scoring on a Gauss-Hermite quadrature grid.
+
+    Parameters
+    ----------
+    n_quadpts : int, optional
+        Quadrature points per latent dimension. ``None`` chooses a size from
+        the model's factor count when scoring: 49 points for one or two
+        factors, 21 for three, 9 for four, 7 for five, and 5 for six or more.
+    prior_mean : ndarray, optional
+        Prior mean for theta. Default zeros.
+    prior_cov : ndarray, optional
+        Prior covariance for theta. Default identity.
+    batch_size : int, optional
+        Maximum response rows per likelihood batch.
+    """
+
     def __init__(
         self,
-        n_quadpts: int = 49,
+        n_quadpts: int | None = None,
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
         batch_size: int | None = None,
     ) -> None:
-        if (
+        if n_quadpts is not None and (
             isinstance(n_quadpts, (bool, np.bool_))
             or not isinstance(n_quadpts, (int, np.integer))
             or n_quadpts < 5
         ):
             raise ValueError("n_quadpts should be at least 5")
 
-        self.n_quadpts = int(n_quadpts)
+        self.n_quadpts = None if n_quadpts is None else int(n_quadpts)
         self.prior_mean = (
             None
             if prior_mean is None
@@ -79,6 +115,34 @@ class EAPScorer:
         ):
             raise ValueError("batch_size must be a positive integer or None")
         self.batch_size = None if batch_size is None else int(batch_size)
+
+    def _quadrature(
+        self,
+        n_factors: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Build the scoring grid, resolving the automatic grid size."""
+        default = _default_n_quadpts(n_factors)
+        n_quadpts = default if self.n_quadpts is None else self.n_quadpts
+        n_nodes = n_quadpts**n_factors
+        if n_nodes > _LARGE_GRID_NODES:
+            advice = (
+                f"omit n_quadpts to use {default} points per dimension"
+                if n_quadpts > default
+                else "consider MAP scoring for this many factors"
+            )
+            warnings.warn(
+                f"EAP quadrature with n_quadpts={n_quadpts} and {n_factors} "
+                f"factors has {n_nodes} grid nodes, which is slow and "
+                f"memory-intensive; {advice}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return build_quadrature(
+            n_quadpts=n_quadpts,
+            n_factors=n_factors,
+            prior_mean=self.prior_mean,
+            prior_cov=self.prior_cov,
+        )
 
     def _resolve_batch_size(
         self,
@@ -137,12 +201,7 @@ class EAPScorer:
         responses = validate_scoring_responses(model, responses)
         n_factors = model.n_factors
 
-        quad_points, quad_weights = build_quadrature(
-            n_quadpts=self.n_quadpts,
-            n_factors=n_factors,
-            prior_mean=self.prior_mean,
-            prior_cov=self.prior_cov,
-        )
+        quad_points, quad_weights = self._quadrature(n_factors)
         if responses.shape[0] == 0:
             shape = (0,) if n_factors == 1 else (0, n_factors)
             return ScoreResult(
@@ -215,12 +274,7 @@ class EAPScorer:
         person_ids = AbilityPosteriorResult._validated_person_ids(
             person_ids, responses.shape[0]
         )
-        quad_points, quad_weights = build_quadrature(
-            n_quadpts=self.n_quadpts,
-            n_factors=model.n_factors,
-            prior_mean=self.prior_mean,
-            prior_cov=self.prior_cov,
-        )
+        quad_points, quad_weights = self._quadrature(model.n_factors)
         n_persons = responses.shape[0]
         posterior_weights = np.empty(
             (n_persons, quad_points.shape[0]),
@@ -280,7 +334,7 @@ def ability_posterior(
     model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     *,
-    n_quadpts: int = 49,
+    n_quadpts: int | None = None,
     prior_mean: NDArray[np.float64] | None = None,
     prior_cov: NDArray[np.float64] | None = None,
     batch_size: int | None = None,
@@ -289,7 +343,9 @@ def ability_posterior(
     """Compute normalized posterior ability distributions for respondents.
 
     ``model_or_result`` may be either a fitted item model or the ``FitResult``
-    returned by :func:`mirt.fit_mirt`.
+    returned by :func:`mirt.fit_mirt`. ``n_quadpts`` is the number of grid
+    points per latent dimension; by default it is 49 for one or two factors,
+    21 for three, 9 for four, 7 for five, and 5 for six or more.
     """
     from mirt.results.fit_result import FitResult
 

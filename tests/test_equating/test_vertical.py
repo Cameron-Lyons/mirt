@@ -289,6 +289,121 @@ class TestVerticalScale:
         )
         np.testing.assert_allclose(list(result.grade_means.values()), 2.0, atol=1e-6)
 
+    @pytest.mark.parametrize("reference_grade", [0, 1, 2])
+    @pytest.mark.parametrize("linking_method", ["stocking_lord", "mean_sigma"])
+    def test_chain_scaling_equals_chain_link(
+        self, monkeypatch, linking_method, reference_grade
+    ):
+        """Vertical chain scaling reuses chain_link's pairwise composition."""
+        from mirt.equating.chain import chain_link
+
+        rng = np.random.default_rng(31)
+        models = []
+        for grade in range(3):
+            model = TwoParameterLogistic(n_items=8)
+            model.set_parameters(
+                discrimination=rng.uniform(0.7, 1.8, 8),
+                difficulty=rng.normal(0.4 * grade, 1.0, 8),
+            )
+            models.append(model)
+        grade_data = [
+            GradeData(
+                "g0", np.zeros((3, 8), dtype=int), anchor_items_above=[4, 5, 6, 7]
+            ),
+            GradeData(
+                "g1",
+                np.zeros((3, 8), dtype=int),
+                anchor_items_below=[0, 1, 2, 3],
+                anchor_items_above=[5, 6, 7, 4],
+            ),
+            GradeData(
+                "g2", np.zeros((3, 8), dtype=int), anchor_items_below=[0, 1, 2, 3]
+            ),
+        ]
+        thetas = [rng.normal(size=(3, 1)) for _ in range(3)]
+        grade_models = [
+            _GradeModelInfo(model, theta, gd.grade_label)
+            for model, theta, gd in zip(models, thetas, grade_data, strict=True)
+        ]
+        monkeypatch.setattr(
+            vertical_module,
+            "_fit_grade_models",
+            lambda grade_data, models: grade_models,
+        )
+
+        result = vertical_scale(
+            grade_data,
+            models=models,
+            linking_method=linking_method,
+            reference_grade=reference_grade,
+            enforce_monotonicity=False,
+        )
+
+        expected = chain_link(
+            models,
+            [([4, 5, 6, 7], [0, 1, 2, 3]), ([5, 6, 7, 4], [0, 1, 2, 3])],
+            method=linking_method,
+            reference_index=reference_grade,
+            compute_drift=False,
+        )
+        for index, gd in enumerate(grade_data):
+            np.testing.assert_allclose(
+                result.grade_transformations[gd.grade_label],
+                (expected.cumulative_A[index], expected.cumulative_B[index]),
+                rtol=1e-12,
+                atol=1e-12,
+            )
+        assert [r.anchor_items for r in result.linking_results] == [
+            [4, 5, 6, 7],
+            [5, 6, 7, 4],
+        ]
+
+    def test_chain_scaling_supports_graded_response_grades(self, monkeypatch):
+        """Polytomous grades chain through the GRM linker."""
+        from mirt.equating.polytomous import transform_polytomous_parameters
+        from mirt.models.polytomous import GradedResponseModel
+
+        base = GradedResponseModel(6, n_categories=4)
+        base.set_parameters(
+            discrimination=np.linspace(0.7, 1.8, 6),
+            thresholds=np.linspace(-1.5, 1.0, 6)[:, None] + np.array([-0.6, 0.0, 0.7]),
+        )
+        scales, shifts = [1.0, 1.4, 0.8], [0.0, 0.5, -0.3]
+        models = [
+            transform_polytomous_parameters(base, scale, shift, model_type="grm")
+            for scale, shift in zip(scales, shifts, strict=True)
+        ]
+        anchors = [0, 1, 2, 3]
+        grade_data = [
+            GradeData("g0", np.zeros((3, 6), dtype=int), anchor_items_above=anchors),
+            GradeData(
+                "g1",
+                np.zeros((3, 6), dtype=int),
+                anchor_items_below=anchors,
+                anchor_items_above=anchors,
+            ),
+            GradeData("g2", np.zeros((3, 6), dtype=int), anchor_items_below=anchors),
+        ]
+        grade_models = [
+            _GradeModelInfo(model, np.zeros((3, 1)), gd.grade_label)
+            for model, gd in zip(models, grade_data, strict=True)
+        ]
+        monkeypatch.setattr(
+            vertical_module,
+            "_fit_grade_models",
+            lambda grade_data, models: grade_models,
+        )
+
+        result = vertical_scale(grade_data, models=models, enforce_monotonicity=False)
+
+        for scale, shift, gd in zip(scales, shifts, grade_data, strict=True):
+            np.testing.assert_allclose(
+                result.grade_transformations[gd.grade_label],
+                (1.0 / scale, -shift / scale),
+                atol=1e-6,
+            )
+        assert all(r.fit_statistics is not None for r in result.linking_results)
+
     def test_monotonicity_preserves_reference_and_scale(self):
         """Growth correction shifts locations without rescaling abilities."""
         labels = ["g1", "g2", "g3"]

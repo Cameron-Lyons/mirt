@@ -1,12 +1,11 @@
 //! Core utility functions for IRT computations.
 
-use numpy::ndarray::ArrayView1;
 use rand::{Rng, RngExt};
 
 use crate::special::erfc;
 
-pub const LOG_2_PI: f64 = 1.8378770664093453;
-pub const EPSILON: f64 = 1e-10;
+pub(crate) const LOG_2_PI: f64 = 1.8378770664093453;
+pub(crate) const EPSILON: f64 = 1e-10;
 
 /// Normal-distribution sampler backed only by the core `rand` crate.
 ///
@@ -14,7 +13,7 @@ pub const EPSILON: f64 = 1e-10;
 /// sample keeps repeated MCMC and imputation draws efficient while avoiding a
 /// separate distribution dependency.
 #[derive(Clone, Debug)]
-pub struct NormalSampler {
+pub(crate) struct NormalSampler {
     mean: f64,
     std_dev: f64,
     spare: Option<f64>,
@@ -60,7 +59,7 @@ impl NormalSampler {
 }
 
 #[inline]
-pub fn logsumexp(arr: &[f64]) -> f64 {
+pub(crate) fn logsumexp(arr: &[f64]) -> f64 {
     if arr.is_empty() {
         return f64::NEG_INFINITY;
     }
@@ -73,7 +72,7 @@ pub fn logsumexp(arr: &[f64]) -> f64 {
 }
 
 #[inline]
-pub fn sigmoid(x: f64) -> f64 {
+pub(crate) fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())
     } else {
@@ -83,7 +82,7 @@ pub fn sigmoid(x: f64) -> f64 {
 }
 
 #[inline]
-pub fn log_sigmoid(x: f64) -> f64 {
+pub(crate) fn log_sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         -(-x).exp().ln_1p()
     } else {
@@ -91,24 +90,14 @@ pub fn log_sigmoid(x: f64) -> f64 {
     }
 }
 
-#[inline]
-pub fn clip(x: f64, min: f64, max: f64) -> f64 {
-    x.max(min).min(max)
-}
-
-#[inline]
-pub fn normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x / std::f64::consts::SQRT_2)
-}
-
 /// Return the standard normal survival probability without tail cancellation.
 #[inline]
-pub fn normal_sf(x: f64) -> f64 {
+pub(crate) fn normal_sf(x: f64) -> f64 {
     0.5 * erfc(x / std::f64::consts::SQRT_2)
 }
 
 #[inline]
-pub fn log_likelihood_2pl_single(
+pub(crate) fn log_likelihood_2pl_single(
     responses: &[i32],
     theta: f64,
     discrimination: &[f64],
@@ -124,78 +113,6 @@ pub fn log_likelihood_2pl_single(
             ll += log_sigmoid(z);
         } else {
             ll += log_sigmoid(-z);
-        }
-    }
-    ll
-}
-
-#[inline]
-pub fn log_likelihood_2pl_view(
-    responses: ArrayView1<i32>,
-    theta: f64,
-    discrimination: &[f64],
-    difficulty: &[f64],
-) -> f64 {
-    let mut ll = 0.0;
-    for (j, &resp) in responses.iter().enumerate() {
-        if resp < 0 {
-            continue;
-        }
-        let z = discrimination[j] * (theta - difficulty[j]);
-        if resp == 1 {
-            ll += log_sigmoid(z);
-        } else {
-            ll += log_sigmoid(-z);
-        }
-    }
-    ll
-}
-
-#[inline]
-pub fn log_likelihood_3pl_single(
-    responses: &[i32],
-    theta: f64,
-    discrimination: &[f64],
-    difficulty: &[f64],
-    guessing: &[f64],
-) -> f64 {
-    let mut ll = 0.0;
-    for (j, &resp) in responses.iter().enumerate() {
-        if resp < 0 {
-            continue;
-        }
-        let p_star = sigmoid(discrimination[j] * (theta - difficulty[j]));
-        let p = guessing[j] + (1.0 - guessing[j]) * p_star;
-        let p_clipped = clip(p, EPSILON, 1.0 - EPSILON);
-        if resp == 1 {
-            ll += p_clipped.ln();
-        } else {
-            ll += (1.0 - p_clipped).ln();
-        }
-    }
-    ll
-}
-
-#[inline]
-pub fn log_likelihood_3pl_view(
-    responses: ArrayView1<i32>,
-    theta: f64,
-    discrimination: &[f64],
-    difficulty: &[f64],
-    guessing: &[f64],
-) -> f64 {
-    let mut ll = 0.0;
-    for (j, &resp) in responses.iter().enumerate() {
-        if resp < 0 {
-            continue;
-        }
-        let p_star = sigmoid(discrimination[j] * (theta - difficulty[j]));
-        let p = guessing[j] + (1.0 - guessing[j]) * p_star;
-        let p_clipped = clip(p, EPSILON, 1.0 - EPSILON);
-        if resp == 1 {
-            ll += p_clipped.ln();
-        } else {
-            ll += (1.0 - p_clipped).ln();
         }
     }
     ll
@@ -203,7 +120,7 @@ pub fn log_likelihood_3pl_view(
 
 /// Normalize log posterior values and return probabilities
 #[inline]
-pub fn normalize_log_posterior(log_posterior: &[f64]) -> Vec<f64> {
+pub(crate) fn normalize_log_posterior(log_posterior: &[f64]) -> Vec<f64> {
     let log_norm = logsumexp(log_posterior);
     log_posterior
         .iter()
@@ -213,7 +130,7 @@ pub fn normalize_log_posterior(log_posterior: &[f64]) -> Vec<f64> {
 
 /// Compute EAP estimate and standard error from posterior and quadrature points
 #[inline]
-pub fn compute_eap_with_se(posterior: &[f64], quad_points: &[f64]) -> (f64, f64) {
+pub(crate) fn compute_eap_with_se(posterior: &[f64], quad_points: &[f64]) -> (f64, f64) {
     let mut theta_eap = 0.0;
     for (p, &theta) in posterior.iter().zip(quad_points.iter()) {
         theta_eap += p * theta;
@@ -230,7 +147,7 @@ pub fn compute_eap_with_se(posterior: &[f64], quad_points: &[f64]) -> (f64, f64)
 
 /// Compute log weights without inflating small Gauss-Hermite masses.
 #[inline]
-pub fn compute_log_weights(weights: &[f64]) -> Vec<f64> {
+pub(crate) fn compute_log_weights(weights: &[f64]) -> Vec<f64> {
     weights
         .iter()
         .map(|&w| w.max(f64::MIN_POSITIVE).ln())
@@ -238,7 +155,7 @@ pub fn compute_log_weights(weights: &[f64]) -> Vec<f64> {
 }
 
 /// Density-ratio adjustment for normalized Gaussian masses on standard-normal GH nodes.
-pub fn normalized_log_gaussian_adjustment(
+pub(crate) fn normalized_log_gaussian_adjustment(
     quad_points: &[f64],
     quad_weights: &[f64],
     prior_mean: f64,
@@ -272,20 +189,13 @@ pub fn normalized_log_gaussian_adjustment(
         .collect()
 }
 
-/// Compute Fisher information for 2PL at a single theta
-#[inline]
-pub fn fisher_info_2pl(theta: f64, discrimination: &[f64], difficulty: &[f64]) -> f64 {
-    let mut info = 0.0;
-    for (a, b) in discrimination.iter().zip(difficulty.iter()) {
-        let p = sigmoid(a * (theta - b));
-        info += a * a * p * (1.0 - p);
-    }
-    info
-}
-
 /// Compute Fisher information for each item at a single theta
 #[inline]
-pub fn fisher_info_2pl_items(theta: f64, discrimination: &[f64], difficulty: &[f64]) -> Vec<f64> {
+pub(crate) fn fisher_info_2pl_items(
+    theta: f64,
+    discrimination: &[f64],
+    difficulty: &[f64],
+) -> Vec<f64> {
     discrimination
         .iter()
         .zip(difficulty.iter())
@@ -297,7 +207,7 @@ pub fn fisher_info_2pl_items(theta: f64, discrimination: &[f64], difficulty: &[f
 }
 
 #[inline]
-pub fn grm_category_probability(
+pub(crate) fn grm_category_probability(
     theta: f64,
     discrimination: f64,
     thresholds: &[f64],
@@ -322,7 +232,7 @@ pub fn grm_category_probability(
 }
 
 /// Gauss-Hermite quadrature nodes and weights
-pub fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
+pub(crate) fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
     assert!(n > 0, "quadrature requires at least one point");
     if n == 1 {
         return (vec![0.0], vec![1.0]);
@@ -450,32 +360,19 @@ mod tests {
     }
 
     #[test]
-    fn clip_bounds_values() {
-        assert!((clip(0.5, 0.0, 1.0) - 0.5).abs() < 1e-12);
-        assert!((clip(-1.0, 0.0, 1.0) - 0.0).abs() < 1e-12);
-        assert!((clip(2.0, 0.0, 1.0) - 1.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn normal_distribution_helpers_match_reference_values() {
+    fn normal_sf_matches_reference_values() {
         let cases = [
-            (-8.0, 6.220_960_574_271_74e-16, 0.999_999_999_999_999_3),
-            (-3.0, 0.001_349_898_031_630_094_5, 0.998_650_101_968_369_9),
-            (-1.0, 0.158_655_253_931_457_07, 0.841_344_746_068_542_9),
-            (0.0, 0.5, 0.5),
-            (1.0, 0.841_344_746_068_542_9, 0.158_655_253_931_457_07),
-            (3.0, 0.998_650_101_968_369_9, 0.001_349_898_031_630_094_5),
-            (8.0, 0.999_999_999_999_999_3, 6.220_960_574_271_74e-16),
+            (-8.0, 0.999_999_999_999_999_3),
+            (-3.0, 0.998_650_101_968_369_9),
+            (-1.0, 0.841_344_746_068_542_9),
+            (0.0, 0.5),
+            (1.0, 0.158_655_253_931_457_07),
+            (3.0, 0.001_349_898_031_630_094_5),
+            (8.0, 6.220_960_574_271_74e-16),
         ];
 
-        for (value, expected_cdf, expected_sf) in cases {
-            let cdf_error = (normal_cdf(value) - expected_cdf).abs();
+        for (value, expected_sf) in cases {
             let sf_error = (normal_sf(value) - expected_sf).abs();
-            assert!(
-                cdf_error <= 64.0 * f64::EPSILON * expected_cdf,
-                "normal_cdf({value}) was {}, expected {expected_cdf}",
-                normal_cdf(value)
-            );
             assert!(
                 sf_error <= 64.0 * f64::EPSILON * expected_sf,
                 "normal_sf({value}) was {}, expected {expected_sf}",
@@ -483,9 +380,6 @@ mod tests {
             );
         }
 
-        assert!(normal_cdf(f64::NAN).is_nan());
-        assert_eq!(normal_cdf(f64::NEG_INFINITY), 0.0);
-        assert_eq!(normal_cdf(f64::INFINITY), 1.0);
         assert!(normal_sf(f64::NAN).is_nan());
         assert_eq!(normal_sf(f64::NEG_INFINITY), 1.0);
         assert_eq!(normal_sf(f64::INFINITY), 0.0);
@@ -500,12 +394,6 @@ mod tests {
         assert!(ll.is_finite());
         assert!(ll < 0.0);
         assert!((ll - 3.0 * 0.5_f64.ln()).abs() < 1e-10);
-    }
-
-    #[test]
-    fn fisher_info_2pl_at_difficulty() {
-        let info = fisher_info_2pl(0.0, &[1.0, 1.0], &[0.0, 0.0]);
-        assert!((info - 0.5).abs() < 1e-12);
     }
 
     #[test]

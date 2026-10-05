@@ -42,6 +42,10 @@ Wrappers live under `src/mirt/backends/rust/`. Each module declares `FALLBACK_MO
 
 Prefer public APIs and `mirt.should_use_rust()` over private `_rust_backend` symbols.
 
+Every function registered in `mirt_rs` must be called as `mirt_rs.<name>` by
+package code, and every such call must resolve; `tests/test_native_registry.py`
+enforces both. Crate modules are private, so rustc reports unused helpers.
+
 ## Rust checks
 
 The extension lives under `rust_src/` with the workspace `Cargo.toml` at the repo root.

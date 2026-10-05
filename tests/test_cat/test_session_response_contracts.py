@@ -7,19 +7,26 @@ import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 
 from mirt.cat import CATEngine, MCATEngine, SympsonHetter
-from mirt.models import GradedResponseModel, MultidimensionalModel, TwoParameterLogistic
+from mirt.models import (
+    GeneralizedPartialCredit,
+    GradedResponseModel,
+    MultidimensionalModel,
+    TwoParameterLogistic,
+)
 
 
 def _model(n_factors: int, *, polytomous: bool = False):
-    if polytomous:
-        model = GradedResponseModel(
-            n_items=3, n_factors=n_factors, n_categories=[2, 3, 4]
-        )
-        slopes = np.array([0.8, 1.2, 1.5])
-        if n_factors == 2:
-            slopes = np.column_stack((slopes, [1.1, 0.7, 1.3]))
+    if polytomous and n_factors == 2:
+        # MCAT needs exact polytomous Fisher matrices, which GPCM defines.
+        model = GeneralizedPartialCredit(n_items=3, n_factors=2, n_categories=[2, 3, 4])
         model.set_parameters(
-            discrimination=slopes,
+            discrimination=np.array([[0.8, 1.1], [1.2, 0.7], [1.5, 1.3]]),
+            steps=np.array([[0.1, 0.0, 0.0], [-0.8, 0.7, 0.0], [-1.0, 0.0, 1.0]]),
+        )
+    elif polytomous:
+        model = GradedResponseModel(n_items=3, n_categories=[2, 3, 4])
+        model.set_parameters(
+            discrimination=np.array([0.8, 1.2, 1.5]),
             thresholds=np.array([[0.1, 0.0, 0.0], [-0.8, 0.7, 0.0], [-1.0, 0.0, 1.0]]),
         )
     elif n_factors == 1:

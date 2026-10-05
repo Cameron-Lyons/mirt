@@ -15,6 +15,7 @@ from mirt.diagnostics.dif import (
     _expected_response_matrix,
     _score_grdif_responses,
     compute_grdif,
+    grdif_effect_size,
 )
 from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 
@@ -532,3 +533,152 @@ def test_expected_response_matrix_rejects_invalid_model_output(
 
     with pytest.raises(ValueError):
         _expected_response_matrix(InvalidModel(), np.zeros((4, 1)), n_items=2)
+
+
+def _scalar_effect_reference(
+    data: np.ndarray,
+    groups: np.ndarray,
+    theta: np.ndarray,
+    model: _DichotomousModel,
+    effect_type: str,
+) -> np.ndarray:
+    """Per-item, per-group loop of the original effect-size definition."""
+    effects = np.zeros(data.shape[1])
+    for item in range(data.shape[1]):
+        mrr_values: list[float] = []
+        msr_values: list[float] = []
+        for group in np.unique(groups):
+            responses = data[groups == group, item]
+            valid = responses >= 0
+            if np.count_nonzero(valid) < 2:
+                continue
+            expected = model.probability(theta[groups == group][valid])[:, item]
+            residuals = responses[valid] - expected
+            mrr_values.append(float(np.mean(residuals)))
+            msr_values.append(float(np.mean(residuals**2)))
+        if len(mrr_values) >= 2:
+            delta_mrr = max(mrr_values) - min(mrr_values)
+            delta_msr = max(msr_values) - min(msr_values)
+            effects[item] = {
+                "delta_mrr": delta_mrr,
+                "delta_msr": delta_msr,
+                "max_diff": max(delta_mrr, delta_msr),
+            }[effect_type]
+    return effects
+
+
+def _effect_size_inputs() -> tuple[np.ndarray, np.ndarray]:
+    data = np.array(
+        [
+            [1, 0, 1],
+            [0, 1, -1],
+            [1, 1, 0],
+            [0, 0, 1],
+            [1, 0, 0],
+            [1, 1, 1],
+            [0, 1, -1],
+            [1, 0, 1],
+            [0, 0, -1],
+        ],
+        dtype=np.int64,
+    )
+    # Group "c" has a single valid response to item 2, so only two groups
+    # contribute to that item's spread.
+    groups = np.repeat(["a", "b", "c"], 3)
+    return data, groups
+
+
+def _install_effect_size_fit(monkeypatch: pytest.MonkeyPatch) -> _DichotomousModel:
+    model = _DichotomousModel(3)
+    monkeypatch.setattr(
+        "mirt.fit_mirt", lambda *args, **kwargs: SimpleNamespace(model=model)
+    )
+    monkeypatch.setattr(
+        "mirt.scoring.fscores",
+        lambda fitted, responses, **kwargs: SimpleNamespace(
+            theta=np.linspace(-1.5, 1.5, responses.shape[0])[:, None]
+        ),
+    )
+    return model
+
+
+@pytest.mark.parametrize("effect_type", ["delta_mrr", "delta_msr", "max_diff"])
+def test_effect_size_reuses_grdif_moments_without_refitting(
+    monkeypatch: pytest.MonkeyPatch, effect_type: str
+) -> None:
+    data, groups = _effect_size_inputs()
+    model = _install_effect_size_fit(monkeypatch)
+    result = compute_grdif(data, groups)
+
+    def unexpected_fit(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("grdif_effect_size must not refit a model")
+
+    monkeypatch.setattr("mirt.fit_mirt", unexpected_fit)
+    effects = grdif_effect_size(data, groups, result, effect_type=effect_type)
+
+    expected = _scalar_effect_reference(
+        data, groups, result["theta"], model, effect_type
+    )
+    assert_allclose(effects, expected, rtol=1e-12, atol=1e-14)
+    assert_array_equal(result["group_item_counts"][:, 2], [2, 3, 1])
+
+
+def test_effect_size_recomputes_moments_from_theta_with_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data, groups = _effect_size_inputs()
+    model = _install_effect_size_fit(monkeypatch)
+    result = compute_grdif(data, groups)
+    stored = grdif_effect_size(data, groups, result, effect_type="max_diff")
+    hand_built = {
+        key: value
+        for key, value in result.items()
+        if key not in {"mrr", "msr", "group_item_counts"}
+    }
+
+    recomputed = grdif_effect_size(
+        data, groups, hand_built, effect_type="max_diff", model=model
+    )
+
+    assert_allclose(recomputed, stored, rtol=1e-12)
+    with pytest.raises(ValueError, match="model="):
+        grdif_effect_size(data, groups, hand_built)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"effect_type": "ratio"}, "effect_type"),
+        ({"groups": np.repeat(["a", "b"], 4)}, "one group label"),
+        ({"data": np.zeros((9, 2), dtype=np.int64)}, "one column per item"),
+    ],
+)
+def test_effect_size_validates_inputs(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, Any], message: str
+) -> None:
+    data, groups = _effect_size_inputs()
+    _install_effect_size_fit(monkeypatch)
+    result = compute_grdif(data, groups)
+    arguments = {"data": data, "groups": groups, **kwargs}
+
+    with pytest.raises(ValueError, match=message):
+        grdif_effect_size(grdif_results=result, **arguments)
+
+
+@pytest.mark.parametrize(
+    ("model", "n_categories"), [("1PL", 2), ("GRM", 3)], ids=["1PL", "GRM"]
+)
+def test_effect_size_supports_the_grdif_model(model: str, n_categories: int) -> None:
+    rng = np.random.default_rng(17)
+    data = rng.integers(0, n_categories, size=(120, 4))
+    groups = np.repeat(["reference", "focal"], 60)
+
+    result = compute_grdif(data, groups, model=model, n_quadpts=11, max_iter=40)
+    effects = grdif_effect_size(data, groups, result, effect_type="max_diff")
+
+    assert result["mrr"].shape == (2, 4)
+    assert np.all(np.isfinite(effects)) and np.all(effects >= 0.0)
+    spread = np.ptp(result["mrr"], axis=0)
+    assert_allclose(
+        grdif_effect_size(data, groups, result, effect_type="delta_mrr"), spread
+    )

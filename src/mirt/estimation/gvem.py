@@ -19,7 +19,13 @@ from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation._variational_objective import variational_elbo
 from mirt.estimation._variational_statistics import variational_item_statistics
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import (
+    BaseEstimator,
+    StartValues,
+    _apply_starting_values,
+    _reject_parameter_restrictions,
+    _validate_start,
+)
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -141,6 +147,8 @@ class GVEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
+        *,
+        start: StartValues = "default",
     ) -> FitResult:
         """Fit model using Gaussian Variational EM algorithm.
 
@@ -154,6 +162,8 @@ class GVEMEstimator(BaseEstimator):
             Prior mean for latent abilities. Defaults to zeros.
         prior_cov : ndarray of shape (n_factors, n_factors), optional
             Prior covariance for latent abilities. Defaults to identity.
+        start : {"default", "model"} or mapping, default="default"
+            Starting values, as for :meth:`EMEstimator.fit`.
 
         Returns
         -------
@@ -164,6 +174,9 @@ class GVEMEstimator(BaseEstimator):
         ------
         ValueError
             If model type is not supported.
+        MirtValidationError
+            If ``set_free_parameter_masks`` fixes parameters, which the
+            closed-form M-step cannot hold.
         """
         from mirt.results.fit_result import FitResult
 
@@ -171,6 +184,8 @@ class GVEMEstimator(BaseEstimator):
             raise ValueError(
                 f"GVEMEstimator currently only supports 2PL models, got {model.model_name}"
             )
+        _reject_parameter_restrictions(model, "GVEMEstimator")
+        start = _validate_start(start)
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
@@ -183,8 +198,7 @@ class GVEMEstimator(BaseEstimator):
             n_factors,
         )
 
-        if not model._is_fitted:
-            model._initialize_parameters()
+        _apply_starting_values(model, start)
 
         self._convert_to_slope_intercept(model)
 

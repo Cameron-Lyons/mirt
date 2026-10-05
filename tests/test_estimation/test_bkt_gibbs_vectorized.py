@@ -268,6 +268,59 @@ def test_fit_uses_batch_ffbs_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert np.isfinite(result.log_likelihood)
 
 
+@pytest.mark.parametrize("use_rust", [False, True])
+def test_fit_runs_forward_backward_only_for_final_summaries(
+    monkeypatch: pytest.MonkeyPatch,
+    use_rust: bool,
+) -> None:
+    """Only the posterior-mean summaries need a full smoothing pass.
+
+    Retained draws used to run one each for a log-likelihood trace that was
+    never read, and the final log-likelihood repeated the summary pass. The
+    seeded estimates are pinned to the values produced before both changes.
+    """
+    generator = BKTModel(
+        n_skills=2,
+        allow_forgetting=True,
+        p_init=np.array([0.3, 0.6]),
+        p_learn=np.array([0.2, 0.1]),
+        p_forget=np.array([0.05, 0.1]),
+        p_slip=np.array([0.1, 0.2]),
+        p_guess=np.array([0.2, 0.25]),
+        use_rust=False,
+    )
+    responses, skills, _ = generator.simulate(40, 6, seed=3)
+    responses[::5, ::4] = -1
+    calls = 0
+    original = BKTModel.forward_backward_batch
+
+    def counting_forward_backward(
+        self: BKTModel, *args: Any, **kwargs: Any
+    ) -> tuple[np.ndarray, np.ndarray]:
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(BKTModel, "forward_backward_batch", counting_forward_backward)
+
+    result = BKTGibbsSampler(
+        n_iter=30,
+        burnin=10,
+        thin=3,
+        seed=17,
+        use_rust=use_rust,
+    ).fit(responses, skills, n_skills=2, allow_forgetting=True)
+
+    assert calls == 1
+    fitted = result.model
+    assert_allclose(fitted.p_init, [0.2471178664118861, 0.5504381961981714])
+    assert_allclose(fitted.p_learn, [0.18673314419041204, 0.09035160898147468])
+    assert_allclose(fitted.p_forget, [0.0451883930016815, 0.1774433145837402])
+    assert_allclose(fitted.p_slip, [0.06939182329664755, 0.13352689383747104])
+    assert_allclose(fitted.p_guess, [0.2293050684117861, 0.30193786367527226])
+    assert_allclose(result.log_likelihood, -285.76666674297803, rtol=1e-10)
+
+
 @pytest.mark.parametrize(
     ("kwargs", "error", "match"),
     [

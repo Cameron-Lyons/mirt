@@ -30,6 +30,11 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
+# Central-difference steps for the marginal Hessian: an analytic gradient
+# tolerates a smaller step than second differences of the likelihood.
+_GRADIENT_STEP = 1e-5
+_LIKELIHOOD_STEP = 1e-4
+
 
 class BLEstimator(BaseEstimator):
     """Bock-Lieberman marginal maximum likelihood estimator.
@@ -56,6 +61,13 @@ class BLEstimator(BaseEstimator):
 
     Notes
     -----
+    Standard errors invert the full Hessian of the marginal log-likelihood.
+    Built-in unidimensional and multidimensional item models compute it
+    exactly by Louis's identity; other models with analytic gradients
+    difference the gradient, and the remaining models difference the
+    likelihood. Coordinates on an optimizer bound are held fixed and receive
+    ``NaN`` standard errors. The covariance is stored in ``FitResult.vcov``.
+
     The BL method directly maximizes:
 
         L(xi) = prod_i integral P(x_i | theta)^{x_i} Q(x_i | theta)^{1-x_i} g(theta) dtheta
@@ -190,18 +202,27 @@ class BLEstimator(BaseEstimator):
         n_iterations = result.nit if hasattr(result, "nit") else 0
         converged = result.success
 
-        if prepared is None or "_compute_standard_errors" in vars(self):
+        covariance = None
+        if (
+            "_compute_standard_errors" in vars(self)
+            or type(self)._compute_standard_errors
+            is not BLEstimator._compute_standard_errors
+        ):
             se = self._compute_standard_errors(
                 model, responses, result.x, param_structure
             )
         else:
-            se = self._compute_standard_errors(
+            covariance = self._parameter_covariance(
                 model,
                 responses,
                 result.x,
                 param_structure,
-                objective=prepared.value,
+                gradient=prepared,
+                bounds=bounds,
             )
+            se = self._unflatten_standard_errors(model, covariance, param_structure)
+            if not _uses_free_layout(model, param_structure):
+                covariance = None
 
         n_params = len(result.x)
         aic = -2 * final_ll + 2 * n_params
@@ -217,6 +238,8 @@ class BLEstimator(BaseEstimator):
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+            se_method=None if covariance is None else "hessian",
+            vcov=covariance,
         )
 
     def _compute_marginal_log_likelihood(
@@ -320,6 +343,156 @@ class BLEstimator(BaseEstimator):
                 name, values.reshape(info["shape"])
             )
 
+    def _exact_information(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        params: NDArray[np.float64],
+        structure: dict,
+    ) -> NDArray[np.float64] | None:
+        """Louis observed information, when it describes the BL objective."""
+        from mirt.estimation._louis_information import (
+            louis_information,
+            supports_louis_information,
+        )
+        from mirt.estimation.standard_errors import _flatten_parameters
+
+        own_objective = not any(
+            name in vars(self)
+            or getattr(type(self), name) is not getattr(BLEstimator, name)
+            for name in (
+                "_compute_marginal_log_likelihood",
+                "_flatten_parameters",
+                "_unflatten_parameters",
+            )
+        )
+        if (
+            not own_objective
+            or not supports_louis_information(model)
+            or not _uses_free_layout(model, structure)
+        ):
+            return None
+        self._unflatten_parameters(model, params, structure)
+        _, layouts = _flatten_parameters(model)
+        weights = self._quadrature.weights
+        return louis_information(
+            model, responses, self._quadrature.nodes, weights / weights.sum(), layouts
+        ).information
+
+    def _marginal_hessian(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        params: NDArray[np.float64],
+        structure: dict,
+        *,
+        objective: Callable[[NDArray[np.float64]], float] | None = None,
+        gradient: Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
+        | None = None,
+    ) -> NDArray[np.float64]:
+        """Return the Hessian of the negative marginal log-likelihood.
+
+        Built-in item models on the estimator's own likelihood use the exact
+        Louis observed information, whichever optimizer produced ``params``.
+        Other analytic ``gradient`` objectives are differenced once per
+        coordinate, and the remaining models, or a caller-supplied
+        ``objective``, difference the likelihood over every coordinate pair.
+        """
+        if objective is None:
+            exact = self._exact_information(model, responses, params, structure)
+            if exact is not None:
+                return exact
+        n_params = params.size
+        hessian = np.zeros((n_params, n_params))
+        if gradient is not None:
+            for column in range(n_params):
+                plus, minus = params.copy(), params.copy()
+                plus[column] += _GRADIENT_STEP
+                minus[column] -= _GRADIENT_STEP
+                hessian[:, column] = (gradient(plus)[1] - gradient(minus)[1]) / (
+                    2.0 * _GRADIENT_STEP
+                )
+            return (hessian + hessian.T) / 2.0
+
+        def neg_ll(candidate: NDArray[np.float64]) -> float:
+            if objective is not None:
+                return objective(candidate)
+            self._unflatten_parameters(model, candidate, structure)
+            return -self._compute_marginal_log_likelihood(model, responses)
+
+        h = _LIKELIHOOD_STEP
+        try:
+            center = neg_ll(params)
+            for row in range(n_params):
+                shifted = {}
+                for sign in (1.0, -1.0):
+                    candidate = params.copy()
+                    candidate[row] += sign * h
+                    shifted[sign] = neg_ll(candidate)
+                hessian[row, row] = (shifted[1.0] - 2.0 * center + shifted[-1.0]) / h**2
+                for column in range(row + 1, n_params):
+                    total = 0.0
+                    for row_sign, column_sign in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+                        candidate = params.copy()
+                        candidate[row] += row_sign * h
+                        candidate[column] += column_sign * h
+                        total += row_sign * column_sign * neg_ll(candidate)
+                    hessian[row, column] = hessian[column, row] = total / (4.0 * h**2)
+        finally:
+            if objective is None:
+                self._unflatten_parameters(model, params, structure)
+        return hessian
+
+    def _parameter_covariance(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        params: NDArray[np.float64],
+        structure: dict,
+        *,
+        objective: Callable[[NDArray[np.float64]], float] | None = None,
+        gradient: Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
+        | None = None,
+        bounds: list[tuple[float, float]] | None = None,
+    ) -> NDArray[np.float64]:
+        """Invert the marginal Hessian, holding coordinates on a bound fixed."""
+        from mirt.estimation.standard_errors import _BOUND_TOLERANCE, _covariance
+
+        hessian = self._marginal_hessian(
+            model,
+            responses,
+            params,
+            structure,
+            objective=objective,
+            gradient=gradient,
+        )
+        active = np.ones(params.size, dtype=np.bool_)
+        if bounds is not None:
+            limits = np.asarray(bounds, dtype=np.float64).reshape(-1, 2)
+            active &= np.abs(params - limits[:, 0]) > _BOUND_TOLERANCE
+            active &= np.abs(params - limits[:, 1]) > _BOUND_TOLERANCE
+        return _covariance("oakes", hessian, None, active)
+
+    def _unflatten_standard_errors(
+        self,
+        model: BaseItemModel,
+        covariance: NDArray[np.float64],
+        structure: dict,
+    ) -> dict[str, NDArray[np.float64]]:
+        variances = np.diag(covariance)
+        se_flat = np.full(variances.shape, np.nan)
+        valid = np.isfinite(variances) & (variances >= 0.0)
+        se_flat[valid] = np.sqrt(variances[valid])
+
+        se_dict = {}
+        for name, info in structure.items():
+            full_se = np.zeros(info["shape"], dtype=np.float64)
+            full_se.ravel()[info["free_indices"]] = se_flat[
+                info["start_idx"] : info["end_idx"]
+            ]
+            se_dict[name] = model._expand_parameter_standard_errors(name, full_se)
+        return se_dict
+
     def _compute_standard_errors(
         self,
         model: BaseItemModel,
@@ -328,44 +501,30 @@ class BLEstimator(BaseEstimator):
         structure: dict,
         *,
         objective: Callable[[NDArray[np.float64]], float] | None = None,
+        gradient: Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
+        | None = None,
+        bounds: list[tuple[float, float]] | None = None,
     ) -> dict[str, NDArray[np.float64]]:
-        """Compute standard errors using numerical Hessian."""
-        h = 1e-5
-        n_params = len(params)
+        """Compute standard errors from the inverse marginal Hessian."""
+        covariance = self._parameter_covariance(
+            model,
+            responses,
+            params,
+            structure,
+            objective=objective,
+            gradient=gradient,
+            bounds=bounds,
+        )
+        return self._unflatten_standard_errors(model, covariance, structure)
 
-        def neg_ll(p):
-            if objective is not None:
-                return objective(p)
-            self._unflatten_parameters(model, p, structure)
-            return -self._compute_marginal_log_likelihood(model, responses)
 
-        hessian_diag = np.zeros(n_params)
-        try:
-            ll_center = neg_ll(params)
-
-            for i in range(n_params):
-                params_plus = params.copy()
-                params_plus[i] += h
-                params_minus = params.copy()
-                params_minus[i] -= h
-
-                ll_plus = neg_ll(params_plus)
-                ll_minus = neg_ll(params_minus)
-
-                hessian_diag[i] = (ll_plus - 2 * ll_center + ll_minus) / (h**2)
-        finally:
-            if objective is None:
-                self._unflatten_parameters(model, params, structure)
-
-        positive = hessian_diag > 0
-        se_flat = np.full(n_params, np.nan)
-        se_flat[positive] = np.sqrt(1.0 / hessian_diag[positive])
-
-        se_dict = {}
-        for name, info in structure.items():
-            se_values = se_flat[info["start_idx"] : info["end_idx"]]
-            full_se = np.zeros(info["shape"], dtype=np.float64)
-            full_se.ravel()[info["free_indices"]] = se_values
-            se_dict[name] = model._expand_parameter_standard_errors(name, full_se)
-
-        return se_dict
+def _uses_free_layout(model: BaseItemModel, structure: dict) -> bool:
+    """Whether a BL layout orders coordinates as ``FitResult.vcov`` does."""
+    masks = model.free_parameter_masks
+    parameters = model.parameters
+    return list(structure) == list(parameters) and all(
+        np.array_equal(
+            info["free_indices"], np.flatnonzero(np.asarray(masks[name]).ravel())
+        )
+        for name, info in structure.items()
+    )

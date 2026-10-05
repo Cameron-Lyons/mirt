@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from mirt import sibtest, sibtest_items
-from mirt.diagnostics.sibtest import _adjust_p_values
+from mirt.diagnostics.multiple_testing import adjust_p_values
 
 
 class TestSIBTEST:
@@ -227,7 +227,7 @@ class TestSIBTESTItems:
         raw = np.array([0.01, 0.04, 0.03, 0.002, np.nan])
 
         np.testing.assert_allclose(
-            _adjust_p_values(raw, method),
+            adjust_p_values(raw, method),
             expected,
             equal_nan=True,
         )

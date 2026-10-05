@@ -1043,3 +1043,212 @@ class TestPlausibleValueStatistics:
 
         assert "estimate" in stats
         assert abs(stats["estimate"]) < 1.0
+
+
+def _shifted_population_fixture(n_persons, seed, mean=0.5, sd=1.2):
+    from mirt import simdata
+    from mirt.models import TwoParameterLogistic
+
+    rng = np.random.default_rng(seed)
+    discrimination = rng.uniform(0.8, 2.0, 10)
+    difficulty = rng.normal(0.0, 1.0, 10)
+    model = TwoParameterLogistic(10).set_parameters(
+        discrimination=discrimination, difficulty=difficulty
+    )
+    model._is_fitted = True
+    theta = rng.normal(mean, sd, n_persons)
+    responses = simdata(
+        theta=theta,
+        discrimination=discrimination,
+        difficulty=difficulty,
+        seed=seed + 1,
+    )
+    return model, responses, theta
+
+
+class TestPopulationPrior:
+    """Plausible values drawn under a supplied normal population prior."""
+
+    def test_population_prior_recovers_population_moments(self):
+        model, responses, theta = _shifted_population_fixture(20_000, 5)
+
+        default = generate_plausible_values(model, responses, n_plausible=4, seed=1)
+        conditioned = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=4,
+            seed=1,
+            prior_mean=[0.5],
+            prior_cov=[[1.44]],
+        )
+
+        # Plausible values reproduce the generating population; the sampling
+        # error of the realized abilities' mean and variance is far smaller
+        # than these tolerances.
+        mean_error = 4.0 * 1.2 / np.sqrt(theta.size)
+        variance_error = 4.0 * 1.44 * np.sqrt(2.0 / theta.size)
+        assert conditioned.mean() == pytest.approx(theta.mean(), abs=mean_error)
+        assert conditioned[:, 0, :].var(axis=0).mean() == pytest.approx(
+            theta.var(), abs=variance_error
+        )
+        assert abs(default.mean() - theta.mean()) > 4 * mean_error
+        assert theta.var() - default[:, 0, :].var(axis=0).mean() > 4 * variance_error
+
+    def test_default_prior_arguments_reproduce_seeded_draws(self):
+        model, responses, _ = _shifted_population_fixture(500, 7)
+
+        default = generate_plausible_values(model, responses, n_plausible=3, seed=4)
+        explicit = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=3,
+            seed=4,
+            prior_mean=np.zeros(1),
+            prior_cov=np.eye(1),
+        )
+
+        np.testing.assert_array_equal(explicit, default)
+
+    def test_constant_person_means_match_a_shared_mean(self):
+        model, responses, _ = _shifted_population_fixture(2_000, 9)
+        options = {"n_plausible": 3, "seed": 2, "prior_cov": [[1.44]]}
+
+        shared = generate_plausible_values(
+            model, responses, prior_mean=[0.5], **options
+        )
+        person = generate_plausible_values(
+            model, responses, prior_mean=np.full((2_000, 1), 0.5), **options
+        )
+        chunked = generate_plausible_values(
+            model,
+            responses,
+            prior_mean=np.full((2_000, 1), 0.5),
+            chunk_size=37,
+            **options,
+        )
+
+        np.testing.assert_array_equal(person, shared)
+        np.testing.assert_array_equal(chunked, shared)
+
+    def test_person_specific_means_recover_a_latent_regression(self):
+        from mirt import simdata
+
+        model, _, _ = _shifted_population_fixture(10, 11)
+        rng = np.random.default_rng(12)
+        covariate = rng.standard_normal(6_000)
+        theta = 0.8 * covariate + rng.normal(0.0, 0.6, covariate.size)
+        responses = simdata(
+            theta=theta,
+            discrimination=model.parameters["discrimination"],
+            difficulty=model.parameters["difficulty"],
+            seed=13,
+        )
+
+        def slope_on_covariate(prior_mean=None, prior_cov=None):
+            values = generate_plausible_values(
+                model,
+                responses,
+                n_plausible=5,
+                seed=14,
+                prior_mean=prior_mean,
+                prior_cov=prior_cov,
+            )
+            draws = values[:, 0, :]
+            centered = covariate - covariate.mean()
+            return float(
+                np.mean(centered @ (draws - draws.mean(axis=0))) / (centered @ centered)
+            )
+
+        conditioned = slope_on_covariate(0.8 * covariate[:, None], [[0.36]])
+        unconditioned = slope_on_covariate()
+
+        # Conditioning on the covariate removes the attenuation that a common
+        # standard normal prior imposes on the latent regression slope.
+        assert conditioned == pytest.approx(0.8, abs=0.04)
+        assert unconditioned < 0.75
+
+    def test_mcmc_and_posterior_agree_under_a_population_prior(self):
+        model, responses, _ = _shifted_population_fixture(3_000, 15)
+        prior = {"prior_mean": [0.5], "prior_cov": [[1.44]]}
+
+        posterior = generate_plausible_values(
+            model, responses, n_plausible=2, seed=3, **prior
+        )
+        mcmc = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=2,
+            method="mcmc",
+            n_iter=10,
+            burn_in=40,
+            seed=3,
+            **prior,
+        )
+
+        assert mcmc.mean() == pytest.approx(posterior.mean(), abs=0.05)
+        assert mcmc[:, 0, :].var(axis=0).mean() == pytest.approx(
+            posterior[:, 0, :].var(axis=0).mean(), rel=0.08
+        )
+
+    def test_mcmc_chains_start_at_the_prior_mean(self, monkeypatch):
+        import mirt.utils.plausible as plausible_module
+
+        model, responses, _ = _shifted_population_fixture(4, 17)
+        starts = []
+        original = plausible_module._paired_log_density
+
+        def record(model, responses, theta, chunk_size, prior=None):
+            if not starts:
+                starts.append(theta.copy())
+            return original(model, responses, theta, chunk_size, prior)
+
+        monkeypatch.setattr(plausible_module, "_paired_log_density", record)
+        means = np.array([[-1.0], [0.0], [1.0], [2.0]])
+        generate_plausible_values(
+            model, responses, n_plausible=1, method="mcmc", n_iter=1, prior_mean=means
+        )
+
+        np.testing.assert_array_equal(starts[0], means)
+
+    def test_multidimensional_population_prior_moves_the_quadrature_grid(self):
+        from mirt.models import TwoParameterLogistic
+
+        model = TwoParameterLogistic(n_items=4, n_factors=2)
+        model._is_fitted = True
+        responses = -np.ones((3, 4), dtype=int)
+        mean = np.array([1.0, -2.0])
+        cov = np.array([[0.5, 0.2], [0.2, 0.3]])
+
+        values = generate_plausible_values(
+            model,
+            responses,
+            n_plausible=4000,
+            n_quadpts=9,
+            seed=6,
+            prior_mean=mean,
+            prior_cov=cov,
+        )
+
+        draws = values.transpose(0, 2, 1).reshape(-1, 2)
+        np.testing.assert_allclose(draws.mean(axis=0), mean, atol=0.04)
+        np.testing.assert_allclose(np.cov(draws.T), cov, atol=0.04)
+
+    @pytest.mark.parametrize(
+        ("prior", "message"),
+        [
+            ({"prior_mean": [0.0, 1.0]}, "prior_mean must have shape"),
+            ({"prior_mean": np.zeros(4)}, "prior_mean must have shape"),
+            ({"prior_mean": np.zeros((3, 1))}, "prior_mean must have shape"),
+            ({"prior_mean": [np.nan]}, "finite"),
+            ({"prior_mean": np.full((4, 1), np.inf)}, "finite"),
+            ({"prior_cov": [[1.0, 0.0]]}, "prior_cov must have shape"),
+            ({"prior_cov": [[-1.0]]}, "positive definite"),
+            ({"prior_cov": [[np.nan]]}, "finite"),
+        ],
+    )
+    @pytest.mark.parametrize("method", ["posterior", "mcmc"])
+    def test_validates_population_prior(self, prior, message, method):
+        model, responses, _ = _shifted_population_fixture(4, 19)
+
+        with pytest.raises(ValueError, match=message):
+            generate_plausible_values(model, responses, method=method, **prior)

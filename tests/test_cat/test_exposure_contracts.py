@@ -315,12 +315,29 @@ def test_progressive_restricted_validates_theta_and_item_indices() -> None:
         control.filter_items({-1}, model, 0.0)
 
 
-def test_progressive_restricted_validates_batched_information_shape() -> None:
-    model = _InformationModel([0.5, 1.0])
-    model.n_items = 3
+class _TestInformationModel(_InformationModel):
+    """Return total test information from the bulk call, like polytomous models."""
 
-    with pytest.raises(ValueError, match="one value per item"):
-        ProgressiveRestricted().filter_items({0, 1}, model, 0.0)
+    def information(
+        self,
+        theta: np.ndarray,
+        item_idx: int | None = None,
+    ) -> np.ndarray:
+        self.calls += 1
+        if item_idx is None:
+            return np.array([self.values.sum()])
+        return self.values[item_idx : item_idx + 1]
+
+
+def test_progressive_restricted_evaluates_items_when_bulk_output_is_not_itemwise() -> (
+    None
+):
+    model = _TestInformationModel([0.5, 1.0, 0.2])
+    control = ProgressiveRestricted(window_size=0.6)
+
+    assert control.filter_items({0, 1, 2}, model, 0.0) == {0, 1}
+    assert control.max_information_seen == {0: 0.5, 1: 1.0, 2: 0.2}
+    assert model.calls == 4
 
 
 def test_progressive_restricted_works_in_multidimensional_engine() -> None:

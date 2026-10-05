@@ -104,8 +104,22 @@ serialized:
 
    json_text = result.to_json(indent=2)
 
-The export contains model metadata and scalar fit statistics. Parameter and uncertainty
-arrays are converted to nested Python lists.
+The export contains model metadata, including per-item category counts for
+polytomous models, and scalar fit statistics. Parameter and uncertainty arrays are
+converted to nested Python lists.
+
+Results from the ``fit_mirt`` families (1PL, 2PL, 3PL, 4PL, GRM, GPCM, PCM and NRM)
+can be rebuilt from a full export and scored again:
+
+.. code-block:: python
+
+   restored = mirt.FitResult.from_json(result.to_json())
+   scores = mirt.fscores(restored, responses)
+
+``from_dict()`` and ``from_json()`` reject unknown fields, exports written with
+``include_parameters=False``, and other model families. Unknown standard errors are
+written as ``NaN``, which Python's ``json`` module accepts but strict JSON parsers may
+not.
 
 Person-score results
 --------------------

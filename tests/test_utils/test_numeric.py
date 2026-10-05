@@ -10,7 +10,6 @@ from mirt.constants import PROB_EPSILON
 from mirt.models.dichotomous import ThreeParameterLogistic, TwoParameterLogistic
 from mirt.models.polytomous import GradedResponseModel
 from mirt.utils.numeric import (
-    compute_expected_variance,
     compute_fit_stats,
     compute_hessian_se,
     compute_probability_moments,
@@ -193,7 +192,7 @@ class TestExpectedVariance:
         )
         theta = np.linspace(-2.0, 2.0, 21)[:, None]
 
-        expected, variance = compute_expected_variance(model, theta, model.n_items)
+        _, expected, variance = compute_probability_moments(model, theta, model.n_items)
         probabilities = model.probability(theta)
 
         np.testing.assert_allclose(expected, probabilities, atol=1e-14)
@@ -205,7 +204,7 @@ class TestExpectedVariance:
         model = GradedResponseModel(3, n_categories=[3, 4, 2])
         theta = np.linspace(-2.0, 2.0, 17)[:, None]
 
-        expected, variance = compute_expected_variance(model, theta, model.n_items)
+        _, expected, variance = compute_probability_moments(model, theta, model.n_items)
         probabilities = model.probability(theta)
         categories = np.arange(probabilities.shape[2], dtype=float)
         direct_expected = probabilities @ categories
@@ -227,7 +226,7 @@ class TestExpectedVariance:
 
         model.probability = counted_probability  # type: ignore[method-assign]
 
-        compute_expected_variance(model, theta, model.n_items)
+        compute_probability_moments(model, theta, model.n_items)
 
         assert calls == 1
 
@@ -247,7 +246,7 @@ class TestExpectedVariance:
         model = TwoParameterLogistic(2)
 
         with pytest.raises(ValueError, match=message):
-            compute_expected_variance(model, theta, n_items)
+            compute_probability_moments(model, theta, n_items)
 
     def test_invalid_model_probabilities_are_rejected(self) -> None:
         model = TwoParameterLogistic(2)
@@ -256,7 +255,7 @@ class TestExpectedVariance:
         )
 
         with pytest.raises(ValueError, match="outside"):
-            compute_expected_variance(model, np.array([[0.0]]), 2)
+            compute_probability_moments(model, np.array([[0.0]]), 2)
 
 
 class TestFitStatistics:

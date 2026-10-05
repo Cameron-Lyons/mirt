@@ -11,6 +11,11 @@ from typing import Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    item_category_table,
+)
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
@@ -314,17 +319,8 @@ class _OrdinalLogitModel(PolytomousItemModel):
         item_idx = self._validate_item_idx(item_idx)
         return self._all_item_information(theta_1d)[:, item_idx]
 
-    def information(
-        self,
-        theta: NDArray[np.float64],
-        item_idx: int | None = None,
-    ) -> NDArray[np.float64]:
-        """Compute exact Fisher information for one item or the test."""
-        theta_1d = self._prepare_theta(theta)
-        information = self._all_item_information(theta_1d)
-        if item_idx is not None:
-            return information[:, self._validate_item_idx(item_idx)]
-        return np.sum(information, axis=1)
+    def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        return self._all_item_information(self._prepare_theta(theta))
 
     def expected_score(
         self,
@@ -412,16 +408,15 @@ class _OrdinalLogitModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         """Compute each response pattern's likelihood over an ability grid."""
         safe_responses, observed = self._validated_responses(responses)
-        probabilities = self.probability(theta)
-        log_probabilities = np.log(np.clip(probabilities, PROB_EPSILON, 1.0))
-        result = np.zeros((safe_responses.shape[0], probabilities.shape[0]))
-        category_mask = np.empty_like(observed)
-        for category in range(self.max_categories):
-            np.equal(safe_responses, category, out=category_mask)
-            np.logical_and(category_mask, observed, out=category_mask)
-            if np.any(category_mask):
-                result += category_mask @ log_probabilities[:, :, category].T
-        return result
+        log_table = item_category_table(self.probability(theta), self._n_categories)
+        np.clip(log_table, PROB_EPSILON, 1.0, out=log_table)
+        np.log(log_table, out=log_table)
+        return categorical_log_likelihood_batch(
+            log_table,
+            category_offsets(self._n_categories),
+            safe_responses,
+            observed,
+        )
 
 
 class _SequentialProcessModel(_OrdinalLogitModel):

@@ -1,24 +1,35 @@
 //! Polytomous IRT model computations (GRM, GPCM).
 
 use crate::likelihood_cache::cached_likelihoods;
-use crate::utils::grm_category_probability;
+use crate::utils::{EPSILON, grm_category_probability};
 use numpy::ndarray::ArrayView2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyIndexError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
-fn validate_categories(
-    responses: ArrayView2<'_, i32>,
+/// Convert category counts to `usize`, mapping negative counts to zero so the
+/// parameter check rejects them.
+pub(crate) fn category_counts(n_categories: PyReadonlyArray1<i32>) -> Vec<usize> {
+    n_categories
+        .as_array()
+        .iter()
+        .map(|&v| v.max(0) as usize)
+        .collect()
+}
+
+/// Check one parameter row per item and enough columns for each item's
+/// categories; `includes_zero` means column 0 belongs to category 0.
+pub(crate) fn validate_category_parameters(
+    n_items: usize,
     categories: &[usize],
     n_parameters: usize,
     parameters: ArrayView2<'_, f64>,
     includes_zero: bool,
 ) -> PyResult<()> {
-    let items = responses.ncols();
-    if categories.len() != items
-        || n_parameters != items
-        || parameters.nrows() != items
+    if categories.len() != n_items
+        || n_parameters != n_items
+        || parameters.nrows() != n_items
         || categories
             .iter()
             .any(|&k| k < 2 || k - usize::from(!includes_zero) > parameters.ncols())
@@ -27,6 +38,14 @@ fn validate_categories(
             "incompatible item parameters or category counts",
         ));
     }
+    Ok(())
+}
+
+/// Reject observed responses at or above their item's category count.
+pub(crate) fn validate_response_categories(
+    responses: ArrayView2<'_, i32>,
+    categories: &[usize],
+) -> PyResult<()> {
     for row in responses.rows() {
         if row
             .iter()
@@ -39,6 +58,52 @@ fn validate_categories(
         }
     }
     Ok(())
+}
+
+fn validate_categories(
+    responses: ArrayView2<'_, i32>,
+    categories: &[usize],
+    n_parameters: usize,
+    parameters: ArrayView2<'_, f64>,
+    includes_zero: bool,
+) -> PyResult<()> {
+    validate_category_parameters(
+        responses.ncols(),
+        categories,
+        n_parameters,
+        parameters,
+        includes_zero,
+    )?;
+    validate_response_categories(responses, categories)
+}
+
+/// Fill `row` with the log GRM category probabilities of one item at `theta`.
+pub(crate) fn grm_log_row(theta: f64, discrimination: f64, thresholds: &[f64], row: &mut [f64]) {
+    let n_categories = row.len();
+    for (k, value) in row.iter_mut().enumerate() {
+        *value = grm_category_probability(theta, discrimination, thresholds, k, n_categories).ln();
+    }
+}
+
+/// Turn adjacent-category increments into log category probabilities.
+///
+/// Category 0 has logit zero and category `k` the sum of `increment(1..=k)`.
+/// Probabilities are floored at `EPSILON` before taking logs.
+pub(crate) fn adjacent_log_row(row: &mut [f64], increment: impl Fn(usize) -> f64) {
+    row[0] = 0.0;
+    for k in 1..row.len() {
+        row[k] = row[k - 1] + increment(k);
+    }
+    log_softmax_floor(row);
+}
+
+/// Replace logits with floored log-softmax probabilities in place.
+pub(crate) fn log_softmax_floor(row: &mut [f64]) {
+    let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let log_denom = max + row.iter().map(|&v| (v - max).exp()).sum::<f64>().ln();
+    for value in row {
+        *value = (*value - log_denom).exp().max(EPSILON).ln();
+    }
 }
 
 /// Compute GRM likelihoods using a bounded shared category-probability table.
@@ -55,11 +120,7 @@ pub fn compute_log_likelihoods_grm<'py>(
     let points = quad_points.as_array();
     let disc = discrimination.as_array();
     let thresholds = thresholds.as_array();
-    let categories: Vec<usize> = n_categories
-        .as_array()
-        .iter()
-        .map(|&v| v.max(0) as usize)
-        .collect();
+    let categories = category_counts(n_categories);
     validate_categories(responses, &categories, disc.len(), thresholds, false)?;
     let thresholds: Vec<Vec<f64>> = thresholds
         .rows()
@@ -68,11 +129,7 @@ pub fn compute_log_likelihoods_grm<'py>(
         .collect();
     let result = py.detach(|| {
         cached_likelihoods(responses, points.len(), &categories, false, |q, j, row| {
-            for (k, value) in row.iter_mut().enumerate() {
-                *value =
-                    grm_category_probability(points[q], disc[j], &thresholds[j], k, categories[j])
-                        .ln();
-            }
+            grm_log_row(points[q], disc[j], &thresholds[j], row);
         })
     });
     Ok(result.into_pyarray(py))
@@ -92,22 +149,11 @@ pub fn compute_log_likelihoods_gpcm<'py>(
     let points = quad_points.as_array();
     let disc = discrimination.as_array();
     let steps = steps.as_array();
-    let categories: Vec<usize> = n_categories
-        .as_array()
-        .iter()
-        .map(|&v| v.max(0) as usize)
-        .collect();
+    let categories = category_counts(n_categories);
     validate_categories(responses, &categories, disc.len(), steps, true)?;
     let result = py.detach(|| {
         cached_likelihoods(responses, points.len(), &categories, false, |q, j, row| {
-            for k in 1..row.len() {
-                row[k] = row[k - 1] + disc[j] * (points[q] - steps[[j, k]]);
-            }
-            let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            let log_denom = max + row.iter().map(|&v| (v - max).exp()).sum::<f64>().ln();
-            for value in row {
-                *value = (*value - log_denom).exp().max(1e-10).ln();
-            }
+            adjacent_log_row(row, |k| disc[j] * (points[q] - steps[[j, k]]));
         })
     });
     Ok(result.into_pyarray(py))

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt._categorical import draw_item_responses
 from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.constants import PROB_EPSILON
 from mirt.utils.numeric import logsumexp
@@ -308,45 +309,6 @@ def _pointwise_log_likelihood(
         )
 
     return np.where(observed, log_likelihood, 0.0)
-
-
-def _simulate_response_matrix(
-    model: BaseItemModel,
-    theta: NDArray[np.float64],
-    rng: np.random.Generator,
-) -> NDArray[np.int_]:
-    """Draw a dichotomous or polytomous response matrix from a model."""
-    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-    expected_shape = (theta.shape[0], model.n_items)
-
-    if probabilities.shape[:2] != expected_shape:
-        raise ValueError(
-            "model probability shape does not match theta and item dimensions: "
-            f"{probabilities.shape[:2]} != {expected_shape}"
-        )
-
-    if probabilities.ndim == 2:
-        if not np.all(np.isfinite(probabilities)):
-            raise ValueError("model probabilities must be finite")
-        probabilities = np.clip(probabilities, 0.0, 1.0)
-        return (rng.random(probabilities.shape) < probabilities).astype(np.int64)
-
-    if probabilities.ndim != 3:
-        raise ValueError(
-            "model probabilities must have shape (n_persons, n_items) or "
-            "(n_persons, n_items, n_categories)"
-        )
-
-    probabilities = np.clip(probabilities, 0.0, None)
-    totals = probabilities.sum(axis=2, keepdims=True)
-    if not np.all(np.isfinite(probabilities)) or np.any(totals <= 0):
-        raise ValueError("category probabilities must be finite with positive totals")
-    probabilities = probabilities / totals
-    cumulative = np.cumsum(probabilities, axis=2)
-    draws = rng.random(probabilities.shape[:2])
-    replicated = np.sum(draws[..., None] > cumulative, axis=2)
-    category_max = np.asarray(model.n_categories, dtype=np.int64)[None, :] - 1
-    return np.minimum(replicated, category_max).astype(np.int64)
 
 
 @dataclass
@@ -1031,7 +993,7 @@ def posterior_predictive_checks(
                 theta = rng.standard_normal((n_persons, model.n_factors))
             if not builtin_curves:
                 theta = theta.copy()
-            replicated = _simulate_response_matrix(model, theta, rng)
+            replicated = draw_item_responses(model, theta, rng, dtype=np.int64)
             replicated = np.where(observed, replicated, -1)
             for name, statistic in statistics.items():
                 replicated_statistics[name][rep_idx] = statistic(replicated)

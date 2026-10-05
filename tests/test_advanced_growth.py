@@ -238,9 +238,138 @@ class TestNonlinearGrowthModel:
 
         params = model.fit_individual(time_values, true_theta)
 
-        assert "asymptote" in params
-        assert "rate" in params
-        assert "inflection" in params
+        assert set(params) == {"asymptote", "rate", "inflection", "converged", "sse"}
+        assert all(type(params[key]) is float for key in params if key != "converged")
+        assert params["converged"] is True
+        assert params["asymptote"] == pytest.approx(1.0, abs=1e-6)
+        assert params["rate"] == pytest.approx(1.0, abs=1e-6)
+        assert params["inflection"] == pytest.approx(2.0, abs=1e-6)
+
+    @pytest.mark.parametrize("growth_type", ["logistic", "gompertz", "exponential"])
+    def test_fit_individual_recovers_noise_free_curve(self, growth_type):
+        """Regression: the rate and inflection must move away from the defaults."""
+        model = NonlinearGrowthModel(
+            growth_type=growth_type,
+            asymptote=2.0,
+            rate=1.5,
+            inflection=3.0,
+        )
+        time_values = np.linspace(0.0, 8.0, 17)
+        observations = model.compute_theta(
+            time_values, asymptote=3.0, rate=0.8, inflection=5.0
+        )
+
+        params = model.fit_individual(time_values, observations)
+
+        assert params["converged"] is True
+        assert params["asymptote"] == pytest.approx(3.0, abs=1e-6)
+        assert params["rate"] == pytest.approx(0.8, abs=1e-6)
+        expected_inflection = 3.0 if growth_type == "exponential" else 5.0
+        assert params["inflection"] == pytest.approx(expected_inflection, abs=1e-6)
+        assert params["sse"] < 1e-12
+
+    @pytest.mark.parametrize("growth_type", ["logistic", "gompertz", "exponential"])
+    def test_fit_individual_recovers_noisy_curve(self, growth_type):
+        """Noisy trajectories are fitted close to the generating curve."""
+        model = NonlinearGrowthModel(growth_type=growth_type, rate=1.0)
+        rng = np.random.default_rng(20261005)
+        time_values = np.linspace(0.0, 10.0, 25)
+        truth = model.compute_theta(
+            time_values, asymptote=2.5, rate=0.7, inflection=4.0
+        )
+        observations = truth + rng.normal(0.0, 0.05, time_values.size)
+
+        params = model.fit_individual(time_values, observations)
+
+        assert params["converged"] is True
+        assert params["asymptote"] == pytest.approx(2.5, abs=0.1)
+        assert params["rate"] == pytest.approx(0.7, abs=0.1)
+        if growth_type != "exponential":
+            assert params["inflection"] == pytest.approx(4.0, abs=0.1)
+        residuals = observations - model.compute_theta(
+            time_values,
+            asymptote=params["asymptote"],
+            rate=params["rate"],
+            inflection=params["inflection"],
+        )
+        assert params["sse"] == pytest.approx(float(residuals @ residuals))
+        assert params["sse"] <= float((observations - truth) @ (observations - truth))
+
+    def test_fit_individual_allows_declining_trajectories(self):
+        """A negative asymptote is estimated rather than clamped."""
+        model = NonlinearGrowthModel(growth_type="logistic")
+        time_values = np.linspace(0.0, 8.0, 12)
+        observations = model.compute_theta(
+            time_values, asymptote=-2.0, rate=0.5, inflection=4.0
+        )
+
+        params = model.fit_individual(time_values, observations)
+
+        assert params["asymptote"] == pytest.approx(-2.0, abs=1e-6)
+        assert params["rate"] == pytest.approx(0.5, abs=1e-6)
+        assert params["inflection"] == pytest.approx(4.0, abs=1e-6)
+
+    def test_fit_individual_reports_nonconvergence_at_iteration_limit(self):
+        """Exhausting max_iter returns finite estimates flagged as unconverged."""
+        model = NonlinearGrowthModel(growth_type="logistic")
+        time_values = np.linspace(0.0, 8.0, 17)
+
+        params = model.fit_individual(time_values, np.full(17, 1.3), max_iter=5)
+
+        assert params["converged"] is False
+        assert np.isfinite([params[key] for key in ("asymptote", "rate", "sse")]).all()
+
+    def test_fit_individual_reports_rate_stuck_at_bound(self):
+        """A rate pinned to its bound is not reported as converged."""
+        model = NonlinearGrowthModel(growth_type="logistic", rate=1e12)
+        time_values = np.linspace(0.0, 8.0, 17)
+        observations = model.compute_theta(
+            time_values, asymptote=2.0, rate=0.5, inflection=3.0
+        )
+
+        params = model.fit_individual(time_values, observations)
+
+        assert params["converged"] is False
+        assert params["rate"] == pytest.approx(1e8)
+
+    def test_fit_individual_rejects_curves_overflowing_at_start(self):
+        """Overflowing starting curves raise a clear error instead of scipy's."""
+        model = NonlinearGrowthModel(growth_type="exponential")
+
+        with pytest.raises(ValueError, match="overflows at the starting values"):
+            model.fit_individual(np.linspace(-800.0, 0.0, 9), np.linspace(0, 1, 9))
+
+    @pytest.mark.parametrize(
+        ("time_values", "observations", "kwargs", "message"),
+        [
+            (np.zeros((2, 2)), np.zeros(4), {}, "1D"),
+            (np.arange(5.0), np.zeros(4), {}, "same length"),
+            (np.arange(5.0), np.array([0.0, 1.0, np.nan, 1.0, 1.0]), {}, "finite"),
+            (np.arange(3.0), np.zeros(3), {}, "at least 4 observations"),
+            (np.arange(5.0), np.zeros(5), {"max_iter": 0}, "max_iter"),
+            (np.arange(5.0), np.zeros(5), {"max_iter": 2.5}, "max_iter"),
+        ],
+    )
+    def test_fit_individual_rejects_invalid_inputs(
+        self, time_values, observations, kwargs, message
+    ):
+        """Malformed trajectories are rejected before optimization."""
+        model = NonlinearGrowthModel(growth_type="logistic")
+
+        with pytest.raises(ValueError, match=message):
+            model.fit_individual(time_values, observations, **kwargs)
+
+    def test_fit_individual_exponential_needs_three_observations(self):
+        """Exponential curves have two free parameters."""
+        model = NonlinearGrowthModel(growth_type="exponential")
+
+        with pytest.raises(ValueError, match="at least 3 observations"):
+            model.fit_individual(np.arange(2.0), np.zeros(2))
+        params = model.fit_individual(
+            np.arange(3.0), model.compute_theta(np.arange(3.0), 1.5, 0.4)
+        )
+        assert params["asymptote"] == pytest.approx(1.5, abs=1e-6)
+        assert params["rate"] == pytest.approx(0.4, abs=1e-6)
 
 
 class TestGrowthMixtureModel:
@@ -386,6 +515,251 @@ class TestGrowthMixtureModel:
         entropy = model.entropy(observations, time_values)
 
         assert 0 <= entropy
+
+
+def _dense_growth_mixture_reference(model, observations, time_values, prediction_times):
+    """Per-person dense-covariance reference for the masked Woodbury algebra."""
+    n_persons = observations.shape[0]
+    trajectories = np.vstack(
+        [model.compute_class_trajectory(k, time_values) for k in range(model.n_classes)]
+    )
+    prediction_trajectories = np.vstack(
+        [
+            model.compute_class_trajectory(k, prediction_times)
+            for k in range(model.n_classes)
+        ]
+    )
+    design = np.column_stack([np.ones_like(time_values), time_values])
+    if model.growth_type == "quadratic":
+        design = np.column_stack([design, time_values**2])
+    elif model.growth_type == "piecewise":
+        hinge = np.maximum(time_values - model.changepoint, 0.0)
+        design = np.column_stack([design, hinge])
+
+    log_likelihoods = np.empty((n_persons, model.n_classes))
+    class_means = np.empty((n_persons, model.n_classes, prediction_times.size))
+    conditional_variances = np.empty((n_persons, prediction_times.size))
+    precision_grams = np.empty((n_persons, design.shape[1], design.shape[1]))
+    precision_observations = np.empty((n_persons, design.shape[1]))
+    for person, row in enumerate(observations):
+        observed = ~np.isnan(row)
+        times = time_values[observed]
+        covariance = (
+            model.intercept_var * np.ones((times.size, times.size))
+            + model.slope_var * np.outer(times, times)
+            + model.residual_variance * np.eye(times.size)
+        )
+        cross = model.intercept_var + model.slope_var * np.outer(
+            prediction_times, times
+        )
+        _, log_determinant = np.linalg.slogdet(covariance)
+        for k in range(model.n_classes):
+            residual = row[observed] - trajectories[k, observed]
+            log_likelihoods[person, k] = -0.5 * (
+                residual @ np.linalg.solve(covariance, residual)
+                + times.size * np.log(2.0 * np.pi)
+                + log_determinant
+            )
+            class_means[person, k] = prediction_trajectories[k] + cross @ (
+                np.linalg.solve(covariance, residual)
+            )
+        conditional_variances[person] = (
+            model.intercept_var
+            + model.slope_var * prediction_times**2
+            - np.einsum("ij,ji->i", cross, np.linalg.solve(covariance, cross.T))
+        )
+        observed_design = design[observed]
+        precision_grams[person] = observed_design.T @ np.linalg.solve(
+            covariance, observed_design
+        )
+        precision_observations[person] = observed_design.T @ np.linalg.solve(
+            covariance, row[observed]
+        )
+
+    log_joint = log_likelihoods + np.log(model.class_proportions)
+    posteriors = np.exp(log_joint - log_joint.max(axis=1, keepdims=True))
+    posteriors /= posteriors.sum(axis=1, keepdims=True)
+    means = np.einsum("nk,nkp->np", posteriors, class_means)
+    variances = conditional_variances + np.einsum(
+        "nk,nkp->np", posteriors, (class_means - means[:, None, :]) ** 2
+    )
+    normal_matrices = np.einsum("nk,nab->kab", posteriors, precision_grams)
+    right_hand_sides = posteriors.T @ precision_observations
+    coefficients = np.linalg.solve(normal_matrices, right_hand_sides[..., None])[..., 0]
+    return log_likelihoods, posteriors, means, variances, coefficients
+
+
+class TestGrowthMixtureMaskedLikelihood:
+    """Vectorized masked-Woodbury algebra against dense per-person references."""
+
+    @pytest.mark.parametrize("growth_type", ["linear", "quadratic", "piecewise"])
+    @pytest.mark.parametrize(
+        ("intercept_var", "slope_var"),
+        [(0.5, 0.1), (0.0, 0.1), (0.5, 0.0), (0.0, 0.0)],
+    )
+    @pytest.mark.parametrize("missing_rate", [0.0, 0.15, 0.4])
+    def test_matches_dense_reference(
+        self, growth_type, intercept_var, slope_var, missing_rate
+    ):
+        """Likelihoods, predictions and one EM update match dense algebra."""
+        model = GrowthMixtureModel(
+            n_classes=3,
+            growth_type=growth_type,
+            class_proportions=np.array([0.3, 0.45, 0.25]),
+            class_intercepts=np.array([-1.5, 0.0, 1.5]),
+            class_slopes=np.array([0.3, -0.2, 0.1]),
+            class_quadratics=np.array([0.04, -0.02, 0.01]),
+            class_post_slopes=np.array([-0.3, 0.4, 0.2]),
+            changepoint=1.5,
+            intercept_var=intercept_var,
+            slope_var=slope_var,
+            residual_variance=0.25,
+        )
+        time_values = np.linspace(-1.0, 4.0, 8)
+        rng = np.random.default_rng(
+            [len(growth_type), int(intercept_var * 10), int(slope_var * 10)]
+        )
+        observations, _ = model.simulate(60, time_values, seed=rng)
+        if missing_rate:
+            observations[rng.random(observations.shape) < missing_rate] = np.nan
+            observations[:3] = np.nan
+            observations[:3, [1, 4, 6]] = [0.2, -0.1, 0.6]
+            observations[3, :] = np.nan
+            observations[3, 2] = 0.4
+            observations[4, :] = np.nan
+            observations[4, [0, 7]] = [-1.0, 1.0]
+            observations[5] = model.simulate(1, time_values, seed=rng)[0][0]
+            observations = observations[np.isfinite(observations).any(axis=1)]
+        prediction_times = np.array([-2.0, 0.5, 3.0, 6.0])
+
+        (
+            expected_log_likelihoods,
+            expected_posteriors,
+            expected_means,
+            expected_variances,
+            expected_coefficients,
+        ) = _dense_growth_mixture_reference(
+            model, observations, time_values, prediction_times
+        )
+
+        np.testing.assert_allclose(
+            model.class_log_likelihood(observations, time_values),
+            expected_log_likelihoods,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        np.testing.assert_allclose(
+            model.posterior_probabilities(observations, time_values),
+            expected_posteriors,
+            rtol=1e-10,
+            atol=1e-12,
+        )
+        means, variances = model.predict_trajectory_moments(
+            observations, time_values, prediction_times
+        )
+        np.testing.assert_allclose(means, expected_means, rtol=1e-10, atol=1e-10)
+        np.testing.assert_allclose(variances, expected_variances, rtol=1e-9, atol=1e-10)
+        np.testing.assert_allclose(
+            model.predict_trajectories(observations, time_values, prediction_times),
+            expected_means,
+            rtol=1e-10,
+            atol=1e-10,
+        )
+        _, residual_variances = model.predict_trajectory_moments(
+            observations, time_values, prediction_times, include_residual=True
+        )
+        np.testing.assert_allclose(
+            residual_variances,
+            expected_variances + model.residual_variance,
+            rtol=1e-9,
+            atol=1e-10,
+        )
+
+        model.fit_em(observations, time_values, max_iter=1)
+
+        np.testing.assert_allclose(
+            model.class_proportions, expected_posteriors.mean(axis=0), rtol=1e-10
+        )
+        np.testing.assert_allclose(
+            model.class_intercepts, expected_coefficients[:, 0], rtol=1e-9, atol=1e-10
+        )
+        np.testing.assert_allclose(
+            model.class_slopes, expected_coefficients[:, 1], rtol=1e-9, atol=1e-10
+        )
+        if growth_type == "quadratic":
+            np.testing.assert_allclose(
+                model.class_quadratics,
+                expected_coefficients[:, 2],
+                rtol=1e-9,
+                atol=1e-10,
+            )
+        elif growth_type == "piecewise":
+            np.testing.assert_allclose(
+                model.class_post_slopes,
+                expected_coefficients[:, 1] + expected_coefficients[:, 2],
+                rtol=1e-9,
+                atol=1e-10,
+            )
+
+    def test_fit_does_not_depend_on_row_order_or_pattern_count(self):
+        """Every row has its own pattern yet the fit equals the permuted fit."""
+        source = GrowthMixtureModel(
+            n_classes=2,
+            class_intercepts=np.array([-1.0, 1.0]),
+            class_slopes=np.array([0.4, -0.2]),
+            intercept_var=0.3,
+            slope_var=0.05,
+            residual_variance=0.2,
+        )
+        time_values = np.arange(14.0)
+        observations, _ = source.simulate(300, time_values, seed=11)
+        rng = np.random.default_rng(12)
+        observations[rng.random(observations.shape) < 0.3] = np.nan
+        observations[:, 0] = rng.normal(size=300)
+        assert np.unique(np.isnan(observations), axis=0).shape[0] > 250
+        order = rng.permutation(300)
+        first = GrowthMixtureModel(
+            n_classes=2,
+            class_intercepts=np.array([-0.5, 0.5]),
+            intercept_var=0.3,
+            slope_var=0.05,
+            residual_variance=0.2,
+        )
+        second = GrowthMixtureModel(
+            n_classes=2,
+            class_intercepts=np.array([-0.5, 0.5]),
+            intercept_var=0.3,
+            slope_var=0.05,
+            residual_variance=0.2,
+        )
+
+        result = first.fit(observations, time_values, max_iter=200, tol=1e-10)
+        permuted = second.fit(observations[order], time_values, max_iter=200, tol=1e-10)
+
+        assert result.converged and permuted.converged
+        np.testing.assert_allclose(first.class_intercepts, second.class_intercepts)
+        np.testing.assert_allclose(first.class_slopes, second.class_slopes)
+        np.testing.assert_allclose(result.posteriors[order], permuted.posteriors)
+        assert result.log_likelihood == pytest.approx(permuted.log_likelihood)
+
+    def test_complete_data_without_random_effects_is_unchanged(self):
+        """The cdist fast path still produces the closed-form normal density."""
+        model = GrowthMixtureModel(
+            n_classes=2, intercept_var=0.0, slope_var=0.0, residual_variance=0.4
+        )
+        time_values = np.arange(5.0)
+        observations = np.random.default_rng(3).normal(size=(7, 5))
+        trajectories = np.vstack(
+            [model.compute_class_trajectory(k, time_values) for k in range(2)]
+        )
+        squared = ((observations[:, None, :] - trajectories[None]) ** 2).sum(axis=2)
+        expected = -0.5 * (squared / 0.4 + 5 * np.log(2.0 * np.pi) + 5 * np.log(0.4))
+
+        np.testing.assert_allclose(
+            model.class_log_likelihood(observations, time_values),
+            expected,
+            rtol=1e-14,
+        )
 
 
 class TestGrowthModelIntegration:

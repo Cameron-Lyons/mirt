@@ -361,19 +361,21 @@ class TestComputeOutfitInfit:
 
         result = compute_outfit_infit(model, responses, np.zeros(4))
 
+        squared = np.where(responses >= 0, (responses - expected) ** 2, np.nan)
         assert model.probability_calls == responses.shape[1]
-        assert_allclose(result["item_outfit"], np.nanmean(z_sq, axis=0))
-        assert_allclose(result["person_outfit"], np.nanmean(z_sq, axis=1))
+        assert_allclose(result["item_outfit"], np.nanmean(squared / variance, axis=0))
+        assert_allclose(result["person_outfit"], np.nanmean(squared / variance, axis=1))
         assert_allclose(
             result["item_infit"],
-            np.nansum(z_sq * variance, axis=0)
-            / (np.nansum(variance, axis=0) + PROB_EPSILON),
+            np.nansum(squared, axis=0) / np.nansum(variance, axis=0),
+            rtol=1e-14,
         )
         assert_allclose(
             result["person_infit"],
-            np.nansum(z_sq * variance, axis=1)
-            / (np.nansum(variance, axis=1) + PROB_EPSILON),
+            np.nansum(squared, axis=1) / np.nansum(variance, axis=1),
+            rtol=1e-14,
         )
+        assert_allclose(z_sq, squared / (variance + PROB_EPSILON), equal_nan=True)
 
     def test_reports_valid_observation_counts_on_request(self):
         probabilities = [
@@ -457,48 +459,82 @@ class TestComputeOutfitInfit:
             compute_outfit_infit(model, responses, np.zeros(2), **kwargs)
 
 
-def test_fit_statistics_chunking_matches_direct_aggregation() -> None:
-    rng = np.random.default_rng(20260830)
-    residuals = rng.normal(size=(17, 13))
-    variances = rng.uniform(0.05, 0.25, size=residuals.shape)
-    missing = rng.random(residuals.shape) < 0.2
-    residuals[missing] = np.nan
-    variances[missing] = np.nan
-    residuals[:, -1] = np.nan
-    variances[:, -1] = np.nan
-    accumulator = residuals_module._FitAccumulator.create(*residuals.shape)
-    for start in range(0, len(residuals), 3):
-        rows = slice(start, start + 3)
-        accumulator.add(residuals[rows], variances[rows], rows=rows)
-    actual = accumulator.finish()
+@pytest.mark.parametrize("block_rows", [1, 3, 17])
+def test_item_person_totals_match_shared_fit_statistics(block_rows) -> None:
+    """Row blocks reproduce the shared item and person fit statistics."""
+    from mirt.utils.numeric import compute_fit_stats
 
-    valid = np.isfinite(residuals)
-    squared = np.where(valid, np.square(residuals), 0.0)
-    weighted = np.where(valid, squared * variances, 0.0)
-    item_n = np.sum(valid, axis=0)
-    person_n = np.sum(valid, axis=1)
-    item_variance = np.sum(variances, axis=0, where=valid, initial=0.0)
-    person_variance = np.sum(variances, axis=1, where=valid, initial=0.0)
-    references = {
-        "item_outfit": np.divide(
-            np.sum(squared, axis=0),
-            item_n,
-            out=np.full(residuals.shape[1], np.nan),
-            where=item_n > 0,
-        ),
-        "item_infit": np.divide(
-            np.sum(weighted, axis=0),
-            item_variance + PROB_EPSILON,
-            out=np.full(residuals.shape[1], np.nan),
-            where=item_n > 0,
-        ),
-        "person_outfit": np.sum(squared, axis=1) / person_n,
-        "person_infit": np.sum(weighted, axis=1) / (person_variance + PROB_EPSILON),
-    }
-    np.testing.assert_array_equal(actual["item_n"], item_n)
-    np.testing.assert_array_equal(actual["person_n"], person_n)
-    for name, expected in references.items():
-        assert_allclose(actual[name], expected, equal_nan=True)
+    rng = np.random.default_rng(20260830)
+    expected = rng.uniform(0.05, 0.95, size=(17, 13))
+    variance = expected * (1.0 - expected)
+    variance[:3, 2] = PROB_EPSILON / 4
+    responses = (rng.random(expected.shape) < expected).astype(float)
+    responses[rng.random(responses.shape) < 0.2] = -1
+    responses[:, -1] = -1
+    totals = residuals_module._ItemPersonFit(*responses.shape)
+    for start in range(0, len(responses), block_rows):
+        rows = slice(start, start + block_rows)
+        totals.add(responses[rows], expected[rows], variance[rows], persons=rows)
+    actual = totals.finish()
+
+    for prefix, axis in (("item", 0), ("person", 1)):
+        infit, outfit = compute_fit_stats(responses, expected, variance, axis=axis)
+        assert_allclose(actual[f"{prefix}_infit"], infit, rtol=1e-13, equal_nan=True)
+        assert_allclose(actual[f"{prefix}_outfit"], outfit, rtol=1e-13, equal_nan=True)
+        np.testing.assert_array_equal(
+            actual[f"{prefix}_n"], np.count_nonzero(responses >= 0, axis=axis)
+        )
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+def test_outfit_infit_matches_itemfit_and_personfit(polytomous) -> None:
+    """All mean-square APIs share one definition, near-deterministic cells too.
+
+    Persons at theta = 12 answer steep items with variance far below
+    ``PROB_EPSILON``. They used to dominate ``compute_outfit_infit`` outfit
+    (about 2e7 for an item and 1e9 for a person) while ``compute_itemfit`` and
+    ``compute_personfit`` excluded them.
+    """
+    from mirt.diagnostics.itemfit import compute_itemfit
+    from mirt.diagnostics.personfit import compute_personfit
+    from mirt.models import GradedResponseModel, TwoParameterLogistic
+
+    rng = np.random.default_rng(0)
+    n_items = 10
+    if polytomous:
+        model = GradedResponseModel(n_items, n_categories=3)
+    else:
+        model = TwoParameterLogistic(n_items)
+        model.set_parameters(
+            discrimination=np.full(n_items, 3.0),
+            difficulty=np.linspace(-1.0, 1.0, n_items),
+        )
+    theta = rng.normal(size=(500, 1))
+    theta[:5] = 12.0
+    probabilities = model.probability(theta)
+    if polytomous:
+        cumulative = probabilities.cumsum(axis=2)
+        responses = (rng.random((500, n_items, 1)) > cumulative).sum(axis=2)
+    else:
+        responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+    responses[0, 0] = 0
+    responses[rng.random(responses.shape) < 0.03] = -1
+
+    combined = compute_outfit_infit(model, responses, theta, include_standardized=True)
+    statistics = ["infit", "outfit", "z_infit", "z_outfit"]
+    items = compute_itemfit(model, responses, statistics, theta=theta)
+    persons = compute_personfit(model, responses, theta, statistics)
+
+    for name in statistics:
+        assert_allclose(
+            combined[f"item_{name}"], items[name], rtol=1e-12, equal_nan=True
+        )
+        assert_allclose(
+            combined[f"person_{name}"], persons[name], rtol=1e-12, equal_nan=True
+        )
+    if not polytomous:
+        assert np.all(combined["item_outfit"] < 5.0)
+        assert np.nanmax(combined["person_outfit"]) < 1e3
 
 
 class TestIdentifyMisfittingPatterns:

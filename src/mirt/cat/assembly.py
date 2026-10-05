@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 AssemblyMethod = Literal["maximize_information", "target_information"]
 
+# Absolute and row-relative tolerance for checking rounded solver solutions.
+_FEASIBILITY_TOLERANCE = 1e-6
+
 
 @dataclass(frozen=True)
 class FormAssemblyResult:
@@ -47,6 +50,14 @@ class FormAssemblyResult:
         Sum of selected item costs when costs were supplied.
     solver_message : str
         Completion detail reported by the mixed-integer optimizer.
+    is_optimal : bool
+        Whether the optimizer proved the form optimal, within its relative
+        gap tolerance ``mip_rel_gap``. ``False`` means a solver limit, such as
+        ``time_limit`` or ``node_limit``, stopped the search and the form is
+        the best feasible solution found.
+    mip_gap : float | None
+        Relative gap between the form's objective and the optimizer's bound,
+        when reported.
     """
 
     selected_items: NDArray[np.intp]
@@ -57,6 +68,8 @@ class FormAssemblyResult:
     content_counts: dict[str, int]
     total_cost: float | None
     solver_message: str
+    is_optimal: bool = True
+    mip_gap: float | None = None
 
     @property
     def n_items(self) -> int:
@@ -74,6 +87,7 @@ class FormAssemblyResult:
             "Fixed-form assembly",
             f"Items: {self.n_items}",
             f"Objective: {objective_name} = {self.objective_value:.6g}",
+            _solver_status(self.is_optimal, self.mip_gap),
         ]
         if self.total_cost is not None:
             lines.append(f"Total cost: {self.total_cost:.6g}")
@@ -83,6 +97,72 @@ class FormAssemblyResult:
             )
             lines.append(f"Content: {counts}")
         return "\n".join(lines)
+
+
+def _solver_status(is_optimal: bool, mip_gap: float | None) -> str:
+    """Describe whether an assembly is proven optimal."""
+    if is_optimal:
+        return "Solver: optimal"
+    gap = "unavailable" if mip_gap is None else f"{mip_gap:.4g}"
+    return f"Solver: limit reached, best feasible solution (MIP gap {gap})"
+
+
+def _validate_require_optimal(value: Any) -> bool:
+    """Return a boolean optimality requirement."""
+    if not isinstance(value, (bool, np.bool_)):
+        raise TypeError("require_optimal must be a boolean")
+    return bool(value)
+
+
+def _solver_incumbent(
+    result: Any,
+    *,
+    require_optimal: bool,
+    label: str,
+) -> tuple[NDArray[np.float64], bool, float | None]:
+    """Return the solver's solution, whether it is proven optimal, and its gap.
+
+    When a time, node, or solution limit stops branch and bound, HiGHS still
+    reports its best feasible incumbent. That incumbent is returned unless
+    ``require_optimal`` is set. Runs without an incumbent always raise.
+    """
+    status = int(result.status)
+    is_optimal = status == 0
+    if result.x is None or status in (2, 3) or (require_optimal and not is_optimal):
+        raise RuntimeError(f"{label} failed: {result.message}")
+    gap = getattr(result, "mip_gap", None)
+    mip_gap = float(gap) if gap is not None and np.isfinite(gap) else None
+    return np.asarray(result.x, dtype=np.float64), is_optimal, mip_gap
+
+
+def _check_rounded_solution(
+    constraint_matrix: Any,
+    solution: NDArray[np.float64],
+    constraint_bounds: tuple[NDArray[np.float64], NDArray[np.float64]],
+    variable_bounds: tuple[NDArray[np.float64], NDArray[np.float64]],
+    *,
+    label: str,
+    message: str,
+) -> None:
+    """Reject a rounded solution that violates a constraint or bound.
+
+    The tolerance scales with each row's magnitude, covering summation-order
+    differences without accepting a genuinely violated count or budget.
+    """
+    lower, upper = constraint_bounds
+    activity = constraint_matrix @ solution
+    slack = _FEASIBILITY_TOLERANCE * (1.0 + abs(constraint_matrix) @ np.abs(solution))
+    variable_lower, variable_upper = variable_bounds
+    feasible = (
+        np.all(activity >= lower - slack)
+        and np.all(activity <= upper + slack)
+        and np.all(solution >= variable_lower - _FEASIBILITY_TOLERANCE)
+        and np.all(solution <= variable_upper + _FEASIBILITY_TOLERANCE)
+    )
+    if not feasible:
+        raise RuntimeError(
+            f"{label} failed: the solver solution violates the constraints ({message})"
+        )
 
 
 def _validate_form_size(value: int, pool_size: int) -> int:
@@ -370,6 +450,7 @@ def assemble_form(
     item_costs: ArrayLike | None = None,
     max_cost: float | None = None,
     solver_options: Mapping[str, bool | int | float] | None = None,
+    require_optimal: bool = False,
 ) -> FormAssemblyResult:
     """Assemble an optimal constrained fixed form.
 
@@ -411,17 +492,23 @@ def assemble_form(
         Maximum total selected-item cost.
     solver_options : mapping, optional
         Options forwarded to :func:`scipy.optimize.milp`, such as
-        ``time_limit`` or ``mip_rel_gap``.
+        ``time_limit``, ``node_limit``, or ``mip_rel_gap``.
+    require_optimal : bool, default=False
+        Raise when a solver limit stops the search before optimality is
+        proven. By default the best feasible form found is returned with
+        ``is_optimal=False`` and its ``mip_gap``.
 
     Returns
     -------
     FormAssemblyResult
-        Optimal selected items and assembly diagnostics.
+        Selected items and assembly diagnostics.
 
     Raises
     ------
     RuntimeError
-        If the requested constraints have no optimal feasible form.
+        If the constraints are infeasible, if a solver limit is reached
+        before any feasible form is found, or if ``require_optimal`` is set
+        and optimality was not proven.
 
     Examples
     --------
@@ -440,6 +527,7 @@ def assemble_form(
     pool_size = int(pool_size)
     if getattr(model, "n_factors", None) != 1:
         raise ValueError("assemble_form requires a unidimensional model")
+    require_optimal = _validate_require_optimal(require_optimal)
 
     theta_values = _validate_theta(theta)
     weights = _validate_weights(theta_weights, theta_values.size)
@@ -600,18 +688,29 @@ def assemble_form(
         ),
         options=options,
     )
-    if not result.success or result.x is None:
-        raise RuntimeError(f"form assembly failed: {result.message}")
+    solution, is_optimal, mip_gap = _solver_incumbent(
+        result, require_optimal=require_optimal, label="form assembly"
+    )
 
-    selected_positions = np.flatnonzero(result.x[:n_candidates] > 0.5)
+    selected_positions = np.flatnonzero(solution[:n_candidates] > 0.5)
     selected_items = candidate_indices[selected_positions]
-    if selected_items.size != size:
-        raise RuntimeError("form assembly returned an invalid item count")
     assembled_information = np.sum(candidate_information[:, selected_positions], axis=1)
+    rounded = np.zeros(n_variables, dtype=np.float64)
+    rounded[selected_positions] = 1.0
     if target is None:
         objective_value = float(weights @ assembled_information)
     else:
-        objective_value = float(weights @ np.abs(assembled_information - target))
+        deviations = np.abs(assembled_information - target)
+        rounded[n_candidates:] = deviations
+        objective_value = float(weights @ deviations)
+    _check_rounded_solution(
+        constraint_matrix,
+        rounded,
+        (constraint_lower, constraint_upper),
+        (variable_lower, variable_upper),
+        label="form assembly",
+        message=str(result.message),
+    )
 
     content_counts = (
         {
@@ -632,4 +731,6 @@ def assemble_form(
         content_counts=content_counts,
         total_cost=total_cost,
         solver_message=str(result.message),
+        is_optimal=is_optimal,
+        mip_gap=mip_gap,
     )

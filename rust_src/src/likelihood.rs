@@ -6,6 +6,21 @@ use pyo3::prelude::*;
 use crate::likelihood_cache::cached_likelihoods;
 use crate::utils::{EPSILON, log_sigmoid, sigmoid};
 
+/// Fill a binary row with the 2PL log probabilities `[log(1 - p), log(p)]` of logit `z`.
+#[inline]
+pub(crate) fn log_2pl_row(z: f64, row: &mut [f64]) {
+    row[0] = log_sigmoid(-z);
+    row[1] = log_sigmoid(z);
+}
+
+/// Fill a binary row with clipped 3PL log probabilities for logit `z`.
+#[inline]
+pub(crate) fn log_3pl_row(z: f64, guessing: f64, row: &mut [f64]) {
+    let p = (guessing + (1.0 - guessing) * sigmoid(z)).clamp(EPSILON, 1.0 - EPSILON);
+    row[0] = (1.0 - p).ln();
+    row[1] = p.ln();
+}
+
 /// Compute log-likelihoods for all persons at all quadrature points (2PL)
 #[pyfunction]
 #[pyo3(signature = (responses, quad_points, discrimination, difficulty))]
@@ -27,11 +42,7 @@ pub fn compute_log_likelihoods_2pl<'py>(
             quad_points.len(),
             &vec![2; responses.ncols()],
             true,
-            |q, j, row| {
-                let z = discrimination[j] * (quad_points[q] - difficulty[j]);
-                row[0] = log_sigmoid(-z);
-                row[1] = log_sigmoid(z);
-            },
+            |q, j, row| log_2pl_row(discrimination[j] * (quad_points[q] - difficulty[j]), row),
         )
     });
     result.into_pyarray(py)
@@ -61,12 +72,8 @@ pub fn compute_log_likelihoods_3pl<'py>(
             &vec![2; responses.ncols()],
             true,
             |q, j, row| {
-                let p = (guessing[j]
-                    + (1.0 - guessing[j])
-                        * sigmoid(discrimination[j] * (quad_points[q] - difficulty[j])))
-                .clamp(EPSILON, 1.0 - EPSILON);
-                row[0] = (1.0 - p).ln();
-                row[1] = p.ln();
+                let z = discrimination[j] * (quad_points[q] - difficulty[j]);
+                log_3pl_row(z, guessing[j], row);
             },
         )
     });
@@ -105,8 +112,7 @@ pub fn compute_log_likelihoods_mirt<'py>(
                     z += discrimination[[j, f]] * quad_points[[q, f]];
                 }
                 z -= disc_sums[j] * difficulty[j];
-                row[0] = log_sigmoid(-z);
-                row[1] = log_sigmoid(z);
+                log_2pl_row(z, row);
             },
         )
     });

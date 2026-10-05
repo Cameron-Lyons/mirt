@@ -16,10 +16,16 @@ References:
     Cagnone, S., & Monari, P. (2013). Latent variable models for ordinal
         data by using the adaptive quadrature approximation.
         Computational Statistics, 28(2), 597-619.
+
+    Caffo, B. S., Jank, W., & Jones, G. L. (2005). Ascent-based Monte Carlo
+        expectation-maximization. Journal of the Royal Statistical Society:
+        Series B, 67(2), 235-251.
 """
 
 from __future__ import annotations
 
+import math
+import warnings
 from collections.abc import Callable
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
@@ -36,13 +42,19 @@ from mirt._model_defaults import (
     uses_original_model_hook,
 )
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._acceleration import FreeItemParameters
 from mirt.estimation._gaussian_kernel import gaussian_log_kernel
 from mirt.estimation._mc_likelihood import (
     sampled_log_likelihoods,
     uses_default_sample_likelihood,
 )
 from mirt.estimation._posterior import normalize_log_posterior
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import (
+    BaseEstimator,
+    StartValues,
+    _apply_starting_values,
+    _validate_start,
+)
 from mirt.models.base import DichotomousItemModel, PolytomousItemModel
 from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 from mirt.utils.numeric import logsumexp
@@ -54,6 +66,13 @@ if TYPE_CHECKING:
 
 _MAX_LIKELIHOOD_ELEMENTS = 2_000_000
 _MAX_QMC_COUNT_ELEMENTS = 1_000_000
+# Ascent-based MCEM (Caffo, Jank and Jones, 2005): one-sided 75% normal
+# quantile for the confidence bounds on the log-likelihood change, the factor
+# by which the Monte Carlo sample grows when a step is not a confirmed ascent,
+# and the number of unconfirmed steps at ``max_samples`` before stopping.
+_ASCENT_Z = 0.6744897501960817
+_SAMPLE_GROWTH = 1.5
+_STALLED_ITERATIONS = 3
 
 
 def _positive_integer(value: int, name: str, minimum: int = 1) -> int:
@@ -130,6 +149,30 @@ def _validated_prior(
     return mean.copy(), cholesky
 
 
+def _log_likelihood_change(
+    weights: NDArray[np.float64],
+    base: NDArray[np.float64],
+    other: NDArray[np.float64],
+) -> tuple[float, float]:
+    """Estimate ``log p(y; other) - log p(y; base)`` from common draws.
+
+    ``weights`` are normalized posterior weights of each person's draws under
+    the base parameters, and ``base`` and ``other`` hold the draws'
+    log-likelihoods under the two parameter sets. Each person contributes the
+    log of the weighted mean likelihood ratio. Returns the estimate and its
+    delta-method Monte Carlo standard error.
+    """
+    log_ratio = other - base
+    shift = np.max(log_ratio, axis=1, keepdims=True)
+    ratio = np.exp(log_ratio - shift)
+    mean_ratio = np.sum(weights * ratio, axis=1)
+    change = float(np.sum(np.log(mean_ratio) + shift[:, 0]))
+    ratio -= mean_ratio[:, None]
+    ratio *= weights
+    variance = np.sum(ratio * ratio, axis=1) / (mean_ratio * mean_ratio)
+    return change, float(np.sqrt(np.sum(variance)))
+
+
 class MCEMEstimator(BaseEstimator):
     """Monte Carlo EM estimator for IRT models.
 
@@ -139,12 +182,14 @@ class MCEMEstimator(BaseEstimator):
     Parameters
     ----------
     n_samples : int
-        Number of Monte Carlo samples per person per iteration.
+        Initial number of Monte Carlo samples per person per iteration.
         More samples give more accurate E-step but slower computation.
     max_iter : int
         Maximum number of EM iterations.
-    tol : float
-        Convergence tolerance for log-likelihood change.
+    tol : float, default=1e-3
+        Convergence tolerance for the change in marginal log-likelihood
+        between iterates. MCEM converges when a 50% confidence interval for
+        the change lies within ``(-tol, tol)``; see Notes.
     verbose : bool
         Whether to print progress.
     seed : int or None
@@ -152,6 +197,10 @@ class MCEMEstimator(BaseEstimator):
     importance_sampling : bool
         Whether to use importance sampling from the prior.
         Improves efficiency when posterior differs from prior.
+    max_samples : int, optional
+        Largest number of samples per person that sample-size growth may
+        reach. Defaults to ten times ``n_samples``. Draws and their
+        likelihoods take memory proportional to persons times samples.
 
     Notes
     -----
@@ -160,9 +209,20 @@ class MCEMEstimator(BaseEstimator):
     - Quadrature-based EM is too slow
     - Exact integration is not required
 
-    The number of samples should increase as iterations progress to
-    ensure convergence. This implementation uses a fixed number for
-    simplicity.
+    Convergence adapts ascent-based MCEM (Caffo, Jank and Jones, 2005).
+    From the second iteration on, the change in marginal log-likelihood made
+    by the previous M-step is estimated on the fresh draws, which are shared
+    by both parameter sets, together with its delta-method Monte Carlo
+    standard error. A change whose lower 75% confidence bound is not positive
+    is within Monte Carlo error. Unlike the original algorithm, which repeats
+    such a step with more draws, the step is kept and the next iteration's
+    sample grows by half, up to ``max_samples``. The fit converges once the
+    75% bounds lie within ``(-tol, tol)``. Once ``max_samples`` is reached, three consecutive changes
+    within Monte Carlo error stop the fit early with ``converged=False`` and a
+    warning, because more iterations cannot improve the precision.
+    When ``max_iter`` is reached, the last M-step is judged by the change in
+    the log-likelihood estimate on its own draws. ``sample_size_history``
+    records the sample size of every iteration.
 
     Built-in logistic, affine, and polytomous items use shared analytic
     gradients. Small item sample blocks are prepared once; larger draws
@@ -183,23 +243,33 @@ class MCEMEstimator(BaseEstimator):
     """
 
     _minimum_samples = 50
+    # QMCEM's shared grid makes its iterations deterministic, and stochastic EM
+    # keeps a fixed number of chains, so both use the plain change rule.
+    _adaptive_sample_size = True
 
     def __init__(
         self,
         n_samples: int = 500,
         max_iter: int = 500,
-        tol: float = 1e-4,
+        tol: float = 1e-3,
         verbose: bool = False,
         seed: int | None = None,
         importance_sampling: bool = True,
         compute_standard_errors: bool = False,
         se_step_size: float = 1e-5,
+        max_samples: int | None = None,
     ) -> None:
         super().__init__(max_iter, tol, verbose)
 
         self.n_samples = _positive_integer(
             n_samples, "n_samples", minimum=self._minimum_samples
         )
+        self.max_samples = (
+            10 * self.n_samples
+            if max_samples is None
+            else _positive_integer(max_samples, "max_samples", minimum=self.n_samples)
+        )
+        self._sample_size_history: list[int] = []
         self.seed = _seed_value(seed)
         self.importance_sampling = _boolean(importance_sampling, "importance_sampling")
         self.compute_standard_errors = _boolean(
@@ -215,6 +285,11 @@ class MCEMEstimator(BaseEstimator):
         self.se_step_size: float = float(se_step_size)
         self._rng: np.random.Generator | None = None
 
+    @property
+    def sample_size_history(self) -> list[int]:
+        """Monte Carlo samples per person used by each iteration of the last fit."""
+        return self._sample_size_history.copy()
+
     def _random_generator(self) -> np.random.Generator:
         """Return the initialized fit-local random generator."""
         if self._rng is None:
@@ -227,19 +302,24 @@ class MCEMEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         prior_mean: NDArray[np.float64] | None = None,
         prior_cov: NDArray[np.float64] | None = None,
+        *,
+        start: StartValues = "default",
     ) -> FitResult:
         """Fit model using Monte Carlo EM algorithm.
 
         Parameters
         ----------
         model : BaseItemModel
-            IRT model to fit
+            IRT model to fit. Coordinates fixed with
+            ``set_free_parameter_masks`` keep their values.
         responses : ndarray of shape (n_persons, n_items)
             Response matrix
         prior_mean : ndarray of shape (n_factors,), optional
             Prior mean for latent abilities
         prior_cov : ndarray of shape (n_factors, n_factors), optional
             Prior covariance for latent abilities
+        start : {"default", "model"} or mapping, default="default"
+            Starting values, as for :meth:`EMEstimator.fit`.
 
         Returns
         -------
@@ -248,6 +328,7 @@ class MCEMEstimator(BaseEstimator):
         """
         from mirt.results.fit_result import FitResult
 
+        start = _validate_start(start)
         responses = self._validate_responses(responses, model.n_items)
         n_persons = responses.shape[0]
         n_factors = model.n_factors
@@ -256,45 +337,88 @@ class MCEMEstimator(BaseEstimator):
 
         prior_mean, cholesky = _validated_prior(prior_mean, prior_cov, n_factors)
 
-        if not model._is_fitted:
-            model._initialize_parameters()
+        _apply_starting_values(model, start)
 
+        adaptive = self._adaptive_sample_size
+        free_parameters = FreeItemParameters(model) if adaptive else None
+        configured_samples = next_samples = self.n_samples
         self._convergence_history = []
+        self._sample_size_history = []
         prev_ll = -np.inf
+        previous: NDArray[np.float64] | None = None
         converged = False
+        stalled = 0
 
-        for iteration in range(self.max_iter):
-            theta_samples, weights, current_ll = self._e_step_and_marginal_ll(
-                model, responses, prior_mean, cholesky, n_factors
-            )
-            self._convergence_history.append(current_ll)
+        try:
+            for iteration in range(self.max_iter):
+                self.n_samples = next_samples
+                theta_samples, weights, current_ll = self._e_step_and_marginal_ll(
+                    model, responses, prior_mean, cholesky, n_factors
+                )
+                self._convergence_history.append(current_ll)
+                self._sample_size_history.append(self.n_samples)
 
-            self._log_iteration(iteration, current_ll)
+                self._log_iteration(iteration, current_ll)
 
-            if self._check_convergence(prev_ll, current_ll):
-                converged = True
-                if self.verbose:
-                    print(f"Converged at iteration {iteration}")
-                break
+                if free_parameters is None:
+                    converged = self._check_convergence(prev_ll, current_ll)
+                elif previous is not None:
+                    change, error = self._iterate_change(
+                        model,
+                        responses,
+                        theta_samples,
+                        weights,
+                        free_parameters,
+                        previous,
+                    )
+                    converged = self._monte_carlo_converged(change, error)
+                    if change - _ASCENT_Z * error > 0.0:
+                        stalled = 0
+                    elif self.n_samples < self.max_samples:
+                        next_samples = min(
+                            math.ceil(_SAMPLE_GROWTH * self.n_samples),
+                            self.max_samples,
+                        )
+                    else:
+                        stalled += 1
 
-            prev_ll = current_ll
+                if converged:
+                    if self.verbose:
+                        print(f"Converged at iteration {iteration}")
+                    break
+                if stalled >= _STALLED_ITERATIONS:
+                    warnings.warn(
+                        "MCEM stopped before convergence: log-likelihood changes "
+                        f"stayed within Monte Carlo error at max_samples="
+                        f"{self.max_samples}. Increase max_samples or tol.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    break
 
-            self._m_step_mc(model, responses, theta_samples, weights)
-            if iteration + 1 < self.max_iter:
-                # Release the previous draw before allocating its replacement.
-                del theta_samples, weights
-        else:
-            current_ll, weights = self._refresh_mc_state(
+                prev_ll = current_ll
+                if free_parameters is not None:
+                    previous = free_parameters.get(model)
+
+                self._m_step_mc(model, responses, theta_samples, weights)
+                if iteration + 1 < self.max_iter:
+                    # Release the previous draw before allocating its replacement.
+                    del theta_samples, weights
+            else:
+                current_ll, weights = self._refresh_mc_state(
+                    model, responses, theta_samples, weights
+                )
+                self._convergence_history.append(current_ll)
+                # Both estimates use the last draw, so they share its noise.
+                converged = self._check_convergence(prev_ll, current_ll)
+
+            model._is_fitted = True
+
+            standard_errors = self._compute_standard_errors_mc(
                 model, responses, theta_samples, weights
             )
-            self._convergence_history.append(current_ll)
-            converged = self._check_convergence(prev_ll, current_ll)
-
-        model._is_fitted = True
-
-        standard_errors = self._compute_standard_errors_mc(
-            model, responses, theta_samples, weights
-        )
+        finally:
+            self.n_samples = configured_samples
 
         n_params = model.n_parameters
         aic = self._compute_aic(current_ll, n_params)
@@ -311,6 +435,37 @@ class MCEMEstimator(BaseEstimator):
             n_observations=n_persons,
             n_parameters=n_params,
         )
+
+    def _iterate_change(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        theta_samples: NDArray[np.float64],
+        weights: NDArray[np.float64],
+        free_parameters: FreeItemParameters,
+        previous: NDArray[np.float64],
+    ) -> tuple[float, float]:
+        """Estimate the log-likelihood gain over ``previous`` on the current draws.
+
+        Returns the estimated change from the previous iterate to the current
+        parameters and its Monte Carlo standard error.
+        """
+        current_values = self._sample_log_likelihoods(model, responses, theta_samples)
+        current = free_parameters.get(model)
+        if not free_parameters.set(model, previous):
+            raise ValueError("the previous MCEM iterate is not a valid parameter set")
+        try:
+            previous_values = self._sample_log_likelihoods(
+                model, responses, theta_samples
+            )
+        finally:
+            free_parameters.set(model, current)
+        loss, error = _log_likelihood_change(weights, current_values, previous_values)
+        return -loss, error
+
+    def _monte_carlo_converged(self, change: float, error: float) -> bool:
+        """Return whether a confidence interval for the change is within ``tol``."""
+        return abs(change) + _ASCENT_Z * error < self.tol
 
     @staticmethod
     def _validated_log_likelihoods(
@@ -852,6 +1007,8 @@ class QMCEMEstimator(MCEMEstimator):
         methods. Society for Industrial and Applied Mathematics.
     """
 
+    _adaptive_sample_size = False
+
     def __init__(
         self,
         n_samples: int = 256,
@@ -1134,6 +1291,7 @@ class StochasticEMEstimator(MCEMEstimator):
     """
 
     _minimum_samples = 1
+    _adaptive_sample_size = False
 
     def __init__(
         self,

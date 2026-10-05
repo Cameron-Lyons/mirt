@@ -1056,9 +1056,7 @@ def cross_validate(
     ... )
     >>> print(cv_result.summary())
     """
-    import os
-
-    from mirt.utils._parallel import _process_pool
+    from mirt.utils._parallel import _process_pool, resolve_n_jobs
 
     responses = np.asarray(responses)
     if responses.ndim != 2 or responses.shape[0] < 2 or responses.shape[1] == 0:
@@ -1066,11 +1064,7 @@ def cross_validate(
             "responses must be a two-dimensional matrix with at least "
             "2 persons and 1 item"
         )
-    if isinstance(n_jobs, bool) or not isinstance(n_jobs, (int, np.integer)):
-        raise ValueError("n_jobs must be an integer")
-    if n_jobs == 0 or n_jobs < -1:
-        raise ValueError("n_jobs must be -1 or a positive integer")
-    n_jobs = int(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
 
     if splitter is None:
         splitter = KFold(n_splits=5)
@@ -1087,9 +1081,6 @@ def cross_validate(
 
     scores: dict[str, list[float]] = {name: [] for name in scorer_names}
     fold_results: list[FitResult] = []
-
-    if n_jobs == -1:
-        n_jobs = os.cpu_count() or 1
 
     splits = _validated_splits(splitter, responses)
     n_folds = len(splits)

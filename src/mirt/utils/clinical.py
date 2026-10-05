@@ -9,6 +9,12 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtValidationError
+from mirt.utils._validation import (
+    as_finite_vector,
+    validate_alpha,
+    validate_finite_scalar,
+    validate_positive_scalar,
+)
 
 RCIMethod = Literal["jacobson", "hageman", "iverson"]
 
@@ -101,8 +107,8 @@ def RCI(
     """
     from scipy import stats
 
-    pre = _as_finite_vector(theta_pre, "theta_pre")
-    post = _as_finite_vector(theta_post, "theta_post")
+    pre = as_finite_vector(theta_pre, "theta_pre")
+    post = as_finite_vector(theta_post, "theta_post")
     if pre.size != post.size:
         raise MirtValidationError(
             "theta_pre and theta_post must have the same length",
@@ -111,9 +117,9 @@ def RCI(
             expected=str(pre.size),
         )
 
-    alpha_value = _validate_alpha(alpha)
+    alpha_value = validate_alpha(alpha)
     reliability_value = _validate_reliability(reliability)
-    sd_value = _validate_positive_scalar(sd_theta, "sd_theta")
+    sd_value = validate_positive_scalar(sd_theta, "sd_theta")
     _validate_method(method)
     orientation = _validate_boolean(higher_is_better, "higher_is_better")
 
@@ -181,10 +187,10 @@ def clinical_significance(
     indicate better functioning. The returned masks are mutually exclusive
     and collectively exhaustive.
     """
-    cutoff_value = _validate_finite_scalar(cutoff, "cutoff")
+    cutoff_value = validate_finite_scalar(cutoff, "cutoff")
     orientation = _validate_boolean(higher_is_better, "higher_is_better")
-    pre = _as_finite_vector(theta_pre, "theta_pre")
-    post = _as_finite_vector(theta_post, "theta_post")
+    pre = as_finite_vector(theta_pre, "theta_pre")
+    post = as_finite_vector(theta_post, "theta_post")
 
     result = RCI(
         pre,
@@ -215,35 +221,13 @@ def clinical_significance(
     }
 
 
-def _as_finite_vector(values: ArrayLike, parameter: str) -> NDArray[np.float64]:
-    """Convert a numeric input to a nonempty finite one-dimensional array."""
-    try:
-        result = np.asarray(values, dtype=np.float64).reshape(-1)
-    except (TypeError, ValueError) as exc:
-        raise MirtValidationError(
-            f"{parameter} must contain numeric values",
-            parameter=parameter,
-        ) from exc
-    if result.size == 0:
-        raise MirtValidationError(
-            f"{parameter} must contain at least one value",
-            parameter=parameter,
-        )
-    if not np.all(np.isfinite(result)):
-        raise MirtValidationError(
-            f"{parameter} must contain only finite values",
-            parameter=parameter,
-        )
-    return result
-
-
 def _as_sem_vector(
     values: ArrayLike,
     n_persons: int,
     parameter: str,
 ) -> NDArray[np.float64]:
     """Validate and broadcast person-level standard errors."""
-    result = _as_finite_vector(values, parameter)
+    result = as_finite_vector(values, parameter)
     if result.size == 1:
         result = np.full(n_persons, result.item(), dtype=np.float64)
     elif result.size != n_persons:
@@ -261,22 +245,10 @@ def _as_sem_vector(
     return result
 
 
-def _validate_alpha(alpha: float) -> float:
-    value = _validate_finite_scalar(alpha, "alpha")
-    if not 0.0 < value < 1.0:
-        raise MirtValidationError(
-            "alpha must be between 0 and 1",
-            parameter="alpha",
-            value=alpha,
-            expected="0 < alpha < 1",
-        )
-    return value
-
-
 def _validate_reliability(reliability: float | None) -> float | None:
     if reliability is None:
         return None
-    value = _validate_finite_scalar(reliability, "reliability")
+    value = validate_finite_scalar(reliability, "reliability")
     if not 0.0 <= value < 1.0:
         raise MirtValidationError(
             "reliability must be at least 0 and less than 1",
@@ -285,42 +257,6 @@ def _validate_reliability(reliability: float | None) -> float | None:
             expected="0 <= reliability < 1",
         )
     return value
-
-
-def _validate_positive_scalar(value: float, parameter: str) -> float:
-    result = _validate_finite_scalar(value, parameter)
-    if result <= 0.0:
-        raise MirtValidationError(
-            f"{parameter} must be positive",
-            parameter=parameter,
-            value=value,
-            expected="> 0",
-        )
-    return result
-
-
-def _validate_finite_scalar(value: float, parameter: str) -> float:
-    if isinstance(value, (bool, np.bool_)) or not np.isscalar(value):
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        )
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        ) from exc
-    if not np.isfinite(result):
-        raise MirtValidationError(
-            f"{parameter} must be a finite number",
-            parameter=parameter,
-            value=value,
-        )
-    return result
 
 
 def _validate_method(method: str) -> None:

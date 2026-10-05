@@ -300,3 +300,102 @@ def test_real_native_fit_tracks_numpy_with_missing_data(
         np.mean(np.abs(native_result.model.guessing - numpy_result.model.guessing))
         < 0.05
     )
+
+
+def _bounded_guessing_responses() -> np.ndarray:
+    """Responses whose 3PL optimum puts several guessing parameters at zero."""
+    rng = np.random.default_rng(3)
+    discrimination = np.array([1.6, 1.2, 1.8, 1.4, 1.0, 1.5])
+    difficulty = np.array([-0.8, 0.2, 0.6, -0.2, 0.9, 1.3])
+    guessing = np.array([0.0, 0.0, 0.0, 0.0, 0.2, 0.2])
+    theta = rng.standard_normal(1500)
+    probability = guessing + (1.0 - guessing) / (
+        1.0 + np.exp(-discrimination * (theta[:, None] - difficulty))
+    )
+    return (rng.random(probability.shape) < probability).astype(np.int32)
+
+
+def _fit_3pl(
+    model: ThreeParameterLogistic,
+    responses: np.ndarray,
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+    max_iter: int,
+) -> Any:
+    set_backend_preference(backend)
+    estimator = EMEstimator(n_quadpts=15, max_iter=max_iter, tol=1e-8, use_gpu=False)
+    monkeypatch.setattr(estimator, "_compute_standard_errors", lambda *args: {})
+    return estimator.fit(model, responses)
+
+
+@pytest.mark.skipif(
+    not em_module.RUST_AVAILABLE,
+    reason="compiled backend is not available",
+)
+def test_native_optimum_with_guessing_on_its_bound_is_a_numpy_fixed_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The native M-step used to solve the joint (a, b, c) Newton system and then
+    # clip c at zero, so it stalled with large (a, b) scores on those items and
+    # a log-likelihood about 2.9 below the bounded optimum.
+    responses = _bounded_guessing_responses()
+    native_iteration = em_module.em_iteration_3pl
+    calls = 0
+
+    def counting_iteration(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        return native_iteration(*args, **kwargs)
+
+    monkeypatch.setattr(em_module, "is_gpu_available", lambda: False)
+    monkeypatch.setattr(em_module, "em_iteration_3pl", counting_iteration)
+    model = ThreeParameterLogistic(n_items=responses.shape[1])
+    native = _fit_3pl(model, responses, "rust", monkeypatch, max_iter=1000)
+    assert native.converged
+    assert calls > 1
+    assert np.count_nonzero(model.guessing == 0.0) >= 3
+    native_parameters = {
+        name: values.copy() for name, values in model.parameters.items()
+    }
+
+    # Warm-started NumPy EM must have nothing left to improve.
+    calls = 0
+    refit = _fit_3pl(model, responses, "numpy", monkeypatch, max_iter=100)
+
+    assert calls == 0
+    assert refit.log_likelihood - native.log_likelihood < 1e-4
+    for name, values in native_parameters.items():
+        np.testing.assert_allclose(model.parameters[name], values, atol=2e-3)
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not em_module.RUST_AVAILABLE,
+    reason="compiled backend is not available",
+)
+def test_native_fit_reaches_numpy_optimum_with_guessing_on_its_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    responses = _bounded_guessing_responses()
+    monkeypatch.setattr(em_module, "is_gpu_available", lambda: False)
+    fits = {
+        backend: _fit_3pl(
+            ThreeParameterLogistic(n_items=responses.shape[1]),
+            responses,
+            backend,
+            monkeypatch,
+            max_iter=3000,
+        )
+        for backend in ("numpy", "rust")
+    }
+
+    assert fits["numpy"].converged and fits["rust"].converged
+    assert fits["rust"].log_likelihood == pytest.approx(
+        fits["numpy"].log_likelihood, abs=1e-3
+    )
+    for name in ("discrimination", "difficulty", "guessing"):
+        np.testing.assert_allclose(
+            fits["rust"].model.parameters[name],
+            fits["numpy"].model.parameters[name],
+            atol=5e-3,
+        )

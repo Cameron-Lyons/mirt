@@ -279,7 +279,7 @@ def test_invalid_mean_orders_are_rejected_before_invariance_changes(order):
         np.zeros(2),
         np.zeros((0, 2)),
         np.array([[0, 0.5]]),
-        np.array([[0, np.nan]]),
+        np.array([[0, np.inf]]),
         np.array([[0, 2]]),
         np.array([[-1, -1]]),
     ],

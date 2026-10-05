@@ -4,14 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from numbers import Real
 from typing import Any, Self
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtValidationError
-from mirt.results._common import normal_critical_value
+from mirt.results._common import (
+    broadcast_cut_scores,
+    classify_from_probabilities,
+    normal_critical_value,
+    validate_classification_confidence,
+)
 
 
 def _portable_person_id(value: Any) -> Any:
@@ -180,7 +184,7 @@ class ScoreResult:
         and 0.5 exactly on it. Infinite uncertainty yields 0.5 for finite scores,
         while unknown scores or uncertainty values yield ``NaN``.
         """
-        cuts = self._broadcast_cut_scores(cut_score)
+        cuts = broadcast_cut_scores(cut_score, self.theta.shape)
         difference = self.theta - cuts
         with np.errstate(divide="ignore", invalid="ignore"):
             standardized = difference / self.standard_error
@@ -206,48 +210,9 @@ class ScoreResult:
         made only when the corresponding normal-approximation probability meets
         ``confidence``. Unknown probabilities remain uncertain.
         """
-        confidence_value = self._validate_classification_confidence(confidence)
+        confidence_value = validate_classification_confidence(confidence)
         probabilities = self.classification_probabilities(cut_score)
-        classifications = np.full(probabilities.shape, "uncertain", dtype="U9")
-        classifications[probabilities >= confidence_value] = "above"
-        classifications[probabilities <= 1.0 - confidence_value] = "below"
-        return classifications
-
-    def _broadcast_cut_scores(self, cut_score: ArrayLike) -> NDArray[np.float64]:
-        """Validate cut scores and broadcast them to the stored score shape."""
-        raw_cuts = np.asarray(cut_score)
-        if raw_cuts.dtype.kind not in {"i", "u", "f"}:
-            raise MirtValidationError(
-                "cut_score must contain only finite numbers",
-                parameter="cut_score",
-                value=cut_score,
-                expected=f"finite values broadcastable to {self.theta.shape}",
-            )
-        try:
-            cuts = np.asarray(cut_score, dtype=np.float64)
-        except (TypeError, ValueError) as exc:
-            raise MirtValidationError(
-                "cut_score must contain only finite numbers",
-                parameter="cut_score",
-                value=cut_score,
-                expected=f"finite values broadcastable to {self.theta.shape}",
-            ) from exc
-        if not np.all(np.isfinite(cuts)):
-            raise MirtValidationError(
-                "cut_score must contain only finite numbers",
-                parameter="cut_score",
-                value=cut_score,
-                expected=f"finite values broadcastable to {self.theta.shape}",
-            )
-        try:
-            return np.broadcast_to(cuts, self.theta.shape)
-        except ValueError as exc:
-            raise MirtValidationError(
-                "cut_score must be broadcastable to the score shape",
-                parameter="cut_score",
-                value=cuts.shape,
-                expected=str(self.theta.shape),
-            ) from exc
+        return classify_from_probabilities(probabilities, confidence_value)
 
     def _factor_parameters(
         self,
@@ -315,22 +280,6 @@ class ScoreResult:
                 expected="> 0",
             )
         return parameters
-
-    @staticmethod
-    def _validate_classification_confidence(confidence: float) -> float:
-        """Validate the confidence required for a score-side decision."""
-        if isinstance(confidence, bool) or not isinstance(confidence, Real):
-            value = np.nan
-        else:
-            value = float(confidence)
-        if not np.isfinite(value) or not 0.5 < value < 1.0:
-            raise MirtValidationError(
-                "confidence must be a finite number strictly between 0.5 and 1",
-                parameter="confidence",
-                value=confidence,
-                expected="0.5 < confidence < 1",
-            )
-        return value
 
     def to_dataframe(self) -> Any:
         """Return scores using the configured dataframe backend."""

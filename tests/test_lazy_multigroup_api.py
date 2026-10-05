@@ -45,7 +45,7 @@ def test_plain_multigroup_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "scipy_loaded": False,
         "multigroup_submodules": [],
-        "export_count": 13,
+        "export_count": 15,
         "exports_visible": True,
     }
 
@@ -144,7 +144,7 @@ def test_star_import_resolves_every_public_multigroup_export() -> None:
 
     assert result == {
         "matches_all": True,
-        "export_count": 13,
+        "export_count": 15,
         "all_cached": True,
     }
 

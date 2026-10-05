@@ -279,6 +279,11 @@ class TestBenchmarkComparisons:
             "q3_missing",
             "ld_complete",
             "ld_missing",
+            "grm_map_scoring",
+            "grm_ml_scoring",
+            "grm_wle_scoring",
+            "grm_eapsum_scoring",
+            "map_scoring_2d",
         ],
     )
     def test_new_workloads_reject_mismatched_person_counts(self, name: str) -> None:

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-import mirt.models.unfolding as unfolding
+import mirt.models.polytomous as polytomous
 from mirt.models.unfolding import GeneralizedGradedUnfolding
 
 
@@ -37,8 +37,8 @@ def test_grouped_ggum_probabilities_are_chunk_invariant(
     expected = model.probability(theta)
 
     monkeypatch.setattr(
-        unfolding,
-        "_MAX_GGUM_PROBABILITY_CHUNK_ENTRIES",
+        polytomous,
+        "_MAX_PROBABILITY_CHUNK_ENTRIES",
         theta.size * model.max_categories * 4,
     )
 

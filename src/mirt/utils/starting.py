@@ -131,6 +131,27 @@ def _random_category_parameter(
     return np.sort(draws, axis=-1) if ordered else draws
 
 
+def _restore_unordered_rows(
+    model: BaseItemModel,
+    values: NDArray[np.float64],
+    current: NDArray[np.float64],
+) -> None:
+    """Keep the current thresholds of items whose random order was broken.
+
+    Fixed thresholds keep their values among random ones, which can leave an
+    item's active thresholds out of order.
+    """
+    if values.ndim != 2:
+        return
+    categories = getattr(model, "n_categories", None)
+    for item_index in range(values.shape[0]):
+        n_active = values.shape[1]
+        if categories is not None and len(categories) == model.n_items:
+            n_active = min(categories[item_index] - 1, n_active)
+        if np.any(np.diff(values[item_index, :n_active]) <= 0.0):
+            values[item_index] = current[item_index]
+
+
 def _random_ggum_thresholds(
     model: BaseItemModel,
     current: NDArray[np.float64],
@@ -212,7 +233,10 @@ def gen_random_pars(
     list of dict
         List of parameter dictionaries containing random starting values for
         all free model parameters. Fixed and reference-category parameters are
-        omitted or retained at their identifying values.
+        omitted or retained at their identifying values, and coordinates fixed
+        with ``set_free_parameter_masks`` keep their current values. An item
+        whose random thresholds would lose their order around a fixed
+        threshold keeps its current thresholds.
 
     Examples
     --------
@@ -261,6 +285,7 @@ def gen_random_pars(
     fixed_parameters = _FIXED_PARAMETERS_BY_MODEL.get(
         getattr(model, "model_name", ""), frozenset()
     )
+    restrictions = getattr(model, "_free_parameter_restrictions", {})
     random_sets: list[dict[str, NDArray[np.float64]]] = []
 
     for _ in range(n_sets):
@@ -321,6 +346,12 @@ def gen_random_pars(
                 )
                 params[name] = current + noise
 
+        for name, free in restrictions.items():
+            if name not in params:
+                continue
+            np.copyto(params[name], base_parameters[name], where=~free)
+            if name == "thresholds" and getattr(model, "model_name", "") != "GGUM":
+                _restore_unordered_rows(model, params[name], base_parameters[name])
         random_sets.append(params)
 
     return random_sets
@@ -446,10 +477,8 @@ def _fit_single_start(
     try:
         trial_model = model.copy()
         trial_model.set_parameters(**start_params)
-        # EM initialization otherwise replaces the supplied starting values.
-        trial_model._is_fitted = True
         estimator = EMEstimator(**fit_kwargs)
-        result = estimator.fit(trial_model, responses)
+        result = estimator.fit(trial_model, responses, start="model")
         log_likelihood = float(result.log_likelihood)
         if not np.isfinite(log_likelihood):
             raise ArithmeticError("fit returned a non-finite log-likelihood")
@@ -493,6 +522,10 @@ def multi_start_fit(
         Print progress.
     n_jobs : int
         Number of parallel jobs. Use -1 for all CPUs, 1 for sequential.
+        Workers are spawned as fresh interpreters that use the current
+        backend, so the model, its class and ``fit_kwargs`` must be picklable,
+        and scripts must guard their entry point with
+        ``if __name__ == "__main__":``.
     **fit_kwargs
         Additional arguments passed to the estimator.
 
@@ -514,28 +547,14 @@ def multi_start_fit(
     >>> bool(np.isfinite(result.log_likelihood))
     True
     """
-    import os
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import as_completed
+
+    from mirt.utils._parallel import _process_pool, ensure_picklable, resolve_n_jobs
 
     n_starts = _validate_positive_integer(n_starts, name="n_starts")
-    if (
-        isinstance(n_jobs, (bool, np.bool_))
-        or not isinstance(n_jobs, (int, np.integer))
-        or n_jobs == 0
-        or n_jobs < -1
-    ):
-        raise MirtValidationError(
-            "n_jobs must be a positive integer or -1",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
-    n_jobs = int(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs, n_starts)
     validated = _validate_model_responses(model, responses)
     random_starts = gen_random_pars(model, n_sets=n_starts, seed=seed)
-
-    if n_jobs == -1:
-        n_jobs = os.cpu_count() or 1
-    n_jobs = min(n_jobs, n_starts)
 
     args_list = [
         (index, model, validated, start_params, fit_kwargs)
@@ -546,7 +565,8 @@ def multi_start_fit(
     if n_jobs == 1:
         outcomes = [_fit_single_start(args) for args in args_list]
     else:
-        with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+        ensure_picklable(_fit_single_start, args_list[0], n_jobs=n_jobs)
+        with _process_pool(n_jobs) as executor:
             futures = {
                 executor.submit(_fit_single_start, args): args[0] for args in args_list
             }

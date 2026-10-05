@@ -7,7 +7,9 @@ import pytest
 from numpy.testing import assert_allclose
 from scipy import stats
 
+import mirt
 from mirt._core import sigmoid
+from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import (
     FourParameterLogistic,
     ThreeParameterLogistic,
@@ -15,6 +17,7 @@ from mirt.models.dichotomous import (
 )
 from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import GradedResponseModel
+from mirt.results import FitResult
 from mirt.utils.statistical_tests import lagrange, likelihood_ratio, wald
 
 
@@ -99,6 +102,40 @@ def test_wald_inverts_model_information_when_available() -> None:
 
     assert result.statistic == pytest.approx(4.0)
     assert_allclose(result.standard_errors, [0.5])
+
+
+def test_wald_reads_the_covariance_of_a_fit_result() -> None:
+    data = mirt.simdata(model="2PL", n_persons=600, n_items=4, seed=5)
+    result = mirt.fit_mirt(data, model="2PL", tol=1e-7)
+    vcov = result.vcov
+    estimates = np.concatenate([result.model.discrimination, result.model.difficulty])
+
+    single = wald(result, param_indices=[5], constraint_values=[0.0])
+    assert single.statistic == pytest.approx(estimates[5] ** 2 / vcov[5, 5])
+    assert_allclose(single.standard_errors, [result.standard_errors["difficulty"][1]])
+
+    contrast = np.zeros(8)
+    contrast[[0, 4]] = [1.0, -1.0]
+    combined = wald(result, contrast_matrix=contrast)
+    variance = vcov[0, 0] + vcov[4, 4] - 2.0 * vcov[0, 4]
+    assert combined.statistic == pytest.approx(
+        (estimates[0] - estimates[4]) ** 2 / variance
+    )
+
+
+def test_wald_rejects_fixed_parameters_and_warns_without_covariance() -> None:
+    data = mirt.simdata(model="2PL", n_persons=300, n_items=3, seed=6)
+    rasch = mirt.fit_mirt(data, model="1PL")
+    with pytest.raises(MirtValidationError, match="fixed"):
+        wald(rasch, param_indices=[0], constraint_values=[1.0])
+
+    errors_only = FitResult(rasch.model, -1.0, 1, True, rasch.standard_errors, 0.0, 0.0)
+    with pytest.warns(UserWarning, match="squared standard errors"):
+        test = wald(errors_only, param_indices=[3])
+    difficulty_se = rasch.standard_errors["difficulty"][0]
+    assert test.statistic == pytest.approx(
+        (rasch.model.difficulty[0] / difficulty_se) ** 2
+    )
 
 
 def test_wald_requires_real_covariance_information() -> None:

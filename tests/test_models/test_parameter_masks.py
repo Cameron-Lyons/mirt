@@ -189,9 +189,9 @@ def test_partial_binary_coordinates_fit_and_se_match_independent_curvature(
     model._is_fitted = True
     initial = model.parameters
 
-    result = EMEstimator(n_quadpts=31, use_rust=use_rust, use_gpu=False).fit(
-        model.copy(), responses
-    )
+    result = EMEstimator(
+        n_quadpts=31, use_rust=use_rust, use_gpu=False, se_method="complete_data"
+    ).fit(model.copy(), responses)
 
     assert result.converged
     assert result.n_parameters == 3

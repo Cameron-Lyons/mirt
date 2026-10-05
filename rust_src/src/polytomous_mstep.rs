@@ -6,6 +6,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 
+use crate::counts::category_item_counts;
 use crate::utils::sigmoid;
 
 /// Worker pool whose lifetime is controlled by the Python fit context.
@@ -31,6 +32,8 @@ impl EMThreadPool {
 }
 
 /// Negative expected log likelihood and its gradient in (a, b_1, ...).
+///
+/// `counts` is category-major: `counts[c * points.len() + q]`.
 fn objective(
     x: &[f64],
     points: &[f64],
@@ -39,6 +42,7 @@ fn objective(
     epsilon: f64,
 ) -> (f64, Vec<f64>) {
     let k = x.len();
+    let n_points = points.len();
     let a = x[0];
     let mut value = 0.0;
     let mut gradient = vec![0.0; k];
@@ -77,7 +81,7 @@ fn objective(
         }
         for c in 0..k {
             let p = probabilities[c];
-            let count = counts[q * k + c];
+            let count = counts[c * n_points + q];
             value -= count * p.clamp(epsilon, 1.0 - epsilon).ln();
             effective[c] = if p > epsilon && p < 1.0 - epsilon {
                 count
@@ -313,17 +317,11 @@ pub fn m_step_polytomous<'py>(
             }
         }
     }
+    let posterior = posterior.as_standard_layout();
+    let posterior_rows = posterior.as_slice().expect("standard layout posterior");
     let fit_item = |j: usize| {
         let k = categories[j] as usize;
-        let mut counts = vec![0.0; points.len() * k];
-        for i in 0..responses.nrows() {
-            let r = responses[[i, j]];
-            if r >= 0 {
-                for q in 0..points.len() {
-                    counts[q * k + r as usize] += posterior[[i, q]];
-                }
-            }
-        }
+        let counts = category_item_counts(responses, posterior_rows, points.len(), j, k);
         let mut params = parameters.row(j).to_vec();
         if counts.iter().any(|&v| v > 0.0) {
             let result = optimize(

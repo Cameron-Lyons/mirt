@@ -9,16 +9,25 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import optimize, stats
-from scipy.special import expit
 
 from mirt.equating.linking import (
     _CLOSED_FORM_LINKING_METHODS,
+    _CURVE_LINKING_METHODS,
     LinkingFitStatistics,
     LinkingResult,
+    LinkParameters,
     _bisector_link,
     _closed_form_bootstrap_samples,
+    _compute_fit_statistics,
+    _CurveObjective,
+    _extract_link_parameters,
+    _fit_curve_link,
+    _link_form,
+    _LinkForm,
+    _normalize_anchor_indices,
     _orthogonal_link,
+    _validate_curve_grid,
+    _validate_transform_constants,
     link,
 )
 
@@ -37,7 +46,15 @@ _SUPPORTED_METHODS = frozenset(
         "orthogonal",
     }
 )
-_LOGISTIC_MODEL_NAMES = frozenset({"1PL", "2PL", "3PL", "4PL", "5PL"})
+# Covariance names of the link-relevant parameters, in LinkParameters order.
+_DELTA_PARAMETER_NAMES = (
+    "discrimination",
+    "difficulty",
+    "guessing",
+    "upper",
+    "asymmetry",
+)
+_DELTA_STEP = 1e-5
 
 RefitCallback = Callable[["BaseItemModel", NDArray[np.float64]], "BaseItemModel"]
 
@@ -106,16 +123,16 @@ def bootstrap_linking_se(
     )
     rng = np.random.default_rng(seed)
 
-    parameters_old = _extract_link_parameters(model_old, anchors_old, "old")
-    parameters_new = _extract_link_parameters(model_new, anchors_new, "new")
+    form_old = _link_form(model_old, anchors_old, "old")
+    form_new = _link_form(model_new, anchors_new, "new")
     n_anchors = len(anchors_old)
 
     if response_matrices is None and method in _CLOSED_FORM_LINKING_METHODS:
         A_samples, B_samples = _closed_form_bootstrap_samples(
-            parameters_old[0],
-            parameters_old[1],
-            parameters_new[0],
-            parameters_new[1],
+            form_old.discrimination,
+            form_old.difficulty,
+            form_new.discrimination,
+            form_new.difficulty,
             method,
             n_bootstrap,
             rng,
@@ -127,7 +144,9 @@ def bootstrap_linking_se(
         if invalid.size:
             replicate = int(invalid[0])
             try:
-                _validate_constants(A_samples[replicate], B_samples[replicate])
+                _validate_transform_constants(
+                    A_samples[replicate], B_samples[replicate]
+                )
             except (ValueError, RuntimeError, ArithmeticError) as exc:
                 raise RuntimeError(
                     f"Bootstrap replicate {replicate + 1} failed: {exc}"
@@ -163,8 +182,8 @@ def bootstrap_linking_se(
             response_matrices,
             anchors_old,
             anchors_new,
-            parameters_old,
-            parameters_new,
+            form_old,
+            form_new,
             method,
             theta_grid,
             weights,
@@ -213,8 +232,8 @@ def _linking_bootstrap_replicate(
     response_matrices: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
     anchors_old: list[int],
     anchors_new: list[int],
-    parameters_old: tuple[NDArray[np.float64], ...],
-    parameters_new: tuple[NDArray[np.float64], ...],
+    form_old: _LinkForm,
+    form_new: _LinkForm,
     method: str,
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
@@ -229,16 +248,12 @@ def _linking_bootstrap_replicate(
         fitted_old = refit(model_old.copy(), old_responses[old_rows].copy())
         fitted_new = refit(model_new.copy(), new_responses[new_rows].copy())
         _validate_anchor_pairs(fitted_old, fitted_new, anchors_old, anchors_new)
-        replicate_old = _extract_link_parameters(
-            fitted_old, anchors_old, "refitted old"
-        )
-        replicate_new = _extract_link_parameters(
-            fitted_new, anchors_new, "refitted new"
-        )
+        replicate_old = _link_form(fitted_old, anchors_old, "refitted old")
+        replicate_new = _link_form(fitted_new, anchors_new, "refitted new")
     else:
         assert isinstance(sample, np.ndarray)
-        replicate_old = tuple(values[sample] for values in parameters_old)
-        replicate_new = tuple(values[sample] for values in parameters_new)
+        replicate_old = form_old.take(sample)
+        replicate_new = form_new.take(sample)
 
     try:
         return _estimate_constants(
@@ -269,9 +284,16 @@ def delta_method_se(
 
     The covariance matrices follow the package's flattened parameter order:
     all discrimination parameters, followed by all difficulty parameters,
-    followed by any additional model parameters. Numerical differentiation
-    supports every public dichotomous linking method and includes covariance
-    among every link-relevant parameter estimate within each form.
+    followed by any additional model parameters. Every public dichotomous
+    linking method is supported, including covariance among every
+    link-relevant parameter estimate within each form.
+
+    For Stocking-Lord, TCC, and Haebara links between 1PL-5PL forms, the
+    constants are differentiated through the criterion's first-order
+    condition (implicit-function theorem) using its closed-form gradient, so
+    no re-optimization is needed. Moment methods and model-native curve
+    families use central differences of re-estimated constants. Asymptotes
+    estimated on their [0, 1] bound are differenced one-sidedly.
 
     ``model_old`` and ``model_new`` are required because a Jacobian cannot be
     recovered from A and B alone.
@@ -286,54 +308,76 @@ def delta_method_se(
         model_old, model_new, anchors_old, anchors_new
     )
     theta_grid, weights = _validate_curve_grid(theta_range, n_theta, None)
-    parameters_old = _extract_link_parameters(model_old, anchors_old, "old")
-    parameters_new = _extract_link_parameters(model_new, anchors_new, "new")
+    form_old = _link_form(model_old, anchors_old, "old")
+    form_new = _link_form(model_new, anchors_new, "new")
     covariance_old = _validate_covariance(vcov_old, model_old.n_parameters, "old")
     covariance_new = _validate_covariance(vcov_new, model_new.n_parameters, "new")
 
-    components_old = _delta_components("old", model_old, anchors_old, parameters_old)
-    components_new = _delta_components("new", model_new, anchors_new, parameters_new)
+    components_old = _delta_components(
+        "old", model_old, anchors_old, form_old.parameters
+    )
+    components_new = _delta_components(
+        "new", model_new, anchors_new, form_new.parameters
+    )
     components = components_old + components_new
     parameter_vector = np.concatenate([component[2] for component in components])
 
-    def constants_from_vector(values: NDArray[np.float64]) -> NDArray[np.float64]:
-        varied_old = list(parameters_old)
-        varied_new = list(parameters_new)
+    def forms_from_vector(values: NDArray[np.float64]) -> tuple[_LinkForm, _LinkForm]:
+        varied = {"old": list(form_old.parameters), "new": list(form_new.parameters)}
         offset = 0
         for form, component_index, component_values, _ in components:
             size = component_values.size
-            varied = varied_old if form == "old" else varied_new
-            varied[component_index] = values[offset : offset + size]
+            varied[form][component_index] = values[offset : offset + size]
             offset += size
-        A, B = _estimate_constants(
-            tuple(varied_old),
-            tuple(varied_new),
+        return (
+            _perturbed_form(form_old, model_old, anchors_old, varied["old"]),
+            _perturbed_form(form_new, model_new, anchors_new, varied["new"]),
+        )
+
+    steps = _DELTA_STEP * np.maximum(1.0, np.abs(parameter_vector))
+    lowest = np.full(parameter_vector.size, -np.inf)
+    highest = np.full(parameter_vector.size, np.inf)
+    offset = 0
+    for _, component_index, component_values, _ in components:
+        positions = slice(offset, offset + component_values.size)
+        if component_index == 0:
+            steps[positions] = np.minimum(steps[positions], 0.25 * component_values)
+        elif component_index == 2:
+            lowest[positions] = 0.0
+        elif component_index == 3:
+            highest[positions] = 1.0
+        offset += component_values.size
+    # Asymptote probes stay in [0, 1], which fitted models enforce, so an
+    # estimate on its bound gets a one-sided difference.
+    probes = (
+        np.maximum(parameter_vector - steps, lowest),
+        np.minimum(parameter_vector + steps, highest),
+    )
+
+    if method in _CURVE_LINKING_METHODS and not (
+        form_old.is_native or form_new.is_native
+    ):
+        jacobian = _implicit_curve_jacobian(
+            form_old,
+            form_new,
             method,
             theta_grid,
             weights,
+            forms_from_vector,
+            parameter_vector,
+            probes,
         )
-        return np.array([A, B], dtype=np.float64)
+    else:
 
-    jacobian = np.empty((2, parameter_vector.size), dtype=np.float64)
-    discrimination_positions: set[int] = set()
-    offset = 0
-    for _, component_index, component_values, _ in components:
-        if component_index == 0:
-            discrimination_positions.update(
-                range(offset, offset + component_values.size)
+        def constants_from_vector(
+            values: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
+            varied_old, varied_new = forms_from_vector(values)
+            return np.array(
+                _estimate_constants(varied_old, varied_new, method, theta_grid, weights)
             )
-        offset += component_values.size
-    for index, value in enumerate(parameter_vector):
-        step = 1e-5 * max(1.0, abs(float(value)))
-        if index in discrimination_positions:
-            step = min(step, float(value) * 0.25)
-        upper = parameter_vector.copy()
-        lower = parameter_vector.copy()
-        upper[index] += step
-        lower[index] -= step
-        jacobian[:, index] = (
-            constants_from_vector(upper) - constants_from_vector(lower)
-        ) / (2.0 * step)
+
+        jacobian = _difference_columns(constants_from_vector, parameter_vector, probes)
 
     old_indices = np.concatenate([component[3] for component in components_old]).astype(
         np.int64, copy=False
@@ -358,6 +402,99 @@ def delta_method_se(
     )
 
 
+def _implicit_curve_jacobian(
+    form_old: _LinkForm,
+    form_new: _LinkForm,
+    method: str,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    forms_from_vector: Callable[[NDArray[np.float64]], tuple[_LinkForm, _LinkForm]],
+    parameter_vector: NDArray[np.float64],
+    probes: tuple[NDArray[np.float64], NDArray[np.float64]],
+) -> NDArray[np.float64]:
+    """Differentiate fitted curve-link constants by the implicit-function theorem.
+
+    At the minimizer ``x*`` of the criterion ``F(x; p)`` in ``x = (log A, B)``,
+    ``dx*/dp = -H^{-1} d2F/dx dp``. Both second-derivative blocks are
+    differences of the closed-form gradient, so no re-optimization is needed.
+    """
+    A, B, _ = _fit_curve_link(form_old, form_new, theta_grid, weights, method)
+    solution = np.array([np.log(A), B], dtype=np.float64)
+
+    def gradient(
+        forms: tuple[_LinkForm, _LinkForm], params: NDArray[np.float64]
+    ) -> NDArray[np.float64]:
+        return _CurveObjective(*forms, theta_grid, weights, method).gradient(params)
+
+    hessian = np.empty((2, 2), dtype=np.float64)
+    for column in range(2):
+        offset = np.zeros(2, dtype=np.float64)
+        offset[column] = _DELTA_STEP * max(1.0, abs(float(solution[column])))
+        hessian[:, column] = (
+            gradient((form_old, form_new), solution + offset)
+            - gradient((form_old, form_new), solution - offset)
+        ) / (2.0 * offset[column])
+    hessian = 0.5 * (hessian + hessian.T)
+
+    mixed = _difference_columns(
+        lambda values: gradient(forms_from_vector(values), solution),
+        parameter_vector,
+        probes,
+    )
+
+    try:
+        derivatives = -np.linalg.solve(hessian, mixed)
+    except np.linalg.LinAlgError as exc:
+        raise ValueError(
+            "The linking criterion is singular at its minimum; "
+            "delta-method derivatives are undefined"
+        ) from exc
+    derivatives[0] *= A
+    return derivatives
+
+
+def _difference_columns(
+    function: Callable[[NDArray[np.float64]], NDArray[np.float64]],
+    center: NDArray[np.float64],
+    probes: tuple[NDArray[np.float64], NDArray[np.float64]],
+) -> NDArray[np.float64]:
+    """Difference quotients of a 2-vector function, one column per parameter."""
+    below, above = probes
+    columns = np.empty((2, center.size), dtype=np.float64)
+    for index in range(center.size):
+        lower = center.copy()
+        upper = center.copy()
+        lower[index] = below[index]
+        upper[index] = above[index]
+        columns[:, index] = (function(upper) - function(lower)) / (
+            above[index] - below[index]
+        )
+    return columns
+
+
+def _perturbed_form(
+    form: _LinkForm,
+    model: BaseItemModel,
+    anchors: list[int],
+    parameters: list[NDArray[np.float64]],
+) -> _LinkForm:
+    """Rebuild one form's curves at perturbed link-relevant parameters."""
+    if not form.is_native:
+        return form.with_parameters(
+            (parameters[0], parameters[1], parameters[2], parameters[3], parameters[4])
+        )
+    varied = model.copy()
+    updates: dict[str, NDArray[np.float64]] = {}
+    for component_index, name in enumerate(_DELTA_PARAMETER_NAMES):
+        if name not in model.parameters:
+            continue
+        values = np.array(model.parameters[name], dtype=np.float64, copy=True)
+        values.reshape(values.shape[0], -1)[anchors, 0] = parameters[component_index]
+        updates[name] = values
+    varied.set_parameters(**updates)
+    return _link_form(varied, anchors, form.label)
+
+
 def compute_linking_fit(
     model_old: BaseItemModel,
     model_new: BaseItemModel,
@@ -373,35 +510,15 @@ def compute_linking_fit(
     anchors_old, anchors_new = _validate_anchor_pairs(
         model_old, model_new, anchors_old, anchors_new
     )
-    scale, shift = _validate_constants(A, B)
+    scale, shift = _validate_transform_constants(A, B)
     theta_grid, normalized_weights = _validate_curve_grid(theta_range, n_theta, weights)
-    parameters_old = _extract_link_parameters(model_old, anchors_old, "old")
-    parameters_new = _extract_link_parameters(model_new, anchors_new, "new")
-    disc_old, diff_old = parameters_old[:2]
-    disc_new, diff_new = parameters_new[:2]
-
-    disc_new_transformed = disc_new / scale
-    diff_new_transformed = scale * diff_new + shift
-    diff_a = disc_old - disc_new_transformed
-    diff_b = diff_old - diff_new_transformed
-    rmse_a = float(np.sqrt(np.mean(diff_a**2)))
-    rmse_b = float(np.sqrt(np.mean(diff_b**2)))
-
-    curves_old = _model_curves(
-        model_old, theta_grid, anchors_old, parameters_old, "old"
-    )
-    theta_new = (theta_grid - shift) / scale
-    curves_new = _model_curves(model_new, theta_new, anchors_new, parameters_new, "new")
-    tcc_old = curves_old.sum(axis=1)
-    tcc_new = curves_new.sum(axis=1)
-    tcc_rmse = float(np.sqrt(np.sum(normalized_weights * (tcc_old - tcc_new) ** 2)))
-    return LinkingFitStatistics(
-        rmse_a=rmse_a,
-        rmse_b=rmse_b,
-        mad_a=float(np.mean(np.abs(diff_a))),
-        mad_b=float(np.mean(np.abs(diff_b))),
-        weighted_rmse=float(np.hypot(rmse_a, rmse_b)),
-        tcc_rmse=tcc_rmse,
+    return _compute_fit_statistics(
+        _link_form(model_old, anchors_old, "old"),
+        _link_form(model_new, anchors_new, "new"),
+        scale,
+        shift,
+        theta_grid,
+        normalized_weights,
     )
 
 
@@ -567,7 +684,7 @@ def parameter_recovery_summary(
     anchors_old, anchors_new = _validate_anchor_pairs(
         model_old, model_new, anchors_old, anchors_new
     )
-    scale, shift = _validate_constants(A, B)
+    scale, shift = _validate_transform_constants(A, B)
     disc_old, diff_old, _, _, _ = _extract_link_parameters(
         model_old, anchors_old, "old"
     )
@@ -684,137 +801,9 @@ def _validate_anchor_pairs(
     if len(anchors_old) < 2:
         raise ValueError("At least 2 anchor items are required")
 
-    normalized: list[list[int]] = []
-    for label, anchors, n_items in (
-        ("old", anchors_old, model_old.n_items),
-        ("new", anchors_new, model_new.n_items),
-    ):
-        current: list[int] = []
-        for anchor in anchors:
-            if isinstance(anchor, (bool, np.bool_)) or not isinstance(
-                anchor, (int, np.integer)
-            ):
-                raise ValueError(
-                    f"Anchor indices for the {label} model must be integers"
-                )
-            index = int(anchor)
-            if index < 0 or index >= n_items:
-                raise ValueError(
-                    f"Anchor index {index} out of range for the {label} model "
-                    f"with {n_items} items"
-                )
-            current.append(index)
-        if len(set(current)) != len(current):
-            raise ValueError(f"Anchor indices for the {label} model must be unique")
-        normalized.append(current)
-    return normalized[0], normalized[1]
-
-
-def _extract_link_parameters(
-    model: BaseItemModel, anchors: list[int], label: str
-) -> tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.float64],
-]:
-    """Extract validated dichotomous parameters for selected anchors."""
-    try:
-        discrimination = np.asarray(model.discrimination, dtype=np.float64)
-        difficulty = np.asarray(model.difficulty, dtype=np.float64)
-    except AttributeError as exc:
-        raise ValueError(
-            f"The {label} model must expose discrimination and difficulty parameters"
-        ) from exc
-    if discrimination.ndim == 2 and discrimination.shape == (model.n_items, 1):
-        discrimination = discrimination[:, 0]
-    if discrimination.shape != (model.n_items,) or difficulty.shape != (model.n_items,):
-        raise ValueError(
-            f"The {label} model must contain one discrimination and difficulty per item"
-        )
-    lower = np.asarray(
-        getattr(model, "guessing", np.zeros(model.n_items)), dtype=np.float64
+    return _normalize_anchor_indices(
+        anchors_old, anchors_new, model_old.n_items, model_new.n_items
     )
-    upper = np.asarray(
-        getattr(model, "upper", np.ones(model.n_items)), dtype=np.float64
-    )
-    asymmetry = np.asarray(
-        getattr(model, "asymmetry", np.ones(model.n_items)), dtype=np.float64
-    )
-    if (
-        lower.shape != (model.n_items,)
-        or upper.shape != (model.n_items,)
-        or asymmetry.shape != (model.n_items,)
-    ):
-        raise ValueError(
-            f"Curve parameters for the {label} model have an invalid shape"
-        )
-
-    selected = (
-        discrimination[anchors],
-        difficulty[anchors],
-        lower[anchors],
-        upper[anchors],
-        asymmetry[anchors],
-    )
-    if not all(np.all(np.isfinite(values)) for values in selected):
-        raise ValueError(f"Item parameters for the {label} model must be finite")
-    if np.any(selected[0] <= 0.0):
-        raise ValueError(f"Discriminations for the {label} model must be positive")
-    if np.any(selected[2] < 0.0) or np.any(selected[3] > 1.0):
-        raise ValueError(f"Asymptotes for the {label} model must lie in [0, 1]")
-    if np.any(selected[2] >= selected[3]):
-        raise ValueError(
-            f"Lower asymptotes for the {label} model must be below upper asymptotes"
-        )
-    if np.any(selected[4] <= 0.0):
-        raise ValueError(f"Asymmetries for the {label} model must be positive")
-    return selected
-
-
-def _validate_curve_grid(
-    theta_range: tuple[float, float],
-    n_theta: int,
-    weights: NDArray[np.float64] | None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Validate an integration grid and normalize its weights."""
-    if not isinstance(theta_range, (tuple, list)) or len(theta_range) != 2:
-        raise ValueError("theta_range must contain exactly two values")
-    lower, upper = float(theta_range[0]), float(theta_range[1])
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-        raise ValueError("theta_range must contain finite, increasing values")
-    if isinstance(n_theta, (bool, np.bool_)) or not isinstance(
-        n_theta, (int, np.integer)
-    ):
-        raise ValueError("n_theta must be an integer")
-    if n_theta < 2:
-        raise ValueError("n_theta must be at least 2")
-    theta_grid = np.linspace(lower, upper, int(n_theta))
-    if weights is None:
-        normalized_weights = stats.norm.pdf(theta_grid)
-    else:
-        normalized_weights = np.asarray(weights, dtype=np.float64)
-        if normalized_weights.shape != (n_theta,):
-            raise ValueError(f"weights must have shape ({n_theta},)")
-        if not np.all(np.isfinite(normalized_weights)):
-            raise ValueError("weights must be finite")
-        if np.any(normalized_weights < 0.0):
-            raise ValueError("weights must be non-negative")
-    weight_sum = float(np.sum(normalized_weights))
-    if not np.isfinite(weight_sum) or weight_sum <= 0.0:
-        raise ValueError("weights must have a positive sum")
-    return theta_grid, normalized_weights / weight_sum
-
-
-def _validate_constants(A: float, B: float) -> tuple[float, float]:
-    """Require finite orientation-preserving linking constants."""
-    scale, shift = float(A), float(B)
-    if not np.isfinite(scale) or scale <= 0.0:
-        raise ValueError("A must be finite and positive")
-    if not np.isfinite(shift):
-        raise ValueError("B must be finite")
-    return scale, shift
 
 
 def _validate_covariance(
@@ -841,13 +830,7 @@ def _delta_components(
     form: str,
     model: BaseItemModel,
     anchors: list[int],
-    extracted: tuple[
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-    ],
+    extracted: LinkParameters,
 ) -> list[tuple[str, int, NDArray[np.float64], NDArray[np.int64]]]:
     """Map link-relevant arrays to their flattened covariance positions."""
     parameter_offsets: dict[str, int] = {}
@@ -857,13 +840,7 @@ def _delta_components(
         offset += values.size
 
     components: list[tuple[str, int, NDArray[np.float64], NDArray[np.int64]]] = []
-    for name, component_index in (
-        ("discrimination", 0),
-        ("difficulty", 1),
-        ("guessing", 2),
-        ("upper", 3),
-        ("asymmetry", 4),
-    ):
+    for component_index, name in enumerate(_DELTA_PARAMETER_NAMES):
         if name not in parameter_offsets:
             continue
         indices = parameter_offsets[name] + np.asarray(anchors, dtype=np.int64)
@@ -871,70 +848,17 @@ def _delta_components(
     return components
 
 
-def _icc_matrix(
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    theta: NDArray[np.float64],
-    lower: NDArray[np.float64],
-    upper: NDArray[np.float64],
-    asymmetry: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Evaluate stable dichotomous item curves in one batch."""
-    logistic = expit(discrimination[None, :] * (theta[:, None] - difficulty[None, :]))
-    shaped = logistic if np.all(asymmetry == 1.0) else logistic ** asymmetry[None, :]
-    return lower[None, :] + (upper - lower)[None, :] * shaped
-
-
-def _model_curves(
-    model: BaseItemModel,
-    theta: NDArray[np.float64],
-    anchors: list[int],
-    parameters: tuple[
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-        NDArray[np.float64],
-    ],
-    label: str,
-) -> NDArray[np.float64]:
-    """Evaluate the model's native response function for selected items."""
-    if model.model_name in _LOGISTIC_MODEL_NAMES:
-        curves = _icc_matrix(*parameters[:2], theta, *parameters[2:])
-        expected_shape = (theta.size, len(anchors))
-    else:
-        all_curves = np.asarray(model.probability(theta), dtype=np.float64)
-        expected_shape = (theta.size, model.n_items)
-        if all_curves.shape != expected_shape:
-            raise ValueError(
-                f"The {label} model returned curves with shape {all_curves.shape}; "
-                f"expected {expected_shape}"
-            )
-        curves = all_curves[:, anchors]
-        expected_shape = (theta.size, len(anchors))
-    if curves.shape != expected_shape:
-        raise ValueError(
-            f"The {label} model returned curves with shape {curves.shape}; "
-            f"expected {expected_shape}"
-        )
-    if not np.all(np.isfinite(curves)):
-        raise ValueError(f"Response curves for the {label} model must be finite")
-    if np.any(curves < 0.0) or np.any(curves > 1.0):
-        raise ValueError(f"Response curves for the {label} model must lie in [0, 1]")
-    return curves
-
-
 def _estimate_constants(
-    parameters_old: tuple[NDArray[np.float64], ...],
-    parameters_new: tuple[NDArray[np.float64], ...],
+    form_old: _LinkForm,
+    form_new: _LinkForm,
     method: str,
     theta_grid: NDArray[np.float64],
     weights: NDArray[np.float64],
 ) -> tuple[float, float]:
-    """Estimate constants from aligned parameter arrays."""
+    """Estimate constants from aligned anchor forms."""
     _validate_method(method)
-    disc_old, diff_old, lower_old, upper_old, asymmetry_old = parameters_old
-    disc_new, diff_new, lower_new, upper_new, asymmetry_new = parameters_new
+    disc_old, diff_old = form_old.discrimination, form_old.difficulty
+    disc_new, diff_new = form_new.discrimination, form_new.difficulty
     if method == "mean_sigma":
         sd_old = float(np.std(diff_old, ddof=1))
         sd_new = float(np.std(diff_new, ddof=1))
@@ -946,93 +870,13 @@ def _estimate_constants(
     elif method == "mean_mean":
         A = float(np.mean(disc_new) / np.mean(disc_old))
         B = float(np.mean(diff_old) - A * np.mean(diff_new))
-    elif method in {"stocking_lord", "haebara", "tcc"}:
-        A, B = _curve_link(
-            disc_old,
-            diff_old,
-            lower_old,
-            upper_old,
-            asymmetry_old,
-            disc_new,
-            diff_new,
-            lower_new,
-            upper_new,
-            asymmetry_new,
-            theta_grid,
-            weights,
-            method,
-        )
+    elif method in _CURVE_LINKING_METHODS:
+        A, B, _ = _fit_curve_link(form_old, form_new, theta_grid, weights, method)
     elif method == "bisector":
         A, B, _ = _bisector_link(disc_old, diff_old, disc_new, diff_new)
     else:
         A, B, _ = _orthogonal_link(disc_old, diff_old, disc_new, diff_new)
-    return _validate_constants(A, B)
-
-
-def _curve_link(
-    disc_old: NDArray[np.float64],
-    diff_old: NDArray[np.float64],
-    lower_old: NDArray[np.float64],
-    upper_old: NDArray[np.float64],
-    asymmetry_old: NDArray[np.float64],
-    disc_new: NDArray[np.float64],
-    diff_new: NDArray[np.float64],
-    lower_new: NDArray[np.float64],
-    upper_new: NDArray[np.float64],
-    asymmetry_new: NDArray[np.float64],
-    theta_grid: NDArray[np.float64],
-    weights: NDArray[np.float64],
-    method: str,
-) -> tuple[float, float]:
-    """Fit a positive-scale curve-matching transformation."""
-    curves_old = _icc_matrix(
-        disc_old,
-        diff_old,
-        theta_grid,
-        lower_old,
-        upper_old,
-        asymmetry_old,
-    )
-    sd_old = float(np.std(diff_old, ddof=1))
-    sd_new = float(np.std(diff_new, ddof=1))
-    if sd_old < 1e-10 or sd_new < 1e-10:
-        initial_A = float(np.mean(disc_new) / np.mean(disc_old))
-    else:
-        initial_A = sd_old / sd_new
-    initial_B = float(np.mean(diff_old) - initial_A * np.mean(diff_new))
-    initial_A, initial_B = _validate_constants(initial_A, initial_B)
-
-    def criterion(values: NDArray[np.float64]) -> float:
-        log_A, B = float(values[0]), float(values[1])
-        if not np.isfinite(log_A) or not np.isfinite(B) or abs(log_A) > 20.0:
-            return float("inf")
-        A = float(np.exp(log_A))
-        curves_new = _icc_matrix(
-            disc_new / A,
-            A * diff_new + B,
-            theta_grid,
-            lower_new,
-            upper_new,
-            asymmetry_new,
-        )
-        if method in {"stocking_lord", "tcc"}:
-            difference = curves_old.sum(axis=1) - curves_new.sum(axis=1)
-            return float(np.sum(weights * difference**2))
-        return float(np.sum(weights[:, None] * (curves_old - curves_new) ** 2))
-
-    initial = np.array([np.log(initial_A), initial_B])
-    initial_value = criterion(initial)
-    if initial_value <= 1e-14:
-        return initial_A, initial_B
-    result = optimize.minimize(
-        criterion,
-        initial,
-        method="Nelder-Mead",
-        options={"maxiter": 1000, "xatol": 1e-8, "fatol": 1e-8},
-    )
-    if not result.success or not np.all(np.isfinite(result.x)):
-        raise RuntimeError(f"{method} linking failed to converge: {result.message}")
-    return _validate_constants(float(np.exp(result.x[0])), float(result.x[1]))
+    return _validate_transform_constants(A, B)
 
 
 def _safe_correlation(

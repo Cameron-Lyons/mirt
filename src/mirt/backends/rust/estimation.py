@@ -5,6 +5,8 @@ Fallback mode: mixed. em_fit_2pl / gibbs_sample_2pl / mhrm_fit_2pl / bootstrap_f
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -97,6 +99,21 @@ def _em_fit_2pl_prepared(
     rust_required("em_fit_2pl")
 
 
+def _validate_chain_schedule(
+    length: int,
+    burnin: int,
+    length_name: str,
+) -> tuple[int, int]:
+    length = _validate_positive_integer(length, f"{length_name} must be at least 1")
+    if (
+        isinstance(burnin, (bool, np.bool_))
+        or not isinstance(burnin, (int, np.integer))
+        or burnin < 0
+    ):
+        raise ValueError("burnin must be a non-negative integer")
+    return length, int(burnin)
+
+
 def gibbs_sample_2pl(
     responses: NDArray[np.int_],
     n_iter: int = 5000,
@@ -108,11 +125,29 @@ def gibbs_sample_2pl(
 ]:
     """Run Gibbs sampler for 2PL model in Rust.
 
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative.
+    n_iter : int
+        Total number of iterations, including burn-in.
+    burnin : int
+        Number of initial iterations to discard; must be less than ``n_iter``.
+    thin : int
+        Keep every ``thin``-th draw after burn-in.
+    seed : int, optional
+        Random seed.
+
     Returns
     -------
     tuple
-        (disc_chain, diff_chain, theta_chain, ll_chain)
+        (disc_chain, diff_chain, theta_chain, ll_chain) holding
+        ``ceil((n_iter - burnin) / thin)`` draws.
     """
+    n_iter, burnin = _validate_chain_schedule(n_iter, burnin, "n_iter")
+    thin = _validate_positive_integer(thin, "thin must be at least 1")
+    if burnin >= n_iter:
+        raise ValueError("burnin must be less than n_iter")
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
@@ -134,14 +169,39 @@ def mhrm_fit_2pl(
     burnin: int = 500,
     proposal_sd: float = 0.5,
     seed: int | None = None,
+    gain_sequence: str = "standard",
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], float]:
     """Fit 2PL model using MHRM algorithm in Rust.
+
+    Every cycle samples abilities and takes a Robbins-Monro step on all item
+    parameters; the estimates average the iterates after ``burnin`` (the final
+    iterate when ``burnin >= n_cycles``).
+
+    Parameters
+    ----------
+    responses : NDArray
+        Response matrix (n_persons, n_items), missing coded as negative.
+    n_cycles : int
+        Number of MHRM cycles.
+    burnin : int
+        Number of initial cycles excluded from the parameter average.
+    proposal_sd : float
+        Standard deviation of the ability random-walk proposal.
+    seed : int, optional
+        Random seed.
+    gain_sequence : {"standard", "adaptive"}
+        Gain ``1 / (cycle + 1)`` or ``min(1, 10 / (cycle + 10))``.
 
     Returns
     -------
     tuple
-        (discrimination, difficulty, log_likelihood)
+        (discrimination, difficulty, log_likelihood), where the log-likelihood
+        is evaluated at the final ability draw.
     """
+    n_cycles, burnin = _validate_chain_schedule(n_cycles, burnin, "n_cycles")
+    proposal_sd = _validate_positive_float(proposal_sd, "proposal_sd")
+    if gain_sequence not in ("standard", "adaptive"):
+        raise ValueError("gain_sequence must be 'standard' or 'adaptive'")
     if seed is None:
         seed = np.random.default_rng().integers(0, 2**31)
 
@@ -152,6 +212,7 @@ def mhrm_fit_2pl(
             burnin,
             proposal_sd,
             int(seed),
+            gain_sequence,
         )
 
     rust_required("mhrm_fit_2pl")
@@ -305,8 +366,8 @@ def em_iteration_3pl(
     disc_bounds: tuple[float, float] = (0.1, 5.0),
     diff_bounds: tuple[float, float] = (-6.0, 6.0),
     guess_bounds: tuple[float, float] = (0.0, 0.35),
-    damping_ab: float = 0.5,
-    damping_c: float = 0.3,
+    damping_ab: float | None = None,
+    damping_c: float | None = None,
     regularization: float = 0.01,
     regularization_c: float = 0.1,
     frequencies: NDArray[np.float64] | None = None,
@@ -323,6 +384,11 @@ def em_iteration_3pl(
     """Single EM iteration for 3PL model (batched E+M step).
 
     Performs both E-step and M-step in a single call to reduce FFI overhead.
+    Each item's M-step is a bounded Fisher-scoring ascent with backtracking:
+    parameters on (or within 1e-3 of) a bound whose score points outside it
+    move onto that bound while the others solve the reduced system, so the
+    iteration reaches the bounded optimum of the expected log-likelihood. The
+    ridge terms only stabilize the steps and do not change that optimum.
 
     Parameters
     ----------
@@ -352,14 +418,15 @@ def em_iteration_3pl(
         (min, max) bounds for difficulty
     guess_bounds : tuple
         (min, max) bounds for guessing
-    damping_ab : float
-        Damping factor for a and b updates
-    damping_c : float
-        Damping factor for c updates
+    damping_ab, damping_c : float, optional
+        Deprecated and ignored; the backtracking line search replaces the
+        fixed step damping.
     regularization : float
-        Regularization strength for a and b
+        Ridge added to the a and b Fisher information in the Newton steps
     regularization_c : float
-        Regularization strength for c
+        Ridge added to the c Fisher information in the Newton steps
+    frequencies : NDArray, optional
+        Positive row weights, such as response-pattern counts
 
     Returns
     -------
@@ -367,6 +434,13 @@ def em_iteration_3pl(
         (new_discrimination, new_difficulty, new_guessing, posterior_weights, log_likelihood)
         Returns None if Rust unavailable
     """
+    if damping_ab is not None or damping_c is not None:
+        warnings.warn(
+            "damping_ab and damping_c are deprecated and ignored; the 3PL M-step "
+            "uses a backtracking line search",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     if rust_enabled():
         return mirt_rs.em_iteration_3pl(
             _ensure_i32(responses),
@@ -382,8 +456,6 @@ def em_iteration_3pl(
             disc_bounds,
             diff_bounds,
             guess_bounds,
-            damping_ab,
-            damping_c,
             regularization,
             regularization_c,
             _ensure_f64(frequencies),

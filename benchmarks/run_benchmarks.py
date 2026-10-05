@@ -1272,7 +1272,7 @@ def bench_kernels(
 def bench_optimization(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Time complete polytomous fits, MAP/ML scoring, and repetitive EM data."""
+    """Time polytomous fits, optimizer and EAPsum scoring, and repetitive EM data."""
     results = []
     for kind in ("GRM", "GPCM", "PCM"):
         data = mirt.simdata(
@@ -1323,6 +1323,43 @@ def bench_optimization(
                 lambda: mirt.fit_mirt(
                     repeated, model="2PL", n_quadpts=21, max_iter=20, tol=1e-12
                 ),
+                repeats=repeats,
+                warmups=warmups,
+            ),
+        )
+    )
+    # Models without compiled scorers use the row-batched optimizers.
+    rng = np.random.default_rng(64)
+    grm = mirt.GradedResponseModel(n_items, n_categories=4)
+    grm.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, n_items),
+        thresholds=np.sort(rng.normal(size=(n_items, 3)), axis=1),
+    )
+    grm._is_fitted = True
+    grm_data = rng.integers(0, 4, (n_persons, n_items))
+    grm_data[rng.random(grm_data.shape) < 0.05] = -1
+    for method in ("MAP", "ML", "WLE", "EAPsum"):
+        results.append(
+            BenchResult(
+                f"grm_{method.lower()}_scoring",
+                _time(
+                    lambda: mirt.fscores(grm, grm_data, method=method),
+                    repeats=repeats,
+                    warmups=warmups,
+                ),
+            )
+        )
+    two_factor = mirt.TwoParameterLogistic(n_items, n_factors=2)
+    two_factor.set_parameters(
+        discrimination=rng.uniform(0.5, 1.5, (n_items, 2)),
+        difficulty=rng.normal(size=n_items),
+    )
+    two_factor._is_fitted = True
+    results.append(
+        BenchResult(
+            "map_scoring_2d",
+            _time(
+                lambda: mirt.fscores(two_factor, data, method="MAP"),
                 repeats=repeats,
                 warmups=warmups,
             ),
@@ -2871,6 +2908,11 @@ def _validate_baseline_compatibility(
         "em_fit_repeated",
         "map_scoring",
         "ml_scoring",
+        "grm_map_scoring",
+        "grm_ml_scoring",
+        "grm_wle_scoring",
+        "grm_eapsum_scoring",
+        "map_scoring_2d",
         "marginal_information",
         "gaussian_update_1d",
         "gaussian_update_3d",

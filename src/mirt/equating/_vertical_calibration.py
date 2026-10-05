@@ -95,29 +95,9 @@ def _union_item_design(grade_data: list[GradeData]) -> _UnionItemDesign:
 
 
 def _model_types() -> dict[str, type[BaseItemModel]]:
-    from mirt.models.dichotomous import (
-        FourParameterLogistic,
-        OneParameterLogistic,
-        ThreeParameterLogistic,
-        TwoParameterLogistic,
-    )
-    from mirt.models.polytomous import (
-        GeneralizedPartialCredit,
-        GradedResponseModel,
-        NominalResponseModel,
-        PartialCreditModel,
-    )
+    from mirt.models._factory import ITEM_MODEL_FAMILIES, item_model_class
 
-    return {
-        "1PL": OneParameterLogistic,
-        "2PL": TwoParameterLogistic,
-        "3PL": ThreeParameterLogistic,
-        "4PL": FourParameterLogistic,
-        "GRM": GradedResponseModel,
-        "GPCM": GeneralizedPartialCredit,
-        "PCM": PartialCreditModel,
-        "NRM": NominalResponseModel,
-    }
+    return {name: item_model_class(name) for name in ITEM_MODEL_FAMILIES}
 
 
 def _make_model(
@@ -126,14 +106,11 @@ def _make_model(
     categories: list[int] | None = None,
     item_names: list[str] | None = None,
 ) -> BaseItemModel:
-    constructor = _model_types()[model_name]
-    kwargs: dict[str, Any] = {
-        "n_items": n_items,
-        "item_names": None if item_names is None else item_names.copy(),
-    }
-    if categories is not None:
-        kwargs["n_categories"] = categories
-    return constructor(**kwargs)
+    from mirt.models._factory import build_item_model
+
+    return build_item_model(
+        model_name, n_items, n_categories=categories, item_names=item_names
+    )
 
 
 def _validate_models_and_categories(
@@ -190,8 +167,7 @@ def _pairwise_initial_constants(
     grade_data: list[GradeData], models: list[BaseItemModel]
 ) -> list[tuple[float, float]]:
     """Use moment links only to initialize the joint response calibration."""
-    from mirt.equating.linking import link
-    from mirt.equating.polytomous import link_gpcm, link_grm, link_nrm
+    from mirt.equating.polytomous import _linker_for
     from mirt.equating.vertical import _resolve_anchor_pair
 
     constants = []
@@ -200,12 +176,7 @@ def _pairwise_initial_constants(
             grade_data[grade], grade_data[grade + 1]
         )
         old, new = models[grade : grade + 2]
-        linker = {
-            "GRM": link_grm,
-            "GPCM": link_gpcm,
-            "PCM": link_gpcm,
-            "NRM": link_nrm,
-        }.get(old.model_name, link)
+        linker = _linker_for(old)
         method = "haebara" if old.model_name == "NRM" else "mean_mean"
         fitted = linker(
             old, new, anchors_old, anchors_new, method=method, compute_diagnostics=False
@@ -220,8 +191,7 @@ def _anchor_calibration_diagnostics(
     method: str,
 ) -> list[LinkingResult]:
     """Describe adjacent shared anchors on their fitted common metric."""
-    from mirt.equating.linking import link
-    from mirt.equating.polytomous import link_gpcm, link_grm, link_nrm
+    from mirt.equating.polytomous import _linker_for
     from mirt.equating.vertical import _resolve_anchor_pair
 
     results = []
@@ -230,13 +200,9 @@ def _anchor_calibration_diagnostics(
             grade_data[grade], grade_data[grade + 1]
         )
         old, new = models[grade : grade + 2]
-        linker = {
-            "GRM": link_grm,
-            "GPCM": link_gpcm,
-            "PCM": link_gpcm,
-            "NRM": link_nrm,
-        }.get(old.model_name, link)
-        diagnostic = linker(old, new, anchors_old, anchors_new, method="stocking_lord")
+        diagnostic = _linker_for(old)(
+            old, new, anchors_old, anchors_new, method="stocking_lord"
+        )
         diagnostic.constants.method = method
         diagnostic.convergence_info = {"success": True, "joint_calibration": True}
         results.append(diagnostic)

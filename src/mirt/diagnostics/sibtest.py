@@ -491,13 +491,6 @@ def _effect_size(
     return beta / np.sqrt(pooled_variance)
 
 
-def _adjust_p_values(
-    p_values: NDArray[np.float64], method: PValueAdjustment
-) -> NDArray[np.float64]:
-    """Compatibility wrapper for the shared adjustment utility."""
-    return adjust_p_values(p_values, method)
-
-
 def sibtest_items(
     data: NDArray[np.int_],
     groups: NDArray,

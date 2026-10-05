@@ -1,20 +1,24 @@
 """Fixed-item calibration and test equating functions.
 
 Provides functions for calibrating new items to an existing scale
-and equating test forms. Uses Rust backend for performance when available.
+and equating test forms. :func:`fixed_calib` uses the Rust backend for
+performance when available; :func:`fixed_item_calibration` calibrates any
+item model family by marginal maximum likelihood.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 try:
     from mirt.backends.rust._helpers import RUST_AVAILABLE
@@ -625,6 +629,300 @@ def fixed_calib(
     )
 
 
+@dataclass
+class FixedItemCalibrationResult:
+    """Result of marginal maximum likelihood fixed-item calibration.
+
+    Attributes
+    ----------
+    fit_result : FitResult
+        EM fit of the calibration model. Anchor parameters keep their supplied
+        values and report zero standard errors.
+    latent_mean : ndarray of shape (n_factors,)
+        Estimated mean of the calibration population on the anchor scale.
+    latent_cov : ndarray of shape (n_factors, n_factors)
+        Estimated covariance of the calibration population.
+    anchor_items : list of int
+        Response columns whose parameters were held fixed.
+    new_items : list of int
+        Response columns whose parameters were estimated.
+    """
+
+    fit_result: "FitResult"
+    latent_mean: NDArray[np.float64]
+    latent_cov: NDArray[np.float64]
+    anchor_items: list[int]
+    new_items: list[int]
+
+    @property
+    def model(self) -> "BaseItemModel":
+        """Calibrated model containing the anchor and new items."""
+        return self.fit_result.model
+
+    @property
+    def new_item_parameters(self) -> dict[str, NDArray[np.float64]]:
+        """Item-indexed parameters of the new items only."""
+        model = self.fit_result.model
+        return {
+            name: values[self.new_items]
+            for name, values in model.parameters.items()
+            if values.ndim >= 1 and values.shape[0] == model.n_items
+        }
+
+
+def _anchor_parameter_values(
+    model: "BaseItemModel",
+    anchor_items: list[int],
+    anchor_parameters: "BaseItemModel | FitResult | Mapping[str, ArrayLike]",
+) -> dict[str, NDArray[np.float64]]:
+    """Return complete parameter arrays with the anchor rows replaced."""
+    from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
+
+    if isinstance(anchor_parameters, FitResult):
+        anchor_parameters = anchor_parameters.model
+    if isinstance(anchor_parameters, BaseItemModel):
+        if anchor_parameters.n_items != len(anchor_items):
+            raise MirtValidationError(
+                "the anchor model must contain one item per anchor item",
+                parameter="anchor_parameters",
+                value=anchor_parameters.n_items,
+                expected=str(len(anchor_items)),
+            )
+        anchor_counts = getattr(anchor_parameters, "n_categories", None)
+        model_counts = getattr(model, "n_categories", None)
+        if (anchor_counts is None) != (model_counts is None) or (
+            model_counts is not None
+            and not np.array_equal(
+                np.broadcast_to(anchor_counts, len(anchor_items)),
+                np.broadcast_to(model_counts, model.n_items)[anchor_items],
+            )
+        ):
+            raise MirtValidationError(
+                "anchor items must have the same category counts in both models",
+                parameter="anchor_parameters",
+            )
+        supplied: Mapping[str, ArrayLike] = anchor_parameters.parameters
+    elif isinstance(anchor_parameters, Mapping):
+        supplied = anchor_parameters
+    else:
+        raise MirtValidationError(
+            "anchor_parameters must be a model, a fit result, or a mapping",
+            parameter="anchor_parameters",
+        )
+
+    current = model.parameters
+    unknown = sorted(set(supplied) - set(current))
+    if unknown:
+        raise MirtValidationError(
+            f"Unknown anchor parameters: {', '.join(unknown)}",
+            parameter="anchor_parameters",
+            expected=", ".join(current),
+        )
+    masks = model.free_parameter_masks
+    updated: dict[str, NDArray[np.float64]] = {}
+    for name, values in current.items():
+        item_indexed = values.ndim >= 1 and values.shape[0] == model.n_items
+        if name not in supplied:
+            # Omission is safe only where no anchor coordinate is free.
+            if np.any(masks[name][anchor_items] if item_indexed else masks[name]):
+                raise MirtValidationError(
+                    f"anchor_parameters must provide {name}",
+                    parameter="anchor_parameters",
+                )
+            continue
+        try:
+            replacement = np.asarray(supplied[name], dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                f"anchor parameter {name} must be numeric",
+                parameter="anchor_parameters",
+            ) from exc
+        expected = (
+            (len(anchor_items), *values.shape[1:]) if item_indexed else values.shape
+        )
+        if replacement.shape != expected:
+            raise MirtValidationError(
+                f"anchor parameter {name} must have shape {expected}",
+                parameter="anchor_parameters",
+                value=replacement.shape,
+            )
+        if not np.all(np.isfinite(replacement)):
+            raise MirtValidationError(
+                f"anchor parameter {name} must be finite",
+                parameter="anchor_parameters",
+            )
+        if item_indexed:
+            values[anchor_items] = replacement
+        else:
+            values = replacement.copy()
+        updated[name] = values
+    return updated
+
+
+def fixed_item_calibration(
+    responses: ArrayLike,
+    model: "BaseItemModel",
+    anchor_items: list[int],
+    anchor_parameters: "BaseItemModel | FitResult | Mapping[str, ArrayLike] | None" = None,
+    *,
+    estimate_mean: bool = True,
+    estimate_cov: bool = True,
+    n_quadpts: int = 21,
+    max_iter: int = 500,
+    tol: float = 1e-5,
+    compute_standard_errors: bool = True,
+) -> FixedItemCalibrationResult:
+    """Calibrate new items by MML while anchor items stay fixed (FIPC).
+
+    Fixed-item parameter calibration places new items on the scale of
+    previously calibrated anchor items: anchor parameters are held at their
+    known values, while EM estimates the new items' parameters together with
+    the mean and covariance of the calibration population. Any dichotomous or
+    polytomous item model family is supported, unlike :func:`fixed_calib`,
+    which fits only 2PL items under a fixed standard normal population.
+
+    Parameters
+    ----------
+    responses : array-like of shape (n_persons, n_items)
+        Responses to the anchor and new items. Negative codes and ``NaN`` are
+        missing, so new items given to a subsample may be calibrated as well.
+    model : BaseItemModel
+        Item model covering every response column, for example
+        ``GradedResponseModel(n_items, n_categories=5)``. It is copied, not
+        modified. Its existing free-parameter masks are respected, and the
+        current values of new-item parameters are their starting values.
+    anchor_items : list of int
+        Response columns of the anchor items.
+    anchor_parameters : BaseItemModel, FitResult or mapping, optional
+        Known anchor parameters. A model or fit result must contain exactly
+        the anchor items, in ``anchor_items`` order, with parameter arrays
+        shaped like ``model``'s. A mapping gives each parameter's anchor rows
+        by name; parameters whose anchor coordinates are fixed by the model
+        family, such as 1PL discriminations, may be omitted. By default the
+        anchor rows already stored in ``model`` are used.
+    estimate_mean : bool, default=True
+        Whether to estimate the calibration population's latent mean.
+    estimate_cov : bool, default=True
+        Whether to estimate the calibration population's latent covariance.
+    n_quadpts : int, default=21
+        Quadrature points per latent dimension.
+    max_iter : int, default=500
+        Maximum EM iterations.
+    tol : float, default=1e-5
+        Convergence tolerance for the change in marginal log-likelihood.
+    compute_standard_errors : bool, default=True
+        Whether to compute standard errors of the new-item parameters.
+
+    Returns
+    -------
+    FixedItemCalibrationResult
+        Fit result, estimated latent mean and covariance, and the anchor and
+        new item indices.
+
+    Notes
+    -----
+    Parameters shared by all items, such as rating-scale thresholds, belong to
+    the anchored scale and remain fixed. Standard errors are conditional on
+    the estimated latent mean and covariance. To score people on the anchor
+    scale, pass the estimated population as the scoring prior, for example
+    ``fscores(result.model, responses, prior_mean=result.latent_mean,
+    prior_cov=result.latent_cov)``.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from mirt import TwoParameterLogistic, simdata
+    >>> from mirt.utils.calibration import fixed_item_calibration
+    >>> a = np.linspace(0.8, 1.6, 10)
+    >>> b = np.linspace(-1.5, 1.5, 10)
+    >>> theta = np.random.default_rng(1).normal(0.5, 1.2, 800)
+    >>> data = simdata(theta=theta, discrimination=a, difficulty=b, seed=1)
+    >>> anchors = TwoParameterLogistic(6).set_parameters(
+    ...     discrimination=a[:6], difficulty=b[:6]
+    ... )
+    >>> result = fixed_item_calibration(
+    ...     data, TwoParameterLogistic(10), list(range(6)), anchors
+    ... )
+    >>> bool(np.allclose(result.model.parameters["difficulty"][:6], b[:6]))
+    True
+    """
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.latent_density import GaussianDensity
+    from mirt.models.base import BaseItemModel
+    from mirt.utils.data import validate_responses
+
+    if not isinstance(model, BaseItemModel):
+        raise MirtValidationError(
+            "model must be an item model covering every response column",
+            parameter="model",
+        )
+    for name, flag in (
+        ("estimate_mean", estimate_mean),
+        ("estimate_cov", estimate_cov),
+        ("compute_standard_errors", compute_standard_errors),
+    ):
+        if not isinstance(flag, (bool, np.bool_)):
+            raise MirtValidationError(
+                f"{name} must be a boolean", parameter=name, value=flag
+            )
+    validated = validate_responses(responses, n_items=model.n_items)
+    anchor_items = _validate_item_indices(
+        anchor_items, name="anchor_items", n_items=model.n_items
+    )
+    anchor_set = set(anchor_items)
+    new_items = [item for item in range(model.n_items) if item not in anchor_set]
+    if not new_items:
+        raise MirtValidationError(
+            "at least one response column must be a new item",
+            parameter="anchor_items",
+        )
+
+    calibration_model = model.copy()
+    if anchor_parameters is not None:
+        calibration_model.set_parameters(
+            **_anchor_parameter_values(
+                calibration_model, anchor_items, anchor_parameters
+            )
+        )
+    masks = calibration_model.free_parameter_masks
+    for name, values in calibration_model.parameters.items():
+        if values.ndim >= 1 and values.shape[0] == calibration_model.n_items:
+            masks[name][anchor_items] = False
+        else:
+            masks[name][...] = False
+    if not any(np.any(mask) for mask in masks.values()):
+        raise MirtValidationError(
+            "the new items have no free parameters to calibrate",
+            parameter="model",
+        )
+    calibration_model.set_free_parameter_masks(masks)
+    # Fitted models keep their values as EM starting values, so the anchor
+    # coordinates are never reinitialized.
+    calibration_model._is_fitted = True
+
+    density = GaussianDensity(
+        n_dimensions=calibration_model.n_factors,
+        estimate_mean=bool(estimate_mean),
+        estimate_cov=bool(estimate_cov),
+    )
+    estimator = EMEstimator(
+        n_quadpts=n_quadpts,
+        max_iter=max_iter,
+        tol=tol,
+        latent_density=density,
+        compute_standard_errors=bool(compute_standard_errors),
+    )
+    fit_result = estimator.fit(calibration_model, validated)
+    return FixedItemCalibrationResult(
+        fit_result=fit_result,
+        latent_mean=np.array(density.mean, dtype=np.float64),
+        latent_cov=np.array(density.cov, dtype=np.float64),
+        anchor_items=anchor_items,
+        new_items=new_items,
+    )
+
+
 def equate(
     model_old: "BaseItemModel",
     model_new: "BaseItemModel",
@@ -642,6 +940,10 @@ def equate(
 
     Finds transformation constants A and B such that:
         theta_new = A * theta_old + B
+
+    The estimator is :func:`mirt.equating.link`, whose constants describe the
+    opposite direction (``theta_old = A_link * theta_new + B_link``), so
+    ``A = 1 / A_link`` and ``B = -B_link / A_link``.
 
     Parameters
     ----------
@@ -663,7 +965,9 @@ def equate(
     Returns
     -------
     EquatingResult
-        Transformation constants and diagnostics.
+        Transformation constants. ``rmse`` combines the discrimination and
+        difficulty RMSEs of the anchors after placing the new form on the old
+        scale; it is zero for an exact linear relation.
 
     See Also
     --------
@@ -672,9 +976,11 @@ def equate(
     Examples
     --------
     >>> eq = equate(old_model, new_model, [0,1,2], [0,1,2])
-    >>> theta_equated = eq.A * theta_new + eq.B
+    >>> theta_on_old_scale = transform_theta(theta_new, eq)
     """
     import warnings
+
+    from mirt.equating.linking import link
 
     warnings.warn(
         "equate() is deprecated. Use mirt.equating.link() instead for more "
@@ -682,80 +988,26 @@ def equate(
         DeprecationWarning,
         stacklevel=2,
     )
-    disc_old = np.asarray(model_old.discrimination)[anchor_items_old]
-    diff_old = np.asarray(model_old.difficulty)[anchor_items_old]
-    disc_new = np.asarray(model_new.discrimination)[anchor_items_new]
-    diff_new = np.asarray(model_new.difficulty)[anchor_items_new]
-
-    if disc_old.ndim > 1:
-        disc_old = disc_old[:, 0]
-    if disc_new.ndim > 1:
-        disc_new = disc_new[:, 0]
-
-    if method == "mean_sigma":
-        A = np.std(disc_old) / np.std(disc_new)
-        B = np.mean(diff_old) - A * np.mean(diff_new)
-
-    elif method == "mean_mean":
-        A = np.mean(disc_old) / np.mean(disc_new)
-        B = np.mean(diff_old) - A * np.mean(diff_new)
-
-    elif method == "stocking_lord":
-        from scipy.optimize import minimize
-
-        def criterion(params):
-            A, B = params
-            theta = np.linspace(-4, 4, 41)
-
-            total_diff = 0.0
-            for j in range(len(anchor_items_old)):
-                p_old = 1 / (1 + np.exp(-disc_old[j] * (theta - diff_old[j])))
-                theta_trans = A * theta + B
-                p_new = 1 / (1 + np.exp(-disc_new[j] * (theta_trans - diff_new[j])))
-                total_diff += np.sum((p_old - p_new) ** 2)
-
-            return total_diff
-
-        result = minimize(criterion, [1.0, 0.0], method="Nelder-Mead")
-        A, B = result.x
-
-    elif method == "haebara":
-        from scipy.optimize import minimize
-
-        def criterion(params):
-            A, B = params
-            theta = np.linspace(-4, 4, 41)
-
-            total_diff = 0.0
-            for j in range(len(anchor_items_old)):
-                p_old = 1 / (1 + np.exp(-disc_old[j] * (theta - diff_old[j])))
-                theta_trans = A * theta + B
-                p_new = 1 / (1 + np.exp(-disc_new[j] * (theta_trans - diff_new[j])))
-
-                diff_sq = (p_old - p_new) ** 2
-                total_diff += np.sum(diff_sq)
-
-            return total_diff
-
-        result = minimize(criterion, [1.0, 0.0], method="Nelder-Mead")
-        A, B = result.x
-
-    else:
+    if method not in ("mean_sigma", "mean_mean", "stocking_lord", "haebara"):
         raise ValueError(f"Unknown equating method: {method}")
 
-    disc_new_trans = disc_new / A
-    diff_new_trans = A * diff_new + B
-    rmse = np.sqrt(
-        np.mean((disc_old - disc_new_trans) ** 2)
-        + np.mean((diff_old - diff_new_trans) ** 2)
+    linked = link(
+        model_old,
+        model_new,
+        anchor_items_old,
+        anchor_items_new,
+        method=method,
+        compute_diagnostics=True,
     )
+    assert linked.fit_statistics is not None
+    A_link, B_link = linked.constants.A, linked.constants.B
 
     return EquatingResult(
-        A=float(A),
-        B=float(B),
+        A=float(1.0 / A_link),
+        B=float(-B_link / A_link),
         method=method,
-        anchor_items=anchor_items_old,
-        rmse=float(rmse),
+        anchor_items=linked.anchor_items,
+        rmse=float(linked.fit_statistics.weighted_rmse),
     )
 
 
@@ -764,6 +1016,9 @@ def transform_theta(
     equating_result: EquatingResult,
 ) -> NDArray[np.float64]:
     """Transform theta estimates using equating constants.
+
+    :func:`equate` returns constants for ``theta_new = A * theta_old + B``,
+    so new-form estimates map onto the old scale as ``(theta - B) / A``.
 
     Parameters
     ----------
@@ -777,4 +1032,8 @@ def transform_theta(
     NDArray[np.float64]
         Transformed theta on old/reference scale.
     """
-    return equating_result.A * np.asarray(theta) + equating_result.B
+    scale = _validate_finite_number(equating_result.A, name="A")
+    shift = _validate_finite_number(equating_result.B, name="B")
+    if scale <= 0.0:
+        raise MirtValidationError("A must be positive", parameter="A", value=scale)
+    return (np.asarray(theta, dtype=np.float64) - shift) / scale

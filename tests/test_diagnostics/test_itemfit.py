@@ -358,3 +358,225 @@ class TestItemfitEdgeCases:
 
         assert_allclose(result1["infit"], result2["infit"])
         assert_allclose(result1["outfit"], result2["outfit"])
+
+
+def _reference_standardized_fit(responses, probabilities, axis):
+    """Scalar Wright-Masters mean squares and Wilson-Hilferty z statistics."""
+    from mirt.constants import PROB_EPSILON
+
+    if probabilities.ndim == 2:
+        probabilities = np.stack((1.0 - probabilities, probabilities), axis=2)
+    scores = np.arange(probabilities.shape[2])
+    n_groups = responses.shape[1 - axis]
+    reference = {
+        name: np.full(n_groups, np.nan)
+        for name in ("infit", "outfit", "z_infit", "z_outfit")
+    }
+    for group in range(n_groups):
+        squared, variance, fourth = [], [], []
+        for other in range(responses.shape[axis]):
+            person, item = (other, group) if axis == 0 else (group, other)
+            if responses[person, item] < 0:
+                continue
+            cell = probabilities[person, item]
+            mean = np.sum(scores * cell)
+            squared.append((responses[person, item] - mean) ** 2)
+            variance.append(np.sum((scores - mean) ** 2 * cell))
+            fourth.append(np.sum((scores - mean) ** 4 * cell))
+        squared, variance, fourth = map(np.asarray, (squared, variance, fourth))
+        eligible = variance > PROB_EPSILON
+        count = eligible.sum()
+        if count:
+            outfit = np.mean(squared[eligible] / variance[eligible])
+            q2 = np.sum(fourth[eligible] / variance[eligible] ** 2) / count**2
+            q2 -= 1.0 / count
+            reference["outfit"][group] = outfit
+            if q2 > 0:
+                q = np.sqrt(q2)
+                reference["z_outfit"][group] = (outfit ** (1 / 3) - 1) * 3 / q + q / 3
+        if variance.sum() > PROB_EPSILON:
+            infit = squared.sum() / variance.sum()
+            q2 = np.sum(fourth - variance**2) / variance.sum() ** 2
+            reference["infit"][group] = infit
+            if q2 > 0:
+                q = np.sqrt(q2)
+                reference["z_infit"][group] = (infit ** (1 / 3) - 1) * 3 / q + q / 3
+    return reference
+
+
+class TestStandardizedMeanSquares:
+    """Wilson-Hilferty z_infit and z_outfit."""
+
+    def test_hand_computed_binary_item(self):
+        model = FixedProbabilityModel(np.array([[0.2], [0.5], [0.8]]))
+        responses = np.array([[1], [0], [1]])
+
+        result = compute_itemfit(
+            model,
+            responses,
+            statistics=["infit", "outfit", "z_infit", "z_outfit"],
+            theta=np.zeros(3),
+        )
+
+        # Outfit: (0.64/0.16 + 0.25/0.25 + 0.04/0.16) / 3 = 1.75 with
+        # q^2 = sum((1 - 3W) / W) / 9 - 1/3 = 7.5 / 9 - 1 / 3 = 0.5.
+        q_out = np.sqrt(0.5)
+        # Infit: 0.93 / 0.57 with q^2 = sum(W - 4W^2) / 0.57^2.
+        q_in = np.sqrt(0.1152 / 0.57**2)
+        assert_allclose(result["outfit"], [1.75])
+        assert_allclose(result["infit"], [0.93 / 0.57])
+        assert_allclose(
+            result["z_outfit"], [(1.75 ** (1 / 3) - 1) * 3 / q_out + q_out / 3]
+        )
+        assert_allclose(
+            result["z_infit"],
+            [((0.93 / 0.57) ** (1 / 3) - 1) * 3 / q_in + q_in / 3],
+        )
+
+    @pytest.mark.parametrize("polytomous", [False, True])
+    @pytest.mark.parametrize("block_rows", [1, 7, 1000])
+    def test_blocks_match_scalar_reference(self, monkeypatch, polytomous, block_rows):
+        rng = np.random.default_rng(4219)
+        n_persons, n_items = 61, 4
+        categories = [2, 4, 3, 5] if polytomous else None
+        if polytomous:
+            probabilities = rng.uniform(0.1, 1.0, size=(n_persons, n_items, 5))
+            probabilities *= np.arange(5) < np.asarray(categories)[:, None]
+            probabilities /= probabilities.sum(axis=2, keepdims=True)
+        else:
+            probabilities = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
+            probabilities[:10, 1] = 0.0
+        responses = rng.integers(
+            0, categories if polytomous else 2, size=(n_persons, n_items)
+        )
+        if not polytomous:
+            responses[:10, 1] = 0
+        responses[rng.random(responses.shape) < 0.2] = -9
+        responses[:, 3] = -1
+        theta = np.arange(n_persons, dtype=float)[:, None]
+        model = IndexedProbabilityModel(probabilities, categories)
+        monkeypatch.setattr(
+            itemfit_module,
+            "_ITEMFIT_TARGET_CHUNK_ELEMENTS",
+            block_rows * n_items * (5 if polytomous else 1),
+        )
+
+        actual = compute_itemfit(
+            model,
+            responses,
+            theta=theta,
+            statistics=["z_infit", "z_outfit", "infit", "outfit"],
+        )
+
+        reference = _reference_standardized_fit(responses, probabilities, axis=0)
+        assert max(model.batch_sizes) <= block_rows
+        assert list(actual) == ["outfit", "z_outfit", "infit", "z_infit"]
+        for name, values in reference.items():
+            assert_allclose(actual[name], values, rtol=1e-11, equal_nan=True)
+        assert np.isnan(actual["z_infit"][3])
+
+    def test_approximately_standard_normal_under_true_rasch_model(self):
+        from mirt.models import OneParameterLogistic
+
+        rng = np.random.default_rng(1)
+        n_items = 60
+        model = OneParameterLogistic(n_items=n_items)
+        model.set_parameters(difficulty=rng.normal(size=n_items))
+        theta = rng.normal(size=(1000, 1))
+        probabilities = model.probability(theta)
+        responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+
+        result = compute_itemfit(
+            model, responses, statistics=["z_infit", "z_outfit"], theta=theta
+        )
+
+        for name in ("z_infit", "z_outfit"):
+            assert abs(np.mean(result[name])) < 0.3
+            assert 0.7 < np.std(result[name]) < 1.3
+
+    def test_nan_codes_missing_responses_like_negative_codes(self):
+        from mirt.models import TwoParameterLogistic
+
+        rng = np.random.default_rng(12)
+        model = TwoParameterLogistic(n_items=5)
+        model.set_parameters(
+            discrimination=rng.uniform(0.8, 2.0, 5), difficulty=rng.normal(size=5)
+        )
+        model._is_fitted = True
+        responses = rng.integers(0, 2, size=(120, 5)).astype(float)
+        missing = rng.random(responses.shape) < 0.1
+        statistics = ["infit", "outfit", "z_infit", "z_outfit", "X2", "PV_Q1"]
+
+        responses[missing] = np.nan
+        with_nan = compute_itemfit(model, responses, statistics, n_plausible=3, seed=0)
+        responses[missing] = -1
+        with_negative = compute_itemfit(
+            model, responses, statistics, n_plausible=3, seed=0
+        )
+
+        assert with_nan.keys() == with_negative.keys()
+        for name, values in with_negative.items():
+            assert_allclose(with_nan[name], values, equal_nan=True)
+
+    def test_constant_half_probabilities_have_undefined_z(self):
+        model = FixedProbabilityModel(np.full((4, 2), 0.5))
+        responses = np.array([[0, 1], [1, 1], [0, 0], [1, 0]])
+
+        result = compute_itemfit(
+            model, responses, statistics=["z_infit", "z_outfit"], theta=np.zeros(4)
+        )
+
+        assert np.all(np.isnan(result["z_infit"]))
+        assert np.all(np.isnan(result["z_outfit"]))
+
+
+class TestStatisticNames:
+    """Unknown statistic names fail instead of being silently dropped."""
+
+    @pytest.mark.parametrize(
+        "statistics", [["X3"], ["infit", "s_x2"], ["Zh"], ["infit", "lz"], []]
+    )
+    def test_compute_itemfit_rejects_unknown_names(self, statistics):
+        from mirt.exceptions import MirtValidationError
+
+        model = FixedProbabilityModel(np.full((3, 2), 0.5))
+        with pytest.raises(MirtValidationError, match="statistic"):
+            compute_itemfit(model, np.ones((3, 2)), statistics, theta=np.zeros(3))
+        assert model.probability_calls == 0
+
+    def test_single_name_string_is_accepted(self):
+        model = FixedProbabilityModel(np.full((3, 2), 0.5))
+
+        result = compute_itemfit(
+            model, np.array([[0, 1], [1, 0], [1, 1]]), "outfit", theta=np.zeros(3)
+        )
+
+        assert set(result) == {"outfit"}
+
+    def test_top_level_itemfit_rejects_unknown_names(
+        self, fitted_2pl_model, dichotomous_responses
+    ):
+        from mirt import itemfit
+
+        with pytest.raises(ValueError, match="Unknown fit statistic"):
+            itemfit(
+                fitted_2pl_model,
+                dichotomous_responses["responses"],
+                statistics=["infit", "X2*"],
+            )
+
+    def test_statistic_literal_lists_every_supported_name(self):
+        from typing import get_args
+
+        from mirt.typing import ItemFitStatistic
+
+        assert set(get_args(ItemFitStatistic)) == {
+            "infit",
+            "outfit",
+            "z_infit",
+            "z_outfit",
+            "S_X2",
+            "X2",
+            "G2",
+            "PV_Q1",
+        }

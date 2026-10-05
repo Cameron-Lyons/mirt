@@ -16,6 +16,11 @@ from typing import Any, Self
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._categorical import (
+    categorical_log_likelihood_batch,
+    category_offsets,
+    item_category_table,
+)
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.base import BaseItemModel
@@ -632,15 +637,13 @@ class CustomItemModel(BaseItemModel):
             missed = np.where(valid, 1 - response_values, 0)
             return observed @ np.log(clipped).T + missed @ np.log1p(-clipped).T
 
-        likelihood = np.zeros((response_values.shape[0], theta_2d.shape[0]))
-        safe_responses = np.where(valid, response_values, 0)
-        for item in range(self.n_items):
-            log_probabilities = np.log(
-                np.clip(probabilities[:, item, :], PROB_EPSILON, None)
-            )
-            contribution = log_probabilities[:, safe_responses[:, item]].T
-            likelihood += np.where(valid[:, item, None], contribution, 0.0)
-        return likelihood
+        counts = [self.n_categories] * self.n_items
+        log_table = item_category_table(probabilities, counts)
+        np.clip(log_table, PROB_EPSILON, None, out=log_table)
+        np.log(log_table, out=log_table)
+        return categorical_log_likelihood_batch(
+            log_table, category_offsets(counts), response_values, valid
+        )
 
     def parameter_gradient(
         self, theta: FloatArray, item_idx: int

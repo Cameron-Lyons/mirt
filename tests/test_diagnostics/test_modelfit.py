@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mirt import compute_fit_indices, compute_m2
+from mirt.diagnostics import modelfit
 from mirt.diagnostics.modelfit import (
     _compute_expected_margins,
     _compute_rmsea,
@@ -193,3 +194,118 @@ class TestFitIndices:
         lower, upper = _compute_rmsea_ci(10.2, 1, 4)
 
         assert lower <= estimate <= upper
+
+
+def _simulated_fit_data(model_name, n_items, n_persons, seed, missing=0.0):
+    """Return a parameterized model and responses simulated from it."""
+    rng = np.random.default_rng(seed)
+    theta = rng.normal(size=(n_persons, 1))
+    if model_name == "2PL":
+        model = TwoParameterLogistic(n_items=n_items)
+        model.set_parameters(
+            discrimination=rng.uniform(0.8, 2.5, n_items),
+            difficulty=rng.normal(size=n_items),
+        )
+        probabilities = model.probability(theta)
+        responses = (rng.random(probabilities.shape) < probabilities).astype(float)
+    else:
+        model = GradedResponseModel(n_items=n_items, n_categories=4)
+        probabilities = model.probability(theta)
+        draws = rng.random((n_persons, n_items, 1))
+        responses = np.minimum((draws > probabilities.cumsum(axis=2)).sum(axis=2), 3)
+        responses = responses.astype(float)
+    responses[rng.random(responses.shape) < missing] = np.nan
+    return model, responses
+
+
+class TestCholeskyWhitening:
+    """M2 whitens well-conditioned covariances with a Cholesky factor."""
+
+    @staticmethod
+    def _eigenvalue_path_only(monkeypatch):
+        monkeypatch.setattr(modelfit, "_well_conditioned_cholesky", lambda _: None)
+
+    @pytest.mark.parametrize(
+        ("model_name", "n_items", "missing"),
+        [("2PL", 8, 0.0), ("2PL", 12, 0.1), ("GRM", 6, 0.0), ("GRM", 7, 0.1)],
+    )
+    def test_fit_indices_match_eigenvalue_whitening(
+        self, monkeypatch, model_name, n_items, missing
+    ):
+        model, responses = _simulated_fit_data(
+            model_name, n_items, 800, seed=n_items, missing=missing
+        )
+        fast = compute_fit_indices(model, responses)
+
+        self._eigenvalue_path_only(monkeypatch)
+        reference = compute_fit_indices(model, responses)
+
+        assert fast.keys() == reference.keys()
+        assert fast["M2_df"] == reference["M2_df"]
+        np.testing.assert_allclose(
+            list(fast.values()), list(reference.values()), rtol=1e-10, atol=1e-12
+        )
+
+    def test_sixty_item_m2_takes_the_cholesky_path(self, monkeypatch):
+        model, responses = _simulated_fit_data("2PL", 60, 2000, seed=60)
+        factors = []
+        original = modelfit._well_conditioned_cholesky
+
+        def spy(matrix):
+            factor = original(matrix)
+            factors.append(factor is not None)
+            return factor
+
+        monkeypatch.setattr(modelfit, "_well_conditioned_cholesky", spy)
+        fast = compute_m2(model, responses)
+        assert factors == [True]
+
+        self._eigenvalue_path_only(monkeypatch)
+        reference = compute_m2(model, responses)
+        assert fast["df"] == reference["df"] == 1830 - 120
+        np.testing.assert_allclose(fast["M2"], reference["M2"], rtol=1e-10)
+        np.testing.assert_allclose(fast["p_value"], reference["p_value"], rtol=1e-8)
+
+    def test_singular_covariance_uses_eigenvalue_rank(self):
+        rng = np.random.default_rng(11)
+        loadings = rng.normal(size=(6, 4))
+        covariance = loadings @ loadings.T
+        jacobian = loadings[:, :1].copy()
+        scales = np.sqrt(np.diag(covariance))
+
+        assert (
+            modelfit._well_conditioned_cholesky(covariance / np.outer(scales, scales))
+            is None
+        )
+
+        supported = loadings @ rng.normal(size=4)
+        statistic, degrees = modelfit._projected_chi_square(
+            supported, covariance, jacobian
+        )
+        # Weight the residual with the pseudoinverse after projecting out the
+        # tangent direction within the four-dimensional covariance support.
+        coefficients = np.linalg.lstsq(loadings, supported, rcond=None)[0]
+        tangent = np.linalg.lstsq(loadings, jacobian[:, 0], rcond=None)[0]
+        tangent /= np.linalg.norm(tangent)
+        expected = coefficients @ coefficients - (tangent @ coefficients) ** 2
+        assert degrees == 3
+        assert statistic == pytest.approx(expected, rel=1e-8)
+
+        unsupported = supported + np.linalg.svd(loadings)[0][:, -1]
+        statistic, degrees = modelfit._projected_chi_square(
+            unsupported, covariance, jacobian
+        )
+        assert degrees == 3
+        assert np.isinf(statistic)
+
+    def test_complete_rows_are_counted_once_per_design(self, monkeypatch):
+        rng = np.random.default_rng(3)
+        responses = (rng.random((50, 4)) < 0.5).astype(float)
+        responses[[7, 31], [1, 3]] = np.nan
+        monkeypatch.setattr(modelfit, "_MOMENT_CHUNK_ELEMENTS", 40)
+
+        design = modelfit._moment_design(responses)
+
+        present = modelfit._score_features(np.isfinite(responses).astype(float))
+        np.testing.assert_array_equal(design.counts, present.sum(axis=0))
+        np.testing.assert_array_equal(design.overlap, present.T @ present)

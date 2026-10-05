@@ -236,16 +236,16 @@ class TestThetaChangeStop:
         assert result is False
 
     def test_reset(self):
-        """Test reset clears state."""
+        """Test reset forgets the previous estimate and the stable run."""
         theta_stop = ThetaChangeStop(threshold=0.1, n_stable=1)
 
         theta_stop.should_stop(make_state(theta=0.0, n_items=1))
-        theta_stop.should_stop(make_state(theta=0.05, n_items=2))
+        assert theta_stop.should_stop(make_state(theta=0.05, n_items=2)) is True
 
         theta_stop.reset()
 
-        assert theta_stop._stable_count == 0
-        assert theta_stop._last_theta is None
+        assert theta_stop.should_stop(make_state(theta=0.05, n_items=1)) is False
+        assert theta_stop.should_stop(make_state(theta=0.05, n_items=2)) is True
 
 
 class TestClassificationStop:
@@ -336,7 +336,7 @@ class TestClassificationStop:
         rule.reset()
 
         assert rule._classification is None
-        assert rule._triggered is False
+        assert "undetermined" in rule.get_reason()
 
 
 class TestCombinedStop:
@@ -443,8 +443,8 @@ class TestCombinedStop:
         )
 
         assert combined.should_stop(make_state(theta=0.0, se=0.1)) is True
-        assert tracker._last_theta is None
-        assert tracker._stable_count == 0
+        # An observed stopping state would make this repeated estimate stable.
+        assert tracker.should_stop(make_state(theta=0.0, se=0.1)) is False
 
     def test_and_evaluates_all_rules_to_preserve_state_tracking(self):
         first = _RecordingStop(False)
@@ -472,13 +472,14 @@ class TestCombinedStop:
         tracker = ThetaChangeStop(threshold=0.1, n_stable=2)
         combined = CombinedStop([tracker])
         combined.should_stop(make_state(theta=0.0, se=1.0, n_items=1))
-        combined.should_stop(make_state(theta=0.05, se=1.0, n_items=2))
-        assert tracker._stable_count == 1
+        assert combined.should_stop(make_state(theta=0.05, se=1.0, n_items=2)) is False
 
         combined.reset()
 
+        # Without the reset, the first state below would complete the stable run.
         assert combined.should_stop(make_state(theta=0.0, se=1.0, n_items=1)) is False
-        assert tracker._stable_count == 0
+        assert combined.should_stop(make_state(theta=0.05, se=1.0, n_items=2)) is False
+        assert combined.should_stop(make_state(theta=0.06, se=1.0, n_items=3)) is True
 
 
 class TestCreateStoppingRule:

@@ -5,7 +5,12 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.cat import CATEngine, MCATEngine
-from mirt.models import GradedResponseModel, MultidimensionalModel, TwoParameterLogistic
+from mirt.models import (
+    GeneralizedPartialCredit,
+    GradedResponseModel,
+    MultidimensionalModel,
+    TwoParameterLogistic,
+)
 
 
 def _engine(kind):
@@ -16,8 +21,12 @@ def _engine(kind):
         model = MultidimensionalModel(n_items=5, n_factors=2)
         engine_type = MCATEngine
     else:
+        # MCAT needs exact polytomous Fisher matrices, which GPCM defines.
+        ordinal_model = (
+            GradedResponseModel if kind == "ordinal_cat" else GeneralizedPartialCredit
+        )
         dimensions = 1 if kind == "ordinal_cat" else 2
-        model = GradedResponseModel(
+        model = ordinal_model(
             n_items=5, n_factors=dimensions, n_categories=[2, 4, 3, 2, 5]
         )
         engine_type = CATEngine if dimensions == 1 else MCATEngine

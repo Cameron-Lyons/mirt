@@ -97,36 +97,38 @@ def test_custom_likelihood_buffer_is_not_mutated():
 
 @native
 def test_native_standard_errors_retain_pattern_compression(monkeypatch):
-    from mirt.backends.rust._helpers import mirt_rs
-    from mirt.backends.rust.diagnostics import compute_item_se_parallel
-    from mirt.backends.rust.estep import e_step_complete
+    import mirt.estimation.standard_errors as standard_errors
+    from mirt.estimation.base import _parameter_bounds
 
     mirt.set_backend("rust")
     pool = np.array([[0, 1, -1], [1, 0, 1], [-1, 0, 0], [0, 1, 1]])
     responses = np.repeat(pool, [100, 200, 300, 400], axis=0)
     before = responses.copy()
-    original_e_step = mirt_rs.e_step_complete
-    shapes = []
+    original = standard_errors.estimate_covariance
+    calls = []
 
-    def capture(data, *args):
-        shapes.append(data.shape)
-        return original_e_step(data, *args)
+    def capture(model, data, *args, **kwargs):
+        calls.append((data.shape, kwargs["frequencies"].sum()))
+        return original(model, data, *args, **kwargs)
 
     with monkeypatch.context() as patch:
-        patch.setattr(mirt_rs, "e_step_complete", capture)
+        patch.setattr(standard_errors, "estimate_covariance", capture)
         result = mirt.fit_mirt(responses, n_quadpts=7, max_iter=3)
-    assert shapes == [(4, 3)]
+    assert calls == [((4, 3), 1000.0)]
     np.testing.assert_array_equal(responses, before)
     quad = GaussHermiteQuadrature(n_points=7)
-    a, b = result.model.discrimination, result.model.difficulty
-    posterior, _ = e_step_complete(responses, quad.nodes.ravel(), quad.weights, a, b)
-    se_a, se_b = compute_item_se_parallel(
-        responses, posterior, quad.nodes.ravel(), a, b
+    expected = original(
+        result.model,
+        responses,
+        quad,
+        quad.weights,
+        "oakes",
+        bounds=lambda name: _parameter_bounds(result.model, name),
     )
-    np.testing.assert_allclose(
-        result.standard_errors["discrimination"], se_a, rtol=1e-10
-    )
-    np.testing.assert_allclose(result.standard_errors["difficulty"], se_b, rtol=1e-10)
+    assert result.se_method == "oakes"
+    np.testing.assert_allclose(result.vcov, expected.covariance, rtol=1e-9)
+    for name, values in expected.standard_errors.items():
+        np.testing.assert_allclose(result.standard_errors[name], values, rtol=1e-9)
     assert result.n_observations == 1000
 
 

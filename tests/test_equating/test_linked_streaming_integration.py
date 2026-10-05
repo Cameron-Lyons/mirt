@@ -28,6 +28,19 @@ def _pattern_distribution(probabilities, weights):
     return distribution
 
 
+def _kolen_brennan_equivalents(old, new):
+    """Transcribe Kolen and Brennan (2014, eqs. 2.14-2.18) score by score."""
+    cumulative_new = np.cumsum(new)
+    equivalents = []
+    for score in range(len(old)):
+        rank = np.sum(old[:score]) + old[score] / 2
+        (above,) = np.nonzero(cumulative_new > rank)
+        cell = above[0]
+        below = cumulative_new[cell - 1] if cell else 0.0
+        equivalents.append(cell - 0.5 + (rank - below) / new[cell])
+    return np.array(equivalents)
+
+
 @pytest.mark.parametrize("backend", ["numpy", "rust"])
 def test_positional_linking_and_streaming_preserve_zero_weight_population_batches(
     backend,
@@ -53,9 +66,7 @@ def test_positional_linking_and_streaming_preserve_zero_weight_population_batche
     new_distribution = _pattern_distribution(
         expit(new_slopes * (theta[:, None] - new_locations)), weights
     )
-    old_ranks = np.cumsum(old_distribution) - old_distribution / 2
-    new_ranks = np.cumsum(new_distribution) - new_distribution / 2
-    expected = np.interp(old_ranks, new_ranks, np.arange(4))
+    expected = _kolen_brennan_equivalents(old_distribution, new_distribution)
 
     previous_backend = mirt.get_backend()
     mirt.set_backend(backend)

@@ -4,8 +4,10 @@ This module provides comprehensive CAT functionality including:
 - Item selection strategies (MFI, MEI, KL, etc.)
 - Stopping rules (SE threshold, max items, etc.)
 - Exposure control (Sympson-Hetter, randomesque)
-- Content balancing (test blueprints)
+- Content balancing (test blueprints) and shadow-test selection
+- Fixed and parallel form assembly
 - CAT engine for orchestrating adaptive tests
+- Simulation study reports
 - Multidimensional CAT (MCAT) support
 
 Examples
@@ -70,11 +72,15 @@ _LAZY_IMPORTS = {
     "RandomSelection": "mirt.cat.selection",
     "AStratified": "mirt.cat.selection",
     "create_selection_strategy": "mirt.cat.selection",
+    "ShadowTestSelection": "mirt.cat.shadow",
     "StoppingRule": "mirt.cat.stopping",
     "StandardErrorStop": "mirt.cat.stopping",
     "MaxItemsStop": "mirt.cat.stopping",
     "MinItemsStop": "mirt.cat.stopping",
     "ThetaChangeStop": "mirt.cat.stopping",
+    "SEChangeStop": "mirt.cat.stopping",
+    "MinInformationStop": "mirt.cat.stopping",
+    "PredictedSEReductionStop": "mirt.cat.stopping",
     "ClassificationStop": "mirt.cat.stopping",
     "CombinedStop": "mirt.cat.stopping",
     "create_stopping_rule": "mirt.cat.stopping",
@@ -115,6 +121,8 @@ _LAZY_IMPORTS = {
     "assemble_form": "mirt.cat.assembly",
     "ParallelFormAssemblyResult": "mirt.cat.parallel_assembly",
     "assemble_parallel_forms": "mirt.cat.parallel_assembly",
+    "CATSimulationReport": "mirt.cat.simulation_report",
+    "summarize_cat_simulation": "mirt.cat.simulation_report",
 }
 
 __all__ = list(_LAZY_IMPORTS)

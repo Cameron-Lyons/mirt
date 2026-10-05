@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from mirt._categorical import item_category_frequencies
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.utils.data import validate_responses
+from mirt.utils.plausible import _rubin_pool
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -28,6 +29,13 @@ LARGE_DF = 1e10
 _PAIRWISE_CHUNK_ELEMENTS = 1_000_000
 _MODEL_DRAW_TARGET_ELEMENTS = 2_000_000
 _IMPUTATION_METHODS = ("mean", "median", "mode", "random", "EM", "multiple")
+_MODEL_FIT_FAILURES = (
+    ValueError,
+    RuntimeError,
+    ArithmeticError,
+    FloatingPointError,
+    np.linalg.LinAlgError,
+)
 ImputationMethod = Literal["mean", "median", "mode", "random", "EM", "multiple"]
 ImputationModelName = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 
@@ -196,7 +204,8 @@ def impute_responses(
         - 'median': Replace with item median (rounded)
         - 'mode': Replace with item mode
         - 'random': Random draw from item distribution
-        - 'EM': Model-based imputation using IRT
+        - 'EM': Model-based single imputation: draw each missing response
+          from the IRT model given the person's EAP ability
         - 'multiple': Multiple imputation (returns list)
     model : str, BaseItemModel or FitResult, optional
         IRT model for model-based imputation (default: '2PL'). A model name
@@ -222,6 +231,9 @@ def impute_responses(
 
     Notes
     -----
+    EM imputation calibrates a named model once by marginal maximum
+    likelihood on the observed responses, scores each person by EAP, and then
+    draws every missing response from the model at that ability.
     Multiple imputation draws jointly from each person's ability posterior
     conditional on observed responses, then draws the missing item responses.
     Item parameters remain fixed at the supplied or estimated calibration, so
@@ -465,47 +477,39 @@ def _impute_em(
     model: str | BaseItemModel,
     rng: np.random.Generator,
 ) -> NDArray[np.int_]:
-    """Model-based imputation using EM algorithm."""
+    """Draw missing responses from an observed-data MML calibration."""
     from mirt import fit_mirt
     from mirt.scoring import fscores
 
-    if not isinstance(model, str):
-        observed_responses = np.where(missing_mask, -1, responses)
-        scores = fscores(model, observed_responses, method="EAP")
-        imputed = responses.copy()
-        _draw_model_responses(
-            imputed,
-            missing_mask,
-            model,
-            scores.theta.reshape(responses.shape[0], model.n_factors),
-            rng,
-        )
-        return imputed
-
-    imputed = responses.copy()
-    imputed = _impute_mode(responses, missing_mask)
-
-    for _ in range(10):
+    observed_responses = np.where(missing_mask, -1, responses)
+    if isinstance(model, str):
         try:
-            result = fit_mirt(imputed, model=model, verbose=False)
-            scores = fscores(result.model, imputed, method="EAP")
-            theta = scores.theta
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ):
+            # EM marginalizes over missing cells, so one fit on the observed
+            # data calibrates the items without contamination by fill-ins.
+            model = fit_mirt(
+                observed_responses,
+                model=model,
+                verbose=False,
+                compute_standard_errors=False,
+            ).model
+        except _MODEL_FIT_FAILURES as exc:
+            warnings.warn(
+                "EM imputation calibration failed; using empirical item "
+                f"distributions: {exc}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
             return _impute_random(responses, missing_mask, rng)
 
-        old_imputed = imputed.copy()
-
-        _draw_model_responses(imputed, missing_mask, result.model, theta, rng)
-
-        if np.array_equal(old_imputed[missing_mask], imputed[missing_mask]):
-            break
-
+    scores = fscores(model, observed_responses, method="EAP")
+    imputed = responses.copy()
+    _draw_model_responses(
+        imputed,
+        missing_mask,
+        model,
+        scores.theta.reshape(responses.shape[0], model.n_factors),
+        rng,
+    )
     return imputed
 
 
@@ -543,13 +547,7 @@ def _impute_multiple(
             n_quadpts,
             rng,
         )
-    except (
-        ValueError,
-        RuntimeError,
-        ArithmeticError,
-        FloatingPointError,
-        np.linalg.LinAlgError,
-    ) as exc:
+    except _MODEL_FIT_FAILURES as exc:
         if not isinstance(model, str):
             raise
         warnings.warn(
@@ -992,34 +990,20 @@ def averageMI(
     else:
         variances_stacked = uncertainty_stacked**2
 
-    q_bar = estimates_stacked.mean(axis=0)
-    u_bar = variances_stacked.mean(axis=0)
-    b = estimates_stacked.var(axis=0, ddof=1)
-    extra_variance = (1 + 1 / m) * b
-    total_var = u_bar + extra_variance
-
+    pooled = _rubin_pool(estimates_stacked, variances_stacked, zero_between_df=LARGE_DF)
+    q_bar = pooled.estimate
+    u_bar = pooled.within_variance
+    b = pooled.between_variance
+    total_var = pooled.total_variance
+    df_old = pooled.df
     se = np.sqrt(total_var)
 
     lambda_hat = np.divide(
-        extra_variance,
+        (1 + 1 / m) * b,
         total_var,
         out=np.zeros_like(total_var),
         where=total_var > 0,
     )
-    df_old = np.full_like(total_var, LARGE_DF, dtype=np.float64)
-    has_between_variance = extra_variance > 0
-    relative_within = np.divide(
-        u_bar,
-        extra_variance,
-        out=np.zeros_like(u_bar),
-        where=has_between_variance,
-    )
-    df_old = np.where(
-        has_between_variance,
-        (m - 1) * (1 + relative_within) ** 2,
-        df_old,
-    )
-
     fmi = lambda_hat + 2 / (df_old + 3) * (1 - lambda_hat)
     fmi = np.clip(fmi, 0, 1)
 

@@ -64,7 +64,7 @@ class ModelFitReport(ReportBuilder):
 
         sections = []
 
-        sections.append(self._build_model_summary())
+        sections.append(self._model_summary_section())
 
         fit_indices = compute_fit_indices(self.fit_result.model, self.responses)
         sections.append(
@@ -99,26 +99,6 @@ class ModelFitReport(ReportBuilder):
             )
 
         return "\n".join(sections)
-
-    def _build_model_summary(self) -> str:
-        from mirt.reports._templates import (
-            escape_text,
-            format_value,
-            section,
-            summary_box,
-        )
-
-        model = self.fit_result.model
-        stats = self.fit_result.fit_statistics()
-        summary_html = f"""
-        <p><strong>Model:</strong> {escape_text(model.model_name)}</p>
-        <p><strong>Items:</strong> {model.n_items} | <strong>Factors:</strong> {model.n_factors}</p>
-        <p><strong>Persons:</strong> {stats["n_observations"]} | <strong>Parameters:</strong> {stats["n_parameters"]}</p>
-        <p><strong>Log-Likelihood:</strong> {format_value(stats["log_likelihood"], ".2f")}</p>
-        <p><strong>AIC:</strong> {format_value(stats["aic"], ".2f")} | <strong>BIC:</strong> {format_value(stats["bic"], ".2f")}</p>
-        <p><strong>Converged:</strong> {stats["converged"]} ({stats["n_iterations"]} iterations)</p>
-        """
-        return section("Model Summary", summary_box(summary_html))
 
     def _build_fit_indices_table(self, fit_indices: dict[str, float]) -> str:
         from mirt.reports._templates import format_value, table_from_data

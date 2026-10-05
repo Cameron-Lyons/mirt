@@ -15,42 +15,37 @@
 
 use pyo3::prelude::*;
 
+mod bayesian_diagnostics;
+mod bootstrap;
+mod calibration;
+mod cat;
+mod counts;
+mod diagnostics;
+mod dynamic;
+mod eapsum;
+mod equating;
+mod estep;
+mod estimation;
+mod explanatory;
+mod gvem;
+mod likelihood;
 mod likelihood_cache;
+mod mstep;
+mod multigroup;
 mod optimization_scoring;
+mod patterns;
+mod plausible;
+mod polytomous;
 mod polytomous_mstep;
+mod posterior;
+mod regularized;
+mod response_time;
+mod scoring;
+mod sibtest;
+mod simulation;
 mod special;
-
-pub mod utils;
-
-pub mod bayesian_diagnostics;
-pub mod bootstrap;
-pub mod calibration;
-pub mod cat;
-pub mod diagnostics;
-pub mod dynamic;
-pub mod eapsum;
-pub mod equating;
-pub mod estep;
-pub mod estimation;
-pub mod explanatory;
-pub mod gvem;
-pub mod irtree;
-pub mod likelihood;
-pub mod mfrm;
-pub mod mirt_models;
-pub mod mstep;
-pub mod multigroup;
-pub mod multilevel;
-pub mod patterns;
-pub mod plausible;
-pub mod polytomous;
-pub mod posterior;
-pub mod regularized;
-pub mod response_time;
-pub mod scoring;
-pub mod sibtest;
-pub mod simulation;
-pub mod standard_errors;
+mod standard_errors;
+mod utils;
 
 /// Python module for mirt_rs
 #[pymodule]
@@ -66,7 +61,6 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     scoring::register(m)?;
     optimization_scoring::register(m)?;
     bootstrap::register(m)?;
-    mirt_models::register(m)?;
     eapsum::register(m)?;
     cat::register(m)?;
     mstep::register(m)?;
@@ -76,10 +70,7 @@ fn mirt_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     polytomous::register(m)?;
     multigroup::register(m)?;
     gvem::register(m)?;
-    multilevel::register(m)?;
-    mfrm::register(m)?;
     regularized::register(m)?;
-    irtree::register(m)?;
     response_time::register(m)?;
     dynamic::register(m)?;
     explanatory::register(m)?;

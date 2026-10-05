@@ -17,7 +17,7 @@ from mirt.constants import (
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
 from mirt.estimation._variational_objective import variational_elbo
 from mirt.estimation._variational_statistics import variational_item_statistics
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import BaseEstimator, _reject_parameter_restrictions
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -433,6 +433,13 @@ class SparseBayesianEstimator(BaseEstimator):
         -------
         SparseBayesianResult
             Fitted model with sparse structure and diagnostics.
+
+        Raises
+        ------
+        MirtValidationError
+            If ``model.n_factors`` differs from ``k_max``, or if
+            ``set_free_parameter_masks`` fixes parameters, which the
+            variational updates cannot hold.
         """
         if model.model_name not in ("2PL", "1PL"):
             raise ValueError(
@@ -445,6 +452,7 @@ class SparseBayesianEstimator(BaseEstimator):
                 value=self.k_max,
                 expected=str(model.n_factors),
             )
+        _reject_parameter_restrictions(model, "SparseBayesianEstimator")
 
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape

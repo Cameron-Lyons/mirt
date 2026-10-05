@@ -1,12 +1,18 @@
 """Standard error computation methods for IRT models.
 
 This module provides multiple methods for computing standard errors:
-- Numerical (finite difference Hessian)
-- Louis (missing information principle)
-- Sandwich (robust standard errors)
-- Oakes (cross-product of scores)
-- Crossprod (observed information from scores)
-- SEM (supplemented EM)
+
+- Numerical, central, forward and Richardson: itemwise finite differences of
+  the expected complete-data log-likelihood (diagonal complete-data curvature,
+  which ignores the missing information and understates uncertainty)
+- Louis, Oakes and SEM: the observed information of the marginal likelihood
+- Crossprod: the outer product of marginal person scores
+- Sandwich: observed information bread around the score cross-product
+- Fisher: the marginal expected information, by response-pattern enumeration
+
+Built-in item models whose parameters each belong to one item compute the
+marginal information and scores exactly (Louis, 1982); other models use
+central differences of the marginal log-likelihood.
 
 References
 ----------
@@ -144,9 +150,12 @@ def compute_se(
     posterior_weights : ndarray
         Posterior weights from final E-step.
     method : str
-        Method for SE computation.
+        Method for SE computation. The default ``"numerical"`` is itemwise
+        complete-data curvature; ``"oakes"`` (or its aliases ``"louis"`` and
+        ``"sem"``) gives observed-information standard errors.
     step_size : float
-        Step size for numerical differentiation.
+        Step size for numerical differentiation. Matrix-based methods use it
+        only for models without exact item derivatives.
     n_jobs : int
         Number of parallel jobs for item-wise computation.
         Use -1 for all CPUs, 1 for sequential.
@@ -223,7 +232,13 @@ def compute_se(
         )
     elif method == "fisher":
         return _se_fisher(
-            model, responses, quadrature, posterior_weights, step_size, n_jobs
+            model,
+            responses,
+            quadrature,
+            posterior_weights,
+            step_size,
+            n_jobs,
+            prior_mass,
         )
     else:
         raise ValueError(f"Unknown SE method: {method}")
@@ -607,42 +622,27 @@ def _se_fisher(
     posterior_weights: NDArray[np.float64],
     h: float,
     n_jobs: int = 1,
+    prior_mass: NDArray[np.float64] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
-    """Expected (Fisher) information standard errors.
+    """Marginal expected (Fisher) information standard errors.
 
-    Uses the expected information matrix computed from the model.
-    This assumes the model is correctly specified.
+    The information ``N * sum_y P(y) s(y) s(y)'`` sums the outer products of
+    exact marginal scores over every complete response pattern, weighted by
+    the pattern probabilities under the fitted model. It assumes the model is
+    correctly specified and is available for at most ``2**16`` patterns.
     """
-    quad_points = quadrature.nodes
-    quad_weights = quadrature.weights
-    n_persons = responses.shape[0]
+    del n_jobs
+    from mirt.estimation.standard_errors import (
+        _resolve_prior_mass,
+        _se_from_information,
+        compute_expected_information,
+    )
 
-    se_dict = {}
-    free_masks = model.free_parameter_masks
-
-    for param_name, values in model.parameters.items():
-        free_mask = free_masks[param_name]
-        if not np.any(free_mask):
-            se_dict[param_name] = np.zeros_like(values)
-            continue
-
-        se = np.zeros_like(values)
-
-        for item_idx in range(model.n_items):
-            info = model.information(quad_points, item_idx)
-            expected_info = n_persons * np.sum(quad_weights * info)
-
-            if values.ndim == 1:
-                se[item_idx] = (
-                    1.0 / np.sqrt(expected_info) if expected_info > 0 else np.nan
-                )
-            else:
-                se[item_idx] = np.full(
-                    values.shape[1],
-                    1.0 / np.sqrt(expected_info) if expected_info > 0 else np.nan,
-                )
-
-        se[~free_mask] = 0.0
-        se_dict[param_name] = model._expand_parameter_standard_errors(param_name, se)
-
-    return se_dict
+    response_array = np.asarray(responses)
+    mass = _resolve_prior_mass(
+        model, response_array, posterior_weights, quadrature, prior_mass
+    )
+    information, layouts = compute_expected_information(
+        model, quadrature, mass, response_array.shape[0], h
+    )
+    return _se_from_information(information, layouts, model)

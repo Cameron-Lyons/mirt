@@ -10,7 +10,7 @@ import pytest
 
 from mirt.exceptions import MirtValidationError
 from mirt.models.dichotomous import TwoParameterLogistic
-from mirt.results import FitResult, ScoreResult
+from mirt.results import AbilityPosteriorResult, FitResult, ScoreResult
 
 
 def _fit_result(
@@ -192,6 +192,88 @@ def test_fit_result_json_export_respects_compact_options() -> None:
     assert payload["n_observations"] == 250
     assert "parameters" not in payload
     assert "standard_errors" not in payload
+
+
+def test_fit_result_derives_covariance_labels_from_free_parameters() -> None:
+    covariance = np.diag([0.04, 0.01, 0.02, 0.03, 0.05, 0.06])
+    covariance[0, 3] = covariance[3, 0] = 0.005
+    result = _fit_result(vcov=covariance, se_method="oakes")
+
+    assert result.vcov_labels == [
+        "discrimination[item-a]",
+        "discrimination[item-b]",
+        "discrimination[item-c]",
+        "difficulty[item-a]",
+        "difficulty[item-b]",
+        "difficulty[item-c]",
+    ]
+    assert result.se_method == "oakes"
+    covariance[0, 0] = 99.0
+    assert result.vcov[0, 0] == 0.04
+
+    payload = result.to_dict()
+    assert payload["se_method"] == "oakes"
+    assert payload["vcov"]["labels"] == result.vcov_labels
+    assert payload["vcov"]["matrix"][0][3] == 0.005
+    compact = result.to_dict(include_standard_errors=False)
+    assert "vcov" not in compact
+    assert "se_method" not in compact
+
+
+def test_fit_result_embeds_covariance_rows_in_stored_layout() -> None:
+    covariance = np.array([[0.04, 0.01], [0.01, np.nan]])
+    covariance[1, :] = covariance[:, 1] = np.nan
+    result = _fit_result(
+        vcov=covariance,
+        vcov_labels=["difficulty[item-c]", "discrimination[item-b]"],
+    )
+
+    embedded, random, joint = result._parameter_covariance(
+        ["discrimination", "difficulty"]
+    )
+
+    assert joint
+    expected = np.zeros((6, 6))
+    expected[5, 5] = 0.04
+    np.testing.assert_array_equal(embedded, expected)
+    np.testing.assert_array_equal(random, np.arange(6) == 5)
+
+    diagonal, random, joint = _fit_result()._parameter_covariance(["difficulty"])
+    assert not joint
+    np.testing.assert_allclose(diagonal, np.diag([0.04, 0.0625, 0.09]))
+    assert random.all()
+    with pytest.raises(MirtValidationError, match="no parameter covariance"):
+        _fit_result(standard_errors={})._parameter_covariance(["difficulty"])
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"vcov": np.eye(5)}, "pass vcov_labels"),
+        ({"vcov": np.ones((2, 3))}, "square"),
+        (
+            {"vcov": np.array([[1.0, 0.5], [0.0, 1.0]]), "vcov_labels": ["a", "b"]},
+            "symmetric",
+        ),
+        ({"vcov": np.diag([1.0, np.inf])}, "symmetric"),
+        ({"vcov": -np.eye(6)}, "negative"),
+        ({"vcov_labels": ["difficulty[item-a]"]}, "require vcov"),
+        (
+            {"vcov": np.eye(2), "vcov_labels": ["difficulty[item-a]"] * 2},
+            "unique",
+        ),
+        (
+            {"vcov": np.eye(1), "vcov_labels": ["difficulty[item-z]"]},
+            "unknown parameters",
+        ),
+        ({"se_method": 3}, "se_method"),
+    ],
+)
+def test_fit_result_validates_covariance(
+    overrides: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(MirtValidationError, match=message):
+        _fit_result(**overrides)
 
 
 def test_fit_statistics_preserve_scalar_types() -> None:
@@ -470,6 +552,50 @@ def test_score_classification_validates_confidence(confidence: Any) -> None:
 
     with pytest.raises(MirtValidationError, match="0.5 < confidence < 1"):
         result.classify(confidence=confidence)
+
+
+def _posterior_result() -> AbilityPosteriorResult:
+    return AbilityPosteriorResult(
+        points=np.array([-1.0, 0.0, 1.0]),
+        weights=np.array([[0.7, 0.2, 0.1], [0.05, 0.05, 0.9]]),
+        log_marginal_likelihood=np.zeros(2),
+    )
+
+
+@pytest.mark.parametrize(
+    "confidence", [True, 0.3, 0.5, 1.0, 1.5, np.nan, np.inf, "0.95", None]
+)
+def test_classification_confidence_errors_match_across_result_types(
+    confidence: Any,
+) -> None:
+    # The two result types used to word these errors differently.
+    messages = []
+    for result in (ScoreResult(np.zeros(2), np.ones(2), "EAP"), _posterior_result()):
+        with pytest.raises(MirtValidationError) as error:
+            result.classify(confidence=confidence)
+        messages.append(str(error.value))
+
+    assert messages[0] == messages[1]
+    assert "strictly between 0.5 and 1" in messages[0]
+
+
+@pytest.mark.parametrize("cut_score", [True, np.nan, "invalid", [0.0, 1.0, 2.0]])
+def test_cut_score_validation_is_shared_across_result_types(cut_score: Any) -> None:
+    for result in (ScoreResult(np.zeros(2), np.ones(2), "EAP"), _posterior_result()):
+        with pytest.raises(MirtValidationError, match="cut_score"):
+            result.classification_probabilities(cut_score)
+
+
+def test_posterior_classification_uses_shared_thresholds() -> None:
+    result = _posterior_result()
+
+    np.testing.assert_allclose(result.classification_probabilities(-0.5), [0.3, 0.95])
+    np.testing.assert_array_equal(
+        result.classify(-0.5, confidence=0.9), ["uncertain", "above"]
+    )
+    np.testing.assert_array_equal(
+        result.classify(0.5, confidence=0.85), ["below", "above"]
+    )
 
 
 def test_score_dataframe_accepts_numpy_person_ids() -> None:

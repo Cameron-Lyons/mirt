@@ -2254,3 +2254,76 @@ class TestStateSpaceIRT:
         summary = model.summary()
         assert "State-Space IRT" in summary
         assert "Observation Noise:  0.2000" in summary
+
+
+def _reference_state_integration(model, responses, state_means, state_variances, n):
+    """Integrate node by node with explicit masks, as before the shared kernel."""
+    from mirt.utils.numeric import standard_normal_quadrature
+
+    nodes, weights = standard_normal_quadrature(n)
+    flat_responses = responses.reshape(-1, model.n_items)
+    marginal = np.zeros((state_means.size, model.n_items))
+    scores = np.full(state_means.size, -np.inf)
+    for node, weight in zip(nodes, weights, strict=True):
+        states = state_means.ravel() + np.sqrt(state_variances).ravel() * node
+        probabilities = model._observation_probability(states)
+        marginal += weight * probabilities
+        conditional = np.sum(
+            np.where(
+                flat_responses == 1,
+                np.log(probabilities),
+                np.where(flat_responses == 0, np.log1p(-probabilities), 0.0),
+            ),
+            axis=1,
+        )
+        scores = np.logaddexp(scores, np.log(weight) + conditional)
+    scores[~np.any(flat_responses >= 0, axis=1)] = 0.0
+    return (
+        np.clip(marginal.reshape(state_means.shape + (model.n_items,)), 0.0, 1.0),
+        scores.reshape(state_means.shape),
+    )
+
+
+@pytest.mark.parametrize("base_model", ["2PL", "3PL"])
+def test_shared_state_quadrature_kernel_matches_nodewise_reference(base_model):
+    model = StateSpaceIRT(
+        n_items=6,
+        n_timepoints=4,
+        base_model=base_model,
+        discrimination=np.linspace(0.5, 2.5, 6),
+        difficulty=np.linspace(-1.5, 1.5, 6),
+    )
+    rng = np.random.default_rng(31)
+    responses = rng.integers(0, 2, size=(9, 4, 6))
+    responses[rng.random(responses.shape) < 0.2] = -1
+    responses[2, 1] = -1
+    responses[5] = -1
+    state_means = rng.normal(size=(9, 4))
+    state_variances = rng.uniform(0.0, 1.5, size=(9, 4))
+    state_variances[0, 0] = 0.0
+
+    expected_probabilities, expected_scores = _reference_state_integration(
+        model, responses, state_means, state_variances, 15
+    )
+    probabilities, scores = model._integrated_response_diagnostics(
+        responses, state_means, state_variances, 15
+    )
+
+    assert_allclose(probabilities, expected_probabilities, rtol=0.0, atol=1e-15)
+    assert_allclose(scores, expected_scores, rtol=1e-12, atol=1e-12)
+    assert np.all(scores[5] == 0.0)
+    assert scores[2, 1] == 0.0
+    assert_allclose(
+        model._integrated_response_log_likelihoods(
+            responses, state_means, state_variances, 15
+        ),
+        scores,
+        rtol=0.0,
+        atol=0.0,
+    )
+    assert_allclose(
+        model._integrated_observation_probabilities(state_means, state_variances, 15),
+        probabilities,
+        rtol=0.0,
+        atol=0.0,
+    )

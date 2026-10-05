@@ -9,6 +9,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt.backends.rust._helpers import (
+    _ensure_f64,
+    _ensure_i32,
     mirt_rs,
     rust_enabled,
 )
@@ -26,8 +28,6 @@ def multigroup_e_step_2pl(
     prior_vars: NDArray[np.float64],
 ) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
     """Compute multigroup E-step for 2PL models using Rust backend.
-
-    Processes all groups in parallel using Rayon.
 
     Parameters
     ----------
@@ -52,20 +52,25 @@ def multigroup_e_step_2pl(
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
         - posterior_weights: list of (n_persons_g, n_quad) arrays
         - group_log_likelihoods: (n_groups,) array
+
+    Raises
+    ------
+    ValueError
+        If parameter lengths or group priors are invalid.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        disc_float = [d.astype(np.float64) for d in disc_list]
-        diff_float = [d.astype(np.float64) for d in diff_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        disc_float = [_ensure_f64(d) for d in disc_list]
+        diff_float = [_ensure_f64(d) for d in diff_list]
 
         return mirt_rs.multigroup_e_step_2pl(
             responses_int,
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             disc_float,
             diff_float,
-            prior_means.astype(np.float64),
-            prior_vars.astype(np.float64),
+            _ensure_f64(prior_means),
+            _ensure_f64(prior_vars),
         )
 
     return None
@@ -106,22 +111,27 @@ def multigroup_e_step_3pl(
     -------
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+
+    Raises
+    ------
+    ValueError
+        If parameter lengths or group priors are invalid.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        disc_float = [d.astype(np.float64) for d in disc_list]
-        diff_float = [d.astype(np.float64) for d in diff_list]
-        guess_float = [g.astype(np.float64) for g in guess_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        disc_float = [_ensure_f64(d) for d in disc_list]
+        diff_float = [_ensure_f64(d) for d in diff_list]
+        guess_float = [_ensure_f64(g) for g in guess_list]
 
         return mirt_rs.multigroup_e_step_3pl(
             responses_int,
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             disc_float,
             diff_float,
             guess_float,
-            prior_means.astype(np.float64),
-            prior_vars.astype(np.float64),
+            _ensure_f64(prior_means),
+            _ensure_f64(prior_vars),
         )
 
     return None
@@ -138,8 +148,6 @@ def multigroup_e_step_grm(
     prior_vars: NDArray[np.float64],
 ) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
     """Compute multigroup E-step for GRM models using Rust backend.
-
-    Processes all groups in parallel using Rayon.
 
     Parameters
     ----------
@@ -164,22 +172,29 @@ def multigroup_e_step_grm(
     -------
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+
+    Raises
+    ------
+    IndexError
+        If an observed response is not below its item's category count.
+    ValueError
+        If parameter shapes, category counts or group priors are invalid.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        disc_float = [d.astype(np.float64) for d in disc_list]
-        thresh_float = [t.astype(np.float64) for t in thresh_list]
-        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        disc_float = [_ensure_f64(d) for d in disc_list]
+        thresh_float = [_ensure_f64(t) for t in thresh_list]
+        n_cats_int = [_ensure_i32(n) for n in n_categories_list]
 
         return mirt_rs.multigroup_e_step_grm(
             responses_int,
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             disc_float,
             thresh_float,
             n_cats_int,
-            prior_means.astype(np.float64),
-            prior_vars.astype(np.float64),
+            _ensure_f64(prior_means),
+            _ensure_f64(prior_vars),
         )
 
     return None
@@ -196,8 +211,6 @@ def multigroup_e_step_gpcm(
     prior_vars: NDArray[np.float64],
 ) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
     """Compute multigroup E-step for GPCM models using Rust backend.
-
-    Processes all groups in parallel using Rayon.
 
     Parameters
     ----------
@@ -222,22 +235,29 @@ def multigroup_e_step_gpcm(
     -------
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+
+    Raises
+    ------
+    IndexError
+        If an observed response is not below its item's category count.
+    ValueError
+        If parameter shapes, category counts or group priors are invalid.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        disc_float = [d.astype(np.float64) for d in disc_list]
-        steps_float = [s.astype(np.float64) for s in steps_list]
-        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        disc_float = [_ensure_f64(d) for d in disc_list]
+        steps_float = [_ensure_f64(s) for s in steps_list]
+        n_cats_int = [_ensure_i32(n) for n in n_categories_list]
 
         return mirt_rs.multigroup_e_step_gpcm(
             responses_int,
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             disc_float,
             steps_float,
             n_cats_int,
-            prior_means.astype(np.float64),
-            prior_vars.astype(np.float64),
+            _ensure_f64(prior_means),
+            _ensure_f64(prior_vars),
         )
 
     return None
@@ -254,8 +274,6 @@ def multigroup_e_step_nrm(
     prior_vars: NDArray[np.float64],
 ) -> tuple[list[NDArray[np.float64]], NDArray[np.float64]] | None:
     """Compute multigroup E-step for NRM models using Rust backend.
-
-    Processes all groups in parallel using Rayon.
 
     Parameters
     ----------
@@ -280,22 +298,29 @@ def multigroup_e_step_nrm(
     -------
     tuple or None
         (posterior_weights, group_log_likelihoods) or None if Rust unavailable
+
+    Raises
+    ------
+    IndexError
+        If an observed response is not below its item's category count.
+    ValueError
+        If parameter shapes, category counts or group priors are invalid.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        slopes_float = [s.astype(np.float64) for s in slopes_list]
-        intercepts_float = [i.astype(np.float64) for i in intercepts_list]
-        n_cats_int = [n.astype(np.int32) for n in n_categories_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        slopes_float = [_ensure_f64(s) for s in slopes_list]
+        intercepts_float = [_ensure_f64(i) for i in intercepts_list]
+        n_cats_int = [_ensure_i32(n) for n in n_categories_list]
 
         return mirt_rs.multigroup_e_step_nrm(
             responses_int,
-            quad_points.astype(np.float64),
-            quad_weights.astype(np.float64),
+            _ensure_f64(quad_points),
+            _ensure_f64(quad_weights),
             slopes_float,
             intercepts_float,
             n_cats_int,
-            prior_means.astype(np.float64),
-            prior_vars.astype(np.float64),
+            _ensure_f64(prior_means),
+            _ensure_f64(prior_vars),
         )
 
     return None
@@ -320,10 +345,15 @@ def multigroup_expected_counts(
         (r_k_list, n_k_list) or None if Rust unavailable
         - r_k_list: list of (n_items, n_quad) expected correct counts
         - n_k_list: list of (n_items, n_quad) expected total counts
+
+    Raises
+    ------
+    ValueError
+        If the lists differ in length or a posterior has the wrong row count.
     """
     if rust_enabled():
-        responses_int = [r.astype(np.int32) for r in responses_list]
-        weights_float = [w.astype(np.float64) for w in posterior_weights_list]
+        responses_int = [_ensure_i32(r) for r in responses_list]
+        weights_float = [_ensure_f64(w) for w in posterior_weights_list]
 
         return mirt_rs.multigroup_expected_counts(responses_int, weights_float)
 

@@ -1,8 +1,15 @@
 """Tests for score equating functions."""
 
+import warnings
+from fractions import Fraction
+from itertools import accumulate
+
 import numpy as np
 import pytest
+from scipy.optimize import brentq
+from scipy.special import expit, gammaln
 
+from mirt import CustomItemModel, create_item_type
 from mirt.equating import (
     ScoreEquatingResult,
     equipercentile_equating,
@@ -12,7 +19,64 @@ from mirt.equating import (
     theta_to_score,
     true_score_equating,
 )
-from mirt.models.dichotomous import TwoParameterLogistic
+from mirt.models.dichotomous import (
+    FourParameterLogistic,
+    ThreeParameterLogistic,
+    TwoParameterLogistic,
+)
+from mirt.models.polytomous import GradedResponseModel
+from mirt.models.zeroinflated import ZeroInflated3PL
+
+
+def _asymptotic_form(model_type, n_items, seed, guessing=0.2):
+    """Build a form whose expected-score curve has the family's asymptotes."""
+    rng = np.random.default_rng(seed)
+    discrimination = rng.uniform(0.6, 2.0, n_items)
+    difficulty = rng.normal(0.0, 1.0, n_items)
+    if model_type is GradedResponseModel:
+        model = model_type(n_items, n_categories=4)
+        thresholds = np.sort(rng.normal(0.0, 1.2, (n_items, 3)), axis=1)
+        return model.set_parameters(
+            discrimination=discrimination, thresholds=thresholds
+        )
+    model = model_type(n_items)
+    parameters = {"discrimination": discrimination, "difficulty": difficulty}
+    if model_type is not TwoParameterLogistic:
+        parameters["guessing"] = np.full(n_items, guessing)
+    if model_type is FourParameterLogistic:
+        parameters["upper"] = rng.uniform(0.85, 0.95, n_items)
+    if model_type is ZeroInflated3PL:
+        parameters["zero_inflation"] = rng.uniform(0.02, 0.1, n_items)
+    return model.set_parameters(**parameters)
+
+
+def _three_pl_true_score_oracle(old, new, score):
+    """Solve the old 3PL test characteristic curve with an independent solver."""
+
+    def tcc(model, theta):
+        logits = model.discrimination * (theta - model.difficulty)
+        return np.sum(model.guessing + (1.0 - model.guessing) * expit(logits))
+
+    theta = brentq(lambda t: tcc(old, t) - score, -60.0, 60.0, xtol=1e-14)
+    return tcc(new, theta)
+
+
+def _exact_kolen_brennan(old_counts, new_counts):
+    """Evaluate Kolen and Brennan (2014, eqs. 2.14-2.18) in exact arithmetic."""
+    old = [Fraction(int(count), int(sum(old_counts))) for count in old_counts]
+    new = [Fraction(int(count), int(sum(new_counts))) for count in new_counts]
+    cumulative = list(accumulate(new))
+    equivalents = []
+    for score, probability in enumerate(old):
+        rank = sum(old[:score], Fraction(0)) + probability / 2
+        cells = [y for y, total in enumerate(cumulative) if total > rank]
+        if not cells:
+            equivalents.append(len(new) - 0.5)
+            continue
+        cell = cells[0]
+        below = cumulative[cell - 1] if cell else Fraction(0)
+        equivalents.append(float(cell - Fraction(1, 2) + (rank - below) / new[cell]))
+    return np.array(equivalents)
 
 
 @pytest.fixture
@@ -73,11 +137,23 @@ class TestTrueScoreEquating:
         diffs = np.diff(result.new_scores)
         assert np.all(diffs >= -0.01)
 
-    def test_true_score_same_form_identity(self, simple_model):
-        """Test that equating same form gives identity."""
-        result = true_score_equating(simple_model, simple_model)
+    @pytest.mark.parametrize(
+        "model_type",
+        [
+            TwoParameterLogistic,
+            ThreeParameterLogistic,
+            FourParameterLogistic,
+            GradedResponseModel,
+            ZeroInflated3PL,
+        ],
+    )
+    def test_true_score_same_form_identity(self, model_type):
+        """Equating a form to itself is the identity, endpoints included."""
+        model = _asymptotic_form(model_type, n_items=8, seed=3)
 
-        np.testing.assert_allclose(result.old_scores, result.new_scores, atol=0.5)
+        result = true_score_equating(model, model)
+
+        np.testing.assert_allclose(result.new_scores, result.old_scores, atol=1e-10)
 
     def test_true_score_with_item_subset(self, simple_model):
         """Test equating with item subsets."""
@@ -89,6 +165,94 @@ class TestTrueScoreEquating:
         )
 
         assert len(result.old_scores) == 6
+
+
+class TestTrueScoreEndpoints:
+    """Kolen-Brennan conventions outside the attainable true-score range."""
+
+    def test_scores_below_chance_follow_lord_line(self):
+        old = _asymptotic_form(ThreeParameterLogistic, 20, seed=0, guessing=0.2)
+        new = _asymptotic_form(ThreeParameterLogistic, 20, seed=1, guessing=0.25)
+
+        result = true_score_equating(old, new)
+
+        # Sum of guessing is 4 on the old form and 5 on the new form, so
+        # scores 0..4 lie on the line from (0, 0) to (4, 5).
+        np.testing.assert_allclose(
+            result.new_scores[:5], np.arange(5) * 5.0 / 4.0, rtol=1e-12
+        )
+        assert np.all(np.diff(result.new_scores) > 0.0)
+
+    def test_interior_scores_match_independent_root_oracle(self):
+        old = _asymptotic_form(ThreeParameterLogistic, 20, seed=0, guessing=0.2)
+        new = _asymptotic_form(ThreeParameterLogistic, 20, seed=1, guessing=0.25)
+
+        result = true_score_equating(old, new)
+
+        expected = [_three_pl_true_score_oracle(old, new, x) for x in range(5, 20)]
+        np.testing.assert_allclose(result.new_scores[5:20], expected, atol=1e-10)
+
+    def test_extreme_scores_map_to_extreme_scores(self):
+        old = _asymptotic_form(TwoParameterLogistic, 12, seed=4)
+        new = _asymptotic_form(TwoParameterLogistic, 17, seed=5)
+
+        result = true_score_equating(old, new)
+
+        assert result.new_scores[0] == 0.0
+        assert result.new_scores[-1] == 17.0
+        assert np.all(np.diff(result.new_scores) > 0.0)
+
+    def test_scores_above_upper_asymptote_interpolate_to_maximum(self):
+        old = FourParameterLogistic(10).set_parameters(
+            discrimination=np.linspace(0.8, 1.6, 10),
+            difficulty=np.linspace(-1.5, 1.5, 10),
+            guessing=np.full(10, 0.1),
+            upper=np.full(10, 0.85),
+        )
+        new = FourParameterLogistic(10).set_parameters(
+            discrimination=np.linspace(0.9, 1.4, 10),
+            difficulty=np.linspace(-1.0, 1.8, 10),
+            guessing=np.full(10, 0.2),
+            upper=np.full(10, 0.9),
+        )
+
+        result = true_score_equating(old, new)
+
+        # Old upper limit 8.5 maps to 9; old maximum 10 maps to maximum 10.
+        np.testing.assert_allclose(
+            result.new_scores[[0, 1, 9, 10]],
+            [0.0, 2.0, 9.0 + 1.0 / 3.0, 10.0],
+            rtol=1e-12,
+        )
+
+    def test_reporting_range_does_not_limit_solved_abilities(self):
+        old = _asymptotic_form(ThreeParameterLogistic, 15, seed=6)
+        new = _asymptotic_form(ThreeParameterLogistic, 15, seed=7)
+
+        narrow = true_score_equating(old, new, theta_range=(-0.5, 0.5), n_theta=5)
+        default = true_score_equating(old, new)
+
+        np.testing.assert_array_equal(narrow.theta, np.linspace(-0.5, 0.5, 5))
+        np.testing.assert_allclose(narrow.new_scores, default.new_scores, atol=1e-11)
+
+    def test_custom_curves_that_overflow_at_extreme_abilities_do_not_warn(self):
+        def logistic(theta, slope, location):
+            return 1 / (1 + np.exp(-slope * (theta - location)))
+
+        spec = create_item_type(
+            "Logistic",
+            logistic,
+            par_bounds={"slope": (0.05, 5), "location": (-5, 5)},
+            par_defaults={"slope": 1, "location": 0},
+        )
+        model = CustomItemModel(n_items=3, item_type=spec)
+        model.set_parameters(slope=[0.8, 1.2, 1.5], location=[-0.5, 0.0, 0.7])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            result = true_score_equating(model, model)
+
+        np.testing.assert_allclose(result.new_scores, result.old_scores, atol=1e-10)
 
 
 class TestObservedScoreEquating:
@@ -167,7 +331,18 @@ class TestEquipercentileEquating:
 
         equated = equipercentile_equating(dist, dist)
 
-        np.testing.assert_allclose(equated, np.arange(5), atol=0.01)
+        np.testing.assert_allclose(equated, np.arange(5), atol=1e-12)
+
+    def test_same_dist_identity_keeps_tail_precision(self):
+        """Tail scores with tiny probabilities still equate to themselves."""
+        scores = np.arange(61)
+        dist = np.exp(
+            gammaln(61) - gammaln(scores + 1) - gammaln(61 - scores) - 60 * np.log(2)
+        )
+
+        equated = equipercentile_equating(dist, dist)
+
+        np.testing.assert_allclose(equated, scores, atol=1e-12)
 
     def test_equipercentile_shifted_dist(self):
         """Test with shifted distribution."""
@@ -177,8 +352,33 @@ class TestEquipercentileEquating:
         equated = equipercentile_equating(dist_old, dist_new)
 
         assert len(equated) == len(dist_old)
-        assert equated[0] >= 0
-        assert equated[-1] <= len(dist_new) - 1
+        assert equated[0] >= -0.5
+        assert equated[-1] <= len(dist_new) - 0.5
+        assert np.all(np.diff(equated) > 0.0)
+
+    def test_kolen_brennan_four_point_example(self):
+        """Low ranks invert below zero instead of being clamped."""
+        equated = equipercentile_equating(
+            np.array([0.1, 0.2, 0.3, 0.4]), np.array([0.4, 0.3, 0.2, 0.1])
+        )
+
+        np.testing.assert_allclose(
+            equated, [-0.375, 0.0, 2.0 / 3.0, 2.0], rtol=1e-12, atol=1e-12
+        )
+
+    @pytest.mark.parametrize("seed", range(6))
+    def test_matches_exact_kolen_brennan_oracle_with_zero_cells(self, seed):
+        rng = np.random.default_rng(seed)
+        old_counts = rng.integers(0, 20, 9) * (rng.random(9) > 0.3)
+        new_counts = rng.integers(0, 20, 12) * (rng.random(12) > 0.3)
+        old_counts[rng.integers(9)] += 1
+        new_counts[rng.integers(12)] += 1
+
+        equated = equipercentile_equating(old_counts, new_counts)
+
+        expected = _exact_kolen_brennan(old_counts, new_counts)
+        np.testing.assert_allclose(equated, expected, rtol=1e-12, atol=1e-12)
+        assert np.all(equated >= -0.5) and np.all(equated <= len(new_counts) - 0.5)
 
     def test_equipercentile_smoothing(self):
         """Test smoothing options."""

@@ -526,7 +526,8 @@ def test_s_x2_bounds_response_counting_and_evaluates_only_quadrature_nodes(monke
     )
     assert sum(counted_rows) == len(responses) * (model.n_items + 1)
     assert sum(model.batch_sizes) == 41
-    assert max(model.batch_sizes) <= 2
+    # Probability batches hold at most 2 * 15 node-item-category values.
+    assert max(model.batch_sizes) * model.n_items * 2 <= 2 * 15
     assert_allclose(result["S_X2"], 0, atol=1e-20)
     assert_allclose(result["df"], 3)
 
@@ -635,3 +636,245 @@ def test_mixture_class_dependence_requires_joint_score_integration():
         model, responses, statistics=["infit"], theta=np.zeros((8, 1))
     )
     assert np.all(np.isfinite(result["infit"]))
+
+
+def _reference_full_recursion_tables(probabilities, categories, weights):
+    """Previous algorithm: one full Lord-Wingersky recursion per left-out item."""
+
+    def distribution(skip):
+        values = np.ones((probabilities.shape[0], 1))
+        for item, count in enumerate(categories):
+            if item == skip:
+                continue
+            updated = np.zeros((len(values), values.shape[1] + count - 1))
+            for category in range(count):
+                updated[:, category : category + values.shape[1]] += (
+                    values * probabilities[:, item, category, None]
+                )
+            values = updated
+        return values
+
+    marginal = weights @ distribution(-1)
+    joint = []
+    for item, count in enumerate(categories):
+        rest = distribution(item)
+        table = np.zeros((len(marginal), count))
+        for category in range(count):
+            table[category : category + rest.shape[1], category] = (
+                weights * probabilities[:, item, category]
+            ) @ rest
+        joint.append(table / marginal[:, None])
+    return joint, marginal
+
+
+@pytest.mark.parametrize("categories", [[2] * 7, [3] * 5, [2, 5, 3, 2, 4, 6]])
+@pytest.mark.parametrize("chunk_elements", [1, 200, 262_144])
+def test_prefix_suffix_tables_match_full_recursion_reference(
+    monkeypatch, categories, chunk_elements
+):
+    rng = np.random.default_rng(len(categories) + chunk_elements)
+    n_nodes, width = 23, max(categories)
+    probabilities = rng.uniform(0.05, 1.0, size=(n_nodes, len(categories), width))
+    probabilities *= np.arange(width) < np.asarray(categories)[:, None]
+    probabilities /= probabilities.sum(axis=2, keepdims=True)
+    weights = rng.uniform(0.1, 1.0, n_nodes)
+    weights /= weights.sum()
+    model = GridProbabilityModel(probabilities, categories)
+    # Bound both probability batches and the recursion's node blocks.
+    monkeypatch.setattr(
+        itemfit_module, "_ITEMFIT_TARGET_CHUNK_ELEMENTS", chunk_elements
+    )
+    monkeypatch.setattr(itemfit_module, "_SX2_TARGET_CHUNK_ELEMENTS", chunk_elements)
+    recursion_blocks = []
+    original_add = itemfit_module._add_item_to_distribution
+
+    def spy_add(distribution, item_probabilities):
+        recursion_blocks.append(len(distribution))
+        return original_add(distribution, item_probabilities)
+
+    monkeypatch.setattr(itemfit_module, "_add_item_to_distribution", spy_add)
+
+    conditional, marginal = itemfit_module._conditional_category_probabilities(
+        model,
+        np.asarray(categories),
+        np.arange(n_nodes, dtype=float)[:, None],
+        weights,
+    )
+
+    expected_joint, expected_marginal = _reference_full_recursion_tables(
+        probabilities, categories, weights
+    )
+    assert_allclose(marginal, expected_marginal, rtol=1e-12, atol=1e-15)
+    for actual, expected in zip(conditional, expected_joint, strict=True):
+        assert_allclose(actual, expected, rtol=1e-12, atol=1e-15)
+    n_scores = sum(categories) - len(categories) + 1
+    block_rows = max(1, chunk_elements // (len(categories) * n_scores))
+    assert max(recursion_blocks) == min(block_rows, n_nodes)
+    assert max(model.batch_sizes) <= block_rows
+
+
+def test_antidiagonal_sums_match_direct_reduction():
+    rng = np.random.default_rng(9)
+    for shape in [(3, 4, 7), (2, 7, 4), (1, 1, 5), (2, 6, 1)]:
+        matrices = rng.normal(size=shape)
+        expected = np.zeros((shape[0], shape[1] + shape[2] - 1))
+        for row in range(shape[1]):
+            for column in range(shape[2]):
+                expected[:, row + column] += matrices[:, row, column]
+        assert_allclose(
+            itemfit_module._antidiagonal_sums(matrices), expected, rtol=1e-14
+        )
+
+
+def _reference_pooled_statistic(observed, expected, n_parameters, minimum):
+    """Row-by-row pooling with array deletion, as before vectorization."""
+    # Expected counts that equal min_expected up to rounding are not sparse.
+    minimum *= 1.0 - 1e-10
+    n_categories, n_scores = observed.shape[1], observed.shape[0]
+    observed, expected = observed[1:-1].copy(), expected[1:-1].copy()
+    if n_categories > 2 and len(observed):
+        high, low = n_scores - n_categories - 1, n_categories - 2
+        if high < low:
+            return np.nan, 0, np.nan
+        observed[low] += observed[:low].sum(axis=0)
+        expected[low] += expected[:low].sum(axis=0)
+        observed[high] += observed[high + 1 :].sum(axis=0)
+        expected[high] += expected[high + 1 :].sum(axis=0)
+        observed, expected = observed[low : high + 1], expected[low : high + 1]
+    populated = observed.sum(axis=1) > 0
+    observed, expected = observed[populated], expected[populated]
+    while n_categories == 2 and minimum > 0 and len(expected) > 1:
+        sparse_rows = np.flatnonzero(np.min(expected, axis=1) < minimum)
+        if sparse_rows.size == 0:
+            break
+        row = int(sparse_rows[0])
+        if row == 0:
+            neighbor = 1
+        elif row == len(expected) - 1:
+            neighbor = row - 1
+        elif observed[row - 1].sum() <= observed[row + 1].sum():
+            neighbor = row - 1
+        else:
+            neighbor = row + 1
+        observed[neighbor] += observed[row]
+        expected[neighbor] += expected[row]
+        observed = np.delete(observed, row, axis=0)
+        expected = np.delete(expected, row, axis=0)
+    statistic, contrasts, sparse = 0.0, 0, False
+    for row_observed, row_expected in zip(observed, expected, strict=True):
+        while (
+            n_categories > 2
+            and minimum > 0
+            and len(row_expected) > 1
+            and np.min(row_expected) < minimum
+        ):
+            category = int(np.argmin(row_expected))
+            if category == 0:
+                neighbor = 1
+            elif category == len(row_expected) - 1:
+                neighbor = category - 1
+            elif row_expected[category - 1] <= row_expected[category + 1]:
+                neighbor = category - 1
+            else:
+                neighbor = category + 1
+            row_observed = row_observed.copy()
+            row_expected = row_expected.copy()
+            row_observed[neighbor] += row_observed[category]
+            row_expected[neighbor] += row_expected[category]
+            row_observed = np.delete(row_observed, category)
+            row_expected = np.delete(row_expected, category)
+        positive = row_expected > 0
+        contrasts += max(int(positive.sum()) - 1, 0)
+        if np.any(~positive & (row_observed > 0)):
+            statistic = np.inf
+        statistic += np.sum(
+            (row_observed[positive] - row_expected[positive]) ** 2
+            / row_expected[positive]
+        )
+        sparse |= bool(np.any(row_expected[positive] < minimum))
+    degrees = max(contrasts - n_parameters, 0)
+    p_value = chi2.sf(statistic, degrees) if degrees > 0 and not sparse else np.nan
+    return statistic, degrees, p_value
+
+
+@pytest.mark.parametrize("n_categories", [2, 3, 5])
+@pytest.mark.parametrize("minimum", [0.0, 1.0, 4.0])
+def test_vectorized_pooling_matches_rowwise_reference(n_categories, minimum):
+    rng = np.random.default_rng(n_categories * 10 + int(minimum))
+    for _ in range(25):
+        n_scores = int(rng.integers(n_categories + 3, 30))
+        expected = rng.gamma(0.7, 3.0, size=(n_scores, n_categories))
+        expected[rng.random(expected.shape) < 0.05] = 0.0
+        observed = rng.poisson(expected + 0.1).astype(float)
+        # As in S-X2, expected rows redistribute each score group's persons.
+        totals = expected.sum(axis=1, keepdims=True)
+        expected *= np.divide(
+            observed.sum(axis=1, keepdims=True),
+            totals,
+            out=np.zeros_like(totals),
+            where=totals > 0,
+        )
+        actual = itemfit_module._sx2_from_tables(observed, expected, 1, minimum)
+        reference = _reference_pooled_statistic(observed, expected, 1, minimum)
+        assert_allclose(actual[0], reference[0], rtol=1e-12)
+        assert actual[1] == reference[1]
+        assert_allclose(actual[2], reference[2], rtol=1e-10, equal_nan=True)
+
+
+def test_one_person_score_row_at_threshold_keeps_p_value():
+    # Score row 2 holds one person; pooling all its categories leaves one cell
+    # whose expected count is 1 up to rounding. It used to be judged sparse
+    # only when the rounding fell below 1, which suppressed the p-value.
+    observed = np.zeros((7, 3))
+    expected = np.zeros((7, 3))
+    observed[2] = [0, 1, 0]
+    expected[2] = [0.25, 0.5, 0.25 - 1e-16]
+    observed[3:5] = [[10, 20, 10], [15, 10, 15]]
+    expected[3:5] = [[12.0, 17.0, 11.0], [14.0, 12.0, 14.0]]
+    assert expected[2].sum() < 1.0
+
+    statistic, degrees, p_value = itemfit_module._sx2_from_tables(
+        observed, expected, 0, 1.0
+    )
+
+    reference = sum(
+        np.sum((observed[row] - expected[row]) ** 2 / expected[row]) for row in (3, 4)
+    )
+    assert_allclose(statistic, reference + 0.0)
+    assert degrees == 4
+    assert_allclose(p_value, chi2.sf(reference, 4))
+
+
+def test_binary_row_pooling_breaks_population_ties_toward_lower_scores():
+    # Rows 0 and 2 both hold three persons, but rounding leaves the expected
+    # total of row 0 one unit in the last place above row 2. The sparse middle
+    # row must still join its lower-score neighbor, as documented.
+    observed = np.array([[2, 1], [0, 1], [1, 2]], dtype=float)
+    expected = np.array([[1.5, 1.5000000000000004], [0.4, 0.6], [1.5, 1.5]])
+    assert expected[0].sum() > expected[2].sum()
+
+    pooled_observed, pooled_expected = itemfit_module._pool_score_rows(
+        observed, expected, 1.0
+    )
+
+    assert_allclose(pooled_observed, [[2, 2], [1, 2]])
+    assert_allclose(pooled_expected, [[1.9, 2.1], [1.5, 1.5]])
+
+
+def test_ordinal_s_x2_p_values_survive_single_person_score_rows():
+    # Long five-category forms leave one-person score rows whose pooled
+    # expected count is exactly one person up to rounding. Every p-value used
+    # to be NaN because that rounding could fall below min_expected=1.
+    from mirt.models import GradedResponseModel
+
+    rng = np.random.default_rng(2)
+    model = GradedResponseModel(n_items=20, n_categories=5)
+    theta = rng.normal(size=(1000, 1))
+    probabilities = model.probability(theta)
+    draws = rng.random((1000, 20, 1))
+    responses = np.minimum((draws > probabilities.cumsum(axis=2)).sum(axis=2), 4)
+
+    result = compute_s_x2(model, responses)
+
+    assert np.all(np.isfinite(result["p_value"]))
+    assert np.all(result["df"] > 0)

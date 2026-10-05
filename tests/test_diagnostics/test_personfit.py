@@ -1,5 +1,6 @@
 """Tests for person fit statistics."""
 
+from types import SimpleNamespace
 from typing import get_args
 
 import numpy as np
@@ -665,3 +666,111 @@ class TestPersonfitPolytomous:
             equal_nan=True,
         )
         assert_allclose(result["lz"], result["Zh"], equal_nan=True)
+
+
+def _wilson_hilferty(mean_square, variance):
+    q = np.sqrt(variance)
+    return (mean_square ** (1 / 3) - 1) * 3 / q + q / 3
+
+
+class TestStandardizedPersonFit:
+    """Wilson-Hilferty z_infit and z_outfit for respondents."""
+
+    def test_hand_computed_binary_person(self):
+        model = FixedProbabilityModel(np.array([[0.2, 0.5, 0.8]]))
+
+        result = compute_personfit(
+            model,
+            np.array([[1, 0, 1]]),
+            np.zeros(1),
+            statistics=["infit", "outfit", "z_infit", "z_outfit"],
+        )
+
+        assert list(result) == ["outfit", "z_outfit", "infit", "z_infit"]
+        assert_allclose(result["outfit"], [1.75])
+        assert_allclose(result["z_outfit"], [_wilson_hilferty(1.75, 0.5)])
+        assert_allclose(result["infit"], [0.93 / 0.57])
+        assert_allclose(
+            result["z_infit"], [_wilson_hilferty(0.93 / 0.57, 0.1152 / 0.57**2)]
+        )
+
+    def test_polytomous_person_matches_direct_moments(self):
+        probabilities = np.array([[[0.6, 0.3, 0.1], [0.7, 0.3, 0.0]]] * 2)
+        model = FixedProbabilityModel(probabilities, n_categories=[3, 2])
+        responses = np.array([[2, 1], [0, -1]])
+
+        result = compute_personfit(
+            model,
+            responses,
+            np.zeros(2),
+            statistics=["z_infit", "z_outfit", "infit", "outfit"],
+        )
+
+        scores = np.arange(3)
+        means = probabilities[0] @ scores
+        variances = np.sum((scores - means[:, None]) ** 2 * probabilities[0], axis=1)
+        fourth = np.sum((scores - means[:, None]) ** 4 * probabilities[0], axis=1)
+        squared = (responses[0] - means) ** 2
+        outfit = np.mean(squared / variances)
+        infit = squared.sum() / variances.sum()
+        outfit_variance = np.sum(fourth / variances**2) / 4 - 1 / 2
+        infit_variance = np.sum(fourth - variances**2) / variances.sum() ** 2
+        assert_allclose(result["outfit"][0], outfit)
+        assert_allclose(result["infit"][0], infit)
+        assert_allclose(
+            result["z_outfit"][0], _wilson_hilferty(outfit, outfit_variance)
+        )
+        assert_allclose(result["z_infit"][0], _wilson_hilferty(infit, infit_variance))
+        # A single observed response: q_out^2 = C / W^2 - 1.
+        single = fourth[0] / variances[0] ** 2 - 1
+        assert_allclose(
+            result["z_outfit"][1],
+            _wilson_hilferty(means[0] ** 2 / variances[0], single),
+        )
+
+    def test_true_model_scores_are_approximately_standard_normal(self):
+        from mirt.models.dichotomous import OneParameterLogistic
+
+        rng = np.random.default_rng(2)
+        model = OneParameterLogistic(n_items=60)
+        model.set_parameters(difficulty=rng.normal(size=60))
+        theta = rng.normal(size=(1000, 1))
+        probabilities = model.probability(theta)
+        responses = (rng.random(probabilities.shape) < probabilities).astype(int)
+
+        result = compute_personfit(
+            model, responses, theta, statistics=["z_infit", "z_outfit"]
+        )
+
+        for name in ("z_infit", "z_outfit"):
+            assert abs(np.nanmean(result[name])) < 0.2
+            assert 0.8 < np.nanstd(result[name]) < 1.2
+
+
+class TestPersonFitStatisticNames:
+    @pytest.mark.parametrize("statistics", [["ZZ"], ["infit", "S_X2"], []])
+    def test_unknown_names_are_rejected(self, statistics):
+        from mirt.exceptions import MirtValidationError
+
+        model = FixedProbabilityModel(np.full((3, 2), 0.5))
+        with pytest.raises(MirtValidationError, match="statistic"):
+            compute_personfit(model, np.ones((3, 2)), np.zeros(3), statistics)
+        assert model.probability_calls == 0
+
+    def test_top_level_personfit_validates_before_scoring(self, monkeypatch):
+        import mirt
+        import mirt.scoring
+
+        def fail_scoring(*args, **kwargs):
+            raise AssertionError("statistics must be validated before scoring")
+
+        monkeypatch.setattr(mirt.scoring, "fscores", fail_scoring)
+        with pytest.raises(ValueError, match="Unknown fit statistic"):
+            mirt.personfit(
+                SimpleNamespace(model=object()),
+                np.zeros((2, 2), dtype=int),
+                statistics=["Zh", "ZZ"],
+            )
+
+    def test_statistic_literal_includes_standardized_mean_squares(self):
+        assert {"z_infit", "z_outfit"}.issubset(get_args(PersonFitStatistic))

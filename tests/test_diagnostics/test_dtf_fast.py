@@ -12,13 +12,16 @@ from scipy import integrate
 
 from mirt.diagnostics.dtf import (
     _aggregate_dtf,
-    _bootstrap_dtf_se,
     _bootstrap_dtf_statistics,
     _compute_expected_score,
     _create_integration_weights,
     compute_dtf,
     plot_dtf,
 )
+from mirt.models.dichotomous import TwoParameterLogistic
+
+UNLINKED_WARNING = "compute_dtf compares separately standardized"
+pytestmark = pytest.mark.filterwarnings(f"ignore:{UNLINKED_WARNING}:UserWarning")
 
 
 class BinaryModel:
@@ -563,23 +566,178 @@ class TestBootstrap:
         assert summary.standard_error == pytest.approx(0.0)
         assert summary.p_value == expected_p_value
 
-    def test_compatibility_wrapper_returns_two_values(self, monkeypatch):
+    def test_bootstrap_summary_reports_uncertainty(self, monkeypatch):
         self.install_data_driven_fit(monkeypatch)
         data, groups = base_data()
+        theta = np.linspace(-2.0, 2.0, 9)
+        weights, _ = _create_integration_weights(theta, "normal")
 
-        standard_error, p_value = _bootstrap_dtf_se(
-            data,
-            groups,
-            "2PL",
-            "unsigned",
-            (-2.0, 2.0),
-            9,
+        summary = _bootstrap_dtf_statistics(
+            data=data,
+            groups=groups,
+            model="2PL",
+            method="unsigned",
+            theta_grid=theta,
+            integration_weights=weights,
+            observed_dtf=0.1,
+            ref_group="focal",
+            focal_group="reference",
             n_bootstrap=10,
+            confidence_level=0.95,
             random_state=123,
+            fit_kwargs={},
         )
 
-        assert np.isfinite(standard_error)
-        assert 0.0 <= p_value <= 1.0
+        assert np.isfinite(summary.standard_error)
+        assert 0.0 <= summary.p_value <= 1.0
+        assert summary.confidence_interval[0] <= summary.confidence_interval[1]
+        assert summary.n_successful == 10
+
+
+def _impact_calibrations() -> tuple[TwoParameterLogistic, TwoParameterLogistic]:
+    """Reference 2PL and a separate focal calibration of the same items.
+
+    Focal abilities follow N(-1, 1.2**2). Calibrating the focal group alone
+    standardizes them, giving ``a * 1.2`` and ``(b + 1) / 1.2``.
+    """
+    discrimination = np.array([0.8, 1.0, 1.3, 1.6, 2.0, 1.1])
+    difficulty = np.array([-1.5, -0.8, -0.2, 0.3, 0.9, 1.4])
+    reference = TwoParameterLogistic(n_items=6)
+    reference.set_parameters(discrimination=discrimination, difficulty=difficulty)
+    focal = TwoParameterLogistic(n_items=6)
+    focal.set_parameters(
+        discrimination=1.2 * discrimination, difficulty=(difficulty + 1.0) / 1.2
+    )
+    return reference, focal
+
+
+def impact_data():
+    return np.zeros((8, 6), dtype=np.int64), np.repeat(["reference", "zfocal"], 4)
+
+
+class TestLinkedDTF:
+    def test_missing_anchors_warn_that_impact_is_confounded(self, monkeypatch):
+        install_group_models(
+            monkeypatch, BinaryModel([0.8, 0.7]), BinaryModel([0.2, 0.3])
+        )
+        data, groups = base_data()
+
+        with pytest.warns(UserWarning, match="anchor_items"):
+            result = compute_dtf(data, groups, n_bootstrap=0)
+
+        assert result["anchor_items"] is None
+        assert result["linking_constants"] is None
+
+    def test_anchor_items_remove_pure_impact(self, monkeypatch):
+        reference, focal = _impact_calibrations()
+        install_group_models(monkeypatch, reference, focal)
+        data, groups = impact_data()
+
+        unlinked = compute_dtf(data, groups, method="signed", n_bootstrap=0)
+        linked = compute_dtf(
+            data, groups, method="signed", n_bootstrap=0, anchor_items=[0, 1, 2, 3]
+        )
+
+        assert abs(unlinked["DTF"]) > 0.5
+        assert linked["DTF"] == pytest.approx(0.0, abs=1e-3)
+        A, B = linked["linking_constants"]
+        assert A == pytest.approx(1.2, rel=1e-4)
+        assert B == pytest.approx(-1.0, abs=1e-4)
+        assert linked["anchor_items"] == [0, 1, 2, 3]
+        np.testing.assert_allclose(
+            linked["expected_score_focal"], linked["expected_score_ref"], atol=1e-3
+        )
+
+    def test_bootstrap_relinks_every_replicate(self, monkeypatch):
+        reference, focal = _impact_calibrations()
+        install_group_models(monkeypatch, reference, focal)
+        from mirt.diagnostics import dtf as dtf_module
+
+        anchors_seen: list[list[int]] = []
+        original_link = dtf_module.link_focal_to_reference
+
+        def spy_link(reference_model, focal_model, anchors, **kwargs):
+            anchors_seen.append(list(anchors))
+            return original_link(reference_model, focal_model, anchors, **kwargs)
+
+        monkeypatch.setattr(dtf_module, "link_focal_to_reference", spy_link)
+        data, groups = impact_data()
+
+        result = compute_dtf(
+            data,
+            groups,
+            method="signed",
+            n_bootstrap=4,
+            n_quadpts=9,
+            anchor_items=[5, 0],
+        )
+
+        assert anchors_seen == [[0, 5]] * 5
+        assert result["n_bootstrap_successful"] == 4
+        assert result["DTF_SE"] == pytest.approx(0.0, abs=1e-3)
+
+    @pytest.mark.parametrize(
+        ("anchor_items", "message"),
+        [([0], "at least 2"), ([1, 1], "duplicate"), ([0, 7], r"\[0, 6\)")],
+    )
+    def test_anchor_items_are_validated_before_fitting(
+        self, monkeypatch, anchor_items, message
+    ):
+        def unexpected_fit(*args, **kwargs):
+            raise AssertionError("fit should not run")
+
+        monkeypatch.setattr("mirt.diagnostics.dtf.fit_group_models", unexpected_fit)
+        data, groups = impact_data()
+        with pytest.raises(ValueError, match=message):
+            compute_dtf(data, groups, n_bootstrap=0, anchor_items=anchor_items)
+
+
+def simulate_impact(seed: int, *, dif_items: tuple[int, ...] = ()):
+    """Twelve 2PL items, focal mean -1, and +0.8 difficulty DIF on dif_items."""
+    rng = np.random.default_rng(seed)
+    discrimination = np.linspace(0.9, 1.8, 12)
+    difficulty = np.linspace(-1.2, 1.2, 12)
+    focal_difficulty = difficulty.copy()
+    focal_difficulty[list(dif_items)] += 0.8
+
+    def responses(theta, locations):
+        logits = discrimination * (theta[:, None] - locations)
+        return (rng.random(logits.shape) < 1.0 / (1.0 + np.exp(-logits))).astype(int)
+
+    data = np.vstack(
+        [
+            responses(rng.normal(0.0, 1.0, 1000), difficulty),
+            responses(rng.normal(-1.0, 1.0, 1000), focal_difficulty),
+        ]
+    )
+    return data, np.repeat([0, 1], 1000)
+
+
+class TestLinkedDTFSimulation:
+    """Regression: unlinked calibrations reported impact as DTF."""
+
+    anchors = list(range(4, 12))
+
+    def test_pure_impact_is_not_dtf_once_linked(self):
+        data, groups = simulate_impact(1)
+
+        unlinked = compute_dtf(data, groups, method="signed", n_bootstrap=0)
+        linked = compute_dtf(
+            data, groups, method="signed", n_bootstrap=0, anchor_items=self.anchors
+        )
+
+        assert unlinked["DTF"] > 1.5
+        assert abs(linked["DTF"]) < 0.25
+        assert linked["linking_constants"][1] == pytest.approx(-1.0, abs=0.2)
+
+    def test_dif_on_four_items_is_detected_with_clean_anchors(self):
+        data, groups = simulate_impact(1, dif_items=(0, 1, 2, 3))
+
+        result = compute_dtf(
+            data, groups, method="signed", n_bootstrap=0, anchor_items=self.anchors
+        )
+
+        assert result["DTF"] > 0.4
 
 
 class FakeAxes:

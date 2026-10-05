@@ -241,6 +241,4 @@ def test_custom_dichotomous_models_use_their_public_probability(monkeypatch, cha
         return SimpleNamespace(x=trial)
 
     monkeypatch.setattr(em_module, "minimize", minimize)
-    estimator._optimize_item_params(
-        model, 0, responses, posterior, points, posterior.sum(axis=0)
-    )
+    estimator._optimize_item_params(model, 0, responses, posterior, points)

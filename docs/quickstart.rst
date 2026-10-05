@@ -217,6 +217,35 @@ distribution must remain appropriate. Out-of-range categories, noninteger codes,
 invalid model probabilities, and observed scores with zero model probability
 raise descriptive errors.
 
+Standardized and ability-grouped item fit
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``z_infit`` and ``z_outfit`` (items and persons) are Wilson-Hilferty
+standardized mean squares, approximately standard normal under the model.
+Their variances use the second and fourth central moments of each modeled
+score (Wright and Masters, 1982). ``compute_outfit_infit`` reports them with
+``include_standardized=True`` and follows the same mean-square rules as
+``itemfit()`` and ``personfit()``.
+
+``X2`` (Bock/Yen Q1) and ``G2`` group respondents into ``n_groups`` quantiles
+of their abilities (default 10) and compare category counts with the model at
+each group's mean ability. Because the abilities are estimates, their p-values
+are approximate and liberal, severely so on short tests; prefer ``S_X2`` or
+``PV_Q1`` for inference there. ``PV_Q1`` (Chalmers and Ng, 2017)
+recomputes ``X2`` on ``n_plausible`` posterior draws and reports the median,
+with ``seed`` for reproducibility. These statistics require unidimensional
+models. Unknown statistic names raise ``MirtValidationError``.
+
+.. code-block:: python
+
+   grouped = mirt.itemfit(
+       result,
+       responses,
+       statistics=["z_infit", "z_outfit", "X2", "PV_Q1"],
+       n_plausible=50,
+       seed=1,
+   )
+
 Overall model fit
 ~~~~~~~~~~~~~~~~~
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,6 +14,38 @@ from mirt.constants import PROB_EPSILON
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+# Bound (ability points x items) information blocks for large item pools.
+_MAX_INFORMATION_VALUES = 131_072
+
+
+def _validate_candidate_items(
+    model: BaseItemModel,
+    available_items: set[int],
+) -> list[int]:
+    """Return sorted candidate indices, rejecting invalid model access."""
+    normalized: list[int] = []
+    for item_idx in available_items:
+        if isinstance(item_idx, (bool, np.bool_)) or not isinstance(item_idx, Integral):
+            raise ValueError("available item indices must be integers")
+        item = int(item_idx)
+        if item < 0 or item >= model.n_items:
+            raise ValueError(
+                f"available item {item} is out of range [0, {model.n_items})"
+            )
+        normalized.append(item)
+    normalized.sort()
+    return normalized
+
+
+def _information_at(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+) -> NDArray[np.float64]:
+    """Return one item's information at each row of a 2D ability array."""
+    information = np.asarray(model.information(theta, item_idx=item_idx), dtype=float)
+    return information.reshape(len(theta), -1).sum(axis=1)
 
 
 class ItemSelectionStrategy(ABC):
@@ -119,7 +151,7 @@ class MaxFisherInformation(ItemSelectionStrategy):
 
     Selects the item that provides the maximum Fisher information
     at the current ability estimate. This is the most common
-    item selection method in CAT.
+    item selection method in CAT. Ties go to the lowest item index.
 
     References
     ----------
@@ -149,8 +181,13 @@ class MaxFisherInformation(ItemSelectionStrategy):
         administered_items: list[int] | None = None,
         responses: list[int] | None = None,
     ) -> dict[int, float]:
-        """Get Fisher information with one model call when supported."""
+        """Get Fisher information with one model call when supported.
+
+        Items are returned in increasing index order, so the first maximum
+        does not depend on set iteration order.
+        """
         theta_arr = np.array([[theta]])
+        items = sorted(available_items)
 
         # Polytomous models define information(theta) as total test
         # information rather than an item-wise array.
@@ -159,13 +196,12 @@ class MaxFisherInformation(ItemSelectionStrategy):
             if information.size == model.n_items:
                 item_information = information.reshape(model.n_items)
                 return {
-                    item_idx: float(item_information[item_idx])
-                    for item_idx in available_items
+                    item_idx: float(item_information[item_idx]) for item_idx in items
                 }
 
         return {
             item_idx: self._compute_criterion(model, theta_arr, item_idx)
-            for item_idx in available_items
+            for item_idx in items
         }
 
     def _compute_criterion(
@@ -263,7 +299,15 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         administered_items: list[int] | None = None,
         responses: list[int] | None = None,
     ) -> dict[int, float]:
-        """Compute history-aware expected information for available items."""
+        """Compute history-aware expected information for available items.
+
+        Dichotomous item banks use a fixed number of model calls per
+        selection: response probabilities at the current ability and at the
+        posterior nodes, plus item information at every hypothetical posterior
+        mean in bounded row blocks. Polytomous banks evaluate each candidate's
+        own curves, but each administered item's information is evaluated once
+        for all hypothetical abilities.
+        """
         if model.n_factors != 1:
             raise ValueError("MEI only supports unidimensional models")
         if not np.isfinite(theta):
@@ -272,19 +316,23 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         administered, observed_responses = self._validate_history(
             model, administered_items, responses
         )
+        items = _validate_candidate_items(model, available_items)
+        if not items:
+            return {}
         history_log_mass = self._history_log_mass(
             model, administered, observed_responses
         )
-        return {
-            item_idx: self._compute_expected_information(
-                model,
-                theta,
-                item_idx,
-                administered,
-                history_log_mass,
+
+        values = None
+        if not model.is_polytomous:
+            values = self._binary_expected_information(
+                model, float(theta), items, administered, history_log_mass
             )
-            for item_idx in available_items
-        }
+        if values is None:
+            values = self._itemwise_expected_information(
+                model, float(theta), items, administered, history_log_mass
+            )
+        return dict(zip(items, values.tolist(), strict=True))
 
     @staticmethod
     def _validate_history(
@@ -359,41 +407,117 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         ).ravel()
         return log_likelihood + self._log_prior_mass
 
-    def _compute_expected_information(
+    def _posterior_means(
         self,
-        model: BaseItemModel,
-        theta: float,
-        item_idx: int,
-        administered_items: list[int],
         history_log_mass: NDArray[np.float64],
-    ) -> float:
-        """Compute information after each hypothetical response to an item."""
-        current_probabilities = self._response_probabilities(model, theta, item_idx)
-        node_probabilities = self._node_response_probabilities(model, item_idx)
-        clipped_probabilities = np.clip(
-            node_probabilities,
-            PROB_EPSILON,
-            1.0 - PROB_EPSILON,
-        )
+        node_probabilities: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Return posterior means after each response, reducing over axis 0.
 
-        log_mass = history_log_mass[:, None] + np.log(clipped_probabilities)
+        ``node_probabilities`` holds response probabilities with the
+        quadrature nodes on the first axis; the result drops that axis.
+        """
+        clipped = np.clip(node_probabilities, PROB_EPSILON, 1.0 - PROB_EPSILON)
+        extra_axes = (slice(None),) + (None,) * (clipped.ndim - 1)
+        log_mass = history_log_mass[extra_axes] + np.log(clipped)
         log_mass -= np.max(log_mass, axis=0, keepdims=True)
         posterior_mass = np.exp(log_mass)
         posterior_mass /= posterior_mass.sum(axis=0, keepdims=True)
-        hypothetical_theta = posterior_mass.T @ self._theta_nodes
+        return np.moveaxis(posterior_mass, 0, -1) @ self._theta_nodes
 
-        theta_values = hypothetical_theta[:, None]
-        test_information = np.zeros(len(current_probabilities), dtype=np.float64)
-        for provisional_item in (*administered_items, item_idx):
+    def _binary_expected_information(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        administered: list[int],
+        history_log_mass: NDArray[np.float64],
+    ) -> NDArray[np.float64] | None:
+        """Evaluate every dichotomous candidate with bulk model calls.
+
+        Return None when the model's bulk output is not one value per item,
+        so customized models keep the item-wise evaluation.
+        """
+        n_items = model.n_items
+        candidates = np.asarray(items, dtype=np.intp)
+        current = np.asarray(model.probability(np.array([[theta]])), dtype=np.float64)
+        nodes = np.asarray(
+            model.probability(self._theta_nodes[:, None]), dtype=np.float64
+        )
+        if current.size != n_items or nodes.size != self.n_quadpts * n_items:
+            return None
+
+        p_current = current.reshape(n_items)[candidates]
+        response_probabilities = np.stack((1.0 - p_current, p_current), axis=1)
+        p_nodes = nodes.reshape(self.n_quadpts, n_items)[:, candidates]
+        node_probabilities = np.stack((1.0 - p_nodes, p_nodes), axis=2)
+        # Two hypothetical abilities per candidate: rows 2j and 2j + 1.
+        hypothetical_theta = self._posterior_means(
+            history_log_mass, node_probabilities
+        ).reshape(-1)
+
+        own_columns = np.repeat(candidates, 2)
+        test_information = np.empty(hypothetical_theta.size, dtype=np.float64)
+        block_size = max(1, _MAX_INFORMATION_VALUES // n_items)
+        for start in range(0, hypothetical_theta.size, block_size):
+            stop = min(start + block_size, hypothetical_theta.size)
             information = np.asarray(
-                model.information(theta_values, item_idx=provisional_item),
+                model.information(hypothetical_theta[start:stop, None]),
                 dtype=np.float64,
             )
-            test_information += information.reshape(len(current_probabilities), -1).sum(
-                axis=1
-            )
+            if information.size != (stop - start) * n_items:
+                return None
+            information = information.reshape(stop - start, n_items)
+            block = information[:, administered].sum(axis=1)
+            block += information[np.arange(stop - start), own_columns[start:stop]]
+            test_information[start:stop] = block
 
-        return float(current_probabilities @ test_information)
+        return np.einsum(
+            "jr,jr->j", response_probabilities, test_information.reshape(-1, 2)
+        )
+
+    def _itemwise_expected_information(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        items: list[int],
+        administered: list[int],
+        history_log_mass: NDArray[np.float64],
+    ) -> NDArray[np.float64]:
+        """Evaluate candidates through per-item model calls.
+
+        Each candidate's response curves are evaluated separately, while each
+        administered item's information is evaluated once at the hypothetical
+        abilities of all candidates.
+        """
+        response_probabilities = []
+        hypothetical_theta = []
+        for item_idx in items:
+            response_probabilities.append(
+                self._response_probabilities(model, theta, item_idx)
+            )
+            hypothetical_theta.append(
+                self._posterior_means(
+                    history_log_mass,
+                    self._node_response_probabilities(model, item_idx),
+                )
+            )
+        counts = [len(values) for values in hypothetical_theta]
+        all_theta = np.concatenate(hypothetical_theta)[:, None]
+
+        test_information = np.zeros(len(all_theta), dtype=np.float64)
+        for item_idx in administered:
+            test_information += _information_at(model, all_theta, item_idx)
+
+        offsets = np.cumsum([0, *counts])
+        criteria = np.empty(len(items), dtype=np.float64)
+        for position, item_idx in enumerate(items):
+            rows = slice(offsets[position], offsets[position + 1])
+            information = test_information[rows] + _information_at(
+                model, all_theta[rows], item_idx
+            )
+            criteria[position] = response_probabilities[position] @ information
+        return criteria
 
     @staticmethod
     def _response_probabilities(
@@ -430,14 +554,11 @@ class MaxExpectedInformation(ItemSelectionStrategy):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        history_log_mass = self._history_log_mass(model, [], [])
-        return self._compute_expected_information(
-            model,
-            float(theta[0, 0]),
-            item_idx,
-            [],
-            history_log_mass,
+        # Bypass overrides: a subclass's get_item_criteria may delegate here.
+        criteria = MaxExpectedInformation.get_item_criteria(
+            self, model, float(theta[0, 0]), {item_idx}
         )
+        return criteria[item_idx]
 
 
 class KullbackLeibler(ItemSelectionStrategy):
@@ -505,7 +626,7 @@ class KullbackLeibler(ItemSelectionStrategy):
         if model.n_factors != 1:
             raise ValueError("KL selection only supports unidimensional models")
 
-        item_indices = self._validate_available_items(model, available_items)
+        item_indices = _validate_candidate_items(model, available_items)
         if not item_indices:
             return {}
 
@@ -535,27 +656,6 @@ class KullbackLeibler(ItemSelectionStrategy):
             )
             for item_idx in item_indices
         }
-
-    @staticmethod
-    def _validate_available_items(
-        model: BaseItemModel,
-        available_items: set[int],
-    ) -> list[int]:
-        """Normalize candidate indices and reject invalid model access."""
-        normalized: list[int] = []
-        for item_idx in available_items:
-            if isinstance(item_idx, (bool, np.bool_)) or not isinstance(
-                item_idx, Integral
-            ):
-                raise ValueError("available item indices must be integers")
-            item = int(item_idx)
-            if item < 0 or item >= model.n_items:
-                raise ValueError(
-                    f"available item {item} is out of range [0, {model.n_items})"
-                )
-            normalized.append(item)
-        normalized.sort()
-        return normalized
 
     def _evaluation_thetas(self, theta: float) -> NDArray[np.float64]:
         """Return the current theta followed by every nonzero grid neighbor."""
@@ -665,6 +765,16 @@ class KullbackLeibler(ItemSelectionStrategy):
         return self._compute_kl_info(model, float(theta[0, 0]), item_idx)
 
 
+def _item_location(model: BaseItemModel, item_idx: int) -> float:
+    """Return an item's difficulty, or its mean threshold, defaulting to 0."""
+    params = model.get_item_parameters(item_idx)
+    if "difficulty" in params:
+        return float(np.mean(params["difficulty"]))
+    if "thresholds" in params:
+        return float(np.mean(params["thresholds"]))
+    return 0.0
+
+
 class UrryRule(ItemSelectionStrategy):
     """Urry's rule for item selection.
 
@@ -693,16 +803,7 @@ class UrryRule(ItemSelectionStrategy):
         min_diff = np.inf
 
         for item_idx in available_items:
-            params = model.get_item_parameters(item_idx)
-
-            if "difficulty" in params:
-                b = params["difficulty"]
-            elif "thresholds" in params:
-                b = np.mean(params["thresholds"])
-            else:
-                b = 0.0
-
-            diff = abs(theta - b)
+            diff = abs(theta - _item_location(model, item_idx))
             if diff < min_diff:
                 min_diff = diff
                 best_item = item_idx
@@ -715,14 +816,7 @@ class UrryRule(ItemSelectionStrategy):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> float:
-        params = model.get_item_parameters(item_idx)
-        if "difficulty" in params:
-            b = params["difficulty"]
-        elif "thresholds" in params:
-            b = np.mean(params["thresholds"])
-        else:
-            b = 0.0
-        return -abs(float(theta[0, 0]) - b)
+        return -abs(float(theta[0, 0]) - _item_location(model, item_idx))
 
 
 class RandomSelection(ItemSelectionStrategy):
@@ -754,27 +848,51 @@ class RandomSelection(ItemSelectionStrategy):
         items_list = list(available_items)
         return items_list[self.rng.integers(len(items_list))]
 
-    def _compute_criterion(
+    def get_item_criteria(
         self,
         model: BaseItemModel,
-        theta: NDArray[np.float64],
-        item_idx: int,
-    ) -> float:
-        return 0.0
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+    ) -> dict[int, float]:
+        """Return independent uniform scores from this strategy's generator.
+
+        Ranking these scores, as randomesque exposure control does, yields a
+        seeded uniformly random choice instead of a fixed item order.
+        """
+        items = sorted(available_items)
+        return dict(zip(items, self.rng.random(len(items)).tolist(), strict=True))
 
 
 class AStratified(ItemSelectionStrategy):
-    """A-stratified item selection with content balancing.
+    """A-stratified item selection.
 
-    Divides items into strata based on discrimination parameters
-    and selects from appropriate strata as the test progresses.
-    Early items come from low-discrimination strata, later items
-    from high-discrimination strata.
+    Divides the pool into strata of increasing mean discrimination and moves
+    through them as the test progresses. A test of ``test_length`` items
+    spends ``test_length / n_strata`` items in each stratum, starting with the
+    least discriminating items, as in Chang and Ying (1999). Saving highly
+    discriminating items for later stages, when the ability estimate is more
+    accurate, spreads exposure across the pool.
+
+    Within the current stratum, items are ranked by Fisher information at the
+    current ability (``within="MFI"``) or by the closeness of their
+    difficulty to the current ability (``within="b-matching"``, the rule of
+    the original paper). When the current stratum has no available items, the
+    next non-empty later stratum is used, then the whole available pool.
 
     Parameters
     ----------
     n_strata : int, optional
         Number of discrimination strata. Default is 3.
+    test_length : int | None, optional
+        Planned test length that schedules the strata, capped at the pool
+        size. When None, CATEngine supplies its ``max_items`` (or the pool
+        size without one) on every selection, and standalone calls use the
+        pool size. Variable-length tests should set ``max_items`` or this
+        value; otherwise later strata are reached only near pool exhaustion.
+    within : {"MFI", "b-matching"}, optional
+        Ranking rule within a stratum. Default is "MFI".
 
     References
     ----------
@@ -783,12 +901,40 @@ class AStratified(ItemSelectionStrategy):
     Measurement, 23(3), 211-222.
     """
 
-    def __init__(self, n_strata: int = 3):
-        self.n_strata = n_strata
-        self._strata: list[set[int]] | None = None
+    def __init__(
+        self,
+        n_strata: int = 3,
+        test_length: int | None = None,
+        within: Literal["MFI", "b-matching"] = "MFI",
+    ) -> None:
+        if (
+            isinstance(n_strata, (bool, np.bool_))
+            or not isinstance(n_strata, Integral)
+            or n_strata < 1
+        ):
+            raise ValueError("n_strata must be a positive integer")
+        if test_length is not None and (
+            isinstance(test_length, (bool, np.bool_))
+            or not isinstance(test_length, Integral)
+            or test_length < 1
+        ):
+            raise ValueError("test_length must be a positive integer or None")
+        rules = {"mfi": "MFI", "b-matching": "b-matching"}
+        rule = rules.get(str(within).strip().lower().replace("_", "-"))
+        if rule is None:
+            raise ValueError("within must be 'MFI' or 'b-matching'")
 
-    def _initialize_strata(self, model: BaseItemModel) -> None:
-        """Initialize item strata based on discrimination."""
+        self.n_strata: int = int(n_strata)
+        self.test_length: int | None = None if test_length is None else int(test_length)
+        self.within: str = rule
+        self._strata: list[set[int]] | None = None
+        # The pool the strata were built for; identity, not id(), so a new
+        # model allocated at a collected model's address is restratified.
+        self._strata_model: BaseItemModel | None = None
+        self._strata_size: int = 0
+
+    def _initialize_strata(self, model: BaseItemModel) -> list[set[int]]:
+        """Partition items into strata of increasing discrimination."""
         discriminations = []
         for i in range(model.n_items):
             params = model.get_item_parameters(i)
@@ -806,13 +952,92 @@ class AStratified(ItemSelectionStrategy):
         items_per_stratum = n_items // self.n_strata
         remainder = n_items % self.n_strata
 
-        self._strata = []
+        strata = []
         start = 0
         for s in range(self.n_strata):
             end = start + items_per_stratum + (1 if s < remainder else 0)
-            stratum_items = {discriminations[i][0] for i in range(start, end)}
-            self._strata.append(stratum_items)
+            strata.append({discriminations[i][0] for i in range(start, end)})
             start = end
+        self._strata = strata
+        self._strata_model = model
+        self._strata_size = model.n_items
+        return strata
+
+    def current_stratum(
+        self,
+        model: BaseItemModel,
+        n_administered: int,
+        *,
+        test_length: int | None = None,
+    ) -> int:
+        """Return the scheduled stratum index after ``n_administered`` items.
+
+        Parameters
+        ----------
+        model : BaseItemModel
+            The fitted IRT model.
+        n_administered : int
+            Number of items already administered.
+        test_length : int | None, optional
+            Planned test length used when the strategy has none configured.
+            Defaults to the pool size, which also caps any planned length.
+
+        Returns
+        -------
+        int
+            Zero-based stratum index, ordered by increasing discrimination.
+        """
+        length = min(self.test_length or test_length or model.n_items, model.n_items)
+        return min(self.n_strata - 1, n_administered * self.n_strata // length)
+
+    def _stratum_candidates(
+        self,
+        model: BaseItemModel,
+        available_items: set[int],
+        administered_items: list[int] | None,
+        test_length: int | None,
+    ) -> set[int]:
+        """Return the available items of the scheduled or next non-empty stratum."""
+        strata = self._strata
+        if (
+            strata is None
+            or self._strata_model is not model
+            or self._strata_size != model.n_items
+        ):
+            strata = self._initialize_strata(model)
+
+        n_administered = len(administered_items) if administered_items else 0
+        stage = self.current_stratum(model, n_administered, test_length=test_length)
+        for stratum in strata[stage:]:
+            candidates = available_items & stratum
+            if candidates:
+                return candidates
+        return set(available_items)
+
+    def get_item_criteria(
+        self,
+        model: BaseItemModel,
+        theta: float,
+        available_items: set[int],
+        administered_items: list[int] | None = None,
+        responses: list[int] | None = None,
+        *,
+        test_length: int | None = None,
+    ) -> dict[int, float]:
+        """Rank only the scheduled stratum's available items.
+
+        Items outside that stratum are omitted, so ranking-based exposure
+        control such as randomesque selection stays within it.
+        """
+        candidates = self._stratum_candidates(
+            model, set(available_items), administered_items, test_length
+        )
+        if self.within == "MFI":
+            return MaxFisherInformation().get_item_criteria(model, theta, candidates)
+        return {
+            item_idx: -abs(theta - _item_location(model, item_idx))
+            for item_idx in sorted(candidates)
+        }
 
     def select_item(
         self,
@@ -821,28 +1046,38 @@ class AStratified(ItemSelectionStrategy):
         available_items: set[int],
         administered_items: list[int] | None = None,
         responses: list[int] | None = None,
+        *,
+        test_length: int | None = None,
     ) -> int:
         if not available_items:
             raise ValueError("No available items to select from")
 
-        if self._strata is None:
-            self._initialize_strata(model)
-
-        n_administered = len(administered_items) if administered_items else 0
-
-        stratum_idx = min(
-            n_administered // (model.n_items // self.n_strata // 2 + 1),
-            self.n_strata - 1,
+        # Subclasses may still override get_item_criteria without test_length.
+        options = {} if test_length is None else {"test_length": test_length}
+        criteria = self.get_item_criteria(
+            model, theta, available_items, administered_items, responses, **options
         )
+        return max(sorted(criteria), key=criteria.__getitem__)
 
-        for s in range(stratum_idx, self.n_strata):
-            stratum_available = available_items & self._strata[s]
-            if stratum_available:
-                mfi = MaxFisherInformation()
-                return mfi.select_item(model, theta, stratum_available)
 
-        mfi = MaxFisherInformation()
-        return mfi.select_item(model, theta, available_items)
+_SELECTION_STRATEGIES: dict[str, type[ItemSelectionStrategy]] = {
+    "MFI": MaxFisherInformation,
+    "MEI": MaxExpectedInformation,
+    "KL": KullbackLeibler,
+    "Urry": UrryRule,
+    "random": RandomSelection,
+    "a-stratified": AStratified,
+}
+
+
+def _selection_strategy_class(method: str) -> type[ItemSelectionStrategy]:
+    """Resolve a strategy name, ignoring case, whitespace, and ``_`` vs ``-``."""
+    normalized = method.strip().lower().replace("_", "-")
+    for name, strategy_class in _SELECTION_STRATEGIES.items():
+        if name.lower() == normalized:
+            return strategy_class
+    valid = ", ".join(_SELECTION_STRATEGIES)
+    raise ValueError(f"Unknown selection method '{method}'. Valid options: {valid}")
 
 
 def create_selection_strategy(
@@ -855,7 +1090,9 @@ def create_selection_strategy(
     ----------
     method : str
         Selection method name. One of: "MFI", "MEI", "KL", "Urry",
-        "random", "a-stratified".
+        "random", "a-stratified". Names match regardless of case and
+        surrounding whitespace, and ``"_"`` is accepted for ``"-"``, so
+        ``"a_stratified"`` and ``"urry"`` also work.
     **kwargs
         Additional keyword arguments passed to the strategy constructor.
 
@@ -869,25 +1106,4 @@ def create_selection_strategy(
     ValueError
         If the method is not recognized.
     """
-    strategies = {
-        "MFI": MaxFisherInformation,
-        "MEI": MaxExpectedInformation,
-        "KL": KullbackLeibler,
-        "Urry": UrryRule,
-        "random": RandomSelection,
-        "a-stratified": AStratified,
-    }
-
-    method_upper = (
-        method.upper() if method not in ("random", "a-stratified") else method
-    )
-
-    if method_upper not in strategies and method not in strategies:
-        valid = ", ".join(strategies.keys())
-        raise ValueError(f"Unknown selection method '{method}'. Valid options: {valid}")
-
-    if method_upper in strategies:
-        strategy_class = strategies[method_upper]
-    else:
-        strategy_class = strategies[method]
-    return strategy_class(**kwargs)
+    return _selection_strategy_class(method)(**kwargs)

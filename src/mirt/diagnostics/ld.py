@@ -187,19 +187,8 @@ def compute_ld_statistics(
     """
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
-
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP", n_quadpts=n_quadpts)
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
+    n_items = responses.shape[1]
+    theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
     residuals, positive_probabilities = _compute_residuals_and_positive_probabilities(
         model,
@@ -295,32 +284,12 @@ def compute_q3(
     NDArray
         Matrix of Q3 statistics
     """
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import compute_q3_matrix as rust_compute_q3
-
     responses = np.asarray(responses)
-    n_persons = responses.shape[0]
+    theta = _ability_matrix(model, responses, theta)
 
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP")
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            return rust_compute_q3(responses, theta_flat, disc.ravel(), diff.ravel())
-
-    residuals = _compute_residuals(model, responses, theta)
+    residuals, _ = _compute_residuals_and_positive_probabilities(
+        model, responses, theta
+    )
     return _compute_q3(residuals, responses)
 
 
@@ -353,39 +322,12 @@ def compute_ld_chi2(
     p_value_matrix : NDArray
         Matrix of raw or adjusted p-values, according to ``p_adjust``.
     """
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import (
-        compute_ld_chi2_matrix as rust_compute_chi2,
-    )
-
     p_adjust = _validate_p_value_adjustment(p_adjust, name="p_adjust")
     responses = np.asarray(responses)
-    n_persons, n_items = responses.shape
+    n_items = responses.shape[1]
+    theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
-    if theta is None:
-        from mirt.scoring import fscores
-
-        result = fscores(model, responses, method="EAP", n_quadpts=n_quadpts)
-        theta = result.theta
-
-    theta = np.atleast_2d(theta)
-    if theta.shape[0] == 1 and n_persons > 1:
-        theta = theta.T
-    if theta.ndim == 1:
-        theta = theta.reshape(-1, 1)
-
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            chi2_matrix = rust_compute_chi2(
-                responses, theta_flat, disc.ravel(), diff.ravel()
-            )
-        else:
-            chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
-    else:
-        chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
+    chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
 
     p_value_matrix = np.zeros_like(chi2_matrix)
     rows, columns = np.triu_indices(n_items, k=1)
@@ -400,44 +342,25 @@ def compute_ld_chi2(
     return chi2_matrix, p_value_matrix
 
 
-def _compute_residuals(
+def _ability_matrix(
     model: BaseItemModel,
     responses: NDArray[np.int_],
-    theta: NDArray[np.float64],
+    theta: NDArray[np.float64] | None,
+    **fscores_kwargs: int,
 ) -> NDArray[np.float64]:
-    """Compute standardized residuals for each person-item combination."""
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import compute_standardized_residuals
+    """Return person abilities as an ``(n_persons, n_factors)`` matrix.
 
-    if should_use_rust() and not model.is_polytomous:
-        disc = model.parameters.get("discrimination")
-        diff = model.parameters.get("difficulty")
-        if disc is not None and diff is not None:
-            theta_flat = theta.ravel() if theta.ndim > 1 else theta
-            return compute_standardized_residuals(
-                responses, theta_flat, disc.ravel(), diff.ravel()
-            )
+    Missing abilities default to EAP scores.
+    """
+    if theta is None:
+        from mirt.scoring import fscores
 
-    n_persons, n_items = responses.shape
-    residuals = np.full((n_persons, n_items), np.nan)
+        theta = fscores(model, responses, method="EAP", **fscores_kwargs).theta
 
-    for j in range(n_items):
-        probs = model.probability(theta, j)
-
-        if probs.ndim == 2:
-            n_cats = probs.shape[1]
-            expected = np.sum(probs * np.arange(n_cats), axis=1)
-            variance = np.sum(probs * (np.arange(n_cats) ** 2), axis=1) - expected**2
-        else:
-            expected = probs
-            variance = probs * (1 - probs)
-
-        valid = responses[:, j] >= 0
-        residuals[valid, j] = (responses[valid, j] - expected[valid]) / np.sqrt(
-            variance[valid] + PROB_EPSILON
-        )
-
-    return residuals
+    theta = np.atleast_2d(theta)
+    if theta.shape[0] == 1 and responses.shape[0] > 1:
+        theta = theta.T
+    return theta
 
 
 def _compute_residuals_and_positive_probabilities(

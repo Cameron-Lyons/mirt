@@ -19,12 +19,12 @@ from numpy.typing import NDArray
 from scipy import stats
 
 from mirt.constants import PROB_EPSILON
-from mirt.exceptions import MirtEstimationError
+from mirt.exceptions import MirtEstimationError, MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
-from mirt.estimation.base import BaseEstimator
+from mirt.estimation.base import BaseEstimator, _reject_parameter_restrictions
 from mirt.results.fit_result import FitResult
 
 PosteriorValue = NDArray[np.float64] | np.float64
@@ -32,6 +32,24 @@ PosteriorSummary = dict[str, dict[str, PosteriorValue]]
 CredibleIntervals = dict[str, tuple[PosteriorValue, PosteriorValue]]
 
 _MHRM_MAX_PROBABILITY_VALUES = 1_000_000
+_MHRM_GAIN_SEQUENCES = ("standard", "adaptive")
+
+
+def _validate_count(value: int, name: str, minimum: int) -> int:
+    """Return an integer sampler control of at least ``minimum``."""
+    if (
+        isinstance(value, (bool, np.bool_))
+        or not isinstance(value, (int, np.integer))
+        or value < minimum
+    ):
+        expected = "positive integer" if minimum == 1 else "non-negative integer"
+        raise MirtValidationError(
+            f"{name} must be a {expected}",
+            parameter=name,
+            value=value,
+            expected=expected,
+        )
+    return int(value)
 
 
 def _is_2pl_unidimensional(model: BaseItemModel) -> bool:
@@ -265,7 +283,8 @@ class MHRMEstimator(BaseEstimator):
         n_cycles : int
             Number of MHRM cycles
         burnin : int
-            Number of burnin cycles
+            Number of initial cycles excluded from the parameter average; the
+            final iterate is used when ``burnin >= n_cycles``
         n_chains : int
             Number of parallel chains
         proposal_sd : float
@@ -279,11 +298,32 @@ class MHRMEstimator(BaseEstimator):
         seed : int, optional
             Random seed for reproducibility
         """
+        n_cycles = _validate_count(n_cycles, "n_cycles", 1)
+        burnin = _validate_count(burnin, "burnin", 0)
+        if (
+            isinstance(proposal_sd, (bool, np.bool_))
+            or not isinstance(proposal_sd, (int, float, np.integer, np.floating))
+            or not np.isfinite(proposal_sd)
+            or proposal_sd <= 0
+        ):
+            raise MirtValidationError(
+                "proposal_sd must be finite and positive",
+                parameter="proposal_sd",
+                value=proposal_sd,
+                expected="> 0",
+            )
+        if gain_sequence not in _MHRM_GAIN_SEQUENCES:
+            raise MirtValidationError(
+                "gain_sequence must be 'standard' or 'adaptive'",
+                parameter="gain_sequence",
+                value=gain_sequence,
+                expected="'standard' or 'adaptive'",
+            )
         super().__init__(max_iter=n_cycles, tol=1e-4, verbose=verbose)
         self.n_cycles = n_cycles
         self.burnin = burnin
         self.n_chains = n_chains
-        self.proposal_sd = proposal_sd
+        self.proposal_sd = float(proposal_sd)
         self.gain_sequence = gain_sequence
         self.use_rust = use_rust
         self.seed = seed
@@ -309,10 +349,17 @@ class MHRMEstimator(BaseEstimator):
         -------
         FitResult
             Fitted model result
+
+        Raises
+        ------
+        MirtValidationError
+            If ``set_free_parameter_masks`` fixes parameters, which MHRM
+            cannot hold.
         """
         from mirt._backend_config import should_use_rust
         from mirt.backends.rust.estimation import mhrm_fit_2pl
 
+        _reject_parameter_restrictions(model, "MHRMEstimator")
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 
@@ -323,12 +370,13 @@ class MHRMEstimator(BaseEstimator):
                 else np.random.default_rng().integers(0, 2**31)
             )
 
-            discrimination, difficulty, log_likelihood = mhrm_fit_2pl(
+            discrimination, difficulty, _ = mhrm_fit_2pl(
                 responses,
                 n_cycles=self.n_cycles,
                 burnin=self.burnin,
                 proposal_sd=self.proposal_sd,
                 seed=seed,
+                gain_sequence=self.gain_sequence,
             )
 
             if not model._parameters:
@@ -336,6 +384,13 @@ class MHRMEstimator(BaseEstimator):
             model._parameters["discrimination"] = np.asarray(discrimination)
             model._parameters["difficulty"] = np.asarray(difficulty)
             model._is_fitted = True
+
+            # Score at MAP abilities as the NumPy path does, so AIC and BIC do
+            # not depend on the backend.
+            theta_map = self._estimate_theta_map(
+                model, responses, np.random.default_rng(seed)
+            )
+            log_likelihood = float(np.sum(model.log_likelihood(responses, theta_map)))
 
             n_params = 2 * n_items
             aic = -2 * log_likelihood + 2 * n_params
@@ -611,9 +666,9 @@ class GibbsSampler(BaseEstimator):
         n_iter : int
             Number of iterations
         burnin : int
-            Burnin iterations
+            Burnin iterations; must be less than ``n_iter``
         thin : int
-            Thinning interval
+            Thinning interval; ``ceil((n_iter - burnin) / thin)`` draws are kept
         n_chains : int
             Number of chains
         priors : dict, optional
@@ -627,6 +682,16 @@ class GibbsSampler(BaseEstimator):
         parallel_chains : bool
             Whether to run multiple chains in parallel (only when n_chains > 1)
         """
+        n_iter = _validate_count(n_iter, "n_iter", 1)
+        burnin = _validate_count(burnin, "burnin", 0)
+        thin = _validate_count(thin, "thin", 1)
+        if burnin >= n_iter:
+            raise MirtValidationError(
+                "burnin must be less than n_iter",
+                parameter="burnin",
+                value=burnin,
+                expected=f"< {n_iter}",
+            )
         super().__init__(max_iter=n_iter, verbose=verbose)
         self.n_iter = n_iter
         self.burnin = burnin
@@ -656,10 +721,17 @@ class GibbsSampler(BaseEstimator):
         -------
         MCMCResult
             MCMC estimation result with chains and diagnostics
+
+        Raises
+        ------
+        MirtValidationError
+            If ``set_free_parameter_masks`` fixes parameters, which the
+            sampler cannot hold.
         """
         from mirt._backend_config import should_use_rust
         from mirt.backends.rust.estimation import gibbs_sample_2pl
 
+        _reject_parameter_restrictions(model, "GibbsSampler")
         responses = self._validate_responses(responses, model.n_items)
         n_persons, n_items = responses.shape
 

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from numpy.typing import NDArray
 
-import mirt.models.nested as nested
+import mirt.models.polytomous as polytomous
 from mirt.models.nested import (
     FourPLNestedLogit,
     ThreePLNestedLogit,
@@ -51,8 +51,8 @@ def test_grouped_probabilities_are_chunk_invariant(
     expected = model.probability(theta)
 
     monkeypatch.setattr(
-        nested,
-        "_MAX_NESTED_PROBABILITY_CHUNK_ENTRIES",
+        polytomous,
+        "_MAX_PROBABILITY_CHUNK_ENTRIES",
         theta.size * model.max_categories * 3,
     )
 

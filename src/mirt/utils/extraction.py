@@ -429,11 +429,12 @@ def estfun(
     responses: NDArray[np.float64],
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Extract empirical estimating functions from a fitted model.
+    """Extract conditional person scores at supplied abilities.
 
-    Computes the score function (gradient of log-likelihood) for each
-    person. Used for sandwich estimators of standard errors and for
-    detecting influential observations.
+    Computes, for each person, the gradient of the item-response
+    log-likelihood with respect to the item parameters with the ability fixed
+    at ``theta``. These plug-in scores describe sensitivity to individual
+    responses; they are not the marginal scores maximized by EM estimation.
 
     Parameters
     ----------
@@ -456,14 +457,18 @@ def estfun(
     >>> result = fit_mirt(responses, model="2PL")
     >>> scores = fscores(result, responses)
     >>> ef = estfun(result.model, responses, scores.theta)
-    >>> # Sum should be close to zero at MLE
-    >>> print(f"Sum of estimating functions: {ef.sum(axis=0)}")
+    >>> influence = np.abs(ef).sum(axis=1)
 
     Notes
     -----
-    The estimating functions are the first derivatives of the log-likelihood
-    with respect to the item parameters. At the MLE, these should sum to
-    approximately zero across all persons.
+    The estimating functions are the first derivatives of the conditional
+    log-likelihood with respect to the item parameters at fixed abilities.
+    Marginal maximum likelihood sets the sum of the marginal scores, which
+    integrate over each person's ability posterior, to zero. The column sums
+    of these plug-in scores therefore need not vanish at the estimate, and
+    their cross-product is not a valid information estimate. For standard
+    errors use ``FitResult.vcov`` or :func:`mirt.compute_se` with
+    ``method="crossprod"`` or ``"sandwich"``, which use marginal scores.
 
     Standard 1PL through 4PL scores use vectorized analytic derivatives.
     Other model families use vectorized person likelihoods with central
@@ -471,8 +476,7 @@ def estfun(
     and less common response models.
 
     These can be used to compute:
-    - Robust (sandwich) standard errors
-    - Influence functions for individual observations
+    - Influence diagnostics for individual observations
     - Model-based residuals
     """
     raw_responses = np.asarray(responses)
@@ -653,7 +657,7 @@ def estfun_summary(
     responses: NDArray[np.float64],
     theta: NDArray[np.float64],
 ) -> dict[str, NDArray[np.float64]]:
-    """Compute summary statistics for estimating functions.
+    """Compute summary statistics for conditional estimating functions.
 
     Parameters
     ----------
@@ -668,10 +672,13 @@ def estfun_summary(
     -------
     dict
         Dictionary containing:
-        - sum: Sum of estimating functions (should be ~0)
+        - sum: Column sums of the plug-in scores from :func:`estfun`, which
+          need not vanish at a marginal maximum likelihood estimate
         - mean: Mean estimating function
         - var: Variance of estimating functions
-        - meat: "Meat" matrix for sandwich estimator (sum of outer products)
+        - meat: Mean outer product of the plug-in scores. It describes these
+          conditional scores only; sandwich standard errors of a marginal fit
+          need marginal scores (``FitResult.vcov`` with ``se_method="sandwich"``)
     """
     ef = estfun(model, responses, theta)
 

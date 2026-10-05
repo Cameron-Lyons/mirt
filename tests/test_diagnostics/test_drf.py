@@ -1,8 +1,37 @@
 """Tests for Differential Response Functioning (DRF)."""
 
+import numpy as np
 import pytest
 
 from mirt import compute_drf, compute_item_drf, reliability_invariance
+
+
+def test_linked_drf_does_not_report_impact(monkeypatch):
+    """Regression: unlinked information curves were shifted by group impact."""
+    rng = np.random.default_rng(3)
+    discrimination = np.linspace(0.9, 1.8, 12)
+    difficulty = np.linspace(-1.2, 1.2, 12)
+
+    def responses(theta):
+        logits = discrimination * (theta[:, None] - difficulty)
+        return (rng.random(logits.shape) < 1.0 / (1.0 + np.exp(-logits))).astype(int)
+
+    data = np.vstack(
+        [responses(rng.normal(0.0, 1.0, 1000)), responses(rng.normal(-1.0, 1.0, 1000))]
+    )
+    groups = np.repeat([0, 1], 1000)
+
+    linked = compute_drf(data, groups)
+    monkeypatch.setattr(
+        "mirt.diagnostics.drf.link_focal_to_reference",
+        lambda reference, focal, anchors, **kwargs: (focal, 1.0, 0.0),
+    )
+    unlinked = compute_drf(data, groups)
+
+    assert linked["DRF"] < 1.5
+    assert unlinked["DRF"] > 3.0
+    assert linked["linking_constants"][1] == pytest.approx(-1.0, abs=0.2)
+    assert linked["reliability_focal"] == pytest.approx(unlinked["reliability_focal"])
 
 
 class TestDRF:

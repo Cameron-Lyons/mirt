@@ -1,9 +1,10 @@
-"""Bootstrap methods for standard errors and confidence intervals.
+"""Bootstrap methods for standard errors, confidence intervals and tests.
 
-This module provides nonparametric bootstrap procedures for:
+This module provides bootstrap procedures for:
 - Standard error estimation
 - Confidence interval construction
 - Parameter uncertainty quantification
+- Likelihood-ratio tests of nested models
 """
 
 from __future__ import annotations
@@ -17,8 +18,9 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt.constants import PROB_EPSILON
+from mirt._categorical import draw_item_responses
 from mirt.exceptions import MirtModelError, MirtValidationError
+from mirt.utils._parallel import _process_pool, ensure_picklable, resolve_n_jobs
 from mirt.utils.data import validate_responses
 
 if TYPE_CHECKING:
@@ -36,6 +38,8 @@ _CI_METHODS = ("percentile", "BCa", "basic")
 _STATISTICS = ("parameters", "theta")
 _TaskInput = TypeVar("_TaskInput")
 _TaskResult = TypeVar("_TaskResult")
+# Bootstrap-based diagnostics resolve their worker counts through this name.
+_validate_n_jobs = resolve_n_jobs
 
 
 @dataclass(slots=True)
@@ -192,26 +196,6 @@ def _validate_resample_count(n_bootstrap: int) -> None:
         )
 
 
-def _validate_n_jobs(n_jobs: int) -> int:
-    """Validate and resolve bootstrap worker counts."""
-    if (
-        isinstance(n_jobs, (bool, np.bool_))
-        or not isinstance(n_jobs, (int, np.integer))
-        or n_jobs == 0
-        or n_jobs < -1
-    ):
-        raise MirtValidationError(
-            "n_jobs must be -1 or a positive integer",
-            parameter="n_jobs",
-            value=n_jobs,
-        )
-    if n_jobs == -1:
-        import os
-
-        return max(1, os.cpu_count() or 1)
-    return int(n_jobs)
-
-
 def _run_bootstrap_tasks(
     function: Callable[[_TaskInput], _TaskResult],
     inputs: list[_TaskInput],
@@ -221,24 +205,8 @@ def _run_bootstrap_tasks(
     if n_jobs == 1 or len(inputs) < 2:
         return [function(value) for value in inputs]
 
-    import pickle
-    from concurrent.futures import ProcessPoolExecutor
-    from multiprocessing import get_context
-
-    try:
-        pickle.dumps((function, inputs[0]))
-    except (AttributeError, pickle.PickleError, TypeError) as exc:
-        raise MirtValidationError(
-            "parallel bootstrap inputs must be picklable; use n_jobs=1 for "
-            "locally defined models or statistics",
-            parameter="n_jobs",
-            value=n_jobs,
-        ) from exc
-
-    with ProcessPoolExecutor(
-        max_workers=min(n_jobs, len(inputs)),
-        mp_context=get_context("spawn"),
-    ) as executor:
+    ensure_picklable(function, inputs[0], n_jobs=n_jobs)
+    with _process_pool(min(n_jobs, len(inputs))) as executor:
         return list(executor.map(function, inputs))
 
 
@@ -378,15 +346,17 @@ def _prepare_bootstrap_model(
     original_params: Mapping[str, NDArray[np.float64]],
     warm_start: bool,
 ) -> BaseItemModel:
+    """Copy a model for refitting from its original estimates.
+
+    A warm start keeps every estimate as a starting value. A cold start lets
+    EM reinitialize free coordinates while fixed coordinates keep their values.
+    """
     boot_model = model.copy()
-    if warm_start:
-        boot_model._parameters = {
-            name: values.copy() for name, values in original_params.items()
-        }
-    else:
-        boot_model._parameters.clear()
-        boot_model._initialize_parameters()
-    boot_model._is_fitted = False
+    boot_model._parameters = {
+        name: values.copy() for name, values in original_params.items()
+    }
+    # EM reinitializes the free coordinates of unfitted models only.
+    boot_model._is_fitted = bool(warm_start)
     return boot_model
 
 
@@ -545,77 +515,6 @@ def _bca_interval(
     return lower, upper
 
 
-def _simulate_model_responses(
-    model: BaseItemModel,
-    theta: NDArray[np.float64],
-    rng: np.random.Generator,
-) -> NDArray[np.int_]:
-    probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-    n_persons = theta.shape[0]
-
-    if probabilities.ndim == 1:
-        probabilities = probabilities.reshape(-1, 1)
-
-    if probabilities.ndim == 2:
-        expected_shape = (n_persons, model.n_items)
-        if probabilities.shape != expected_shape:
-            raise MirtModelError(
-                "Binary probability output has an unexpected shape",
-                model_type=model.model_name,
-                value=probabilities.shape,
-                expected=str(expected_shape),
-            )
-        if not np.all(np.isfinite(probabilities)) or np.any(
-            (probabilities < -PROB_EPSILON) | (probabilities > 1 + PROB_EPSILON)
-        ):
-            raise MirtModelError(
-                "Binary probabilities must be finite and within [0, 1]"
-            )
-        probabilities = np.clip(probabilities, 0.0, 1.0)
-        return (rng.random(expected_shape) < probabilities).astype(np.int_)
-
-    if probabilities.ndim != 3 or probabilities.shape[:2] != (
-        n_persons,
-        model.n_items,
-    ):
-        raise MirtModelError(
-            "Categorical probability output has an unexpected shape",
-            model_type=model.model_name,
-            value=probabilities.shape,
-            expected=f"({n_persons}, {model.n_items}, n_categories)",
-        )
-    if not np.all(np.isfinite(probabilities)) or np.any(probabilities < -PROB_EPSILON):
-        raise MirtModelError("Categorical probabilities must be finite and nonnegative")
-
-    probabilities = np.maximum(probabilities, 0.0)
-    totals = probabilities.sum(axis=2, keepdims=True)
-    if np.any(totals <= PROB_EPSILON):
-        raise MirtModelError("Each categorical probability row must have positive mass")
-    normalized = probabilities / totals
-    cumulative = np.cumsum(normalized, axis=2)
-
-    category_counts = getattr(model, "n_categories", None)
-    if category_counts is None:
-        category_counts = [probabilities.shape[2]] * model.n_items
-    elif isinstance(category_counts, int):
-        category_counts = [category_counts] * model.n_items
-    if len(category_counts) != model.n_items:
-        raise MirtModelError("Category counts must match the number of items")
-    for item_idx, n_categories in enumerate(category_counts):
-        if (
-            not isinstance(n_categories, (int, np.integer))
-            or n_categories < 2
-            or n_categories > probabilities.shape[2]
-        ):
-            raise MirtModelError(
-                "Category counts must be valid for the probability output"
-            )
-        cumulative[:, item_idx, n_categories - 1 :] = 1.0
-
-    uniforms = rng.random((n_persons, model.n_items, 1))
-    return (uniforms > cumulative).sum(axis=2).astype(np.int_)
-
-
 def _fit_parametric_replicate(
     task: _ParametricFitTask,
     replicate_rng: np.random.Generator,
@@ -624,7 +523,7 @@ def _fit_parametric_replicate(
     from mirt.estimation.em import EMEstimator
 
     theta = replicate_rng.standard_normal((task.n_persons, task.model.n_factors))
-    sim_data = _simulate_model_responses(task.model, theta, replicate_rng)
+    sim_data = draw_item_responses(task.model, theta, replicate_rng)
     boot_model = _prepare_bootstrap_model(
         task.model,
         task.original_params,
@@ -674,7 +573,8 @@ def _native_2pl_bootstrap_samples(
         or model.model_name != "2PL"
     ):
         return None
-    if model.n_factors != 1:
+    # The native kernel estimates every parameter, so fixed ones need EM.
+    if model.n_factors != 1 or model._free_parameter_restrictions:
         return None
 
     parameters = model.parameters
@@ -739,8 +639,10 @@ def bootstrap_se(
     verbose : bool
         Whether to print progress
     warm_start : bool
-        Whether to use original parameter estimates as starting values
-        for bootstrap samples. This significantly speeds up convergence.
+        Whether each replicate fit starts from the original parameter
+        estimates, which significantly speeds up convergence. Otherwise EM
+        reinitializes the free parameters; fixed parameters keep their values
+        either way.
     n_jobs : int
         Number of process workers for the general Python implementation.
         Use ``-1`` for all available CPU cores. The default ``1`` preserves
@@ -767,7 +669,7 @@ def bootstrap_se(
 
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
 
     responses = validate_responses(responses, n_items=model.n_items)
     if statistic == "parameters":
@@ -866,8 +768,10 @@ def bootstrap_ci(
     verbose : bool
         Whether to print progress
     warm_start : bool
-        Whether to use original parameter estimates as starting values
-        for bootstrap samples. This significantly speeds up convergence.
+        Whether each replicate fit starts from the original parameter
+        estimates, which significantly speeds up convergence. Otherwise EM
+        reinitializes the free parameters; fixed parameters keep their values
+        either way.
     n_jobs : int
         Number of process workers for bootstrap and jackknife fits. Use ``-1``
         for all available CPU cores. The default is serial execution and is
@@ -902,7 +806,7 @@ def bootstrap_ci(
     _validate_resample_count(n_bootstrap)
     _validate_statistic(statistic)
     _validate_ci_configuration(alpha, method)
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
 
     rng = np.random.default_rng(seed)
     responses = validate_responses(responses, n_items=original_model.n_items)
@@ -1092,8 +996,10 @@ def parametric_bootstrap(
     verbose : bool
         Whether to print progress
     warm_start : bool
-        Whether to use original parameter estimates as starting values
-        for bootstrap samples. This significantly speeds up convergence.
+        Whether each replicate fit starts from the original parameter
+        estimates, which significantly speeds up convergence. Otherwise EM
+        reinitializes the free parameters; fixed parameters keep their values
+        either way.
     n_jobs : int
         Number of process workers. Use ``-1`` for all available CPU cores. The
         default ``1`` preserves serial execution and is preferable for small
@@ -1115,7 +1021,7 @@ def parametric_bootstrap(
         model = model.model
 
     _validate_resample_count(n_bootstrap)
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
     if n_persons is None:
         n_persons = 500
     if (
@@ -1194,3 +1100,267 @@ def parametric_bootstrap(
             se_results[name] = np.full_like(estimates[0], np.nan, dtype=np.float64)
 
     return se_results
+
+
+@dataclass(frozen=True)
+class BootstrapLRResult:
+    """Parametric bootstrap likelihood-ratio test of nested models.
+
+    Attributes
+    ----------
+    statistic : float
+        Observed likelihood-ratio statistic ``2 * (ll_full - ll_reduced)``,
+        floored at zero, from refits of both models under the replicate
+        estimator settings.
+    p_value : float
+        Bootstrap p-value ``(1 + #{null >= statistic}) / (n_successful + 1)``.
+        NaN when every replicate failed.
+    null_statistics : ndarray
+        Likelihood-ratio statistics of the successful replicates, which were
+        simulated from the refitted reduced model.
+    n_failed : int
+        Number of replicates whose data could not be fitted by both models.
+    df : int
+        Difference in the numbers of free parameters.
+    asymptotic_p_value : float
+        Upper tail of the chi-square distribution with ``df`` degrees of
+        freedom at ``statistic``. It is unreliable when the reduced model lies
+        on the boundary of the full model, for example 2PL versus 3PL.
+    reduced_log_likelihood : float
+        Marginal log-likelihood of the refitted reduced model.
+    full_log_likelihood : float
+        Marginal log-likelihood of the refitted full model.
+    """
+
+    statistic: float
+    p_value: float
+    null_statistics: NDArray[np.float64]
+    n_failed: int
+    df: int
+    asymptotic_p_value: float
+    reduced_log_likelihood: float
+    full_log_likelihood: float
+
+
+@dataclass(slots=True)
+class _LRFitTask:
+    reduced: BaseItemModel
+    full: BaseItemModel
+    missing: NDArray[np.bool_]
+    warm_start: bool
+    estimator_options: dict[str, Any]
+    seeds: list[np.random.SeedSequence]
+
+
+def _refit_log_likelihood(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    warm_start: bool,
+    estimator_options: Mapping[str, Any],
+) -> tuple[float, BaseItemModel]:
+    """Refit a model copy from its current estimates and return its LL."""
+    from mirt.estimation.em import EMEstimator
+
+    start = _prepare_bootstrap_model(model, model.parameters, warm_start)
+    result = EMEstimator(**estimator_options).fit(start, responses)
+    log_likelihood = float(result.log_likelihood)
+    if not np.isfinite(log_likelihood):
+        raise ArithmeticError("fit returned a non-finite log-likelihood")
+    return log_likelihood, result.model
+
+
+def _fit_lr_task(task: _LRFitTask) -> list[tuple[float, str | None]]:
+    """Simulate from the reduced model and refit both models per replicate."""
+    n_persons = task.missing.shape[0]
+    outcomes: list[tuple[float, str | None]] = []
+    for seed in task.seeds:
+        rng = np.random.default_rng(seed)
+        theta = rng.standard_normal((n_persons, task.reduced.n_factors))
+        simulated = draw_item_responses(task.reduced, theta, rng)
+        simulated[task.missing] = -1
+        try:
+            reduced_ll, _ = _refit_log_likelihood(
+                task.reduced, simulated, task.warm_start, task.estimator_options
+            )
+            full_ll, _ = _refit_log_likelihood(
+                task.full, simulated, task.warm_start, task.estimator_options
+            )
+        except _BOOTSTRAP_EXCEPTIONS as exc:
+            outcomes.append((np.nan, f"{type(exc).__name__}: {exc}"))
+            continue
+        outcomes.append((max(0.0, 2.0 * (full_ll - reduced_ll)), None))
+    return outcomes
+
+
+def bootstrap_lr(
+    reduced: BaseItemModel | FitResult,
+    full: BaseItemModel | FitResult,
+    responses: NDArray[np.int_],
+    *,
+    n_bootstrap: int = 200,
+    seed: int | None = None,
+    n_quadpts: int = 21,
+    tol: float = 1e-5,
+    max_iter: int = 500,
+    warm_start: bool = True,
+    n_jobs: int = 1,
+) -> BootstrapLRResult:
+    """Parametric bootstrap likelihood-ratio test for nested models.
+
+    The chi-square reference distribution of the likelihood-ratio statistic
+    fails when the reduced model fixes a parameter on the boundary of the
+    full model, such as 2PL versus 3PL (zero guessing) or ``k`` versus
+    ``k + 1`` factors. This test instead simulates the statistic's null
+    distribution from the fitted reduced model, like ``boot.LR`` in the R
+    package mirt.
+
+    Parameters
+    ----------
+    reduced : BaseItemModel or FitResult
+        Fitted model of the null hypothesis.
+    full : BaseItemModel or FitResult
+        Fitted model that nests ``reduced`` and has more free parameters.
+    responses : ndarray of shape (n_persons, n_items)
+        Observed responses used to fit both models. Negative codes are
+        missing.
+    n_bootstrap : int, default=200
+        Number of simulated data sets, at least 2.
+    seed : int, optional
+        Random seed for reproducible simulations.
+    n_quadpts : int, default=21
+        Quadrature points per latent dimension for every refit.
+    tol : float, default=1e-5
+        EM convergence tolerance for every refit. Statistics near zero need
+        tighter tolerances than parameter bootstraps.
+    max_iter : int, default=500
+        Maximum EM iterations for every refit.
+    warm_start : bool, default=True
+        Whether replicate fits start from the observed-data estimates.
+        Otherwise EM reinitializes the free parameters.
+    n_jobs : int, default=1
+        Number of process workers. Use ``-1`` for all available CPU cores.
+        Custom models must be picklable when using multiple workers.
+
+    Returns
+    -------
+    BootstrapLRResult
+        Observed statistic, bootstrap and asymptotic p-values, and the null
+        statistics.
+
+    Notes
+    -----
+    Both models are first refitted to ``responses``, starting from their
+    supplied estimates, with exactly the estimator settings used for the
+    replicates. The observed statistic comes from these refits rather than
+    from the supplied fits, so differing quadrature or tolerance settings
+    cannot bias the comparison. Each replicate draws standard normal
+    abilities for every person, simulates responses from the refitted
+    reduced model, applies the observed missing-data pattern, and refits both
+    models. Every fit uses the default EM estimator of its model family,
+    including any built-in regularization such as the native 3PL guessing
+    prior, so observed and replicate statistics are computed alike.
+    Replicates that fail to fit are excluded and counted in ``n_failed``.
+    Seeded results are identical for every worker count.
+
+    Examples
+    --------
+    >>> from mirt import bootstrap_lr, fit_mirt, simdata
+    >>> data = simdata("2PL", n_persons=300, n_items=8, seed=1)
+    >>> reduced = fit_mirt(data, model="2PL", max_iter=50)
+    >>> full = fit_mirt(data, model="3PL", max_iter=50)
+    >>> test = bootstrap_lr(reduced, full, data, n_bootstrap=5, seed=1)
+    >>> 0.0 < test.p_value <= 1.0
+    True
+    """
+    from scipy import stats
+
+    from mirt.estimation.em import EMEstimator
+    from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
+
+    reduced_model = reduced.model if isinstance(reduced, FitResult) else reduced
+    full_model = full.model if isinstance(full, FitResult) else full
+    for name, candidate in (("reduced", reduced_model), ("full", full_model)):
+        if not isinstance(candidate, BaseItemModel):
+            raise MirtValidationError(
+                f"{name} must be an item model or a FitResult wrapping one",
+                parameter=name,
+                value=type(candidate).__name__,
+            )
+    _validate_resample_count(n_bootstrap)
+    n_jobs = resolve_n_jobs(n_jobs)
+    if reduced_model.n_items != full_model.n_items:
+        raise MirtValidationError(
+            "reduced and full models must contain the same items",
+            parameter="full",
+            value=full_model.n_items,
+            expected=str(reduced_model.n_items),
+        )
+    df = full_model.n_parameters - reduced_model.n_parameters
+    if df < 1:
+        raise MirtValidationError(
+            "the full model must have more free parameters than the reduced model",
+            parameter="full",
+            value=full_model.n_parameters,
+            expected=f"> {reduced_model.n_parameters}",
+        )
+    responses = validate_responses(responses, n_items=reduced_model.n_items)
+    estimator_options: dict[str, Any] = {
+        "n_quadpts": n_quadpts,
+        "max_iter": max_iter,
+        "tol": tol,
+        "compute_standard_errors": False,
+        "verbose": False,
+    }
+    EMEstimator(**estimator_options)  # Validate settings before any fitting.
+
+    reduced_ll, reduced_refit = _refit_log_likelihood(
+        reduced_model, responses, reduced_model.is_fitted, estimator_options
+    )
+    full_ll, full_refit = _refit_log_likelihood(
+        full_model, responses, full_model.is_fitted, estimator_options
+    )
+    statistic = max(0.0, 2.0 * (full_ll - reduced_ll))
+
+    seeds = np.random.SeedSequence(seed).spawn(n_bootstrap)
+    tasks = [
+        _LRFitTask(
+            reduced=reduced_refit,
+            full=full_refit,
+            missing=responses < 0,
+            warm_start=warm_start,
+            estimator_options=estimator_options,
+            seeds=seed_chunk,
+        )
+        for seed_chunk in _chunk_values(seeds, n_jobs)
+    ]
+    outcomes = [
+        outcome
+        for chunk in _run_bootstrap_tasks(_fit_lr_task, tasks, n_jobs)
+        for outcome in chunk
+    ]
+    null_statistics = np.array(
+        [value for value, error in outcomes if error is None], dtype=np.float64
+    )
+    n_failed = len(outcomes) - null_statistics.size
+    if null_statistics.size == 0:
+        warnings.warn(
+            "every bootstrap likelihood-ratio replicate failed",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        p_value = np.nan
+    else:
+        exceedances = np.count_nonzero(null_statistics >= statistic)
+        p_value = (1.0 + exceedances) / (null_statistics.size + 1.0)
+
+    return BootstrapLRResult(
+        statistic=statistic,
+        p_value=float(p_value),
+        null_statistics=null_statistics,
+        n_failed=int(n_failed),
+        df=int(df),
+        asymptotic_p_value=float(stats.chi2.sf(statistic, df)),
+        reduced_log_likelihood=reduced_ll,
+        full_log_likelihood=full_ll,
+    )

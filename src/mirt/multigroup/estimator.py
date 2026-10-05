@@ -29,6 +29,7 @@ from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.multigroup.latent import GroupLatentDistribution
     from mirt.multigroup.model import MultigroupModel
 
 
@@ -106,6 +107,7 @@ class MultigroupEMEstimator:
         fixed_parameters: Mapping[str, Mapping[int, float | NDArray[np.float64]]]
         | None = None,
         mean_order: Sequence[int] | None = None,
+        initial_latent: Sequence[GroupLatentDistribution] | None = None,
     ) -> MultigroupFitResult:
         """Fit multigroup model with simultaneous EM.
 
@@ -125,6 +127,11 @@ class MultigroupEMEstimator:
         mean_order : sequence of int, optional
             Permutation of all group indices in nondecreasing population-mean
             order. Supported for unidimensional Gaussian latent distributions.
+        initial_latent : sequence of GroupLatentDistribution, optional
+            Starting latent distributions, one per group, such as those of a
+            previous fit. Only means and covariances that this fit estimates
+            are copied. Together with already fitted group models this
+            warm-starts nested refits.
 
         Returns
         -------
@@ -172,6 +179,19 @@ class MultigroupEMEstimator:
         ):
             distribution.estimate_mean = estimate_mean
             distribution.estimate_cov = estimate_cov
+        if initial_latent is not None:
+            if len(initial_latent) != model.n_groups:
+                raise ValueError(
+                    "initial_latent must contain one distribution per group"
+                )
+            for g, start in enumerate(initial_latent):
+                current = self._latent_density.distributions[g]
+                if current.estimate_mean or current.estimate_cov:
+                    self._latent_density.set_group_distribution(
+                        g,
+                        mean=start.mean if current.estimate_mean else None,
+                        cov=start.cov if current.estimate_cov else None,
+                    )
         inv_spec.apply_to_model(model)
 
         for g in range(model.n_groups):

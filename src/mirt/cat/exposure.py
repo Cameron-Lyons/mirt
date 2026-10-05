@@ -54,6 +54,33 @@ def _prepare_available_items(available_items: set[int]) -> NDArray[np.int_]:
     return item_indices
 
 
+def _candidate_information(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_indices: NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Return candidate item information at one ability point.
+
+    Dichotomous models usually return one value per item from a single bulk
+    call. Polytomous models define ``information(theta)`` as total test
+    information, so they, and any model whose bulk output is not item-wise,
+    are evaluated one candidate at a time.
+    """
+    if not model.is_polytomous:
+        information = np.asarray(model.information(theta), dtype=np.float64)
+        if information.size == model.n_items:
+            return information.reshape(-1)[item_indices]
+    return np.array(
+        [
+            np.asarray(
+                model.information(theta, item_idx=int(item_idx)), dtype=np.float64
+            ).sum()
+            for item_idx in item_indices
+        ],
+        dtype=np.float64,
+    )
+
+
 @dataclass(frozen=True)
 class ExposureReport:
     """Item-level exposure monitoring summary.
@@ -677,11 +704,7 @@ class ProgressiveRestricted(ExposureControl):
         if not np.all(np.isfinite(theta_arr)):
             raise ValueError("theta values must be finite")
 
-        all_information = np.asarray(model.information(theta_arr), dtype=np.float64)
-        flattened_information = all_information.reshape(-1)
-        if flattened_information.size != model.n_items:
-            raise ValueError("model.information(theta) must return one value per item")
-        candidate_information = flattened_information[item_indices]
+        candidate_information = _candidate_information(model, theta_arr, item_indices)
 
         finite = np.isfinite(candidate_information)
         if not np.any(finite):
