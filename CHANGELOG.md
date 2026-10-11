@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-11
+
+### Security
+
+- The optional GPU extra now requires `fsspec>=2026.6.0` to address
+  [CVE-2026-104851 / GHSA-27vj-qcqg-25rc](https://github.com/fsspec/filesystem_spec/security/advisories/GHSA-27vj-qcqg-25rc).
+  The lockfile also selects the patched dependency.
+
 ### Fixed
 
+- `mirt.utils.residuals` remains the public callable regardless of whether
+  `Q3`, `LD_X2`, `ResidualResult` or the implementation submodule is imported
+  first, while utility imports remain lazy.
+- `IRTreeResult` preserves its 1.1.0 positional and keyword constructor
+  arguments. Trait covariance is optional; omitted covariance retains the
+  former unit-variance trait distribution.
 - Multidimensional GradedResponseModel and NominalResponseModel now provide
   exact item_information_matrix(theta, item_idx) and
   test_information_matrix(theta). D- and A-optimal MCAT item selection for these
@@ -592,6 +606,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook checks are recorded at model definition time, including overrides made
   before estimator imports. Polytomous likelihoods now respect public
   probability overrides, and custom curves retain numerical fitting.
+- Preserved finite Gaussian log kernels near floating-point limits and finite
+  Cholesky factors for large prior covariances. Posterior acceptance now keeps
+  prior differences under huge common likelihood offsets. Cached and read-only
+  custom likelihood/prior outputs remain intact during chain updates, including
+  callbacks that share scratch storage.
+- Preserved custom MCEM item callbacks when using a shared QMC grid. Normalized
+  importance weights after centering log likelihoods so large common offsets
+  retain unit posterior mass, with bounded scratch and protected borrowed inputs.
+- Preserved IRTree posterior normalization for large common log-likelihood
+  offsets and protected borrowed custom likelihood buffers. Explicit node masks
+  suppress stored decisions consistently in likelihoods and counts. IRTree
+  optimizer gradients now respect clipped tails. Custom theta overrides retain
+  numerical EM item objectives for logistic and affine models.
+- Restored BL parameters after failed numerical optimization or curvature
+  trials, and skipped optimization for models with no free parameters.
+- Preserved custom model constructor state and bound instance probability
+  methods in parallel numerical uncertainty. Core EM uncertainty falls back
+  to numerical curvature for custom curve and parameter overrides.
+- Enabled item updates and access for category-by-factor parameter arrays,
+  fixing multidimensional NRM fitting. Shared coordinate-wise numerical
+  curvature now preserves tensor shapes in EM and standalone standard errors,
+  with parameter restoration when probability evaluation fails.
+- Kept regularized MIRT convergence, likelihoods, and fit statistics in log space
+  so long tests do not underflow into a likelihood floor or falsely converge.
+  Posterior weights preserve unit row sums and prior differences under large
+  common log-likelihood offsets. Failed adaptive warmstarts restore the penalty
+  and adaptive weights, and response preparation is released after each fit.
+- Matched Python 1PL–4PL EM gradients to the clipped likelihood, preserved small
+  positive-tail derivatives, and avoided NaNs from zero counts at saturated
+  probabilities. Custom binary models now retain their own probability functions
+  during optimization. Multidimensional 2PL objectives share stable logit recovery.
+- Preserved confirmatory loading patterns across model copies and excluded
+  fixed zero loadings from optimization and parameter counts. Parallel EM
+  workers now isolate numerical trial updates, including custom model state.
+  Bifactor copies retain subclass behavior. Affine M-step gradients follow
+  probability clipping and handle zero counts at saturated probabilities.
+- Recovered finite MIRT and bifactor logits after product overflow, intercept
+  cancellation, or cancellation between factor contributions. Probabilities
+  and scalar/matrix information now share this recovery, while unrelated
+  bifactor columns and genuinely nonfinite inputs retain their prior semantics.
+- Retained multidimensional and bifactor information in both logistic tails,
+  recovering representable scalar and matrix entries after intermediate slope
+  overflow or tail underflow. Standardized MIRT loadings and communalities now
+  retain large finite slopes without overflowing their squared norms.
+- Logistic probabilities recover finite results from overflowing offsets, and
+  4PL curves retain exact asymptotes. Multidimensional 2PL probability and
+  information recenter large locations before subtraction, with exact arithmetic
+  limited to cells whose severe cancellation survives centered evaluation.
+- Unipolar probability and information preserve both tails and small nonzero
+  information near the curve peak, including extreme slope rescaling. Corrected
+  the docstring to describe the implemented symmetric curve with a 0.25 peak.
+- Logistic Fisher information preserves both tails when success probabilities
+  round to one, and recovers representable results after extreme slope scaling.
+  Multidimensional 2PL information avoids premature overflow in slope norms and
+  location offsets; NaN abilities propagate instead of appearing uninformative.
+- CLL/NLL information preserves representable tails when probabilities round to
+  zero or one, including recovery after slope rescaling. Extreme finite offsets
+  no longer overflow before small slopes can rescale them, and probabilities
+  retain their exact limits at infinite abilities.
+- Strongly asymmetric 5PL curves preserve probabilities and Fisher information
+  when the underlying sigmoid rounds to zero or one. Generalized difficulty
+  inversion retains interior solutions at extreme asymmetries and targets near
+  probability boundaries instead of incorrectly clamping to the search limits.
+  Finite abilities and parameters also retain representable results when their
+  initial differences or logit products overflow before asymmetry rescaling.
+- Information and expected-score queries accept NumPy integer indices and item
+  selection arrays, preserve repeated selection order, and interpret a single
+  multidimensional ability vector consistently. Invalid indices and integration
+  inputs now fail validation before model evaluation.
+- Empirical reliability preserves score-unit invariance for tiny and very large
+  scores and standard errors. Marginal reliability normalizes large or tiny
+  density weights safely, handles normal-density tails, and retains positive
+  variances without an arbitrary minimum. Invalid item information is rejected
+  before summing it into test information.
+- Classical item-total correlations remain accurate and within [-1, 1] on long,
+  nearly constant tests, including exactly constant corrected totals.
+- Empirical quantile bins handle extreme finite abilities without overflowing
+  their edges or means. Empirical RMSEA accepts shared category counts from
+  custom ordinal models and rejects malformed category metadata.
+- Kernel calibration preserves person weights when observations share very large
+  distances, excludes zero-weight neighbors from extreme-distance centering, and
+  keeps ordinary grid points independent of overflowing-distance fallbacks.
+- `itemGAM` produces finite curves with tiny positive bandwidths and preserves
+  uncertainty in grid tails when nearby responses are missing.
+- Highest-density intervals no longer depend on row position or batch size at
+  adjacent floating-point probability boundaries, or return reversed bounds at
+  very small positive probability levels.
+- Benchmark comparisons reject different person counts for pattern grouping
+  and the new highest-density interval workload.
 
 ### Added
 
@@ -1038,8 +1141,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fit_multigroup, the estimators and others), treat NaN as a missing response.
   This includes R's NA and pandas nullable Int64/boolean/Float64 pd.NA. Pass
   nan_as_missing=False to restore rejection. Infinite, non-integer and text
-  codes are still rejected. fscores, itemfit and personfit still require missing
-  responses coded as negative numbers.
+  codes are still rejected. fscores, itemfit and personfit also accept NaN and
+  nullable DataFrame nulls as missing responses.
 - FullDiagnosticReport's item-fit table now also flags the 0.8-1.2 'Check' tier,
   matching ItemAnalysisReport.
 - ScoreResult.classify and AbilityPosteriorResult.classify share cut-score and
@@ -1639,97 +1742,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lines. The 5PL model now shares the unidimensional curve evaluator, and its
   outputs are bit-identical to before.
 - The multigroup E-step's duplicated Python implementation.
-
-### Fixed
-- Preserved finite Gaussian log kernels near floating-point limits and finite
-  Cholesky factors for large prior covariances. Posterior acceptance now keeps
-  prior differences under huge common likelihood offsets. Cached and read-only
-  custom likelihood/prior outputs remain intact during chain updates, including
-  callbacks that share scratch storage.
-- Preserved custom MCEM item callbacks when using a shared QMC grid. Normalized
-  importance weights after centering log likelihoods so large common offsets
-  retain unit posterior mass, with bounded scratch and protected borrowed inputs.
-- Preserved IRTree posterior normalization for large common log-likelihood
-  offsets and protected borrowed custom likelihood buffers. Explicit node masks
-  suppress stored decisions consistently in likelihoods and counts. IRTree
-  optimizer gradients now respect clipped tails. Custom theta overrides retain
-  numerical EM item objectives for logistic and affine models.
-- Restored BL parameters after failed numerical optimization or curvature
-  trials, and skipped optimization for models with no free parameters.
-- Preserved custom model constructor state and bound instance probability
-  methods in parallel numerical uncertainty. Core EM uncertainty falls back
-  to numerical curvature for custom curve and parameter overrides.
-- Enabled item updates and access for category-by-factor parameter arrays,
-  fixing multidimensional NRM fitting. Shared coordinate-wise numerical
-  curvature now preserves tensor shapes in EM and standalone standard errors,
-  with parameter restoration when probability evaluation fails.
-- Kept regularized MIRT convergence, likelihoods, and fit statistics in log space
-  so long tests do not underflow into a likelihood floor or falsely converge.
-  Posterior weights preserve unit row sums and prior differences under large
-  common log-likelihood offsets. Failed adaptive warmstarts restore the penalty
-  and adaptive weights, and response preparation is released after each fit.
-- Matched Python 1PL–4PL EM gradients to the clipped likelihood, preserved small
-  positive-tail derivatives, and avoided NaNs from zero counts at saturated
-  probabilities. Custom binary models now retain their own probability functions
-  during optimization. Multidimensional 2PL objectives share stable logit recovery.
-- Preserved confirmatory loading patterns across model copies and excluded
-  fixed zero loadings from optimization and parameter counts. Parallel EM
-  workers now isolate numerical trial updates, including custom model state.
-  Bifactor copies retain subclass behavior. Affine M-step gradients follow
-  probability clipping and handle zero counts at saturated probabilities.
-- Recovered finite MIRT and bifactor logits after product overflow, intercept
-  cancellation, or cancellation between factor contributions. Probabilities
-  and scalar/matrix information now share this recovery, while unrelated
-  bifactor columns and genuinely nonfinite inputs retain their prior semantics.
-- Retained multidimensional and bifactor information in both logistic tails,
-  recovering representable scalar and matrix entries after intermediate slope
-  overflow or tail underflow. Standardized MIRT loadings and communalities now
-  retain large finite slopes without overflowing their squared norms.
-- Logistic probabilities recover finite results from overflowing offsets, and
-  4PL curves retain exact asymptotes. Multidimensional 2PL probability and
-  information recenter large locations before subtraction, with exact arithmetic
-  limited to cells whose severe cancellation survives centered evaluation.
-- Unipolar probability and information preserve both tails and small nonzero
-  information near the curve peak, including extreme slope rescaling. Corrected
-  the docstring to describe the implemented symmetric curve with a 0.25 peak.
-- Logistic Fisher information preserves both tails when success probabilities
-  round to one, and recovers representable results after extreme slope scaling.
-  Multidimensional 2PL information avoids premature overflow in slope norms and
-  location offsets; NaN abilities propagate instead of appearing uninformative.
-- CLL/NLL information preserves representable tails when probabilities round to
-  zero or one, including recovery after slope rescaling. Extreme finite offsets
-  no longer overflow before small slopes can rescale them, and probabilities
-  retain their exact limits at infinite abilities.
-- Strongly asymmetric 5PL curves preserve probabilities and Fisher information
-  when the underlying sigmoid rounds to zero or one. Generalized difficulty
-  inversion retains interior solutions at extreme asymmetries and targets near
-  probability boundaries instead of incorrectly clamping to the search limits.
-  Finite abilities and parameters also retain representable results when their
-  initial differences or logit products overflow before asymmetry rescaling.
-- Information and expected-score queries accept NumPy integer indices and item
-  selection arrays, preserve repeated selection order, and interpret a single
-  multidimensional ability vector consistently. Invalid indices and integration
-  inputs now fail validation before model evaluation.
-- Empirical reliability preserves score-unit invariance for tiny and very large
-  scores and standard errors. Marginal reliability normalizes large or tiny
-  density weights safely, handles normal-density tails, and retains positive
-  variances without an arbitrary minimum. Invalid item information is rejected
-  before summing it into test information.
-- Classical item-total correlations remain accurate and within [-1, 1] on long,
-  nearly constant tests, including exactly constant corrected totals.
-- Empirical quantile bins handle extreme finite abilities without overflowing
-  their edges or means. Empirical RMSEA accepts shared category counts from
-  custom ordinal models and rejects malformed category metadata.
-- Kernel calibration preserves person weights when observations share very large
-  distances, excludes zero-weight neighbors from extreme-distance centering, and
-  keeps ordinary grid points independent of overflowing-distance fallbacks.
-- `itemGAM` produces finite curves with tiny positive bandwidths and preserves
-  uncertainty in grid tails when nearby responses are missing.
-- Highest-density intervals no longer depend on row position or batch size at
-  adjacent floating-point probability boundaries, or return reversed bounds at
-  very small positive probability levels.
-- Benchmark comparisons reject different person counts for pattern grouping
-  and the new highest-density interval workload.
 
 ## [1.1.0] - 2026-08-18
 

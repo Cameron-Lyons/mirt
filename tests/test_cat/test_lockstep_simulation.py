@@ -271,7 +271,9 @@ def test_lockstep_is_seeded_and_leaves_interactive_state_untouched():
     left = first.run_batch_simulation([-0.5, 0.5], n_replications=3)
     right = second.run_batch_simulation([-0.5, 0.5], n_replications=3)
 
-    _assert_same_sessions(left, right, atol=0.0)
+    # Independent batch buffers can change the last bits of float reductions.
+    _assert_same_sessions(left, right, atol=16 * np.finfo(np.float64).eps)
+    assert first.rng.bit_generator.state == second.rng.bit_generator.state
     assert first._items_administered == []
     assert first._theta_history == []
     assert not first._is_complete

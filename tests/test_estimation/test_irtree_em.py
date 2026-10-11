@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 import mirt.estimation.irtree_em as irtree_em
-from mirt.estimation.irtree_em import IRTreeEMEstimator
+from mirt.estimation.irtree_em import IRTreeEMEstimator, IRTreeResult
 from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.exceptions import MirtDataError, MirtValidationError
 from mirt.models.irtree import IRTreeModel
@@ -26,6 +26,55 @@ def _simulate_responses(
     probabilities = model.probability(theta)
     uniforms = rng.random((n_persons, model.n_items, 1))
     return np.sum(uniforms > np.cumsum(probabilities, axis=2), axis=2)
+
+
+@pytest.fixture
+def legacy_result_fields() -> dict:
+    """The constructor fields in their public v1.1.0 positional order."""
+    return {
+        "model": IRTreeModel(n_items=2, tree_spec="direction_intensity"),
+        "log_likelihood": -12.5,
+        "trait_means": np.array([0.2, -0.3]),
+        "trait_correlations": np.array([[1.0, 0.25], [0.25, 1.0]]),
+        "theta_estimates": np.array([[0.1, -0.2], [0.3, 0.4]]),
+        "theta_se": np.array([[0.5, 0.6], [0.7, 0.8]]),
+        "standard_errors": {"difficulty": np.full((2, 2), 0.1)},
+        "aic": 41.0,
+        "bic": 30.545177444479563,
+        "converged": True,
+        "n_iterations": 5,
+        "n_observations": 2,
+        "n_parameters": 8,
+    }
+
+
+@pytest.mark.parametrize("construction", ["positional", "keyword"])
+def test_result_accepts_legacy_constructor_fields(
+    legacy_result_fields, construction: str
+) -> None:
+    if construction == "positional":
+        result = IRTreeResult(*legacy_result_fields.values())
+    else:
+        result = IRTreeResult(**legacy_result_fields)
+
+    for name, value in legacy_result_fields.items():
+        np.testing.assert_equal(getattr(result, name), value)
+    np.testing.assert_array_equal(
+        result.trait_covariance, legacy_result_fields["trait_correlations"]
+    )
+    assert not np.shares_memory(result.trait_covariance, result.trait_correlations)
+    assert result.trait_summary().count(f"Variance: {1.0:>8.4f}") == 2
+    assert "IRTree Model Results" in result.summary()
+
+
+def test_result_preserves_explicit_covariance(legacy_result_fields) -> None:
+    covariance = np.array([[2.25, 0.3], [0.3, 0.64]])
+    result = IRTreeResult(**legacy_result_fields, trait_covariance=covariance)
+
+    assert result.trait_covariance is covariance
+    np.testing.assert_array_equal(result.trait_correlations, [[1.0, 0.25], [0.25, 1.0]])
+    for variance in np.diag(covariance):
+        assert f"Variance: {variance:>8.4f}" in result.trait_summary()
 
 
 def test_bulk_log_likelihood_matches_category_likelihood() -> None:

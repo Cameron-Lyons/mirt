@@ -111,19 +111,31 @@ def _assert_frames_equal(actual: Any, expected: Any) -> None:
         assert_array_equal(actual_columns[name], values, err_msg=name)
 
 
-def _assert_same(actual: Any, expected: Any) -> None:
-    """Compare nested results exactly, treating NaN as equal to NaN."""
+def _assert_same(actual: Any, expected: Any, *, float_atol: float = 0.0) -> None:
+    """Keep discrete results and NaN masks exact; allow optional float roundoff."""
     if dataclasses.is_dataclass(expected):
         for field in dataclasses.fields(expected):
-            _assert_same(getattr(actual, field.name), getattr(expected, field.name))
+            _assert_same(
+                getattr(actual, field.name),
+                getattr(expected, field.name),
+                float_atol=float_atol,
+            )
     elif isinstance(expected, dict):
         assert actual.keys() == expected.keys()
         for key, value in expected.items():
-            _assert_same(actual[key], value)
+            _assert_same(actual[key], value, float_atol=float_atol)
     elif isinstance(expected, (list, tuple)):
         assert len(actual) == len(expected)
         for actual_value, expected_value in zip(actual, expected, strict=True):
-            _assert_same(actual_value, expected_value)
+            _assert_same(actual_value, expected_value, float_atol=float_atol)
+    elif float_atol and np.asarray(expected).dtype.kind == "f":
+        actual_array = np.asarray(actual)
+        expected_array = np.asarray(expected)
+        assert actual_array.shape == expected_array.shape
+        assert_array_equal(np.isnan(actual_array), np.isnan(expected_array))
+        np.testing.assert_allclose(
+            actual_array, expected_array, rtol=0.0, atol=float_atol, equal_nan=True
+        )
     else:
         assert_array_equal(actual, expected)
 
@@ -350,7 +362,16 @@ def test_model_fit_and_local_dependence_treat_nan_and_nulls_as_missing(
     function = _MODEL_FIT_AND_LD_CALLS[call]
     expected = function(result, coded, theta)
 
-    _assert_same(function(result, to_missing(coded), theta), expected)
+    # LD reductions depend on layout; G2 cancels count-scaled log terms.
+    # Other calls, pair indices, and missingness still require exact agreement.
+    float_atol = (
+        32 * len(coded) * np.finfo(float).eps
+        if call in {"ld_chi2", "ld_statistics"}
+        else 0.0
+    )
+    _assert_same(
+        function(result, to_missing(coded), theta), expected, float_atol=float_atol
+    )
 
 
 def test_vuong_test_treats_nan_as_missing(
