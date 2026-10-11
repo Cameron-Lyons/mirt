@@ -1,6 +1,7 @@
 """Optional Monte Carlo uncertainty matches conditional item curvature."""
 
 import tracemalloc
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -63,10 +64,10 @@ def _inputs(model, layout="ordinary", persons=13):
     )
     responses[rng.random(responses.shape) < 0.2] = -1
     samples = rng.normal(size=(persons, 50, model.n_factors))
-    if layout == "shared":
-        samples = np.broadcast_to(samples[:1], samples.shape)
-    elif layout == "float32":
+    if layout in ("float32", "shared-float32"):
         samples = samples.astype(np.float32)
+    if layout in ("shared", "shared-float32"):
+        samples = np.broadcast_to(samples[:1], samples.shape)
     elif layout == "strided":
         storage = np.empty((persons, 100, model.n_factors))
         storage[:, ::2] = samples
@@ -135,7 +136,7 @@ def test_standard_error_switch_requires_a_boolean(factory, value):
 
 @pytest.mark.parametrize("kind", _MODELS)
 @pytest.mark.parametrize(
-    "layout", ["ordinary", "shared", "float32", "strided", "blocked"]
+    "layout", ["ordinary", "shared", "float32", "shared-float32", "strided", "blocked"]
 )
 def test_standard_errors_match_direct_weighted_likelihood_curvature(
     kind, layout, monkeypatch
@@ -369,7 +370,7 @@ def test_default_fit_retains_placeholder_errors(factory):
 @pytest.mark.parametrize(
     "method", ["importance", "posterior", "sobol", "halton", "stochastic"]
 )
-def test_opt_in_fit_reports_errors_without_changing_seeded_fit(method):
+def test_opt_in_fit_reports_errors_without_changing_seeded_fit(method, monkeypatch):
     options = {"n_samples": 50, "max_iter": 2, "seed": 945}
     if method in ("sobol", "halton"):
         cls, options = QMCEMEstimator, {**options, "sequence": method}
@@ -386,15 +387,62 @@ def test_opt_in_fit_reports_errors_without_changing_seeded_fit(method):
     model = _model("2pl")
     responses, _, _ = _inputs(model, persons=61)
     ordinary, enabled = cls(**options), cls(**options, compute_standard_errors=True)
+    compute_errors = enabled._compute_standard_errors_mc
+    calls = 0
+
+    def checked_compute_errors(fitted, data, samples, weights):
+        nonlocal calls
+        calls += 1
+        parameters = fitted.parameters
+        original_samples, original_weights = samples.copy(), weights.copy()
+        rng = enabled._random_generator()
+        rng_state = deepcopy(rng.bit_generator.state)
+        errors = compute_errors(fitted, data, samples, weights)
+        restored = fitted.parameters
+        assert restored.keys() == parameters.keys()
+        for name in parameters:
+            np.testing.assert_array_equal(restored[name], parameters[name])
+        np.testing.assert_array_equal(samples, original_samples)
+        np.testing.assert_array_equal(weights, original_weights)
+        assert enabled._random_generator().bit_generator.state == rng_state
+        return errors
+
+    monkeypatch.setattr(enabled, "_compute_standard_errors_mc", checked_compute_errors)
     expected = ordinary.fit(model.copy(), responses)
     actual = enabled.fit(model.copy(), responses)
-    assert actual.log_likelihood == expected.log_likelihood
+    assert calls == 1
+    # Independent optimizer runs can round differently; SE must preserve its inputs.
+    roundoff = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(
+        actual.log_likelihood, expected.log_likelihood, rtol=roundoff, atol=roundoff
+    )
     assert actual.n_iterations == expected.n_iterations
-    assert enabled.convergence_history == ordinary.convergence_history
-    for name in actual.model.parameters:
-        np.testing.assert_array_equal(
-            actual.model.parameters[name], expected.model.parameters[name]
+    assert len(enabled.convergence_history) == len(ordinary.convergence_history)
+    np.testing.assert_allclose(
+        enabled.convergence_history,
+        ordinary.convergence_history,
+        rtol=roundoff,
+        atol=roundoff,
+    )
+    assert (
+        enabled._random_generator().bit_generator.state
+        == ordinary._random_generator().bit_generator.state
+    )
+    actual_parameters, expected_parameters = (
+        actual.model.parameters,
+        expected.model.parameters,
+    )
+    assert actual_parameters.keys() == expected_parameters.keys()
+    assert actual.standard_errors.keys() == actual_parameters.keys()
+    for name in actual_parameters:
+        assert actual_parameters[name].shape == expected_parameters[name].shape
+        np.testing.assert_allclose(
+            actual_parameters[name],
+            expected_parameters[name],
+            rtol=roundoff,
+            atol=roundoff,
         )
+        assert actual.standard_errors[name].shape == actual_parameters[name].shape
         assert np.isfinite(actual.standard_errors[name]).all()
 
 

@@ -81,6 +81,9 @@ def prepare_logistic_objective(
         _unidimensional_logits,
     )
 
+    # NumPy 1.x can retain float32 during arithmetic with scalar parameters.
+    # Match the public curves' precision; MC callers pass bounded theta blocks.
+    theta = np.asarray(theta, dtype=np.float64)
     unidimensional = theta.shape[1] == 1
     fixed_slope = fixed_a is not None
     fixed_a = 1.0 if fixed_a is None else fixed_a
