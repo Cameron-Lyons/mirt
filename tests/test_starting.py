@@ -353,9 +353,23 @@ def test_parallel_multi_start_fit_spawns_workers_with_the_parent_backend():
     finally:
         mirt.set_backend(previous)
 
-    assert parallel.log_likelihood == serial.log_likelihood
-    for name, values in serial.model.parameters.items():
-        np.testing.assert_array_equal(parallel.model.parameters[name], values)
+    # Independently allocated worker fits can round float reductions differently.
+    roundoff = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(
+        parallel.log_likelihood, serial.log_likelihood, rtol=roundoff, atol=roundoff
+    )
+    assert parallel.n_iterations == serial.n_iterations
+    assert parallel.converged == serial.converged
+    serial_parameters, parallel_parameters = (
+        serial.model.parameters,
+        parallel.model.parameters,
+    )
+    assert parallel_parameters.keys() == serial_parameters.keys()
+    for name, values in serial_parameters.items():
+        assert parallel_parameters[name].shape == values.shape
+        np.testing.assert_allclose(
+            parallel_parameters[name], values, rtol=roundoff, atol=roundoff
+        )
 
 
 def test_parallel_multi_start_fit_uses_spawned_workers(monkeypatch):

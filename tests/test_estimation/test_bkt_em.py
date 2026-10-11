@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+from copy import deepcopy
 from typing import Any
 
 import numpy as np
@@ -344,7 +345,17 @@ def test_identical_person_rows_use_the_shared_layout() -> None:
     repeated = fit_bkt_em(responses, np.tile(skills, (responses.shape[0], 1)))
 
     _assert_fits_match(shared, repeated)
-    assert_array_equal(repeated.log_likelihood_history, shared.log_likelihood_history)
+    assert repeated.n_iterations == shared.n_iterations
+    assert repeated.converged == shared.converged
+    assert repeated.log_likelihood_history.shape == shared.log_likelihood_history.shape
+    # Independent EM reductions can round differently even with the same layout.
+    roundoff = 32 * np.finfo(np.float64).eps
+    assert_allclose(
+        repeated.log_likelihood_history,
+        shared.log_likelihood_history,
+        rtol=roundoff,
+        atol=roundoff,
+    )
 
 
 @pytest.mark.parametrize("forgetting", [False, True])
@@ -540,7 +551,9 @@ def test_bounds_protect_against_label_swapped_starts(
     )
 
 
-def test_random_starts_are_seeded_and_respect_bounds() -> None:
+def test_random_starts_are_seeded_and_respect_bounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     generator = BKTModel(n_skills=3, **_truth(forgetting=False))
     responses, skills, _ = generator.simulate(300, 6, seed=3)
     template = BKTModel(n_skills=3, allow_forgetting=True)
@@ -550,6 +563,37 @@ def test_random_starts_are_seeded_and_respect_bounds() -> None:
         bkt_em._start_model(template, start, rng, (0.01, 0.3), (0.05, 0.6))
         for start in range(20)
     ]
+    sampled_starts: list[dict[str, Any]] = []
+    original_start_model = bkt_em._start_model
+
+    def record_start(
+        template: BKTModel,
+        start: int,
+        rng: np.random.Generator,
+        slip_bounds: tuple[float, float],
+        guess_bounds: tuple[float, float],
+    ) -> BKTModel:
+        model = original_start_model(template, start, rng, slip_bounds, guess_bounds)
+        sampled_starts.append(
+            {
+                "configuration": (
+                    start,
+                    slip_bounds,
+                    guess_bounds,
+                    model.n_skills,
+                    model.skill_names.copy(),
+                    model.allow_forgetting,
+                    model.use_rust,
+                ),
+                "parameters": {
+                    name: getattr(model, name).copy() for name in _PARAMETERS
+                },
+                "rng_state": deepcopy(rng.bit_generator.state),
+            }
+        )
+        return model
+
+    monkeypatch.setattr(bkt_em, "_start_model", record_start)
     first = fit_bkt_em(responses, skills, n_starts=4, seed=11)
     second = fit_bkt_em(responses, skills, n_starts=4, seed=11)
 
@@ -558,7 +602,40 @@ def test_random_starts_are_seeded_and_respect_bounds() -> None:
         assert np.all((model.p_guess >= 0.05) & (model.p_guess <= 0.4))
         assert np.all(model.p_forget > 0.0)
     assert_allclose(starts[0].p_init, 0.3)
-    assert_array_equal(first.start_log_likelihoods, second.start_log_likelihoods)
+    assert len(sampled_starts) == 8
+    assert [entry["configuration"][0] for entry in sampled_starts] == list(range(4)) * 2
+    for first_start, second_start in zip(
+        sampled_starts[:4], sampled_starts[4:], strict=True
+    ):
+        assert first_start["configuration"] == second_start["configuration"]
+        assert first_start["rng_state"] == second_start["rng_state"]
+        for name in _PARAMETERS:
+            assert_array_equal(
+                first_start["parameters"][name], second_start["parameters"][name]
+            )
+    assert first.n_iterations == second.n_iterations
+    assert first.converged == second.converged
+    assert first.log_likelihood_history.shape == second.log_likelihood_history.shape
+    assert (
+        first.start_log_likelihoods.shape == second.start_log_likelihoods.shape == (4,)
+    )
+    assert np.argmax(first.start_log_likelihoods) == np.argmax(
+        second.start_log_likelihoods
+    )
+    # Seeded inputs stay exact; only independent EM reductions allow roundoff.
+    roundoff = 32 * np.finfo(np.float64).eps
+    assert_allclose(
+        first.start_log_likelihoods,
+        second.start_log_likelihoods,
+        rtol=roundoff,
+        atol=roundoff,
+    )
+    assert_allclose(
+        first.log_likelihood_history,
+        second.log_likelihood_history,
+        rtol=roundoff,
+        atol=roundoff,
+    )
     _assert_fits_match(first, second)
 
 

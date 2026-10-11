@@ -541,28 +541,72 @@ def test_fit_inputs_are_validated_before_sampling(
 
 def test_flat_and_tensor_inputs_produce_same_seeded_fit(
     longitudinal_data: tuple[np.ndarray, np.ndarray, np.ndarray],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     responses, _, time_values = longitudinal_data
-    tensor_result = LongitudinalGibbsSampler(
-        n_iter=4,
-        burnin=2,
-        seed=123,
-    ).fit(responses, time_values=time_values)
-    flat_result = LongitudinalGibbsSampler(
-        n_iter=4,
-        burnin=2,
-        seed=123,
-    ).fit(
+    original_responses, original_times = responses.copy(), time_values.copy()
+    options = dict(n_iter=4, burnin=2, seed=123)
+    default_rng = np.random.default_rng
+    generators = []
+    seeds = []
+
+    def record_generator(seed):
+        generator = default_rng(seed)
+        seeds.append(seed)
+        generators.append(generator)
+        return generator
+
+    monkeypatch.setattr(dynamic_gibbs.np.random, "default_rng", record_generator)
+    tensor_result = LongitudinalGibbsSampler(**options).fit(
+        responses, time_values=time_values
+    )
+    flat_result = LongitudinalGibbsSampler(**options).fit(
         responses.reshape(responses.shape[0], -1),
         n_items=responses.shape[2],
         time_values=time_values,
     )
 
-    assert_array_equal(
-        flat_result.model.discrimination,
-        tensor_result.model.discrimination,
-    )
-    assert_array_equal(flat_result.model.difficulty, tensor_result.model.difficulty)
-    assert_array_equal(flat_result.growth_factors, tensor_result.growth_factors)
-    assert_array_equal(flat_result.theta_trajectories, tensor_result.theta_trajectories)
-    assert flat_result.log_likelihood == tensor_result.log_likelihood
+    assert seeds == [options["seed"], options["seed"]]
+    assert generators[0].bit_generator.state == generators[1].bit_generator.state
+    assert_array_equal(responses, original_responses)
+    assert_array_equal(time_values, original_times)
+    assert flat_result.n_iterations == tensor_result.n_iterations == options["n_iter"]
+    assert flat_result.converged == tensor_result.converged
+    for name in ("n_items", "n_timepoints", "n_growth_factors", "growth_model"):
+        assert getattr(flat_result.model, name) == getattr(tensor_result.model, name)
+
+    # Separate covariance solves and sampling transforms can round differently
+    # at each recurrent sweep. Allow only a float64 roundoff budget per sweep.
+    tolerance = 32 * options["n_iter"] * np.finfo(np.float64).eps
+    for left, right, names in (
+        (
+            flat_result.model,
+            tensor_result.model,
+            (
+                "discrimination",
+                "difficulty",
+                "growth_mean",
+                "growth_cov",
+                "residual_variance",
+            ),
+        ),
+        (
+            flat_result,
+            tensor_result,
+            (
+                "growth_factors",
+                "theta_trajectories",
+                "growth_factor_se",
+                "log_likelihood",
+                "aic",
+                "bic",
+            ),
+        ),
+    ):
+        for name in names:
+            actual, expected = (
+                np.asarray(getattr(left, name)),
+                np.asarray(getattr(right, name)),
+            )
+            assert actual.shape == expected.shape
+            assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)

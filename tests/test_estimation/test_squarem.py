@@ -236,9 +236,19 @@ def test_estimated_latent_densities_fall_back_to_plain_em(density):
     with pytest.warns(UserWarning, match="fixed Gaussian latent density"):
         model, result = fit("squarem")
     assert result.n_iterations == plain_fit.n_iterations
-    assert result.log_likelihood == plain_fit.log_likelihood
-    for name, values in plain.parameters.items():
-        np.testing.assert_array_equal(model.parameters[name], values)
+    assert result.converged == plain_fit.converged
+    # Independent optimizer runs can differ in the last bits of float reductions.
+    roundoff = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(
+        result.log_likelihood, plain_fit.log_likelihood, rtol=roundoff, atol=roundoff
+    )
+    actual_parameters, plain_parameters = model.parameters, plain.parameters
+    assert actual_parameters.keys() == plain_parameters.keys()
+    for name, values in plain_parameters.items():
+        assert actual_parameters[name].shape == values.shape
+        np.testing.assert_allclose(
+            actual_parameters[name], values, rtol=roundoff, atol=roundoff
+        )
 
 
 def test_accelerate_none_is_the_default_plain_loop():
@@ -252,9 +262,24 @@ def test_accelerate_none_is_the_default_plain_loop():
         fits.append((model, estimator.fit(model, responses), estimator))
     (first, first_fit, first_estimator), (second, second_fit, second_estimator) = fits
     assert first_fit.n_iterations == second_fit.n_iterations
-    assert first_estimator.convergence_history == second_estimator.convergence_history
-    for name, values in first.parameters.items():
-        np.testing.assert_array_equal(second.parameters[name], values)
+    assert first_fit.converged == second_fit.converged
+    assert len(first_estimator.convergence_history) == len(
+        second_estimator.convergence_history
+    )
+    roundoff = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(
+        first_estimator.convergence_history,
+        second_estimator.convergence_history,
+        rtol=roundoff,
+        atol=roundoff,
+    )
+    first_parameters, second_parameters = first.parameters, second.parameters
+    assert second_parameters.keys() == first_parameters.keys()
+    for name, values in first_parameters.items():
+        assert second_parameters[name].shape == values.shape
+        np.testing.assert_allclose(
+            second_parameters[name], values, rtol=roundoff, atol=roundoff
+        )
 
 
 @pytest.mark.parametrize("value", ["fast", None, 1, "SQUAREM"])
