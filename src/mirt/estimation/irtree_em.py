@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -74,12 +74,15 @@ def _collapse_to_trait_grids(
 
 @dataclass
 class IRTreeResult:
-    """Result from IRTree model estimation."""
+    """Result from IRTree model estimation.
+
+    ``trait_covariance`` is optional and keyword-only. When omitted, traits
+    have unit variances, so ``trait_correlations`` also gives their covariance.
+    """
 
     model: IRTreeModel
     log_likelihood: float
     trait_means: NDArray[np.float64]
-    trait_covariance: NDArray[np.float64]
     trait_correlations: NDArray[np.float64]
     theta_estimates: NDArray[np.float64]
     theta_se: NDArray[np.float64]
@@ -90,6 +93,13 @@ class IRTreeResult:
     n_iterations: int
     n_observations: int
     n_parameters: int
+    trait_covariance: NDArray[np.float64] | None = field(default=None, kw_only=True)
+
+    def __post_init__(self) -> None:
+        if self.trait_covariance is None:
+            self.trait_covariance = np.array(
+                self.trait_correlations, dtype=np.float64, copy=True
+            )
 
     def summary(self) -> str:
         lines = []
@@ -136,6 +146,7 @@ class IRTreeResult:
 
     def trait_summary(self) -> str:
         """Generate summary focused on response style traits."""
+        assert self.trait_covariance is not None
         lines = []
         width = 60
 

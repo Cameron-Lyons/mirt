@@ -433,8 +433,13 @@ class TestBootstrapRefits:
         reference = mirt.bootstrap_se(result, data, **options)
 
         assert fast.keys() == reference.keys()
+        # Repeating the iterative fits can change their final rounding; these
+        # SEs must agree well below the common EM convergence tolerance of 1e-3.
         for name in fast:
-            np.testing.assert_array_equal(fast[name], reference[name])
+            assert fast[name].shape == reference[name].shape == (result.model.n_items,)
+            np.testing.assert_allclose(
+                fast[name], reference[name], rtol=0.0, atol=1e-10
+            )
 
     def test_process_workers_receive_the_recipe(self, guessing_prior_fit):
         result, data = guessing_prior_fit

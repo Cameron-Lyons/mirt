@@ -67,6 +67,7 @@ plot = [
 ]
 gpu = [
     "torch>=2.0",
+    "fsspec>=2026.6.0",
 ]
 
 [project.urls]

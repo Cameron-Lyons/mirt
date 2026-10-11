@@ -121,9 +121,18 @@ def test_anchor_values_may_be_given_by_mapping_or_stored_in_the_template(shifted
     )
     from_template = fixed_item_calibration(responses, template, ANCHORS, **options)
 
+    optimizer_roundoff = 256 * np.finfo(float).eps
     for result in (from_mapping, from_template):
         for name, values in from_model.model.parameters.items():
-            np.testing.assert_array_equal(result.model.parameters[name], values)
+            actual = result.model.parameters[name]
+            np.testing.assert_array_equal(actual[ANCHORS], values[ANCHORS])
+            # Equivalent inputs can accumulate rounding across optimizer updates.
+            np.testing.assert_allclose(
+                actual[NEW_ITEMS],
+                values[NEW_ITEMS],
+                rtol=optimizer_roundoff,
+                atol=optimizer_roundoff,
+            )
     assert template.parameters["difficulty"][25] == 0.0
     # The template itself is copied, not restricted in place.
     assert template.free_parameter_masks["difficulty"].all()

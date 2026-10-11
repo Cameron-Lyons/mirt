@@ -102,7 +102,7 @@ result = mirt.fit_mirt(responses, model="2PL")
 print(result.summary())
 
 scores = mirt.fscores(result, responses, method="EAP")
-print(scores.to_dataframe().head())
+print(scores.theta[:5])
 ```
 
 ## Examples
@@ -932,10 +932,10 @@ misleading ratios. A detected regression returns a nonzero process status for CI
 The hosted performance job also publishes its structured scoring report as a retained
 build artifact, making individual revisions directly comparable.
 
-## API Stability (v1.1)
+## API Stability (v1.2)
 
 Starting with v1.0, this package follows [semantic versioning](https://semver.org/).
-The current release is **1.1.0**.
+The current release is **1.2.0**.
 
 ### Stable Public API
 
@@ -975,7 +975,7 @@ If you use this package in your research, please cite:
   author = {Lyons, Cameron},
   title = {mirt: Multidimensional Item Response Theory for Python},
   url = {https://github.com/Cameron-Lyons/mirt},
-  version = {1.1.0}
+  version = {1.2.0}
 }
 ```
 

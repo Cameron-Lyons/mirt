@@ -91,9 +91,9 @@ def test_representable_tail_kernel_does_not_overflow_square_or_sum(kind):
     standardized = np.array([[1.5e154, 0, 0, 0], [7.5e153] * 4])
     theta = standardized @ factor.T
     actual = MCEMEstimator._gaussian_log_kernel(theta, np.zeros(4), factor)
-    expected = np.asarray(
-        -0.5 * np.sum(standardized.astype(np.longdouble) ** 2, axis=1), dtype=np.float64
-    )
+    # Both standardized rows have squared norm 2.25e308. Half that norm is
+    # representable, even where longdouble has the same range as float64.
+    expected = np.full(2, -1.125e308)
     assert np.isfinite(actual).all()
     np.testing.assert_allclose(actual, expected, rtol=1e-14)
 

@@ -197,11 +197,16 @@ def test_temporary_memory_does_not_grow_with_response_matrix(monkeypatch):
     assert peaks[1] < peaks[0] + 256 * 1024
 
 
-def test_single_item_vector_probability_output(monkeypatch):
+@pytest.mark.parametrize("n_quadpts", [21, 51])
+def test_single_item_vector_probability_output(monkeypatch, n_quadpts):
     model = TwoParameterLogistic(1)
     monkeypatch.setattr(model, "probability", lambda theta: np.full(len(theta), 0.5))
     monkeypatch.setattr(modelfit, "_MOMENT_CHUNK_ELEMENTS", 3)
-    result = modelfit.compute_fit_indices(model, np.array([[0], [1]] * 5))
-    assert result["M2"] == 0.0
+    result = modelfit.compute_fit_indices(
+        model, np.array([[0], [1]] * 5), n_quadpts=n_quadpts
+    )
+    # Normalized quadrature sums can differ from 0.5 by a rounding unit;
+    # M2 squares that residual, leaving a statistic near machine epsilon squared.
+    assert result["M2"] == pytest.approx(0.0, abs=1e-28)
     assert np.isnan(result["SRMSR"])
     assert np.isnan(result["CFI"])

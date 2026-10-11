@@ -7,6 +7,8 @@ public symbol is accessed.
 from __future__ import annotations
 
 import importlib
+import sys
+from types import ModuleType
 from typing import Any
 
 _LAZY_IMPORTS = {
@@ -150,3 +152,18 @@ def __getattr__(name: str) -> Any:
 def __dir__() -> list[str]:
     """Return loaded attributes together with deferred public symbols."""
     return sorted(set(globals()) | set(__all__))
+
+
+class _UtilityModule(ModuleType):
+    """Keep function exports when Python attaches same-named submodules."""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Importing residuals for Q3 (or importing the submodule directly)
+        # attaches the module to this package. Preserve its public function
+        # while leaving the genuine submodule available through sys.modules.
+        if isinstance(value, ModuleType) and _LAZY_IMPORTS.get(name) == value.__name__:
+            value = getattr(value, name, value)
+        super().__setattr__(name, value)
+
+
+sys.modules[__name__].__class__ = _UtilityModule

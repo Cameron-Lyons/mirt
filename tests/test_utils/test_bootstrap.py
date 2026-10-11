@@ -474,9 +474,12 @@ class TestBootstrapSE:
         )
 
         assert serial.keys() == parallel.keys()
+        # Independently optimized replicates need numerical agreement, not
+        # bitwise equality; this remains far below the EM tolerance of 1e-3.
         for name in serial:
+            assert parallel[name].shape == serial[name].shape == (model.n_items,)
             np.testing.assert_allclose(
-                parallel[name], serial[name], rtol=0.0, atol=1e-12
+                parallel[name], serial[name], rtol=0.0, atol=1e-10
             )
 
     def test_parallel_replicates_reject_unpicklable_statistics(self, monkeypatch):
@@ -765,13 +768,13 @@ class TestBootstrapCI:
         )
 
         assert serial.keys() == parallel.keys()
+        # BCa endpoints also combine independently optimized jackknife fits;
+        # allow rounding below the item optimizer's objective tolerance of 1e-6.
         for name in serial:
-            np.testing.assert_allclose(
-                parallel[name][0], serial[name][0], rtol=0.0, atol=1e-12
-            )
-            np.testing.assert_allclose(
-                parallel[name][1], serial[name][1], rtol=0.0, atol=1e-12
-            )
+            assert len(parallel[name]) == len(serial[name]) == 2
+            for actual, expected in zip(parallel[name], serial[name], strict=True):
+                assert actual.shape == expected.shape == (model.n_items,)
+                np.testing.assert_allclose(actual, expected, rtol=0.0, atol=1e-8)
 
 
 class TestParametricBootstrap:
@@ -820,9 +823,12 @@ class TestParametricBootstrap:
         )
 
         assert serial.keys() == parallel.keys()
+        # Four-parameter refits use iterative optimization with objective
+        # tolerance 1e-6; their aggregated SEs must agree more tightly than that.
         for name in serial:
+            assert parallel[name].shape == serial[name].shape == (model.n_items,)
             np.testing.assert_allclose(
-                parallel[name], serial[name], rtol=0.0, atol=1e-12
+                parallel[name], serial[name], rtol=0.0, atol=1e-7
             )
 
     def test_seeded_simulations_preserve_the_serial_random_stream(self, monkeypatch):

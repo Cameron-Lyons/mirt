@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import ast
 import importlib
-import importlib.util
 import pkgutil
 import re
 import sys
@@ -144,10 +143,8 @@ def test_documentation_code_parses_and_mirt_names_resolve() -> None:
                         continue
                     module = importlib.import_module(node.module)
                     for alias in node.names:
-                        submodule = f"{node.module}.{alias.name}"
-                        if not hasattr(module, alias.name) or (
-                            hasattr(module, "__path__")
-                            and importlib.util.find_spec(submodule) is not None
+                        if not hasattr(module, alias.name) or isinstance(
+                            getattr(module, alias.name), ModuleType
                         ):
                             problems.append(
                                 f"{where}: from {node.module} import {alias.name}"

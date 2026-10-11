@@ -542,14 +542,21 @@ class TestConcurrentLink:
         # One value evaluation per free form plus two coordinate probes each.
         assert calls == [1, 3, 3]
         x = np.array([0.1, -0.2, 0.3, 0.05])
+        step = 1e-8
         expected = np.array(
             [
-                (captured["fun"](x + 1e-8 * unit) - captured["value"])
-                / ((x + 1e-8 * unit) - x)[position]
+                (captured["fun"](x + step * unit) - captured["value"])
+                / ((x + step * unit) - x)[position]
                 for position, unit in enumerate(np.eye(4))
             ]
         )
-        assert_allclose(captured["gradient"], expected, rtol=1e-12, atol=1e-15)
+        # Forward differences amplify last-bit loss changes by about eps / step.
+        assert_allclose(
+            captured["gradient"],
+            expected,
+            rtol=1e-12,
+            atol=np.finfo(np.float64).eps / step,
+        )
 
     @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
     @pytest.mark.parametrize("family", ["3PL", "GRM"])

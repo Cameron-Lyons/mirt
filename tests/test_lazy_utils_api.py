@@ -7,6 +7,8 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
+
 
 def _run_probe(source: str) -> dict[str, object]:
     completed = subprocess.run(
@@ -110,22 +112,30 @@ def test_top_level_and_utils_exports_preserve_identity() -> None:
     }
 
 
-def test_star_import_resolves_every_public_utility_export() -> None:
+@pytest.mark.parametrize("residuals_last", [False, True])
+def test_star_import_resolves_every_public_utility_export(residuals_last: bool) -> None:
     result = _run_probe(
-        """
+        f"""
+        import importlib
         import json
 
         import mirt.utils as utils
 
-        namespace = {}
-        exec("from mirt.utils import *", namespace)
-        exported = {name for name in namespace if not name.startswith("__")}
+        if {residuals_last!r}:
+            utils.__all__ = sorted(utils.__all__, key=lambda name: name == "residuals")
 
-        print(json.dumps({
+        namespace = {{}}
+        exec("from mirt.utils import *", namespace)
+        exported = {{name for name in namespace if not name.startswith("__")}}
+        residuals_module = importlib.import_module("mirt.utils.residuals")
+
+        print(json.dumps({{
             "matches_all": exported == set(utils.__all__),
             "export_count": len(exported),
             "all_cached": all(name in utils.__dict__ for name in utils.__all__),
-        }))
+            "residuals_is_function": namespace["residuals"]
+                is residuals_module.residuals,
+        }}))
         """
     )
 
@@ -133,6 +143,92 @@ def test_star_import_resolves_every_public_utility_export() -> None:
         "matches_all": True,
         "export_count": 120,
         "all_cached": True,
+        "residuals_is_function": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "first_import",
+    [
+        "from mirt.utils import Q3",
+        "from mirt.utils.residuals import Q3",
+        "importlib.import_module('mirt.utils.residuals')",
+        "from mirt.utils import residuals",
+        "from mirt import Q3",
+    ],
+    ids=["utils-q3", "submodule-q3", "submodule", "function", "top-level-q3"],
+)
+def test_residuals_function_survives_submodule_import_order(first_import: str) -> None:
+    result = _run_probe(
+        f"""
+        import importlib
+        import json
+        import sys
+        import types
+
+        import mirt.utils as utils
+
+        {first_import}
+        from mirt.utils import residuals
+
+        cached = utils.__dict__["residuals"] is residuals
+        residuals_module = importlib.import_module("mirt.utils.residuals")
+        from mirt.utils.residuals import residuals as implementation
+        from mirt import residuals as top_level
+
+        print(json.dumps({{
+            "callable": callable(residuals),
+            "cached": cached and utils.__dict__["residuals"] is residuals,
+            "same_symbol": residuals is implementation is top_level,
+            "submodule_preserved": isinstance(residuals_module, types.ModuleType)
+                and sys.modules["mirt.utils.residuals"] is residuals_module,
+            "utils_submodules": sorted(
+                name for name in sys.modules if name.startswith("mirt.utils.")
+            ),
+            "scipy_loaded": "scipy" in sys.modules,
+        }}))
+        """
+    )
+
+    assert result == {
+        "callable": True,
+        "cached": True,
+        "same_symbol": True,
+        "submodule_preserved": True,
+        "utils_submodules": ["mirt.utils.data", "mirt.utils.residuals"],
+        "scipy_loaded": False,
+    }
+
+
+def test_utils_module_assignments_keep_normal_behavior() -> None:
+    result = _run_probe(
+        """
+        import json
+        import types
+
+        import mirt.utils as utils
+
+        sentinel = object()
+        utils.residuals = sentinel
+        normal_assignment = utils.residuals is sentinel
+        unrelated_module = types.ModuleType("unrelated")
+        utils.residuals = unrelated_module
+        unrelated_assignment = utils.residuals is unrelated_module
+        incomplete_module = types.ModuleType("mirt.utils.residuals")
+        utils.residuals = incomplete_module
+
+        print(json.dumps({
+            "normal_assignment": normal_assignment,
+            "unrelated_assignment": unrelated_assignment,
+            "incomplete_module_assignment": utils.residuals is incomplete_module,
+        }))
+        """
+    )
+
+    assert result == {
+        "normal_assignment": True,
+        "unrelated_assignment": True,
+        "incomplete_module_assignment": True,
     }
 
 
