@@ -420,25 +420,71 @@ class TestBootstrapRefits:
         result, data = guessing_prior_fit
         options = {"n_bootstrap": 3, "seed": 5}
         fast = mirt.bootstrap_se(result, data, **options)
+        replicate_tol = 1e-3
+        se_calls = []
 
         def reference_estimator(model, recipe, max_iter):
             # The replicate estimator before standard errors were skipped.
-            return em_estimator_for(
-                model, recipe=recipe, max_iter=max_iter, tol=1e-3, verbose=False
+            estimator = em_estimator_for(
+                model,
+                recipe=recipe,
+                max_iter=max_iter,
+                tol=replicate_tol,
+                verbose=False,
             )
+            compute_errors = estimator._compute_standard_errors
+            call_index = len(se_calls)
+            se_calls.append(0)
+
+            def fit_state():
+                return {
+                    "nodes": estimator._quadrature.nodes,
+                    "weights": estimator._quadrature.weights,
+                    "mean": estimator._latent_density.mean.copy(),
+                    "cov": estimator._latent_density.cov.copy(),
+                    "frequencies": estimator._pattern_frequencies.copy(),
+                }
+
+            def checked_compute_errors(fitted, responses, posterior_weights):
+                se_calls[call_index] += 1
+                parameters = fitted.parameters
+                original_responses = responses.copy()
+                original_posterior = posterior_weights.copy()
+                state = fit_state()
+                history = estimator.convergence_history
+                errors = compute_errors(fitted, responses, posterior_weights)
+                restored = fitted.parameters
+                assert restored.keys() == parameters.keys()
+                for name in parameters:
+                    np.testing.assert_array_equal(restored[name], parameters[name])
+                np.testing.assert_array_equal(responses, original_responses)
+                np.testing.assert_array_equal(posterior_weights, original_posterior)
+                for name, values in fit_state().items():
+                    np.testing.assert_array_equal(values, state[name])
+                assert estimator.convergence_history == history
+                return errors
+
+            monkeypatch.setattr(
+                estimator, "_compute_standard_errors", checked_compute_errors
+            )
+            return estimator
 
         monkeypatch.setattr(
             bootstrap_module, "_replicate_estimator", reference_estimator
         )
         reference = mirt.bootstrap_se(result, data, **options)
 
+        assert se_calls == [1] * options["n_bootstrap"]
         assert fast.keys() == reference.keys()
-        # Repeating the iterative fits can change their final rounding; these
-        # SEs must agree well below the common EM convergence tolerance of 1e-3.
+        # Independent optimizer reductions can round differently. Keep bootstrap
+        # SE differences six orders below the replicate EM convergence tolerance.
         for name in fast:
             assert fast[name].shape == reference[name].shape == (result.model.n_items,)
+            np.testing.assert_array_equal(
+                np.isnan(fast[name]), np.isnan(reference[name])
+            )
             np.testing.assert_allclose(
-                fast[name], reference[name], rtol=0.0, atol=1e-10
+                fast[name], reference[name], rtol=0.0, atol=replicate_tol * 1e-6
             )
 
     def test_process_workers_receive_the_recipe(self, guessing_prior_fit):
