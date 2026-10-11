@@ -57,11 +57,14 @@ def _public_objective(model, estimator, points, observed, correct, params):
 @pytest.mark.parametrize("kind", _KINDS)
 @pytest.mark.parametrize("epsilon", [1e-10, 0.1])
 @pytest.mark.parametrize("bounded", [False, True])
-def test_dichotomous_gradient_matches_public_clipped_likelihood(kind, epsilon, bounded):
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_dichotomous_gradient_matches_public_clipped_likelihood(
+    kind, epsilon, bounded, dtype
+):
     model = _model(kind)
     original = model.parameters
     rng = np.random.default_rng(914)
-    points = rng.normal(size=(41, model.n_factors)) * 3
+    points = (rng.normal(size=(41, model.n_factors)) * 3).astype(dtype)
     observed = rng.uniform(1, 10, 41)
     correct = observed * rng.random(41)
     observed[::5] = correct[::5] = 0

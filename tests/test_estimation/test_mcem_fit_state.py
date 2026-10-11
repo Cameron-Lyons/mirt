@@ -14,6 +14,14 @@ from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
 _METHODS = ("importance", "posterior", "stochastic", "sobol", "halton")
 
 
+def _assert_fit_values_close(actual, expected):
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    assert actual.shape == expected.shape
+    # Independent fit buffers can change the last bits of float reductions.
+    tolerance = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+
+
 def _estimator(method, **kwargs):
     if method in ("sobol", "halton"):
         return QMCEMEstimator(n_samples=64, sequence=method, seed=931, **kwargs)
@@ -57,15 +65,22 @@ def test_fit_matches_separate_e_step_and_likelihood_evaluation(method, kind, sto
     originals = [value.copy() for value in (responses, mean, covariance)]
     actual = optimized.fit(model.copy(), responses, mean, covariance)
     expected = separate.fit(model.copy(), responses, mean, covariance)
-    assert actual.log_likelihood == expected.log_likelihood
-    assert actual.aic == expected.aic and actual.bic == expected.bic
+    _assert_fit_values_close(
+        [actual.log_likelihood, actual.aic, actual.bic],
+        [expected.log_likelihood, expected.aic, expected.bic],
+    )
     assert actual.n_iterations == expected.n_iterations
     assert actual.converged == expected.converged
-    np.testing.assert_array_equal(
+    _assert_fit_values_close(
         optimized.convergence_history, separate.convergence_history
     )
+    assert optimized._random_generator().bit_generator.state == (
+        separate._random_generator().bit_generator.state
+    )
+    assert actual.model.parameters.keys() == expected.model.parameters.keys()
     for name, parameters in actual.model.parameters.items():
-        np.testing.assert_array_equal(parameters, expected.model.parameters[name])
+        _assert_fit_values_close(parameters, expected.model.parameters[name])
+    assert actual.standard_errors.keys() == expected.standard_errors.keys()
     for name, errors in actual.standard_errors.items():
         np.testing.assert_array_equal(errors, expected.standard_errors[name])
     for value, original in zip((responses, mean, covariance), originals, strict=True):
@@ -148,11 +163,16 @@ def test_repeated_fits_reset_draws_weights_and_likelihood_history(method):
     model, responses, mean, covariance = _input("2pl")
     first = estimator.fit(model.copy(), responses, mean, covariance)
     history = estimator.convergence_history
+    rng_state = estimator._random_generator().bit_generator.state
     second = estimator.fit(model.copy(), responses, mean, covariance)
-    assert first.log_likelihood == second.log_likelihood
-    assert history == estimator.convergence_history
+    _assert_fit_values_close(first.log_likelihood, second.log_likelihood)
+    assert first.n_iterations == second.n_iterations
+    assert first.converged == second.converged
+    _assert_fit_values_close(history, estimator.convergence_history)
+    assert rng_state == estimator._random_generator().bit_generator.state
+    assert first.model.parameters.keys() == second.model.parameters.keys()
     for name, parameters in first.model.parameters.items():
-        np.testing.assert_array_equal(parameters, second.model.parameters[name])
+        _assert_fit_values_close(parameters, second.model.parameters[name])
 
 
 @pytest.mark.parametrize("method", _METHODS)
@@ -180,12 +200,20 @@ def test_interrupted_fit_releases_previous_draw_and_can_be_retried(method, monke
     monkeypatch.setattr(estimator, "_m_step_mc", m_step)
     fresh_model, _, _, _ = _input("2pl")
     actual = estimator.fit(fresh_model.copy(), responses, mean, covariance)
-    expected = _estimator(method, max_iter=2, tol=1e-12).fit(
-        fresh_model.copy(), responses, mean, covariance
+    fresh_estimator = _estimator(method, max_iter=2, tol=1e-12)
+    expected = fresh_estimator.fit(fresh_model.copy(), responses, mean, covariance)
+    _assert_fit_values_close(actual.log_likelihood, expected.log_likelihood)
+    assert actual.n_iterations == expected.n_iterations
+    assert actual.converged == expected.converged
+    _assert_fit_values_close(
+        estimator.convergence_history, fresh_estimator.convergence_history
     )
-    assert actual.log_likelihood == expected.log_likelihood
+    assert estimator._random_generator().bit_generator.state == (
+        fresh_estimator._random_generator().bit_generator.state
+    )
+    assert actual.model.parameters.keys() == expected.model.parameters.keys()
     for name, parameters in actual.model.parameters.items():
-        np.testing.assert_array_equal(parameters, expected.model.parameters[name])
+        _assert_fit_values_close(parameters, expected.model.parameters[name])
 
 
 _HOOK_CASES = (

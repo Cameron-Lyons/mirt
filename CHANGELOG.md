@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `IRTreeResult` preserves its 1.1.0 positional and keyword constructor
   arguments. Trait covariance is optional; omitted covariance retains the
   former unit-variance trait distribution.
+- Prepared logistic objectives use float64 arithmetic for float32 latent
+  draws. This keeps Monte Carlo curvature estimates accurate on NumPy 1.24
+  for both shared and chunked draws.
 - Multidimensional GradedResponseModel and NominalResponseModel now provide
   exact item_information_matrix(theta, item_idx) and
   test_information_matrix(theta). D- and A-optimal MCAT item selection for these
