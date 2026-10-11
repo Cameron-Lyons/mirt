@@ -27,6 +27,9 @@ from mirt.models import (
 )
 from mirt.scoring import fscores
 
+# Independently allocated sessions can round float64 reductions differently.
+_SESSION_ROUNDOFF = 32 * np.finfo(np.float64).eps
+
 
 def _model(kind: str, n_items: int = 24, seed: int = 4):
     rng = np.random.default_rng(seed)
@@ -93,21 +96,29 @@ def _inject_responses(monkeypatch, true_thetas, responses):
     monkeypatch.setattr(lockstep, "_simulated_responses", answer)
 
 
-def _assert_same_sessions(actual, expected, *, atol=1e-12):
+def _assert_float_values_close(actual, expected, *, rtol=0.0, atol=1e-12):
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    assert actual.shape == expected.shape
+    assert_allclose(actual, expected, rtol=rtol, atol=atol)
+
+
+def _assert_same_sessions(actual, expected, *, rtol=0.0, atol=1e-12):
     assert len(actual) == len(expected)
     for fast, reference in zip(actual, expected, strict=True):
         assert fast.items_administered == reference.items_administered
         assert_array_equal(fast.responses, reference.responses)
         assert fast.n_items_administered == reference.n_items_administered
         assert fast.stopping_reason == reference.stopping_reason
-        assert_allclose(fast.theta, reference.theta, rtol=0.0, atol=atol)
-        assert_allclose(
-            fast.standard_error, reference.standard_error, rtol=0.0, atol=atol
+        _assert_float_values_close(fast.theta, reference.theta, rtol=rtol, atol=atol)
+        _assert_float_values_close(
+            fast.standard_error, reference.standard_error, rtol=rtol, atol=atol
         )
         for name in ("theta_history", "se_history", "item_info_history"):
             values = getattr(fast, name)
             assert len(values) == fast.n_items_administered
-            assert_allclose(values, getattr(reference, name), rtol=0.0, atol=atol)
+            _assert_float_values_close(
+                values, getattr(reference, name), rtol=rtol, atol=atol
+            )
 
 
 @pytest.mark.parametrize("kind", ["2PL", "3PL", "GRM", "GPCM"])
@@ -271,8 +282,7 @@ def test_lockstep_is_seeded_and_leaves_interactive_state_untouched():
     left = first.run_batch_simulation([-0.5, 0.5], n_replications=3)
     right = second.run_batch_simulation([-0.5, 0.5], n_replications=3)
 
-    # Independent batch buffers can change the last bits of float reductions.
-    _assert_same_sessions(left, right, atol=16 * np.finfo(np.float64).eps)
+    _assert_same_sessions(left, right, rtol=_SESSION_ROUNDOFF, atol=_SESSION_ROUNDOFF)
     assert first.rng.bit_generator.state == second.rng.bit_generator.state
     assert first._items_administered == []
     assert first._theta_history == []
@@ -291,7 +301,10 @@ def test_sequential_reference_remains_available():
     )
     expected = [loop_engine.run_simulation(theta) for theta in (-1.0, -1.0, 1.0, 1.0)]
 
-    _assert_same_sessions(actual, expected, atol=0.0)
+    _assert_same_sessions(
+        actual, expected, rtol=_SESSION_ROUNDOFF, atol=_SESSION_ROUNDOFF
+    )
+    assert batch_engine.rng.bit_generator.state == loop_engine.rng.bit_generator.state
 
 
 def test_vectorized_flag_must_be_boolean():
@@ -351,15 +364,23 @@ def test_nonfinite_posterior_restores_generator_and_uses_sequential_path(
         expected = reference.run_batch_simulation(
             [-0.5, 0.5], n_replications=2, vectorized=False
         )
-        _assert_same_sessions(actual, expected, atol=0.0)
+        _assert_same_sessions(
+            actual, expected, rtol=_SESSION_ROUNDOFF, atol=_SESSION_ROUNDOFF
+        )
     else:
         actual = engine.compute_conditional_mse([-0.5, 0.5], n_replications=2)
         expected = reference.compute_conditional_mse(
             [-0.5, 0.5], n_replications=2, vectorized=False
         )
-        for left, right in zip(actual, expected, strict=True):
-            assert_array_equal(left, right)
+        # Ability points and mean lengths depend only on exact inputs and counts.
+        assert_array_equal(actual[0], expected[0])
+        assert_array_equal(actual[3], expected[3])
+        for left, right in zip(actual[1:3], expected[1:3], strict=True):
+            _assert_float_values_close(
+                left, right, rtol=_SESSION_ROUNDOFF, atol=_SESSION_ROUNDOFF
+            )
     assert len(calls) == 3
+    assert engine.rng.bit_generator.state == reference.rng.bit_generator.state
 
 
 def test_nonfinite_information_restores_generator_and_uses_sequential_path(
@@ -378,15 +399,17 @@ def test_nonfinite_information_restores_generator_and_uses_sequential_path(
         return values
 
     monkeypatch.setattr(lockstep, "_item_information", poison_later)
-    actual = CATEngine(model, **options).run_batch_simulation(
-        [-0.5, 0.5], use_rust=False
-    )
-    expected = CATEngine(model, **options).run_batch_simulation(
+    engine, reference = CATEngine(model, **options), CATEngine(model, **options)
+    actual = engine.run_batch_simulation([-0.5, 0.5], use_rust=False)
+    expected = reference.run_batch_simulation(
         [-0.5, 0.5], use_rust=False, vectorized=False
     )
 
-    _assert_same_sessions(actual, expected, atol=0.0)
+    _assert_same_sessions(
+        actual, expected, rtol=_SESSION_ROUNDOFF, atol=_SESSION_ROUNDOFF
+    )
     assert len(calls) == 2
+    assert engine.rng.bit_generator.state == reference.rng.bit_generator.state
 
 
 def test_maximum_length_rule_without_se_uses_lockstep_but_not_rust(monkeypatch):

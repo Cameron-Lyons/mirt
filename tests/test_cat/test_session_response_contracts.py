@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
@@ -60,11 +62,19 @@ def _engine(n_factors: int, *, polytomous: bool = False):
     return engine, exposure
 
 
-def _assert_same_state(left, right):
-    assert_allclose(left.theta, right.theta, rtol=0.0, atol=0.0)
-    assert_allclose(left.standard_error, right.standard_error, rtol=0.0, atol=0.0)
+def _assert_same_float(left, right, *, roundoff=0.0):
+    left, right = np.asarray(left), np.asarray(right)
+    assert left.shape == right.shape
+    assert_array_equal(np.isnan(left), np.isnan(right))
+    assert_allclose(left, right, rtol=roundoff, atol=roundoff)
+
+
+def _assert_same_state(left, right, *, roundoff=0.0):
+    _assert_same_float(left.theta, right.theta, roundoff=roundoff)
+    _assert_same_float(left.standard_error, right.standard_error, roundoff=roundoff)
+    assert hasattr(left, "covariance") == hasattr(right, "covariance")
     if hasattr(left, "covariance"):
-        assert_allclose(left.covariance, right.covariance, rtol=0.0, atol=0.0)
+        _assert_same_float(left.covariance, right.covariance, roundoff=roundoff)
     assert left.items_administered == right.items_administered
     assert left.responses == right.responses
     assert left.n_items == right.n_items
@@ -101,23 +111,69 @@ def test_invalid_dichotomous_answer_preserves_session_and_exposure(n_factors, re
 def test_rejecting_an_answer_does_not_change_final_estimate_or_adaptive_path(n_factors):
     clean, clean_exposure = _engine(n_factors)
     corrected, corrected_exposure = _engine(n_factors)
+    # Independent EAP buffers can round posterior reductions differently.
+    roundoff = 32 * np.finfo(np.float64).eps
+    count_fields = ("selection_counts", "opportunity_counts", "eligibility_counts")
 
     for response in [1, 0, 1]:
-        _assert_same_state(clean.get_current_state(), corrected.get_current_state())
+        before = corrected.get_current_state()
+        _assert_same_state(clean.get_current_state(), before, roundoff=roundoff)
+        histories = {
+            name: np.array(getattr(corrected, name), copy=True)
+            for name in (
+                "_theta_history",
+                "_se_history",
+                "_info_history",
+                "_covariance_history",
+            )
+            if hasattr(corrected, name)
+        }
+        rng_state = deepcopy(corrected.rng.bit_generator.state)
+        exposure_rng_state = deepcopy(corrected_exposure.rng.bit_generator.state)
+        report = corrected_exposure.exposure_report(n_items=3)
         with pytest.raises(ValueError):
             corrected.administer_item(0.75)
+        _assert_same_state(corrected.get_current_state(), before)
+        for name, values in histories.items():
+            assert_array_equal(getattr(corrected, name), values)
+        assert corrected.rng.bit_generator.state == rng_state
+        assert corrected_exposure.rng.bit_generator.state == exposure_rng_state
+        after_report = corrected_exposure.exposure_report(n_items=3)
+        for name in count_fields:
+            assert_array_equal(getattr(after_report, name), getattr(report, name))
         _assert_same_state(
-            clean.administer_item(response), corrected.administer_item(response)
+            clean.administer_item(response),
+            corrected.administer_item(response),
+            roundoff=roundoff,
         )
 
     left, right = clean.get_result(), corrected.get_result()
-    assert_allclose(left.theta_history, right.theta_history, rtol=0.0, atol=0.0)
-    assert_allclose(left.se_history, right.se_history, rtol=0.0, atol=0.0)
+    for name in (
+        "theta",
+        "standard_error",
+        "theta_history",
+        "se_history",
+        "item_info_history",
+        "covariance",
+        "covariance_history",
+    ):
+        assert hasattr(left, name) == hasattr(right, name)
+        if hasattr(left, name):
+            _assert_same_float(
+                getattr(left, name), getattr(right, name), roundoff=roundoff
+            )
+    assert left.items_administered == right.items_administered
+    assert_array_equal(left.responses, right.responses)
+    assert left.n_items_administered == right.n_items_administered == 3
     assert left.stopping_reason == right.stopping_reason
-    assert_array_equal(
-        clean_exposure.exposure_report(n_items=3).selection_counts,
-        corrected_exposure.exposure_report(n_items=3).selection_counts,
+    assert clean.rng.bit_generator.state == corrected.rng.bit_generator.state
+    assert clean_exposure.rng.bit_generator.state == (
+        corrected_exposure.rng.bit_generator.state
     )
+    clean_report = clean_exposure.exposure_report(n_items=3)
+    corrected_report = corrected_exposure.exposure_report(n_items=3)
+    for name in count_fields:
+        assert_array_equal(getattr(clean_report, name), getattr(corrected_report, name))
 
 
 @pytest.mark.parametrize("n_factors", [1, 2], ids=["CAT", "MCAT"])

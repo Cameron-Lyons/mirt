@@ -141,9 +141,28 @@ def _assert_same(actual: Any, expected: Any, *, float_atol: float = 0.0) -> None
 
 
 def _assert_same_fit(actual: Any, expected: Any) -> None:
-    assert actual.log_likelihood == expected.log_likelihood
-    _assert_same(actual.model.parameters, expected.model.parameters)
-    _assert_same(actual.standard_errors, expected.standard_errors)
+    # Refitting equivalent inputs allocates independent optimizer buffers.
+    roundoff = 32 * np.finfo(np.float64).eps
+    np.testing.assert_allclose(
+        actual.log_likelihood, expected.log_likelihood, rtol=roundoff, atol=roundoff
+    )
+    assert actual.n_iterations == expected.n_iterations
+    assert actual.converged == expected.converged
+    for actual_values, expected_values in (
+        (actual.model.parameters, expected.model.parameters),
+        (actual.standard_errors, expected.standard_errors),
+    ):
+        assert actual_values.keys() == expected_values.keys()
+        for name, values in expected_values.items():
+            assert actual_values[name].shape == values.shape
+            assert_array_equal(np.isnan(actual_values[name]), np.isnan(values))
+            np.testing.assert_allclose(
+                actual_values[name],
+                values,
+                rtol=roundoff,
+                atol=roundoff,
+                equal_nan=True,
+            )
 
 
 def test_missing_coded_responses_maps_nan_and_nulls_to_missing_code() -> None:
