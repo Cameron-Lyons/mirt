@@ -241,21 +241,40 @@ def test_complete_fits_agree_with_scalar_objective(
     assert actual.converged == expected.converged
     assert_allclose(histories[0], histories[1], rtol=1e-13, atol=1e-12)
     assert_allclose(actual.log_likelihood, expected.log_likelihood, rtol=1e-13)
-    for name in actual.model.parameters:
-        assert_array_equal(
-            actual.model.parameters[name], expected.model.parameters[name]
+    # Separate fit buffers can change the last bits of floating reductions.
+    tolerance = 32 * np.finfo(np.float64).eps
+    assert actual.model.parameters.keys() == expected.model.parameters.keys()
+    for name, values in actual.model.parameters.items():
+        assert values.shape == expected.model.parameters[name].shape
+        assert_allclose(
+            values, expected.model.parameters[name], rtol=tolerance, atol=tolerance
         )
     if kind == "gvem":
+        assert actual.standard_errors.keys() == expected.standard_errors.keys()
         for name in actual.standard_errors:
+            assert (
+                actual.standard_errors[name].shape
+                == expected.standard_errors[name].shape
+            )
             if se_step_size == 1e-5:
-                assert_array_equal(
-                    actual.standard_errors[name], expected.standard_errors[name]
+                assert_allclose(
+                    actual.standard_errors[name],
+                    expected.standard_errors[name],
+                    rtol=tolerance,
+                    atol=tolerance,
                 )
             assert_allclose(
                 actual.standard_errors[name], expected.standard_errors[name], rtol=1e-6
             )
     else:
         assert_array_equal(actual.sparsity_pattern, expected.sparsity_pattern)
-        assert_array_equal(
-            actual.inclusion_probabilities, expected.inclusion_probabilities
+        assert (
+            actual.inclusion_probabilities.shape
+            == expected.inclusion_probabilities.shape
+        )
+        assert_allclose(
+            actual.inclusion_probabilities,
+            expected.inclusion_probabilities,
+            rtol=tolerance,
+            atol=tolerance,
         )

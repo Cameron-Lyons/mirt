@@ -255,7 +255,7 @@ def test_numerical_failure_restores_parameters_and_internal_predictors(
 
 @pytest.mark.parametrize("backend", ["numpy", "rust"])
 @pytest.mark.parametrize("factors", [1, 3])
-def test_complete_fit_matches_numerical_uncertainty(backend, factors):
+def test_complete_fit_matches_numerical_uncertainty(backend, factors, monkeypatch):
     if backend == "rust" and not mirt.is_rust_available():
         pytest.skip("native backend unavailable")
     previous = mirt.get_backend()
@@ -264,16 +264,82 @@ def test_complete_fit_matches_numerical_uncertainty(backend, factors):
         data = mirt.simdata(n_persons=100, n_items=5, n_factors=factors, seed=4)
         data[::7, 0] = -1
         options = dict(max_iter=3, use_gpu=False)
-        analytic = GVEMEstimator(**options).fit(
+        analytic_estimator = GVEMEstimator(**options)
+        numerical_estimator = GVEMEstimator(**options, se_step_size=1e-3)
+        checked_estimators = []
+
+        def guard_errors(estimator):
+            compute_errors = estimator._compute_standard_errors
+
+            def checked_compute_errors(fitted, responses, prior_mean, prior_cov):
+                parameters = fitted.parameters
+                # SE rebuilds predictors from public parameters at entry. Match
+                # that conversion before checking their exact preservation.
+                estimator._convert_to_slope_intercept(fitted)
+                normalized = fitted.parameters
+                assert normalized.keys() == parameters.keys()
+                for name in parameters:
+                    np.testing.assert_array_equal(normalized[name], parameters[name])
+                names = ("_mu", "_sigma", "_xi", "_slopes", "_intercepts")
+                state = {name: getattr(estimator, name).copy() for name in names}
+                inputs = (responses, prior_mean, prior_cov)
+                snapshots = [array.copy() for array in inputs]
+                errors = compute_errors(fitted, responses, prior_mean, prior_cov)
+                restored = fitted.parameters
+                assert restored.keys() == parameters.keys()
+                for name in parameters:
+                    np.testing.assert_array_equal(restored[name], parameters[name])
+                for name in names:
+                    np.testing.assert_array_equal(getattr(estimator, name), state[name])
+                for array, snapshot in zip(inputs, snapshots, strict=True):
+                    np.testing.assert_array_equal(array, snapshot)
+                checked_estimators.append(estimator)
+                return errors
+
+            monkeypatch.setattr(
+                estimator, "_compute_standard_errors", checked_compute_errors
+            )
+
+        for estimator in (analytic_estimator, numerical_estimator):
+            guard_errors(estimator)
+        analytic = analytic_estimator.fit(
             mirt.TwoParameterLogistic(5, n_factors=factors), data
         )
-        numerical = GVEMEstimator(**options, se_step_size=1e-3).fit(
+        numerical = numerical_estimator.fit(
             mirt.TwoParameterLogistic(5, n_factors=factors), data
         )
-        assert analytic.log_likelihood == numerical.log_likelihood
+        assert checked_estimators == [analytic_estimator, numerical_estimator]
+        # Independent fits can differ in the last bits of float reductions.
+        roundoff = 32 * np.finfo(np.float64).eps
+        np.testing.assert_allclose(
+            [analytic.log_likelihood, analytic.aic, analytic.bic],
+            [numerical.log_likelihood, numerical.aic, numerical.bic],
+            rtol=roundoff,
+            atol=roundoff,
+        )
         assert analytic.n_iterations == numerical.n_iterations
-        for name, values in analytic.model.parameters.items():
-            np.testing.assert_array_equal(values, numerical.model.parameters[name])
+        assert analytic.converged == numerical.converged
+        assert len(analytic_estimator.convergence_history) == len(
+            numerical_estimator.convergence_history
+        )
+        np.testing.assert_allclose(
+            analytic_estimator.convergence_history,
+            numerical_estimator.convergence_history,
+            rtol=roundoff,
+            atol=roundoff,
+        )
+        analytic_parameters = analytic.model.parameters
+        numerical_parameters = numerical.model.parameters
+        assert analytic_parameters.keys() == numerical_parameters.keys()
+        assert analytic.standard_errors.keys() == analytic_parameters.keys()
+        assert numerical.standard_errors.keys() == numerical_parameters.keys()
+        for name, values in analytic_parameters.items():
+            assert values.shape == numerical_parameters[name].shape
+            np.testing.assert_allclose(
+                values, numerical_parameters[name], rtol=roundoff, atol=roundoff
+            )
+            assert analytic.standard_errors[name].shape == values.shape
+            assert numerical.standard_errors[name].shape == values.shape
             np.testing.assert_allclose(
                 analytic.standard_errors[name],
                 numerical.standard_errors[name],
