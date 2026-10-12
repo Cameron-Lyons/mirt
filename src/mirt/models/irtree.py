@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
+from mirt.models.base import validate_item_index
 
 _IRTREE_MAX_PROBABILITY_VALUES = 1_000_000
 
@@ -90,23 +91,27 @@ class IRTreeSpec:
     root: TreeNode
 
     @classmethod
-    def bockenholt_adi(cls, n_categories: int = 5) -> IRTreeSpec:
-        """Bockenholt's Acquiescence-Direction-Intensity model.
+    def bockenholt_mdi(cls, n_categories: int = 5) -> IRTreeSpec:
+        """Bockenholt's (2012) Midpoint-Direction-Intensity model.
 
         For Likert scales, decomposes responses into:
-        1. Acquiescence (0 = non-acquiescence, 1 = acquiescence)
-        2. Direction (0 = disagree, 1 = agree) - only if non-acquiescence
-        3. Intensity (0 = mild, 1 = extreme) - only if non-acquiescence
+        1. Midpoint (0 = directional response, 1 = neutral midpoint)
+        2. Direction (0 = disagree, 1 = agree) - only if not the midpoint
+        3. Intensity (0 = mild, 1 = extreme) - only if not the midpoint
+
+        The midpoint trait is a midpoint response style. Acquiescence, the
+        tendency to agree regardless of content, enters through the
+        direction decision instead.
 
         Standard 5-point mapping:
-        - 1 (Strongly Disagree): A=0, D=0, I=1
-        - 2 (Disagree): A=0, D=0, I=0
-        - 3 (Neutral): A=1
-        - 4 (Agree): A=0, D=1, I=0
-        - 5 (Strongly Agree): A=0, D=1, I=1
+        - 1 (Strongly Disagree): M=0, D=0, I=1
+        - 2 (Disagree): M=0, D=0, I=0
+        - 3 (Neutral): M=1
+        - 4 (Agree): M=0, D=1, I=0
+        - 5 (Strongly Agree): M=0, D=1, I=1
         """
         if n_categories != 5:
-            raise ValueError("Bockenholt ADI model requires 5 categories")
+            raise ValueError("Bockenholt MDI model requires 5 categories")
 
         intensity_disagree = TreeNode(
             name="intensity_disagree",
@@ -127,18 +132,27 @@ class IRTreeSpec:
         )
 
         root = TreeNode(
-            name="acquiescence",
+            name="midpoint",
             latent_trait=0,
             children={0: direction, 1: 2},
         )
 
         return cls(
-            name="Bockenholt ADI",
+            name="Bockenholt MDI",
             n_categories=5,
             n_traits=3,
-            trait_names=["Acquiescence", "Direction", "Intensity"],
+            trait_names=["Midpoint", "Direction", "Intensity"],
             root=root,
         )
+
+    @classmethod
+    def bockenholt_adi(cls, n_categories: int = 5) -> IRTreeSpec:
+        """Return :meth:`bockenholt_mdi`, kept under its former name.
+
+        The first node of this tree is the midpoint decision, which earlier
+        releases mislabeled as acquiescence.
+        """
+        return cls.bockenholt_mdi(n_categories)
 
     @classmethod
     def extreme_midpoint(cls, n_categories: int = 5) -> IRTreeSpec:
@@ -412,15 +426,16 @@ class IRTreeModel:
 
     IRTree models decompose ordinal responses into a sequence of binary
     decisions represented as a tree structure. This enables modeling of
-    response styles (acquiescence, extreme responding, midpoint endorsement)
-    separately from substantive content.
+    response styles (extreme responding, midpoint endorsement) separately
+    from substantive content.
 
     Parameters
     ----------
     n_items : int
         Number of items
     tree_spec : IRTreeSpec or str
-        Tree structure specification. Can be "bockenholt", "extreme_midpoint",
+        Tree structure specification. Can be "bockenholt" (Bockenholt's
+        midpoint-direction-intensity tree), "extreme_midpoint",
         "direction_intensity", or a custom IRTreeSpec.
     n_categories : int
         Number of response categories (default 5 for Likert)
@@ -509,7 +524,7 @@ class IRTreeModel:
 
         if isinstance(tree_spec, str):
             if tree_spec == "bockenholt":
-                self.tree_spec = IRTreeSpec.bockenholt_adi(n_categories)
+                self.tree_spec = IRTreeSpec.bockenholt_mdi(n_categories)
             elif tree_spec == "extreme_midpoint":
                 self.tree_spec = IRTreeSpec.extreme_midpoint(n_categories)
             elif tree_spec == "direction_intensity":
@@ -686,14 +701,7 @@ class IRTreeModel:
         return theta_array
 
     def _validate_item_idx(self, item_idx: int) -> int:
-        if (
-            isinstance(item_idx, bool)
-            or not isinstance(item_idx, Integral)
-            or item_idx < 0
-            or item_idx >= self.n_items
-        ):
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return int(item_idx)
+        return validate_item_index(item_idx, self.n_items)
 
     def _validate_node_idx(self, node_idx: int) -> int:
         if (

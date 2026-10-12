@@ -1,4 +1,4 @@
-"""Analytic affine M-step gradients, clipping, constraints, and thread isolation."""
+"""Analytic affine M-step gradients, saturation, constraints, and thread isolation."""
 
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
@@ -7,6 +7,7 @@ from types import MethodType, SimpleNamespace
 import numpy as np
 import pytest
 from scipy.optimize import minimize
+from scipy.special import expit
 
 from mirt.estimation import em as em_module
 from mirt.estimation._affine_objective import prepare_affine_objective
@@ -80,7 +81,7 @@ def _public_objective(model, item, theta, observed, correct, epsilon, params):
 @pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
 @pytest.mark.parametrize("item", [0, 2])
 @pytest.mark.parametrize("epsilon", [1e-10, 0.1])
-def test_affine_gradient_matches_public_clipped_likelihood(kind, item, epsilon):
+def test_affine_gradient_matches_public_likelihood(kind, item, epsilon):
     model = _model(kind)
     original = model.parameters
     rng = np.random.default_rng(614)
@@ -95,17 +96,27 @@ def test_affine_gradient_matches_public_clipped_likelihood(kind, item, epsilon):
     )
     assert objective is not None
     actual, gradient = objective(params)
-    expected = _public_objective(model, item, theta, observed, correct, epsilon, params)
-    np.testing.assert_allclose(actual, expected, rtol=1e-14)
+    # Saturated nodes keep the exact likelihood, so only the default clip,
+    # where nothing saturates, reproduces the clipped value. The wide clip
+    # compares exact tails with a reference that loses precision near one.
+    expected = _public_objective(model, item, theta, observed, correct, 0.0, params)
+    np.testing.assert_allclose(
+        actual, expected, rtol=1e-14 if epsilon < 1e-6 else 1e-10
+    )
+    if epsilon < 1e-6:
+        clipped = _public_objective(
+            model, item, theta, observed, correct, epsilon, params
+        )
+        np.testing.assert_allclose(actual, clipped, rtol=1e-14)
     numerical = np.empty_like(params)
     for coordinate in range(len(params)):
         offset = np.zeros_like(params)
         offset[coordinate] = 1e-5
         high = _public_objective(
-            model, item, theta, observed, correct, epsilon, params + offset
+            model, item, theta, observed, correct, 0.0, params + offset
         )
         low = _public_objective(
-            model, item, theta, observed, correct, epsilon, params - offset
+            model, item, theta, observed, correct, 0.0, params - offset
         )
         numerical[coordinate] = (high - low) / 2e-5
     np.testing.assert_allclose(gradient, numerical, rtol=3e-7, atol=2e-8)
@@ -151,7 +162,9 @@ def test_fixed_coordinates_keep_the_affine_objective(kind):
 
 
 @pytest.mark.parametrize("kind", ["mirt", "bifactor", "confirmatory"])
-def test_affine_clipped_tails_have_zero_gradient(kind):
+def test_affine_saturated_tails_keep_the_exact_likelihood(kind):
+    # Regression: clipped probabilities left these tails flat, so the
+    # itemwise optimizer stopped on items whose expected responses saturate.
     model = _model(kind)
     item = 0
     params, bounds = EMEstimator()._get_item_params_and_bounds(model, item)
@@ -165,9 +178,18 @@ def test_affine_clipped_tails_have_zero_gradient(kind):
     assert objective is not None
     with np.errstate(over="raise", invalid="raise", divide="raise", under="ignore"):
         loss, gradient = objective(params)
-    expected = _public_objective(model, item, theta, observed, correct, 1e-8, params)
+    # In every kind, item 0 loads 0.7 on the first factor.
+    logits = 0.7 * theta[:, 0] - 0.2
+    expected = np.sum(
+        correct * np.logaddexp(0.0, -logits)
+        + (observed - correct) * np.logaddexp(0.0, logits)
+    )
     np.testing.assert_allclose(loss, expected, rtol=1e-14)
-    np.testing.assert_array_equal(gradient, 0.0)
+    residual = observed * expit(logits) - correct
+    expected_gradient = np.zeros(len(params))
+    expected_gradient[0] = theta[:, 0] @ residual
+    expected_gradient[-1] = residual.sum()
+    np.testing.assert_allclose(gradient, expected_gradient, rtol=1e-14)
 
 
 def test_large_quadrature_coordinates_use_exact_logit_recovery():

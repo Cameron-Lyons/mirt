@@ -23,7 +23,12 @@ from mirt._categorical import (
 )
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
-from mirt.models.base import BaseItemModel
+from mirt.models.base import (
+    _DICHOTOMOUS_MAX_PROBABILITY_VALUES,
+    _POLYTOMOUS_MAX_PROBABILITY_VALUES,
+    BaseItemModel,
+    _simulate_responses,
+)
 
 FloatArray = NDArray[np.float64]
 
@@ -139,7 +144,8 @@ class ItemTypeSpec:
     The probability callback receives theta followed by the named item
     parameters.  It returns ``(n_theta,)`` for dichotomous items or
     ``(n_theta, n_categories)`` for polytomous items. Optional batch callbacks
-    receive full item-parameter arrays and return all items together.
+    receive full item-parameter arrays and return all items together. Every
+    item of a :class:`CustomItemModel` has ``n_categories`` categories.
     """
 
     name: str
@@ -279,7 +285,17 @@ class CustomItemModel(BaseItemModel):
         return self.item_type.n_categories > 2
 
     @property
-    def n_categories(self) -> int:
+    def n_categories(self) -> list[int]:
+        """Category count of every item, as for the built-in families.
+
+        Every item has the item type's ``n_categories``, so dichotomous types
+        report two categories per item.
+        """
+        return [self.item_type.n_categories] * self.n_items
+
+    @property
+    def max_categories(self) -> int:
+        """Largest category count, the width of polytomous probabilities."""
         return self.item_type.n_categories
 
     def _validated_theta(self, theta: FloatArray) -> FloatArray:
@@ -296,21 +312,12 @@ class CustomItemModel(BaseItemModel):
     def _callback_theta(self, theta: FloatArray) -> FloatArray:
         return theta[:, 0] if self.n_factors == 1 else theta
 
-    def _validated_item(self, item_idx: int) -> int:
-        if isinstance(item_idx, bool) or not isinstance(item_idx, (int, np.integer)):
-            raise MirtValidationError(
-                "item_idx must be an integer", parameter="item_idx", value=item_idx
-            )
-        if item_idx < 0 or item_idx >= self.n_items:
-            raise IndexError(f"Item index {item_idx} out of range [0, {self.n_items})")
-        return int(item_idx)
-
     def _validate_probability_output(
         self, values: Any, n_theta: int, callback_name: str = "icc_function"
     ) -> FloatArray:
         probabilities = np.asarray(values, dtype=np.float64)
         if self.is_polytomous:
-            expected = (n_theta, self.n_categories)
+            expected = (n_theta, self.max_categories)
             if probabilities.shape != expected:
                 raise MirtValidationError(
                     f"{callback_name} returned shape {probabilities.shape}, expected {expected}",
@@ -354,7 +361,7 @@ class CustomItemModel(BaseItemModel):
         """Validate probabilities returned for every theta-item combination."""
         probabilities = np.asarray(values, dtype=np.float64)
         if self.is_polytomous:
-            expected = (n_theta, self.n_items, self.n_categories)
+            expected = (n_theta, self.n_items, self.max_categories)
         else:
             if probabilities.shape == (n_theta, self.n_items, 1):
                 probabilities = probabilities[:, :, 0]
@@ -406,7 +413,7 @@ class CustomItemModel(BaseItemModel):
 
         theta_2d = self._validated_theta(theta)
         if item_idx is not None:
-            return self._item_probability(theta_2d, self._validated_item(item_idx))
+            return self._item_probability(theta_2d, self._validate_item_index(item_idx))
         return self._all_item_probabilities(theta_2d)
 
     def icc(self, theta: FloatArray, item_idx: int) -> FloatArray:
@@ -423,10 +430,10 @@ class CustomItemModel(BaseItemModel):
             isinstance(category, bool)
             or not isinstance(category, (int, np.integer))
             or category < 0
-            or category >= self.n_categories
+            or category >= self.max_categories
         ):
             raise MirtValidationError(
-                f"category must be in [0, {self.n_categories})",
+                f"category must be in [0, {self.max_categories})",
                 parameter="category",
                 value=category,
             )
@@ -503,7 +510,7 @@ class CustomItemModel(BaseItemModel):
             return np.column_stack(
                 [self.information(theta_2d, item) for item in range(self.n_items)]
             )
-        item_idx = self._validated_item(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         if self.item_type.info_function is None:
             return self._numerical_information(theta_2d, item_idx)
         result = self.item_type.info_function(
@@ -565,9 +572,51 @@ class CustomItemModel(BaseItemModel):
         probabilities = self.probability(theta, item_idx)
         if not self.is_polytomous:
             return probabilities.sum(axis=1) if item_idx is None else probabilities
-        scores = np.arange(self.n_categories, dtype=np.float64)
+        scores = np.arange(self.max_categories, dtype=np.float64)
         expected = probabilities @ scores
         return expected.sum(axis=1) if item_idx is None else expected
+
+    def simulate(
+        self,
+        theta: FloatArray,
+        seed: int | None = None,
+        *,
+        chunk_size: int | None = None,
+    ) -> NDArray[np.int_]:
+        """Simulate responses from the probability callbacks.
+
+        Parameters
+        ----------
+        theta : ndarray
+            Latent trait values with shape ``(n_persons, n_factors)``. A
+            one-dimensional array is also accepted for unidimensional models.
+        seed : int, optional
+            Random seed for reproducible response draws.
+        chunk_size : int, optional
+            Maximum number of persons evaluated at once. By default, a
+            memory-bounded chunk size is selected from the model dimensions.
+
+        Returns
+        -------
+        ndarray
+            Responses with shape ``(n_persons, n_items)``: 0 or 1 for a
+            dichotomous item type, otherwise category codes
+            ``0, ..., n_categories - 1``.
+
+        Notes
+        -----
+        As for the built-in families, each response is drawn from
+        ``probability(theta)`` with one uniform per person and item, by
+        inverse CDF for polytomous item types. A fixed seed produces
+        identical responses for every valid chunk size.
+        """
+        if self.is_polytomous:
+            values = _POLYTOMOUS_MAX_PROBABILITY_VALUES // self.max_categories
+        else:
+            values = _DICHOTOMOUS_MAX_PROBABILITY_VALUES
+        return _simulate_responses(
+            self, theta, seed, chunk_size, values // self.n_items
+        )
 
     def _validated_responses(
         self, responses: NDArray[np.int_], n_persons: int | None = None
@@ -589,9 +638,10 @@ class CustomItemModel(BaseItemModel):
         integer_values = values.astype(np.int64)
         if not np.array_equal(values, integer_values):
             raise MirtDataError("responses must contain integer category values")
-        if np.any(integer_values < -1) or np.any(integer_values >= self.n_categories):
+        if np.any(integer_values < -1) or np.any(integer_values >= self.max_categories):
             raise MirtDataError(
-                f"responses must use -1 for missing or categories 0 through {self.n_categories - 1}"
+                "responses must use -1 for missing or categories 0 through "
+                f"{self.max_categories - 1}"
             )
         return integer_values
 
@@ -637,7 +687,7 @@ class CustomItemModel(BaseItemModel):
             missed = np.where(valid, 1 - response_values, 0)
             return observed @ np.log(clipped).T + missed @ np.log1p(-clipped).T
 
-        counts = [self.n_categories] * self.n_items
+        counts = self.n_categories
         log_table = item_category_table(probabilities, counts)
         np.clip(log_table, PROB_EPSILON, None, out=log_table)
         np.log(log_table, out=log_table)
@@ -651,7 +701,7 @@ class CustomItemModel(BaseItemModel):
         """Compute probability gradients with respect to item parameters."""
 
         theta_2d = self._validated_theta(theta)
-        item_idx = self._validated_item(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         params = self.get_item_parameters(item_idx)
         if self.item_type.gradient_function is not None:
             raw = self.item_type.gradient_function(
@@ -678,7 +728,7 @@ class CustomItemModel(BaseItemModel):
                 minus_value = max(value - h, lower)
                 if plus_value == minus_value:
                     shape = (
-                        (theta_2d.shape[0], self.n_categories)
+                        (theta_2d.shape[0], self.max_categories)
                         if self.is_polytomous
                         else (theta_2d.shape[0],)
                     )
@@ -703,7 +753,7 @@ class CustomItemModel(BaseItemModel):
                 )
 
         expected_shape = (
-            (theta_2d.shape[0], self.n_categories)
+            (theta_2d.shape[0], self.max_categories)
             if self.is_polytomous
             else (theta_2d.shape[0],)
         )
@@ -753,7 +803,7 @@ class CustomItemModel(BaseItemModel):
     def set_item_parameter(self, item_idx: int, param_name: str, value: Any) -> None:
         """Set one bounded scalar parameter for a single item."""
 
-        item_idx = self._validated_item(item_idx)
+        item_idx = self._validate_item_index(item_idx)
         if param_name not in self._parameters:
             raise MirtValidationError(
                 f"Unknown parameter: {param_name}", parameter=param_name

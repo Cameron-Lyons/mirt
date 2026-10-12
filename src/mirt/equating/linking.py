@@ -13,6 +13,8 @@ from numpy.typing import NDArray
 from scipy import optimize, stats
 from scipy.special import expit
 
+from mirt._model_defaults import uses_original_model_hook
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
 
@@ -37,8 +39,20 @@ _CURVE_METHOD_LABELS = {
     "tcc": "TCC",
     "haebara": "Haebara",
 }
-# Families whose response curves the closed-form logistic kernel reproduces.
-_LOGISTIC_MODEL_NAMES = frozenset({"1PL", "2PL", "3PL", "4PL", "5PL"})
+# Recorded hooks through which built-in 1PL-5PL classes evaluate their curves.
+_CLOSED_FORM_CURVE_HOOKS = ("probability", "_evaluate_logistic", "_ensure_theta_2d")
+# Unrecorded curve dispatch and the parameter accessors the kernel reads.
+_CLOSED_FORM_CURVE_ATTRIBUTES = (
+    "_curve_evaluator",
+    "_evaluate_curve",
+    "_evaluate_block",
+    "_curve_parameter_names",
+    "discrimination",
+    "difficulty",
+    "guessing",
+    "upper",
+    "asymmetry",
+)
 _MAX_ABS_LOG_SCALE = 20.0
 _LEAST_SQUARES_TOLERANCE = 1e-12
 # Relative cost reduction; nonzero-residual Haebara fits stop early at 1e-12.
@@ -67,9 +81,11 @@ class LinkingConstants:
     B : float
         Intercept of linear transformation.
     A_se : float | None
-        Bootstrap standard error of A.
+        Standard error of A: a paired-anchor bootstrap estimate from a
+        linker's ``compute_se``, or a delta-method estimate from
+        :func:`~mirt.equating.chain_link` with ``vcovs``.
     B_se : float | None
-        Bootstrap standard error of B.
+        Standard error of B, estimated like ``A_se``.
     method : str
         Linking method used.
     """
@@ -251,8 +267,9 @@ def link(
     Curve methods, anchor areas, and TCC fit use each model's own response
     function. Built-in 1PL-5PL forms use the closed-form logistic kernel
     (including 5PL asymmetry); other dichotomous families, such as CLL, NLL,
-    ULL, or zero-inflated models, are evaluated through ``model.probability``
-    at the transformed grid ``(theta - B) / A``. Stocking-Lord and Haebara
+    ULL, or zero-inflated models, and subclasses that override the response
+    function are evaluated through ``model.probability`` at the transformed
+    grid ``(theta - B) / A``. Stocking-Lord and Haebara
     criteria are minimized by Levenberg-Marquardt least squares in
     ``(log A, B)``, falling back to Nelder-Mead if it fails.
 
@@ -556,10 +573,48 @@ class _LinkForm:
         )
 
 
+def _uses_closed_form_curves(model: "BaseItemModel") -> bool:
+    """Whether the closed-form logistic kernel reproduces ``model.probability``.
+
+    Built-in 1PL-5PL classes qualify, as do subclasses that inherit their
+    family's response function and parameter accessors unchanged.
+    Subclasses that override them, and instances with replaced hooks, are
+    evaluated through their own ``probability``.
+    """
+    from mirt.models.dichotomous import (
+        FiveParameterLogistic,
+        FourParameterLogistic,
+        OneParameterLogistic,
+        ThreeParameterLogistic,
+        TwoParameterLogistic,
+    )
+
+    families = (
+        OneParameterLogistic,
+        TwoParameterLogistic,
+        ThreeParameterLogistic,
+        FourParameterLogistic,
+        FiveParameterLogistic,
+    )
+    family = next((cls for cls in type(model).__mro__ if cls in families), None)
+    if family is None or getattr(model, "model_name", None) != family.model_name:
+        return False
+    if not all(
+        uses_original_model_hook(model, name) for name in _CLOSED_FORM_CURVE_HOOKS
+    ):
+        return False
+    namespace = vars(model)
+    return all(
+        name not in namespace
+        and getattr(type(model), name, None) is getattr(family, name, None)
+        for name in _CLOSED_FORM_CURVE_ATTRIBUTES
+    )
+
+
 def _link_form(model: "BaseItemModel", anchors: list[int], label: str) -> _LinkForm:
     """Build the curve source for validated anchors of one form."""
     parameters = _extract_link_parameters(model, anchors, label)
-    if getattr(model, "model_name", None) in _LOGISTIC_MODEL_NAMES:
+    if _uses_closed_form_curves(model):
         return _LinkForm(*parameters, label=label)
     return _LinkForm(
         *parameters,
@@ -569,12 +624,10 @@ def _link_form(model: "BaseItemModel", anchors: list[int], label: str) -> _LinkF
     )
 
 
-def _validate_curve_grid(
-    theta_range: tuple[float, float],
-    n_theta: int,
-    weights: NDArray[np.float64] | None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Validate and construct the shared curve-matching grid."""
+def _validate_theta_grid(
+    theta_range: tuple[float, float], n_theta: int
+) -> NDArray[np.float64]:
+    """Validate and construct an evenly spaced ability grid."""
     if not isinstance(theta_range, (tuple, list)) or len(theta_range) != 2:
         raise ValueError("theta_range must contain exactly two values")
     lower, upper = float(theta_range[0]), float(theta_range[1])
@@ -586,8 +639,16 @@ def _validate_curve_grid(
         raise ValueError("n_theta must be an integer")
     if n_theta < 2:
         raise ValueError("n_theta must be at least 2")
+    return np.linspace(lower, upper, int(n_theta))
 
-    theta_grid = np.linspace(lower, upper, int(n_theta))
+
+def _validate_curve_grid(
+    theta_range: tuple[float, float],
+    n_theta: int,
+    weights: NDArray[np.float64] | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Validate and construct the shared curve-matching grid and weights."""
+    theta_grid = _validate_theta_grid(theta_range, n_theta)
     if weights is None:
         normalized_weights = stats.norm.pdf(theta_grid)
     else:
@@ -628,17 +689,13 @@ def _icc_matrix(
     discrimination: NDArray[np.float64],
     difficulty: NDArray[np.float64],
     theta: NDArray[np.float64],
-    lower: NDArray[np.float64] | None = None,
-    upper: NDArray[np.float64] | None = None,
-    asymmetry: NDArray[np.float64] | None = None,
+    lower: NDArray[np.float64],
+    upper: NDArray[np.float64],
+    asymmetry: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Evaluate every 1PL-5PL item curve in one stable batch."""
-    if lower is None:
-        lower = np.zeros_like(discrimination)
-    if upper is None:
-        upper = np.ones_like(discrimination)
     logistic = expit(discrimination[None, :] * (theta[:, None] - difficulty[None, :]))
-    if asymmetry is not None and not np.all(asymmetry == 1.0):
+    if not np.all(asymmetry == 1.0):
         logistic = logistic ** asymmetry[None, :]
     return lower[None, :] + (upper - lower)[None, :] * logistic
 
@@ -1184,13 +1241,19 @@ def _compute_fit_statistics(
 
 
 def _robust_z_scores(values: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Compute MAD-based z-scores without hiding isolated tied outliers."""
+    """Compute MAD-based z-scores without hiding isolated tied outliers.
+
+    When more than half of the values tie, the MAD is zero: tied values score
+    zero and every other value scores infinity with the sign of its
+    difference from the median.
+    """
     median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)) * 1.4826)
+    differences = np.asarray(values, dtype=np.float64) - median
+    mad = float(np.median(np.abs(differences)) * 1.4826)
     if mad >= 1e-10:
-        return (values - median) / mad
+        return differences / mad
     matches_median = np.isclose(values, median, rtol=1e-8, atol=1e-10)
-    return np.where(matches_median, 0.0, np.inf)
+    return np.where(matches_median, 0.0, np.copysign(np.inf, differences))
 
 
 def _batch_ols_slope(

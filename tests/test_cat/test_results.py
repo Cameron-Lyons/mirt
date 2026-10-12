@@ -456,3 +456,84 @@ class TestCATResultPlotConvergence:
             plt.close(fig)
         except ImportError:
             pytest.skip("matplotlib not available")
+
+
+class TestResponseSummaries:
+    """Summaries count correct answers only for dichotomous items."""
+
+    @staticmethod
+    def _result(responses, polytomous):
+        return CATResult(
+            theta=0.5,
+            standard_error=0.4,
+            items_administered=list(range(len(responses))),
+            responses=np.array(responses),
+            n_items_administered=len(responses),
+            stopping_reason="Max items",
+            polytomous=polytomous,
+        )
+
+    def test_polytomous_summary_reports_categories(self):
+        summary = self._result([2, 2, 3, 0], polytomous=True).summary()
+
+        # Category codes used to be counted as "Correct: 0 / 4".
+        assert "Correct" not in summary
+        assert "Mean response: 1.7500" in summary
+        assert "0: 1, 1: 0, 2: 2, 3: 1" in summary
+
+    def test_polytomous_flag_applies_to_low_categories(self):
+        summary = self._result([0, 1, 1], polytomous=True).summary()
+        assert "Correct" not in summary
+
+    def test_dichotomous_summary_counts_correct_answers(self):
+        assert "Correct: 2 / 3" in self._result([1, 0, 1], polytomous=False).summary()
+
+    def test_unknown_items_are_inferred_from_the_responses(self):
+        assert "Correct: 2 / 3" in self._result([1, 0, 1], polytomous=None).summary()
+        assert "Mean response" in self._result([1, 2, 0], polytomous=None).summary()
+
+    def test_flag_round_trips_and_is_optional(self):
+        result = self._result([2, 1], polytomous=True)
+        assert CATResult.from_json(result.to_json()).polytomous is True
+        legacy = result.to_dict()
+        del legacy["polytomous"]
+        assert CATResult.from_dict(legacy).polytomous is None
+        assert "polytomous" not in self._result([1], polytomous=None).to_dict()
+
+    def test_flag_must_be_boolean(self):
+        with pytest.raises(MirtValidationError, match="polytomous"):
+            self._result([1], polytomous="yes")
+
+    def test_engines_record_the_item_type(self):
+        from mirt.cat import CATEngine, MCATEngine
+        from mirt.models import GradedResponseModel, MultidimensionalModel
+
+        grm = GradedResponseModel(n_items=6, n_categories=4)
+        grm._is_fitted = True
+        result = CATEngine(grm, max_items=3).run_simulation(0.0, lambda i, t: 2)
+        assert result.polytomous is True
+        assert "Mean response: 2.0000" in result.summary()
+
+        mirt_model = MultidimensionalModel(n_items=6, n_factors=2)
+        mirt_model._is_fitted = True
+        mcat = MCATEngine(mirt_model, max_items=3).run_simulation(
+            np.zeros(2), lambda i, t: 1
+        )
+        assert mcat.polytomous is False
+        assert "Correct: 3 / 3" in mcat.summary()
+
+    def test_mcat_polytomous_summary(self):
+        result = MCATResult(
+            theta=np.zeros(2),
+            covariance=np.eye(2),
+            standard_error=np.ones(2),
+            items_administered=[0, 1],
+            responses=np.array([2, 1]),
+            n_items_administered=2,
+            stopping_reason="Max items",
+            polytomous=True,
+        )
+        summary = result.summary()
+        assert "Correct" not in summary
+        assert "Mean response: 1.5000" in summary
+        assert MCATResult.from_dict(result.to_dict()).polytomous is True

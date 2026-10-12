@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt.equating._curves import _expected_item_score_curves, _ItemCurveSet
 from mirt.equating.linking import LinkingResult, link, transform_parameters
 from mirt.equating.polytomous import (
     _NRM_METHODS,
@@ -22,12 +23,20 @@ from mirt.equating.polytomous import (
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
-_PROBABILITY_TOLERANCE = 1e-10
 _CONCURRENT_METHODS = frozenset({"stocking_lord", "tcc", "haebara"})
-# Absolute forward-difference step used by scipy's L-BFGS-B by default.
-_FORWARD_DIFFERENCE_STEP = 1e-8
+# Central-difference step of the curves' theta slopes in the concurrent
+# Jacobian; truncation and rounding errors are both near 1e-10.
+_THETA_DIFFERENCE_STEP = 1e-5
+# Concurrent Jacobians with more entries are stored sparse: each residual
+# depends on the constants of at most two forms.
+_DENSE_JACOBIAN_ELEMENTS = 4_000_000
+# Termination on relative criterion reduction and on the scaled gradient,
+# as in :func:`mirt.equating.link`; ``tol`` bounds the parameter change.
+_CONCURRENT_FTOL = 1e-15
+_CONCURRENT_GTOL = 1e-12
 
 
 @dataclass
@@ -54,6 +63,12 @@ class ChainLinkingResult:
         Later-minus-earlier difficulty changes on the reference metric,
         aligned with ``drift_accumulation``. These describe residual change
         after linking, rather than unadjusted differences between forms.
+    cumulative_A_se, cumulative_B_se : list[float] | None
+        Delta-method standard errors of the cumulative constants, zero at
+        the reference, when :func:`chain_link` received ``vcovs``.
+    cumulative_covariance : NDArray[np.float64] | None
+        Covariance of each time point's cumulative ``(A, B)``, shape
+        ``(n_models, 2, 2)``, when :func:`chain_link` received ``vcovs``.
     """
 
     cumulative_A: list[float]
@@ -63,6 +78,9 @@ class ChainLinkingResult:
     reference_index: int
     drift_item_ids: list[tuple[int, int]] | None = None
     drift_difficulty_changes: NDArray[np.float64] | None = None
+    cumulative_A_se: list[float] | None = None
+    cumulative_B_se: list[float] | None = None
+    cumulative_covariance: NDArray[np.float64] | None = None
 
 
 @dataclass
@@ -82,14 +100,6 @@ class TimePointModel:
     model: "BaseItemModel"
     anchor_items: list[int]
     time_label: str = ""
-
-
-@dataclass
-class _ItemCurveSet:
-    """Expected-score and category curves for selected items."""
-
-    expected: NDArray[np.float64]
-    categories: list[NDArray[np.float64]] | None
 
 
 def _validate_grid(theta_range: tuple[float, float], n_theta: int) -> None:
@@ -168,6 +178,7 @@ def chain_link(
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_theta: int = 61,
     compute_drift: bool = True,
+    vcovs: "list[NDArray[np.float64] | FitResult] | None" = None,
 ) -> ChainLinkingResult:
     """Perform chain linking across multiple time points.
 
@@ -198,6 +209,15 @@ def chain_link(
         Whether to track drift accumulation. NRM anchors have no single
         location parameter, so their ``drift_difficulty_changes`` are NaN;
         their robust z-statistics are still reported.
+    vcovs : list of ndarray or FitResult, optional
+        Parameter covariance of each calibration, in any form accepted by
+        :func:`~mirt.equating.delta_method_se`. When given, each pairwise
+        result receives delta-method standard errors, and
+        ``cumulative_A_se``, ``cumulative_B_se``, and
+        ``cumulative_covariance`` propagate them through the composition.
+        Calibrations are independent, so parameter covariances are block
+        diagonal across models; a model in two adjacent links contributes to
+        both, and the covariance this induces between them is included.
 
     Returns
     -------
@@ -276,6 +296,26 @@ def chain_link(
         pairwise_A, pairwise_B, reference_index
     )
 
+    cumulative_A_se = None
+    cumulative_B_se = None
+    cumulative_covariance = None
+    if vcovs is not None:
+        pairwise_covariance, cumulative_covariance = _chain_delta_covariance(
+            models,
+            anchor_item_pairs,
+            [pair_method for _, pair_method, _ in pair_linkers],
+            [(r.constants.A, r.constants.B) for r in pairwise_results],
+            vcovs,
+            reference_index,
+            theta_range,
+            n_theta,
+        )
+        pairwise_se = np.sqrt(np.diag(pairwise_covariance)).reshape(-1, 2)
+        for result, (A_se, B_se) in zip(pairwise_results, pairwise_se, strict=True):
+            result.constants.A_se, result.constants.B_se = float(A_se), float(B_se)
+        cumulative_A_se = [float(np.sqrt(c[0, 0])) for c in cumulative_covariance]
+        cumulative_B_se = [float(np.sqrt(c[1, 1])) for c in cumulative_covariance]
+
     drift_accumulation = None
     drift_item_ids = None
     drift_difficulty_changes = None
@@ -297,7 +337,170 @@ def chain_link(
         reference_index=reference_index,
         drift_item_ids=drift_item_ids,
         drift_difficulty_changes=drift_difficulty_changes,
+        cumulative_A_se=cumulative_A_se,
+        cumulative_B_se=cumulative_B_se,
+        cumulative_covariance=cumulative_covariance,
     )
+
+
+def _chain_delta_covariance(
+    models: list["BaseItemModel"],
+    anchor_item_pairs: list[tuple[list[int], list[int]]],
+    pair_methods: list[str],
+    pairwise_constants: list[tuple[float, float]],
+    vcovs: "list[NDArray[np.float64] | FitResult]",
+    reference_index: int,
+    theta_range: tuple[float, float],
+    n_theta: int,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Delta-method covariance of the pairwise and cumulative chain constants.
+
+    Each pairwise ``(A_t, B_t)`` is differentiated with respect to the
+    anchor parameters of both its forms. A form's coordinates from its two
+    links share one covariance block, so the pairwise covariance includes
+    the dependence that shared forms induce; the cumulative covariance
+    follows from the Jacobian of the composition.
+    """
+    from scipy import linalg
+
+    from mirt.equating.diagnostics import (
+        _anchor_covariance,
+        _constants_jacobian,
+        _delta_side,
+        _DeltaComponent,
+        _validate_linking_pair,
+    )
+    from mirt.equating.linking import _validate_curve_grid
+
+    n_models = len(models)
+    if len(vcovs) != n_models:
+        raise ValueError(
+            f"vcovs must contain one covariance per model; expected {n_models}, "
+            f"got {len(vcovs)}"
+        )
+    theta_grid, weights = _validate_curve_grid(theta_range, n_theta, None)
+    if not anchor_item_pairs:
+        return np.zeros((0, 0)), np.zeros((n_models, 2, 2))
+    sides = []
+    for t, (anchors_left, anchors_right) in enumerate(anchor_item_pairs):
+        left, right = _validate_linking_pair(
+            models[t], models[t + 1], anchors_left, anchors_right, pair_methods[t]
+        )
+        sides.append(
+            (
+                _delta_side(models[t], left, "old"),
+                _delta_side(models[t + 1], right, "new"),
+            )
+        )
+
+    # Each model's coordinates from both of its links, in one shared order.
+    positions: list[dict[tuple[str, int], int]] = []
+    covariances = []
+    for index, model in enumerate(models):
+        used = [sides[index][0]] if index < len(sides) else []
+        used += [sides[index - 1][1]] if index > 0 else []
+        varied: dict[str, set[int]] = {}
+        for side in used:
+            for component in side.components:
+                varied.setdefault(component.name, set()).update(
+                    int(flat) for flat in component.indices
+                )
+        components = []
+        for name, values in model.parameters.items():
+            if name in varied:
+                flat = np.array(sorted(varied[name]), dtype=np.intp)
+                stored = np.asarray(values, dtype=np.float64).ravel()
+                components.append(_DeltaComponent(name, stored[flat], flat))
+        coordinates: dict[tuple[str, int], int] = {}
+        for component in components:
+            for flat in component.indices:
+                coordinates[(component.name, int(flat))] = len(coordinates)
+        positions.append(coordinates)
+        covariances.append(
+            _anchor_covariance(
+                vcovs[index],
+                model,
+                components,
+                str(index),
+                names=(f"vcovs[{index}]", f"models[{index}]"),
+            )
+        )
+
+    offsets = np.cumsum([0] + [covariance.shape[0] for covariance in covariances])
+    jacobian = np.zeros((2 * len(sides), int(offsets[-1])), dtype=np.float64)
+    for t, (old, new) in enumerate(sides):
+        local = [
+            np.array(
+                [
+                    positions[index][(component.name, int(flat))]
+                    for component in side.components
+                    for flat in component.indices
+                ],
+                dtype=np.intp,
+            )
+            for index, side in ((t, old), (t + 1, new))
+        ]
+        # Coordinates without covariance cannot move the constants.
+        active = np.flatnonzero(
+            np.concatenate(
+                [
+                    np.any(covariances[index][rows] != 0.0, axis=1)
+                    for index, rows in zip((t, t + 1), local, strict=True)
+                ]
+            )
+        )
+        if active.size:
+            columns = np.concatenate([offsets[t] + local[0], offsets[t + 1] + local[1]])
+            jacobian[2 * t : 2 * t + 2, columns[active]] = _constants_jacobian(
+                pair_methods[t], old, new, active, theta_grid, weights
+            )
+
+    pairwise = jacobian @ linalg.block_diag(*covariances) @ jacobian.T
+    pairwise = 0.5 * (pairwise + pairwise.T)
+    composition = _cumulative_constant_jacobians(pairwise_constants, reference_index)
+    cumulative = composition @ pairwise @ composition.transpose(0, 2, 1)
+    for covariance in (pairwise, *cumulative):
+        tolerance = 1e-10 * max(1.0, float(np.max(np.abs(covariance))))
+        if np.any(np.diag(covariance) < -tolerance):
+            raise ValueError("Propagated covariance produced a negative variance")
+        # Rounding can leave exactly known variances slightly negative.
+        np.fill_diagonal(covariance, np.maximum(np.diag(covariance), 0.0))
+    return pairwise, cumulative
+
+
+def _cumulative_constant_jacobians(
+    pairwise_constants: list[tuple[float, float]],
+    reference_index: int,
+) -> NDArray[np.float64]:
+    """Jacobians of each cumulative ``(A, B)`` with respect to the pairwise ones.
+
+    Pairwise constants map model ``t + 1`` onto model ``t``:
+    ``theta_t = A_t * theta_{t+1} + B_t``. Returns an array of shape
+    ``(n_models, 2, 2 * n_pairs)`` whose columns are ``(A_0, B_0, A_1, ...)``.
+    """
+    n_pairs = len(pairwise_constants)
+    slopes = np.ones(n_pairs + 1)
+    jacobians = np.zeros((n_pairs + 1, 2, 2 * n_pairs), dtype=np.float64)
+    # Below the reference: C_t = C_{t+1} / A_t, D_t = D_{t+1} - C_{t+1} B_t / A_t.
+    for t in range(reference_index - 1, -1, -1):
+        A, B = pairwise_constants[t]
+        following = jacobians[t + 1]
+        jacobians[t, 0] = following[0] / A
+        jacobians[t, 0, 2 * t] -= slopes[t + 1] / A**2
+        jacobians[t, 1] = following[1] - (B / A) * following[0]
+        jacobians[t, 1, 2 * t] += slopes[t + 1] * B / A**2
+        jacobians[t, 1, 2 * t + 1] -= slopes[t + 1] / A
+        slopes[t] = slopes[t + 1] / A
+    # Above it: C_t = C_{t-1} A_{t-1}, D_t = C_{t-1} B_{t-1} + D_{t-1}.
+    for t in range(reference_index + 1, n_pairs + 1):
+        A, B = pairwise_constants[t - 1]
+        previous = jacobians[t - 1]
+        jacobians[t, 0] = A * previous[0]
+        jacobians[t, 0, 2 * (t - 1)] += slopes[t - 1]
+        jacobians[t, 1] = B * previous[0] + previous[1]
+        jacobians[t, 1, 2 * (t - 1) + 1] += slopes[t - 1]
+        slopes[t] = slopes[t - 1] * A
+    return jacobians
 
 
 def _pair_linker(
@@ -630,95 +833,18 @@ def _prepare_concurrent_relations(
     return compact_relations, selected_arrays
 
 
-def _validated_probabilities(probabilities: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Validate probability bounds and absorb harmless roundoff."""
-    if not np.all(np.isfinite(probabilities)) or np.any(
-        (probabilities < -_PROBABILITY_TOLERANCE)
-        | (probabilities > 1.0 + _PROBABILITY_TOLERANCE)
-    ):
-        raise ValueError("model returned probabilities outside [0, 1]")
-    return np.clip(probabilities, 0.0, 1.0, out=probabilities)
-
-
-def _expected_item_score_curves(
-    model: "BaseItemModel",
-    theta: NDArray[np.float64],
-    item_indices: NDArray[np.int_],
+def _scaled_difference(
+    upper: _ItemCurveSet, lower: _ItemCurveSet, factor: NDArray[np.float64]
 ) -> _ItemCurveSet:
-    """Evaluate selected items without scanning unused portions of large banks.
-
-    Selections covering at least a quarter of the bank use one batched
-    probability call; sparse selections of large banks are evaluated per item.
-    """
-    n_theta = theta.shape[0]
-    if len(item_indices) * 4 >= model.n_items:
-        probabilities = np.asarray(model.probability(theta), dtype=np.float64)
-    else:
-        probabilities = None
-
-    if model.is_polytomous and probabilities is not None:
-        if probabilities.ndim != 3 or probabilities.shape[:2] != (
-            n_theta,
-            model.n_items,
-        ):
-            raise ValueError("model returned invalid polytomous probabilities")
-        probabilities = _validated_probabilities(probabilities[:, item_indices, :])
-        probability_mass = probabilities.sum(axis=2, keepdims=True)
-        if np.any(np.abs(probability_mass - 1.0) > _PROBABILITY_TOLERANCE):
-            raise ValueError("model category probabilities must sum to one")
-        probabilities /= probability_mass
-        categories = np.arange(probabilities.shape[2], dtype=np.float64)
-        category_counts = model.n_categories
-        return _ItemCurveSet(
-            expected=probabilities @ categories,
-            categories=[
-                probabilities[:, column, : category_counts[int(index)]]
-                for column, index in enumerate(item_indices)
-            ],
-        )
-
-    if model.is_polytomous:
-        expected = np.empty((n_theta, len(item_indices)), dtype=np.float64)
-        category_curves: list[NDArray[np.float64]] = []
-        category_counts = model.n_categories
-        for column, item_index in enumerate(item_indices):
-            n_categories = category_counts[int(item_index)]
-            item_probabilities = np.array(
-                model.probability(theta, int(item_index)),
-                dtype=np.float64,
-                copy=True,
-            )
-            if item_probabilities.shape != (n_theta, n_categories):
-                raise ValueError("model returned invalid polytomous probabilities")
-            item_probabilities = _validated_probabilities(item_probabilities)
-            probability_mass = item_probabilities.sum(axis=1, keepdims=True)
-            if np.any(np.abs(probability_mass - 1.0) > _PROBABILITY_TOLERANCE):
-                raise ValueError("model category probabilities must sum to one")
-            item_probabilities /= probability_mass
-            category_curves.append(item_probabilities)
-            expected[:, column] = item_probabilities @ np.arange(
-                n_categories, dtype=np.float64
-            )
-        return _ItemCurveSet(expected=expected, categories=category_curves)
-
-    if probabilities is None:
-        item_curves = []
-        for item_index in item_indices:
-            item_probabilities = np.array(
-                model.probability(theta, int(item_index)),
-                dtype=np.float64,
-                copy=True,
-            )
-            if item_probabilities.shape != (n_theta,):
-                raise ValueError("model returned invalid dichotomous probabilities")
-            item_curves.append(_validated_probabilities(item_probabilities))
-        return _ItemCurveSet(expected=np.column_stack(item_curves), categories=None)
-
-    if probabilities.shape != (n_theta, model.n_items):
-        raise ValueError("model returned invalid dichotomous probabilities")
+    """Expected and category curves of ``factor * (upper - lower)`` by theta row."""
+    categories = None
+    if upper.categories is not None and lower.categories is not None:
+        categories = [
+            factor[:, None] * (above - below)
+            for above, below in zip(upper.categories, lower.categories, strict=True)
+        ]
     return _ItemCurveSet(
-        expected=_validated_probabilities(probabilities[:, item_indices]),
-        categories=None,
+        factor[:, None] * (upper.expected - lower.expected), categories
     )
 
 
@@ -728,8 +854,8 @@ def concurrent_link(
     method: str = "stocking_lord",
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_theta: int = 61,
-    max_iter: int = 50,
-    tol: float = 1e-4,
+    max_iter: int = 100,
+    tol: float = 1e-10,
     reference_index: int = 0,
 ) -> list[tuple[float, float]]:
     """Perform concurrent (simultaneous) linking of multiple forms.
@@ -752,9 +878,14 @@ def concurrent_link(
     n_theta : int
         Number of theta points.
     max_iter : int
-        Maximum iterations.
+        Maximum number of criterion evaluations of the trust-region
+        least-squares solver. Default 100.
     tol : float
-        Convergence tolerance.
+        Relative tolerance on the change in the free forms' ``(log A, B)``
+        between iterations (``xtol`` of :func:`scipy.optimize.least_squares`).
+        The solver also stops once the criterion's relative reduction or its
+        gradient vanishes to rounding accuracy. The default ``1e-10``
+        recovers exact transformations to rounding accuracy.
     reference_index : int
         Model that defines the common metric and theta-weighting grid.
         Its transformation is fixed at ``(1, 0)``.
@@ -763,8 +894,23 @@ def concurrent_link(
     -------
     list[tuple[float, float]]
         (A, B) transformation for each model to common scale.
+
+    Raises
+    ------
+    RuntimeError
+        If the solver exhausts ``max_iter`` or fails before converging.
+
+    Notes
+    -----
+    The criterion is the sum of the relations' squared, theta-weighted
+    curve differences, minimized as a nonlinear least-squares problem in
+    each free form's ``(log A, B)``, with ``A`` bounded in ``[0.01, 100]``.
+    A form's curves depend on its constants only through the grid
+    ``u = (theta - B) / A``, so the Jacobian follows from each curve's theta
+    slope by the chain rule; the slopes are central differences, accurate
+    to about ``1e-10``.
     """
-    from scipy import optimize
+    from scipy import optimize, sparse
 
     n_models = len(models)
     if n_models < 2:
@@ -799,6 +945,7 @@ def concurrent_link(
     theta_grid = np.linspace(theta_range[0], theta_range[1], n_theta)
     weights = np.exp(-0.5 * theta_grid**2)
     weights = weights / np.sum(weights)
+    root_weights = np.sqrt(weights)
     n_free_models = n_models - 1
     free_indices = [index for index in range(n_models) if index != reference_index]
     # The reference metric never changes during optimization.
@@ -816,110 +963,132 @@ def concurrent_link(
     ]
     max_log_slope = float(np.log(100.0))
 
-    def form_curves(
-        params: NDArray[np.float64], position: int, index: int
-    ) -> _ItemCurveSet:
-        slopes = np.exp(params[:n_free_models])
-        theta = (theta_grid - params[n_free_models + position]) / slopes[position]
+    def form_grid(params: NDArray[np.float64], position: int) -> NDArray[np.float64]:
+        """Form coordinates ``(theta - B) / A`` of the reference grid."""
+        slope = np.exp(params[position])
+        return (theta_grid - params[n_free_models + position]) / slope
+
+    def form_curves(index: int, grid: NDArray[np.float64]) -> _ItemCurveSet:
         return _expected_item_score_curves(
-            models[index], theta[:, None], selected_items[index]
+            models[index], grid[:, None], selected_items[index]
         )
 
-    def relation_terms(
+    def side_vector(
+        relation: tuple[int, int, NDArray[np.int_], NDArray[np.int_]],
+        side: int,
+        curves: _ItemCurveSet,
+    ) -> NDArray[np.float64]:
+        """One side's square-root-weighted curves in the relation's layout."""
+        anchors = relation[2 + side]
+        if method != "haebara":
+            return root_weights * curves.expected[:, anchors].sum(axis=1)
+        if curves.categories is None:
+            return (root_weights[:, None] * curves.expected[:, anchors]).ravel()
+        return np.concatenate(
+            [
+                (root_weights[:, None] * curves.categories[int(anchor)]).ravel()
+                for anchor in anchors
+            ]
+        )
+
+    def relation_residuals(
         relation: tuple[int, int, NDArray[np.int_], NDArray[np.int_]],
         score_curves: list[_ItemCurveSet],
-    ) -> list[float]:
-        left_model, right_model, anchors_left, anchors_right = relation
-        left_curves = score_curves[left_model].expected[:, anchors_left]
-        right_curves = score_curves[right_model].expected[:, anchors_right]
-        if method != "haebara":
-            curve_difference = left_curves.sum(axis=1) - right_curves.sum(axis=1)
-            return [float(weights @ curve_difference**2)]
-        left_categories = score_curves[left_model].categories
-        right_categories = score_curves[right_model].categories
-        if left_categories is None or right_categories is None:
-            curve_difference = left_curves - right_curves
-            return [float(np.sum(weights[:, None] * curve_difference**2))]
-        return [
-            float(
-                np.sum(
-                    weights[:, None]
-                    * (
-                        left_categories[int(left_index)]
-                        - right_categories[int(right_index)]
-                    )
-                    ** 2
-                )
-            )
-            for left_index, right_index in zip(anchors_left, anchors_right, strict=True)
-        ]
+    ) -> NDArray[np.float64]:
+        left_model, right_model, _, _ = relation
+        return side_vector(relation, 0, score_curves[left_model]) - side_vector(
+            relation, 1, score_curves[right_model]
+        )
 
-    def total_loss(terms: list[list[float]]) -> float:
-        # Sequential accumulation keeps every probe on the same rounding path.
-        total = 0.0
-        for relation_loss in terms:
-            for term in relation_loss:
-                total += term
-        return total
+    cache: dict[bytes, NDArray[np.float64]] = {}
 
-    cache: dict[bytes, tuple[list[_ItemCurveSet], list[list[float]]]] = {}
-
-    def evaluate(
-        params: NDArray[np.float64],
-    ) -> tuple[list[_ItemCurveSet], list[list[float]]]:
+    def residuals(params: NDArray[np.float64]) -> NDArray[np.float64]:
         key = params.tobytes()
         if key not in cache:
             score_curves = [reference_curves] * n_models
             for position, index in enumerate(free_indices):
-                score_curves[index] = form_curves(params, position, index)
-            terms = [relation_terms(relation, score_curves) for relation in relations]
+                score_curves[index] = form_curves(index, form_grid(params, position))
             cache.clear()
-            cache[key] = (score_curves, terms)
+            cache[key] = np.concatenate(
+                [relation_residuals(relation, score_curves) for relation in relations]
+            )
         return cache[key]
 
-    def criterion(params: NDArray[np.float64]) -> float:
-        return total_loss(evaluate(params)[1])
+    def relation_rows(
+        relation: tuple[int, int, NDArray[np.int_], NDArray[np.int_]],
+    ) -> int:
+        left_model, _, anchors_left, _ = relation
+        if method != "haebara":
+            return n_theta
+        if not models[left_model].is_polytomous:
+            return n_theta * anchors_left.size
+        category_counts = models[left_model].n_categories
+        items = selected_items[left_model][anchors_left]
+        return n_theta * sum(category_counts[int(item)] for item in items)
 
-    def gradient(params: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Forward differences that re-evaluate only the perturbed form."""
-        score_curves, terms = evaluate(params)
-        base_loss = total_loss(terms)
-        result = np.empty_like(params)
+    # First residual row of each relation, and the total, in stacking order.
+    row_offsets = np.cumsum([0] + [relation_rows(relation) for relation in relations])
+
+    def jacobian(
+        params: NDArray[np.float64],
+    ) -> NDArray[np.float64] | sparse.csr_matrix:
+        """Chain-rule derivatives that re-evaluate only each form's own curves.
+
+        ``du/dlog(A) = -u`` and ``du/dB = -1 / A`` scale the theta slopes of
+        the form's curves at its grid ``u``.
+        """
+        rows, columns, values = [], [], []
+        step = _THETA_DIFFERENCE_STEP
         for position, index in enumerate(free_indices):
-            for slot in (position, n_free_models + position):
-                # Match L-BFGS-B's default absolute step and bound handling.
-                step = _FORWARD_DIFFERENCE_STEP
-                if slot < n_free_models and params[slot] + step > max_log_slope:
-                    step = -step
-                probe = params.copy()
-                probe[slot] = params[slot] + step
-                probe_curves = list(score_curves)
-                probe_curves[index] = form_curves(probe, position, index)
-                probe_terms = list(terms)
+            grid = form_grid(params, position)
+            upper = form_curves(index, grid + step)
+            lower = form_curves(index, grid - step)
+            factors = (-grid, np.full(n_theta, -np.exp(-params[position])))
+            for column, factor in zip(
+                (position, n_free_models + position), factors, strict=True
+            ):
+                derivative = _scaled_difference(upper, lower, factor / (2.0 * step))
                 for relation_position in incident_relations[index]:
-                    probe_terms[relation_position] = relation_terms(
-                        relations[relation_position], probe_curves
-                    )
-                result[slot] = (total_loss(probe_terms) - base_loss) / (
-                    probe[slot] - params[slot]
-                )
-        return result
+                    relation = relations[relation_position]
+                    side = 0 if relation[0] == index else 1
+                    entries = side_vector(relation, side, derivative)
+                    start = int(row_offsets[relation_position])
+                    rows.append(np.arange(start, start + entries.size))
+                    columns.append(np.full(entries.size, column))
+                    values.append(entries if side == 0 else -entries)
+        shape = (int(row_offsets[-1]), 2 * n_free_models)
+        if shape[0] * shape[1] > _DENSE_JACOBIAN_ELEMENTS:
+            return sparse.csr_matrix(
+                (
+                    np.concatenate(values),
+                    (np.concatenate(rows), np.concatenate(columns)),
+                ),
+                shape=shape,
+            )
+        matrix = np.zeros(shape, dtype=np.float64)
+        for row, column, entries in zip(rows, columns, values, strict=True):
+            matrix[row, column] = entries
+        return matrix
 
     x0 = np.zeros(2 * n_free_models, dtype=np.float64)
-    bounds = [(-max_log_slope, max_log_slope)] * n_free_models + [
-        (None, None)
-    ] * n_free_models
+    unbounded = np.full(n_free_models, np.inf)
+    log_slope_bound = np.full(n_free_models, max_log_slope)
+    bounds = (np.r_[-log_slope_bound, -unbounded], np.r_[log_slope_bound, unbounded])
 
-    result = optimize.minimize(
-        criterion,
+    result = optimize.least_squares(
+        residuals,
         x0,
-        jac=gradient,
-        method="L-BFGS-B",
+        jac=jacobian,
         bounds=bounds,
-        options={"maxiter": int(max_iter), "ftol": tol, "gtol": tol},
+        method="trf",
+        x_scale="jac",
+        ftol=_CONCURRENT_FTOL,
+        xtol=float(tol),
+        gtol=_CONCURRENT_GTOL,
+        max_nfev=int(max_iter),
     )
 
-    if not np.all(np.isfinite(result.x)) or not np.isfinite(result.fun):
+    if not np.all(np.isfinite(result.x)) or not np.all(np.isfinite(result.fun)):
         raise RuntimeError("concurrent linking failed to find a finite solution")
     if not result.success:
         raise RuntimeError(f"concurrent linking failed to converge: {result.message}")
@@ -958,16 +1127,27 @@ def chain_linking_summary(result: ChainLinkingResult) -> str:
     lines.append(f"Reference index: {result.reference_index}")
     lines.append("")
 
+    standard_errors = (
+        None
+        if result.cumulative_A_se is None or result.cumulative_B_se is None
+        else list(zip(result.cumulative_A_se, result.cumulative_B_se, strict=True))
+    )
     lines.append("Cumulative Transformations to Reference Scale")
     lines.append("-" * 50)
-    lines.append(f"{'Time':>6} {'A':>12} {'B':>12}")
+    header = f"{'Time':>6} {'A':>12} {'B':>12}"
+    if standard_errors is not None:
+        header += f" {'SE(A)':>10} {'SE(B)':>10}"
+    lines.append(header)
     lines.append("-" * 50)
 
     for t, (A, B) in enumerate(
         zip(result.cumulative_A, result.cumulative_B, strict=True)
     ):
         marker = " *" if t == result.reference_index else ""
-        lines.append(f"{t:>6} {A:>12.4f} {B:>12.4f}{marker}")
+        row = f"{t:>6} {A:>12.4f} {B:>12.4f}"
+        if standard_errors is not None:
+            row += f" {standard_errors[t][0]:>10.4f} {standard_errors[t][1]:>10.4f}"
+        lines.append(row + marker)
 
     lines.append("-" * 50)
     lines.append("* = reference point")
@@ -979,6 +1159,10 @@ def chain_linking_summary(result: ChainLinkingResult) -> str:
     for t, pr in enumerate(result.pairwise_results):
         lines.append(f"Time {t + 1} -> {t}:")
         lines.append(f"  A = {pr.constants.A:.4f}, B = {pr.constants.B:.4f}")
+        if pr.constants.A_se is not None and pr.constants.B_se is not None:
+            lines.append(
+                f"  SE(A) = {pr.constants.A_se:.4f}, SE(B) = {pr.constants.B_se:.4f}"
+            )
         lines.append(f"  Method: {pr.constants.method}")
 
         if pr.fit_statistics is not None:

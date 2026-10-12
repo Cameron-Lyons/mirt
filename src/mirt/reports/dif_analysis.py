@@ -17,6 +17,7 @@ class DIFAnalysisReport(HTMLReport):
     """Generate HTML report for Differential Item Functioning (DIF) analysis.
 
     This report includes:
+
     - Analysis summary (method, groups, items analyzed/flagged)
     - DIF statistics table with ETS A/B/C classification
     - DIF effect size plot
@@ -29,12 +30,16 @@ class DIFAnalysisReport(HTMLReport):
     ----------
     dif_results : dict
         DIF analysis results from compute_dif, containing:
+
         - 'statistic': Test statistic for each item
         - 'p_value': P-value for each item
         - 'effect_size': Effect size measure
+        - 'ets_effect' (optional): MH D-DIF or SMD/SD behind the class,
+          plotted against the ETS thresholds of 'ets_scale'
         - 'classification': ETS classification (A/B/C)
-    data : ndarray
-        Response matrix (n_persons x n_items).
+    data : array-like or DataFrame
+        Response matrix (n_persons x n_items); ``NaN`` and nullable-column
+        nulls (``pd.NA``) are missing responses.
     groups : ndarray
         Group membership array.
     method : str, optional
@@ -75,7 +80,11 @@ class DIFAnalysisReport(HTMLReport):
         include_plots: bool = True,
     ) -> None:
         super().__init__(title)
-        data_array = np.asarray(data)
+        from mirt.utils.data import _missing_coded_responses
+
+        # Nullable DataFrame columns (pd.NA) read as missing codes, as in
+        # compute_dif, instead of an object array.
+        data_array = np.asarray(_missing_coded_responses(data))
         groups_array = np.asarray(groups)
         if data_array.ndim != 2 or 0 in data_array.shape:
             raise MirtDataError(
@@ -118,7 +127,13 @@ class DIFAnalysisReport(HTMLReport):
                 expected=f"length {n_items}",
             )
 
-        for key in ("statistic", "p_value", "effect_size", "classification"):
+        for key in (
+            "statistic",
+            "p_value",
+            "effect_size",
+            "ets_effect",
+            "classification",
+        ):
             if key not in dif_results:
                 continue
             values = np.asarray(dif_results[key])
@@ -193,7 +208,11 @@ class DIFAnalysisReport(HTMLReport):
     def _build_dif_table(self) -> str:
         from mirt.reports._templates import format_label, format_value, table_from_data
 
+        ets_effect = self.dif_results.get("ets_effect")
         headers = ["Item", "Statistic", "p-value", "Effect Size", "Class"]
+        if ets_effect is not None:
+            # The MH D-DIF or SMD/SD behind the class (see the guide below).
+            headers.insert(4, "ETS Effect")
         rows: list[list[str]] = []
 
         statistic = self.dif_results.get("statistic", np.zeros(len(self.item_names)))
@@ -215,15 +234,16 @@ class DIFAnalysisReport(HTMLReport):
 
             p_quality = "poor" if p < 0.05 else None
 
-            rows.append(
-                [
-                    self.item_names[i],
-                    format_value(stat, ".3f"),
-                    format_value(p, ".4f", p_quality),
-                    format_value(es, ".4f"),
-                    format_label(cls, quality),
-                ]
-            )
+            row = [
+                self.item_names[i],
+                format_value(stat, ".3f"),
+                format_value(p, ".4f", p_quality),
+                format_value(es, ".4f"),
+                format_label(cls, quality),
+            ]
+            if ets_effect is not None:
+                row.insert(4, format_value(ets_effect[i], ".3f"))
+            rows.append(row)
 
         return table_from_data(headers, rows)
 
@@ -234,9 +254,9 @@ class DIFAnalysisReport(HTMLReport):
             """
         <h4>ETS DIF Classification System</h4>
         <ul>
-            <li><strong class="good">A (Negligible):</strong> |effect size| &lt; 0.426 OR not statistically significant</li>
-            <li><strong class="warning">B (Moderate):</strong> 0.426 &le; |effect size| &lt; 0.638 AND statistically significant</li>
-            <li><strong class="poor">C (Large):</strong> |effect size| &ge; 0.638 AND statistically significant</li>
+            <li><strong class="good">A (Negligible):</strong> |MH D-DIF| &lt; 1 (polytomous: |SMD/SD| &le; 0.17) OR not statistically significant</li>
+            <li><strong class="warning">B (Moderate):</strong> 1 &le; |MH D-DIF| &lt; 1.5 (polytomous: 0.17 &lt; |SMD/SD| &le; 0.25) AND statistically significant</li>
+            <li><strong class="poor">C (Large):</strong> |MH D-DIF| &ge; 1.5 (polytomous: |SMD/SD| &gt; 0.25) AND statistically significant</li>
         </ul>
         <h4>Recommended Actions</h4>
         <ul>

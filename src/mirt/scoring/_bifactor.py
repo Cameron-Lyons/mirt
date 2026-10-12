@@ -5,7 +5,8 @@ conditionally independent, so the posterior moments of every factor follow
 from one two-dimensional (general by specific) grid per specific factor. The
 results equal EAP on the full ``n_quadpts ** (1 + S)`` product grid at the
 same number of points per dimension, at a cost linear rather than
-exponential in the number of specific factors ``S``.
+exponential in the number of specific factors ``S``. Dichotomous and graded
+items enter through the log-probabilities of their categories.
 
 References
 ----------
@@ -28,7 +29,7 @@ from mirt.scoring._common import resolve_prior_distribution
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
-    from mirt.models.bifactor import BifactorModel
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 
 # Relative size of a specific-factor conditional covariance below which the
 # specific factors count as conditionally independent given the general one.
@@ -45,7 +46,7 @@ class ReducedBifactorGrid:
     the Cholesky-transformed product grid that EAP otherwise integrates.
     """
 
-    model: BifactorModel
+    model: BifactorModel | GradedBifactorModel
     nodes: NDArray[np.float64]
     log_weights: NDArray[np.float64]
     mean: NDArray[np.float64]
@@ -62,16 +63,17 @@ def reduced_bifactor_grid(
 ) -> ReducedBifactorGrid | None:
     """Return the reduced grid, or ``None`` when the reduction does not apply.
 
-    The reduction needs a built-in :class:`~mirt.models.BifactorModel` and a
-    normal prior under which the specific factors are conditionally
-    independent given the general factor, such as any diagonal covariance.
+    The reduction needs a built-in :class:`~mirt.models.BifactorModel` or
+    :class:`~mirt.models.GradedBifactorModel` and a normal prior under which
+    the specific factors are conditionally independent given the general
+    factor, such as any diagonal covariance.
     """
     from mirt._model_defaults import uses_builtin_model_hooks
-    from mirt.models.bifactor import BifactorModel
+    from mirt.models.bifactor import BifactorModel, GradedBifactorModel
 
-    if not isinstance(model, BifactorModel) or not uses_builtin_model_hooks(
-        model, likelihood=True
-    ):
+    if not isinstance(
+        model, (BifactorModel, GradedBifactorModel)
+    ) or not uses_builtin_model_hooks(model, likelihood=True):
         return None
     mean, cov = resolve_prior_distribution(
         n_factors=model.n_factors, prior_mean=prior_mean, prior_cov=prior_cov
@@ -100,12 +102,14 @@ def reduced_bifactor_grid(
 
 def _log_curves(
     grid: ReducedBifactorGrid,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Return clipped log item probabilities on the ``(Q * Q, items)`` grid.
+) -> tuple[NDArray[np.float64], NDArray[np.intp], NDArray[np.intp]]:
+    """Return clipped category log-probabilities on the ``(Q * Q)`` grid.
 
-    Rows are ordered general node first. Every specific column holds its own
-    factor's nodes, so each item is evaluated on its factor's grid, with the
-    clipping of the model's likelihood.
+    The table has one row per node, general node first, and one column per
+    item category, item-major; ``offsets`` and ``sizes`` locate each item's
+    columns. Every specific column of theta holds its own factor's nodes, so
+    each item is evaluated on its factor's grid, with the clipping of the
+    model's likelihood.
     """
     nodes = grid.nodes
     general = np.repeat(nodes, nodes.size)
@@ -115,10 +119,20 @@ def _log_curves(
     theta[:, 1:] = (
         grid.mean[1:] + np.outer(general, grid.cross) + np.outer(specific, grid.scale)
     )
-    probability = np.clip(
-        grid.model.probability(theta), PROB_EPSILON, 1.0 - PROB_EPSILON
-    )
-    return np.log(probability), np.log1p(-probability)
+    model = grid.model
+    if model.is_polytomous:
+        sizes = np.asarray(model.n_categories, dtype=np.intp)
+        present = np.arange(int(sizes.max())) < sizes[:, None]
+        probability = model.probability(theta).transpose(1, 2, 0)[present].T
+        table = np.log(np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON))
+    else:
+        sizes = np.full(model.n_items, 2, dtype=np.intp)
+        correct = np.clip(model.probability(theta), PROB_EPSILON, 1.0 - PROB_EPSILON)
+        table = np.empty((general.size, 2 * model.n_items))
+        table[:, 0::2] = np.log1p(-correct)
+        table[:, 1::2] = np.log(correct)
+    offsets = np.concatenate(([0], np.cumsum(sizes)[:-1])).astype(np.intp)
+    return table, offsets, sizes
 
 
 def bifactor_eap(
@@ -135,12 +149,18 @@ def bifactor_eap(
     nodes = grid.nodes
     n_points = nodes.size
     nodes_squared = nodes**2
-    log_p, log_q = _log_curves(grid)
+    table, offsets, sizes = _log_curves(grid)
     groups = [
         np.flatnonzero(model._specific_factor_indices == factor)
         for factor in range(model.n_specific_factors)
     ]
-    curves = [(items, log_p[:, items].T, log_q[:, items].T) for items in groups]
+    # Each factor's category columns and their log-probability rows.
+    curves = []
+    for items in groups:
+        columns = np.concatenate(
+            [np.arange(offsets[item], offsets[item] + sizes[item]) for item in items]
+        )
+        curves.append((columns, table[:, columns].T))
     n_patterns = patterns.shape[0]
     theta = np.empty((n_patterns, model.n_factors))
     variance = np.empty_like(theta)
@@ -148,17 +168,18 @@ def bifactor_eap(
     for start in range(0, n_patterns, rows):
         stop = min(start + rows, n_patterns)
         block = patterns[start:stop]
-        correct = (block == 1).astype(np.float64)
-        incorrect = (block == 0).astype(np.float64)
         n = stop - start
+        persons, items = np.nonzero(block >= 0)
+        indicators = np.zeros((n, table.shape[1]))
+        indicators[persons, offsets[items] + block[persons, items]] = 1.0
         log_general = np.tile(grid.log_weights, (n, 1))
         # Moments of z_k given each general node, per specific factor k.
         first = np.empty((len(groups), n, n_points))
         second = np.empty_like(first)
-        for factor, (items, log_p_items, log_q_items) in enumerate(curves):
-            log_joint = correct[:, items] @ log_p_items
-            log_joint += incorrect[:, items] @ log_q_items
-            log_joint = log_joint.reshape(n, n_points, n_points)
+        for factor, (columns, log_curves) in enumerate(curves):
+            log_joint = (indicators[:, columns] @ log_curves).reshape(
+                n, n_points, n_points
+            )
             log_joint += grid.log_weights
             shift = log_joint.max(axis=2, keepdims=True)
             log_joint -= shift

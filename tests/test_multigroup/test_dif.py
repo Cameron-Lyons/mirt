@@ -130,16 +130,17 @@ class TestDropScheme:
             "converged",
             "round",
         ]
-        assert list(frame["item"]) == [f"Item_{index}" for index in range(8)]
+        # Default names are 1-based, as in fit_mirt and itemfit.
+        assert list(frame["item"]) == [f"Item_{index + 1}" for index in range(8)]
         assert list(frame["flagged"]) == [True] + [False] * 7
 
 
 def test_public_function_tests_selected_items(dif_data, drop_table) -> None:
     data, groups = dif_data
 
-    frame = multigroup_dif(data, groups, items=["Item_1", 0], **FIT)
+    frame = multigroup_dif(data, groups, items=["Item_2", 0], **FIT)
 
-    assert list(frame["item"]) == ["Item_0", "Item_1"]
+    assert list(frame["item"]) == ["Item_1", "Item_2"]
     rows = _rows(drop_table)
     np.testing.assert_allclose(
         list(frame["chi2"]), [rows[0].chi2, rows[1].chi2], atol=1e-6

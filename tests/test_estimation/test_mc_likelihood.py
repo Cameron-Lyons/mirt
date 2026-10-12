@@ -1,13 +1,16 @@
 """Bounded Monte Carlo likelihoods and preservation of model callbacks."""
 
 import tracemalloc
+import warnings
 from types import MethodType
 
 import numpy as np
 import pytest
 
+import mirt
 from mirt.estimation import _mc_likelihood as likelihood_module
 from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator, StochasticEMEstimator
+from mirt.estimation.quadrature import RectangularQuadrature
 from mirt.models.base import BaseItemModel, DichotomousItemModel, PolytomousItemModel
 from mirt.models.bifactor import BifactorModel
 from mirt.models.dichotomous import (
@@ -27,6 +30,7 @@ from mirt.models.polytomous import (
     NominalResponseModel,
     PartialCreditModel,
 )
+from mirt.utils.numeric import logsumexp
 
 
 def _model(kind):
@@ -449,3 +453,81 @@ def test_qmc_independent_draws_use_bounded_reduction():
         model, responses, samples
     )
     np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
+
+
+def _prior_grid_log_likelihood(model, responses, mean, variance):
+    """Integrate a unidimensional model on EM's grid over a normal prior."""
+    sd = np.sqrt(variance)
+    quadrature = RectangularQuadrature(
+        61,
+        mean=np.array([mean]),
+        cov=np.array([[variance]]),
+        limits=(mean - 6 * sd, mean + 6 * sd),
+    )
+    joint = model.log_likelihood_batch(responses, quadrature.nodes)
+    return float(np.sum(logsumexp(joint + np.log(quadrature.weights), axis=1)))
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: MCEMEstimator(n_samples=50, max_iter=3, seed=7),
+        lambda: MCEMEstimator(
+            n_samples=50, max_iter=3, seed=7, importance_sampling=False
+        ),
+        lambda: QMCEMEstimator(n_samples=64, max_iter=3, seed=7),
+        lambda: StochasticEMEstimator(max_iter=3, seed=7, burnin=0),
+    ],
+    ids=["importance", "posterior", "sobol", "stochastic"],
+)
+def test_reported_log_likelihood_is_the_marginal_at_the_estimates(factory):
+    # Posterior-draw fits used to report a harmonic-mean estimate thousands
+    # below the marginal log-likelihood, and importance-sampling fits a noisy
+    # estimate, so their information criteria were not comparable with EM's.
+    responses = mirt.simdata("2PL", n_persons=200, n_items=6, seed=4)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = factory().fit(
+            TwoParameterLogistic(6), responses, np.array([0.3]), np.array([[1.5]])
+        )
+    expected = _prior_grid_log_likelihood(result.model, responses, 0.3, 1.5)
+    assert result.log_likelihood == pytest.approx(expected, rel=1e-12)
+    assert result.aic == pytest.approx(-2 * expected + 2 * result.n_parameters)
+    assert result.bic == pytest.approx(
+        -2 * expected + np.log(len(responses)) * result.n_parameters
+    )
+
+
+@pytest.mark.parametrize("n_factors", [1, 2, 3, 7])
+def test_prior_grid_integrates_the_gaussian_prior(n_factors):
+    rng = np.random.default_rng(3)
+    mean = rng.normal(size=n_factors)
+    factor = rng.normal(size=(n_factors, n_factors))
+    covariance = factor @ factor.T + n_factors * np.eye(n_factors)
+    grid = likelihood_module.prior_grid(
+        mean, np.linalg.cholesky(covariance), np.random.default_rng(4)
+    )
+    # EM's default grid up to six factors; scrambled Sobol points beyond.
+    n_nodes = {1: 61, 2: 31**2, 3: 15**3, 7: 4096}[n_factors]
+    assert grid.nodes.shape == (n_nodes, n_factors) == (grid.n_total_points, n_factors)
+    assert not grid.nodes.flags.writeable and not grid.weights.flags.writeable
+    assert grid.weights.sum() == pytest.approx(1.0)
+    tolerance = 0.05 if n_factors == 7 else 1e-8
+    np.testing.assert_allclose(grid.weights @ grid.nodes, mean, atol=tolerance)
+    centred = grid.nodes - mean
+    np.testing.assert_allclose(
+        (grid.weights[:, None] * centred).T @ centred,
+        covariance,
+        atol=tolerance * n_factors,
+    )
+
+
+def test_high_dimensional_fit_reports_a_reproducible_quasi_monte_carlo_likelihood():
+    model = TwoParameterLogistic(3, n_factors=7)
+    responses = np.random.default_rng(5).integers(0, 2, (30, 3))
+    results = [
+        QMCEMEstimator(n_samples=64, max_iter=2, seed=6).fit(model.copy(), responses)
+        for _ in range(2)
+    ]
+    assert np.isfinite(results[0].log_likelihood)
+    assert results[0].log_likelihood == results[1].log_likelihood

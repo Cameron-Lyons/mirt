@@ -141,10 +141,12 @@ class MixedFormatEMEstimator(EMEstimator):
     example ``{"3PL.guessing": BetaPrior(5, 17)}``, or without one to apply
     to every component that has the parameter.
 
-    With ``se_method="auto"``, standard errors come from the observed
-    information (``"oakes"``) when every component is a unidimensional
-    built-in 1PL-4PL, GRM, GPCM, PCM, RSM or GRSM model, and from itemwise
-    complete-data curvature otherwise. The observed information, score
+    With ``se_method="auto"``, standard errors come from the exact observed
+    information (``"oakes"``) when the person likelihood is the product of
+    the components' item curves and every component has exact item-local
+    derivatives, as the built-in item families (with any number of
+    factors) and custom item models do; otherwise they come from itemwise
+    complete-data curvature. The observed information, score
     cross-product and sandwich estimators treat all components jointly, so
     ``FitResult.vcov`` includes covariances between components. Item priors
     add their curvature to the information of every estimator.
@@ -308,26 +310,6 @@ class MixedFormatEMEstimator(EMEstimator):
                     super()._m_step(fit.model, fit.context.responses, posterior_weights)
             finally:
                 self._fit_context, self._prior_penalty = context, penalty
-
-    def _resolve_se_method(
-        self,
-        model: BaseItemModel,
-        person_weights: NDArray[np.float64] | None,
-    ) -> str:
-        from mirt.estimation._louis_information import has_analytic_item_derivatives
-        from mirt.models.mixed_format import MixedItemModel, uses_component_likelihoods
-
-        if not isinstance(model, MixedItemModel):
-            return super()._resolve_se_method(model, person_weights)
-        if person_weights is not None or self.se_method == "complete_data":
-            return "complete_data"
-        if self.se_method != "auto":
-            return self.se_method
-        analytic = uses_component_likelihoods(model) and all(
-            has_analytic_item_derivatives(component)
-            for component in model.component_models
-        )
-        return "oakes" if analytic else "complete_data"
 
     def _compute_standard_errors(
         self,

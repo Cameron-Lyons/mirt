@@ -11,9 +11,6 @@ import mirt
 from mirt._prior_mass import gaussian_log_quadrature_mass
 from mirt._rust_backend import (
     RUST_AVAILABLE,
-    cat_eap_update,
-    e_step_complete,
-    em_iteration_2pl,
     multigroup_e_step_2pl,
     multigroup_e_step_3pl,
     multigroup_e_step_gpcm,
@@ -142,66 +139,6 @@ def test_multigroup_python_e_steps_use_normalized_group_masses() -> None:
         mirt.set_backend(previous_backend)
 
 
-@pytest.mark.parametrize("backend", ["numpy", "rust"])
-def test_complete_e_step_and_cat_update_preserve_prior_moments(backend: str) -> None:
-    if backend == "rust" and not RUST_AVAILABLE:
-        pytest.skip("Rust extension is not available")
-
-    previous_backend = mirt.get_backend()
-    try:
-        mirt.set_backend(backend)
-        quadrature = GaussHermiteQuadrature(n_points=31)
-        mean, variance = 0.75, 0.8
-        posterior, marginal = e_step_complete(
-            np.array([[-1]], dtype=np.int_),
-            quadrature.nodes.ravel(),
-            quadrature.weights,
-            np.ones(1),
-            np.zeros(1),
-            prior_mean=mean,
-            prior_var=variance,
-        )
-        _assert_gaussian_moments(posterior[0], quadrature, mean, variance)
-        np.testing.assert_allclose(marginal, 1.0, atol=1e-14)
-
-        theta, standard_error = cat_eap_update(
-            np.array([], dtype=np.int_),
-            np.array([], dtype=np.int_),
-            np.ones(1),
-            np.zeros(1),
-            quadrature.nodes.ravel(),
-            quadrature.weights,
-        )
-        np.testing.assert_allclose(theta, 0.0, atol=1e-14)
-        np.testing.assert_allclose(standard_error, 1.0, atol=1e-14)
-    finally:
-        mirt.set_backend(previous_backend)
-
-
-@pytest.mark.skipif(not RUST_AVAILABLE, reason="Rust extension is not available")
-def test_native_iteration_uses_normalized_shifted_prior() -> None:
-    previous_backend = mirt.get_backend()
-    try:
-        mirt.set_backend("rust")
-        quadrature = GaussHermiteQuadrature(n_points=31)
-        result = em_iteration_2pl(
-            np.array([[-1]], dtype=np.int_),
-            quadrature.nodes.ravel(),
-            quadrature.weights,
-            np.ones(1),
-            np.zeros(1),
-            prior_mean=0.75,
-            prior_var=0.8,
-            max_m_iter=1,
-        )
-        assert result is not None
-        posterior, log_likelihood = result[2], result[3]
-        _assert_gaussian_moments(posterior[0], quadrature, 0.75, 0.8)
-        np.testing.assert_allclose(log_likelihood, 0.0, atol=1e-14)
-    finally:
-        mirt.set_backend(previous_backend)
-
-
 def _native_fit_responses() -> np.ndarray:
     rng = np.random.default_rng(4127)
     theta = rng.standard_normal(600)
@@ -271,14 +208,10 @@ def test_native_fit_reports_likelihood_for_returned_parameters() -> None:
         use_rust=True,
     )
     quadrature = GaussHermiteQuadrature(n_points=9)
-    _, marginal = e_step_complete(
-        responses,
-        quadrature.nodes.ravel(),
-        quadrature.weights,
-        result.model.discrimination,
-        result.model.difficulty,
+    log_likelihoods = result.model.log_likelihood_batch(responses, quadrature.nodes)
+    expected_likelihood = float(
+        np.logaddexp.reduce(log_likelihoods + np.log(quadrature.weights), axis=1).sum()
     )
-    expected_likelihood = float(np.log(marginal).sum())
 
     assert result.log_likelihood == pytest.approx(expected_likelihood, abs=1e-10)
     assert result.aic == pytest.approx(

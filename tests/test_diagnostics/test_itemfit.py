@@ -537,7 +537,7 @@ class TestStatisticNames:
     """Unknown statistic names fail instead of being silently dropped."""
 
     @pytest.mark.parametrize(
-        "statistics", [["X3"], ["infit", "s_x2"], ["Zh"], ["infit", "lz"], []]
+        "statistics", [["X3"], ["infit", "s_x2"], ["zh"], ["infit", "lz"], []]
     )
     def test_compute_itemfit_rejects_unknown_names(self, statistics):
         from mirt.exceptions import MirtValidationError
@@ -582,6 +582,7 @@ class TestStatisticNames:
             "X2",
             "G2",
             "PV_Q1",
+            "Zh",
         }
 
 
@@ -643,3 +644,77 @@ def test_top_level_itemfit_accepts_external_abilities():
 
     for name in statistics:
         assert_allclose(np.asarray(frame[name]), expected[name])
+
+
+def _reference_item_zh(probabilities, responses):
+    """Direct per-item sums of l0, E[l0] and Var[l0] over observed persons."""
+    valid = responses >= 0
+    codes = np.where(valid, responses, 0).astype(int)
+    # Zero-padded categories of shorter items contribute nothing.
+    log_p = np.log(np.where(probabilities > 0, probabilities, 1.0))
+    picked = np.take_along_axis(log_p, codes[..., None], axis=2)[..., 0]
+    mean = np.sum(probabilities * log_p, axis=2)
+    variance = np.sum(probabilities * log_p**2, axis=2) - mean**2
+    totals = [
+        np.where(valid, values, 0.0).sum(axis=0) for values in (picked, mean, variance)
+    ]
+    return (totals[0] - totals[1]) / np.sqrt(totals[2])
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+def test_item_zh_sums_log_likelihood_terms_over_persons(polytomous):
+    from mirt.models import GradedResponseModel, TwoParameterLogistic
+
+    rng = np.random.default_rng(13)
+    n_items = 6
+    if polytomous:
+        model = GradedResponseModel(n_items, n_categories=[2, 3, 4, 3, 5, 4])
+        model.set_parameters(discrimination=rng.uniform(0.7, 1.8, n_items))
+    else:
+        model = TwoParameterLogistic(n_items)
+        model.set_parameters(
+            discrimination=rng.uniform(0.7, 1.8, n_items),
+            difficulty=rng.normal(size=n_items),
+        )
+    theta = rng.normal(size=(250, 1))
+    probabilities = np.asarray(model.probability(theta))
+    if not polytomous:
+        probabilities = np.stack([1 - probabilities, probabilities], axis=2)
+    cumulative = probabilities.cumsum(axis=2)
+    responses = (rng.random((250, n_items, 1)) > cumulative).sum(axis=2)
+    responses[rng.random(responses.shape) < 0.1] = -1
+
+    result = compute_itemfit(model, responses, ["Zh"], theta=theta)
+
+    assert_allclose(
+        result["Zh"], _reference_item_zh(probabilities, responses), rtol=1e-10
+    )
+    # Under the generating abilities the statistic is centered.
+    assert abs(np.mean(result["Zh"])) < 1.5
+
+
+def test_item_zh_with_eap_abilities_warns_and_reaches_the_top_level():
+    import mirt
+    from mirt.results.fit_result import FitResult
+
+    model, responses, theta = _two_parameter_sample(n_persons=400)
+    result = FitResult(
+        model=model,
+        log_likelihood=-1.0,
+        n_iterations=1,
+        converged=True,
+        standard_errors={},
+        aic=0.0,
+        bic=0.0,
+        n_observations=responses.shape[0],
+        n_parameters=40,
+    )
+    with pytest.warns(UserWarning, match="Zh with EAP abilities"):
+        eap = compute_itemfit(model, responses, ["Zh"])
+    # EAP abilities adapt to the responses, so items look too predictable.
+    assert np.mean(eap["Zh"]) > 1.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        frame = mirt.itemfit(result, responses, ["Zh", "infit"], theta=theta)
+    expected = compute_itemfit(model, responses, ["Zh"], theta=theta)
+    assert_allclose(np.asarray(frame["Zh"]), expected["Zh"])

@@ -8,9 +8,11 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from scipy.special import ndtri
 
+from mirt.cat._names import resolve_name
 from mirt.cat._native import register_native_defaults as _register_native_defaults
 from mirt.cat._stopping_common import (
     ChangeTracker,
+    classification_confidence,
     combination_operator,
     finite_real,
     integer,
@@ -324,14 +326,13 @@ class ClassificationStop(StoppingRule):
     cut_score : float
         The ability cut score for classification.
     confidence : float, optional
-        Required confidence level (0-1). Default is 0.95.
+        Required one-sided confidence, strictly between 0.5 and 1. Default
+        is 0.95.
     """
 
     def __init__(self, cut_score: float, confidence: float = 0.95):
         cut_score_value = finite_real(cut_score, "cut_score")
-        confidence_value = finite_real(confidence, "confidence")
-        if not 0.0 < confidence_value < 1.0:
-            raise ValueError("confidence must be between 0 and 1")
+        confidence_value = classification_confidence(confidence)
         self.cut_score = cut_score_value
         self.confidence = confidence_value
         self._critical_z = float(ndtri(confidence_value))
@@ -346,10 +347,10 @@ class ClassificationStop(StoppingRule):
             raise ValueError("state.standard_error must be non-negative")
 
         distance = abs(theta - self.cut_score)
-        if standard_error == 0.0 or math.isinf(standard_error):
-            confident = distance > 0.0 if standard_error == 0.0 else False
-            if self._critical_z <= 0.0:
-                confident = True
+        if math.isinf(standard_error):
+            confident = False
+        elif standard_error == 0.0:
+            confident = distance > 0.0
         else:
             confident = distance >= self._critical_z * standard_error
 
@@ -429,9 +430,11 @@ def create_stopping_rule(
     ----------
     method : str
         Stopping rule name. One of: "SE", "max_items", "min_items",
-        "theta_change", "se_change", "classification", "combined". Rules
-        that need the item model, such as :class:`MinInformationStop`, are
-        constructed directly.
+        "theta_change", "se_change", "classification", "combined". Names
+        match regardless of case and surrounding whitespace, and ``"-"`` is
+        accepted for ``"_"``, so ``"se"`` and ``"max-items"`` also work.
+        Rules that need the item model, such as :class:`MinInformationStop`,
+        are constructed directly.
     **kwargs
         Additional keyword arguments passed to the rule constructor.
 
@@ -455,8 +458,5 @@ def create_stopping_rule(
         "combined": CombinedStop,
     }
 
-    if method not in rules:
-        valid = ", ".join(rules.keys())
-        raise ValueError(f"Unknown stopping rule '{method}'. Valid options: {valid}")
-
-    return rules[method](**kwargs)
+    _, rule_class = resolve_name(method, rules, kind="stopping rule")
+    return rule_class(**kwargs)

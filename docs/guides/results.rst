@@ -52,11 +52,65 @@ Diagnostic group refits use this mode by default.
 ``coef()`` and ``coef_with_se()`` methods remain available for item-aligned one- and
 two-dimensional parameters through the configured pandas or polars backend.
 
+Rotating exploratory solutions
+------------------------------
+
+An exploratory fit, such as ``fit_mirt(responses, model="2PL", n_factors=2)``,
+determines its factors only up to a rotation. ``get_rotated_loadings`` rotates the
+standardized loadings as R mirt's ``summary(rotate=...)`` does, and
+``apply_rotation_to_model`` re-expresses the fit on the rotated factors, like R's
+``coef(rotate=...)``:
+
+.. code-block:: python
+
+   from mirt.utils.rotation import apply_rotation_to_model, get_rotated_loadings
+
+   result = mirt.fit_mirt(responses, model="2PL", n_factors=2)
+   loadings, phi = get_rotated_loadings(result, "oblimin", standardized=True)
+
+   apply_rotation_to_model(result, "oblimin")
+   print(result.factor_correlation)
+   scores = mirt.fscores(result, responses)
+
+Both accept a ``FitResult`` or its model: a 2PL, GRM, GPCM, NRM or ``MIRT`` model
+whose slopes on two or more factors are all free. ``apply_rotation_to_model`` maps
+the slopes ``a`` to ``a @ T`` and the factors to ``inv(T) @ theta``. An oblique
+rotation records the factor correlation ``inv(T) @ inv(T).T`` as the result's
+``latent_covariance``, so the marginal likelihood, response probabilities and fit
+statistics are unchanged, and scoring, simulation and diagnostics use the correlated
+factors. A bare model has nowhere to keep that correlation, so it accepts only
+orthogonal rotations. The 2PL, GRM and GPCM have multidimensional logits
+``a @ theta - sum(a) * b``, so their locations ``b`` are rescaled to keep each
+item's intercepts. The standard errors and ``vcov`` entries of the rotated
+parameters become ``NaN``, as R drops them.
+
+``rotate_loadings`` provides varimax, quartimax, equamax, orthogonal and oblique
+geomin (``geominT``, ``geominQ``), bifactor (``bifactorT``, ``bifactorQ``), target
+and partially specified target (``targetT``, ``targetQ``, ``pstT``, ``pstQ``),
+oblimin, quartimin and promax rotations. Every criterion except promax is minimized
+by gradient projection (Jennrich, 2001, 2002) with a monotone line search, from the
+identity and from ``random_starts`` random orthogonal starts. The defaults follow R
+mirt. Kaiser normalization is off (``normalize=None``) except in the varimax step of
+promax, whose power target is formed from the de-normalized varimax loadings as in
+``stats::promax``. Each column is reflected so that its largest loading is positive,
+and ``get_rotated_loadings`` defaults to ``"oblimin"``. With these defaults the
+loadings and factor correlations match R mirt 1.48 to the optimizer tolerance.
+
+Some differences remain. ``tol`` defaults to ``1e-6``, where GPArotation's ``eps``
+is ``1e-5``. GPArotation's Barzilai-Borwein steps can stop at a different point
+within that tolerance. For criteria with several local minima, such as
+biquartimin, they can also reach a different minimum. Equamax is the orthomax
+criterion with weight ``n_factors / 2``, GPArotation's
+``cfT(kappa = n_factors / (2 * n_items))``, which R mirt's ``summary()`` does not
+offer. R's ``coef(rotate=...)`` multiplies GPCM and nominal slopes by the
+``sqrt((K - 1) * 1.702)`` scale of their standardized loadings, whereas
+``get_rotated_loadings`` returns the model's own slopes.
+
 Monte Carlo item uncertainty
 ----------------------------
 
-``MCEMEstimator``, ``QMCEMEstimator``, and ``StochasticEMEstimator`` can estimate
-optional diagonal complete-data standard errors on the final draws and weights:
+``MCEMEstimator``, ``QMCEMEstimator``, and ``StochasticEMEstimator`` estimate
+standard errors after fitting with ``compute_standard_errors=True``:
 
 .. code-block:: python
 
@@ -70,19 +124,30 @@ optional diagonal complete-data standard errors on the final draws and weights:
        se_step_size=1e-5,
    ).fit(TwoParameterLogistic(responses.shape[1]), responses)
 
-   print(result.standard_errors["difficulty"])
+   print(result.se_method, result.standard_errors["difficulty"])
 
-Draws and weights remain fixed during differentiation. This approximation
-excludes missing information, covariance between parameters, and Monte Carlo
-sampling error. Built-in polytomous items use exact diagonal curvature, while
-logistic and affine items use prepared item gradients. Custom item objectives
-use numerical likelihood curvature. Fixed coordinates receive
+Unidimensional built-in 1PL-4PL, GRM, GPCM and PCM fits report the observed
+information of the marginal likelihood at the estimates (Louis, 1982),
+integrated over the ability prior on EM's default grid, as
+``se_method="oakes"`` with the free-parameter covariance in ``vcov``. They match
+EM's default standard errors at the same parameters. The diagonal
+complete-data curvature these estimators used to report was 0.4 to 0.8 times
+those errors on a 2PL of 1000 persons and 20 items.
+
+Other models, and estimators or models with custom likelihood hooks, report
+diagonal complete-data standard errors on the final draws and weights, with
+``se_method="complete_data"`` and no ``vcov``. Draws and weights remain fixed
+during differentiation. This approximation excludes missing information,
+covariance between parameters, and Monte Carlo sampling error, so it
+understates the uncertainty. Built-in polytomous items use exact diagonal
+curvature, while logistic and affine items use prepared item gradients. Custom
+item objectives use numerical likelihood curvature. Fixed coordinates receive
 zero errors; unobserved items and undefined curvature receive ``NaN``.
 
 The option defaults to ``False``, retaining placeholder errors and the existing
 fitting cost. Enabling it preserves the fitted parameters, likelihood, random
 draws, and convergence history. ``se_step_size`` must be finite and positive;
-it controls finite differences and does not affect exact polytomous curvature.
+it controls finite differences and does not affect exact derivatives.
 
 Portable model exports
 ----------------------
@@ -149,9 +214,14 @@ Person-score results
 Person identifiers may be lists or NumPy arrays and must contain one identifier per
 score row. NumPy scalar identifiers are converted to standard Python scalars in
 portable exports. ``from_dict()`` and ``from_json()`` validate reconstructed array
-shapes and any supplied ``n_persons`` or ``n_factors`` metadata. ``to_dataframe()``
-preserves identifiers with either supported dataframe backend. Score and uncertainty
-arrays must have identical shapes, and finite standard errors cannot be negative.
+shapes and any supplied ``n_persons`` or ``n_factors`` metadata, which also restores
+the factor count of an empty multidimensional result. ``to_json()`` writes standard
+JSON: infinite and NaN values, such as the infinite standard errors of extreme ML
+scores, become the strings ``"Inf"``, ``"-Inf"`` and ``"NaN"``, which
+``from_json()`` restores exactly and R's ``jsonlite::fromJSON`` reads as numbers.
+``to_dict()`` keeps them as floats. ``to_dataframe()`` preserves identifiers with
+either supported dataframe backend. Score and uncertainty arrays must have identical
+shapes, and finite standard errors cannot be negative.
 
 ``classification_probabilities()`` uses the score and its standard error to calculate
 the normal-approximation probability that ability exceeds a cut score. ``classify()``
@@ -160,6 +230,29 @@ requested confidence; otherwise it returns ``"uncertain"``. Both methods accept 
 scalar cut or an array broadcastable to the score shape, including one cut per factor
 for multidimensional scores. Zero standard error produces a deterministic decision
 away from the cut, while infinite or unknown uncertainty does not force a decision.
+
+Response columns and extreme ML scores
+--------------------------------------
+
+Every scoring function, including ``fscores``, ``ability_posterior``, the EAPsum
+functions, ``generate_plausible_values`` and ``personfit``, reads array columns by
+position. A data frame's columns are matched to the model's item names instead, as
+when the model was fitted to a data frame: they may come in any order, and other
+columns, such as respondent identifiers, are ignored. A data frame without columns
+for some of the named items raises ``MirtDataError`` listing them; pass
+``frame.to_numpy()`` to score its columns by position. Models fitted to unnamed
+arrays, whose items are named ``Item_1``, ``Item_2``, ..., also read other data
+frames by position. ``mirt.utils.data.align_response_columns`` applies this rule.
+R's ``mirt`` always reads ``response.pattern`` columns by position.
+
+A response pattern whose observed responses are all in the lowest category, or all
+in each item's highest category, has no finite maximum likelihood estimate. For every
+model family, ``method="ML"`` reports it at the lower or upper ``bounds`` value in
+every coordinate with an infinite standard error, where R's ``mirt`` reports
+``-Inf`` or ``Inf`` with a missing standard error. In multidimensional models, a
+coordinate whose likelihood still increases at a bound, such as a factor whose items
+are all answered in their lowest or highest category, is likewise reported at that
+bound with an infinite standard error. WLE scores of such patterns are finite.
 
 EAP grids for bifactor models
 -----------------------------
@@ -184,8 +277,25 @@ Unidimensional 2PL WLE scoring groups repeated response patterns and evaluates t
 unique patterns through a batched backend. It uses the native implementation when
 available and a vectorized, memory-bounded NumPy implementation otherwise. Pass
 ``n_jobs`` to ``fscores`` to control native worker parallelism; ``-1`` uses all
-available CPU cores. Other model families and multidimensional models retain the
-general scorer.
+available CPU cores. Other unidimensional families share one row-batched search.
+
+The unidimensional WLE is the global maximum of the weighted likelihood over the
+search bounds. A test that mixes weakly and highly discriminating items, with
+sparse responses, can give that criterion several local maxima, and a local search
+then stops on a lower one. Every search is therefore followed by a scan of each
+pattern's criterion on a grid at most 0.25 apart; the three highest grid maxima
+away from (or above) the estimate are refined, and the estimate moves to a higher
+maximum when one is found. Unimodal patterns keep the local search's estimate, so
+typical tests score as before and as R's ``fscores(method="WLE")``. On multimodal
+patterns R's local search can stop on the lower maximum.
+
+Multidimensional WLE follows Warm's estimator as R's ``mirt`` does: it maximizes the
+log likelihood plus half the log determinant of the observed items' Fisher
+information matrix (Wang, 2015), and its standard errors come from the inverse of
+that matrix. Built-in multidimensional models are scored, for ML as for MAP and WLE,
+by one row-batched projected Newton search over the unique response patterns, with
+an L-BFGS-B fallback for rows that do not converge. Factors that no observed item
+measures are reported as zero with infinite standard errors.
 
 Negative response values, ``NaN`` and the nulls of nullable data frame columns are
 treated as missing by every scoring method, as by ``fit_mirt``. Missing items

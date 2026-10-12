@@ -17,9 +17,9 @@ models accepted by
 :func:`~mirt.estimation._louis_information.supports_louis_information`:
 1PL-4PL with any number of factors, GRM, GPCM, PCM, NRM, RSM, GRSM,
 multidimensional and bifactor models, and the other built-in families whose
-likelihood is a product of item curves. Other models, such as custom,
-testlet or mixture models, use central differences of the marginal
-log-likelihood, which cost O(P^2) likelihood evaluations. As in fitted
+likelihood is a product of item curves, and custom item models. Other
+models, such as testlet or mixture models, use central differences of the
+marginal log-likelihood, which cost O(P^2) likelihood evaluations. As in fitted
 results, the matrix methods hold coordinates on an EM optimizer bound fixed
 with ``NaN`` standard errors.
 
@@ -326,7 +326,7 @@ def _se_itemwise_numerical(
     """Compute diagonal item-wise curvature without sharing mutable models."""
     from copy import deepcopy
 
-    from mirt.scoring._common import resolve_n_jobs
+    from mirt.utils._parallel import resolve_n_jobs
 
     params = model.parameters
     free_masks = model.free_parameter_masks

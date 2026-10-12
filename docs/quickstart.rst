@@ -24,6 +24,12 @@ Explore the sample datasets without loading response-matrix copies:
    print(mirt.list_datasets())
    print(mirt.describe_dataset("LSAT7"))
 
+``LSAT6`` and ``LSAT7`` are the published Bock and Lieberman (1970) tables,
+identical to R mirt's. The other datasets are simulated stand-ins, not the R
+mirt data of the same name: their sizes and coding differ, their
+``description`` starts with "Simulated stand-in", and their metadata carry
+``"simulated": True``.
+
 For repeated read-only workflows, ``load_dataset(name, copy=False)`` returns
 arrays backed by the process-local cache. Those arrays are intentionally
 read-only; omit the argument when writable, independent arrays are needed.
@@ -68,8 +74,14 @@ such as ``n_categories=[2, 3, 4]`` for a three-item response matrix. Omitting
 ``n_categories`` infers each item's count separately from its largest observed
 code, with a minimum of two. Explicit counts retain categories absent from the
 sample and are required for wholly unobserved items. A scalar count applies
-to every item. GRM EM calibration constrains adjacent thresholds to remain
-ordered, including free thresholds next to fixed ones.
+to every item. As in R, an item whose observed responses all fall in one
+category cannot be estimated and raises ``MirtDataError``. A category that is
+never used below an item's highest observed code (say codes 0, 2 and 3) leaves
+the thresholds next to it unidentified; ``fit_mirt`` warns, and the warning
+shows the ``mirt.utils.recode_responses`` call that renumbers the item to
+consecutive categories, as R does before fitting. GRM EM calibration
+constrains adjacent thresholds to remain ordered, including free thresholds
+next to fixed ones.
 
 Data frames and missing responses
 ---------------------------------
@@ -220,27 +232,29 @@ thresholds are excluded using the model's free parameter masks. Supply
 RSM, GRSM, explanatory item-feature models, and testlet models. A global array
 whose length happens to equal the item count still requires this explicit
 allocation. For externally known item parameters, supply one zero per item.
-For a fit with equality ``constraints``, pass the same ``constraints`` to
-``itemfit()``, ``compute_m2()`` and ``compute_fit_indices()``: a group of
-``k`` tied coordinates is one parameter, of which each of its items counts
-``1/k``, and M2 projects out one direction per group.
+Given a fit with equality ``constraints`` (or ``CONSTRAIN``), ``itemfit()``,
+``compute_m2()`` and ``compute_fit_indices()`` read them from the
+``FitResult``: a group of ``k`` tied coordinates is one parameter, of which
+each of its items counts ``1/k``, and M2 projects out one direction per group.
+Pass ``constraints`` explicitly with a bare item model, or ``constraints=[]``
+to count every free coordinate separately.
 Nonpositive degrees of freedom appear as ``df=0`` and ``p_value=NaN``; a
 remaining expected cell below the requested minimum also gives ``NaN``.
 An ordinal item whose maximum score exceeds the remaining test's maximum
 has no full-category score group and returns ``S_X2=NaN``, ``df=0``.
 
 By default, S-X2 integrates over independent standard-normal factors, or over
-the estimated ``latent_covariance`` of a ``FitResult`` that has one, with 41
-quadrature points per factor and assumes conditionally independent items.
+the estimated ``latent_covariance`` of a ``FitResult`` that has one, and
+assumes conditionally independent items. Its default grid has 41 quadrature
+points per factor for one or two factors and fewer for more (21 for three, 9
+for four, 7 for five, 5 for six or seven), at most 100,000 points in all.
 ``prior_mean`` and ``prior_cov`` choose another normal population.
 ``MixtureIRT`` and ``HigherOrderCDM`` need joint integration over their shared
 latent classes or mastery patterns and are rejected. Testlet and bifactor
-models remain conditionally independent when all their factors are specified;
-the quadrature distribution must match those factors, including testlet
-variances. Full-factor testlet curves use the supplied testlet-factor values;
-they do not rescale those values using the model's stored testlet variances.
-S-X2 therefore needs explicit quadrature masses for that full-factor
-distribution when it differs from independent standard normals.
+models remain conditionally independent when all their factors are specified.
+Full-factor testlet curves take standardized testlet effects and scale them
+by the stored testlet standard deviations, so the default independent
+standard normals are the population of a fitted testlet model.
 Other fitted nonstandard factor distributions, such as an empirical
 histogram, are not selected automatically.
 For a different fitted latent distribution,
@@ -278,7 +292,11 @@ depend on the tested responses, for example ``theta=`` estimates from an
 independent calibration. With the default EAP abilities, item z statistics
 are strongly biased toward overfit (about half of well-fitting items fall
 below -1.96 on a 20-item test), so ``itemfit()`` warns and they are only
-descriptive; person z statistics are mildly conservative.
+descriptive; person z statistics are mildly conservative. The item-level
+``Zh`` of Drasgow, Levine and Williams (1985), R's
+``itemfit(fit_stats = "Zh")``, standardizes the item's summed response
+log-likelihood. It has the same reference distribution and the same EAP bias,
+in the other direction: about half of well-fitting items exceed 1.96.
 ``compute_outfit_infit`` reports them with ``include_standardized=True`` and
 follows the same mean-square rules as ``itemfit()`` and ``personfit()``.
 
@@ -320,6 +338,17 @@ parameter directions. This follows `Maydeu-Olivares and Joe (2006)
 the category codes 0, 1, ... have meaningful order and spacing; it does not test
 every category-specific univariate and bivariate margin.
 
+``type="C2"`` selects the C2 statistic of Cai and Monroe (2014), R's
+``M2(type = "C2")``, which tests the proportion of every category above the
+lowest instead of the item score means and keeps the pairwise score products.
+An item with ``K`` categories adds ``K - 1`` moments instead of one, so C2
+can be tested where M2* cannot: a graded model of six five-category items has
+30 parameters, 21 M2* moments and 39 C2 moments (9 degrees of freedom). When
+M2* has no degrees of freedom, the default ``type=None`` reports C2 with a
+``UserWarning``, and ``compute_fit_indices`` computes RMSEA, CFI and TLI from
+it, against a C2 independence baseline. For binary items all three
+statistics coincide.
+
 The default null model has independent standard normal latent factors and
 conditionally independent item responses. A ``FitResult`` with an estimated
 ``latent_covariance`` replaces the standard normal with that population, and
@@ -330,10 +359,11 @@ are not supported: averaging their shared latent classes or mastery patterns
 before forming joint moments would violate this assumption. For testlet and
 bifactor models, integration conditions on all factors, and the stated
 standard-normal distribution must match the intended null for every factor.
-Full-factor testlet curves do not apply the stored testlet variances; those
-variances enter the separate one-dimensional marginalized model methods.
-Default M2 quadrature does not automatically select that marginalized
-distribution.
+Full-factor testlet curves scale the standardized testlet effects by the
+stored testlet standard deviations, so it does for a fitted testlet model.
+The default grid has 21 points per factor for up to three
+factors and fewer for more (9 for four, 7 for five, 5 for six or seven), at
+most 100,000 nodes; grids above ``21 ** 5`` nodes are rejected.
 Increase ``n_quadpts`` and check
 stability for steep item curves. If ``theta`` is supplied, it defines a fixed
 person ability design, with conditional expectations and covariance for each
@@ -352,7 +382,8 @@ an explicit missingness model.
 Degrees of freedom use the numerical ranks of the covariance and free
 parameter tangent. Too few observable moments, especially with short ordinal
 tests, can leave zero testable dimensions: ``M2``, its p-value, and inferential
-fit indices then return NaN. SRMSR remains available as a descriptive score
+fit indices then return NaN, unless C2 has degrees of freedom and replaces M2*
+(see above). SRMSR remains available as a descriptive score
 correlation residual. Deterministic moments are removed from the stochastic
 rank; an observed response impossible under the model yields an infinite
 statistic when testable dimensions remain. CFI and TLI use a covariance-weighted

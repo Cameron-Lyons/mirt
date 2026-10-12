@@ -1,7 +1,8 @@
 """Model fit statistics for IRT models.
 
 This module provides limited-information goodness-of-fit statistics:
-- M2 statistic (Maydeu-Olivares & Joe, 2005)
+- M2 statistic (Maydeu-Olivares & Joe, 2005), its collapsed ordinal form M2*
+  (Cai & Hansen, 2013) and the hybrid C2 (Cai & Monroe, 2014)
 - RMSEA (Root Mean Square Error of Approximation)
 - CFI (Comparative Fit Index)
 - TLI (Tucker-Lewis Index)
@@ -10,10 +11,11 @@ This module provides limited-information goodness-of-fit statistics:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, get_args
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -21,7 +23,14 @@ from scipy import stats
 from scipy.linalg import lapack, solve_triangular
 
 from mirt.constants import PROB_EPSILON
-from mirt.utils.data import _response_array
+from mirt.diagnostics._quadrature import (
+    default_diagnostic_quadpts,
+    resolve_diagnostic_quadpts,
+)
+from mirt.diagnostics._utils import resolve_fit_constraints
+from mirt.exceptions import MirtValidationError
+from mirt.typing import M2Type
+from mirt.utils.data import _response_array, align_response_columns
 
 if TYPE_CHECKING:
     from mirt.estimation._shared_step import EqualityConstraints
@@ -31,6 +40,13 @@ if TYPE_CHECKING:
 
 _MOMENT_CHUNK_ELEMENTS = 262_144
 _CHOLESKY_MIN_RECIPROCAL_CONDITION = 1e-8
+# Default Gauss-Hermite points per factor for up to three factors. More
+# factors take the dimension-aware rule of the diagnostics, which is smaller.
+_M2_QUADPTS = 21
+# The largest grid M2 integrates over, 21 points in five dimensions; larger
+# tensor-product grids exhaust memory before they finish.
+_MAX_GRID_NODES = 21**5
+_M2_TYPES: tuple[str, ...] = get_args(M2Type)
 
 
 @dataclass(frozen=True)
@@ -122,30 +138,70 @@ class _FitMoments:
     pair_counts: NDArray[np.float64]
 
 
+@dataclass(frozen=True)
+class _MomentLayout:
+    """Univariate moments of a limited-information statistic.
+
+    M2 and M2* test the score mean of every item. C2 tests the proportion of
+    every category above the lowest instead (Cai & Monroe, 2014), so an item
+    with ``K`` categories has ``K - 1`` univariate rows. All of them test
+    the ``J (J - 1) / 2`` score cross-products ``E[Y_j Y_k]``.
+
+    ``items`` holds the item of each univariate row, and ``categories`` its
+    category, or ``None`` for score means.
+    """
+
+    items: NDArray[np.intp]
+    categories: NDArray[np.intp] | None = None
+
+    def design_rows(self) -> NDArray[np.intp]:
+        """Rows of the score-moment design sharing each moment's observations.
+
+        A category proportion is observed with its item's score.
+        """
+        n_items = int(self.items.max()) + 1
+        n_pairs = n_items * (n_items - 1) // 2
+        return np.concatenate([self.items, n_items + np.arange(n_pairs)])
+
+
+def _moment_layout(model: BaseItemModel, statistic: str) -> _MomentLayout:
+    """Return the univariate moments that ``statistic`` tests."""
+    if statistic != "C2":
+        return _MomentLayout(np.arange(model.n_items))
+    counts = _category_counts(model)
+    return _MomentLayout(
+        np.repeat(np.arange(model.n_items), counts - 1),
+        np.concatenate([np.arange(1, count) for count in counts]),
+    )
+
+
 def compute_m2(
     model: BaseItemModel | FitResult,
     responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     *,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
     constraints: EqualityConstraints | None = None,
+    type: M2Type | None = None,
 ) -> dict[str, float]:
     """Compute M2 limited-information fit statistic.
 
     The statistic weights first- and second-order score residuals by their
     model-implied covariance and projects out the free parameter tangent.
     Binary items use M2; ordinal items use the collapsed M2* formulation of
-    Cai and Hansen (2013). Degrees of freedom use numerical covariance and
-    tangent ranks. When no testable dimensions remain, inferential outputs
-    are NaN instead of reporting a fictitious chi-square test.
+    Cai and Hansen (2013) or the hybrid C2 of Cai and Monroe (2014) (see
+    ``type``). Degrees of freedom use numerical covariance and tangent
+    ranks. When no testable dimensions remain, inferential outputs are NaN
+    instead of reporting a fictitious chi-square test.
 
     Parameters
     ----------
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit, whose estimated
-        ``latent_covariance`` then defines the latent population.
+        ``latent_covariance`` then defines the latent population and whose
+        equality constraints are counted (see ``constraints``).
     responses : array-like of shape (n_persons, n_items)
         Response matrix. Negative codes, ``NaN`` and the nulls of nullable
         DataFrame columns denote missing responses.
@@ -154,8 +210,13 @@ def compute_m2(
         omitted, moments are integrated against the normal latent population.
         Abilities estimated from these responses do not satisfy the
         fixed-design assumption needed for chi-square calibration.
-    n_quadpts : int
-        Number of quadrature points for integration
+    n_quadpts : int, optional
+        Gauss-Hermite quadrature points per factor for the integration.
+        ``None`` (default) uses 21 for up to three factors and the
+        dimension-aware default of the diagnostics above: 9 for four
+        factors, 7 for five, 5 for six or seven, and fewer beyond, so the
+        grid has at most 100,000 nodes. Grids above ``21 ** 5`` nodes raise
+        :class:`~mirt.exceptions.MirtValidationError`.
     prior_mean : array-like of shape (n_factors,), optional
         Mean of the normal latent population. Default zero.
     prior_cov : array-like of shape (n_factors, n_factors), optional
@@ -166,16 +227,33 @@ def compute_m2(
         Equality constraints of the fit, in any form that
         ``fit_mirt(constraints=...)`` accepts. Each group of tied coordinates
         is one estimated parameter: its derivative columns are summed into
-        one tangent direction, which removes one degree of freedom.
+        one tangent direction, which removes one degree of freedom. Defaults
+        to the constraints a ``FitResult`` was fitted with; pass ``[]`` to
+        count every free coordinate separately.
+    type : {"M2", "M2*", "C2"}, optional
+        Moments tested. ``"M2*"`` tests the item score means and the score
+        cross-products ``E[Y_j Y_k]``. ``"C2"`` tests the proportions of
+        every category above the lowest instead of the score means, which
+        leaves degrees of freedom for short ordinal scales on which M2* has
+        none. ``"M2"`` requires binary items, on which all three coincide.
+        ``None`` (default) computes M2*, or C2 with a ``UserWarning`` when
+        M2* has no degrees of freedom and C2 has some, so the result is no
+        longer NaN.
 
     Returns
     -------
     dict
         Dictionary with:
-        - 'M2': M2 statistic value
+        - 'M2': statistic value (of the requested ``type``)
         - 'df': Degrees of freedom
         - 'p_value': P-value
         - 'M2_df_ratio': M2/df ratio
+
+    Raises
+    ------
+    MirtValidationError
+        If ``type`` is unknown, or ``"M2"`` for polytomous items, or the
+        quadrature grid is too large.
 
     Notes
     -----
@@ -184,9 +262,30 @@ def compute_m2(
     items: its free entries, the nonzero covariances and the variances that
     differ from one, are projected out like the free item parameters, and
     each removes one degree of freedom.
+
+    An item with ``K`` categories contributes one univariate moment to M2*
+    and ``K - 1`` to C2, so C2 has ``sum(K_j - 1) + J (J - 1) / 2`` moments
+    for ``J`` items. A graded model of six five-category items has 30
+    parameters, 21 M2* moments and 39 C2 moments.
+
+    References
+    ----------
+    Cai, L., & Hansen, M. (2013). Limited-information goodness-of-fit testing
+        of hierarchical item factor models. British Journal of Mathematical
+        and Statistical Psychology, 66(2), 245-276.
+    Cai, L., & Monroe, S. (2014). A new statistic for evaluating item
+        response theory models for ordinal data. National Center for
+        Research on Evaluation, Standards, & Student Testing (CRESST),
+        Technical Report.
+    Maydeu-Olivares, A., & Joe, H. (2006). Limited information
+        goodness-of-fit testing in multidimensional contingency tables.
+        Psychometrika, 71(4), 713-732.
     """
+    constraints = resolve_fit_constraints(model, constraints)
     model, latent = _resolve_latent_population(model, prior_mean, prior_cov)
+    n_quadpts = _resolve_quadpts(n_quadpts, model)
     response_values, max_observed = _validate_diagnostic_inputs(model, responses)
+    _validate_m2_type(model, type)
     moments = _prepare_fit_moments(
         model,
         response_values,
@@ -195,26 +294,30 @@ def compute_m2(
         n_quadpts,
         latent=latent,
     )
-    return _m2_from_moments(
+    result, _ = _limited_information_test(
         model,
         moments,
         response_values,
         theta,
         n_quadpts,
+        _moment_design(response_values),
         latent=latent,
         constraints=constraints,
+        statistic=type,
     )
+    return result
 
 
 def compute_fit_indices(
     model: BaseItemModel | FitResult,
     responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     *,
     prior_mean: ArrayLike | None = None,
     prior_cov: ArrayLike | None = None,
     constraints: EqualityConstraints | None = None,
+    type: M2Type | None = None,
 ) -> dict[str, float]:
     """Compute model fit indices (RMSEA, CFI, TLI, SRMSR).
 
@@ -230,12 +333,17 @@ def compute_fit_indices(
         omitted, moments are integrated against the normal latent population.
         Response-derived ability estimates invalidate the fixed-design
         chi-square calibration.
-    n_quadpts : int
-        Number of quadrature points
+    n_quadpts : int, optional
+        Quadrature points per factor, as in :func:`compute_m2`.
     prior_mean, prior_cov : array-like, optional
         Normal latent population, as in :func:`compute_m2`.
     constraints : sequence, optional
         Equality constraints of the fit, as in :func:`compute_m2`.
+    type : {"M2", "M2*", "C2"}, optional
+        Limited-information statistic behind RMSEA, CFI and TLI, as in
+        :func:`compute_m2`. The independence baseline of CFI and TLI uses
+        the same statistic. By default C2 replaces an M2* without degrees
+        of freedom.
 
     Returns
     -------
@@ -247,9 +355,13 @@ def compute_fit_indices(
         - 'CFI': Comparative Fit Index
         - 'TLI': Tucker-Lewis Index (NNFI)
         - 'SRMSR': Standardized Root Mean Square Residual
+        - 'M2', 'M2_df', 'M2_p': the statistic of :func:`compute_m2`
     """
+    constraints = resolve_fit_constraints(model, constraints)
     model, latent = _resolve_latent_population(model, prior_mean, prior_cov)
+    n_quadpts = _resolve_quadpts(n_quadpts, model)
     response_values, max_observed = _validate_diagnostic_inputs(model, responses)
+    _validate_m2_type(model, type)
     n_persons = response_values.shape[0]
     moments = _prepare_fit_moments(
         model,
@@ -260,7 +372,7 @@ def compute_fit_indices(
         latent=latent,
     )
     design = _moment_design(response_values)
-    m2_result = _m2_from_moments(
+    m2_result, layout = _limited_information_test(
         model,
         moments,
         response_values,
@@ -269,11 +381,12 @@ def compute_fit_indices(
         design,
         latent=latent,
         constraints=constraints,
+        statistic=type,
     )
     M2 = m2_result["M2"]
     df = m2_result["df"]
 
-    M2_0, df_0 = _baseline_m2(moments, response_values, design)
+    M2_0, df_0 = _baseline_m2(moments, response_values, design, layout)
 
     rmsea = _compute_rmsea(M2, df, n_persons)
     rmsea_ci = _compute_rmsea_ci(M2, df, n_persons)
@@ -295,6 +408,93 @@ def compute_fit_indices(
         "M2_df": df,
         "M2_p": m2_result["p_value"],
     }
+
+
+def _resolve_quadpts(n_quadpts: int | None, model: BaseItemModel) -> int:
+    """Validate ``n_quadpts`` or return the dimension-aware M2 default."""
+    if n_quadpts is None:
+        return min(_M2_QUADPTS, default_diagnostic_quadpts(model.n_factors))
+    return resolve_diagnostic_quadpts(n_quadpts, model.n_factors)
+
+
+def _validate_m2_type(model: BaseItemModel, statistic: str | None) -> None:
+    """Reject unknown statistic types and the full M2 of polytomous items."""
+    if statistic is None:
+        return
+    if not isinstance(statistic, str) or statistic not in _M2_TYPES:
+        raise MirtValidationError(
+            f"type must be one of {list(_M2_TYPES)} or None",
+            parameter="type",
+            value=statistic,
+            expected=", ".join(_M2_TYPES),
+        )
+    if statistic == "M2" and np.any(_category_counts(model) > 2):
+        raise MirtValidationError(
+            "type='M2' requires binary items; the full M2 of polytomous items "
+            "is not implemented, use 'M2*' or 'C2'",
+            parameter="type",
+            value=statistic,
+            expected="'M2*' or 'C2' for polytomous items",
+        )
+
+
+def _category_counts(model: BaseItemModel) -> NDArray[np.intp]:
+    """Number of response categories of every item."""
+    counts = model.n_categories if model.is_polytomous else [2] * model.n_items
+    return np.asarray(counts, dtype=np.intp)
+
+
+def _limited_information_test(
+    model: BaseItemModel,
+    moments: _FitMoments,
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64] | None,
+    n_quadpts: int,
+    design: _MomentDesign,
+    *,
+    latent: _LatentNormal | None,
+    constraints: EqualityConstraints | None,
+    statistic: str | None,
+) -> tuple[dict[str, float], _MomentLayout]:
+    """Compute the requested statistic, or M2* falling back to C2 for ``None``.
+
+    Returns the result and the moment layout of the statistic it reports.
+    """
+    layout = _moment_layout(model, "M2*" if statistic is None else statistic)
+    result = _m2_from_moments(
+        model,
+        moments,
+        responses,
+        theta,
+        n_quadpts,
+        design,
+        latent=latent,
+        constraints=constraints,
+        layout=layout,
+    )
+    if statistic is None and result["df"] == 0 and np.any(_category_counts(model) > 2):
+        c2_layout = _moment_layout(model, "C2")
+        c2 = _m2_from_moments(
+            model,
+            moments,
+            responses,
+            theta,
+            n_quadpts,
+            design,
+            latent=latent,
+            constraints=constraints,
+            layout=c2_layout,
+        )
+        if c2["df"] > 0:
+            warnings.warn(
+                "M2* has no degrees of freedom for these items and parameters; "
+                f"reporting C2 on {c2['df']} df instead (pass type='C2' to "
+                "request it, or type='M2*' to keep the untestable M2*)",
+                UserWarning,
+                stacklevel=3,
+            )
+            return c2, c2_layout
+    return result, layout
 
 
 def _resolve_latent_population(
@@ -338,6 +538,23 @@ def _latent_grid(
     from mirt.estimation.quadrature import GaussHermiteQuadrature
 
     _validate_quadrature_count(n_quadpts)
+    n_nodes = int(n_quadpts) ** model.n_factors
+    if n_nodes > _MAX_GRID_NODES:
+        default = min(_M2_QUADPTS, default_diagnostic_quadpts(model.n_factors))
+        advice = (
+            f"omit n_quadpts to use {default} points per factor"
+            if default**model.n_factors <= _MAX_GRID_NODES
+            else "this many factors need a smaller explicit n_quadpts, or "
+            "compute_q3 for local dependence instead"
+        )
+        raise MirtValidationError(
+            f"M2 quadrature with n_quadpts={n_quadpts} and {model.n_factors} "
+            f"factors has {n_nodes} grid nodes, more than {_MAX_GRID_NODES}; "
+            f"{advice}",
+            parameter="n_quadpts",
+            value=n_quadpts,
+            expected=f"n_quadpts ** n_factors <= {_MAX_GRID_NODES}",
+        )
     quadrature = GaussHermiteQuadrature(
         n_points=n_quadpts,
         n_dimensions=model.n_factors,
@@ -347,37 +564,57 @@ def _latent_grid(
     return quadrature.nodes, _normalized_weights(quadrature.weights)
 
 
-def _compute_expected_margins(
-    model: BaseItemModel,
-    n_quadpts: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute expected score moments under the model using quadrature."""
-    moments, _ = _integrate_model_moments(model, n_quadpts)
-    return moments.univariate, moments.bivariate
-
-
 def _baseline_m2(
     moments: _FitMoments,
     responses: NDArray[np.float64],
     design: _MomentDesign | None = None,
+    layout: _MomentLayout | None = None,
 ) -> tuple[float, int]:
-    """Use the same covariance-weighted test for the independence baseline."""
+    """Use the same covariance-weighted test for the independence baseline.
+
+    ``layout`` selects the statistic, by default M2*. Under C2 the baseline
+    reproduces every item's observed category distribution.
+    """
     n_items = responses.shape[1]
     if design is None:
         design = _moment_design(responses)
+    left, right = np.triu_indices(n_items, 1)
     # Arbitrary marginal score distributions are nuisance parameters. Their
     # means affect the tested moments, while their variances only set weights.
     means = np.nan_to_num(moments.observed_uni)[None, :]
     seconds = np.nan_to_num(np.diag(moments.observed_bi))[None, :]
-    expected = _score_features(means)[0]
-    covariance = _conditional_covariance_sum(means, seconds, np.ones(1))
+    if layout is None or layout.categories is None:
+        expected = _score_features(means)[0]
+        covariance = _conditional_covariance_sum(means, seconds, np.ones(1))
+        jacobian = np.zeros((len(expected), n_items))
+        jacobian[:n_items] = np.eye(n_items)
+        jacobian[n_items + np.arange(len(left)), left] = means[0, right]
+        jacobian[n_items + np.arange(len(left)), right] = means[0, left]
+        observed = _flatten_score_moments(moments.observed_uni, moments.observed_bi)
+    else:
+        # The category proportions are the nuisance parameters. A pair moment
+        # E[Y_j] E[Y_k] moves with P(Y_j = c) by c E[Y_k].
+        design = _layout_design(design, layout)
+        n_univariate = len(layout.items)
+        proportions = _observed_category_proportions(
+            responses, layout, design.counts[:n_univariate]
+        )
+        filled = np.nan_to_num(proportions)[None, :]
+        expected = _score_features(means, filled)[0]
+        covariance = _category_covariance_sum(
+            filled, means, seconds, np.ones(1), layout
+        )
+        jacobian = np.zeros((len(expected), n_univariate))
+        jacobian[:n_univariate] = np.eye(n_univariate)
+        for item, other in ((left, right), (right, left)):
+            matches = item[:, None] == layout.items[None, :]
+            jacobian[n_univariate:] += matches * (
+                layout.categories[None, :] * means[0, other][:, None]
+            )
+        observed = np.concatenate(
+            [proportions, moments.observed_bi[np.triu_indices(n_items, 1)]]
+        )
     covariance *= _safe_divide(design.overlap, np.outer(design.counts, design.counts))
-    jacobian = np.zeros((len(expected), n_items))
-    jacobian[:n_items] = np.eye(n_items)
-    left, right = np.triu_indices(n_items, 1)
-    jacobian[n_items + np.arange(len(left)), left] = means[0, right]
-    jacobian[n_items + np.arange(len(left)), right] = means[0, left]
-    observed = _flatten_score_moments(moments.observed_uni, moments.observed_bi)
     selected = design.counts > 0
     return _projected_chi_square(
         (observed - expected)[selected],
@@ -404,7 +641,7 @@ def _validate_diagnostic_inputs(
             "M2 does not support HigherOrderCDM: shared mastery-pattern "
             "integration is required for the joint response moments"
         )
-    values = _response_array(responses)
+    values = _response_array(align_response_columns(responses, model.item_names))
     if values.ndim != 2 or values.shape[0] < 2 or values.shape[1] == 0:
         raise ValueError(
             "responses must be a two-dimensional matrix with at least "
@@ -480,11 +717,15 @@ def _normalized_weights(weights: NDArray[np.float64]) -> NDArray[np.float64]:
     return values / total
 
 
-def _conditional_score_moments(
+def _conditional_probabilities(
     model: BaseItemModel,
     theta: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64], int]:
-    """Compute conditional item score means and second moments in one pass."""
+) -> NDArray[np.float64]:
+    """Validated probabilities, of the upper category (binary) or every one.
+
+    Binary models give shape ``(n_rows, n_items)``; polytomous models give
+    zero-padded categories of shape ``(n_rows, n_items, n_categories)``.
+    """
     probabilities = np.asarray(model.probability(theta), dtype=np.float64)
     n_rows = theta.shape[0]
 
@@ -495,19 +736,12 @@ def _conditional_score_moments(
             raise ValueError(
                 f"model probability output must have shape ({n_rows}, {model.n_items})"
             )
-        expected_scores = probabilities
-        expected_squares = probabilities
-        max_score = 1
     elif probabilities.ndim == 3:
         if probabilities.shape[:2] != (n_rows, model.n_items):
             raise ValueError(
                 "polytomous probability output must start with shape "
                 f"({n_rows}, {model.n_items})"
             )
-        category_scores = np.arange(probabilities.shape[2], dtype=np.float64)
-        expected_scores = probabilities @ category_scores
-        expected_squares = probabilities @ category_scores**2
-        max_score = probabilities.shape[2] - 1
         if not np.allclose(np.sum(probabilities, axis=2), 1.0, atol=1e-8):
             raise ValueError("polytomous probabilities must sum to one")
     else:
@@ -519,7 +753,54 @@ def _conditional_score_moments(
         or np.any(probabilities > 1.0 + PROB_EPSILON)
     ):
         raise ValueError("model probabilities must be finite and between zero and one")
-    return expected_scores, expected_squares, max_score
+    return probabilities
+
+
+def _score_moments(
+    probabilities: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], int]:
+    """Item score means, second moments and the largest score."""
+    if probabilities.ndim == 2:
+        return probabilities, probabilities, 1
+    category_scores = np.arange(probabilities.shape[2], dtype=np.float64)
+    return (
+        probabilities @ category_scores,
+        probabilities @ category_scores**2,
+        probabilities.shape[2] - 1,
+    )
+
+
+def _conditional_score_moments(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64], int]:
+    """Compute conditional item score means and second moments in one pass."""
+    return _score_moments(_conditional_probabilities(model, theta))
+
+
+def _category_features(
+    probabilities: NDArray[np.float64], layout: _MomentLayout
+) -> NDArray[np.float64]:
+    """Conditional probabilities of the categories of a C2 layout."""
+    assert layout.categories is not None
+    if probabilities.ndim == 2:
+        # Binary items have the single upper category.
+        return probabilities[:, layout.items]
+    return probabilities[:, layout.items, layout.categories]
+
+
+def _layout_features(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    layout: _MomentLayout | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Conditional moment features of ``layout`` and item score means."""
+    if layout is None or layout.categories is None:
+        means, _, _ = _conditional_score_moments(model, nodes)
+        return _score_features(means), means
+    probabilities = _conditional_probabilities(model, nodes)
+    means = _score_moments(probabilities)[0]
+    return _score_features(means, _category_features(probabilities, layout)), means
 
 
 def _safe_divide(
@@ -651,10 +932,17 @@ def _flatten_score_moments(
     return np.concatenate([univariate, bivariate[np.triu_indices(len(univariate), 1)]])
 
 
-def _score_features(means: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Conditional expectations of (Y_j, Y_j Y_k), in a fixed ordering."""
+def _score_features(
+    means: NDArray[np.float64], univariate: NDArray[np.float64] | None = None
+) -> NDArray[np.float64]:
+    """Conditional expectations of (Y_j, Y_j Y_k), in a fixed ordering.
+
+    ``univariate`` replaces the score means ``Y_j``, as C2 does with its
+    category probabilities.
+    """
     left, right = np.triu_indices(means.shape[1], 1)
-    return np.concatenate([means, means[:, left] * means[:, right]], axis=1)
+    first = means if univariate is None else univariate
+    return np.concatenate([first, means[:, left] * means[:, right]], axis=1)
 
 
 @dataclass(frozen=True)
@@ -684,6 +972,14 @@ def _moment_design(responses: NDArray[np.float64]) -> _MomentDesign:
     counts += complete_rows
     overlap += complete_rows
     return _MomentDesign(counts, overlap)
+
+
+def _layout_design(design: _MomentDesign, layout: _MomentLayout) -> _MomentDesign:
+    """Observation counts and overlaps of the moments of ``layout``."""
+    if layout.categories is None:
+        return design
+    rows = layout.design_rows()
+    return _MomentDesign(design.counts[rows], design.overlap[np.ix_(rows, rows)])
 
 
 def _conditional_covariance_sum(
@@ -722,6 +1018,60 @@ def _conditional_covariance_sum(
     return result
 
 
+def _category_covariance_sum(
+    categories: NDArray[np.float64],
+    means: NDArray[np.float64],
+    seconds: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    layout: _MomentLayout,
+    present: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Sum exact conditional covariances of the C2 moments in bounded blocks.
+
+    ``categories`` holds the conditional probabilities ``P_jc`` of the
+    layout's category rows. Within item ``j`` the indicators ``1[Y_j = c]``
+    have covariances ``P_jc (delta_cd - P_jd)`` and covary with ``Y_j Y_k``
+    by ``P_jc (c - E[Y_j]) E[Y_k]``. The cross-products are covariant as in
+    :func:`_conditional_covariance_sum`. Indicators of different items are
+    conditionally independent.
+    """
+    assert layout.categories is not None
+    n_items = means.shape[1]
+    n_univariate = len(layout.items)
+    left, right = np.triu_indices(n_items, 1)
+    result = np.zeros((n_univariate + len(left),) * 2)
+    variances = np.maximum(seconds - means**2, 0.0)
+    for item in range(n_items):
+        rows = np.flatnonzero(layout.items == item)
+        pairs = np.flatnonzero((left == item) | (right == item))
+        others = np.where(left[pairs] == item, right[pairs], left[pairs])
+        pair_rows = n_univariate + pairs
+        indicators = categories[:, rows]
+        other_means = means[:, others]
+        if present is not None:
+            # Presence indicators are zero or one, so they square to themselves.
+            indicators = indicators * present[:, rows]
+            other_means = other_means * present[:, pair_rows]
+        weighted = indicators * weights[:, None]
+        result[np.ix_(rows, rows)] += np.diag(weighted.sum(axis=0)) - (
+            weighted.T @ indicators
+        )
+        crossed = (
+            weighted * (layout.categories[rows] - means[:, item, None])
+        ).T @ other_means
+        result[np.ix_(rows, pair_rows)] += crossed
+        result[np.ix_(pair_rows, rows)] += crossed.T
+        result[np.ix_(pair_rows, pair_rows)] += (
+            other_means * (weights * variances[:, item])[:, None]
+        ).T @ other_means
+    products = variances[:, left] * variances[:, right]
+    if present is not None:
+        products *= present[:, n_univariate:]
+    pair_indices = n_univariate + np.arange(len(left))
+    result[pair_indices, pair_indices] += weights @ products
+    return result
+
+
 def _integration_blocks(
     model: BaseItemModel,
     responses: NDArray[np.float64],
@@ -729,15 +1079,21 @@ def _integration_blocks(
     n_quadpts: int,
     *,
     latent: _LatentNormal | None = None,
+    layout: _MomentLayout | None = None,
 ) -> Iterator[
     tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64] | None]
 ]:
-    """Yield bounded quadrature blocks or fixed-design person blocks."""
+    """Yield bounded quadrature blocks or fixed-design person blocks.
+
+    Person blocks with missing responses carry the presence of every moment
+    of ``layout`` (by default the M2* moments).
+    """
     if theta is None:
         nodes, weights = _latent_grid(model, n_quadpts, latent)
     else:
         nodes = _prepare_theta(model, theta, len(responses))
-    n_moments = model.n_items * (model.n_items + 1) // 2
+    rows = None if layout is None or layout.categories is None else layout.design_rows()
+    n_moments = model.n_items * (model.n_items + 1) // 2 if rows is None else len(rows)
     chunk_rows = min(
         _moment_rows_per_chunk(model),
         max(1, _MOMENT_CHUNK_ELEMENTS // n_moments),
@@ -750,6 +1106,8 @@ def _integration_blocks(
             valid = np.isfinite(block) & (block >= 0)
             if not np.all(valid):
                 present = _score_features(valid.astype(np.float64))
+                if rows is not None:
+                    present = present[:, rows]
         block_weights = (
             weights[start:stop] if theta is None else np.ones(len(nodes[start:stop]))
         )
@@ -764,18 +1122,34 @@ def _model_sample_covariance(
     design: _MomentDesign,
     *,
     latent: _LatentNormal | None = None,
+    layout: _MomentLayout | None = None,
 ) -> NDArray[np.float64]:
+    """Covariance of the sample moments of ``layout`` (by default M2*).
+
+    ``design`` holds the observation counts of those moments.
+    """
+    categorical = layout is not None and layout.categories is not None
     n_moments = len(design.counts)
     conditional = np.zeros((n_moments, n_moments))
     raw = np.zeros_like(conditional)
     mean = np.zeros(n_moments)
     for nodes, weights, present in _integration_blocks(
-        model, responses, theta, n_quadpts, latent=latent
+        model, responses, theta, n_quadpts, latent=latent, layout=layout
     ):
-        means, seconds, _ = _conditional_score_moments(model, nodes)
-        conditional += _conditional_covariance_sum(means, seconds, weights, present)
+        if categorical:
+            assert layout is not None
+            probabilities = _conditional_probabilities(model, nodes)
+            means, seconds, _ = _score_moments(probabilities)
+            univariate = _category_features(probabilities, layout)
+            conditional += _category_covariance_sum(
+                univariate, means, seconds, weights, layout, present
+            )
+        else:
+            means, seconds, _ = _conditional_score_moments(model, nodes)
+            univariate = None
+            conditional += _conditional_covariance_sum(means, seconds, weights, present)
         if theta is None:
-            features = _score_features(means)
+            features = _score_features(means, univariate)
             mean += weights @ features
             raw += (features * weights[:, None]).T @ features
     if theta is None:
@@ -786,12 +1160,16 @@ def _model_sample_covariance(
     return _safe_divide(conditional, np.outer(design.counts, design.counts))
 
 
-def _conditional_item_mean(
+def _conditional_item_probabilities(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     item: int,
 ) -> NDArray[np.float64]:
-    """Evaluate an item-local derivative without allocating all-item curves."""
+    """Validated probabilities of one item, without all-item curves.
+
+    Binary items give the upper-category probability of shape
+    ``(n_rows,)``; polytomous items give every category.
+    """
     probabilities = np.asarray(model.probability(theta, item), dtype=np.float64)
     if not np.all(np.isfinite(probabilities)) or np.any(
         (probabilities < -PROB_EPSILON) | (probabilities > 1 + PROB_EPSILON)
@@ -802,8 +1180,20 @@ def _conditional_item_mean(
             probabilities.sum(axis=1), 1.0, atol=1e-8
         ):
             raise ValueError("polytomous probabilities must sum to one")
-        return probabilities @ np.arange(probabilities.shape[1])
+        return probabilities
     return probabilities.reshape(len(theta))
+
+
+def _conditional_item_mean(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item: int,
+) -> NDArray[np.float64]:
+    """Evaluate an item-local derivative without allocating all-item curves."""
+    probabilities = _conditional_item_probabilities(model, theta, item)
+    if probabilities.ndim == 2:
+        return probabilities @ np.arange(probabilities.shape[1])
+    return probabilities
 
 
 def _model_moment_jacobian(
@@ -814,8 +1204,12 @@ def _model_moment_jacobian(
     design: _MomentDesign,
     *,
     latent: _LatentNormal | None = None,
+    layout: _MomentLayout | None = None,
 ) -> NDArray[np.float64]:
-    """Differentiate actual free parameters on an isolated model instance."""
+    """Differentiate actual free parameters on an isolated model instance.
+
+    Rows are the moments of ``layout``, by default those of M2*.
+    """
     from mirt._model_defaults import uses_builtin_model_hooks
 
     parameters = model.parameters
@@ -829,11 +1223,12 @@ def _model_moment_jacobian(
     worker = deepcopy(model)
     builtin = uses_builtin_model_hooks(model)
     left, right = np.triu_indices(model.n_items, 1)
+    categorical = layout is not None and layout.categories is not None
+    n_univariate = model.n_items if layout is None else len(layout.items)
     for nodes, weights, present in _integration_blocks(
-        model, responses, theta, n_quadpts, latent=latent
+        model, responses, theta, n_quadpts, latent=latent, layout=layout
     ):
-        means, _, _ = _conditional_score_moments(model, nodes)
-        original = _score_features(means)
+        original, means = _layout_features(model, nodes, layout)
         for column, (name, index) in enumerate(coordinates):
             values = parameters[name]
             center = values.flat[index]
@@ -882,8 +1277,9 @@ def _model_moment_jacobian(
                 try:
                     worker.set_parameters(**{name: candidate})
                     if item is None:
-                        shifted, _, _ = _conditional_score_moments(worker, nodes)
-                        value = _score_features(shifted)
+                        value = _layout_features(worker, nodes, layout)[0]
+                    elif categorical:
+                        value = _conditional_item_probabilities(worker, nodes, item)
                     else:
                         value = _conditional_item_mean(worker, nodes, item)
                 except ValueError:
@@ -901,7 +1297,13 @@ def _model_moment_jacobian(
                         worker.set_parameters(**restore)
                 perturbed.append(value)
             upper, lower = perturbed
-            center_value = original if item is None else means[:, item]
+            if upper is None or lower is None:
+                if item is None:
+                    center_value = original
+                elif categorical:
+                    center_value = _conditional_item_probabilities(model, nodes, item)
+                else:
+                    center_value = means[:, item]
             if upper is not None and lower is not None:
                 derivative = (upper - lower) / (2 * step)
             elif upper is not None:
@@ -914,16 +1316,35 @@ def _model_moment_jacobian(
                 if present is not None:
                     derivative *= present
                 jacobian[:, column] += weights @ derivative
-            else:
-                pair_indices = np.flatnonzero((left == item) | (right == item))
-                others = np.where(
-                    left[pair_indices] == item, right[pair_indices], left[pair_indices]
-                )
-                indices = np.concatenate([[item], model.n_items + pair_indices])
-                factors = np.column_stack([np.ones(len(nodes)), means[:, others]])
+                continue
+            pair_indices = np.flatnonzero((left == item) | (right == item))
+            others = np.where(
+                left[pair_indices] == item, right[pair_indices], left[pair_indices]
+            )
+            if categorical:
+                assert layout is not None and layout.categories is not None
+                # Category rows move with the item's probabilities and each
+                # cross-product with its score mean.
+                rows = np.flatnonzero(layout.items == item)
+                if derivative.ndim == 1:
+                    category_derivative = derivative[:, None]
+                    mean_derivative = derivative
+                else:
+                    category_derivative = derivative[:, layout.categories[rows]]
+                    mean_derivative = derivative @ np.arange(derivative.shape[1])
+                pair_rows = n_univariate + pair_indices
+                other_means = means[:, others]
                 if present is not None:
-                    factors *= present[:, indices]
-                jacobian[indices, column] += (weights * derivative) @ factors
+                    category_derivative = category_derivative * present[:, rows]
+                    other_means = other_means * present[:, pair_rows]
+                jacobian[rows, column] += weights @ category_derivative
+                jacobian[pair_rows, column] += (weights * mean_derivative) @ other_means
+                continue
+            indices = np.concatenate([[item], model.n_items + pair_indices])
+            factors = np.column_stack([np.ones(len(nodes)), means[:, others]])
+            if present is not None:
+                factors *= present[:, indices]
+            jacobian[indices, column] += (weights * derivative) @ factors
     return jacobian if theta is None else _safe_divide(jacobian, design.counts[:, None])
 
 
@@ -953,10 +1374,35 @@ def _tie_columns(
     return jacobian @ np.eye(int(tying.max(initial=-1)) + 1)[tying]
 
 
+def _integrate_layout_features(
+    model: BaseItemModel,
+    nodes: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    layout: _MomentLayout | None,
+) -> NDArray[np.float64]:
+    """Integrated moments of ``layout`` (by default M2*), flattened."""
+    if layout is None or layout.categories is None:
+        univariate, _, bivariate, _ = _integrate_on_grid(model, nodes, weights)
+        return _flatten_score_moments(univariate, bivariate)
+    categories = np.zeros(len(layout.items))
+    bivariate = np.zeros((model.n_items, model.n_items))
+    rows_per_chunk = _moment_rows_per_chunk(model)
+    for start in range(0, weights.size, rows_per_chunk):
+        stop = start + rows_per_chunk
+        probabilities = _conditional_probabilities(model, nodes[start:stop])
+        means = _score_moments(probabilities)[0]
+        block_weights = weights[start:stop]
+        categories += block_weights @ _category_features(probabilities, layout)
+        bivariate += (means * block_weights[:, None]).T @ means
+    upper = np.triu_indices(model.n_items, 1)
+    return np.concatenate([categories, bivariate[upper]])
+
+
 def _latent_moment_jacobian(
     model: BaseItemModel,
     n_quadpts: int,
     latent: _LatentNormal,
+    layout: _MomentLayout | None = None,
 ) -> NDArray[np.float64]:
     """Differentiate integrated moments by the estimated covariance entries.
 
@@ -975,10 +1421,9 @@ def _latent_moment_jacobian(
             factor = np.linalg.cholesky(cov)
         except np.linalg.LinAlgError:
             return None
-        univariate, _, bivariate, _ = _integrate_on_grid(
-            model, standard_nodes @ factor.T + latent.mean, weights
+        return _integrate_layout_features(
+            model, standard_nodes @ factor.T + latent.mean, weights, layout
         )
-        return _flatten_score_moments(univariate, bivariate)
 
     columns = []
     for row, column in latent.estimated:
@@ -1099,6 +1544,89 @@ def _well_conditioned_cholesky(
     return factor
 
 
+def _observed_category_proportions(
+    responses: NDArray[np.float64],
+    layout: _MomentLayout,
+    counts: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Observed proportions of the layout's categories among responses."""
+    assert layout.categories is not None
+    totals = np.zeros(len(layout.items))
+    rows_per_chunk = max(1, _MOMENT_CHUNK_ELEMENTS // len(layout.items))
+    for start in range(0, len(responses), rows_per_chunk):
+        block = np.asarray(
+            responses[start : start + rows_per_chunk, layout.items], dtype=np.float64
+        )
+        # Missing codes are negative or NaN and match no category.
+        totals += np.count_nonzero(block == layout.categories, axis=0)
+    return _safe_divide(totals, counts)
+
+
+def _expected_category_proportions(
+    model: BaseItemModel,
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64] | None,
+    n_quadpts: int,
+    design: _MomentDesign,
+    layout: _MomentLayout,
+    *,
+    latent: _LatentNormal | None = None,
+) -> NDArray[np.float64]:
+    """Model-implied proportions of the layout's categories.
+
+    They are integrated over the latent population, or averaged over the
+    respondents of each item at fixed abilities.
+    """
+    n_univariate = len(layout.items)
+    totals = np.zeros(n_univariate)
+    for nodes, weights, present in _integration_blocks(
+        model, responses, theta, n_quadpts, latent=latent, layout=layout
+    ):
+        univariate = _category_features(
+            _conditional_probabilities(model, nodes), layout
+        )
+        if present is not None:
+            univariate = univariate * present[:, :n_univariate]
+        totals += weights @ univariate
+    if theta is None:
+        return totals
+    return _safe_divide(totals, design.counts[:n_univariate])
+
+
+def _layout_residual_moments(
+    model: BaseItemModel,
+    moments: _FitMoments,
+    responses: NDArray[np.float64],
+    theta: NDArray[np.float64] | None,
+    n_quadpts: int,
+    design: _MomentDesign,
+    layout: _MomentLayout,
+    *,
+    latent: _LatentNormal | None = None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Observed and model-implied moments of ``layout``.
+
+    ``design`` holds the observation counts of the layout's moments.
+    """
+    if layout.categories is None:
+        return (
+            _flatten_score_moments(moments.observed_uni, moments.observed_bi),
+            _flatten_score_moments(moments.expected_uni, moments.expected_bi),
+        )
+    upper = np.triu_indices(model.n_items, 1)
+    n_univariate = len(layout.items)
+    observed = _observed_category_proportions(
+        responses, layout, design.counts[:n_univariate]
+    )
+    expected = _expected_category_proportions(
+        model, responses, theta, n_quadpts, design, layout, latent=latent
+    )
+    return (
+        np.concatenate([observed, moments.observed_bi[upper]]),
+        np.concatenate([expected, moments.expected_bi[upper]]),
+    )
+
+
 def _m2_from_moments(
     model: BaseItemModel,
     moments: _FitMoments,
@@ -1109,26 +1637,34 @@ def _m2_from_moments(
     *,
     latent: _LatentNormal | None = None,
     constraints: EqualityConstraints | None = None,
+    layout: _MomentLayout | None = None,
 ) -> dict[str, float]:
-    """Compute a genuinely covariance-weighted limited-information test."""
+    """Compute a genuinely covariance-weighted limited-information test.
+
+    ``layout`` selects the univariate moments, by default those of M2*.
+    """
     if design is None:
         design = _moment_design(responses)
+    if layout is None:
+        layout = _MomentLayout(np.arange(model.n_items))
+    design = _layout_design(design, layout)
     selected = design.counts > 0
-    observed = _flatten_score_moments(moments.observed_uni, moments.observed_bi)
-    expected = _flatten_score_moments(moments.expected_uni, moments.expected_bi)
+    observed, expected = _layout_residual_moments(
+        model, moments, responses, theta, n_quadpts, design, layout, latent=latent
+    )
     covariance = _model_sample_covariance(
-        model, responses, theta, n_quadpts, design, latent=latent
+        model, responses, theta, n_quadpts, design, latent=latent, layout=layout
     )
     jacobian = _tie_columns(
         model,
         _model_moment_jacobian(
-            model, responses, theta, n_quadpts, design, latent=latent
+            model, responses, theta, n_quadpts, design, latent=latent, layout=layout
         ),
         constraints,
     )
     if theta is None and latent is not None and latent.estimated:
         jacobian = np.column_stack(
-            (jacobian, _latent_moment_jacobian(model, n_quadpts, latent))
+            (jacobian, _latent_moment_jacobian(model, n_quadpts, latent, layout))
         )
     statistic, degrees = _projected_chi_square(
         (observed - expected)[selected],

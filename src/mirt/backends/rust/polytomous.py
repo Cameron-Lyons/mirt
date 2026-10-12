@@ -13,6 +13,7 @@ from numpy.typing import NDArray
 from mirt._classical import _alpha_if_deleted_numpy
 from mirt._core import sigmoid
 from mirt.backends.rust._helpers import (
+    _category_codes,
     _ensure_f64,
     _ensure_i32,
     _entry_chunk_size,
@@ -29,10 +30,9 @@ def _observed_item_groups(
     n_categories: NDArray[np.int_],
 ) -> Iterator[tuple[int, NDArray[np.intp], NDArray[np.int_]]]:
     """Yield observed items grouped by their shared category count."""
-    if responses.shape[0] == 0:
-        observed_items = np.zeros(responses.shape[1], dtype=bool)
-    else:
-        observed_items = np.max(responses, axis=0) >= 0
+    # ``NaN`` compares false, so a column with NaN-coded missing responses
+    # keeps its observed entries.
+    observed_items = np.any(responses >= 0, axis=0)
     for n_cat_value in np.unique(n_categories):
         n_cat = int(n_cat_value)
         item_indices = np.flatnonzero(n_categories == n_cat)
@@ -47,6 +47,33 @@ def _observed_item_groups(
             if np.any(grouped_responses >= n_cat):
                 raise IndexError("response category is outside the item category range")
             yield n_cat, grouped_indices, grouped_responses
+
+
+def _finite_item_parameters(
+    quad_points: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    locations: NDArray[np.float64],
+    n_categories: NDArray[np.int_],
+    first_column: int,
+) -> bool:
+    """Return whether the evaluation points and used item parameters are finite.
+
+    Item ``j`` uses location columns ``first_column`` through
+    ``first_column + n_categories[j] - 2``. The native kernels give ``NaN``
+    only to the persons whose responses a non-finite value enters, whereas
+    the NumPy path's indicator products spread it to every person. Non-finite
+    inputs take the NumPy path, so both backends return the same values.
+    Inconsistent shapes are left to the kernels to report.
+    """
+    if not (np.all(np.isfinite(quad_points)) and np.all(np.isfinite(discrimination))):
+        return False
+    locations = np.asarray(locations, dtype=np.float64)
+    counts = np.asarray(n_categories)
+    if locations.ndim != 2 or counts.shape != (locations.shape[0],):
+        return True
+    columns = np.arange(locations.shape[1])
+    used = (columns >= first_column) & (columns < counts[:, None] - 1 + first_column)
+    return bool(np.all(np.isfinite(locations[used])))
 
 
 def _accumulate_category_log_probabilities(
@@ -77,7 +104,8 @@ def compute_log_likelihoods_grm(
     Parameters
     ----------
     responses : NDArray
-        Response matrix (n_persons, n_items), missing coded as negative
+        Response matrix (n_persons, n_items), missing coded as negative or
+        ``NaN``
     quad_points : NDArray
         Quadrature points (n_quad,)
     discrimination : NDArray
@@ -90,18 +118,30 @@ def compute_log_likelihoods_grm(
     Returns
     -------
     NDArray
-        Log-likelihoods (n_persons, n_quad)
+        Log-likelihoods (n_persons, n_quad). Non-finite points or item
+        parameters of observed items give ``NaN``, as in NumPy arithmetic.
+
+    Raises
+    ------
+    IndexError
+        If an observed response is not below its item's category count.
     """
-    if rust_enabled():
+    responses = _category_codes(responses)
+    if rust_enabled() and _finite_item_parameters(
+        np.asarray(quad_points, dtype=np.float64),
+        np.asarray(discrimination, dtype=np.float64),
+        thresholds,
+        n_categories,
+        first_column=0,
+    ):
         return mirt_rs.compute_log_likelihoods_grm(
-            _ensure_i32(responses),
+            responses,
             _ensure_f64(quad_points),
             _ensure_f64(discrimination),
             _ensure_f64(thresholds),
             _ensure_i32(n_categories),
         )
 
-    responses = np.asarray(responses)
     quad_points = np.asarray(quad_points, dtype=np.float64)
     discrimination = np.asarray(discrimination, dtype=np.float64)
     thresholds = np.asarray(thresholds, dtype=np.float64)
@@ -163,7 +203,8 @@ def compute_log_likelihoods_gpcm(
     Parameters
     ----------
     responses : NDArray
-        Response matrix (n_persons, n_items), missing coded as negative
+        Response matrix (n_persons, n_items), missing coded as negative or
+        ``NaN``
     quad_points : NDArray
         Quadrature points (n_quad,)
     discrimination : NDArray
@@ -176,18 +217,30 @@ def compute_log_likelihoods_gpcm(
     Returns
     -------
     NDArray
-        Log-likelihoods (n_persons, n_quad)
+        Log-likelihoods (n_persons, n_quad). Non-finite points or item
+        parameters of observed items give ``NaN``, as in NumPy arithmetic.
+
+    Raises
+    ------
+    IndexError
+        If an observed response is not below its item's category count.
     """
-    if rust_enabled():
+    responses = _category_codes(responses)
+    if rust_enabled() and _finite_item_parameters(
+        np.asarray(quad_points, dtype=np.float64),
+        np.asarray(discrimination, dtype=np.float64),
+        steps,
+        n_categories,
+        first_column=1,
+    ):
         return mirt_rs.compute_log_likelihoods_gpcm(
-            _ensure_i32(responses),
+            responses,
             _ensure_f64(quad_points),
             _ensure_f64(discrimination),
             _ensure_f64(steps),
             _ensure_i32(n_categories),
         )
 
-    responses = np.asarray(responses)
     quad_points = np.asarray(quad_points, dtype=np.float64)
     discrimination = np.asarray(discrimination, dtype=np.float64)
     steps = np.asarray(steps, dtype=np.float64)
@@ -240,6 +293,11 @@ def compute_alpha_if_deleted(
     responses: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute Cronbach's alpha if each item is deleted.
+
+    Missing responses add nothing to a respondent's total, while item
+    variances use the observed responses; on complete data this is the
+    usual coefficient. :func:`mirt.traditional` uses it for complete data
+    only and treats missing responses by complete cases or pairs.
 
     Parameters
     ----------

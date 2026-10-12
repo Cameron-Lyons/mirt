@@ -623,3 +623,73 @@ class TestPolytomousEdgeCases:
         assert diagnostics is not None
         assert diagnostics.area_diff[0] > diagnostics.area_diff[1:].max()
         assert diagnostics.flagged.tolist() == [True, False, False, False, False]
+
+
+class TestPolytomousBootstrapStandardErrors:
+    """``compute_se`` mirrors the paired-anchor bootstrap of ``link``."""
+
+    @pytest.mark.parametrize(
+        ("linker", "fixture"),
+        [
+            (link_grm, "grm_model_pair"),
+            (link_gpcm, "gpcm_model_pair"),
+            (link_nrm, "nrm_model_pair"),
+        ],
+    )
+    def test_compute_se_is_seeded_and_off_by_default(self, linker, fixture, request):
+        model_old, model_new, *_ = request.getfixturevalue(fixture)
+        rng = np.random.default_rng(8)
+        noisy = model_new.copy()
+        noisy.set_parameters(
+            **{
+                name: values
+                + rng.normal(0.0, 0.05, values.shape) * noisy.free_parameter_masks[name]
+                for name, values in noisy.parameters.items()
+            }
+        )
+        anchors = list(range(5))
+
+        plain = linker(model_old, noisy, anchors, anchors)
+        first = linker(
+            model_old,
+            noisy,
+            anchors,
+            anchors,
+            compute_se=True,
+            random_state=4,
+            n_bootstrap=25,
+        )
+        second = linker(
+            model_old,
+            noisy,
+            anchors,
+            anchors,
+            compute_se=True,
+            random_state=4,
+            n_bootstrap=25,
+        )
+
+        assert plain.constants.A_se is None and plain.constants.B_se is None
+        assert first.constants.A_se > 0.0 and first.constants.B_se > 0.0
+        assert (first.constants.A_se, first.constants.B_se) == (
+            second.constants.A_se,
+            second.constants.B_se,
+        )
+        assert (first.constants.A, first.constants.B) == (
+            plain.constants.A,
+            plain.constants.B,
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"compute_se": 1}, "compute_se"),
+            ({"compute_se": True, "n_bootstrap": 1}, "at least 2"),
+            ({"compute_se": True, "n_bootstrap": 2.5}, "integer"),
+        ],
+    )
+    def test_bootstrap_options_are_validated(self, grm_model_pair, kwargs, message):
+        model_old, model_new, *_ = grm_model_pair
+
+        with pytest.raises(ValueError, match=message):
+            link_grm(model_old, model_new, [0, 1, 2], [0, 1, 2], **kwargs)

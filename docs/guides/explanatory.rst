@@ -60,6 +60,34 @@ include unexplained ability variation:
 The marginal method uses Gauss-Hermite quadrature and returns one probability
 per respondent and item. Supply ``item_idx`` to evaluate a single item.
 
+Estimating Item Features
+------------------------
+
+``EMEstimator`` fits the item side of :class:`~mirt.models.LLTM`,
+:class:`~mirt.models.RaschLLTM` and ``ExplanatoryIRT`` by marginal maximum
+likelihood with a standard-normal ability. The feature weights, and the
+common discrimination when ``constrain_discrimination=True`` (the default),
+are shared by every item, so EM's shared-parameter step estimates them from
+all items' expected counts:
+
+.. code-block:: python
+
+   from mirt.estimation.em import EMEstimator
+   from mirt.models import LLTM
+
+   lltm = LLTM(n_items=3, item_features=item_features)
+   result = EMEstimator().fit(lltm, responses)
+   print(lltm.feature_weights, lltm.discrimination[0], result.log_likelihood)
+
+A common discrimination ``a`` with a standard-normal ability is R mirt's Rasch
+LLTM (``itemtype="Rasch"`` with ``item.formula``), whose latent variance is
+``a ** 2``. ``mirt.LLTM(q_matrix).fit(responses)`` fits the same model and
+adds the likelihood-ratio test against the Rasch model. EM ignores the person
+covariates of ``ExplanatoryIRT``, whose latent regression keeps its values;
+:class:`mirt.MixedEffectsIRT` estimates item and person covariate effects
+together. Estimators without a shared-parameter step raise
+``MirtModelError`` for these models.
+
 Joint Response Likelihoods
 --------------------------
 

@@ -35,51 +35,29 @@ def restore_backend():
 
 
 @native
-@pytest.mark.parametrize("kind", ["2pl", "3pl", "mirt", "grm", "gpcm"])
+@pytest.mark.parametrize("kind", ["grm", "gpcm"])
 def test_cached_likelihood_matches_independent_model(kind):
-    from mirt.backends.rust import likelihood, polytomous
+    from mirt.backends.rust import polytomous
 
     rng = np.random.default_rng(819)
     points = np.linspace(-3, 3, 13)
     a = rng.uniform(0.5, 1.5, 4)
-    b = rng.uniform(-1, 1, 4)
-    responses = rng.integers(-1, 2, (67, 8), dtype=np.int32)[:, ::2]
-    responses[0] = -19
     mirt.set_backend("rust")
-    if kind == "mirt":
-        points = np.column_stack((points, points[::-1]))
-        model = TwoParameterLogistic(4, n_factors=2)
-        a = np.column_stack((a, a[::-1]))
-        model.set_parameters(discrimination=a, difficulty=b)
-        result = likelihood.compute_log_likelihoods_mirt(responses, points, a, b)
-    elif kind in ("2pl", "3pl"):
-        if kind == "2pl":
-            model = TwoParameterLogistic(4).set_parameters(
-                discrimination=a, difficulty=b
-            )
-            result = likelihood.compute_log_likelihoods_2pl(responses, points, a, b)
-        else:
-            c = np.linspace(0.1, 0.3, 4)
-            model = ThreeParameterLogistic(4).set_parameters(
-                discrimination=a, difficulty=b, guessing=c
-            )
-            result = likelihood.compute_log_likelihoods_3pl(responses, points, a, b, c)
+    categories = np.array([2, 5, 3, 4])
+    responses = np.column_stack([rng.integers(-1, k, 67) for k in categories])
+    responses[0] = -99
+    factory = GradedResponseModel if kind == "grm" else GeneralizedPartialCredit
+    model = factory(4, n_categories=categories.tolist())
+    model.set_parameters(discrimination=a)
+    if kind == "grm":
+        result = polytomous.compute_log_likelihoods_grm(
+            responses, points, a, model.parameters["thresholds"], categories
+        )
     else:
-        categories = np.array([2, 5, 3, 4])
-        responses = np.column_stack([rng.integers(-1, k, 67) for k in categories])
-        responses[0] = -99
-        factory = GradedResponseModel if kind == "grm" else GeneralizedPartialCredit
-        model = factory(4, n_categories=categories.tolist())
-        model.set_parameters(discrimination=a)
-        if kind == "grm":
-            result = polytomous.compute_log_likelihoods_grm(
-                responses, points, a, model.parameters["thresholds"], categories
-            )
-        else:
-            steps = np.column_stack((np.zeros(4), model.parameters["steps"]))
-            result = polytomous.compute_log_likelihoods_gpcm(
-                responses, points, a, steps, categories
-            )
+        steps = np.column_stack((np.zeros(4), model.parameters["steps"]))
+        result = polytomous.compute_log_likelihoods_gpcm(
+            responses, points, a, steps, categories
+        )
     # Evaluate each theta independently through the model, not the cached kernel.
     theta = np.asarray(points).reshape(len(points), -1)
     expected = np.column_stack(
@@ -264,9 +242,18 @@ def test_compressed_em_matches_expanded_fit(monkeypatch, kind):
     kwargs = dict(model=kind, n_quadpts=11, max_iter=4, tol=1e-12)
     if poly:
         kwargs["n_categories"] = 4
-    compressed = mirt.fit_mirt(responses, **kwargs)
+
+    def fit():
+        if kind != "PCM":
+            return mirt.fit_mirt(responses, **kwargs)
+        # fit_mirt ties the common PCM slope across items, which the native
+        # M-step leaves to the joint step; the unit-slope PCM keeps it.
+        estimator = EMEstimator(n_quadpts=11, max_iter=4, tol=1e-12)
+        return estimator.fit(PartialCreditModel(5, 4), responses)
+
+    compressed = fit()
     monkeypatch.setattr(patterns, "compress_responses", lambda values: (values, None))
-    expanded = mirt.fit_mirt(responses, **kwargs)
+    expanded = fit()
     assert compressed.n_observations == responses.shape[0]
     assert compressed.log_likelihood == pytest.approx(expanded.log_likelihood, abs=2e-5)
     assert compressed.bic == pytest.approx(expanded.bic, abs=4e-5)

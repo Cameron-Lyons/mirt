@@ -623,7 +623,8 @@ def create_content_constraint(
     Parameters
     ----------
     method : str | None
-        Content constraint method. One of: "blueprint", "weighted", None.
+        Content constraint method. One of: "blueprint", "weighted", "none",
+        or None. Names match regardless of case and surrounding whitespace.
     **kwargs
         Additional keyword arguments passed to the constructor.
 
@@ -642,18 +643,15 @@ def create_content_constraint(
 
     if not isinstance(method, str):
         raise TypeError("method must be a string or None")
+    # Imported here so that importing content data classes stays minimal.
+    from mirt.cat._names import resolve_name
 
-    methods = {
+    methods: dict[str, type[ContentConstraint]] = {
         "blueprint": ContentBlueprint,
         "weighted": WeightedContent,
         "none": NoContentConstraint,
     }
-
-    method_lower = method.strip().lower()
-    if method_lower not in methods:
-        valid = ", ".join(methods.keys())
-        raise ValueError(
-            f"Unknown content constraint method '{method}'. Valid options: {valid}"
-        )
-
-    return methods[method_lower](**kwargs)
+    _, constraint_class = resolve_name(
+        method, methods, kind="content constraint method"
+    )
+    return constraint_class(**kwargs)

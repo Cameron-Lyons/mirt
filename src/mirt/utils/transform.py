@@ -8,10 +8,42 @@ import numpy as np
 from numpy.typing import NDArray
 
 
+def _is_missing_answer(value: object) -> bool:
+    """Return whether one response entry is missing.
+
+    ``None``, ``NaN``, pandas' ``NA`` and negative numeric codes are missing,
+    as in :func:`mirt.utils.data.validate_responses`.
+    """
+    if value is None:
+        return True
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return bool(np.isnan(value) or value < 0)
+    try:
+        # NaN-like values such as NaT differ from themselves; pd.NA raises.
+        return bool(value != value)
+    except TypeError:
+        return True
+
+
+def _missing_answers(responses: NDArray) -> NDArray[np.bool_]:
+    """Return the missing-entry mask of a numeric or object response matrix."""
+    if responses.dtype.kind == "f":
+        return np.isnan(responses) | (responses < 0)
+    if responses.dtype.kind in "iu":
+        return responses < 0
+    if responses.dtype.kind == "O":
+        flat = [_is_missing_answer(value) for value in responses.ravel()]
+        return np.array(flat, dtype=bool).reshape(responses.shape)
+    return np.zeros(responses.shape, dtype=bool)
+
+
 def key2binary(
     responses: NDArray,
     key: list | NDArray,
     scored_values: tuple[int, int] = (0, 1),
+    score_missing: bool = False,
 ) -> NDArray[np.float64]:
     """Score multiple choice responses using an answer key.
 
@@ -22,28 +54,33 @@ def key2binary(
     ----------
     responses : NDArray
         Response matrix. Shape: (n_persons, n_items).
-        Can contain string or numeric values.
+        Can contain string or numeric values. ``None``, ``NaN`` and negative
+        numeric codes are missing.
     key : list or NDArray
         Correct answer for each item. Length: n_items.
     scored_values : tuple
         Values for (incorrect, correct). Default (0, 1).
+    score_missing : bool
+        Whether missing responses are scored as incorrect. By default they
+        stay missing (``NaN``), as in R mirt's ``key2binary``. Default False.
 
     Returns
     -------
     NDArray[np.float64]
-        Binary scored responses.
+        Binary scored responses, with ``NaN`` for missing responses unless
+        ``score_missing`` is True.
 
     Examples
     --------
     >>> responses = np.array([['A', 'B', 'C'],
-    ...                       ['A', 'C', 'C'],
-    ...                       ['B', 'B', 'A']])
+    ...                       ['A', 'C', None],
+    ...                       ['B', 'B', 'A']], dtype=object)
     >>> key = ['A', 'B', 'C']
     >>> scored = key2binary(responses, key)
     >>> print(scored)
-    [[1. 1. 1.]
-     [1. 0. 1.]
-     [0. 1. 0.]]
+    [[ 1.  1.  1.]
+     [ 1.  0. nan]
+     [ 0.  1.  0.]]
     """
     responses = np.asarray(responses)
     if responses.ndim != 2:
@@ -63,8 +100,23 @@ def key2binary(
         incorrect, correct = (float(value) for value in scored_values)
     except (TypeError, ValueError) as exc:
         raise ValueError("scored_values must contain two numeric values") from exc
+    if not isinstance(score_missing, (bool, np.bool_)):
+        raise ValueError("score_missing must be a boolean")
 
-    return np.where(responses == key[None, :], correct, incorrect)
+    scored = np.where(responses == key[None, :], correct, incorrect)
+    if not score_missing:
+        scored[_missing_answers(responses)] = np.nan
+    return scored
+
+
+def _category_codes(observed: NDArray[np.float64], method: str) -> NDArray[np.float64]:
+    """Return the observed category scores, which must be integers."""
+    values = observed[~np.isnan(observed)]
+    if values.size == 0:
+        raise ValueError(f"{method} conversion requires at least one observed response")
+    if np.any(values != np.trunc(values)):
+        raise ValueError(f"{method} conversion requires integer category codes")
+    return values
 
 
 def poly2dich(
@@ -78,7 +130,8 @@ def poly2dich(
     ----------
     responses : NDArray[np.float64]
         Polytomous response matrix. Shape: (n_persons, n_items).
-        Values should be 0, 1, 2, ..., n_categories-1.
+        Values should be 0, 1, 2, ..., n_categories-1. ``NaN`` and negative
+        codes are missing and stay missing (``NaN``) in every method.
     cutoff : scalar or array-like, optional
         Threshold for dichotomization. Responses >= cutoff become 1.
         If None, uses median split for each item.
@@ -86,14 +139,23 @@ def poly2dich(
         cutoff per item. Only used when ``method="threshold"``.
     method : str
         Dichotomization method:
+
         - "threshold": Simple threshold at cutoff
         - "median": Median split per item
-        - "adjacent": Create separate items for adjacent categories
+        - "cumulative": ``K - 1`` indicators per item, ``x >= k`` for
+          ``k = 1, ..., K - 1``, where ``K`` is one more than the largest
+          observed code of any item (the splits of a graded model)
+        - "adjacent": ``K - 1`` adjacent-category indicators per item, 1 if
+          ``x == k`` and 0 if ``x == k - 1``; other categories are missing
+          (the splits of a partial credit model)
+        - "dummy": One indicator per observed category of each item, in
+          ascending order, as R mirt's ``poly2dich``
 
     Returns
     -------
     NDArray[np.float64]
-        Dichotomized responses.
+        Dichotomized responses. The expansions are item-major: each item's
+        indicators are adjacent columns.
 
     Examples
     --------
@@ -104,6 +166,10 @@ def poly2dich(
     [[0. 1. 1.]
      [0. 1. 1.]
      [1. 0. 1.]]
+    >>> print(poly2dich(np.array([[0], [1], [2]]), method="adjacent"))
+    [[ 0. nan]
+     [ 1.  0.]
+     [nan  1.]]
     """
     responses = np.asarray(responses, dtype=np.float64)
     if responses.ndim != 2:
@@ -114,10 +180,12 @@ def poly2dich(
         raise ValueError("responses must contain at least one person and one item")
     if np.any(np.isinf(responses)):
         raise ValueError("responses must contain finite values or NaN")
+    observed = np.where(responses < 0, np.nan, responses)
+    missing = np.isnan(observed)
 
     if method in ("threshold", "median"):
         if method == "median" or cutoff is None:
-            cutoff_values = np.nanmedian(responses, axis=0)
+            cutoff_values = np.nanmedian(observed, axis=0)
         else:
             try:
                 cutoff_values = np.asarray(cutoff, dtype=np.float64)
@@ -134,30 +202,36 @@ def poly2dich(
                 raise ValueError("cutoff must contain only finite values")
 
         binary = np.empty((n_persons, n_items), dtype=np.float64)
-        np.greater_equal(responses, cutoff_values, out=binary)
-        binary[np.isnan(responses)] = np.nan
+        np.greater_equal(observed, cutoff_values, out=binary)
+        binary[missing] = np.nan
         return binary
 
-    if method == "adjacent":
-        observed = responses[~np.isnan(responses)]
-        if observed.size == 0:
-            raise ValueError(
-                "adjacent conversion requires at least one observed response"
-            )
-        if np.any(observed < 0) or np.any(observed != np.trunc(observed)):
-            raise ValueError(
-                "adjacent conversion requires non-negative integer category codes"
-            )
-
-        n_categories = int(observed.max()) + 1
+    if method in ("cumulative", "adjacent"):
+        n_categories = int(_category_codes(observed, method).max()) + 1
         if n_categories < 2:
-            raise ValueError("adjacent conversion requires at least two categories")
+            raise ValueError(f"{method} conversion requires at least two categories")
 
         thresholds = np.arange(1, n_categories, dtype=np.float64)
         expanded = np.empty((n_persons, n_items, n_categories - 1), dtype=np.float64)
-        np.greater_equal(responses[:, :, None], thresholds, out=expanded)
-        expanded[np.isnan(responses)] = np.nan
+        np.greater_equal(observed[:, :, None], thresholds, out=expanded)
+        if method == "adjacent":
+            # Only categories k - 1 and k inform the k-th adjacent split.
+            difference = observed[:, :, None] - thresholds
+            expanded[(difference != 0.0) & (difference != -1.0)] = np.nan
+        expanded[missing] = np.nan
         return expanded.reshape(n_persons, -1)
+
+    if method == "dummy":
+        columns = []
+        for item in range(n_items):
+            item_values = observed[:, item]
+            categories = np.unique(item_values[~missing[:, item]])
+            indicators = (item_values[:, None] == categories[None, :]).astype(
+                np.float64
+            )
+            indicators[missing[:, item]] = np.nan
+            columns.append(indicators)
+        return np.concatenate(columns, axis=1)
 
     raise ValueError(f"Unknown method: {method}")
 
@@ -165,25 +239,36 @@ def poly2dich(
 def reverse_score(
     responses: NDArray[np.float64],
     items: list[int] | None = None,
-    max_score: int | None = None,
+    max_score: int | list[int] | NDArray | None = None,
 ) -> NDArray[np.float64]:
     """Reverse score selected items.
 
-    Transforms responses so that x becomes (max_score - x).
+    Transforms each observed response x of a reversed item into
+    ``max_score - x``. ``NaN`` and negative codes are missing and are left
+    unchanged.
 
     Parameters
     ----------
     responses : NDArray[np.float64]
-        Response matrix. Shape: (n_persons, n_items).
+        Response matrix with categories coded from 0. Shape:
+        (n_persons, n_items).
     items : list of int, optional
         Indices of items to reverse. If None, reverse all items.
-    max_score : int, optional
-        Maximum possible score. If None, inferred from data.
+    max_score : int or array-like, optional
+        Highest category of the reversed items, either one value for all of
+        them or one value per entry of ``items``. If None, each item's
+        largest observed response, so pass it when the top category of an
+        item may be unobserved.
 
     Returns
     -------
     NDArray[np.float64]
         Responses with selected items reverse scored.
+
+    Raises
+    ------
+    ValueError
+        If an observed response of a reversed item exceeds its ``max_score``.
 
     Examples
     --------
@@ -195,18 +280,47 @@ def reverse_score(
      [2. 0. 0.]]
     """
     responses = np.asarray(responses, dtype=np.float64).copy()
+    if responses.ndim != 2:
+        raise ValueError(f"responses must be a 2D array, got {responses.ndim}D")
     n_items = responses.shape[1]
 
     if items is None:
-        items = list(range(n_items))
+        item_indices = np.arange(n_items, dtype=np.intp)
+    else:
+        item_indices = np.asarray(items)
+        if item_indices.ndim != 1 or (
+            item_indices.size and item_indices.dtype.kind not in "iu"
+        ):
+            raise ValueError("items must be a one-dimensional sequence of integers")
+        item_indices = item_indices.astype(np.intp, copy=False)
+        if np.any(item_indices < -n_items) or np.any(item_indices >= n_items):
+            raise IndexError("item index out of range")
+        item_indices = item_indices % n_items
+        if np.unique(item_indices).size != item_indices.size:
+            raise ValueError("items must not contain duplicate indices")
 
+    selected = responses[:, item_indices]
+    observed = np.isfinite(selected) & (selected >= 0)
     if max_score is None:
-        max_score = int(np.nanmax(responses))
+        maxima = np.max(np.where(observed, selected, -np.inf), axis=0)
+    else:
+        try:
+            maxima = np.asarray(max_score, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_score must contain numeric values") from exc
+        if maxima.ndim == 0:
+            maxima = np.full(item_indices.size, maxima.item())
+        elif maxima.shape != item_indices.shape:
+            raise ValueError(
+                "max_score must be a scalar or one value per reversed item; "
+                f"expected {item_indices.size}"
+            )
+        if not np.all(np.isfinite(maxima)) or np.any(maxima < 0):
+            raise ValueError("max_score must contain finite non-negative values")
+        if np.any(observed & (selected > maxima)):
+            raise ValueError("responses of a reversed item exceed its max_score")
 
-    for j in items:
-        mask = ~np.isnan(responses[:, j])
-        responses[mask, j] = max_score - responses[mask, j]
-
+    responses[:, item_indices] = np.where(observed, maxima - selected, selected)
     return responses
 
 

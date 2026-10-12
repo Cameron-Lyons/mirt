@@ -23,7 +23,11 @@ from mirt.estimation.priors import (
     NormalPrior,
     PriorSpecification,
 )
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.quadrature import (
+    GaussHermiteQuadrature,
+    build_quadrature,
+    default_quadpts,
+)
 from mirt.estimation.se_methods import compute_se
 from mirt.estimation.standard_errors import (
     _finite_difference_information,
@@ -115,7 +119,9 @@ def test_one_component_reproduces_component_fit(component, options) -> None:
         responses = np.minimum(responses, np.asarray(model.n_categories) - 1)
     responses[rng.random(responses.shape) < 0.05] = -1
 
-    reference = EMEstimator(**options).fit(model.copy(), responses)
+    # Mixed-format fits take no parameter-expansion steps, so plain EM on the
+    # component follows the same path.
+    reference = EMEstimator(**options, px_em=False).fit(model.copy(), responses)
     mixed = MixedItemModel([(model.copy(), range(4))])
     result = MixedFormatEMEstimator(**options).fit(mixed, responses)
 
@@ -137,6 +143,14 @@ def test_one_component_reproduces_component_fit(component, options) -> None:
         assert result.vcov is None
     else:
         np.testing.assert_allclose(result.vcov, reference.vcov, atol=1e-10)
+    # The default component fit, which takes parameter-expansion steps where
+    # they apply, reaches the same optimum within the convergence tolerance.
+    expanded = EMEstimator(**options).fit(model.copy(), responses)
+    assert expanded.log_likelihood == pytest.approx(result.log_likelihood, abs=1e-3)
+    for name, values in expanded.model.parameters.items():
+        np.testing.assert_allclose(
+            result.model.parameters[f"{prefix}.{name}"], values, atol=5e-3
+        )
 
 
 def test_recovers_three_pl_and_graded_parameters() -> None:
@@ -564,7 +578,11 @@ def test_mixed_bayes_modal_errors_invert_the_log_posterior_hessian() -> None:
     responses = _true_model(types, rng).simulate(rng.standard_normal((300, 1)), seed=4)
     priors = {"discrimination": LogNormalPrior(0.0, 0.3), "difficulty": NormalPrior()}
     result = MixedFormatEMEstimator(
-        n_quadpts=15, tol=1e-7, item_priors=priors, se_method="oakes"
+        n_quadpts=15,
+        quadrature="gauss-hermite",
+        tol=1e-7,
+        item_priors=priors,
+        se_method="oakes",
     ).fit(MixedItemModel.from_itemtypes(types, n_categories=4), responses)
 
     model = result.model
@@ -789,16 +807,19 @@ def test_multidimensional_and_nominal_components() -> None:
         responses, model=["2PL"] * 4 + ["GRM"] * 2, n_factors=2, n_quadpts=7, tol=1e-2
     )
     assert result.model.n_factors == 2
-    assert result.se_method == "complete_data"
+    # Multidimensional and nominal components have exact item-local
+    # derivatives, so they get the observed information too.
+    assert result.se_method == "oakes"
+    assert result.vcov is not None
     assert np.all(np.isfinite(result.standard_errors["GRM.thresholds"]))
 
     nominal = MixedItemModel(
         [(TwoParameterLogistic(4), range(4)), (NominalResponseModel(2, 3), [4, 5])]
     )
     fitted = MixedFormatEMEstimator(tol=1e-2).fit(nominal, responses)
-    assert fitted.se_method == "complete_data"
+    assert fitted.se_method == "oakes"
     assert _parameter_bounds(nominal, "NRM.slopes") == (-5.0, 5.0)
-    assert _parameter_bounds(nominal, "2PL.discrimination") == (0.1, 5.0)
+    assert _parameter_bounds(nominal, "2PL.discrimination") == (0.1, 20.0)
 
 
 @pytest.mark.parametrize("family", [RatingScaleModel, GradedRatingScaleModel])
@@ -828,7 +849,8 @@ def test_components_with_shared_parameters_estimate_them(family) -> None:
     # coordinates; without it the thresholds would keep their defaults.
     estimate = model.parameters[name]
     assert not np.allclose(estimate, start)
-    quadrature = GaussHermiteQuadrature(21, 1)
+    # The default EM grid.
+    quadrature = build_quadrature(default_quadpts(1), 1)
     mass = quadrature.weights / quadrature.weights.sum()
     gradient = []
     for column in np.flatnonzero(model.free_parameter_masks[name]):

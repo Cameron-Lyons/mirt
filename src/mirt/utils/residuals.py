@@ -1,10 +1,11 @@
 """Residual analysis functions for IRT models.
 
 Provides functions for computing various types of residuals
-for model diagnostics. Uses the native backend when its formulas match the
-model and vectorized model-agnostic kernels otherwise.
+for model diagnostics with vectorized model-agnostic kernels. :func:`Q3` and
+:func:`LD_X2` share the definitions of :mod:`mirt.diagnostics.ld`.
 """
 
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -15,28 +16,8 @@ from mirt._correlation import pairwise_correlations
 from mirt.constants import PROB_EPSILON
 from mirt.utils.data import _response_array
 
-_MIN_LD_PAIR_RESPONSES = 5
-_MIN_EXPECTED_CELL = 0.5
-_LD_CATEGORY_CHUNK_ELEMENTS = 1_000_000
-
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
-
-try:
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.diagnostics import (
-        compute_ld_chi2_matrix,
-        compute_q3_matrix,
-        compute_standardized_residuals,
-    )
-except ImportError:
-
-    def should_use_rust(use_rust: bool = True) -> bool:
-        return False
-
-    compute_ld_chi2_matrix = None
-    compute_q3_matrix = None
-    compute_standardized_residuals = None
 
 
 @dataclass
@@ -48,9 +29,12 @@ class ResidualResult:
     raw : NDArray[np.float64]
         Raw residuals (observed - expected).
     standardized : NDArray[np.float64]
-        Standardized residuals.
+        Residuals of the requested ``type``: raw, standardized (also returned
+        for ``"pearson"``) or deviance residuals.
     ld_matrix : NDArray[np.float64] | None
-        Local dependence matrix (Q3 or other).
+        Pairwise correlations of the ``standardized`` residuals, with a unit
+        diagonal. With ``type="raw"`` this is Yen's Q3, as returned by
+        :func:`Q3`; other types correlate standardized or deviance residuals.
     summary : dict
         Summary statistics for residuals.
     """
@@ -94,12 +78,24 @@ def _coerce_responses_theta(
     if not np.all(np.isfinite(theta_2d)):
         raise ValueError("theta must contain only finite values")
 
-    n_items = getattr(model, "n_items", None)
-    if n_items is None or int(n_items) != responses_f.shape[1]:
-        raise ValueError("response columns must match model.n_items")
+    responses_f, observed = _coerce_responses(model, responses_f)
     n_factors = getattr(model, "n_factors", None)
     if n_factors is not None and int(n_factors) != theta_2d.shape[1]:
         raise ValueError("theta columns must match model.n_factors")
+    return responses_f, theta_2d, observed
+
+
+def _coerce_responses(
+    model: "BaseItemModel",
+    responses: ArrayLike,
+) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
+    """Normalize and validate a response matrix and its observed mask."""
+    responses_f = np.asarray(_response_array(responses), dtype=np.float64)
+    if responses_f.ndim != 2 or 0 in responses_f.shape:
+        raise ValueError("responses must be a nonempty two-dimensional matrix")
+    n_items = getattr(model, "n_items", None)
+    if n_items is None or int(n_items) != responses_f.shape[1]:
+        raise ValueError("response columns must match model.n_items")
 
     finite_responses = np.isfinite(responses_f)
     if np.any(np.isinf(responses_f)):
@@ -110,7 +106,7 @@ def _coerce_responses_theta(
     observed = finite_responses & ~negative
     if np.any(observed & (responses_f != np.floor(responses_f))):
         raise ValueError("observed responses must use integer category codes")
-    return responses_f, theta_2d, observed
+    return responses_f, observed
 
 
 def _probability_moments(
@@ -205,40 +201,6 @@ def _prepare_residual_data(
         variance=variance,
         n_categories=n_categories,
     )
-
-
-def _supports_binary_2pl_kernel(model: "BaseItemModel") -> bool:
-    """Return whether the native formulas exactly represent this model."""
-    from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
-
-    return type(model) in (OneParameterLogistic, TwoParameterLogistic) and (
-        model.n_factors == 1
-    )
-
-
-def _prepare_rust_payload(
-    model: "BaseItemModel",
-    data: _ResidualData,
-    use_rust: bool,
-) -> tuple[
-    bool,
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
-    NDArray[np.float64] | None,
-    NDArray[np.int32] | None,
-]:
-    """Build a payload only when the native formulas exactly match the model."""
-    can_use_rust = should_use_rust(use_rust) and _supports_binary_2pl_kernel(model)
-
-    if not can_use_rust:
-        return False, None, None, None, None
-
-    disc = np.asarray(model.discrimination, dtype=np.float64)
-    diff = np.asarray(model.difficulty, dtype=np.float64)
-    theta_1d = data.theta[:, 0].astype(np.float64, copy=False)
-    responses_int = np.where(data.observed, data.responses, -1).astype(np.int32)
-
-    return True, disc, diff, theta_1d, responses_int
 
 
 def _standardized_score_residuals(data: _ResidualData) -> NDArray[np.float64]:
@@ -336,17 +298,22 @@ def residuals(
         Ability estimates. Shape: (n_persons,) or (n_persons, n_dims).
     type : str
         Type of residuals:
-        - "raw": observed - expected
-        - "standardized": raw / sqrt(modeled score variance)
-        - "pearson": alias for standardized score residuals
+
+        - "raw": ``x - E[x | theta]``, with the expected item score ``E``.
+        - "standardized": ``(x - E) / sqrt(Var[x | theta])``.
+        - "pearson": alias for "standardized", the Pearson residual of the
+          item score. For binary items it is the Bernoulli Pearson residual
+          ``(x - P) / sqrt(P(1 - P))``. It differs from
+          ``residual_type="pearson"`` of
+          :func:`mirt.diagnostics.compute_residuals`, which divides by
+          ``sqrt(E)``.
         - "deviance": Signed deviance residuals
     suppress_abs : float, optional
         Suppress residuals with absolute value below this threshold
         when computing LD matrix.
     use_rust : bool
-        Use the native backend when its binary 1PL/2PL formulas exactly match
-        the model. Richer dichotomous and polytomous models use the vectorized
-        model-agnostic path. Default True.
+        Accepted for backward compatibility and validated. Residuals are
+        always computed with vectorized NumPy kernels. Default True.
 
     Returns
     -------
@@ -370,40 +337,14 @@ def residuals(
         raise ValueError("suppress_abs must be finite and nonnegative")
 
     data = _prepare_residual_data(model, responses, theta)
-    rust_ready, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
-        model, data, bool(use_rust)
-    )
-    can_use_rust = rust_ready and type in ("standardized", "pearson")
     raw = np.where(data.observed, data.responses - data.expected, np.nan)
-
-    if can_use_rust:
-        assert disc is not None
-        assert diff is not None
-        assert theta_1d is not None
-        assert responses_int is not None
-        assert compute_standardized_residuals is not None
-        assert compute_q3_matrix is not None
-
-        standardized = np.asarray(
-            compute_standardized_residuals(responses_int, theta_1d, disc, diff),
-            dtype=np.float64,
-        )
-        ld_matrix = np.asarray(
-            compute_q3_matrix(responses_int, theta_1d, disc, diff),
-            dtype=np.float64,
-        )
-        np.fill_diagonal(ld_matrix, 1.0)
-        if suppress_abs is not None:
-            ld_matrix = np.where(np.abs(ld_matrix) < suppress_abs, 0.0, ld_matrix)
-            np.fill_diagonal(ld_matrix, 1.0)
+    if type == "raw":
+        standardized = raw
+    elif type in ("standardized", "pearson"):
+        standardized = _standardized_score_residuals(data)
     else:
-        if type == "raw":
-            standardized = raw
-        elif type in ("standardized", "pearson"):
-            standardized = _standardized_score_residuals(data)
-        else:
-            standardized = _deviance_residuals(data)
-        ld_matrix = _compute_ld_matrix(standardized, suppress_abs)
+        standardized = _deviance_residuals(data)
+    ld_matrix = _compute_ld_matrix(standardized, suppress_abs)
 
     return ResidualResult(
         raw=raw,
@@ -417,10 +358,10 @@ def _compute_ld_matrix(
     standardized_residuals: NDArray[np.float64],
     suppress_abs: float | None = None,
 ) -> NDArray[np.float64]:
-    """Compute local dependence matrix (Q3 statistic).
+    """Compute the pairwise correlation matrix of residuals.
 
-    The Q3 statistic is the correlation between standardized residuals
-    for pairs of items.
+    Correlations of raw residuals are Yen's Q3 statistics. Pairs with fewer
+    than three joint residuals are ``NaN`` and the diagonal is one.
     """
     values = np.asarray(standardized_residuals, dtype=np.float64)
     if values.ndim != 2 or values.shape[1] == 0:
@@ -449,8 +390,10 @@ def Q3(
 ) -> NDArray[np.float64]:
     """Compute Yen's Q3 statistic for local dependence.
 
-    Q3 is the correlation between standardized residuals for pairs
-    of items. Large positive values suggest local dependence.
+    Q3 is the correlation between the raw residuals ``x - E[x | theta]`` of
+    pairs of items, where ``E[x | theta]`` is the expected item score (the
+    expected category for polytomous items) at the ability estimates.
+    Large positive values suggest local dependence.
 
     Parameters
     ----------
@@ -462,18 +405,21 @@ def Q3(
     theta : NDArray[np.float64]
         Ability estimates.
     use_rust : bool
-        Use the native backend for unidimensional 1PL/2PL models. Other
-        supported models use the vectorized model-agnostic path. Default True.
+        Accepted for backward compatibility and validated. Q3 is always
+        computed with vectorized NumPy kernels. Default True.
 
     Returns
     -------
     NDArray[np.float64]
-        Q3 correlation matrix. Shape: (n_items, n_items).
+        Q3 correlation matrix. Shape: (n_items, n_items). The diagonal is
+        one and pairs with fewer than three joint responses are ``NaN``.
 
     Notes
     -----
-    Values above 0.2 may indicate local dependence between items.
-    The average Q3 should be close to zero if model fits well.
+    Values above 0.2 may indicate local dependence between items. Under
+    local independence the average Q3 is about ``-1 / (n_items - 1)``. The
+    values match ``residuals(type = "Q3")`` in the R package mirt for the
+    same abilities.
 
     References
     ----------
@@ -484,186 +430,28 @@ def Q3(
     if not isinstance(use_rust, (bool, np.bool_)):
         raise ValueError("use_rust must be a boolean")
     data = _prepare_residual_data(model, responses, theta)
-    can_use_rust, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
-        model, data, bool(use_rust)
-    )
-
-    if can_use_rust:
-        assert disc is not None
-        assert diff is not None
-        assert theta_1d is not None
-        assert responses_int is not None
-        assert compute_q3_matrix is not None
-
-        q3_matrix = np.asarray(
-            compute_q3_matrix(responses_int, theta_1d, disc, diff),
-            dtype=np.float64,
-        )
-        np.fill_diagonal(q3_matrix, 1.0)
-        return q3_matrix
-
-    return _compute_ld_matrix(_standardized_score_residuals(data))
-
-
-def _binary_ld_x2(
-    data: _ResidualData,
-) -> tuple[NDArray[np.float64], NDArray[np.bool_]]:
-    """Compute every binary LD statistic with matrix reductions."""
-    observed = data.observed.astype(np.float64)
-    response_one = np.where(data.observed, data.responses, 0.0)
-    response_zero = observed - response_one
-    probability_one = np.where(data.observed, data.probabilities, 0.0)
-    probability_zero = observed - probability_one
-
-    observed_cells = (
-        response_zero.T @ response_zero,
-        response_zero.T @ response_one,
-        response_one.T @ response_zero,
-        response_one.T @ response_one,
-    )
-    expected_cells = (
-        probability_zero.T @ probability_zero,
-        probability_zero.T @ probability_one,
-        probability_one.T @ probability_zero,
-        probability_one.T @ probability_one,
-    )
-    ld_x2 = np.zeros_like(observed_cells[0], dtype=np.float64)
-    for observed_cell, expected_cell in zip(
-        observed_cells, expected_cells, strict=True
-    ):
-        ld_x2 += (observed_cell - expected_cell) ** 2 / np.maximum(
-            expected_cell, _MIN_EXPECTED_CELL
-        )
-
-    pair_counts = observed.T @ observed
-    eligible = pair_counts >= _MIN_LD_PAIR_RESPONSES
-    np.fill_diagonal(eligible, False)
-    ld_x2 = np.where(eligible, (ld_x2 + ld_x2.T) / 2.0, 0.0)
-    return ld_x2, eligible
-
-
-def _polytomous_ld_x2(
-    data: _ResidualData,
-) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.bool_]]:
-    """Compute generalized categorical LD statistics in respondent chunks."""
-    n_persons, n_items = data.responses.shape
-    ld_x2 = np.zeros((n_items, n_items), dtype=np.float64)
-    category_degrees = data.n_categories.astype(np.int64, copy=False) - 1
-    degrees = np.multiply.outer(category_degrees, category_degrees)
-    np.fill_diagonal(degrees, 1)
-
-    max_categories = int(np.max(data.n_categories))
-    # Compact item-pair tables perform fewer reductions for small instruments
-    # whose response scale is wider than the item set.
-    if n_items <= max_categories:
-        return _pairwise_polytomous_ld_x2(data, degrees)
-
-    observed_float = data.observed.astype(np.float64)
-    pair_counts = observed_float.T @ observed_float
-    eligible = pair_counts >= _MIN_LD_PAIR_RESPONSES
-    np.fill_diagonal(eligible, False)
-    if not np.any(eligible):
-        return ld_x2, degrees, eligible
-
-    category_exists = np.arange(max_categories)[:, None] < data.n_categories[None, :]
-    chunk_size = min(
-        n_persons,
-        max(1, _LD_CATEGORY_CHUNK_ELEMENTS // n_items),
-    )
-
-    for first_category in range(max_categories):
-        first_exists = category_exists[first_category]
-        for second_category in range(first_category, max_categories):
-            valid_cells = (
-                first_exists[:, None] & category_exists[second_category][None, :]
-            )
-            if not np.any(valid_cells & eligible):
-                continue
-
-            observed_cells = np.zeros((n_items, n_items), dtype=np.float64)
-            expected_cells = np.zeros((n_items, n_items), dtype=np.float64)
-            for start in range(0, n_persons, chunk_size):
-                stop = min(start + chunk_size, n_persons)
-                observed = data.observed[start:stop]
-                responses = data.responses[start:stop]
-                first_observed = (observed & (responses == first_category)).astype(
-                    np.float64
-                )
-                first_probability = np.where(
-                    observed,
-                    data.probabilities[start:stop, :, first_category],
-                    0.0,
-                )
-                if first_category == second_category:
-                    second_observed = first_observed
-                    second_probability = first_probability
-                else:
-                    second_observed = (
-                        observed & (responses == second_category)
-                    ).astype(np.float64)
-                    second_probability = np.where(
-                        observed,
-                        data.probabilities[start:stop, :, second_category],
-                        0.0,
-                    )
-
-                observed_cells += first_observed.T @ second_observed
-                expected_cells += first_probability.T @ second_probability
-
-            contribution = (observed_cells - expected_cells) ** 2
-            contribution /= np.maximum(expected_cells, _MIN_EXPECTED_CELL)
-            ld_x2 += np.where(valid_cells, contribution, 0.0)
-            if first_category != second_category:
-                ld_x2 += np.where(valid_cells.T, contribution.T, 0.0)
-
-    ld_x2 = np.where(eligible, (ld_x2 + ld_x2.T) / 2.0, 0.0)
-
-    return ld_x2, degrees, eligible
-
-
-def _pairwise_polytomous_ld_x2(
-    data: _ResidualData,
-    degrees: NDArray[np.int_],
-) -> tuple[NDArray[np.float64], NDArray[np.int_], NDArray[np.bool_]]:
-    """Use compact per-pair tables when categories outnumber items."""
-    n_items = data.responses.shape[1]
-    ld_x2 = np.zeros((n_items, n_items), dtype=np.float64)
-    eligible = np.zeros((n_items, n_items), dtype=np.bool_)
-    for first in range(n_items):
-        first_categories = int(data.n_categories[first])
-        for second in range(first + 1, n_items):
-            valid = data.observed[:, first] & data.observed[:, second]
-            if np.count_nonzero(valid) < _MIN_LD_PAIR_RESPONSES:
-                continue
-            second_categories = int(data.n_categories[second])
-            first_responses = data.responses[valid, first].astype(np.int64)
-            second_responses = data.responses[valid, second].astype(np.int64)
-            flat_cells = first_responses * second_categories + second_responses
-            observed_cells = np.bincount(
-                flat_cells,
-                minlength=first_categories * second_categories,
-            ).reshape(first_categories, second_categories)
-            expected_cells = (
-                data.probabilities[valid, first, :first_categories].T
-                @ data.probabilities[valid, second, :second_categories]
-            )
-            statistic = np.sum(
-                (observed_cells - expected_cells) ** 2
-                / np.maximum(expected_cells, _MIN_EXPECTED_CELL)
-            )
-            ld_x2[first, second] = ld_x2[second, first] = statistic
-            eligible[first, second] = eligible[second, first] = True
-
-    return ld_x2, degrees, eligible
+    raw = np.where(data.observed, data.responses - data.expected, np.nan)
+    return _compute_ld_matrix(raw)
 
 
 def LD_X2(
     model: "BaseItemModel",
     responses: ArrayLike,
-    theta: NDArray[np.float64],
+    theta: NDArray[np.float64] | None = None,
     use_rust: bool = True,
+    *,
+    n_quadpts: int | None = None,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute Chen & Thissen LD chi-square statistic.
+
+    For items ``i`` and ``j`` the statistic compares the observed
+    ``K_i x K_j`` table of the ``N_ij`` persons who answered both items with
+    the model-implied table ``N_ij * sum_q w_q P_ik(theta_q) P_jl(theta_q)``.
+    The expected table integrates over the latent population on a
+    Gauss-Hermite grid, so it does not depend on ability estimates. This is
+    the statistic of :func:`mirt.diagnostics.compute_ld_chi2`.
 
     Parameters
     ----------
@@ -672,19 +460,27 @@ def LD_X2(
     responses : array-like of shape (n_persons, n_items)
         Integer-coded response matrix or DataFrame. Missing values may be
         ``-1``, ``NaN`` or the nulls of nullable DataFrame columns.
-    theta : NDArray[np.float64]
-        Ability estimates.
+    theta : NDArray[np.float64], optional
+        Deprecated and ignored. Passing it emits a ``DeprecationWarning``.
     use_rust : bool
-        Use the native backend for unidimensional binary 1PL/2PL models. Other
-        dichotomous models use batched matrix reductions, while polytomous
-        models use generalized category-pair tables. Default True.
+        Accepted for backward compatibility and validated. The native kernel
+        conditions on abilities, so the statistic is always computed with
+        vectorized NumPy reductions. Default True.
+    n_quadpts : int, optional
+        Quadrature points per latent dimension. The default depends on the
+        number of factors, as in :func:`mirt.diagnostics.compute_ld_statistics`.
+    prior_mean, prior_cov : array-like, optional
+        Mean and covariance of the normal latent population. Defaults to the
+        standard normal.
 
     Returns
     -------
     ld_x2 : NDArray[np.float64]
         LD chi-square matrix. Shape: (n_items, n_items).
     p_values : NDArray[np.float64]
-        P-value matrix.
+        P-value matrix, on ``(K_i - 1)(K_j - 1)`` degrees of freedom. The
+        diagonal and pairs with fewer than 10 joint responses are ``NaN`` in
+        both matrices.
 
     References
     ----------
@@ -694,35 +490,34 @@ def LD_X2(
     """
     from scipy import stats
 
+    from mirt._local_dependence import model_ld_statistics
+    from mirt.diagnostics._quadrature import resolve_diagnostic_quadpts
+
     if not isinstance(use_rust, (bool, np.bool_)):
         raise ValueError("use_rust must be a boolean")
-    data = _prepare_residual_data(model, responses, theta)
-    can_use_rust, disc, diff, theta_1d, responses_int = _prepare_rust_payload(
-        model, data, bool(use_rust)
-    )
-
-    if can_use_rust:
-        assert disc is not None
-        assert diff is not None
-        assert theta_1d is not None
-        assert responses_int is not None
-        assert compute_ld_chi2_matrix is not None
-
-        ld_x2 = np.asarray(
-            compute_ld_chi2_matrix(responses_int, theta_1d, disc, diff),
-            dtype=np.float64,
-        )
-        observed = data.observed.astype(np.int64)
-        eligible = observed.T @ observed >= _MIN_LD_PAIR_RESPONSES
-        np.fill_diagonal(eligible, False)
-        ld_x2 = np.where(eligible, ld_x2, 0.0)
-        degrees = np.ones_like(ld_x2, dtype=np.int64)
-    elif data.probabilities.ndim == 2:
-        ld_x2, eligible = _binary_ld_x2(data)
-        degrees = np.ones_like(ld_x2, dtype=np.int64)
+    if theta is None:
+        responses_f, observed = _coerce_responses(model, responses)
     else:
-        ld_x2, degrees, eligible = _polytomous_ld_x2(data)
+        warnings.warn(
+            "theta is deprecated for LD_X2 and ignored: the LD chi-square "
+            "integrates over the latent population",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        responses_f, _, observed = _coerce_responses_theta(model, responses, theta)
 
-    p_values = np.ones_like(ld_x2, dtype=np.float64)
-    p_values[eligible] = stats.chi2.sf(ld_x2[eligible], df=degrees[eligible])
+    statistics = model_ld_statistics(
+        model,
+        np.where(observed, responses_f, -1.0),
+        n_quadpts=resolve_diagnostic_quadpts(
+            n_quadpts, int(getattr(model, "n_factors", 1))
+        ),
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
+        compute_g2=False,
+    )
+    ld_x2 = statistics.chi2
+    p_values = np.full_like(ld_x2, np.nan)
+    eligible = ~np.isnan(ld_x2)
+    p_values[eligible] = stats.chi2.sf(ld_x2[eligible], df=statistics.df[eligible])
     return ld_x2, p_values

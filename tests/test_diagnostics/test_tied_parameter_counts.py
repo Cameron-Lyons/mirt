@@ -46,7 +46,8 @@ def test_item_parameter_shares_split_a_tied_group_over_its_items():
 def test_sx2_degrees_of_freedom_count_tied_slopes_once(tied_fit):
     result, responses = tied_fit
 
-    free = compute_itemfit(result, responses, ["S_X2"])
+    # An empty sequence counts every free coordinate separately.
+    free = compute_itemfit(result, responses, ["S_X2"], constraints=[])
     tied = compute_itemfit(result, responses, ["S_X2"], constraints=TIED)
     top_level = mirt.itemfit(result, responses, ["S_X2"], constraints=TIED)
 
@@ -62,7 +63,7 @@ def test_m2_projects_one_direction_per_tied_group(tied_fit):
     n_items = responses.shape[1]
     moments = n_items + n_items * (n_items - 1) // 2
 
-    free = compute_m2(result, responses)
+    free = compute_m2(result, responses, constraints=[])
     tied = compute_m2(result, responses, constraints=TIED)
 
     assert free["df"] == moments - 2 * n_items
@@ -73,3 +74,37 @@ def test_m2_projects_one_direction_per_tied_group(tied_fit):
     indices = mirt.compute_fit_indices(result, responses, constraints=TIED)
     assert indices["M2_df"] == tied["df"]
     assert indices["M2"] == pytest.approx(tied["M2"])
+
+
+def test_fit_result_supplies_its_own_constraints(tied_fit):
+    """A constrained fit counts its tied coordinates without re-passing them."""
+    result, responses = tied_fit
+    model = result.model
+
+    assert compute_m2(result, responses) == compute_m2(
+        result, responses, constraints=TIED
+    )
+    # A bare model carries no constraints.
+    assert compute_m2(model, responses) == compute_m2(result, responses, constraints=[])
+    indices = mirt.compute_fit_indices(result, responses)
+    assert indices["M2_df"] == compute_m2(result, responses, constraints=TIED)["df"]
+
+    tied = compute_itemfit(result, responses, ["S_X2", "X2"], constraints=TIED)
+    for fit_stats in (
+        compute_itemfit(result, responses, ["S_X2", "X2"]),
+        mirt.itemfit(result, responses, ["S_X2", "X2"]),
+    ):
+        for name in ("df", "X2_df", "p_value", "X2_p"):
+            np.testing.assert_allclose(np.asarray(fit_stats[name]), tied[name])
+    bare = compute_itemfit(model, responses, ["S_X2"])
+    np.testing.assert_allclose(bare["df"][:3], tied["df"][:3] - 2.0 / 3.0)
+
+
+def test_constrain_statement_is_counted_like_constraints():
+    data = mirt.simdata("2PL", n_persons=800, n_items=6, seed=3)
+    result = mirt.fit_mirt(data, spec="F = 1-6\nCONSTRAIN = (1-3, a1)", verbose=False)
+
+    fitted = compute_m2(result, data)
+    free = compute_m2(result.model, data)
+    assert fitted["df"] == free["df"] + 2
+    assert fitted == compute_m2(result.model, data, constraints=TIED)

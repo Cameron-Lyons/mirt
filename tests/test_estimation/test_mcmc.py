@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from mirt import GibbsSampler, MCMCResult, MHRMEstimator, TwoParameterLogistic
+from mirt.estimation.priors import LogNormalPrior
 from mirt.exceptions import MirtEstimationError
 from mirt.results.fit_result import FitResult
 
@@ -83,10 +84,12 @@ class TestMHRMEstimator:
         model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
         estimator = MHRMEstimator(n_cycles=25, burnin=10, seed=42)
 
-        result = estimator.fit(model, dichotomous_responses["responses"])
+        # Fifteen decreasing-gain cycles are too few for the stopping rule.
+        with pytest.warns(RuntimeWarning, match="increase n_cycles"):
+            result = estimator.fit(model, dichotomous_responses["responses"])
 
         assert isinstance(result, FitResult)
-        assert result.converged is True
+        assert result.converged is False
         assert result.n_iterations == 25
 
     def test_convergence_tracking(self, dichotomous_responses):
@@ -205,7 +208,7 @@ class TestGibbsSampler:
             burnin=50,
             thin=2,
             n_chains=2,
-            priors={"discrimination": {"mean": 1.0, "sd": 0.5}},
+            priors={"discrimination": LogNormalPrior(0.0, 0.5)},
             verbose=False,
             use_rust=True,
             seed=42,
@@ -504,16 +507,15 @@ class TestMCMCResult:
         assert "difficulty" in result.rhat
 
     def test_rhat_values_reasonable(self, dichotomous_responses):
-        """Test that R-hat values are reasonable (close to 1 for converged chains)."""
+        """R-hat values are finite and near one for a longer chain."""
         model = TwoParameterLogistic(n_items=dichotomous_responses["n_items"])
-        sampler = GibbsSampler(n_iter=80, burnin=30, thin=1, seed=42)
+        sampler = GibbsSampler(n_iter=2000, burnin=400, thin=1, seed=42, use_rust=False)
 
         result = sampler.fit(model, dichotomous_responses["responses"])
 
         for name, rhat_val in result.rhat.items():
-            if not np.isnan(rhat_val):
-                assert rhat_val > 0, f"R-hat for {name} should be positive"
-                assert rhat_val < 2.0, f"R-hat for {name} should be reasonable"
+            assert np.isfinite(rhat_val), f"R-hat for {name} should be finite"
+            assert 0.9 < rhat_val < 1.2, f"R-hat for {name} should be reasonable"
 
     def test_ess_values_positive(self, dichotomous_responses):
         """Test that ESS values are positive."""
@@ -794,7 +796,7 @@ class TestGibbsChains:
         reference = GibbsSampler(n_iter=12, burnin=4, use_rust=False)
         chains = [
             reference._run_single_chain(
-                TwoParameterLogistic(3), self._responses(), 40, s
+                TwoParameterLogistic(3), self._responses(), 40, s, True
             )
             for s in (5, 1005)
         ]
@@ -804,27 +806,18 @@ class TestGibbsChains:
                 chain, np.concatenate([single[name] for single in chains])
             )
 
-    def test_native_chains_are_stacked(self):
-        import mirt
-        from mirt.backends.rust.estimation import gibbs_sample_2pl
-
-        if not mirt.is_rust_available():
-            pytest.skip("native backend unavailable")
+    def test_2pl_chains_do_not_depend_on_use_rust(self):
         responses = self._responses()
-        # The native 2PL path used to ignore n_chains and return one chain.
-        result = GibbsSampler(n_iter=12, burnin=4, n_chains=2, seed=5).fit(
-            TwoParameterLogistic(3), responses
-        )
-        singles = [
-            gibbs_sample_2pl(responses, n_iter=12, burnin=4, thin=1, seed=seed)
-            for seed in (5, 1005)
-        ]
-        names = ("discrimination", "difficulty", "theta", "log_likelihood")
-        for k, name in enumerate(names):
-            np.testing.assert_array_equal(
-                result.chains[name],
-                np.concatenate([np.asarray(single[k]) for single in singles]),
+        # A native 2PL kernel used to replace these chains with draws from a
+        # sampler that clipped its proposals to the box.
+        results = [
+            GibbsSampler(n_iter=12, burnin=4, n_chains=2, seed=5, use_rust=flag).fit(
+                TwoParameterLogistic(3), responses
             )
+            for flag in (True, False)
+        ]
+        for name, chain in results[1].chains.items():
+            np.testing.assert_array_equal(results[0].chains[name], chain)
 
     @pytest.mark.parametrize("n_chains", [0, 1.5, True])
     def test_invalid_chain_counts_are_rejected(self, n_chains):
@@ -844,3 +837,316 @@ class TestGibbsChains:
         )
         with pytest.raises(MirtValidationError, match="parallel_chains=False"):
             sampler.fit(LocalTwoPL(3), self._responses())
+
+
+def _reference_rank_rhat(draws: np.ndarray) -> np.ndarray:
+    """Rank-normalized split R-hat of each column, one column at a time."""
+    from scipy.special import ndtri
+    from scipy.stats import rankdata
+
+    n_chains, n_draws, n_values = draws.shape
+    half = n_draws // 2
+    values = np.empty(n_values)
+    for column in range(n_values):
+        split = np.concatenate(
+            [draws[:, :half, column], draws[:, n_draws - half :, column]]
+        )
+
+        def rhat(x):
+            ranks = rankdata(x.ravel()).reshape(x.shape)
+            z = ndtri((ranks - 0.375) / (x.size + 0.25))
+            within = np.mean(np.var(z, axis=1, ddof=1))
+            between = half * np.var(np.mean(z, axis=1), ddof=1)
+            return np.sqrt((between / within + half - 1) / half)
+
+        values[column] = max(rhat(split), rhat(np.abs(split - np.median(split))))
+    return values
+
+
+def _stacked_result(draws: np.ndarray, model=None) -> MCMCResult:
+    """Wrap ``(n_chains, n_draws, n_items)`` discrimination draws in a result."""
+    from mirt.estimation.mcmc import _diagnose_chains
+
+    n_chains, n_draws, n_items = draws.shape
+    if model is None:
+        model = TwoParameterLogistic(n_items=n_items)
+    chains = {"discrimination": draws.reshape(n_chains * n_draws, n_items)}
+    _, rhat, ess, ess_tail = _diagnose_chains(chains, model, n_chains)
+    return MCMCResult(
+        model=model,
+        chains=chains,
+        log_likelihood=0.0,
+        dic=0.0,
+        waic=0.0,
+        rhat=rhat,
+        ess=ess,
+        n_iterations=n_draws,
+        burnin=0,
+        thin=1,
+        n_chains=n_chains,
+        ess_tail=ess_tail,
+    )
+
+
+class TestConvergenceDiagnostics:
+    """Rank-normalized split R-hat and bulk/tail ESS (Vehtari et al., 2021)."""
+
+    def test_rhat_is_assessed_per_coordinate_within_chains(self):
+        # Two coordinates disagree between chains in opposite directions, so
+        # their item average looks converged. It was what R-hat assessed, on
+        # the stacked draws cut in two halves.
+        rng = np.random.default_rng(3)
+        draws = rng.normal(0.0, 0.1, (2, 400, 2))
+        draws[0] += [1.0, -1.0]
+        draws[1] += [-1.0, 1.0]
+        result = _stacked_result(draws)
+
+        per_coordinate = result.convergence_diagnostics()["discrimination"]["rhat"]
+        # Rank normalization bounds R-hat; separated chains of 200 split
+        # draws give about 1.8.
+        assert np.all(per_coordinate > 1.5)
+        assert result.rhat["discrimination"] == pytest.approx(per_coordinate.max())
+        assert result.converged is False
+
+    def test_rhat_matches_a_columnwise_reference(self):
+        rng = np.random.default_rng(4)
+        draws = np.cumsum(rng.normal(size=(3, 301, 4)), axis=1) * 0.05
+        draws += rng.normal(size=draws.shape)
+        result = _stacked_result(draws)
+
+        np.testing.assert_allclose(
+            result.convergence_diagnostics()["discrimination"]["rhat"],
+            _reference_rank_rhat(draws),
+            rtol=1e-12,
+        )
+
+    def test_independent_chains_pass_with_full_effective_size(self):
+        rng = np.random.default_rng(5)
+        result = _stacked_result(rng.normal(size=(4, 1000, 3)))
+
+        diagnostics = result.convergence_diagnostics()["discrimination"]
+        assert np.all(diagnostics["rhat"] < 1.01)
+        np.testing.assert_allclose(diagnostics["ess_bulk"], 4000, rtol=0.2)
+        np.testing.assert_allclose(diagnostics["ess_tail"], 4000, rtol=0.25)
+        assert result.converged is True
+        assert "Converged: yes" in result.summary()
+
+    def test_bulk_ess_matches_the_autoregressive_value(self):
+        rng = np.random.default_rng(6)
+        rho, n_chains, n_draws = 0.8, 4, 4000
+        draws = np.zeros((n_chains, n_draws, 1))
+        noise = rng.normal(size=draws.shape)
+        for t in range(1, n_draws):
+            draws[:, t] = rho * draws[:, t - 1] + noise[:, t]
+        result = _stacked_result(draws)
+
+        expected = n_chains * n_draws * (1 - rho) / (1 + rho)
+        assert result.ess["discrimination"] == pytest.approx(expected, rel=0.15)
+        # 100 effective draws per chain are required.
+        short = _stacked_result(draws[:, :400])
+        assert short.ess["discrimination"] < 400
+        assert short.converged is False
+
+    def test_fixed_coordinates_are_skipped_and_stuck_ones_fail(self):
+        rng = np.random.default_rng(7)
+        draws = rng.normal(size=(2, 500, 3))
+        draws[:, :, 0] = 1.5
+        model = TwoParameterLogistic(n_items=3)
+        model.set_free_parameter_masks(
+            {"discrimination": np.array([False, True, True])}
+        )
+        result = _stacked_result(draws, model)
+
+        rhat = result.convergence_diagnostics()["discrimination"]["rhat"]
+        assert np.isnan(rhat[0]) and np.all(np.isfinite(rhat[1:]))
+        assert result.converged is True
+
+        stuck = _stacked_result(draws)
+        assert np.isnan(stuck.rhat["discrimination"])
+        assert stuck.converged is False
+
+    def test_sampler_reports_the_chains_it_ran(self):
+        responses = TestGibbsChains._responses()
+        result = GibbsSampler(
+            n_iter=60, burnin=10, n_chains=3, seed=2, use_rust=False
+        ).fit(TwoParameterLogistic(3), responses)
+
+        assert result.n_chains == 3
+        draws = result.chains["difficulty"].reshape(3, 50, 3)
+        np.testing.assert_allclose(
+            result.convergence_diagnostics()["difficulty"]["rhat"],
+            _reference_rank_rhat(draws),
+            rtol=1e-12,
+        )
+        assert result.rhat["difficulty"] == pytest.approx(
+            np.max(_reference_rank_rhat(draws))
+        )
+
+
+def _two_pl_data(n_persons=600, n_items=10, seed=11):
+    rng = np.random.default_rng(seed)
+    discrimination = rng.uniform(0.8, 2.0, n_items)
+    difficulty = np.linspace(-1.5, 1.5, n_items)
+    theta = rng.standard_normal(n_persons)
+    probability = 1 / (1 + np.exp(-discrimination * (theta[:, None] - difficulty)))
+    return (rng.random(probability.shape) < probability).astype(int)
+
+
+def _per_item_acceptance(chain: np.ndarray) -> np.ndarray:
+    return np.mean(np.any(np.diff(chain, axis=0) != 0, axis=2), axis=0)
+
+
+class TestNumPySampler:
+    """Itemwise Metropolis-within-Gibbs updates of the NumPy sampler."""
+
+    def test_items_are_accepted_individually(self):
+        # One joint accept/reject per parameter array accepted ~2% of moves.
+        responses = _two_pl_data()
+        result = GibbsSampler(n_iter=500, burnin=200, seed=1, use_rust=False).fit(
+            TwoParameterLogistic(10), responses
+        )
+        moved = np.diff(result.chains["discrimination"], axis=0) != 0
+        acceptance = moved.mean(axis=0)
+        assert np.all((acceptance > 0.15) & (acceptance < 0.7))
+        # Items move independently of one another.
+        assert np.mean(moved.all(axis=1)) < 0.05
+
+    def test_guessing_and_upper_draws_stay_inside_their_boxes(self):
+        from mirt.models.dichotomous import (
+            FourParameterLogistic,
+            ThreeParameterLogistic,
+        )
+
+        responses = _two_pl_data(n_persons=400, n_items=6, seed=5)
+        for model in (ThreeParameterLogistic(6), FourParameterLogistic(6)):
+            result = GibbsSampler(n_iter=300, burnin=100, seed=2).fit(model, responses)
+            guessing = result.chains["guessing"]
+            assert np.all((guessing > 0.0) & (guessing < 0.5))
+            if "upper" in result.chains:
+                upper = result.chains["upper"]
+                assert np.all((upper > 0.5) & (upper < 1.0))
+            # Negative guessing used to leave a state set_parameters rejects.
+            result.model.set_parameters(**result.model.parameters)
+
+    def test_graded_thresholds_stay_ordered_and_track_em(self):
+        import mirt
+        from mirt.models.polytomous import GradedResponseModel
+
+        n_items = 10
+        responses = mirt.simdata(
+            "GRM",
+            n_persons=600,
+            n_items=n_items,
+            n_categories=4,
+            discrimination=np.linspace(1.0, 1.8, n_items),
+            thresholds=np.array([[-1.5, 0.0, 1.2], [-1.0, 0.2, 1.5]] * 5),
+            seed=4,
+        )
+        em = mirt.fit_mirt(responses, "GRM").model.parameters
+        # Joint proposals for all thresholds used to miss EM by over 0.6.
+        result = GibbsSampler(n_iter=1500, burnin=500, seed=3).fit(
+            GradedResponseModel(n_items, 4), responses
+        )
+
+        assert np.all(np.diff(result.chains["thresholds"], axis=2) > 0)
+        for name in ("discrimination", "thresholds"):
+            difference = result.model.parameters[name] - em[name]
+            assert np.max(np.abs(difference)) < 0.15
+
+    def test_masked_models_keep_fixed_coordinates(self):
+        responses = _two_pl_data(n_persons=300, n_items=4)
+        model = TwoParameterLogistic(4)
+        model.set_parameters(discrimination=np.array([2.0, 1.0, 1.0, 1.0]))
+        model.set_free_parameter_masks(
+            {"discrimination": np.array([False, True, True, True])}
+        )
+        result = GibbsSampler(n_iter=200, burnin=50, seed=1).fit(model, responses)
+
+        assert np.all(result.chains["discrimination"][:, 0] == 2.0)
+        assert np.isnan(result.convergence_diagnostics()["discrimination"]["rhat"][0])
+        assert result.model.parameters["discrimination"][0] == 2.0
+
+    @pytest.mark.parametrize("estimator", ["gibbs", "mhrm"])
+    def test_a_common_estimated_slope_is_refused(self, estimator):
+        from mirt.exceptions import MirtModelError
+        from mirt.models.dichotomous import OneParameterLogistic
+
+        responses = _two_pl_data(n_persons=200, n_items=4)
+        make = {
+            "gibbs": lambda: GibbsSampler(n_iter=20, burnin=5, seed=1),
+            "mhrm": lambda: MHRMEstimator(n_cycles=20, burnin=5, seed=1),
+        }[estimator]
+        with pytest.raises(
+            MirtModelError, match="cannot estimate discrimination.*equal across"
+        ):
+            make().fit(OneParameterLogistic(4, estimate_discrimination=True), responses)
+        # The unit-slope Rasch model keeps its slopes at one.
+        with __import__("warnings").catch_warnings():
+            __import__("warnings").simplefilter("ignore", RuntimeWarning)
+            fitted = make().fit(OneParameterLogistic(4), responses)
+        np.testing.assert_array_equal(
+            fitted.model.parameters["discrimination"], np.ones(4)
+        )
+
+
+class TestMarginalLogLikelihood:
+    """Reported log-likelihoods are marginal, as EM's are."""
+
+    @staticmethod
+    def _grid_log_likelihood(model, responses):
+        from scipy.special import logsumexp
+
+        from mirt.estimation.quadrature import build_quadrature, default_quadpts
+
+        quadrature = build_quadrature(default_quadpts(model.n_factors), model.n_factors)
+        joint = model.log_likelihood_batch(responses, quadrature.nodes)
+        return float(logsumexp(joint + np.log(quadrature.weights), axis=1).sum())
+
+    def test_gibbs_log_likelihood_is_marginal_at_posterior_means(self):
+        import mirt
+
+        responses = _two_pl_data(n_persons=500, n_items=8)
+        em = mirt.fit_mirt(responses, "2PL", compute_standard_errors=False)
+        result = GibbsSampler(n_iter=600, burnin=200, seed=2).fit(
+            TwoParameterLogistic(8), responses
+        )
+
+        assert result.log_likelihood == pytest.approx(
+            self._grid_log_likelihood(result.model, responses), rel=1e-10
+        )
+        # The posterior mean of the conditional log-likelihood was reported,
+        # hundreds of units above the marginal likelihood.
+        assert abs(result.log_likelihood - em.log_likelihood) < 3.0
+        assert np.mean(result.chains["log_likelihood"]) > result.log_likelihood + 100
+
+    def test_importance_sampling_matches_quadrature_for_four_factors(self):
+        from scipy.special import logsumexp
+
+        from mirt.estimation.mcmc import _marginal_log_likelihood, _theta_moments
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+        rng = np.random.default_rng(0)
+        n_items, n_factors = 12, 4
+        model = TwoParameterLogistic(n_items=n_items, n_factors=n_factors)
+        slopes = np.zeros((n_items, n_factors))
+        for item in range(n_items):
+            slopes[item, item % n_factors] = rng.uniform(0.8, 1.6)
+            slopes[item, (item + 1) % n_factors] = 0.4
+        model.set_parameters(
+            discrimination=slopes, difficulty=rng.normal(0.0, 0.8, n_items)
+        )
+        theta = rng.standard_normal((150, n_factors))
+        responses = (rng.random((150, n_items)) < model.probability(theta)).astype(int)
+        grid = GaussHermiteQuadrature(11, n_factors)
+        exact = logsumexp(
+            model.log_likelihood_batch(responses, grid.nodes) + np.log(grid.weights),
+            axis=1,
+        ).sum()
+        draws = theta + 0.6 * rng.standard_normal((400, *theta.shape))
+        estimate = _marginal_log_likelihood(
+            model,
+            responses,
+            posterior=_theta_moments(draws),
+            rng=np.random.default_rng(1),
+        )
+        assert estimate == pytest.approx(exact, abs=0.5)

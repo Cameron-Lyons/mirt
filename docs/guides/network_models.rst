@@ -23,8 +23,6 @@ does not shrink node thresholds.
    model, log_pseudolikelihood = fit_ising(
        responses,
        regularization=0.02,
-       max_iter=500,
-       tol=1e-6,
        node_names=[f"Item {index + 1}" for index in range(12)],
    )
 
@@ -32,7 +30,15 @@ does not shrink node thresholds.
    print(model.thresholds)
    print(model.interactions)
 
-The optimizer updates all unique symmetric edges together. Its penalized
+L-BFGS-B optimizes the thresholds and all unique symmetric edges together,
+using analytic gradients. With a penalty, each edge is split into nonnegative
+positive and negative parts so that absent edges are estimated as exact zeros.
+The fit has converged when its optimality residual is at most ``tol``
+(default ``1e-6``). That residual is the largest gradient of the penalized
+objective in a threshold or nonzero edge, or the largest amount by which a
+zero edge's gradient exceeds the penalty. A fit that stops above ``tol``, for
+example after ``max_iter`` iterations (default 1000), reports
+``model.converged == False`` and emits a ``RuntimeWarning``. The penalized
 objective history is available through ``model.objective_history``. Binary
 inputs, callback widths, parameter shapes, and finite values are validated
 before numerical work begins.
@@ -47,6 +53,9 @@ in one call.
 
    conditional = model.conditional_probabilities(responses[:20])
    # shape: (20, 12)
+
+   # One node, given only the other 11 nodes' values in their original order.
+   first_item = model.conditional_probability(0, responses[:20, 1:])
 
 For small networks, normalized joint probabilities can be computed by exact
 state enumeration.

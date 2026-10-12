@@ -18,19 +18,25 @@ class ItemAnalysisReport(ReportBuilder):
     """Generate HTML report for item analysis.
 
     This report includes:
+
     - Model summary (type, items, factors, fit statistics)
     - Item parameter table with estimates, standard errors, and confidence intervals
     - Item fit statistics (infit/outfit) with flagging for misfit
     - Item Characteristic Curves plot
     - Test Information Function plot
-    - Wright map (person-item map) if theta estimates provided
+    - Wright map (person-item map) if theta estimates provided, one per
+      factor of a multidimensional model; a note replaces maps that do not
+      apply, such as those of nominal response models
 
     Parameters
     ----------
     fit_result : FitResult
         Fitted model result.
-    responses : ndarray
+    responses : array-like or DataFrame
         Response matrix (n_persons x n_items) for computing fit statistics.
+        DataFrame columns are matched to the model's item names, and
+        ``NaN``, nullable-column nulls (``pd.NA``) and negative codes are
+        missing responses, as in :func:`mirt.fit_mirt`.
     theta : ndarray, optional
         Ability estimates for Wright map. If None, Wright map is omitted.
     title : str, optional
@@ -60,7 +66,7 @@ class ItemAnalysisReport(ReportBuilder):
         include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
-        self.responses = np.asarray(responses)
+        self.responses = self._response_matrix(responses)
         self.theta = theta
         self.include_plots = include_plots
 
@@ -89,7 +95,6 @@ class ItemAnalysisReport(ReportBuilder):
                 create_icc_plot_base64,
                 create_information_plot_base64,
                 create_itemfit_plot_base64,
-                create_wright_map_base64,
             )
             from mirt.reports._templates import embedded_plot
 
@@ -120,14 +125,8 @@ class ItemAnalysisReport(ReportBuilder):
             )
 
             if self.theta is not None:
-                wright_base64 = create_wright_map_base64(
-                    self.fit_result.model, self.theta
-                )
                 sections.append(
-                    section(
-                        "Person-Item Map (Wright Map)",
-                        embedded_plot(wright_base64, "Wright Map"),
-                    )
+                    self._wright_map_section(self.theta, "Person-Item Map (Wright Map)")
                 )
 
         return "\n".join(sections)

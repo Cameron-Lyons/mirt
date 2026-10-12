@@ -235,25 +235,29 @@ def test_batch_api_supports_person_specific_skill_layouts() -> None:
         )
 
 
+def _distinct_layouts(
+    n_persons: int, n_trials: int, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return responses and a separate skill layout for every learner."""
+    rng = np.random.default_rng(seed)
+    skill_assignments = rng.integers(0, 3, size=(n_persons, n_trials))
+    skill_assignments[:, :3] = rng.permuted(
+        np.tile(np.arange(3), (n_persons, 1)), axis=1
+    )
+    responses = rng.integers(-1, 2, size=(n_persons, n_trials))
+    return responses.astype(np.int32), skill_assignments.astype(np.int32)
+
+
 @pytest.mark.parametrize("native_available", [True, False])
 def test_person_specific_layouts_are_smoothed_together(
     monkeypatch: pytest.MonkeyPatch,
     native_available: bool,
 ) -> None:
-    responses, shared_skills = _batch()
-    responses = np.vstack((responses, responses, responses[:1]))
-    rolled_skills = np.roll(shared_skills, 1)
-    skill_assignments = np.vstack(
-        (
-            shared_skills,
-            rolled_skills,
-            shared_skills,
-            rolled_skills,
-            shared_skills,
-            np.roll(shared_skills, 2),
-            shared_skills,
-        )
-    )
+    # Many distinct short layouts: one vectorized sweep beats a compiled call
+    # per layout.
+    responses, skill_assignments = _distinct_layouts(12, 9, seed=3)
+    responses[1] = responses[0]
+    skill_assignments[1] = skill_assignments[0]
     model = _model(use_rust=native_available)
     monkeypatch.setattr(model, "_can_use_native_inference", lambda: native_available)
     monkeypatch.setattr(
@@ -312,10 +316,11 @@ def _repeated_layout_batch() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Shuffle one layout shared by many learners among small layout groups."""
     _, shared_skills = _batch()
     min_learners = dynamic_module._BKT_NATIVE_LAYOUT_MIN_LEARNERS
+    _, distinct = _distinct_layouts(12, len(shared_skills), seed=17)
     layouts = (
         [shared_skills] * (min_learners + 3)
         + [np.roll(shared_skills, 1)] * (min_learners - 1)
-        + [np.roll(shared_skills, 2)]
+        + list(distinct)
     )
     rng = np.random.default_rng(17)
     skill_assignments = np.asarray(layouts, dtype=np.int32)[
@@ -395,6 +400,109 @@ def test_real_native_grouped_layouts_match_scalar_oracle() -> None:
         )
         assert_allclose(gamma[person_idx], expected_gamma, rtol=1e-10, atol=1e-12)
         assert log_likelihoods[person_idx] == pytest.approx(expected_ll, rel=1e-10)
+
+
+@pytest.mark.parametrize(
+    ("n_persons", "n_trials", "per_layout"),
+    [(3, 200, True), (200, 20, False)],
+)
+def test_person_layout_dispatch_weighs_compiled_calls_against_sweep(
+    monkeypatch: pytest.MonkeyPatch,
+    n_persons: int,
+    n_trials: int,
+    per_layout: bool,
+) -> None:
+    # Few learners with long sequences get a compiled call per layout, as a
+    # vectorized sweep costs one NumPy step per trial; many short layouts
+    # share one sweep.
+    responses, skill_assignments = _distinct_layouts(n_persons, n_trials, seed=5)
+    model = _model()
+    monkeypatch.setattr(model, "_can_use_native_inference", lambda: True)
+    native_rows: list[int] = []
+    sweep_rows: list[int] = []
+
+    def fake_native(
+        response_values: np.ndarray, skill_values: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        native_rows.append(len(response_values))
+        results = [
+            model._forward_backward_python(row, skill_values) for row in response_values
+        ]
+        return np.stack([gamma for gamma, _ in results]), np.array(
+            [log_likelihood for _, log_likelihood in results]
+        )
+
+    sweep = model._forward_backward_layouts
+
+    def spy_sweep(
+        response_values: np.ndarray, skill_values: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        sweep_rows.append(len(response_values))
+        return sweep(response_values, skill_values)
+
+    monkeypatch.setattr(model, "_native_forward_backward_batch", fake_native)
+    monkeypatch.setattr(model, "_forward_backward_layouts", spy_sweep)
+
+    gamma, log_likelihoods = model.forward_backward_batch(responses, skill_assignments)
+
+    if per_layout:
+        assert native_rows == [1] * n_persons
+        assert sweep_rows == []
+    else:
+        assert native_rows == []
+        assert sweep_rows == [n_persons]
+    for person_idx, person_responses in enumerate(responses):
+        expected_gamma, expected_ll = model._forward_backward_python(
+            person_responses, skill_assignments[person_idx]
+        )
+        assert_allclose(gamma[person_idx], expected_gamma, rtol=1e-12, atol=1e-12)
+        assert log_likelihoods[person_idx] == pytest.approx(expected_ll, rel=1e-12)
+
+
+@pytest.mark.skipif(not RUST_AVAILABLE, reason="compiled backend is unavailable")
+@pytest.mark.parametrize(("n_persons", "n_trials"), [(3, 200), (200, 20)])
+def test_real_native_person_layout_dispatch_matches_python_smoother(
+    n_persons: int, n_trials: int
+) -> None:
+    responses, skill_assignments = _distinct_layouts(n_persons, n_trials, seed=9)
+    set_backend_preference("rust")
+    model = _model()
+
+    gamma, log_likelihoods = model.forward_backward_batch(responses, skill_assignments)
+
+    for person_idx, person_responses in enumerate(responses):
+        expected_gamma, expected_ll = model._forward_backward_python(
+            person_responses, skill_assignments[person_idx]
+        )
+        assert_allclose(gamma[person_idx], expected_gamma, rtol=1e-10, atol=1e-12)
+        assert log_likelihoods[person_idx] == pytest.approx(expected_ll, rel=1e-10)
+
+
+@pytest.mark.parametrize("collide", [False, True])
+def test_layout_groups_match_exact_row_grouping(
+    monkeypatch: pytest.MonkeyPatch, collide: bool
+) -> None:
+    rng = np.random.default_rng(23)
+    layouts = rng.integers(0, 3, size=(6, 40))[rng.integers(0, 6, size=50)]
+    if collide:
+        # Every row shares one hash key, so verification must fall back to
+        # exact grouping.
+        monkeypatch.setattr(
+            dynamic_module,
+            "_layout_hash_keys",
+            lambda rows: np.zeros(len(rows), dtype=np.uint64),
+        )
+
+    layout_ids, counts = dynamic_module._layout_groups(layouts)
+
+    expected: dict[bytes, list[int]] = {}
+    for row, layout in enumerate(layouts):
+        expected.setdefault(layout.tobytes(), []).append(row)
+    groups = sorted(
+        np.flatnonzero(layout_ids == group).tolist() for group in range(counts.size)
+    )
+    assert groups == sorted(expected.values())
+    assert_array_equal(np.bincount(layout_ids, minlength=counts.size), counts)
 
 
 @pytest.mark.parametrize("seed", range(6))

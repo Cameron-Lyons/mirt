@@ -458,22 +458,19 @@ class TestFitMixtureIRT:
         n_persons = 1200
         true_classes = rng.choice(2, size=n_persons, p=[0.35, 0.65])
         theta = rng.normal(size=n_persons)
-        difficulty = np.array(
+        # Six items identify the class split so weakly that EM needs about
+        # 640 iterations to meet the absolute tolerance; twelve need 150.
+        difficulty = np.tile(
             [
                 [-1.2, -0.9, -0.7, -1.0, -0.5, -1.4],
                 [0.8, 1.1, 0.6, 1.3, 0.9, 0.5],
-            ]
+            ],
+            2,
         )
         probability = expit(theta[:, None] - difficulty[true_classes])
         responses = rng.binomial(1, probability)
 
-        model, posterior = fit_mixture_irt(
-            responses,
-            n_classes=2,
-            base_model="1PL",
-            max_iter=50,
-            tol=1e-5,
-        )
+        model, posterior = fit_mixture_irt(responses, n_classes=2, base_model="1PL")
 
         fitted_locations = np.array(
             [
@@ -489,6 +486,65 @@ class TestFitMixtureIRT:
         assert fitted_locations[1] - fitted_locations[0] > 1.0
         assert accuracy > 0.7
         assert model.convergence_info["converged"]
+
+    def test_default_controls_recover_simulated_class_proportions(self):
+        """Stop on the absolute likelihood change, not one relative to |LL|."""
+        rng = np.random.default_rng(2)
+        n_items = 20
+        generator = MixtureIRT(n_items=n_items, n_classes=2, base_model="1PL")
+        difficulty = rng.normal(size=n_items)
+        shift = np.where(np.arange(n_items) < n_items // 2, 1.2, -1.2)
+        generator.set_parameters(
+            class_proportions=np.array([0.65, 0.35]),
+            difficulty_class0=difficulty,
+            difficulty_class1=difficulty + shift,
+        )
+        responses, true_classes = generator.simulate(rng.standard_normal(1000), seed=2)
+
+        model, posterior = fit_mixture_irt(responses, n_classes=2, base_model="1PL")
+
+        info = model.convergence_info
+        history = info["log_likelihood_history"]
+        assert info["converged"]
+        assert abs(history[-1] - history[-2]) < 1e-4
+        assert_allclose(np.sort(model.class_proportions), [0.35, 0.65], atol=0.03)
+        assignments = posterior.argmax(axis=1)
+        accuracy = max(
+            np.mean(assignments == true_classes),
+            np.mean(assignments != true_classes),
+        )
+        assert accuracy > 0.85
+
+    def test_iteration_limit_is_reported_as_not_converged(self):
+        """Report non-convergence when max_iter ends EM before tol is met."""
+        rng = np.random.default_rng(4)
+        responses = (rng.random((300, 8)) < 0.5).astype(int)
+
+        model, _ = fit_mixture_irt(responses, max_iter=2, tol=1e-12)
+
+        info = model.convergence_info
+        assert not info["converged"]
+        assert info["n_iterations"] == 2
+
+    def test_multiple_starts_return_the_best_seeded_start(self):
+        """Keep the start with the largest final log-likelihood."""
+        rng = np.random.default_rng(8)
+        responses = (rng.random((200, 6)) < 0.6).astype(int)
+
+        model, posterior = fit_mixture_irt(
+            responses, base_model="1PL", max_iter=30, n_starts=3, seed=5
+        )
+        repeated, repeated_posterior = fit_mixture_irt(
+            responses, base_model="1PL", max_iter=30, n_starts=3, seed=5
+        )
+        single, _ = fit_mixture_irt(responses, base_model="1PL", max_iter=30)
+
+        starts = model.convergence_info["start_log_likelihoods"]
+        assert starts.shape == (3,)
+        assert starts[0] == pytest.approx(single.convergence_info["log_likelihood"])
+        assert model.convergence_info["log_likelihood"] == pytest.approx(starts.max())
+        assert_allclose(posterior, repeated_posterior)
+        assert_allclose(model.class_proportions, repeated.class_proportions)
 
     def test_all_missing_data_is_stable(self):
         """Return the prior class distribution when no items are observed."""
@@ -509,6 +565,10 @@ class TestFitMixtureIRT:
             ({"n_quadpts": True}, "n_quadpts"),
             ({"tol": 0.0}, "tol"),
             ({"tol": np.nan}, "tol"),
+            ({"n_starts": 0}, "n_starts"),
+            ({"n_starts": 1.5}, "n_starts"),
+            ({"seed": -1}, "seed"),
+            ({"seed": True}, "seed"),
         ],
     )
     def test_rejects_invalid_fit_controls(self, kwargs, message):
@@ -563,3 +623,26 @@ def test_item_objective_analytic_gradient(base_model, values):
         numerical[index] = (upper_value - lower_value) / (2.0 * step)
 
     assert_allclose(gradient, numerical, rtol=2e-6, atol=2e-7)
+
+
+@pytest.mark.parametrize("estimator", ["EM", "MCEM", "MHRM"])
+def test_generic_estimators_refuse_mixture_models(estimator):
+    """The itemwise M-steps ignore the class a respondent shares across items."""
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.mcem import MCEMEstimator
+    from mirt.estimation.mcmc import MHRMEstimator
+    from mirt.exceptions import MirtModelError
+
+    build = {
+        "EM": lambda: EMEstimator(max_iter=5),
+        "MCEM": lambda: MCEMEstimator(max_iter=2),
+        "MHRM": lambda: MHRMEstimator(n_cycles=5, burnin=1, seed=0),
+    }[estimator]
+    model = MixtureIRT(n_items=10, n_classes=2, base_model="2PL")
+    before = model.parameters
+    responses = np.random.default_rng(0).integers(0, 2, (60, 10))
+
+    with pytest.raises(MirtModelError, match="fit_mixture_irt"):
+        build().fit(model, responses)
+    for name, values in before.items():
+        assert_array_equal(model.parameters[name], values)

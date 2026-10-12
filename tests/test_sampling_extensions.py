@@ -590,3 +590,110 @@ def test_sampling_utilities_are_available_from_the_top_level_api():
     assert mirt.ParameterSamples is ParameterSamples
     assert mirt.posterior_summary is posterior_summary
     assert mirt.sample_expected_scores is sample_expected_scores
+
+
+def _numpy_simdata(**options):
+    """Simulate NumPy responses, which differ from the native backend's draws."""
+    previous = mirt.get_backend()
+    mirt.set_backend("numpy")
+    try:
+        return mirt.simdata(**options)
+    finally:
+        mirt.set_backend(previous)
+
+
+@pytest.mark.parametrize("family", ["GRM", "GPCM", "NRM"])
+def test_draw_parameters_supports_polytomous_fits(family):
+    # Regression: draw_parameters raised for every model without a stored
+    # discrimination and difficulty, unlike R's draw_parameters.
+    from mirt.estimation.base import _parameter_bounds
+
+    data = _numpy_simdata(
+        model=family, n_persons=500, n_items=4, n_categories=3, seed=8
+    )
+    result = mirt.fit_mirt(data, model=family, n_categories=3)
+    assert result.vcov is not None
+
+    samples = draw_parameters(result, n_samples=5_000, seed=2)
+
+    stored = result.model.parameters
+    assert samples.difficulty is None
+    assert set(samples.parameters) == set(stored)
+    for name, values in stored.items():
+        draws = samples.parameters[name]
+        errors = result.standard_errors[name]
+        free = errors > 0.0
+        # Draws are redrawn inside the estimation boxes, which shifts those of
+        # an estimate near a box end; these estimates lie well inside theirs.
+        lower, upper = _parameter_bounds(result.model, name)
+        margin = np.minimum(values - lower, upper - values)[free] / errors[free]
+        assert np.all(margin > 4.0)
+        assert draws.shape == (5_000, *values.shape)
+        np.testing.assert_array_equal(
+            draws[:, ~free],
+            np.broadcast_to(values[~free], (5_000, int(np.count_nonzero(~free)))),
+        )
+        np.testing.assert_allclose(draws.mean(axis=0), values, atol=0.05)
+        np.testing.assert_allclose(draws.std(axis=0)[free], errors[free], rtol=0.06)
+    if "discrimination" in stored:
+        assert samples.discrimination is samples.parameters["discrimination"]
+    if family == "GRM":
+        assert np.all(np.diff(samples.parameters["thresholds"], axis=2) > 0.0)
+
+    summary = posterior_summary(samples)
+    assert set(summary) == set(stored)
+    for name, values in stored.items():
+        assert summary[name]["ci_lower"].shape == values.shape
+
+
+def test_graded_draws_are_redrawn_until_thresholds_are_ordered():
+    from mirt.models.polytomous import GradedResponseModel
+
+    model = GradedResponseModel(n_items=1, n_categories=3).set_parameters(
+        discrimination=np.array([1.0]), thresholds=np.array([[-0.05, 0.05]])
+    )
+    covariance = np.diag([0.01, 0.25, 0.25])
+    result = FitResult(model, -1.0, 1, True, {}, 0.0, 0.0, vcov=covariance)
+
+    samples = draw_parameters(result, n_samples=4_000, seed=1)
+
+    thresholds = samples.parameters["thresholds"][:, 0]
+    assert np.all(thresholds[:, 1] > thresholds[:, 0])
+    # About half of the joint normal draws are disordered and redrawn, so
+    # the gap follows its N(0.1, 0.5) distribution truncated at zero.
+    from scipy import stats
+
+    gap = thresholds[:, 1] - thresholds[:, 0]
+    scale = np.sqrt(0.5)
+    truncated = stats.truncnorm(-0.1 / scale, np.inf, loc=0.1, scale=scale)
+    assert gap.mean() == pytest.approx(truncated.mean(), abs=0.03)
+    assert gap.std() == pytest.approx(truncated.std(), abs=0.03)
+    explicit = draw_parameters(model, n_samples=4_000, vcov=covariance, seed=1)
+    np.testing.assert_array_equal(
+        explicit.parameters["thresholds"], thresholds[:, None]
+    )
+
+
+def test_graded_draws_are_projected_after_too_many_redraws():
+    from mirt.models.polytomous import GradedResponseModel
+
+    n_items = 30
+    model = GradedResponseModel(n_items=n_items, n_categories=3).set_parameters(
+        discrimination=np.ones(n_items),
+        thresholds=np.tile([-0.01, 0.01], (n_items, 1)),
+    )
+    covariance = np.diag(np.r_[np.full(n_items, 0.01), np.full(2 * n_items, 1.0)])
+
+    with pytest.warns(UserWarning, match="projected"):
+        samples = draw_parameters(model, n_samples=50, vcov=covariance, seed=3)
+
+    assert np.all(np.diff(samples.parameters["thresholds"], axis=2) >= 0.0)
+    assert np.all(samples.parameters["thresholds"] >= -6.0)
+    assert np.all(samples.parameters["discrimination"] >= 0.1)
+
+
+def test_polytomous_models_require_a_covariance():
+    with pytest.raises(MirtValidationError, match="FitResult or a vcov"):
+        draw_parameters(GeneralizedPartialCredit(2, 3))
+    with pytest.raises(ValueError, match=r"vcov must have shape \(6, 6\)"):
+        draw_parameters(GeneralizedPartialCredit(2, 3), vcov=np.eye(5))

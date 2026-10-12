@@ -24,8 +24,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtValidationError
 from mirt.results.score_result import ScoreResult
-from mirt.scoring._common import build_quadrature
-from mirt.utils.data import _missing_coded_responses
+from mirt.scoring._common import build_quadrature, validate_scoring_responses
 from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
@@ -243,42 +242,8 @@ class EAPSumScorer:
         model: BaseItemModel,
         responses: ArrayLike,
     ) -> NDArray[np.int_]:
-        """Validate response codes, reading ``NaN`` as a missing response.
-
-        Negative missing codes are kept as given.
-        """
-        responses = _missing_coded_responses(responses)
-        if responses.ndim != 2:
-            raise ValueError(f"responses must be 2D, got {responses.ndim}D")
-        if responses.shape[1] != model.n_items:
-            raise ValueError(
-                f"responses has {responses.shape[1]} items, expected {model.n_items}"
-            )
-        dtype_kind = responses.dtype.kind
-        if dtype_kind not in "biuf":
-            raise ValueError("responses must contain numeric values")
-        if dtype_kind == "f":
-            if not np.all(np.isfinite(responses)):
-                raise ValueError("responses must contain finite values")
-            if np.any(responses != np.trunc(responses)):
-                raise ValueError("responses must contain integer category codes")
-            int_bounds = np.iinfo(np.int_)
-            if np.any(responses < int_bounds.min) or np.any(responses > int_bounds.max):
-                raise ValueError("response codes exceed the supported integer range")
-
-        observed = responses >= 0
-        if model.is_polytomous:
-            categories = np.asarray(model._n_categories)
-            invalid = observed & (responses >= categories[None, :])
-            if np.any(invalid):
-                item_idx = int(np.flatnonzero(np.any(invalid, axis=0))[0])
-                raise ValueError(
-                    f"responses for item {item_idx} must be below {categories[item_idx]}"
-                )
-        elif np.any(responses[observed] > 1):
-            raise ValueError("dichotomous responses must be coded as 0 or 1")
-
-        return responses.astype(np.int_, copy=False)
+        """Validate response codes as every scorer does, missing codes as -1."""
+        return validate_scoring_responses(model, responses)
 
     def _score_response_group(
         self,
@@ -480,18 +445,13 @@ class EAPSumScorer:
     ) -> NDArray[np.float64]:
         """Compute log P(sum_score | theta) for all sum scores and theta points.
 
-        Uses the Lord-Wingersky recursion, in compiled log space for built-in
-        1PL/2PL models and otherwise in probability space. A table with sum
-        scores so improbable that their probabilities could underflow is
-        recomputed in log space. Underflow is judged on the posterior terms
+        Uses the Lord-Wingersky recursion in probability space on the cached
+        item probability tables. A table with sum scores so improbable that
+        their probabilities could underflow is recomputed in log space. Underflow is judged on the posterior terms
         when the grid's ``log_prior`` is given, else on the likelihoods alone.
         """
         if item_indices is None:
             item_indices = tuple(range(model.n_items))
-
-        native = _native_sum_score_distribution(model, quad_points, item_indices)
-        if native is not None:
-            return native
 
         tables = self._item_probability_tables(model, quad_points, item_indices)
         log_dist = _probability_sum_score_distribution(tables, quad_points.shape[0])
@@ -618,34 +578,6 @@ class EAPSumScorer:
         return f"EAPSumScorer(n_quadpts={self.n_quadpts})"
 
 
-def _native_sum_score_distribution(
-    model: BaseItemModel,
-    quad_points: NDArray[np.float64],
-    item_indices: tuple[int, ...],
-) -> NDArray[np.float64] | None:
-    """Use the compiled log-space recursion for built-in 1PL/2PL curves."""
-    from mirt._model_defaults import uses_builtin_model_hooks
-    from mirt.backends.rust.eapsum import lord_wingersky_recursion
-    from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
-
-    if (
-        not item_indices
-        or type(model) not in (OneParameterLogistic, TwoParameterLogistic)
-        or not uses_builtin_model_hooks(model)
-    ):
-        return None
-    params = model.parameters
-    discrimination = params.get("discrimination", np.ones(model.n_items))
-    if discrimination.ndim != 1:
-        return None
-    items = list(item_indices)
-    return lord_wingersky_recursion(
-        quad_points[:, 0] if quad_points.ndim > 1 else quad_points,
-        discrimination[items],
-        params["difficulty"][items],
-    )
-
-
 def _probability_sum_score_distribution(
     tables: Sequence[NDArray[np.float64]],
     n_quad: int,
@@ -760,6 +692,8 @@ def eapsum(
         :func:`mirt.fit_mirt`.
     responses : array-like of shape (n_persons, n_items)
         Response matrix. Negative codes and ``NaN`` denote missing responses.
+        DataFrame columns are matched to named items as in
+        :func:`mirt.fscores`.
     n_quadpts : int
         Number of quadrature points
     prior_mean : ndarray, optional

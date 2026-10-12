@@ -350,7 +350,6 @@ def bench_gpu_likelihood(
         ("1pl", mirt.OneParameterLogistic),
         ("2pl", mirt.TwoParameterLogistic),
         ("3pl", mirt.ThreeParameterLogistic),
-        ("mirt_3d", mirt.TwoParameterLogistic),
         ("grm", mirt.GradedResponseModel),
         ("grm_mixed", mirt.GradedResponseModel),
         ("gpcm", mirt.GeneralizedPartialCredit),
@@ -364,7 +363,7 @@ def bench_gpu_likelihood(
         model = (
             factory(n_items, n_categories=categories)
             if polytomous
-            else factory(n_items, n_factors=3 if label == "mirt_3d" else 1)
+            else factory(n_items)
         )
         data = np.column_stack(
             [
@@ -373,7 +372,7 @@ def bench_gpu_likelihood(
             ]
         )
         data[rng.random(data.shape) < 0.1] = -1
-        points = rng.normal(size=(21, 3)) if label == "mirt_3d" else grid.nodes[:, 0]
+        points = grid.nodes[:, 0]
         params = model.parameters
         if polytomous:
             kernel = (
@@ -389,9 +388,10 @@ def bench_gpu_likelihood(
             )
             kwargs = {"n_categories": categories}
         else:
-            kernel = getattr(
-                backend,
-                f"compute_log_likelihoods_{'mirt' if label == 'mirt_3d' else '3pl' if label == '3pl' else '2pl'}_gpu",
+            kernel = (
+                backend.compute_log_likelihoods_3pl_gpu
+                if label == "3pl"
+                else backend.compute_log_likelihoods_2pl_gpu
             )
             args = (data, points, params["discrimination"], params["difficulty"])
             if label == "3pl":
@@ -407,23 +407,6 @@ def bench_gpu_likelihood(
                 _time(likelihood, repeats=repeats, warmups=warmups),
             )
         )
-        if label == "2pl":
-
-            def e_step():
-                return backend.e_step_complete_gpu(
-                    data,
-                    points,
-                    grid.weights,
-                    params["discrimination"],
-                    params["difficulty"],
-                )
-
-            results.append(
-                BenchResult(
-                    f"gpu_likelihood_{device.type}_complete_e_step",
-                    _time(e_step, repeats=repeats, warmups=warmups),
-                )
-            )
     return results
 
 
@@ -1237,18 +1220,22 @@ def bench_regularized(
 def bench_kernels(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
-    """Isolate cached likelihood kernels on responses with missing values."""
-    from mirt.backends.rust import compute_log_likelihoods_2pl
+    """Time item log-likelihood batches on responses with missing values.
 
+    The 2PL row runs the NumPy model path; GRM and GPCM use native kernels.
+    """
     rng = np.random.default_rng(61)
     points = np.linspace(-3, 3, 41)
     a, b = rng.uniform(0.5, 1.5, n_items), rng.normal(size=n_items)
     responses = rng.integers(-1, 2, (n_persons, n_items))
+    binary = mirt.TwoParameterLogistic(n_items).set_parameters(
+        discrimination=a, difficulty=b
+    )
     results = [
         BenchResult(
-            "likelihood_2pl",
+            "likelihood_2pl_numpy",
             _time(
-                lambda: compute_log_likelihoods_2pl(responses, points, a, b),
+                lambda: binary.log_likelihood_batch(responses, points[:, None]),
                 repeats=repeats,
                 warmups=warmups,
             ),
@@ -1315,8 +1302,12 @@ def bench_optimization(
                 ),
             )
         )
-    pool = data[: min(32, n_persons)]
+    pool = data[: min(32, n_persons)].copy()
+    # A row of zeros and a row of ones give every item both categories, which
+    # fit_mirt requires of an estimable item.
+    pool[:2] = np.arange(2)[: len(pool), None]
     repeated = pool[rng.integers(0, len(pool), n_persons)]
+    repeated[:2] = pool[:2]
     results.append(
         BenchResult(
             "em_fit_repeated",
@@ -1578,8 +1569,12 @@ def bench_reliability(
     n_persons: int, n_items: int, repeats: int, warmups: int = 0
 ) -> list[BenchResult]:
     """Measure information-based reliability and measurement-error summaries."""
+    from functools import partial
+
     from mirt.utils.reliability import empirical_rxx, sem
 
+    # Information-based errors, as the abilities stand in for ML scores.
+    information_rxx = partial(empirical_rxx, method="information")
     if n_persons < 2:
         raise ValueError("reliability benchmarks require at least two persons")
     rng = np.random.default_rng(72)
@@ -1590,7 +1585,7 @@ def bench_reliability(
     )
     results = []
     for label, model in models:
-        for name, statistic in (("sem", sem), ("empirical", empirical_rxx)):
+        for name, statistic in (("sem", sem), ("empirical", information_rxx)):
 
             def run() -> None:
                 statistic(model, theta)
@@ -2306,7 +2301,7 @@ def bench_diagnostics(
     warmups: int = 0,
 ) -> list[BenchResult]:
     """Measure NumPy pairwise diagnostics with complete and incomplete data."""
-    from mirt.diagnostics.ld import _compute_ld_chi2_g2
+    from mirt._local_dependence import marginal_ld_statistics
     from mirt.utils.residuals import _compute_ld_matrix
 
     rng = np.random.default_rng(4781)
@@ -2325,14 +2320,18 @@ def bench_diagnostics(
         probabilities = rng.uniform(0.05, 0.95, size=(n_persons, n_items))
         responses = (rng.random(probabilities.shape) < probabilities).astype(np.int32)
         responses[rng.random(responses.shape) < missing_fraction] = -1
+        # Category probabilities on a 49-node unidimensional grid.
+        node_positive = rng.uniform(0.05, 0.95, size=(49, n_items))
+        node_probabilities = np.stack((1.0 - node_positive, node_positive), axis=2)
+        node_weights = np.full(49, 1.0 / 49)
+        categories = np.full(n_items, 2)
 
         def run_ld():
-            return _compute_ld_chi2_g2(
-                None,
+            return marginal_ld_statistics(
                 responses,
-                np.empty((n_persons, 1)),
-                n_quadpts=21,
-                positive_probabilities=probabilities,
+                categories,
+                lambda rows: node_probabilities[rows],
+                node_weights,
             )
 
         times = _time(run_ld, repeats=repeats, warmups=warmups)
@@ -2981,7 +2980,7 @@ def _validate_baseline_compatibility(
         "misfit_2pl_missing",
         "misfit_grm_complete",
         "misfit_grm_missing",
-        "likelihood_2pl",
+        "likelihood_2pl_numpy",
         "likelihood_grm",
         "likelihood_gpcm",
         "em_fit_grm",

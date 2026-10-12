@@ -50,3 +50,15 @@ interface and also support unidimensional polytomous base models.
 Both implementations reuse a quadrature evaluation for respondents with the
 same prior mean. Large groups are processed in bounded chunks; pass
 ``chunk_size`` to impose a smaller explicit row bound when needed.
+
+Crossed rater effects
+---------------------
+
+``CrossedRandomEffectsModel`` shifts a dichotomous base model's log-odds by
+the effect of the rater assigned to each person-item observation. Only the
+base model and these shifts enter its probabilities, likelihood and
+simulations. Its person, item and rater variance components never did, so
+``include_item_effects``, ``set_variance_components``,
+``variance_components`` and ``variance_partition`` are deprecated and emit a
+``DeprecationWarning``; ``MultilevelIRTResult``, which no estimator returns,
+is deprecated as well.

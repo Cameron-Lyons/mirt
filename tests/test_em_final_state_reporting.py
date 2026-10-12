@@ -10,6 +10,7 @@ from mirt.estimation.gvem import GVEMEstimator
 from mirt.estimation.irtree_em import IRTreeEMEstimator
 from mirt.estimation.latent_density import GaussianDensity
 from mirt.estimation.mcem import MCEMEstimator, StochasticEMEstimator
+from mirt.estimation.quadrature import RectangularQuadrature
 from mirt.estimation.regularized import RegularizedMIRTEstimator
 from mirt.estimation.sparse_bayesian import SparseBayesianEstimator
 from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
@@ -74,10 +75,21 @@ def test_mcem_refreshes_existing_draw_after_last_m_step(monkeypatch):
     normalizer = logsumexp(log_likes, axis=1, keepdims=True)
     expected_ll = float(np.sum(normalizer.ravel() - np.log(estimator.n_samples)))
 
-    assert result.log_likelihood == pytest.approx(expected_ll)
+    # The history keeps the estimate on the refreshed draw; the result reports
+    # the marginal log-likelihood on EM's grid at the final parameters.
+    assert estimator.convergence_history[-1] == pytest.approx(expected_ll)
+    assert result.log_likelihood == pytest.approx(
+        _grid_log_likelihood(model, responses)
+    )
     assert result.converged
     assert len(estimator.convergence_history) == 2
     np.testing.assert_allclose(captured["weights"], np.exp(log_likes - normalizer))
+
+
+def _grid_log_likelihood(model, responses):
+    quadrature = RectangularQuadrature(61)
+    joint = model.log_likelihood_batch(responses, quadrature.nodes)
+    return float(np.sum(logsumexp(joint + np.log(quadrature.weights), axis=1)))
 
 
 def test_stochastic_em_reuses_sampled_data_weights(monkeypatch):
@@ -105,10 +117,16 @@ def test_stochastic_em_reuses_sampled_data_weights(monkeypatch):
         estimator, "_compute_standard_errors_mc", capture_standard_errors
     )
 
+    initial = model.copy()
     result = estimator.fit(model, responses)
 
+    # Stochastic EM records the estimate of each E-step, before its M-step,
+    # and reports the marginal log-likelihood at the final parameters.
+    assert estimator.convergence_history == pytest.approx(
+        [estimator._estimate_marginal_ll(initial, responses, samples, weights)]
+    )
     assert result.log_likelihood == pytest.approx(
-        estimator._estimate_marginal_ll(model, responses, samples, weights)
+        _grid_log_likelihood(model, responses)
     )
     assert captured["e_steps"] == 1
     np.testing.assert_array_equal(captured["weights"], weights)
@@ -135,8 +153,13 @@ def test_gvem_refreshes_variational_state_after_last_m_step(monkeypatch):
 
     result = estimator.fit(model, responses)
     expected = estimator._compute_elbo(model, responses, np.zeros(1), np.eye(1))
+    expected_log_likelihood = estimator._marginal_log_likelihood(
+        model, responses, np.zeros(1), np.eye(1)
+    )
 
-    assert result.log_likelihood == pytest.approx(expected)
+    assert result.elbo == pytest.approx(expected)
+    assert result.log_likelihood == pytest.approx(expected_log_likelihood)
+    assert result.log_likelihood > result.elbo
     assert result.converged
     assert calls == 2
     assert estimator.elbo_history == pytest.approx(estimator.convergence_history)

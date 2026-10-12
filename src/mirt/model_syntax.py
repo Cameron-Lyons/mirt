@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from mirt.estimation._shared_step import EqualityGroup
     from mirt.estimation.latent_density import FactorCovarianceDensity
     from mirt.estimation.priors import Prior, PriorSpecification
+    from mirt.estimation.quadrature import QuadratureRule
     from mirt.estimation.standard_errors import StandardErrorMethod
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
@@ -47,6 +48,7 @@ _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*\Z")
 _PARAMETER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _ITEM_RANGE = re.compile(r"(\d+)\s*(?:[-:]\s*(\d+))?\Z")
 _SLOPE_ALIAS = re.compile(r"a(\d*)\Z")
+_INTERCEPT_ALIAS = re.compile(r"d\d*\Z")
 # Short R names for stored parameters; ``a`` and ``a1``, ``a2``, ... select
 # slope columns.
 _PARAMETER_ALIASES = {"d": "intercepts", "g": "guessing", "u": "upper"}
@@ -446,7 +448,12 @@ def mirt_model(syntax: str, item_names: Sequence[str] | None = None) -> ModelSpe
     ``a`` selects the slopes and ``a1``, ``a2``, ... the slopes on each
     factor, ``d`` the intercepts of slope-intercept models, ``g`` guessing
     and ``u`` upper asymptotes. Stored parameter names such as
-    ``difficulty`` or ``thresholds`` select whole item rows.
+    ``difficulty`` or ``thresholds`` select whole item rows. A "2PL" model
+    is fitted in R's slope-intercept form, ``a' theta + d``, when it has
+    several factors or when the syntax names ``d``; the other families store
+    difficulties, thresholds or steps (``b = -d / a``) and reject ``d``.
+    Slopes of families that fix them, such as "1PL" and "PCM", cannot be
+    named.
 
     Parameters
     ----------
@@ -728,7 +735,11 @@ def _parameter_entry(
 
 
 class _ParameterTargets:
-    """Resolve syntax parameter names to stored coordinates of one model."""
+    """Resolve syntax parameter names to stored coordinates of one model.
+
+    Must be built before ``FIXED`` masks are applied, so that slopes the
+    family fixes are told apart from slopes the syntax fixes.
+    """
 
     def __init__(self, model: BaseItemModel, pattern: NDArray[np.bool_]) -> None:
         from mirt.models.multidimensional import MultidimensionalModel
@@ -746,8 +757,25 @@ class _ParameterTargets:
             self.slope = "slopes"
         elif "discrimination" in parameters:
             self.slope = "discrimination"
+        # Families such as the 1PL and PCM hold every slope at a fixed value.
+        self.fixed_slopes = self.slope is not None and not np.any(
+            model.free_parameter_masks[self.slope]
+        )
 
     def _target(self, name: str, line: int) -> tuple[str, int | None]:
+        target = self._resolve(name, line)
+        if target[0] == self.slope and self.fixed_slopes:
+            values = np.unique(self.model._parameters[self.slope])
+            held = f" at {values[0]:g}" if values.size == 1 else ""
+            raise _syntax_error(
+                f"{name} names slopes, but the {self.model.model_name} model "
+                f"fixes every slope{held}; fit a family with free slopes, such "
+                "as 2PL, to start, fix, constrain or put priors on them",
+                line,
+            )
+        return target
+
+    def _resolve(self, name: str, line: int) -> tuple[str, int | None]:
         if name in self.item_parameters:
             return name, None
         n_factors = self.pattern.shape[1]
@@ -766,6 +794,8 @@ class _ParameterTargets:
         alias = _PARAMETER_ALIASES.get(name)
         if alias is not None and alias in self.item_parameters:
             return alias, None
+        if _INTERCEPT_ALIAS.match(name) and "intercepts" not in self.item_parameters:
+            raise _syntax_error(self._missing_intercepts(name), line)
         available = [
             short
             for short, stored in _PARAMETER_ALIASES.items()
@@ -778,6 +808,33 @@ class _ParameterTargets:
             f"unknown parameter {name!r} for the {self.model.model_name} model; "
             f"use {', '.join(available)}",
             line,
+        )
+
+    def _missing_intercepts(self, name: str) -> str:
+        """Explain why ``name`` names no intercepts of a difficulty-form model.
+
+        R's intercepts are not coordinates of these models: fixing or
+        putting a prior on ``d = -a * b`` differs from doing so on ``b``
+        while the slope ``a`` is free.
+        """
+        family = self.model.model_name
+        if "thresholds" in self.item_parameters:
+            stored = "thresholds b_k, R's intercepts being d_k = -a * b_k"
+            choice = "thresholds"
+        elif "steps" in self.item_parameters:
+            stored = "steps b_k, R's intercepts being d_k = -a * (b_1 + ... + b_k)"
+            choice = "steps"
+        elif "difficulty" in self.item_parameters:
+            stored = "the difficulty b, R's intercept being d = -a * b"
+            choice = "difficulty"
+        else:
+            return (
+                f"{name} names intercepts, which the {family} model does not "
+                f"have; use {', '.join(self.item_parameters)}"
+            )
+        return (
+            f"{name} names intercepts, but the {family} model stores {stored}; "
+            f"select whole rows with {choice}, on that scale"
         )
 
     def masks(self, entry: ParameterEntry) -> dict[str, NDArray[np.bool_]]:
@@ -807,14 +864,30 @@ class _ParameterTargets:
         return masks
 
 
+def _names_intercepts(spec: ModelSpec) -> bool:
+    """Whether a group of ``spec`` names the intercepts ``d``."""
+    return any(
+        name in ("d", "intercepts")
+        for entry in spec._entries()
+        for name in entry.parameters
+    )
+
+
 def _confirmatory_model(
     name: str,
     pattern: NDArray[np.bool_],
     n_categories: int | Sequence[int] | None,
     item_names: list[str],
     responses: NDArray[np.int_],
+    *,
+    intercepts: bool = False,
 ) -> BaseItemModel:
-    """Build an unfitted model whose slopes follow ``pattern``."""
+    """Build an unfitted model whose slopes follow ``pattern``.
+
+    A "2PL" model is the slope-intercept :class:`MultidimensionalModel` when
+    it has several factors, and with one factor when ``intercepts`` is true
+    because the syntax names R's intercepts ``d``.
+    """
     from mirt.models._factory import build_item_model
     from mirt.models.multidimensional import MultidimensionalModel
 
@@ -836,9 +909,7 @@ def _confirmatory_model(
         item_names=item_names,
         responses=responses,
     )
-    if n_factors == 1:
-        return model
-    if name == "2PL":
+    if name == "2PL" and (n_factors > 1 or intercepts):
         return MultidimensionalModel(
             n_items,
             n_factors,
@@ -846,6 +917,8 @@ def _confirmatory_model(
             model_type="confirmatory",
             loading_pattern=pattern.astype(np.float64),
         )
+    if n_factors == 1:
+        return model
     model.set_parameters(discrimination=model.parameters["discrimination"] * pattern)
     model.set_free_parameter_masks({"discrimination": pattern})
     return model
@@ -995,6 +1068,59 @@ def _spec_constraints(
     return groups
 
 
+def _warn_if_bifactor(
+    spec: ModelSpec,
+    pattern: NDArray[np.bool_],
+    model: str,
+    n_quadpts: int | None,
+    *,
+    has_priors: bool,
+    has_constraints: bool,
+) -> None:
+    """Point a "2PL" or "GRM" bifactor structure to :func:`mirt.bfactor`.
+
+    One general factor that loads every item, every item loading on exactly
+    one other factor, at least two such specific factors and no ``COV``,
+    priors or constraints describe the model ``bfactor`` fits. It integrates
+    over one two-dimensional grid per specific factor, while this EM fit
+    integrates over the full ``n_quadpts ** n_factors`` product grid.
+    """
+    if (
+        model not in ("2PL", "GRM")
+        or spec.n_factors < 3
+        or spec.covariances
+        or spec.priors
+        or spec.constraints
+        or has_priors
+        or has_constraints
+    ):
+        return
+    general = np.flatnonzero(pattern.all(axis=0))
+    if general.size != 1:
+        return
+    if not np.all(np.delete(pattern, general[0], axis=1).sum(axis=1) == 1):
+        return
+    import warnings
+
+    from mirt.estimation.quadrature import default_quadpts
+
+    if n_quadpts is None:
+        n_quadpts = default_quadpts(min(spec.n_factors, 6))
+    specific = [name for name in spec.factors if name != spec.factors[general[0]]]
+    labels = ", ".join(f"{index} for {name}" for index, name in enumerate(specific))
+    family = ', model="graded"' if model == "GRM" else ""
+    warnings.warn(
+        f"spec is a bifactor structure with general factor "
+        f"{spec.factors[general[0]]}, which EM integrates over "
+        f"{n_quadpts**spec.n_factors:,} quadrature nodes; mirt.bfactor(data, "
+        f"specific_factors{family}) fits the same model on two-dimensional "
+        "grids, much faster, with specific_factors labelling each item's "
+        f"factor ({labels})",
+        RuntimeWarning,
+        stacklevel=4,
+    )
+
+
 def _factor_density(
     model: BaseItemModel,
     spec: ModelSpec,
@@ -1032,7 +1158,7 @@ def _fit_spec(
     n_factors: int,
     n_categories: int | Sequence[int] | None,
     estimation: str,
-    n_quadpts: int,
+    n_quadpts: int | None,
     max_iter: int,
     tol: float,
     verbose: bool,
@@ -1045,6 +1171,8 @@ def _fit_spec(
     se_method: StandardErrorMethod,
     accelerate: Literal["none", "squarem"] = "none",
     constraints: Sequence[EqualityGroup] = (),
+    quadrature: QuadratureRule = "auto",
+    use_gpu: bool | Literal["auto"] = "auto",
 ) -> FitResult:
     """Fit a confirmatory model for ``fit_mirt(data, spec=...)``.
 
@@ -1111,8 +1239,23 @@ def _fit_spec(
             f"every item must load on a factor; {names} load on none",
             parameter="spec",
         )
+    _warn_if_bifactor(
+        spec,
+        pattern,
+        model,
+        n_quadpts,
+        has_priors=priors is not None,
+        has_constraints=bool(constraints),
+    )
 
-    irt_model = _confirmatory_model(model, pattern, n_categories, item_names, responses)
+    irt_model = _confirmatory_model(
+        model,
+        pattern,
+        n_categories,
+        item_names,
+        responses,
+        intercepts=_names_intercepts(spec),
+    )
     targets = _ParameterTargets(irt_model, pattern)
     equality = [*_spec_constraints(irt_model, spec, targets), *constraints]
     free = irt_model.free_parameter_masks
@@ -1139,11 +1282,13 @@ def _fit_spec(
         tol=tol,
         verbose=verbose,
         latent_density=density,
+        use_gpu=use_gpu,
         use_rust=use_rust,
         compute_standard_errors=compute_standard_errors,
         item_priors=spec_priors or priors,
         se_method=se_method,
         accelerate=accelerate,
         constraints=equality,
+        quadrature=quadrature,
     )
     return estimator.fit(irt_model, responses, start=start or "default")

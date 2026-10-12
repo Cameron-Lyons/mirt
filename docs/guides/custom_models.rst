@@ -15,6 +15,7 @@ and can be inferred from the function signature.
 .. code-block:: python
 
    import numpy as np
+   import mirt
    from mirt import CustomItemModel, create_item_type
 
    def logistic(theta, slope, location):
@@ -100,6 +101,10 @@ A polytomous callback returns a complete probability trace. Its shape must be
    traces = ordinal_model.probability(theta)    # (61, 5, 3)
    item_score = ordinal_model.expected_score(theta, item_idx=0)
 
+Every item of a custom model has the item type's ``n_categories``, and
+``ordinal_model.n_categories`` lists it per item (``[3, 3, 3, 3, 3]``), as for
+the built-in polytomous families; ``max_categories`` is the shared count.
+
 Likelihood methods use ``-1`` for missing responses. The batch method evaluates
 every response pattern at every supplied theta point.
 
@@ -109,6 +114,18 @@ every response pattern at every supplied theta point.
    grid = np.linspace(-4, 4, 81)
    log_likelihood = ordinal_model.log_likelihood_batch(responses, grid)
    # shape: (2, 81)
+
+Simulation
+----------
+
+``simulate`` draws responses from the probability callbacks, one uniform per
+person and item, exactly as the built-in families do, and
+:func:`mirt.simdata` accepts a custom model:
+
+.. code-block:: python
+
+   simulated = ordinal_model.simulate(np.random.default_rng(3).normal(size=500), seed=1)
+   sample = mirt.simdata(model=ordinal_model, n_persons=500, seed=1)  # (500, 5)
 
 Multidimensional callbacks
 --------------------------

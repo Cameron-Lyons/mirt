@@ -10,9 +10,7 @@ use numpy::{
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use rayon::prelude::*;
 
-use crate::counts::binary_item_counts;
 use crate::likelihood::{log_2pl_row, log_3pl_row};
 use crate::likelihood_cache::{cached_likelihoods, normalize_log_posterior_rows};
 use crate::polytomous::{
@@ -397,60 +395,6 @@ pub fn multigroup_e_step_nrm<'py>(
     )
 }
 
-/// Compute expected dichotomous counts for every group (for the M-step).
-///
-/// Returns per-group `(n_items, n_quad)` matrices of expected correct (`r_k`)
-/// and expected observed (`n_k`) responses.
-#[allow(clippy::type_complexity)]
-#[pyfunction]
-#[pyo3(signature = (responses_list, posterior_weights_list))]
-pub fn multigroup_expected_counts<'py>(
-    py: Python<'py>,
-    responses_list: Vec<PyReadonlyArray2<i32>>,
-    posterior_weights_list: Vec<PyReadonlyArray2<f64>>,
-) -> PyResult<(
-    Vec<Bound<'py, PyArray2<f64>>>,
-    Vec<Bound<'py, PyArray2<f64>>>,
-)> {
-    let responses = views(&responses_list);
-    let posteriors = views(&posterior_weights_list);
-    check_group_counts(responses.len(), &[posteriors.len()])?;
-    if responses
-        .iter()
-        .zip(&posteriors)
-        .any(|(responses, posterior)| responses.nrows() != posterior.nrows())
-    {
-        return Err(PyValueError::new_err(
-            "each posterior needs one row per response row",
-        ));
-    }
-
-    let counts: Vec<(Array2<f64>, Array2<f64>)> = py.detach(|| {
-        responses
-            .iter()
-            .zip(&posteriors)
-            .map(|(&responses, posterior)| {
-                let posterior = posterior.as_standard_layout();
-                let rows = posterior.as_slice().expect("standard layout posterior");
-                let (n_items, n_quad) = (responses.ncols(), posterior.ncols());
-                let (r_k, n_k): (Vec<Vec<f64>>, Vec<Vec<f64>>) = (0..n_items)
-                    .into_par_iter()
-                    .map(|j| binary_item_counts(responses, rows, n_quad, j, None))
-                    .unzip();
-                let matrix = |rows: Vec<Vec<f64>>| {
-                    Array2::from_shape_vec((n_items, n_quad), rows.concat())
-                        .expect("one count row per item")
-                };
-                (matrix(r_k), matrix(n_k))
-            })
-            .collect()
-    });
-    Ok(counts
-        .into_iter()
-        .map(|(r_k, n_k)| (r_k.into_pyarray(py), n_k.into_pyarray(py)))
-        .unzip())
-}
-
 /// Register multigroup functions with the Python module
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(multigroup_e_step_2pl, m)?)?;
@@ -458,6 +402,5 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(multigroup_e_step_grm, m)?)?;
     m.add_function(wrap_pyfunction!(multigroup_e_step_gpcm, m)?)?;
     m.add_function(wrap_pyfunction!(multigroup_e_step_nrm, m)?)?;
-    m.add_function(wrap_pyfunction!(multigroup_expected_counts, m)?)?;
     Ok(())
 }

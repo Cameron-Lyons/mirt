@@ -1,7 +1,7 @@
 """Rust backend: cat.
 
-Fallback mode: mixed. Item information, selection, and EAP updates have NumPy
-fallbacks; batch simulation and conditional MSE helpers are optional.
+Fallback mode: optional. Batch simulation and conditional MSE helpers return
+``None`` when Rust is unavailable; callers own Python paths.
 """
 
 from __future__ import annotations
@@ -9,22 +9,13 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from mirt._core import sigmoid
-from mirt._prior_mass import normalize_log_mass
 from mirt.backends.rust._helpers import (
-    _quad_chunk_size,
     mirt_rs,
     rust_enabled,
 )
 
-FALLBACK_MODE = "mixed"
+FALLBACK_MODE = "optional"
 
-CATBatchSummary = tuple[
-    NDArray[np.float64],
-    NDArray[np.float64],
-    NDArray[np.int32],
-    NDArray[np.float64],
-]
 CATBatchDetails = tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -160,250 +151,6 @@ def _simulation_inputs(
     )
 
 
-def cat_compute_item_info(
-    theta: float,
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Compute Fisher information for all items at a given theta.
-
-    Parameters
-    ----------
-    theta : float
-        Current ability estimate.
-    discrimination : ndarray
-        Item discrimination parameters, shape (n_items,).
-    difficulty : ndarray
-        Item difficulty parameters, shape (n_items,).
-
-    Returns
-    -------
-    ndarray
-        Fisher information for each item, shape (n_items,).
-    """
-    theta = _finite_scalar(theta, "theta")
-    discrimination, difficulty = _item_parameters(discrimination, difficulty)
-
-    if rust_enabled():
-        return mirt_rs.cat_compute_item_info(
-            theta,
-            discrimination,
-            difficulty,
-        )
-
-    z = discrimination * (theta - difficulty)
-    p = sigmoid(z)
-    q = 1.0 - p
-    return (discrimination**2) * p * q
-
-
-def cat_select_max_info(
-    theta: float,
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    available_mask: NDArray[np.bool_],
-) -> int:
-    """Select item with maximum Fisher information.
-
-    Parameters
-    ----------
-    theta : float
-        Current ability estimate.
-    discrimination : ndarray
-        Item discrimination parameters.
-    difficulty : ndarray
-        Item difficulty parameters.
-    available_mask : ndarray
-        Boolean mask of available items.
-
-    Returns
-    -------
-    int
-        Index of selected item, or -1 if no items available.
-    """
-    theta = _finite_scalar(theta, "theta")
-    discrimination, difficulty = _item_parameters(discrimination, difficulty)
-    mask = np.asarray(available_mask)
-    if mask.dtype != np.bool_ or mask.shape != discrimination.shape:
-        raise ValueError(
-            "available_mask must be a boolean vector with one value per item"
-        )
-    mask = np.ascontiguousarray(mask)
-
-    if rust_enabled():
-        return mirt_rs.cat_select_max_info(
-            theta,
-            discrimination,
-            difficulty,
-            mask,
-        )
-
-    if not np.any(mask):
-        return -1
-    z = discrimination * (theta - difficulty)
-    probability = sigmoid(z)
-    info = np.where(
-        mask, discrimination**2 * probability * (1.0 - probability), -np.inf
-    )
-    return int(np.argmax(info))
-
-
-def cat_eap_update(
-    administered_items: NDArray[np.int32],
-    responses: NDArray[np.int32],
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    quad_points: NDArray[np.float64],
-    quad_weights: NDArray[np.float64],
-) -> tuple[float, float]:
-    """Incremental EAP update after responses.
-
-    Parameters
-    ----------
-    administered_items : ndarray
-        Indices of administered items.
-    responses : ndarray
-        Responses to administered items.
-    discrimination : ndarray
-        Item discrimination parameters.
-    difficulty : ndarray
-        Item difficulty parameters.
-    quad_points : ndarray
-        Quadrature points.
-    quad_weights : ndarray
-        Quadrature weights.
-
-    Returns
-    -------
-    tuple[float, float]
-        (theta_estimate, standard_error).
-    """
-    discrimination, difficulty = _item_parameters(discrimination, difficulty)
-    points, weights = _quadrature(quad_points, quad_weights)
-
-    item_values = np.asarray(administered_items)
-    if item_values.ndim != 1 or not np.issubdtype(item_values.dtype, np.integer):
-        raise ValueError("administered_items must be a one-dimensional integer vector")
-    if np.any(item_values < 0) or np.any(item_values >= discrimination.size):
-        raise ValueError("administered_items contains an out-of-bounds item index")
-    items = np.ascontiguousarray(item_values, dtype=np.int32)
-
-    try:
-        response_values = np.asarray(responses, dtype=np.float64)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("responses must be a numeric vector") from exc
-    if response_values.ndim != 1 or response_values.shape != items.shape:
-        raise ValueError("responses must have one value per administered item")
-    if not np.all(np.isfinite(response_values)):
-        raise ValueError("responses must contain only finite values")
-    observed = response_values >= 0.0
-    if np.any(observed & (response_values != 0.0) & (response_values != 1.0)):
-        raise ValueError("observed responses must be coded as 0 or 1")
-    normalized_responses = np.ascontiguousarray(
-        np.where(observed, response_values, -1.0), dtype=np.int32
-    )
-
-    if rust_enabled():
-        theta, se = mirt_rs.cat_eap_update(
-            items,
-            normalized_responses,
-            discrimination,
-            difficulty,
-            points,
-            weights,
-        )
-        return float(theta[0]), float(se[0])
-
-    observed_items = items[observed]
-    observed_responses = normalized_responses[observed]
-    selected_disc = discrimination[observed_items]
-    selected_diff = difficulty[observed_items]
-
-    log_likes = np.zeros(points.size, dtype=np.float64)
-    chunk_size = _quad_chunk_size(points.size, observed_items.size)
-    signed_responses = 2.0 * observed_responses - 1.0
-    for start in range(0, points.size, chunk_size):
-        point_chunk = points[start : start + chunk_size]
-        logits = selected_disc[:, None] * (
-            point_chunk[None, :] - selected_diff[:, None]
-        )
-        log_likes[start : start + chunk_size] = np.sum(
-            -np.logaddexp(0.0, -signed_responses[:, None] * logits),
-            axis=0,
-        )
-
-    log_weights = np.full_like(weights, -np.inf)
-    positive_weight = weights > 0.0
-    log_weights[positive_weight] = np.log(weights[positive_weight])
-    posterior = np.exp(normalize_log_mass(log_likes + log_weights))
-
-    theta_eap = float(posterior @ points)
-    variance = max(0.0, float(posterior @ np.square(points - theta_eap)))
-    se = np.sqrt(variance)
-
-    return float(theta_eap), float(se)
-
-
-def cat_simulate_batch(
-    true_thetas: NDArray[np.float64],
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    quad_points: NDArray[np.float64],
-    quad_weights: NDArray[np.float64],
-    se_threshold: float,
-    max_items: int,
-    min_items: int,
-    n_replications: int,
-    seed: int | None = None,
-) -> CATBatchSummary | None:
-    """Run batch CAT simulations in parallel using Rust.
-
-    Parameters
-    ----------
-    true_thetas : ndarray
-        True ability values to simulate.
-    discrimination : ndarray
-        Item discrimination parameters.
-    difficulty : ndarray
-        Item difficulty parameters.
-    quad_points : ndarray
-        Quadrature points for EAP scoring.
-    quad_weights : ndarray
-        Quadrature weights.
-    se_threshold : float
-        SE stopping threshold.
-    max_items : int
-        Maximum items per test.
-    min_items : int
-        Minimum items before stopping.
-    n_replications : int
-        Number of replications per theta.
-    seed : int, optional
-        Random seed.
-
-    Returns
-    -------
-    tuple or None
-        (theta_estimates, se_estimates, n_items, true_thetas_expanded).
-        Returns None if Rust backend not available.
-    """
-    result = cat_simulate_batch_full(
-        true_thetas,
-        discrimination,
-        difficulty,
-        quad_points,
-        quad_weights,
-        se_threshold,
-        max_items,
-        min_items,
-        n_replications,
-        seed,
-    )
-    if result is None:
-        return None
-    return result[:4]
-
-
 def cat_simulate_batch_full(
     true_thetas: NDArray[np.float64],
     discrimination: NDArray[np.float64],
@@ -422,6 +169,10 @@ def cat_simulate_batch_full(
     columns, capped by the item-bank size. They use ``-1`` only for padding
     beyond each simulation's reported item count.
     Returns ``None`` when the native backend is unavailable or disabled.
+
+    Replication ``r`` of theta ``t`` draws from its own random stream,
+    mixed from ``seed``, ``t`` and ``r``, so the sessions of a call and of
+    neighbouring seeds are independent.
     """
     (
         true_thetas,
@@ -488,6 +239,9 @@ def cat_conditional_mse(
     | None
 ):
     """Compute conditional MSE at specified theta values using Rust.
+
+    Replication ``r`` of theta ``t`` draws from its own random stream,
+    mixed from ``seed``, ``t`` and ``r``, as in :func:`cat_simulate_batch_full`.
 
     Parameters
     ----------

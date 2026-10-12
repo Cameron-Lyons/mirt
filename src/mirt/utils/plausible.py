@@ -14,8 +14,7 @@ from typing import TYPE_CHECKING, Literal, NamedTuple
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from mirt.exceptions import MirtDataError
-from mirt.utils.data import validate_responses
+from mirt.utils.data import align_response_columns, validate_responses
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -30,7 +29,7 @@ def generate_plausible_values(
     responses: NDArray[np.int_],
     n_plausible: int = 5,
     method: Literal["posterior", "mcmc"] = "posterior",
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     n_iter: int = 50,
     seed: int | None = None,
     burn_in: int = 0,
@@ -53,7 +52,8 @@ def generate_plausible_values(
         ``latent_mean`` and ``latent_covariance`` are then the default
         population mean and covariance.
     responses : NDArray
-        Response matrix (n_persons, n_items)
+        Response matrix (n_persons, n_items). DataFrame columns are matched
+        to named items as in :func:`mirt.fscores`.
     n_plausible : int
         Positive number of plausible values to generate per person
     method : str
@@ -62,8 +62,13 @@ def generate_plausible_values(
         - 'posterior': Sampling quadrature nodes according to their posterior
           mass. Increase ``n_quadpts`` for a finer posterior approximation.
         - 'mcmc': MCMC sampling (slower but more flexible)
-    n_quadpts : int
-        Positive number of quadrature points (for posterior method)
+    n_quadpts : int, optional
+        Positive number of quadrature points per latent dimension (for the
+        posterior method). The default matches :func:`mirt.fscores` EAP
+        scoring: 49 points for one or two factors, 21 for three, 9 for four,
+        7 for five, and 5 for six or more. Draws take only node values, so a
+        coarse grid misstates each person's posterior spread when the
+        posterior is narrow relative to the node spacing.
     n_iter : int
         Positive number of MCMC iterations between draws (for mcmc method)
     seed : int, optional
@@ -126,6 +131,10 @@ def generate_plausible_values(
         raise ValueError("n_plausible must be a positive integer")
     if method not in ("posterior", "mcmc"):
         raise ValueError(f"Unknown method: {method}")
+    if n_quadpts is None:
+        from mirt.scoring.eap import _default_n_quadpts
+
+        n_quadpts = _default_n_quadpts(model.n_factors)
     if method == "posterior" and (
         isinstance(n_quadpts, bool)
         or not isinstance(n_quadpts, (int, np.integer))
@@ -158,18 +167,17 @@ def generate_plausible_values(
     ):
         raise ValueError("chunk_size must be a positive integer")
 
-    responses = validate_responses(responses, n_items=model.n_items)
-    observed = responses >= 0
-    if model.is_polytomous:
-        categories = np.asarray(model.n_categories)
-        invalid = observed & (responses >= categories[None, :])
-        if np.any(invalid):
-            item_idx = int(np.flatnonzero(np.any(invalid, axis=0))[0])
-            raise MirtDataError(
-                f"responses for item {item_idx} must be below {categories[item_idx]}"
-            )
-    elif np.any(responses[observed] > 1):
-        raise MirtDataError("dichotomous responses must be coded as 0 or 1")
+    from mirt.scoring._common import validate_scoring_responses
+
+    # validate_responses also rejects empty matrices; the scoring validator
+    # adds each item's category range.
+    responses = validate_scoring_responses(
+        model,
+        validate_responses(
+            align_response_columns(responses, getattr(model, "item_names", None)),
+            n_items=model.n_items,
+        ),
+    )
 
     prior = _resolve_population_prior(
         prior_mean, prior_cov, model.n_factors, responses.shape[0]

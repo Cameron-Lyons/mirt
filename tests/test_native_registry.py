@@ -52,7 +52,7 @@ def _native_exports() -> set[str]:
 def test_reference_scan_finds_the_backend_wrappers() -> None:
     references = _native_references()
 
-    assert "backends/rust/estep.py" in references["e_step_complete"]
+    assert "backends/rust/estimation.py" in references["mhrm_fit_2pl"]
     assert "estimation/_em_context.py" in references["EMThreadPool"]
 
 

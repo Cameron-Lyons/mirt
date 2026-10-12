@@ -172,6 +172,42 @@ def _normalize_common_result(result: CATResult | MCATResult) -> None:
     result.stopping_reason = result.stopping_reason.strip()
 
 
+def _normalize_polytomous(value: Any) -> bool | None:
+    """Validate the optional polytomous flag of a result."""
+    if value is None:
+        return None
+    if not isinstance(value, (bool, np.bool_)):
+        raise MirtValidationError(
+            "polytomous must be a boolean or None",
+            parameter="polytomous",
+            value=value,
+            expected="bool or None",
+        )
+    return bool(value)
+
+
+def _response_summary(
+    responses: NDArray[np.int_], n_items: int, polytomous: bool | None
+) -> list[str]:
+    """Describe the response pattern; polytomous items have no correct answer.
+
+    When the flag is unknown, responses above 1 mark the items as polytomous.
+    """
+    if polytomous is None:
+        polytomous = bool(np.any(responses > 1))
+    if not polytomous:
+        return [f"  Correct: {int(np.sum(responses == 1))} / {n_items}"]
+    mean = float(np.mean(responses)) if responses.size else float("nan")
+    counts = np.bincount(responses, minlength=2) if responses.size else np.zeros(2)
+    categories = ", ".join(
+        f"{category}: {int(count)}" for category, count in enumerate(counts)
+    )
+    return [
+        f"  Mean response: {mean:.4f}",
+        f"  Categories:  {categories}",
+    ]
+
+
 def _validate_payload(
     payload: Mapping[str, Any],
     *,
@@ -323,6 +359,9 @@ class MCATResult:
         History of covariance matrices after each item.
     item_info_history : list[float]
         History of item information values for selected items.
+    polytomous : bool | None
+        Whether the items are polytomous, so responses are category codes
+        rather than correct or incorrect answers. None when unknown.
     """
 
     theta: NDArray[np.float64]
@@ -336,6 +375,7 @@ class MCATResult:
     se_history: list[NDArray[np.float64]] = field(default_factory=list)
     covariance_history: list[NDArray[np.float64]] = field(default_factory=list)
     item_info_history: list[float] = field(default_factory=list)
+    polytomous: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate dimensions and copy caller-owned result data."""
@@ -409,6 +449,7 @@ class MCATResult:
             name="item_info_history",
             limit=count,
         )
+        self.polytomous = _normalize_polytomous(self.polytomous)
 
     @property
     def n_factors(self) -> int:
@@ -430,6 +471,7 @@ class MCATResult:
             "se_history": [value.tolist() for value in self.se_history],
             "covariance_history": [value.tolist() for value in self.covariance_history],
             "item_info_history": list(self.item_info_history),
+            **({} if self.polytomous is None else {"polytomous": self.polytomous}),
         }
 
     @classmethod
@@ -448,6 +490,7 @@ class MCATResult:
             "se_history",
             "covariance_history",
             "item_info_history",
+            "polytomous",
         }
         required = {
             "theta",
@@ -476,6 +519,7 @@ class MCATResult:
             se_history=payload.get("se_history", []),
             covariance_history=payload.get("covariance_history", []),
             item_info_history=payload.get("item_info_history", []),
+            polytomous=payload.get("polytomous"),
         )
         if "n_factors" in payload:
             value = payload["n_factors"]
@@ -530,7 +574,9 @@ class MCATResult:
                 f"Det(Cov):              {np.linalg.det(self.covariance):.6f}",
                 "",
                 "Response pattern:",
-                f"  Correct: {np.sum(self.responses == 1)} / {self.n_items_administered}",
+                *_response_summary(
+                    self.responses, self.n_items_administered, self.polytomous
+                ),
             ]
         )
         return "\n".join(lines)
@@ -697,6 +743,9 @@ class CATResult:
         History of standard errors after each item.
     item_info_history : list[float]
         History of item information values for selected items.
+    polytomous : bool | None
+        Whether the items are polytomous, so responses are category codes
+        rather than correct or incorrect answers. None when unknown.
     """
 
     theta: float
@@ -708,6 +757,7 @@ class CATResult:
     theta_history: list[float] = field(default_factory=list)
     se_history: list[float] = field(default_factory=list)
     item_info_history: list[float] = field(default_factory=list)
+    polytomous: bool | None = None
 
     def __post_init__(self) -> None:
         """Validate dimensions and copy caller-owned result data."""
@@ -746,6 +796,7 @@ class CATResult:
             name="item_info_history",
             limit=count,
         )
+        self.polytomous = _normalize_polytomous(self.polytomous)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a dependency-free, JSON-compatible result representation."""
@@ -759,6 +810,7 @@ class CATResult:
             "theta_history": list(self.theta_history),
             "se_history": list(self.se_history),
             "item_info_history": list(self.item_info_history),
+            **({} if self.polytomous is None else {"polytomous": self.polytomous}),
         }
 
     @classmethod
@@ -774,6 +826,7 @@ class CATResult:
             "theta_history",
             "se_history",
             "item_info_history",
+            "polytomous",
         }
         required = {
             "theta",
@@ -799,6 +852,7 @@ class CATResult:
             theta_history=payload.get("theta_history", []),
             se_history=payload.get("se_history", []),
             item_info_history=payload.get("item_info_history", []),
+            polytomous=payload.get("polytomous"),
         )
 
     def to_json(self, *, indent: int | None = None) -> str:
@@ -829,7 +883,9 @@ class CATResult:
             f"Stopping reason:       {self.stopping_reason}",
             "",
             "Response pattern:",
-            f"  Correct: {np.sum(self.responses == 1)} / {self.n_items_administered}",
+            *_response_summary(
+                self.responses, self.n_items_administered, self.polytomous
+            ),
             f"  Items:   {self.items_administered}",
         ]
         return "\n".join(lines)

@@ -26,14 +26,15 @@ from mirt.models.polytomous import (
 from mirt.utils.extraction import estfun
 
 
+# Two exploratory factors leave one slope coordinate to the rotation.
 @pytest.mark.parametrize(
     ("model", "expected_n_parameters"),
     [
         (OneParameterLogistic(3), 3),
-        (GradedResponseModel(3, [2, 4, 3], n_factors=2), 12),
-        (GeneralizedPartialCredit(3, [2, 4, 3], n_factors=2), 12),
+        (GradedResponseModel(3, [2, 4, 3], n_factors=2), 12 - 1),
+        (GeneralizedPartialCredit(3, [2, 4, 3], n_factors=2), 12 - 1),
         (PartialCreditModel(3, [2, 4, 3]), 6),
-        (NominalResponseModel(3, [2, 4, 3], n_factors=2), 18),
+        (NominalResponseModel(3, [2, 4, 3], n_factors=2), 18 - 1),
     ],
 )
 def test_parameter_count_includes_only_free_values(model, expected_n_parameters):
@@ -157,7 +158,8 @@ def test_estfun_uses_free_nrm_parameter_layout():
 
     scores = estfun(model, responses, theta)
 
-    assert scores.shape == (3, model.n_parameters)
+    n_free = sum(int(mask.sum()) for mask in model.free_parameter_masks.values())
+    assert scores.shape == (3, n_free) == (3, model.n_parameters + 1)
     assert np.all(np.isfinite(scores))
     assert np.any(scores[:2] != 0.0)
     np.testing.assert_allclose(scores[2], 0.0)

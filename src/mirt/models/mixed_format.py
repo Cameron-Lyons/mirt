@@ -23,7 +23,11 @@ from mirt._model_defaults import record_model_base as _record_model_base
 from mirt._model_defaults import uses_original_model_hook
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtModelError, MirtValidationError
-from mirt.models.base import BaseItemModel, PolytomousItemModel
+from mirt.models.base import (
+    BaseItemModel,
+    PolytomousItemModel,
+    validate_category_index,
+)
 
 _SEPARATOR = "."
 # Hooks through which the mixed model defers to its components.
@@ -698,9 +702,8 @@ class MixedItemModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         """Return one category's probability for one item."""
-        n_categories = self._n_categories[self._validate_item_index(item_idx)]
-        if category < 0 or category >= n_categories:
-            raise ValueError(f"Category {category} out of range [0, {n_categories})")
+        item_idx = self._validate_item_index(item_idx)
+        category = validate_category_index(category, self._n_categories[item_idx])
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def probability_pairs(

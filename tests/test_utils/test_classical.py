@@ -7,6 +7,7 @@ import mirt
 import mirt._classical as classical_core
 import mirt.backends.rust.polytomous as polytomous_backend
 import mirt.utils.classical as classical
+from mirt.exceptions import MirtValidationError
 from mirt.utils import ItemStats
 from mirt.utils import itemstats as exported_itemstats
 from mirt.utils.classical import (
@@ -43,6 +44,28 @@ def _alpha_with_missing(responses: np.ndarray) -> float:
     ]
     n_items = responses.shape[1]
     return n_items / (n_items - 1) * (1 - sum(item_variances) / variance)
+
+
+def _complete_case_reference(
+    responses: np.ndarray,
+) -> tuple[float, np.ndarray, float, float]:
+    """R itemstats: listwise alpha, mean and SD; alpha_if_rm on other items."""
+
+    def listwise_alpha(values: np.ndarray) -> float:
+        rows = values[np.all(np.isfinite(values), axis=1)]
+        totals = rows.sum(axis=1)
+        if np.var(totals) == 0.0:
+            return 0.0
+        return _alpha(rows)
+
+    answered = np.any(np.isfinite(responses), axis=0)
+    kept = responses[:, answered]
+    deleted = np.full(responses.shape[1], np.nan)
+    deleted[answered] = [
+        listwise_alpha(np.delete(kept, item, axis=1)) for item in range(kept.shape[1])
+    ]
+    totals = kept[np.all(np.isfinite(kept), axis=1)].sum(axis=1)
+    return listwise_alpha(kept), deleted, totals.mean(), totals.std(ddof=1)
 
 
 def _scalar_item_fit_groups(
@@ -151,9 +174,10 @@ def test_traditional_python_fallback_matches_native(
     responses = np.array(
         [
             [1.0, 0.0, 1.0, 1.0],
-            [0.0, 1.0, -1.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
             [1.0, 1.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0, 1.0],
         ]
     )
     native = traditional(responses).alpha_if_deleted
@@ -176,7 +200,7 @@ def test_alpha_if_deleted_batches_match_scalar_sparse_reference(
     responses[1, 9] = 0.0
     expected = np.array(
         [
-            classical._cronbach_alpha(np.delete(responses, item, axis=1))
+            _alpha_with_missing(np.delete(responses, item, axis=1))
             for item in range(responses.shape[1])
         ]
     )
@@ -188,18 +212,15 @@ def test_alpha_if_deleted_batches_match_scalar_sparse_reference(
 
     actual = classical._alpha_if_deleted_numpy(responses)
 
-    np.testing.assert_allclose(
-        actual,
-        expected,
-        rtol=4 * np.finfo(np.float64).eps,
-        atol=4 * np.finfo(np.float64).eps,
-    )
+    np.testing.assert_allclose(actual, expected, rtol=1e-13, atol=1e-13)
 
 
 @pytest.mark.skipif(not classical.RUST_AVAILABLE, reason="native extension unavailable")
 def test_alpha_if_deleted_native_matches_sparse_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The zero-filled kernels agree; traditional() itself handles missing
+    # responses by complete cases or pairs.
     responses = np.array(
         [
             [1.0, np.nan, np.nan, np.nan],
@@ -209,10 +230,10 @@ def test_alpha_if_deleted_native_matches_sparse_fallback(
             [0.0, 0.0, 1.0, 0.0],
         ]
     )
-    native = traditional(responses).alpha_if_deleted
-    monkeypatch.setattr(classical, "RUST_AVAILABLE", False)
+    monkeypatch.setattr(polytomous_backend, "rust_enabled", lambda: True)
+    native = polytomous_backend.compute_alpha_if_deleted(responses)
 
-    fallback = traditional(responses).alpha_if_deleted
+    fallback = classical_core._alpha_if_deleted_numpy(responses)
 
     np.testing.assert_allclose(
         native,
@@ -309,10 +330,9 @@ def test_traditional_blocks_match_scalar_statistics(
         if values.size > 1 and np.ptp(values) > 0 and np.ptp(item_totals) > 0:
             correlation = np.corrcoef(values, item_totals)[0, 1]
         expected_discrimination.append(correlation)
-    expected_deleted = [
-        _alpha_with_missing(np.delete(responses, item, axis=1))
-        for item in range(responses.shape[1])
-    ]
+    expected_alpha, expected_deleted, expected_mean, expected_sd = (
+        _complete_case_reference(responses)
+    )
     monkeypatch.setattr(classical, "_TRADITIONAL_CHUNK_ELEMENTS", budget)
     original_backend = mirt.get_backend()
     try:
@@ -325,10 +345,14 @@ def test_traditional_blocks_match_scalar_statistics(
     np.testing.assert_allclose(
         result.discrimination, expected_discrimination, atol=1e-14
     )
-    np.testing.assert_allclose(result.alpha_if_deleted, expected_deleted, atol=1e-14)
-    assert result.alpha == pytest.approx(_alpha_with_missing(responses), abs=1e-14)
-    assert result.mean_score == pytest.approx(np.mean(totals[scored]))
-    assert result.sd_score == pytest.approx(np.std(totals[scored], ddof=1))
+    np.testing.assert_allclose(
+        result.alpha_if_deleted, expected_deleted, atol=1e-13, equal_nan=True
+    )
+    assert result.alpha == pytest.approx(expected_alpha, abs=1e-13)
+    assert result.mean_score == pytest.approx(expected_mean)
+    assert result.sd_score == pytest.approx(expected_sd)
+    if not missing:
+        assert result.mean_score == pytest.approx(np.mean(totals[scored]))
     assert result.n_persons == 53
     assert result.n_items == 9
     np.testing.assert_array_equal(responses, before)
@@ -338,7 +362,6 @@ def test_traditional_numpy_reuses_moments_with_bounded_variance_buffers(
     monkeypatch,
 ) -> None:
     responses = np.random.default_rng(96).integers(0, 2, (53, 9)).astype(float)
-    responses[::5, ::2] = np.nan
     original_variance = classical_core._sample_variance
     matrix_sizes = []
 
@@ -364,8 +387,7 @@ def test_traditional_numpy_reuses_moments_with_bounded_variance_buffers(
     assert matrix_sizes
     assert max(matrix_sizes) <= 53 * 2
     expected = [
-        _alpha_with_missing(np.delete(responses, item, axis=1))
-        for item in range(responses.shape[1])
+        _alpha(np.delete(responses, item, axis=1)) for item in range(responses.shape[1])
     ]
     np.testing.assert_allclose(actual.alpha_if_deleted, expected, atol=1e-14)
 
@@ -424,7 +446,6 @@ def test_traditional_validates_correlation_option() -> None:
         (np.empty((0, 2)), "at least one person"),
         ([[1, 0]], "at least two respondents"),
         ([[0], [1]], "at least two items"),
-        ([[0, 2], [1, 0]], "only 0, 1"),
         ([[0, 0.5], [1, 0]], "integer-valued"),
         ([[0, np.inf], [1, 0]], "finite"),
         ([[0, -np.inf], [1, 0]], "finite"),
@@ -439,6 +460,180 @@ def test_traditional_validates_responses(
         traditional(responses)  # type: ignore[arg-type]
 
 
+# Polytomous scores and R mirt 1.48 itemstats(small) / itemstats(small_missing).
+_SMALL_POLYTOMOUS = np.array(
+    [
+        [1, 2, 0, 1],
+        [2, 1, 3, 3],
+        [1, 2, 0, 0],
+        [2, 2, 1, 3],
+        [1, 1, 2, 3],
+        [0, 1, 0, 3],
+        [0, 0, 1, 1],
+        [0, 0, 1, 0],
+        [1, 2, 3, 2],
+        [2, 1, 3, 2],
+        [2, 3, 3, 1],
+        [0, 2, 2, 2],
+        [0, 0, 0, 0],
+        [0, 0, 1, 0],
+        [2, 3, 3, 3],
+        [2, 1, 2, 2],
+    ],
+    dtype=float,
+)
+
+
+def _small_polytomous_with_missing() -> np.ndarray:
+    responses = _SMALL_POLYTOMOUS.copy()
+    responses[[1, 4, 9, 13], [0, 2, 3, 1]] = np.nan
+    responses[6, [0, 3]] = np.nan
+    return responses
+
+
+@pytest.mark.parametrize("backend", ["auto", "numpy"])
+@pytest.mark.parametrize(
+    ("with_missing", "overall", "items"),
+    [
+        (
+            False,
+            (16, 5.5, 3.386247, 0.7935249, 0.7819767, 1.581139),
+            (
+                [1.0, 1.3125, 1.5625, 1.625],
+                [0.8944272, 1.0144785, 1.2093387, 1.2041595],
+                [0.7222222, 0.5295545, 0.6039572, 0.5420949],
+                [0.6788194, 0.7570873, 0.7228440, 0.7575188],
+            ),
+        ),
+        (
+            True,
+            (11, 5.545455, 3.445682, 0.7886875, 0.7738642, 1.638551),
+            (
+                [1.0, 1.4, 1.533333, 1.642857],
+                [0.8770580, 0.9856108, 1.2459458, 1.2774459],
+                [0.6320804, 0.6296587, 0.4815220, 0.4048728],
+                [0.6706231, 0.6896186, 0.6692607, 0.75],
+            ),
+        ),
+    ],
+)
+def test_traditional_matches_r_itemstats_for_polytomous_items(
+    backend: str, with_missing: bool, overall: tuple, items: tuple
+) -> None:
+    responses = _small_polytomous_with_missing() if with_missing else _SMALL_POLYTOMOUS
+    original_backend = mirt.get_backend()
+    try:
+        mirt.set_backend(backend)
+        result = traditional(responses)
+    finally:
+        mirt.set_backend(original_backend)
+
+    n_complete, mean_total, sd_total, std_alpha, alpha, sem_alpha = overall
+    assert result.n_complete == n_complete
+    assert result.mean_score == pytest.approx(mean_total, abs=5e-7)
+    assert result.sd_score == pytest.approx(sd_total, abs=5e-7)
+    assert result.std_alpha == pytest.approx(std_alpha, abs=5e-7)
+    assert result.alpha == pytest.approx(alpha, abs=5e-7)
+    assert result.sem_alpha == pytest.approx(sem_alpha, abs=5e-7)
+    item_mean, item_sd, cor_if_rm, alpha_if_rm = items
+    np.testing.assert_allclose(result.difficulty, item_mean, atol=5e-7)
+    np.testing.assert_allclose(result.item_sd, item_sd, atol=5e-7)
+    np.testing.assert_allclose(result.discrimination, cor_if_rm, atol=5e-7)
+    np.testing.assert_allclose(result.alpha_if_deleted, alpha_if_rm, atol=5e-7)
+
+
+def test_traditional_pairwise_uses_the_pairwise_covariance_matrix() -> None:
+    responses = _small_polytomous_with_missing()
+    observed = np.isfinite(responses)
+    n_items = responses.shape[1]
+    covariance = np.empty((n_items, n_items))
+    for row in range(n_items):
+        for column in range(n_items):
+            both = observed[:, row] & observed[:, column]
+            covariance[row, column] = np.cov(
+                responses[both, row], responses[both, column]
+            )[0, 1]
+
+    def alpha(matrix: np.ndarray) -> float:
+        k = matrix.shape[0]
+        return k / (k - 1) * (1.0 - np.trace(matrix) / matrix.sum())
+
+    result = traditional(responses, missing="pairwise")
+
+    assert result.missing == "pairwise"
+    assert result.alpha == pytest.approx(alpha(covariance))
+    np.testing.assert_allclose(
+        result.alpha_if_deleted,
+        [
+            alpha(np.delete(np.delete(covariance, item, 0), item, 1))
+            for item in range(n_items)
+        ],
+    )
+    assert result.sd_score == pytest.approx(np.sqrt(covariance.sum()))
+    assert result.mean_score == pytest.approx(np.nanmean(responses, axis=0).sum())
+    rest_covariance = covariance.sum(axis=1) - np.diag(covariance)
+    rest_variance = covariance.sum() - 2 * covariance.sum(axis=1) + np.diag(covariance)
+    np.testing.assert_allclose(
+        result.discrimination,
+        rest_covariance / np.sqrt(np.diag(covariance) * rest_variance),
+    )
+
+
+def test_traditional_missing_modes_agree_on_complete_data() -> None:
+    complete = traditional(_SMALL_POLYTOMOUS)
+    pairwise = traditional(_SMALL_POLYTOMOUS, missing="pairwise")
+
+    for name in ("alpha", "std_alpha", "mean_score", "sd_score", "sem_alpha"):
+        assert getattr(pairwise, name) == pytest.approx(getattr(complete, name))
+    np.testing.assert_allclose(pairwise.alpha_if_deleted, complete.alpha_if_deleted)
+    np.testing.assert_allclose(pairwise.discrimination, complete.discrimination)
+
+
+def test_traditional_alpha_is_unbiased_under_random_missingness() -> None:
+    responses = mirt.simdata(model="2PL", n_persons=6000, n_items=12, seed=7)
+    full = traditional(responses).alpha
+    masked = np.random.default_rng(2).random(responses.shape) < 0.1
+    incomplete = np.where(masked, -1, responses)
+
+    # Counting missing responses as zero in the totals gave 0.63 here.
+    assert traditional(incomplete).alpha == pytest.approx(full, abs=0.03)
+    assert traditional(incomplete, missing="pairwise").alpha == pytest.approx(
+        full, abs=0.01
+    )
+
+
+def test_traditional_warns_when_no_respondent_answers_every_item() -> None:
+    # A planned-missing design: each respondent sees two of three items.
+    responses = np.array(
+        [
+            [1, 1, -1],
+            [0, 1, -1],
+            [1, -1, 1],
+            [0, -1, 0],
+            [-1, 1, 1],
+            [-1, 0, 0],
+        ]
+    )
+
+    with pytest.warns(RuntimeWarning, match="missing='pairwise'"):
+        result = traditional(responses)
+
+    assert result.n_complete == 0
+    assert np.isnan(result.alpha)
+    assert np.isfinite(traditional(responses, missing="pairwise").alpha)
+
+
+def test_traditional_validates_missing_policy() -> None:
+    with pytest.raises(MirtValidationError, match="'complete' or 'pairwise'"):
+        traditional([[0, 1], [1, 0]], missing="listwise")  # type: ignore[arg-type]
+
+
+def test_item_fit_chisq_is_deprecated() -> None:
+    with pytest.warns(DeprecationWarning, match='statistics=\\["X2"\\]'):
+        item_fit_chisq([[0, 1], [1, 0]], [[0.5, 0.5], [0.5, 0.5]])
+
+
+@pytest.mark.filterwarnings("ignore:item_fit_chisq is deprecated:DeprecationWarning")
 def test_item_fit_uses_expected_count_variance() -> None:
     responses = np.array(
         [
@@ -525,6 +720,7 @@ def test_item_fit_group_aggregation_matches_scalar_chunks(
         np.testing.assert_allclose(actual_values, reference_values, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.filterwarnings("ignore:item_fit_chisq is deprecated:DeprecationWarning")
 def test_item_fit_batches_group_reductions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -560,6 +756,7 @@ def test_item_fit_batches_group_reductions(
     assert call_count == 4 * n_chunks
 
 
+@pytest.mark.filterwarnings("ignore:item_fit_chisq is deprecated:DeprecationWarning")
 def test_item_fit_excludes_missing_responses() -> None:
     responses = np.array(
         [
@@ -597,6 +794,7 @@ def test_item_fit_excludes_missing_responses() -> None:
     np.testing.assert_allclose(actual[1], reference[1])
 
 
+@pytest.mark.filterwarnings("ignore:item_fit_chisq is deprecated:DeprecationWarning")
 def test_item_fit_ignores_fully_missing_respondents_when_grouping() -> None:
     responses = np.array(
         [
@@ -668,6 +866,7 @@ def test_item_fit_ignores_fully_missing_respondents_when_grouping() -> None:
         ),
     ],
 )
+@pytest.mark.filterwarnings("ignore:item_fit_chisq is deprecated:DeprecationWarning")
 def test_item_fit_validates_arguments(
     responses: object,
     expected: object,

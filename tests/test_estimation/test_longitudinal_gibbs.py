@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 from scipy import stats
+from scipy.special import digamma
 
 import mirt.estimation.dynamic_gibbs as dynamic_gibbs
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._identified_covariance import sample_unit_leading_covariance
 from mirt.estimation.dynamic_gibbs import (
     LongitudinalGibbsSampler,
     LongitudinalPriors,
@@ -311,11 +313,11 @@ def test_theta_sampler_keeps_chain_state_and_targets_conditional_prior() -> None
 
 
 def test_fit_recovers_residual_to_intercept_variance_ratio() -> None:
-    """The latent scale is not identified, so compare a scale-free ratio.
+    """Compare the residual variance with the intercept variance.
 
     The old kernel pinned the residual variance at its 0.01 floor, about a
-    fifth of the generating ratio. Short chains of the fixed kernel land
-    between 0.8 and 1.8 times it across seeds, so the upper bound is loose.
+    fifth of the generating ratio. The intercept variance is now fixed at one,
+    so the ratio is the residual variance on the identified scale.
     """
     n_items = 10
     generator = LongitudinalIRTModel(
@@ -610,3 +612,262 @@ def test_flat_and_tensor_inputs_produce_same_seeded_fit(
             )
             assert actual.shape == expected.shape
             assert_allclose(actual, expected, rtol=tolerance, atol=tolerance)
+
+
+def _growth_data(
+    n_persons: int, seed: int, n_timepoints: int = 4
+) -> tuple[LongitudinalIRTModel, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    n_items = 10
+    generator = LongitudinalIRTModel(
+        n_items=n_items,
+        n_timepoints=n_timepoints,
+        discrimination=rng.uniform(0.8, 2.0, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+        growth_mean=np.array([0.0, 0.4]),
+        growth_cov=np.array([[1.0, 0.1], [0.1, 0.09]]),
+        residual_variance=0.2,
+    )
+    responses, _, growth_factors = generator.simulate(n_persons, seed=seed + 1)
+    return generator, responses, growth_factors
+
+
+def test_fit_identifies_the_latent_scale_and_recovers_parameters() -> None:
+    """Regression: the latent location and scale drifted with chain length.
+
+    growth_cov[0, 0] climbed from 1.06 to 1.91 over 6000 sweeps (truth 1),
+    the residual variance from 0.21 to 0.50 and mean a fell from 1.19 to
+    0.94. The intercept factor is now standard normal in every draw.
+    """
+    generator, responses, _ = _growth_data(300, seed=1)
+
+    result = LongitudinalGibbsSampler(n_iter=400, burnin=200, seed=1).fit(responses)
+
+    model = result.model
+    assert model.growth_mean[0] == 0.0
+    assert model.growth_cov[0, 0] == 1.0
+    ratio = model.discrimination.mean() / generator.discrimination.mean()
+    assert 0.8 < ratio < 1.2
+    assert abs(np.mean(model.difficulty - generator.difficulty)) < 0.2
+    assert abs(model.growth_mean[1] - 0.4) < 0.15
+    assert 0.1 < model.residual_variance < 0.4
+    n_params = 2 * 10 + 1 + 3
+    assert result.aic == pytest.approx(-2.0 * result.log_likelihood + 2 * n_params)
+
+
+def test_quadratic_fit_is_not_worse_than_the_nested_linear_fit() -> None:
+    """Regression: the quadratic chain drifted to a 4x latent scale.
+
+    Its plug-in log-likelihood was about 1700 below the nested linear fit on
+    these data, so AIC and BIC comparisons were meaningless.
+    """
+    rng = np.random.default_rng(0)
+    n_items = 8
+    generator = LongitudinalIRTModel(
+        n_items=n_items,
+        n_timepoints=5,
+        discrimination=rng.uniform(0.8, 2.0, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+        growth_mean=np.array([0.0, 0.3]),
+        growth_cov=np.array([[1.0, 0.0], [0.0, 0.05]]),
+        residual_variance=0.2,
+    )
+    responses, _, _ = generator.simulate(200, seed=2)
+    sampler = LongitudinalGibbsSampler(n_iter=300, burnin=150, seed=0)
+
+    linear = sampler.fit(responses)
+    quadratic = sampler.fit(responses, growth_model="quadratic")
+
+    assert quadratic.model.growth_mean[0] == 0.0
+    assert quadratic.model.growth_cov[0, 0] == 1.0
+    assert quadratic.log_likelihood > linear.log_likelihood - 50.0
+
+
+def _prior_state(
+    sampler: LongitudinalGibbsSampler,
+    n_persons: int,
+    time_values: np.ndarray,
+    growth_model: str,
+    rng: np.random.Generator,
+) -> tuple[LongitudinalIRTModel, np.ndarray, np.ndarray]:
+    """Draw every latent and item quantity from the identified prior."""
+    priors = sampler.priors
+    model = LongitudinalIRTModel(
+        n_items=3,
+        n_timepoints=time_values.size,
+        growth_model=growth_model,
+    )
+    n_growth = model.n_growth_factors
+    prior_mean, prior_precision = sampler._growth_mean_prior(n_growth)
+    slope_precision = prior_precision[1:, 1:]
+    slope_mean = prior_mean[1:] + np.linalg.solve(
+        slope_precision, prior_precision[1:, 0] * prior_mean[0]
+    )
+    model.growth_mean = np.concatenate(
+        ([0.0], rng.multivariate_normal(slope_mean, np.linalg.inv(slope_precision)))
+    )
+    model.growth_cov = sample_unit_leading_covariance(
+        np.empty((0, n_growth)),
+        priors.growth_cov_prior_df,
+        sampler._growth_cov_prior_scale(n_growth),
+        rng,
+    )
+    model.residual_variance = float(
+        stats.invgamma.rvs(
+            priors.residual_var_prior_shape,
+            scale=priors.residual_var_prior_rate,
+            random_state=rng,
+        )
+    )
+    model.discrimination = np.exp(
+        np.log(priors.discrimination_mean)
+        + np.sqrt(priors.discrimination_var) * rng.standard_normal(3)
+    )
+    model.difficulty = priors.difficulty_mean + np.sqrt(
+        priors.difficulty_var
+    ) * rng.standard_normal(3)
+    growth_factors = rng.multivariate_normal(
+        model.growth_mean, model.growth_cov, size=n_persons
+    )
+    theta = model.compute_theta(growth_factors, time_values) + np.sqrt(
+        model.residual_variance
+    ) * rng.standard_normal((n_persons, time_values.size))
+    return model, growth_factors, theta
+
+
+@pytest.mark.parametrize("growth_model", ["linear", "quadratic"])
+def test_location_scale_moves_preserve_the_prior(growth_model: str) -> None:
+    """Without responses the joint prior is the target, so the moves keep it.
+
+    States drawn exactly from the prior must keep their distribution after
+    repeated location and scale moves. Dropping any Jacobian term shifts the
+    log discrimination, residual-variance or slope-variance moments by 0.1
+    to 0.2.
+    """
+    n_growth = 2 if growth_model == "linear" else 3
+    priors = LongitudinalPriors(
+        discrimination_var=0.5,
+        growth_mean_prior_cov=np.eye(n_growth),
+    )
+    sampler = LongitudinalGibbsSampler(n_iter=2, burnin=1, priors=priors)
+    rng = np.random.default_rng(1)
+    time_values = np.array([0.0, 1.0, 2.0])
+    log_discrimination, difficulty, log_residual, log_slope_residual = [], [], [], []
+    intercepts = []
+    for _ in range(1500):
+        model, growth_factors, theta = _prior_state(
+            sampler, 4, time_values, growth_model, rng
+        )
+        for _ in range(8):
+            theta, growth_factors = sampler._sample_location_scale(
+                theta, growth_factors, model, rng
+            )
+        log_discrimination.append(np.log(model.discrimination[0]))
+        difficulty.append(model.difficulty[0])
+        log_residual.append(np.log(model.residual_variance))
+        log_slope_residual.append(
+            np.log(model.growth_cov[1, 1] - model.growth_cov[0, 1] ** 2)
+        )
+        intercepts.append(growth_factors[0, 0])
+        assert model.growth_mean[0] == 0.0
+        assert model.growth_cov[0, 0] == 1.0
+
+    # log of an inverse-gamma(k, s) draw has mean log(s) - digamma(k).
+    residual_mean = np.log(priors.residual_var_prior_rate) - digamma(
+        priors.residual_var_prior_shape
+    )
+    slope_shape = priors.growth_cov_prior_df / 2.0
+    assert abs(np.mean(log_discrimination)) < 0.06
+    assert abs(np.std(log_discrimination) - np.sqrt(0.5)) < 0.05
+    assert abs(np.mean(difficulty)) < 0.16
+    assert abs(np.mean(log_residual) - residual_mean) < 0.07
+    if growth_model == "linear":
+        slope_mean = np.log(0.5) - digamma(slope_shape)
+        assert abs(np.mean(log_slope_residual) - slope_mean) < 0.07
+    assert abs(np.mean(intercepts)) < 0.08
+    assert abs(np.var(intercepts) - 1.0) < 0.1
+
+
+def test_item_step_row_likelihoods_are_reused_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The theta step reuses the item step's current-state likelihoods."""
+    _, responses, growth_factors = _growth_data(40, seed=3)
+    model = LongitudinalIRTModel(n_items=10, n_timepoints=4)
+    theta = model.compute_theta(growth_factors)
+    sampler = LongitudinalGibbsSampler(n_iter=2, burnin=1)
+
+    rows = sampler._sample_item_params(
+        responses, theta, model, np.random.default_rng(0)
+    )
+
+    assert rows is not None
+    assert_array_equal(
+        rows,
+        dynamic_gibbs._longitudinal_log_likelihood_rows(
+            responses.reshape(-1, 10), theta.reshape(-1), model
+        ),
+    )
+
+    def fit() -> Any:
+        return LongitudinalGibbsSampler(n_iter=30, burnin=10, seed=4).fit(responses)
+
+    reused = fit()
+    monkeypatch.setattr(dynamic_gibbs, "_LONGITUDINAL_REUSE_MAX_VALUES", 0)
+    assert (
+        sampler._sample_item_params(responses, theta, model, np.random.default_rng(0))
+        is None
+    )
+    recomputed = fit()
+    assert_array_equal(reused.growth_factors, recomputed.growth_factors)
+    assert_array_equal(reused.model.discrimination, recomputed.model.discrimination)
+
+
+def test_logit_likelihood_is_exact_in_the_tails() -> None:
+    """The fused form needs no probability clipping, even far in the tails."""
+    logits = np.array([[-60.0, -5.0, 0.0, 5.0, 60.0]] * 3)
+    responses = np.array(
+        [[1, 1, 1, 1, 1], [0, 0, 0, 0, 0], [-1, -1, -1, -1, -1]], dtype=np.int_
+    )
+
+    cells = dynamic_gibbs._binary_log_likelihood_cells(logits.copy(), responses)
+
+    assert_allclose(cells[0], -np.logaddexp(0.0, -logits[0]), rtol=1e-14)
+    assert_allclose(cells[1], -np.logaddexp(0.0, logits[1]), rtol=1e-14)
+    assert_array_equal(cells[2], 0.0)
+    assert cells[0, 0] == pytest.approx(-60.0)
+
+
+@pytest.mark.slow
+def test_long_chains_are_stationary_and_agree_across_seeds() -> None:
+    """Block means stay put and independent seeds agree (MA-16 trace)."""
+    generator, responses, _ = _growth_data(500, seed=0)
+    traces = []
+
+    for seed in (0, 1):
+        trace: list[tuple[float, float, float]] = []
+        sampler = LongitudinalGibbsSampler(n_iter=3000, burnin=500, seed=seed)
+        original = sampler._sample_residual_variance
+
+        def recording(*args: Any, original: Any = original, trace: Any = trace):
+            original(*args)
+            model = args[2]
+            trace.append(
+                (
+                    model.residual_variance,
+                    model.growth_cov[1, 1],
+                    float(np.mean(model.discrimination)),
+                )
+            )
+
+        sampler._sample_residual_variance = recording  # type: ignore[method-assign]
+        sampler.fit(responses)
+        traces.append(np.asarray(trace)[500:])
+
+    for trace in traces:
+        blocks = trace.reshape(5, -1, 3).mean(axis=1)
+        assert np.ptp(blocks[:, 0]) < 0.1
+        assert np.ptp(blocks[:, 2]) < 0.15
+    first, second = (trace.mean(axis=0) for trace in traces)
+    assert_allclose(first, second, rtol=0.15)
+    assert 0.8 < first[2] / generator.discrimination.mean() < 1.1

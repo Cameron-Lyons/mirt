@@ -197,14 +197,16 @@ one call:
    print(posterior.shape)  # (2, 6, 2)
 
 ``skill_assignments`` may also be a matrix matching the response matrix when
-learners receive different trial layouts. Person-specific layouts are filtered
-and smoothed for all learners together in one vectorized pass that tracks each
-learner's per-skill chains, so the cost does not depend on how many distinct
-layouts appear. Shared layouts, including a matrix whose rows are identical,
-use the compiled parallel implementation when it is available, as do
-person-specific layouts repeated across many learners; the NumPy fallback
-also processes all learners at once. BKT Gibbs sampling also filters all
-learners together for hidden-state draws. Set ``use_rust=False`` on
+learners receive different trial layouts. Shared layouts, including a matrix
+whose rows are identical, use the compiled parallel implementation when it is
+available, as do person-specific layouts repeated across many learners. The
+remaining learners get one compiled call per distinct layout when that is
+cheaper, as it is for a few learners or long sequences. Otherwise, and on the
+NumPy fallback, they are filtered and smoothed together in one vectorized pass
+that tracks each learner's per-skill chains; its cost grows with the number of
+trials rather than with the number of distinct layouts. BKT Gibbs sampling
+also filters all learners together for hidden-state draws. Set
+``use_rust=False`` on
 ``BKTModel``, ``BKTGibbsSampler``, or ``fit_bkt_em`` to select the NumPy
 implementation for a specific workflow;
 the global ``mirt.set_backend("numpy")`` preference is also honored.
@@ -414,6 +416,48 @@ predicted state without an observation update. ``observation_noise`` adds
 response-scale variance to the linearized filter, reducing the information
 assigned to each response. It does not change draws from ``simulate``.
 
+Longitudinal growth IRT
+-----------------------
+
+``LongitudinalGibbsSampler`` fits a 2PL measured at several occasions, with
+each person's ability following a linear or quadratic growth curve plus an
+occasion residual:
+
+.. code-block:: python
+
+   import numpy as np
+   from mirt.estimation.dynamic_gibbs import LongitudinalGibbsSampler
+   from mirt.models.dynamic import LongitudinalIRTModel
+
+   generator = LongitudinalIRTModel(
+       n_items=10,
+       n_timepoints=4,
+       growth_mean=np.array([0.0, 0.4]),
+       growth_cov=np.array([[1.0, 0.1], [0.1, 0.09]]),
+       residual_variance=0.2,
+   )
+   responses, theta, growth_factors = generator.simulate(500, seed=1)
+
+   result = LongitudinalGibbsSampler(n_iter=2_000, burnin=500, seed=0).fit(
+       responses, growth_model="linear"
+   )
+   print(result.model.growth_mean, result.model.growth_cov)
+
+The 2PL likelihood does not change when every ability is shifted and
+rescaled with the items, so the sampler fixes the latent scale by making the
+intercept growth factor standard normal: ``growth_mean[0]`` is 0 and
+``growth_cov[0, 0]`` is 1 in every draw. The intercept is the trait at time
+zero net of the occasion residual. With the default ``time_values``
+(``0, 1, 2, ...``) this standardizes the first occasion. Item parameters,
+slope means and covariances, and the residual variance are all reported on
+that scale. AIC and BIC count only the free parameters.
+
+Each sweep also shifts and rescales the whole latent state together, a move
+that leaves the likelihood unchanged, so the chain explores the location and
+scale quickly. The chain starts from standardized empirical log-odds
+trajectories rather than a random draw. Response log-likelihoods are
+evaluated from the logits, which is exact in both tails.
+
 Growth-mixture fitting
 ----------------------
 
@@ -437,6 +481,27 @@ convergence diagnostics:
 
 ``fit_em`` remains available when a mapping is preferred. ``fit`` uses the same
 estimation path and packages its final state into ``GrowthMixtureResult``.
+
+Besides the class proportions and trajectories, fitting estimates the random
+intercept variance ``intercept_var``, random slope variance ``slope_var`` and
+residual variance ``residual_variance``, which all classes share. The
+constructor values are starting values. Each EM iteration updates the
+trajectories by generalized least squares, then runs a second E-step that
+treats the random effects as missing data to update the variances. AIC and BIC
+count the estimated variances, so they can compare models with different
+numbers of classes. A random-effect variance set to zero restricts the model
+and stays at zero. Pass ``estimate_variances=False`` to the constructor to keep
+all three variances fixed, as earlier releases did:
+
+.. code-block:: python
+
+   candidates = {
+       k: GrowthMixtureModel(n_classes=k).fit(trajectories, time_values)
+       for k in (1, 2, 3, 4)
+   }
+   best = min(candidates, key=lambda k: candidates[k].bic)
+   fitted = candidates[best].model
+   print(best, fitted.intercept_var, fitted.slope_var, fitted.residual_variance)
 
 Incomplete trajectories
 -----------------------

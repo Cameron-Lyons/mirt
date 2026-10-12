@@ -39,8 +39,6 @@ _CI_METHODS = ("percentile", "BCa", "basic")
 _STATISTICS = ("parameters", "theta")
 _TaskInput = TypeVar("_TaskInput")
 _TaskResult = TypeVar("_TaskResult")
-# Bootstrap-based diagnostics resolve their worker counts through this name.
-_validate_n_jobs = resolve_n_jobs
 # Convergence tolerance of parameter bootstrap replicates.
 _REPLICATE_TOL = 1e-3
 
@@ -91,14 +89,28 @@ def _refit_source(
 
 
 def _uses_default_estimator(recipe: RefitRecipe | None) -> bool:
-    """Whether refits estimate what the native 2PL bootstrap estimates."""
-    from mirt.estimation.em import EMEstimator
+    """Whether refits estimate what the native 2PL bootstrap estimates.
 
-    return recipe is None or (
+    The native kernel runs plain EM on the fit's grid. On EM's default
+    rectangular grid the refits take parameter-expansion steps and are as
+    fast, so only Gauss-Hermite fits, which EM fits by plain EM, use it.
+    """
+    from mirt.estimation.em import EMEstimator
+    from mirt.estimation.quadrature import resolve_quadpts, resolve_quadrature_rule
+
+    if recipe is None:
+        return True
+    options = recipe.options
+    return (
         recipe.estimator is EMEstimator
         and recipe.latent_density is None
-        and recipe.options.get("item_priors") is None
-        and not recipe.options.get("constraints")
+        and options.get("item_priors") is None
+        and not options.get("constraints")
+        and resolve_quadrature_rule(
+            options.get("quadrature", "auto"),
+            resolve_quadpts(options.get("n_quadpts"), 1),
+        )
+        == "gauss-hermite"
     )
 
 
@@ -286,6 +298,24 @@ class _ParametricFitTask:
     recipe: RefitRecipe | None = None
     latent_mean: NDArray[np.float64] | None = None
     latent_cholesky: NDArray[np.float64] | None = None
+    missing: NDArray[np.bool_] | None = None
+
+
+def _validated_model_responses(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+) -> NDArray[np.int_]:
+    """Validate responses and their category codes against ``model``.
+
+    Replicates resample these responses, so codes the model cannot score,
+    such as a 2 for a dichotomous item, are rejected up front as the
+    estimators reject them.
+    """
+    from mirt.estimation.base import _validate_response_categories
+
+    validated = validate_responses(responses, n_items=model.n_items)
+    _validate_response_categories(model, validated)
+    return validated
 
 
 def _validate_resample_count(n_bootstrap: int) -> None:
@@ -634,6 +664,8 @@ def _fit_parametric_replicate(
         task.latent_cholesky,
     )
     sim_data = draw_item_responses(task.model, theta, replicate_rng)
+    if task.missing is not None:
+        sim_data[task.missing] = -1
     boot_model = _prepare_bootstrap_model(
         task.model,
         task.original_params,
@@ -681,6 +713,8 @@ def _native_2pl_bootstrap_samples(
     """
     from mirt.backends.rust._helpers import rust_enabled
     from mirt.backends.rust.estimation import bootstrap_fit_2pl
+    from mirt.estimation.base import _parameter_bounds
+    from mirt.estimation.quadrature import build_quadrature, resolve_quadpts
     from mirt.models.dichotomous import TwoParameterLogistic
 
     if (
@@ -699,15 +733,27 @@ def _native_2pl_bootstrap_samples(
     initial_difficulty = parameters["difficulty"] if warm_start else None
     rng = np.random.default_rng(seed)
     native_seed = int(rng.integers(0, 2**31))
+    # Replicates integrate on the fit's grid and keep EM's parameter boxes.
+    if recipe is None:
+        grid = build_quadrature(21, 1, "gauss-hermite")
+    else:
+        grid = build_quadrature(
+            resolve_quadpts(recipe.options.get("n_quadpts"), 1),
+            1,
+            recipe.options.get("quadrature", "auto"),
+        )
     discrimination, difficulty = bootstrap_fit_2pl(
         responses,
         n_bootstrap=n_bootstrap,
-        n_quadpts=21 if recipe is None else recipe.options.get("n_quadpts", 21),
         max_iter=100 if warm_start else 200,
         tol=1e-3,
         seed=native_seed,
         initial_discrimination=initial_discrimination,
         initial_difficulty=initial_difficulty,
+        quad_points=grid.nodes.ravel(),
+        quad_weights=grid.weights,
+        disc_bounds=_parameter_bounds(model, "discrimination"),
+        diff_bounds=_parameter_bounds(model, "difficulty"),
     )
 
     expected_shape = (n_bootstrap, model.n_items)
@@ -785,8 +831,9 @@ def bootstrap_se(
     with each replicate's estimated latent population.
 
     Parameter bootstraps for unidimensional 2PL models fitted by plain
-    marginal maximum likelihood use the native parallel implementation when
-    that backend is enabled. Other models and statistics retain the general
+    marginal maximum likelihood on a Gauss-Hermite grid use the native
+    parallel implementation, on the fit's grid and parameter boxes, when that
+    backend is enabled. Other models and statistics retain the general
     Python implementation. Parallel custom models and statistic callables
     must be picklable; define them at module scope. Seeded results are
     deterministic and retain input order across worker counts.
@@ -797,7 +844,7 @@ def bootstrap_se(
     _validate_statistic(statistic)
     n_jobs = resolve_n_jobs(n_jobs)
 
-    responses = validate_responses(responses, n_items=model.n_items)
+    responses = _validated_model_responses(model, responses)
     if statistic == "parameters":
         native_samples = _native_2pl_bootstrap_samples(
             model, responses, n_bootstrap, seed, warm_start, recipe
@@ -917,8 +964,9 @@ def bootstrap_ci(
     priors, latent density, equality constraints and quadrature of the
     original fit (see :func:`bootstrap_se`), and skip standard errors.
     Parameter bootstraps for unidimensional 2PL models fitted by plain
-    marginal maximum likelihood use the native parallel implementation when
-    that backend is enabled. Other models and statistics retain the general
+    marginal maximum likelihood on a Gauss-Hermite grid use the native
+    parallel implementation, on the fit's grid and parameter boxes, when that
+    backend is enabled. Other models and statistics retain the general
     Python implementation. Parallel custom models and statistic callables
     must be picklable; define them at module scope. Seeded results are
     deterministic and retain input order across worker counts.
@@ -937,7 +985,7 @@ def bootstrap_ci(
     n_jobs = resolve_n_jobs(n_jobs)
 
     rng = np.random.default_rng(seed)
-    responses = validate_responses(responses, n_items=original_model.n_items)
+    responses = _validated_model_responses(original_model, responses)
     n_persons = responses.shape[0]
     if method == "BCa" and n_persons < 2:
         raise MirtValidationError("BCa intervals require at least two people")
@@ -1108,10 +1156,15 @@ def parametric_bootstrap(
     verbose: bool = False,
     warm_start: bool = True,
     n_jobs: int = 1,
+    *,
+    responses: NDArray[np.int_] | None = None,
 ) -> dict[str, NDArray[np.float64]]:
     """Parametric bootstrap using model to generate data.
 
-    Instead of resampling observed data, generates new data from the fitted model.
+    Instead of resampling observed data, generates new data from the fitted
+    model. Bootstrap standard errors describe the design that replicates
+    simulate, so by default they have the fitted sample size and, given
+    ``responses``, its missing-data pattern.
 
     Parameters
     ----------
@@ -1122,7 +1175,10 @@ def parametric_bootstrap(
     n_bootstrap : int
         Number of bootstrap samples
     n_persons : int, optional
-        Number of persons to simulate (default: 500)
+        Number of persons to simulate. Defaults to the rows of
+        ``responses``, otherwise to the ``n_observations`` of a
+        ``FitResult``. A bare model, or a result without a recorded sample
+        size, simulates 500 persons with a warning.
     seed : int, optional
         Random seed
     verbose : bool
@@ -1136,6 +1192,11 @@ def parametric_bootstrap(
         Number of process workers. Use ``-1`` for all available CPU cores. The
         default ``1`` preserves serial execution and is preferable for small
         fits. Custom models must be picklable when using multiple workers.
+    responses : ndarray of shape (n_persons, n_items), optional
+        Observed responses of the fit. Their missing-data pattern (negative
+        codes) is applied to every replicate, as in :func:`bootstrap_lr`.
+        Without it, replicates are complete, which understates the standard
+        errors of a fit to incomplete data.
 
     Returns
     -------
@@ -1150,14 +1211,15 @@ def parametric_bootstrap(
     simulations are deterministic and retain replicate order across worker
     counts.
     """
+    from mirt.results.fit_result import FitResult
+
+    n_observations = model.n_observations if isinstance(model, FitResult) else 0
     latent_mean, latent_cholesky = _population_factors(model)
     model, recipe = _refit_source(model)
 
     _validate_resample_count(n_bootstrap)
     n_jobs = resolve_n_jobs(n_jobs)
-    if n_persons is None:
-        n_persons = 500
-    if (
+    if n_persons is not None and (
         not isinstance(n_persons, (int, np.integer))
         or isinstance(n_persons, (bool, np.bool_))
         or n_persons < 1
@@ -1167,6 +1229,32 @@ def parametric_bootstrap(
             parameter="n_persons",
             value=n_persons,
         )
+    missing: NDArray[np.bool_] | None = None
+    if responses is not None:
+        observed = validate_responses(responses, n_items=model.n_items)
+        if n_persons is not None and n_persons != observed.shape[0]:
+            raise MirtValidationError(
+                "n_persons must equal the number of response rows",
+                parameter="n_persons",
+                value=n_persons,
+                expected=str(observed.shape[0]),
+            )
+        n_persons = observed.shape[0]
+        missing = observed < 0
+        if not np.any(missing):
+            missing = None
+    if n_persons is None:
+        if n_observations > 0:
+            n_persons = n_observations
+        else:
+            warnings.warn(
+                "parametric_bootstrap() of a model without a recorded sample "
+                "size simulates 500 persons; standard errors scale with the "
+                "sample size, so pass n_persons or responses",
+                UserWarning,
+                stacklevel=2,
+            )
+            n_persons = 500
 
     rng = np.random.default_rng(seed)
     boot_estimates: dict[str, list[NDArray]] = {}
@@ -1184,6 +1272,7 @@ def parametric_bootstrap(
         recipe=recipe,
         latent_mean=latent_mean,
         latent_cholesky=latent_cholesky,
+        missing=missing,
     )
     if n_jobs == 1:
         replicate_results = [
@@ -1488,7 +1577,8 @@ def bootstrap_lr(
             value=full_count,
             expected=f"> {reduced_count}",
         )
-    responses = validate_responses(responses, n_items=reduced_model.n_items)
+    responses = _validated_model_responses(reduced_model, responses)
+    _validated_model_responses(full_model, responses)
     estimator_options: dict[str, Any] = {
         "n_quadpts": n_quadpts,
         "max_iter": max_iter,

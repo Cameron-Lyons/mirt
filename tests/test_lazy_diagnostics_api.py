@@ -6,8 +6,12 @@ import importlib
 
 
 def _reload_diagnostics_module():
-    diagnostics_module = importlib.import_module("mirt.diagnostics")
-    return importlib.reload(diagnostics_module)
+    diagnostics_module = importlib.reload(importlib.import_module("mirt.diagnostics"))
+    # A reload re-executes the module in its existing namespace, so drop the
+    # symbols that earlier imports resolved and cached there.
+    for name in diagnostics_module._LAZY_IMPORTS:
+        diagnostics_module.__dict__.pop(name, None)
+    return diagnostics_module
 
 
 def test_lazy_diagnostics_symbol_resolution() -> None:

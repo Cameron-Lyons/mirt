@@ -1,8 +1,9 @@
 //! Core utility functions for IRT computations.
 
+use numpy::ndarray::ArrayView2;
+use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use rand::{Rng, RngExt};
-
-use crate::special::erfc;
 
 pub(crate) const LOG_2_PI: f64 = 1.8378770664093453;
 pub(crate) const EPSILON: f64 = 1e-10;
@@ -90,34 +91,6 @@ pub(crate) fn log_sigmoid(x: f64) -> f64 {
     }
 }
 
-/// Return the standard normal survival probability without tail cancellation.
-#[inline]
-pub(crate) fn normal_sf(x: f64) -> f64 {
-    0.5 * erfc(x / std::f64::consts::SQRT_2)
-}
-
-#[inline]
-pub(crate) fn log_likelihood_2pl_single(
-    responses: &[i32],
-    theta: f64,
-    discrimination: &[f64],
-    difficulty: &[f64],
-) -> f64 {
-    let mut ll = 0.0;
-    for (j, &resp) in responses.iter().enumerate() {
-        if resp < 0 {
-            continue;
-        }
-        let z = discrimination[j] * (theta - difficulty[j]);
-        if resp == 1 {
-            ll += log_sigmoid(z);
-        } else {
-            ll += log_sigmoid(-z);
-        }
-    }
-    ll
-}
-
 /// Normalize log posterior values and return probabilities
 #[inline]
 pub(crate) fn normalize_log_posterior(log_posterior: &[f64]) -> Vec<f64> {
@@ -189,21 +162,11 @@ pub(crate) fn normalized_log_gaussian_adjustment(
         .collect()
 }
 
-/// Compute Fisher information for each item at a single theta
+/// Floor a probability at `EPSILON`, keeping NaN: `f64::max` would turn the
+/// NaN of a non-finite parameter into a valid-looking `EPSILON`.
 #[inline]
-pub(crate) fn fisher_info_2pl_items(
-    theta: f64,
-    discrimination: &[f64],
-    difficulty: &[f64],
-) -> Vec<f64> {
-    discrimination
-        .iter()
-        .zip(difficulty.iter())
-        .map(|(a, b)| {
-            let p = sigmoid(a * (theta - b));
-            a * a * p * (1.0 - p)
-        })
-        .collect()
+pub(crate) fn floor_probability(p: f64) -> f64 {
+    if p.is_nan() { p } else { p.max(EPSILON) }
 }
 
 #[inline]
@@ -217,77 +180,89 @@ pub(crate) fn grm_category_probability(
     if category == 0 {
         let z = discrimination * (theta - thresholds[0]);
         let p_above = sigmoid(z);
-        (1.0 - p_above).max(EPSILON)
+        floor_probability(1.0 - p_above)
     } else if category == n_categories - 1 {
         let z = discrimination * (theta - thresholds[category - 1]);
         let p_above = sigmoid(z);
-        p_above.max(EPSILON)
+        floor_probability(p_above)
     } else {
         let z_upper = discrimination * (theta - thresholds[category - 1]);
         let z_lower = discrimination * (theta - thresholds[category]);
         let p_upper = sigmoid(z_upper);
         let p_lower = sigmoid(z_lower);
-        (p_upper - p_lower).max(EPSILON)
+        floor_probability(p_upper - p_lower)
     }
 }
 
-/// Gauss-Hermite quadrature nodes and weights
-pub(crate) fn gauss_hermite_quadrature(n: usize) -> (Vec<f64>, Vec<f64>) {
-    assert!(n > 0, "quadrature requires at least one point");
-    if n == 1 {
-        return (vec![0.0], vec![1.0]);
+/// SplitMix64 finalizer (Steele, Lea and Flood, 2014): a bijective 64-bit mix.
+#[inline]
+pub(crate) fn splitmix64(value: u64) -> u64 {
+    let mut z = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Seed of the random stream that `keys` (such as a task's indices) select
+/// under `base`. Mixing every key keeps the streams of neighbouring bases and
+/// indices unrelated, unlike `base + index`, under which seed `s + 1` replays
+/// the streams of seed `s` shifted by one task.
+pub(crate) fn stream_seed(base: u64, keys: &[u64]) -> u64 {
+    // XOR-ing two hashes would be symmetric in `base` and a key.
+    keys.iter()
+        .fold(splitmix64(base), |state, &key| splitmix64(state ^ key))
+}
+
+/// Reject observed binary responses other than 0 and 1; negative codes are
+/// missing.
+pub(crate) fn check_binary_responses(responses: ArrayView2<'_, i32>) -> PyResult<()> {
+    if responses.iter().any(|&response| response > 1) {
+        return Err(PyValueError::new_err(
+            "observed responses must contain only 0 or 1",
+        ));
     }
+    Ok(())
+}
 
-    let n_symmetric = n.div_ceil(2);
-    let mut nodes = vec![0.0; n];
-    let mut weights = vec![0.0; n];
-    let mut positive_roots = Vec::with_capacity(n_symmetric);
-    let mut root = 0.0;
-
-    for index in 0..n_symmetric {
-        root = match index {
-            0 => {
-                let order = 2.0 * n as f64 + 1.0;
-                order.sqrt() - 1.85575 * order.powf(-1.0 / 6.0)
-            }
-            1 => root - 1.14 * (n as f64).powf(0.426) / root,
-            2 => 1.86 * root - 0.86 * positive_roots[0],
-            3 => 1.91 * root - 0.91 * positive_roots[1],
-            _ => 2.0 * root - positive_roots[index - 2],
-        };
-
-        let mut derivative = 0.0;
-        for _ in 0..50 {
-            let mut polynomial = std::f64::consts::PI.powf(-0.25);
-            let mut previous = 0.0;
-            for degree in 1..=n {
-                let older = previous;
-                previous = polynomial;
-                polynomial = root * (2.0 / degree as f64).sqrt() * previous
-                    - ((degree - 1) as f64 / degree as f64).sqrt() * older;
-            }
-            derivative = (2.0 * n as f64).sqrt() * previous;
-            let old_root = root;
-            root -= polynomial / derivative;
-            if (root - old_root).abs() < 1e-14 {
-                break;
-            }
-        }
-
-        positive_roots.push(root);
-        let symmetric = n - 1 - index;
-        nodes[index] = -std::f64::consts::SQRT_2 * root;
-        nodes[symmetric] = std::f64::consts::SQRT_2 * root;
-        let weight = 2.0 / (derivative * derivative * std::f64::consts::PI.sqrt());
-        weights[index] = weight;
-        weights[symmetric] = weight;
+/// Check a quadrature rule: matching non-empty lengths, finite points and
+/// non-negative finite weights with a positive total.
+pub(crate) fn check_quadrature(points: &[f64], weights: &[f64]) -> PyResult<()> {
+    if points.is_empty() {
+        return Err(PyValueError::new_err(
+            "quad_points must be a non-empty one-dimensional array",
+        ));
     }
-
-    let total: f64 = weights.iter().sum();
-    for weight in &mut weights {
-        *weight /= total;
+    if weights.len() != points.len() {
+        return Err(PyValueError::new_err(format!(
+            "quad_weights must have shape ({},), got ({},)",
+            points.len(),
+            weights.len()
+        )));
     }
-    (nodes, weights)
+    if !points.iter().all(|value| value.is_finite()) {
+        return Err(PyValueError::new_err("quad_points must be finite"));
+    }
+    if !weights
+        .iter()
+        .all(|&value| value.is_finite() && value >= 0.0)
+        || weights.iter().sum::<f64>() <= 0.0
+    {
+        return Err(PyValueError::new_err(
+            "quad_weights must be finite and non-negative with a positive sum",
+        ));
+    }
+    Ok(())
+}
+
+/// Check that a `(lower, upper)` box is ordered; `f64::clamp` panics on NaN
+/// or inverted bounds.
+pub(crate) fn check_bounds(name: &str, (lower, upper): (f64, f64)) -> PyResult<()> {
+    if lower.is_nan() || upper.is_nan() || lower > upper {
+        return Err(PyValueError::new_err(format!(
+            "{name} must satisfy lower <= upper"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -340,60 +315,26 @@ mod tests {
     }
 
     #[test]
-    fn gauss_hermite_quadrature_has_standard_normal_moments() {
-        for order in [9, 15, 21, 31] {
-            let (nodes, weights) = gauss_hermite_quadrature(order);
-            let mean: f64 = nodes
-                .iter()
-                .zip(weights.iter())
-                .map(|(node, weight)| node * weight)
-                .sum();
-            let variance: f64 = nodes
-                .iter()
-                .zip(weights.iter())
-                .map(|(node, weight)| node * node * weight)
-                .sum();
-            assert!((weights.iter().sum::<f64>() - 1.0).abs() < 1e-14);
-            assert!(mean.abs() < 1e-14);
-            assert!((variance - 1.0).abs() < 1e-13);
-        }
+    fn probability_floor_keeps_nan() {
+        assert!(floor_probability(f64::NAN).is_nan());
+        assert_eq!(floor_probability(0.0), EPSILON);
+        assert_eq!(floor_probability(0.25), 0.25);
+        assert!(grm_category_probability(0.0, f64::NAN, &[0.0], 1, 2).is_nan());
+        assert!(grm_category_probability(0.0, 1.0, &[f64::NAN, 1.0], 1, 3).is_nan());
     }
 
     #[test]
-    fn normal_sf_matches_reference_values() {
-        let cases = [
-            (-8.0, 0.999_999_999_999_999_3),
-            (-3.0, 0.998_650_101_968_369_9),
-            (-1.0, 0.841_344_746_068_542_9),
-            (0.0, 0.5),
-            (1.0, 0.158_655_253_931_457_07),
-            (3.0, 0.001_349_898_031_630_094_5),
-            (8.0, 6.220_960_574_271_74e-16),
-        ];
-
-        for (value, expected_sf) in cases {
-            let sf_error = (normal_sf(value) - expected_sf).abs();
-            assert!(
-                sf_error <= 64.0 * f64::EPSILON * expected_sf,
-                "normal_sf({value}) was {}, expected {expected_sf}",
-                normal_sf(value)
-            );
-        }
-
-        assert!(normal_sf(f64::NAN).is_nan());
-        assert_eq!(normal_sf(f64::NEG_INFINITY), 1.0);
-        assert_eq!(normal_sf(f64::INFINITY), 0.0);
-    }
-
-    #[test]
-    fn log_likelihood_2pl_all_correct_is_finite_negative() {
-        let responses = [1, 1, 1];
-        let discrimination = [1.0, 1.0, 1.0];
-        let difficulty = [0.0, 0.0, 0.0];
-        let ll = log_likelihood_2pl_single(&responses, 0.0, &discrimination, &difficulty);
-        assert!(ll.is_finite());
-        assert!(ll < 0.0);
-        assert!((ll - 3.0 * 0.5_f64.ln()).abs() < 1e-10);
+    fn stream_seeds_differ_across_neighbouring_bases_and_keys() {
+        let mut seeds: Vec<u64> = (0..50u64)
+            .flat_map(|base| (0..50u64).map(move |key| stream_seed(base, &[key])))
+            .collect();
+        seeds.sort_unstable();
+        seeds.dedup();
+        assert_eq!(seeds.len(), 2500);
+        // Replicate b of seed s + 1 is not replicate b + 1 of seed s.
+        assert_ne!(stream_seed(11, &[0]), stream_seed(10, &[1]));
+        assert_ne!(stream_seed(7, &[1, 0]), stream_seed(7, &[0, 1]));
+        assert_eq!(stream_seed(7, &[3, 4]), stream_seed(7, &[3, 4]));
     }
 
     #[test]

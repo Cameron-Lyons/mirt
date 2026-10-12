@@ -118,11 +118,20 @@ def _binary_eap_oracle(model, responses, mean, variance, n_quadpts):
     return expected_theta, np.sqrt(expected_variance)
 
 
+# Calibration defaults: 61 rectangular EM points, and EAP scores on the
+# default 49-point grid.
+_DEFAULT_EM_QUADPTS = 61
+_DEFAULT_EAP_QUADPTS = 49
+
+
 def _joint_log_likelihood_oracle(result, grade_data, n_quadpts):
-    """Independently evaluate the fitted EM quadrature and missing-item likelihood."""
-    nodes, weights = hermgauss(n_quadpts)
-    theta = np.sqrt(2.0) * nodes
-    base_log_weights = np.log(weights / np.sqrt(np.pi))
+    """Independently evaluate the fitted EM quadrature and missing-item likelihood.
+
+    Grids of 15 or more points are R mirt's equally spaced nodes on [-6, 6]
+    with standard-normal weights; every grade reweights the same nodes.
+    """
+    theta = np.linspace(-6.0, 6.0, n_quadpts)
+    base_log_weights = -0.5 * theta**2 - logsumexp(-0.5 * theta**2)
     total = 0.0
     for gd in grade_data:
         model = result.calibrated_models[gd.grade_label]
@@ -341,7 +350,7 @@ def test_three_grade_disjoint_bridge_anchors_define_one_identified_item_bank(
                 original_parameters[reference_grade][name][reference_anchors],
             )
     assert result.calibration_result.log_likelihood == pytest.approx(
-        _joint_log_likelihood_oracle(result, grades, 31), abs=1e-7
+        _joint_log_likelihood_oracle(result, grades, _DEFAULT_EM_QUADPTS), abs=1e-7
     )
 
 
@@ -357,7 +366,7 @@ def test_administered_missing_responses_are_ignored_in_calibration_and_scoring()
     )
 
     assert result.calibration_result.log_likelihood == pytest.approx(
-        _joint_log_likelihood_oracle(result, grades, 31), abs=1e-7
+        _joint_log_likelihood_oracle(result, grades, _DEFAULT_EM_QUADPTS), abs=1e-7
     )
     for gd, original in zip(grades, originals, strict=True):
         distribution = result.latent_distributions[gd.grade_label]
@@ -366,7 +375,7 @@ def test_administered_missing_responses_are_ignored_in_calibration_and_scoring()
             gd.responses,
             distribution.mean[0],
             distribution.cov[0, 0],
-            31,
+            _DEFAULT_EAP_QUADPTS,
         )
         assert_allclose(result.scores[gd.grade_label].theta, expected_theta, atol=1e-10)
         assert_allclose(
@@ -715,7 +724,7 @@ def test_ordered_calibration_constrains_density_without_shifting_shared_item_mod
         assert_array_equal(model.discrimination, slopes)
         assert_array_equal(model.difficulty, locations)
     assert result.calibration_result.log_likelihood == pytest.approx(
-        _joint_log_likelihood_oracle(result, grades, 31), abs=1e-7
+        _joint_log_likelihood_oracle(result, grades, _DEFAULT_EM_QUADPTS), abs=1e-7
     )
     distribution = result.latent_distributions["g1"]
     theta, _ = _binary_eap_oracle(
@@ -723,6 +732,47 @@ def test_ordered_calibration_constrains_density_without_shifting_shared_item_mod
         grades[1].responses,
         distribution.mean[0],
         distribution.cov[0, 0],
-        31,
+        _DEFAULT_EAP_QUADPTS,
     )
     assert_allclose(result.scores["g1"].theta, theta, atol=1e-10)
+
+
+def _weakly_anchored_grades(seed=31, n_persons=600):
+    """Three grades on 12-item forms that share 4 anchors with neighbours."""
+    rng = np.random.default_rng(seed)
+    slopes = rng.uniform(1.0, 2.2, 28)
+    locations = np.linspace(-1.5, 3.0, 28)
+    grades = []
+    for grade in range(3):
+        items = np.arange(8 * grade, 8 * grade + 12)
+        theta = rng.normal(0.9 * grade, 1.0 - 0.1 * grade, n_persons)
+        p = expit(slopes[items] * (theta[:, None] - locations[items]))
+        grades.append(
+            GradeData(
+                grade_label=f"G{grade}",
+                responses=(rng.random(p.shape) < p).astype(int),
+                anchor_items_below=list(range(4)) if grade else None,
+                anchor_items_above=list(range(8, 12)) if grade < 2 else None,
+            )
+        )
+    return grades
+
+
+@pytest.mark.parametrize("enforce_monotonicity", [True, False])
+def test_floating_anchor_scale_converges_within_default_iterations(
+    enforce_monotonicity,
+):
+    # Grade means drift slowly along a flat likelihood ridge: plain EM needed
+    # 628 iterations, so the default max_iter=500 raised RuntimeError, and the
+    # ordered density update failed on an SLSQP line search at the start.
+    result = vertical_scale(
+        _weakly_anchored_grades(),
+        method="floating_anchor",
+        enforce_monotonicity=enforce_monotonicity,
+    )
+    fitted = result.calibration_result
+    assert fitted.converged and fitted.n_iterations < 200
+    means = list(result.grade_means.values())
+    assert means[0] == 0.0
+    assert means[1] == pytest.approx(0.82, abs=0.05)
+    assert means[2] == pytest.approx(1.71, abs=0.05)

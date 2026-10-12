@@ -42,10 +42,16 @@ class MixtureIRT(BaseItemModel):
     standard-normal latent ability distribution during marginal fitting.
     Only ``n_classes - 1`` mixing proportions are independent; the first
     proportion is reconstructed from the others during generic unpacking.
+    Fit the model with :func:`fit_mixture_irt`, which the class attribute
+    ``dedicated_estimator`` names for generic estimators to check.
     """
 
     model_name = "MixtureIRT"
     supports_multidimensional = False
+    _global_parameters = frozenset({"class_proportions"})
+    # Generic estimators integrate ability without the respondent's latent
+    # class; this names the estimator that integrates both.
+    dedicated_estimator = "mirt.fit_mixture_irt"
 
     def __init__(
         self,
@@ -101,14 +107,13 @@ class MixtureIRT(BaseItemModel):
 
     @property
     def convergence_info(self) -> dict[str, object] | None:
-        """Return likelihood history, free parameter count, AIC, and BIC."""
+        """Return likelihood histories, free parameter count, AIC, and BIC."""
         if self._convergence_info is None:
             return None
-        result = self._convergence_info.copy()
-        history = result.get("log_likelihood_history")
-        if isinstance(history, np.ndarray):
-            result["log_likelihood_history"] = history.copy()
-        return result
+        return {
+            name: value.copy() if isinstance(value, np.ndarray) else value
+            for name, value in self._convergence_info.items()
+        }
 
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
@@ -759,10 +764,13 @@ def fit_mixture_irt(
     responses: NDArray[np.int_],
     n_classes: int = 2,
     base_model: Literal["1PL", "2PL", "3PL"] = "2PL",
-    max_iter: int = 100,
+    max_iter: int = 500,
     tol: float = 1e-4,
     n_quadpts: int = 21,
     verbose: bool = False,
+    *,
+    n_starts: int = 1,
+    seed: int | None = None,
 ) -> tuple[MixtureIRT, NDArray[np.float64]]:
     """Fit a finite-mixture IRT model by marginal maximum-likelihood EM.
 
@@ -771,40 +779,147 @@ def fit_mixture_irt(
     every free item parameter with aggregated expected response counts.
     This function creates a new model and uses its own fitting controls;
     additional BaseItemModel parameter restrictions are not inputs to it.
+
+    Parameters
+    ----------
+    responses : ndarray of shape (n_persons, n_items)
+        Binary responses coded 0 or 1. Negative values mark missing
+        responses.
+    n_classes : int, default=2
+        Number of latent classes.
+    base_model : {"1PL", "2PL", "3PL"}, default="2PL"
+        Class-specific item model family.
+    max_iter : int, default=500
+        Maximum number of EM iterations per start.
+    tol : float, default=1e-4
+        Convergence tolerance for the absolute change in the marginal
+        log-likelihood between iterations, as in
+        :class:`~mirt.estimation.em.EMEstimator`.
+    n_quadpts : int, default=21
+        Number of Gauss-Hermite points for the standard-normal ability.
+    verbose : bool, default=False
+        Print the log-likelihood after every iteration.
+    n_starts : int, default=1
+        Number of starts. The first uses the fixed default values and later
+        starts draw random proportions and item parameters; the start with
+        the largest final log-likelihood is returned. Mixture likelihoods
+        often have local maxima, so several starts are advisable.
+    seed : int, optional
+        Seed for the random starts.
+
+    Returns
+    -------
+    tuple
+        ``(model, class_posteriors)``: the fitted :class:`MixtureIRT` and
+        the posterior class probabilities of every respondent, with shape
+        ``(n_persons, n_classes)``. ``model.convergence_info`` holds the
+        log-likelihood history, AIC, BIC and the final log-likelihood of
+        every start. Its ``converged`` entry is ``False`` when the selected
+        start used all ``max_iter`` iterations without meeting ``tol``.
+
+    Raises
+    ------
+    MirtEstimationError
+        If an EM iteration decreases the marginal log-likelihood.
     """
     _validate_fit_options(max_iter, tol, n_quadpts)
+    n_starts = _validate_count(n_starts, "n_starts", 1)
+    if seed is not None and (
+        isinstance(seed, (bool, np.bool_))
+        or not isinstance(seed, (int, np.integer))
+        or seed < 0
+    ):
+        raise MirtValidationError(
+            "seed must be a non-negative integer or None",
+            parameter="seed",
+            value=seed,
+        )
     raw_responses = np.asarray(responses)
     if raw_responses.ndim != 2:
         raise MirtDataError(f"responses must be 2D array, got {raw_responses.ndim}D")
     n_items = raw_responses.shape[1] if raw_responses.ndim == 2 else 0
-    model = MixtureIRT(
+    template = MixtureIRT(
         n_items=n_items,
         n_classes=n_classes,
         base_model=base_model,
     )
-    values = model._validate_responses(raw_responses)
+    values = template._validate_responses(raw_responses)
 
     nodes, quadrature_weights = roots_hermite(n_quadpts)
     nodes = nodes * np.sqrt(2.0)
     quadrature_weights = quadrature_weights / np.sqrt(np.pi)
     log_quadrature_weights = np.log(quadrature_weights)
 
+    rng = np.random.default_rng(seed)
+    best: tuple[MixtureIRT, NDArray[np.float64], list[float], bool, int] | None
+    best = None
+    start_log_likelihoods = np.empty(n_starts, dtype=np.float64)
+    for start in range(n_starts):
+        model = template.copy()
+        if start > 0:
+            _randomize_mixture_start(model, rng)
+        class_posteriors, history, converged, n_iterations = _run_mixture_em(
+            model,
+            values,
+            nodes,
+            log_quadrature_weights,
+            max_iter=max_iter,
+            tol=tol,
+            verbose=verbose,
+        )
+        start_log_likelihoods[start] = history[-1]
+        if best is None or history[-1] > best[2][-1]:
+            best = (model, class_posteriors, history, converged, n_iterations)
+
+    assert best is not None
+    model, class_posteriors, history, converged, n_iterations = best
+    current_ll = history[-1]
+    model._is_fitted = True
+    model._convergence_info = {
+        "converged": converged,
+        "n_iterations": n_iterations,
+        "log_likelihood": current_ll,
+        "log_likelihood_history": np.asarray(history, dtype=np.float64),
+        "start_log_likelihoods": start_log_likelihoods,
+        "n_parameters": model.n_parameters,
+        "aic": -2.0 * current_ll + 2.0 * model.n_parameters,
+        "bic": -2.0 * current_ll + np.log(values.shape[0]) * model.n_parameters,
+    }
+    return model, class_posteriors
+
+
+def _run_mixture_em(
+    model: MixtureIRT,
+    responses: NDArray[np.int_],
+    nodes: NDArray[np.float64],
+    log_quadrature_weights: NDArray[np.float64],
+    *,
+    max_iter: int,
+    tol: float,
+    verbose: bool,
+) -> tuple[NDArray[np.float64], list[float], bool, int]:
+    """Iterate EM from the model's current values.
+
+    Returns the final class posteriors, the log-likelihood history, whether
+    the absolute log-likelihood change fell below ``tol``, and the number of
+    iterations.
+    """
     joint_posterior, class_posteriors, current_ll = _mixture_e_step(
-        model, values, nodes, log_quadrature_weights
+        model, responses, nodes, log_quadrature_weights
     )
     history = [current_ll]
     converged = False
     n_iterations = 0
 
     for iteration in range(1, max_iter + 1):
-        _mixture_m_step(model, values, nodes, joint_posterior)
+        _mixture_m_step(model, responses, nodes, joint_posterior)
         next_joint, next_class, next_ll = _mixture_e_step(
-            model, values, nodes, log_quadrature_weights
+            model, responses, nodes, log_quadrature_weights
         )
         history.append(next_ll)
         improvement = next_ll - current_ll
-        scale = 1.0 + abs(current_ll)
-        if improvement < -1e-7 * scale:
+        # Decreases beyond floating-point noise indicate a failed M-step.
+        if improvement < -1e-7 * (1.0 + abs(current_ll)):
             raise MirtEstimationError(
                 "Mixture EM decreased the marginal log likelihood",
                 iteration=iteration,
@@ -821,42 +936,51 @@ def fit_mixture_irt(
                 f"Iteration {iteration}: LL = {current_ll:.6f}, "
                 f"change = {improvement:.6g}"
             )
-        if abs(improvement) <= tol * scale:
+        if abs(improvement) < tol:
             converged = True
             break
+    return class_posteriors, history, converged, n_iterations
 
-    model._is_fitted = True
-    model._convergence_info = {
-        "converged": converged,
-        "n_iterations": n_iterations,
-        "log_likelihood": current_ll,
-        "log_likelihood_history": np.asarray(history, dtype=np.float64),
-        "n_parameters": model.n_parameters,
-        "aic": -2.0 * current_ll + 2.0 * model.n_parameters,
-        "bic": -2.0 * current_ll + np.log(values.shape[0]) * model.n_parameters,
-    }
-    return model, class_posteriors
+
+def _randomize_mixture_start(model: MixtureIRT, rng: np.random.Generator) -> None:
+    """Draw random class proportions and item parameters for one start."""
+    n_classes, n_items = model.n_classes, model.n_items
+    # A concentrated Dirichlet keeps every class large enough to estimate.
+    model._parameters["class_proportions"] = rng.dirichlet(np.full(n_classes, 4.0))
+    for class_idx in range(n_classes):
+        model._parameters[f"difficulty_class{class_idx}"] = rng.normal(
+            0.0, 1.0, n_items
+        )
+        if model.base_model != "1PL":
+            model._parameters[f"discrimination_class{class_idx}"] = np.exp(
+                rng.normal(0.0, 0.3, n_items)
+            )
+        if model.base_model == "3PL":
+            model._parameters[f"guessing_class{class_idx}"] = rng.uniform(
+                0.05, 0.3, n_items
+            )
+
+
+def _validate_count(value: int, name: str, minimum: int) -> int:
+    """Return an integer control after checking its type and lower bound."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)):
+        raise MirtValidationError(
+            f"{name} must be an integer", parameter=name, value=value
+        )
+    if value < minimum:
+        raise MirtValidationError(
+            f"{name} must be at least {minimum}",
+            parameter=name,
+            value=value,
+            expected=f">= {minimum}",
+        )
+    return int(value)
 
 
 def _validate_fit_options(max_iter: int, tol: float, n_quadpts: int) -> None:
     """Validate EM controls before constructing work arrays."""
-    for name, value, minimum in (
-        ("max_iter", max_iter, 1),
-        ("n_quadpts", n_quadpts, 3),
-    ):
-        if isinstance(value, (bool, np.bool_)) or not isinstance(
-            value, (int, np.integer)
-        ):
-            raise MirtValidationError(
-                f"{name} must be an integer", parameter=name, value=value
-            )
-        if value < minimum:
-            raise MirtValidationError(
-                f"{name} must be at least {minimum}",
-                parameter=name,
-                value=value,
-                expected=f">= {minimum}",
-            )
+    _validate_count(max_iter, "max_iter", 1)
+    _validate_count(n_quadpts, "n_quadpts", 3)
     if not np.isfinite(tol) or tol <= 0.0:
         raise MirtValidationError(
             "tol must be finite and positive",

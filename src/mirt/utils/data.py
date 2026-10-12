@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -217,6 +218,92 @@ def response_column_names(responses: Any) -> list[str] | None:
     return names
 
 
+def align_response_columns(
+    responses: Any,
+    item_names: Sequence[str] | None,
+) -> Any:
+    """Select and order the columns of a named response frame by item name.
+
+    A pandas or polars DataFrame whose columns carry item names (see
+    :func:`response_column_names`) is matched to ``item_names`` by label, so
+    its columns may come in any order and may include extra columns, such as
+    respondent identifiers, which are dropped. Arrays, frames with default
+    positional labels, and frames whose columns already equal ``item_names``
+    keep positional semantics and are returned unchanged, as is everything
+    when ``item_names`` is ``None`` or contains duplicates. A model whose
+    item names are the defaults ``Item_1, Item_2, ...`` (or ``Item_0, ...``),
+    as for a fit to an unnamed array, also reads a frame without those labels
+    by position.
+
+    Parameters
+    ----------
+    responses : array-like or DataFrame
+        Response matrix, typically one being scored against a fitted model.
+    item_names : sequence of str or None
+        The model's item names in model order, such as
+        ``result.model.item_names``.
+
+    Returns
+    -------
+    array-like or DataFrame
+        ``responses`` itself when no reordering applies; otherwise a frame of
+        the same library holding exactly the ``item_names`` columns in model
+        order.
+
+    Raises
+    ------
+    MirtDataError
+        If a frame with named columns lacks columns for some of the model's
+        (non-default) item names. The message lists the missing items;
+        convert the frame to an array (``frame.to_numpy()``) to score its
+        columns by position instead.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> frame = pd.DataFrame({"id": [7, 8], "Q2": [1, 0], "Q1": [0, 1]})
+    >>> align_response_columns(frame, ["Q1", "Q2"]).columns.tolist()
+    ['Q1', 'Q2']
+    """
+    if item_names is None:
+        return responses
+    names = response_column_names(responses)
+    if names is None:
+        return responses
+    items = [str(name) for name in item_names]
+    if names == items or len(set(items)) != len(items):
+        return responses
+
+    positions = {name: index for index, name in enumerate(names)}
+    missing = [name for name in items if name not in positions]
+    if missing:
+        n_items = len(items)
+        default_labels = (
+            [f"Item_{index + 1}" for index in range(n_items)],
+            [f"Item_{index}" for index in range(n_items)],
+        )
+        if items in default_labels:
+            return responses
+        shown = ", ".join(missing[:10])
+        if len(missing) > 10:
+            shown += f", ... ({len(missing)} in total)"
+        raise MirtDataError(
+            f"responses has no columns for the model's items {shown}; "
+            "DataFrame columns are matched to the model's item names, so "
+            "pass an array (for example frame.to_numpy()) to score columns "
+            "by position",
+            n_items=len(names),
+        )
+
+    selected = [positions[name] for name in items]
+    labels = list(responses.columns)
+    try:
+        return responses[[labels[index] for index in selected]]
+    except (KeyError, TypeError, ValueError, IndexError):
+        # Frame-like objects without list selection are read as arrays.
+        return _response_array(responses)[:, selected]
+
+
 def check_response_pattern(
     responses: NDArray[np.int_],
     n_categories: int | list[int] | None = None,
@@ -323,58 +410,3 @@ def check_response_pattern(
             "all_maximum": int(all_max.sum()),
         },
     }
-
-
-def expand_table(
-    table: NDArray[Any],
-    freq_col: int = -1,
-) -> NDArray[np.int_]:
-    """Expand frequency table to individual response records.
-
-    Converts a summarized frequency table where each row represents a
-    response pattern with a frequency count into individual response
-    records suitable for IRT analysis.
-
-    Parameters
-    ----------
-    table : ndarray of shape (n_patterns, n_items + 1)
-        Frequency table with response patterns and counts. Each row
-        contains item responses followed by (or preceded by) the frequency.
-    freq_col : int, default=-1
-        Column index containing frequency counts. Default is last column.
-
-    Returns
-    -------
-    ndarray of shape (n_persons, n_items)
-        Expanded response matrix where each pattern is repeated according
-        to its frequency.
-
-    Raises
-    ------
-    ValueError
-        If table is not 2D.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> # Table: [item1, item2, frequency]
-    >>> freq_table = np.array([[1, 1, 10], [1, 0, 5], [0, 0, 3]])
-    >>> data = expand_table(freq_table)
-    >>> print(data.shape)
-    (18, 2)
-    """
-    table = np.asarray(table)
-
-    if table.ndim != 2:
-        raise ValueError("table must be 2D")
-
-    freqs = table[:, freq_col].astype(int)
-
-    if freq_col == -1:
-        patterns = table[:, :-1]
-    else:
-        patterns = np.delete(table, freq_col, axis=1)
-
-    expanded = np.repeat(patterns, freqs, axis=0)
-
-    return expanded.astype(np.int_)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import combinations
 from typing import Literal
 
 import numpy as np
@@ -18,14 +19,21 @@ from mirt.backends.rust.dynamic import (
     bkt_viterbi,
 )
 from mirt.constants import PROB_EPSILON
+from mirt.exceptions import MirtValidationError
+from mirt.models.base import validate_item_index
 from mirt.models.state_space import StateSpaceIRT as StateSpaceIRT
 from mirt.utils.numeric import logsumexp
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
 _GROWTH_MIXTURE_MAX_RANDOM_VALUES = 1_000_000
-# Smaller repeated layouts are cheaper in the vectorized NumPy smoother than in
-# separate compiled calls.
+# Layouts shared by this many learners always get their own compiled call.
 _BKT_NATIVE_LAYOUT_MIN_LEARNERS = 32
+# Relative costs of the two person-specific BKT smoothing paths, in units of
+# one vectorized NumPy sweep step over a single trial: a compiled call per
+# layout costs about two steps, and every learner-trial costs about 1/400 of a
+# step more in the NumPy sweep than in the compiled kernel.
+_BKT_NATIVE_CALL_COST = 2.0
+_BKT_SWEEP_LEARNER_COST = 1.0 / 400.0
 BKTSkillCriterion = Literal[
     "information_gain",
     "mastery_gain",
@@ -444,6 +452,38 @@ class BKTBatchSkillRankingResult:
     def best_skill_indices(self) -> NDArray[np.int_]:
         """Highest-ranked skill index for every learner."""
         return self.skill_indices[:, 0]
+
+
+def _layout_hash_keys(layouts: NDArray[np.int_]) -> NDArray[np.uint64]:
+    """Hash each non-negative layout row to a 64-bit key (wrapping arithmetic)."""
+    weights = np.random.default_rng(0x5EED).integers(
+        1, np.iinfo(np.int64).max, size=layouts.shape[1], dtype=np.uint64
+    )
+    return layouts.astype(np.uint64) @ weights
+
+
+def _layout_groups(
+    layouts: NDArray[np.int_],
+) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
+    """Return each row's layout group and the group sizes.
+
+    Rows are grouped by hash and the grouping is verified row by row; a hash
+    collision falls back to exact grouping by the rows' bytes.
+    """
+    _, first, layout_ids, counts = np.unique(
+        _layout_hash_keys(layouts),
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    if np.array_equal(layouts, layouts[first[layout_ids]]):
+        return layout_ids, counts
+    rows = np.ascontiguousarray(layouts)
+    row_bytes = rows.view(np.dtype((np.void, rows.dtype.itemsize * rows.shape[1])))
+    _, layout_ids, counts = np.unique(
+        row_bytes.ravel(), return_inverse=True, return_counts=True
+    )
+    return layout_ids, counts
 
 
 @dataclass
@@ -2006,12 +2046,14 @@ class BKTModel:
         Shared layouts (including a matrix whose rows are all identical) use
         the compiled kernel when it is available. With the compiled kernel,
         person-specific layouts shared by at least
-        ``_BKT_NATIVE_LAYOUT_MIN_LEARNERS`` learners are also smoothed as
-        compiled batches. All other learners, and every learner on the NumPy
-        fallback, advance together through :meth:`_forward_backward_layouts`
-        whatever the number of distinct layouts.
+        ``_BKT_NATIVE_LAYOUT_MIN_LEARNERS`` learners are smoothed as compiled
+        batches. The other learners get one compiled call per distinct
+        layout when those calls cost less than a vectorized sweep, which
+        takes a NumPy step per trial (few learners or long sequences).
+        Otherwise they, like every learner on the NumPy fallback, advance
+        together through :meth:`_forward_backward_layouts`.
         """
-        n_persons = responses.shape[0]
+        n_persons, n_trials = responses.shape
         if (
             skill_assignments.ndim == 2
             and n_persons > 0
@@ -2023,18 +2065,26 @@ class BKTModel:
             if native is not None:
                 return native
             return self._forward_backward_layouts(responses, skill_assignments)
-        repeated_layouts = (
-            self._repeated_layout_rows(skill_assignments)
-            if self._can_use_native_inference()
-            else []
-        )
-        if not repeated_layouts:
+        if not self._can_use_native_inference():
             return self._forward_backward_layouts(responses, skill_assignments)
 
+        layout_ids, counts = _layout_groups(skill_assignments)
+        small = counts < _BKT_NATIVE_LAYOUT_MIN_LEARNERS
+        # A compiled call per small layout against one sweep step per trial.
+        per_layout = np.count_nonzero(small) * _BKT_NATIVE_CALL_COST <= n_trials * (
+            1.0 + counts[small].sum() * _BKT_SWEEP_LEARNER_COST
+        )
+        native_groups = np.arange(counts.size) if per_layout else np.flatnonzero(~small)
+        if native_groups.size == 0:
+            return self._forward_backward_layouts(responses, skill_assignments)
+
+        order = np.argsort(layout_ids, kind="stable")
+        ends = np.cumsum(counts)
         gamma = np.empty((*responses.shape, 2), dtype=np.float64)
         log_likelihoods = np.empty(n_persons, dtype=np.float64)
         remaining = np.ones(n_persons, dtype=np.bool_)
-        for rows in repeated_layouts:
+        for group in native_groups:
+            rows = order[ends[group] - counts[group] : ends[group]]
             native = self._native_forward_backward_batch(
                 responses[rows],
                 skill_assignments[rows[0]],
@@ -2050,30 +2100,6 @@ class BKTModel:
                 skill_assignments[rows],
             )
         return gamma, log_likelihoods
-
-    @staticmethod
-    def _repeated_layout_rows(
-        skill_assignments: NDArray[np.int_],
-    ) -> list[NDArray[np.intp]]:
-        """Return rows sharing a layout with enough learners for compiled calls."""
-        layouts = np.ascontiguousarray(skill_assignments)
-        layout_keys = layouts.view(
-            np.dtype((np.void, layouts.dtype.itemsize * layouts.shape[1]))
-        ).ravel()
-        _, layout_ids, layout_counts = np.unique(
-            layout_keys,
-            return_inverse=True,
-            return_counts=True,
-        )
-        grouped_rows = np.split(
-            np.argsort(layout_ids, kind="stable"),
-            np.cumsum(layout_counts)[:-1],
-        )
-        return [
-            rows
-            for rows in grouped_rows
-            if rows.size >= _BKT_NATIVE_LAYOUT_MIN_LEARNERS
-        ]
 
     def viterbi(
         self,
@@ -2823,13 +2849,7 @@ class LongitudinalIRTModel:
             raise ValueError("theta must contain only finite values")
 
         if item_idx is not None:
-            if (
-                isinstance(item_idx, bool)
-                or not isinstance(item_idx, (int, np.integer))
-                or not 0 <= item_idx < self.n_items
-            ):
-                raise ValueError(f"item_idx must be between 0 and {self.n_items - 1}")
-            item_idx = int(item_idx)
+            item_idx = validate_item_index(item_idx, self.n_items)
             a = self.discrimination[item_idx]
             if self.base_model == "2PL":
                 b = self.difficulty[item_idx]
@@ -3290,66 +3310,106 @@ class PiecewiseGrowthModel:
         observations: NDArray[np.float64],
         max_changepoints: int = 3,
     ) -> NDArray[np.float64]:
-        """Detect changepoints from observed data.
+        """Detect changepoints in the mean trajectory by BIC.
 
-        Uses a simple residual-based approach to find optimal
-        changepoint locations.
+        Continuous piecewise-linear mean trajectories
+        ``b0 + b1 * t + sum_j d_j * max(t - tau_j, 0)``, with knots ``tau_j``
+        at interior observed time points, are fitted by least squares to every
+        observed person-occasion value. Every knot subset with at most
+        ``max_changepoints`` knots is compared by
+        ``BIC = n * log(SSE / n) + (2 + 2 * m) * log(n)``, where ``n`` counts
+        the observed values, ``SSE`` is their residual sum of squares and each
+        of the ``m`` changepoints adds a slope change and a location. Fits
+        need at least one residual degree of freedom, and ties keep fewer
+        changepoints. The model's own parameters are not used.
 
         Parameters
         ----------
         time_values : NDArray
-            Time points.
+            One finite time point per observation column.
         observations : NDArray
-            Observed values (n_persons, n_timepoints).
+            Observed values (n_persons, n_timepoints); a one-dimensional
+            array is one person. Use ``NaN`` for missing occasions.
         max_changepoints : int
             Maximum number of changepoints to detect.
 
         Returns
         -------
         NDArray
-            Detected changepoint locations.
+            Detected changepoint locations in increasing order, empty when
+            a single straight line has the lowest BIC.
         """
-        observations = np.atleast_2d(observations)
-        mean_trajectory = np.mean(observations, axis=0)
+        times = np.asarray(time_values, dtype=np.float64)
+        if times.ndim != 1 or times.size == 0 or not np.all(np.isfinite(times)):
+            raise ValueError(
+                "time_values must be a non-empty one-dimensional array of finite values"
+            )
+        values = np.asarray(observations, dtype=np.float64)
+        if values.ndim == 1:
+            values = values.reshape(1, -1)
+        if values.ndim != 2 or values.shape[0] == 0 or values.shape[1] != times.size:
+            raise ValueError(
+                "observations must have shape (n_persons, len(time_values))"
+            )
+        if np.any(np.isinf(values)):
+            raise ValueError(
+                "observations must contain finite values or NaN for missing occasions"
+            )
+        if (
+            isinstance(max_changepoints, (bool, np.bool_))
+            or not isinstance(max_changepoints, (int, np.integer))
+            or max_changepoints < 0
+        ):
+            raise ValueError("max_changepoints must be a non-negative integer")
 
-        best_sse = np.inf
-        best_changepoints: NDArray[np.float64] = np.array([])
+        observed = ~np.isnan(values)
+        counts = np.sum(observed, axis=0).astype(np.float64)
+        present = counts > 0.0
+        occasion_times = times[present]
+        counts = counts[present]
+        if np.unique(occasion_times).size < 2:
+            raise ValueError("at least two distinct observed time points are required")
+        occasion_values = values[:, present]
+        occasion_means = np.nansum(occasion_values, axis=0) / counts
+        # The design depends only on time, so the person-level SSE splits into
+        # the fixed spread around each occasion mean plus the count-weighted
+        # SSE of the occasion means.
+        within = float(np.nansum((occasion_values - occasion_means) ** 2))
+        n_values = float(np.sum(counts))
+        grand_mean = float(counts @ occasion_means) / n_values
+        sse_floor = max(
+            1e-12 * (within + float(counts @ (occasion_means - grand_mean) ** 2)),
+            np.finfo(np.float64).tiny,
+        )
+        weights = np.sqrt(counts)
+        candidates = np.unique(occasion_times)[1:-1]
 
-        for n_cp in range(max_changepoints + 1):
-            if n_cp == 0:
-                slope, intercept = np.polyfit(time_values, mean_trajectory, 1)
-                pred = intercept + slope * time_values
-                sse = np.sum((mean_trajectory - pred) ** 2)
-                if sse < best_sse:
-                    best_sse = sse
-                    best_changepoints = np.array([])
-            else:
-                candidate_times = time_values[1:-1]
-                if len(candidate_times) < n_cp:
-                    continue
+        def information_criterion(knots: tuple[float, ...]) -> float:
+            design = np.column_stack(
+                [
+                    np.ones_like(occasion_times),
+                    occasion_times,
+                    *(np.maximum(occasion_times - knot, 0.0) for knot in knots),
+                ]
+            )
+            coefficients = np.linalg.lstsq(
+                design * weights[:, None], occasion_means * weights, rcond=None
+            )[0]
+            residuals = occasion_means - design @ coefficients
+            sse = max(within + float(counts @ residuals**2), sse_floor)
+            n_parameters = 2 + 2 * len(knots)
+            return n_values * np.log(sse / n_values) + n_parameters * np.log(n_values)
 
-                from itertools import combinations
-
-                for cp_combo in combinations(range(len(candidate_times)), n_cp):
-                    cps = candidate_times[list(cp_combo)]
-
-                    sse = 0.0
-                    prev_cp = time_values[0]
-                    for i, cp in enumerate(list(cps) + [time_values[-1]]):
-                        mask = (time_values >= prev_cp) & (time_values <= cp)
-                        if np.sum(mask) > 1:
-                            t_seg = time_values[mask]
-                            y_seg = mean_trajectory[mask]
-                            if len(t_seg) > 1:
-                                slope, intercept = np.polyfit(t_seg, y_seg, 1)
-                                pred = intercept + slope * t_seg
-                                sse += np.sum((y_seg - pred) ** 2)
-                        prev_cp = cp
-
-                    penalty = n_cp * 2 * np.var(mean_trajectory)
-                    if sse + penalty < best_sse:
-                        best_sse = sse + penalty
-                        best_changepoints = cps
+        best_criterion = information_criterion(())
+        best_changepoints = np.array([], dtype=np.float64)
+        for n_changepoints in range(1, min(max_changepoints, candidates.size) + 1):
+            if n_values - (2 + 2 * n_changepoints) < 1:
+                break
+            for knots in combinations(candidates.tolist(), n_changepoints):
+                criterion = information_criterion(knots)
+                if criterion < best_criterion:
+                    best_criterion = criterion
+                    best_changepoints = np.asarray(knots, dtype=np.float64)
 
         return best_changepoints
 
@@ -3378,6 +3438,15 @@ class NonlinearGrowthModel:
         which are fully determined by the asymptote, rate and inflection.
     residual_variance : float
         Residual variance.
+    asymptote_var, rate_var, inflection_var : float
+        Population variances of the person-specific asymptote, rate and
+        inflection used by :meth:`simulate`.
+
+    Raises
+    ------
+    MirtValidationError
+        If ``growth_type`` is unknown, a curve parameter is not a finite
+        scalar, or a variance is negative or not finite.
     """
 
     growth_type: Literal["exponential", "logistic", "gompertz"] = "logistic"
@@ -3390,6 +3459,38 @@ class NonlinearGrowthModel:
     asymptote_var: float = 0.1
     rate_var: float = 0.01
     inflection_var: float = 0.1
+
+    def __post_init__(self) -> None:
+        if self.growth_type not in ("exponential", "logistic", "gompertz"):
+            raise MirtValidationError(
+                "growth_type must be 'exponential', 'logistic' or 'gompertz'",
+                parameter="growth_type",
+                value=self.growth_type,
+            )
+        variances = (
+            "residual_variance",
+            "asymptote_var",
+            "rate_var",
+            "inflection_var",
+        )
+        for name in ("asymptote", "rate", "inflection", "initial_value", *variances):
+            value = getattr(self, name)
+            try:
+                if isinstance(value, (bool, np.bool_)) or np.ndim(value) != 0:
+                    raise TypeError
+                normalized = float(value)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"{name} must be a finite scalar", parameter=name, value=value
+                ) from exc
+            if not np.isfinite(normalized) or (name in variances and normalized < 0):
+                qualifier = " and non-negative" if name in variances else ""
+                raise MirtValidationError(
+                    f"{name} must be finite{qualifier}",
+                    parameter=name,
+                    value=value,
+                )
+            setattr(self, name, normalized)
 
     def compute_theta(
         self,
@@ -3488,6 +3589,14 @@ class NonlinearGrowthModel:
         -------
         NDArray
             Instantaneous velocity at each time point.
+
+        Notes
+        -----
+        With ``u = rate * (time - inflection)``, the logistic velocity is
+        evaluated as ``asymptote * rate * s(u) * s(-u)`` with the stable
+        sigmoid ``s``, and the Gompertz velocity as
+        ``asymptote * rate * exp(-u - exp(-u))``. Both underflow to zero far
+        from the inflection point instead of forming ``inf / inf``.
         """
         if asymptote is None:
             asymptote = self.asymptote
@@ -3496,16 +3605,20 @@ class NonlinearGrowthModel:
         if inflection is None:
             inflection = self.inflection
 
-        time_values = np.atleast_1d(time_values)
+        time_values = np.atleast_1d(np.asarray(time_values, dtype=np.float64))
 
         if self.growth_type == "exponential":
-            velocity = asymptote * rate * np.exp(-rate * time_values)
+            with np.errstate(over="ignore"):
+                velocity = asymptote * rate * np.exp(-rate * time_values)
         elif self.growth_type == "logistic":
-            exp_term = np.exp(-rate * (time_values - inflection))
-            velocity = asymptote * rate * exp_term / (1 + exp_term) ** 2
+            scaled_time = rate * (time_values - inflection)
+            velocity = asymptote * rate * sigmoid(scaled_time) * sigmoid(-scaled_time)
         elif self.growth_type == "gompertz":
-            exp_inner = np.exp(-rate * (time_values - inflection))
-            velocity = asymptote * rate * exp_inner * np.exp(-exp_inner)
+            scaled_time = rate * (time_values - inflection)
+            with np.errstate(over="ignore"):
+                velocity = (
+                    asymptote * rate * np.exp(-scaled_time - np.exp(-scaled_time))
+                )
         else:
             raise ValueError(f"Unknown growth type: {self.growth_type}")
 
@@ -3676,21 +3789,37 @@ class GrowthMixtureModel:
     Models heterogeneous populations with distinct growth trajectories
     using a mixture of growth curves.
 
+    Within class ``k``, person ``i`` follows the class trajectory plus a
+    random intercept and a random slope on time, with independent occasion
+    residuals. The three variance components are shared by all classes.
+
     Parameters
     ----------
     n_classes : int
-        Number of latent classes.
+        Number of latent classes, a positive integer.
     growth_type : str
-        Type of growth model within classes.
+        Type of growth model within classes: ``"linear"``, ``"quadratic"``
+        or ``"piecewise"``.
     n_timepoints : int
         Number of time points.
     class_proportions : NDArray, optional
         Prior class proportions.
+    class_intercepts, class_slopes, class_quadratics : NDArray, optional
+        Class trajectory coefficients.
+    intercept_var, slope_var : float
+        Variances of the random intercept and random slope.
+    residual_variance : float
+        Variance of the occasion-specific residuals.
     class_post_slopes : NDArray, optional
         Post-changepoint slopes for piecewise growth.
     changepoint : float, optional
         Shared piecewise changepoint. The time-range midpoint is used when
         omitted.
+    estimate_variances : bool
+        Whether :meth:`fit` and :meth:`fit_em` estimate ``intercept_var``,
+        ``slope_var`` and ``residual_variance``, starting from their current
+        values. A random-effect variance set to zero is a model restriction
+        and stays zero. ``False`` keeps all three fixed.
     """
 
     n_classes: int
@@ -3708,8 +3837,34 @@ class GrowthMixtureModel:
 
     class_post_slopes: NDArray[np.float64] = field(default_factory=lambda: np.array([]))
     changepoint: float | None = None
+    estimate_variances: bool = True
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.n_classes, (bool, np.bool_))
+            or not isinstance(self.n_classes, (int, np.integer))
+            or self.n_classes < 1
+        ):
+            raise MirtValidationError(
+                "n_classes must be a positive integer",
+                parameter="n_classes",
+                value=self.n_classes,
+            )
+        self.n_classes = int(self.n_classes)
+        if self.growth_type not in ("linear", "quadratic", "piecewise"):
+            raise MirtValidationError(
+                "growth_type must be 'linear', 'quadratic' or 'piecewise'",
+                parameter="growth_type",
+                value=self.growth_type,
+            )
+        if not isinstance(self.estimate_variances, (bool, np.bool_)):
+            raise MirtValidationError(
+                "estimate_variances must be a boolean",
+                parameter="estimate_variances",
+                value=self.estimate_variances,
+            )
+        self.estimate_variances = bool(self.estimate_variances)
+
         if len(self.class_proportions) == 0:
             self.class_proportions = np.ones(self.n_classes) / self.n_classes
 
@@ -4371,6 +4526,13 @@ class GrowthMixtureModel:
     ) -> dict:
         """Fit model using EM algorithm.
 
+        Each iteration updates the class proportions and trajectory
+        coefficients by generalized least squares given the current variance
+        components. When ``estimate_variances`` is true, a second E-step under
+        the updated trajectories then treats each person's random effects as
+        missing data and updates the shared variance components (an
+        alternating ECM cycle), so every iteration increases the likelihood.
+
         Parameters
         ----------
         observations : NDArray
@@ -4382,7 +4544,8 @@ class GrowthMixtureModel:
         max_iter : int
             Maximum iterations.
         tol : float
-            Convergence tolerance.
+            Convergence tolerance on the largest absolute change in a class
+            proportion, trajectory coefficient or estimated variance component.
 
         Returns
         -------
@@ -4452,18 +4615,33 @@ class GrowthMixtureModel:
         )
         observations = covariance.masked(observations)
         complete_data = observation_mask is None
-        if not complete_data:
-            # Fixed variance components make each person's GLS terms
-            # X_i^T Sigma_i^{-1} X_i and X_i^T Sigma_i^{-1} y_i constant across
-            # iterations, so the M-step reduces to posterior-weighted sums.
-            precision_grams = np.stack(
+        estimate_variances = bool(self.estimate_variances)
+        n_observations = float(
+            observations.size if complete_data else np.sum(observation_mask)
+        )
+        observed_values = (
+            observations if complete_data else observations[observation_mask]
+        )
+        # Keeps the residual variance positive if trajectories fit exactly.
+        residual_floor = 1e-10 * max(float(np.var(observed_values)), 1.0)
+
+        def gls_terms(
+            covariance: _MaskedGrowthCovariance,
+        ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+            # Each person's GLS terms X_i^T Sigma_i^{-1} X_i and
+            # X_i^T Sigma_i^{-1} y_i change only with the variance components,
+            # so the M-step reduces to posterior-weighted sums.
+            grams = np.stack(
                 [
                     covariance.solve(covariance.masked(column)) @ design
                     for column in design.T
                 ],
                 axis=2,
             )
-            precision_observations = covariance.solve(observations) @ design
+            return grams, covariance.solve(observations) @ design
+
+        if not complete_data:
+            precision_grams, precision_observations = gls_terms(covariance)
 
         converged = False
         for iteration in range(max_iter):
@@ -4543,10 +4721,34 @@ class GrowthMixtureModel:
                 )
                 parameter_change = max(parameter_change, post_slope_change)
 
+            if estimate_variances:
+                previous_variances = variances
+                variances = self._updated_variance_components(
+                    observations,
+                    times,
+                    covariance,
+                    variances,
+                    n_observations,
+                    residual_floor,
+                )
+                covariance = _MaskedGrowthCovariance.from_time_values(
+                    times,
+                    variances,
+                    observation_mask,
+                )
+                if not complete_data:
+                    precision_grams, precision_observations = gls_terms(covariance)
+                parameter_change = max(
+                    parameter_change,
+                    float(np.max(np.abs(np.subtract(variances, previous_variances)))),
+                )
+
             if parameter_change < tolerance:
                 converged = True
                 break
 
+        if estimate_variances:
+            self.intercept_var, self.slope_var, self.residual_variance = variances
         final_trajectories = self._validated_class_trajectories(times)
         final_log_likelihoods = self._class_log_likelihood_from_covariance(
             observations,
@@ -4567,20 +4769,84 @@ class GrowthMixtureModel:
             "converged": converged,
         }
 
+    def _updated_variance_components(
+        self,
+        masked_observations: NDArray[np.float64],
+        times: NDArray[np.float64],
+        covariance: _MaskedGrowthCovariance,
+        variances: tuple[float, float, float],
+        n_observations: float,
+        residual_floor: float,
+    ) -> tuple[float, float, float]:
+        """Return the ECM update of the shared variance components.
+
+        Given class ``k``, person ``i``'s standardized random effects ``z``
+        have posterior mean ``c_ik = M_i^{-1} B_i^T r_ik`` and covariance
+        ``residual_variance * M_i^{-1}`` (see :class:`_MaskedGrowthCovariance`).
+        Each random-effect variance becomes the posterior mean square of its
+        effect, and the residual variance becomes the posterior mean of
+        ``||r_ik - B_i z||^2`` per observed occasion. With
+        ``B_i^T B_i = M_i - residual_variance * I``, the conditional part of
+        the latter is ``residual_variance * (2 - residual_variance * tr
+        M_i^{-1})``.
+        """
+        intercept_variance, slope_variance, residual_variance = variances
+        trajectories = self._validated_class_trajectories(times)
+        posteriors, _ = self._posterior_from_log_likelihoods(
+            self._class_log_likelihood_from_covariance(
+                masked_observations,
+                trajectories,
+                covariance,
+            )
+        )
+        n_persons = masked_observations.shape[0]
+        residual_sum = 0.0
+        effect_squares = np.zeros(2, dtype=np.float64)
+        for class_index, trajectory in enumerate(trajectories):
+            whitened, effects = covariance._whitened(
+                masked_observations - covariance.masked(trajectory)
+            )
+            weights = posteriors[:, class_index]
+            residual_sum += float(weights @ np.einsum("ij,ij->i", whitened, whitened))
+            effect_squares += weights @ np.square(effects)
+
+        core_diagonals = np.diagonal(covariance.inverse_core, axis1=1, axis2=2)
+        conditional_effects = residual_variance * (
+            n_persons * core_diagonals[0]
+            if core_diagonals.shape[0] == 1
+            else np.sum(core_diagonals, axis=0)
+        )
+        effect_squares += conditional_effects
+        residual_sum += residual_variance * (
+            2.0 * n_persons - float(np.sum(conditional_effects))
+        )
+        return (
+            intercept_variance * float(effect_squares[0]) / n_persons,
+            slope_variance * float(effect_squares[1]) / n_persons,
+            max(residual_sum / n_observations, residual_floor),
+        )
+
     @property
     def n_fitted_parameters(self) -> int:
         """Number of parameters updated by :meth:`fit_em`.
 
         The count includes one intercept and slope per class, one additional
         coefficient per class for quadratic or piecewise growth, and
-        ``n_classes - 1`` independent mixture weights. The shared changepoint
-        and variance components are fixed during the current EM fit and are
-        therefore excluded.
+        ``n_classes - 1`` independent mixture weights. With
+        ``estimate_variances``, it also includes the residual variance and
+        each random-effect variance that is not restricted to zero. The
+        shared changepoint is fixed and therefore excluded.
         """
         coefficients_per_class = (
             3 if self.growth_type in {"quadratic", "piecewise"} else 2
         )
-        return self.n_classes * coefficients_per_class + self.n_classes - 1
+        count = self.n_classes * coefficients_per_class + self.n_classes - 1
+        if self.estimate_variances:
+            intercept_variance, slope_variance, _ = (
+                self._validated_variance_components()
+            )
+            count += 1 + int(intercept_variance > 0.0) + int(slope_variance > 0.0)
+        return count
 
     @staticmethod
     def _entropy_from_posteriors(posteriors: NDArray[np.float64]) -> float:

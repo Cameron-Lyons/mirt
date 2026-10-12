@@ -763,3 +763,176 @@ class TestMCATEdgeCases:
 
         with pytest.raises(RuntimeError, match="not complete"):
             engine.get_result()
+
+
+def _simple_structure_model(n_items: int = 40, seed: int = 0):
+    rng = np.random.default_rng(seed)
+    slopes = np.zeros((n_items, 2))
+    half = n_items // 2
+    slopes[:half, 0] = rng.uniform(1.0, 2.0, half)
+    slopes[half:, 1] = rng.uniform(1.0, 2.0, n_items - half)
+    model = MultidimensionalModel(n_items=n_items, n_factors=2)
+    model.set_parameters(slopes=slopes, intercepts=rng.normal(0.0, 1.0, n_items))
+    model._is_fitted = True
+    return model
+
+
+class TestMCATEngineConfiguration:
+    """MCAT settings are validated when the engine is built."""
+
+    def test_scoring_method_names_ignore_case(self, fitted_mirt_model):
+        def answers(item, theta):
+            return int(item % 2 == 0)
+
+        expected = MCATEngine(fitted_mirt_model, max_items=4, seed=0).run_simulation(
+            np.zeros(2), answers
+        )
+        engine = MCATEngine(
+            fitted_mirt_model, scoring_method="eap", max_items=4, seed=0
+        )
+        actual = engine.run_simulation(np.zeros(2), answers)
+
+        # A lower-case name used to leave theta at the prior mean.
+        assert engine.scoring_method == "EAP"
+        assert_allclose(actual.theta_history, expected.theta_history)
+
+    @pytest.mark.parametrize("name", ["ML", "WLE", "bogus"])
+    def test_unsupported_scoring_methods_are_rejected(self, fitted_mirt_model, name):
+        with pytest.raises(ValueError, match="Unknown MCATEngine scoring_method"):
+            MCATEngine(fitted_mirt_model, scoring_method=name)
+
+    def test_map_scoring_respects_theta_bounds(self, fitted_mirt_model):
+        engine = MCATEngine(
+            fitted_mirt_model,
+            scoring_method="MAP",
+            theta_bounds=(-0.5, 0.5),
+            max_items=4,
+            min_items=4,
+        )
+        result = engine.run_simulation(np.zeros(2), lambda item, theta: 1)
+        assert np.all(np.abs(result.theta) <= 0.5 + 1e-9)
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"max_items": 10, "min_items": 20},
+            {"max_items": 10, "min_items": 20, "stopping_rule": "max_items"},
+        ],
+    )
+    def test_min_items_above_max_items_is_rejected(self, fitted_mirt_model, options):
+        with pytest.raises(ValueError, match=r"min_items \(20\) exceeds"):
+            MCATEngine(fitted_mirt_model, **options)
+
+    def test_negative_min_items_is_rejected(self, fitted_mirt_model):
+        with pytest.raises(ValueError, match="min_items must be non-negative"):
+            MCATEngine(fitted_mirt_model, min_items=-3)
+
+    @pytest.mark.parametrize("name", ["Trace", " trace", "TRACE"])
+    def test_stopping_rule_names_ignore_case(self, fitted_mirt_model, name):
+        engine = MCATEngine(fitted_mirt_model, stopping_rule=name, trace_threshold=0.7)
+        assert isinstance(engine._stopping, CovarianceTraceStop)
+        assert engine._stopping.threshold == 0.7
+
+
+class TestMCATEngineScoringPrior:
+    """Every MCAT update scores with the configured or fitted population."""
+
+    SIGMA = np.array([[1.0, 0.8], [0.8, 1.0]])
+
+    @staticmethod
+    def _reference(model, items, responses, prior_cov, n_quadpts=21):
+        from mirt.scoring import ability_posterior
+
+        matrix = np.full((1, model.n_items), -1)
+        matrix[0, items] = responses
+        posterior = ability_posterior(
+            model, matrix, n_quadpts=n_quadpts, prior_cov=prior_cov
+        )
+        mean = posterior.mean.ravel()
+        centered = posterior.points - mean
+        covariance = centered.T @ (posterior.weights[0, :, None] * centered)
+        return mean, covariance
+
+    def test_initial_covariance_is_the_scoring_prior(self):
+        model = _simple_structure_model()
+        engine = MCATEngine(model, initial_covariance=self.SIGMA, max_items=3)
+        item = engine.select_next_item()
+        state = engine.administer_item(1)
+
+        mean, covariance = self._reference(model, [item], [1], self.SIGMA)
+        # Scoring used to ignore the correlation: covariance [[1, 0], [0, .645]].
+        assert_allclose(state.theta, mean, atol=1e-12)
+        assert_allclose(state.covariance, covariance, atol=1e-12)
+        assert abs(state.covariance[0, 1]) > 0.4
+
+    @pytest.mark.parametrize("method", ["EAP", "MAP"])
+    def test_explicit_prior_is_used_in_every_update(self, method):
+        from mirt.scoring import fscores
+
+        model = _simple_structure_model()
+        engine = MCATEngine(
+            model,
+            scoring_method=method,
+            prior_mean=np.array([0.2, -0.1]),
+            prior_cov=self.SIGMA,
+            max_items=5,
+            min_items=5,
+        )
+        result = engine.run_simulation(np.zeros(2), lambda item, theta: item % 2)
+
+        assert_allclose(engine.initial_theta, [0.2, -0.1])
+        assert_allclose(engine.initial_covariance, self.SIGMA)
+        responses = np.full((1, model.n_items), -1)
+        responses[0, result.items_administered] = result.responses
+        reference = fscores(
+            model,
+            responses,
+            method=method,
+            n_quadpts=21,
+            prior_mean=np.array([0.2, -0.1]),
+            prior_cov=self.SIGMA,
+            bounds=(-4.0, 4.0),
+        )
+        assert_allclose(result.theta, reference.theta[0], atol=1e-6)
+
+    def test_fit_result_latent_covariance_is_the_default_prior(self):
+        from mirt.results.fit_result import FitResult
+
+        model = _simple_structure_model()
+        fit = FitResult(
+            model=model,
+            log_likelihood=0.0,
+            n_iterations=1,
+            converged=True,
+            standard_errors={},
+            aic=0.0,
+            bic=0.0,
+            latent_covariance=self.SIGMA,
+        )
+        engine = MCATEngine(fit, max_items=3)
+
+        assert engine.model is model
+        assert_allclose(engine.prior_cov, self.SIGMA)
+        assert_allclose(engine.initial_covariance, self.SIGMA)
+        item = engine.select_next_item()
+        state = engine.administer_item(0)
+        mean, covariance = self._reference(model, [item], [0], self.SIGMA)
+        assert_allclose(state.covariance, covariance, atol=1e-12)
+
+    def test_non_positive_definite_prior_is_rejected(self):
+        with pytest.raises(ValueError, match="positive definite"):
+            MCATEngine(
+                _simple_structure_model(), prior_cov=np.array([[1.0, 2.0], [2.0, 1.0]])
+            )
+
+    def test_docstring_workflow_with_a_two_factor_fit(self):
+        from mirt import fit_mirt
+
+        rng = np.random.default_rng(0)
+        data = (rng.random((200, 8)) < 0.6).astype(int)
+        fit = fit_mirt(data, model="2PL", n_factors=2, max_iter=5)
+        engine = MCATEngine(fit, trace_threshold=0.5, max_items=4)
+        state = engine.get_current_state()
+        while not state.is_complete:
+            state = engine.administer_item(int(state.next_item % 2))
+        assert "Correct:" in engine.get_result().summary()

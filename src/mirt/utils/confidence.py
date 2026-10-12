@@ -21,19 +21,40 @@ from mirt.utils.numeric import logsumexp
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 ParameterName = Literal["discrimination", "difficulty"]
+PLCIMethod = Literal["profile", "conditional"]
 ScoreCIMethod = Literal["wald", "likelihood"]
 
 _PARAMETER_NAMES = ("discrimination", "difficulty")
+_PLCI_METHODS = ("profile", "conditional")
 _SCORE_CI_METHODS = ("wald", "likelihood")
 _MIN_DISCRIMINATION = 1e-8
 _MAX_SEARCH_DISTANCE = 100.0
+# EM settings of profile refits. Each refit starts from the nearest profiled
+# solution, so a tight log-likelihood tolerance costs few iterations.
+_PROFILE_REFIT_TOL = 1e-6
+_PROFILE_REFIT_MAX_ITER = 1000
 
 
 @dataclass
 class PLCIResult:
-    """Result of a likelihood-drop interval for an item parameter."""
+    """Result of a likelihood-drop interval for an item parameter.
+
+    Attributes
+    ----------
+    log_likelihood : float
+        Maximized log-likelihood (log-posterior with item priors) at the
+        estimate, from which ``critical_drop`` is subtracted.
+    n_evaluations : int
+        Number of distinct parameter values evaluated; with
+        ``method="profile"``, the number of refits.
+    method : str
+        ``"profile"`` (other parameters refitted, or a supplied profile
+        callback) or ``"conditional"`` (other parameters held at their
+        estimates).
+    """
 
     param_name: str
     param_idx: int
@@ -46,10 +67,11 @@ class PLCIResult:
     critical_drop: float = np.nan
     n_evaluations: int = 0
     used_profile_callback: bool = False
+    method: str = "profile"
 
 
 def PLCI(
-    model: BaseItemModel,
+    model: BaseItemModel | FitResult,
     responses: ArrayLike,
     param_idx: int,
     param_name: ParameterName = "discrimination",
@@ -58,28 +80,77 @@ def PLCI(
     tol: float = 1e-3,
     n_quadpts: int = 21,
     profile_log_likelihood: Callable[[float], float] | None = None,
+    method: PLCIMethod = "profile",
 ) -> PLCIResult:
-    """Compute a likelihood-drop interval for an item parameter.
+    """Compute a profile-likelihood interval for an item parameter.
 
-    By default, nuisance parameters remain fixed at their fitted values and
-    the marginal likelihood is evaluated with Gauss-Hermite quadrature. A
-    caller that can refit a constrained model may provide
-    ``profile_log_likelihood`` to obtain a full profile-likelihood interval.
+    The interval holds the parameter values whose profile log-likelihood
+    lies within ``chi2(1).ppf(1 - alpha) / 2`` of its maximum, like
+    ``PLCI.mirt`` in the R package mirt.
 
+    Parameters
+    ----------
+    model : BaseItemModel or FitResult
+        Model fitted to ``responses``. A ``FitResult`` is refitted with the
+        estimator settings that produced it (its ``refit_recipe``: quadrature,
+        item priors and latent density), and a bare model with the default EM
+        estimator of its family.
+    responses : array-like of shape (n_persons, n_items)
+        Dichotomous responses the model was fitted to. Negative codes are
+        missing.
+    param_idx : int
+        Zero-based item index.
+    param_name : {"discrimination", "difficulty"}, default="discrimination"
+        Item parameter to profile.
+    alpha : float, default=0.05
+        One minus the confidence level.
+    max_iter : int, default=100
+        Iteration limit of the bracket expansion and of each root search.
+    tol : float, default=1e-3
+        Absolute tolerance of each interval bound.
+    n_quadpts : int, default=21
+        Gauss-Hermite points of the ``method="conditional"`` likelihood.
+    profile_log_likelihood : callable, optional
+        Function returning the profile log-likelihood at a parameter value.
+        It replaces the built-in refits of ``method="profile"``.
+    method : {"profile", "conditional"}, default="profile"
+        ``"profile"`` refits every other free parameter, and an estimated
+        latent density, at each candidate value, starting from the nearest
+        value already profiled, with the profiled coordinate fixed. An
+        interval typically takes 10-20 refits. ``"conditional"`` holds the other
+        parameters at their estimates and integrates over a standard normal
+        latent density. It is much faster, but ignores the uncertainty of the
+        other parameters, so its intervals are too narrow, often by 10-40%.
+
+    Returns
+    -------
+    PLCIResult
+        Interval bounds, which are infinite (zero for a discrimination's lower
+        bound) when the likelihood does not drop far enough within the search
+        range, and search diagnostics. The maximum ``log_likelihood`` is that
+        of the refit at the estimate, so it can slightly exceed the fit's own
+        when the fit stopped at a looser tolerance.
+
+    Notes
+    -----
     This utility currently supports scalar discrimination and difficulty
-    parameters from unidimensional dichotomous models. Missing responses must
-    use the package convention of a negative response code.
+    parameters from unidimensional dichotomous models. Fits with item priors
+    profile the log-posterior that they maximize.
     """
     from scipy import stats
 
-    _validate_interval_model(model)
+    from mirt.results.fit_result import FitResult
+
+    item_model = model.model if isinstance(model, FitResult) else model
+    _validate_interval_model(item_model)
     parameter = _validate_parameter_name(param_name)
-    item_index = _validate_item_index(param_idx, model.n_items)
+    interval_method = _validate_plci_method(method)
+    item_index = _validate_item_index(param_idx, item_model.n_items)
     alpha_value = validate_alpha(alpha)
     iterations = _validate_positive_integer(max_iter, "max_iter")
     tolerance = validate_positive_scalar(tol, "tol")
     quadrature_points = _validate_positive_integer(n_quadpts, "n_quadpts")
-    data = _validate_response_matrix(responses, model.n_items)
+    data = _validate_response_matrix(responses, item_model.n_items)
     if not np.any(data[:, item_index] >= 0):
         raise MirtDataError(
             "the selected item has no observed responses",
@@ -88,7 +159,7 @@ def PLCI(
             item_idx=item_index,
         )
 
-    parameters = model.parameters
+    parameters = item_model.parameters
     if parameter not in parameters:
         raise MirtValidationError(
             f"the model has no {parameter} parameter",
@@ -96,14 +167,14 @@ def PLCI(
             value=parameter,
         )
     parameter_values = np.asarray(parameters[parameter], dtype=np.float64)
-    if parameter_values.shape != (model.n_items,):
+    if parameter_values.shape != (item_model.n_items,):
         raise MirtValidationError(
             "PLCI requires one scalar parameter per item",
             parameter="param_name",
             value=parameter_values.shape,
-            expected=f"({model.n_items},)",
+            expected=f"({item_model.n_items},)",
         )
-    if parameter == "discrimination" and getattr(model, "model_name", "") == "1PL":
+    if parameter == "discrimination" and getattr(item_model, "model_name", "") == "1PL":
         raise MirtValidationError(
             "discrimination is fixed in a 1PL model",
             parameter="param_name",
@@ -129,6 +200,30 @@ def PLCI(
             "profile_log_likelihood must be callable",
             parameter="profile_log_likelihood",
         )
+    if profile_log_likelihood is not None and interval_method == "conditional":
+        raise MirtValidationError(
+            "profile_log_likelihood requires method='profile'",
+            parameter="method",
+            value=interval_method,
+        )
+    if (
+        not item_model.free_parameter_masks[parameter][item_index]
+        and interval_method == "profile"
+        and profile_log_likelihood is None
+    ):
+        raise MirtValidationError(
+            "the selected parameter is fixed, so it has no profile likelihood",
+            parameter="param_idx",
+            value=item_index,
+        )
+
+    if profile_log_likelihood is None and interval_method == "profile":
+        profile_log_likelihood = _refitted_profile(
+            model, item_model, data, item_index, parameter
+        )
+        used_callback = False
+    else:
+        used_callback = profile_log_likelihood is not None
 
     if profile_log_likelihood is None:
         from mirt.estimation.quadrature import GaussHermiteQuadrature
@@ -153,7 +248,7 @@ def PLCI(
             return -np.inf
 
         if profile_log_likelihood is None:
-            candidate_model = model.copy()
+            candidate_model = item_model.copy()
             candidate_model.set_item_parameter(item_index, parameter, key)
             value = _marginal_log_likelihood(
                 candidate_model,
@@ -166,7 +261,9 @@ def PLCI(
                 value = float(profile_log_likelihood(key))
             except (TypeError, ValueError, ArithmeticError) as exc:
                 raise MirtEstimationError(
-                    "profile_log_likelihood failed",
+                    "profile_log_likelihood failed"
+                    if used_callback
+                    else "the profile refit failed",
                     parameter_value=key,
                 ) from exc
 
@@ -223,8 +320,53 @@ def PLCI(
         log_likelihood=maximum_ll,
         critical_drop=critical_drop,
         n_evaluations=len(cache),
-        used_profile_callback=profile_log_likelihood is not None,
+        used_profile_callback=used_callback,
+        method=interval_method,
     )
+
+
+def _refitted_profile(
+    model_or_result: BaseItemModel | FitResult,
+    item_model: BaseItemModel,
+    responses: NDArray[np.int_],
+    item_index: int,
+    parameter: str,
+) -> Callable[[float], float]:
+    """Return the profile log-likelihood of one item parameter by refitting.
+
+    Each call fixes the coordinate at the requested value and refits every
+    other free coordinate, starting from the profiled solution nearest that
+    value (the supplied estimates for the first call). The estimator is the
+    one that produced a ``FitResult``, or the default EM estimator of a bare
+    model's family. Returns the maximized log-posterior of fits with item
+    priors and the log-likelihood otherwise.
+    """
+    from mirt.estimation._refit import em_estimator_for
+
+    masks = item_model.free_parameter_masks
+    masks[parameter] = masks[parameter].copy()
+    masks[parameter][item_index] = False
+    solutions: dict[float, BaseItemModel] = {}
+
+    def profile(value: float) -> float:
+        nearest = min(solutions, key=lambda known: abs(known - value), default=None)
+        start = (item_model if nearest is None else solutions[nearest]).copy()
+        start.set_item_parameter(item_index, parameter, value)
+        start.set_free_parameter_masks(masks)
+        estimator = em_estimator_for(
+            model_or_result,
+            tol=_PROFILE_REFIT_TOL,
+            max_iter=_PROFILE_REFIT_MAX_ITER,
+            compute_standard_errors=False,
+            verbose=False,
+        )
+        result = estimator.fit(start, responses, start="model")
+        solutions[value] = result.model
+        if result.log_posterior is not None:
+            return float(result.log_posterior)
+        return float(result.log_likelihood)
+
+    return profile
 
 
 def score_CI(
@@ -598,6 +740,17 @@ def _validate_parameter_name(param_name: str) -> str:
             expected=", ".join(_PARAMETER_NAMES),
         )
     return param_name
+
+
+def _validate_plci_method(method: str) -> str:
+    if method not in _PLCI_METHODS:
+        raise MirtValidationError(
+            "Unknown profile-likelihood interval method",
+            parameter="method",
+            value=method,
+            expected=", ".join(_PLCI_METHODS),
+        )
+    return method
 
 
 def _validate_score_method(method: str) -> str:

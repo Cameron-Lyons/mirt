@@ -296,3 +296,161 @@ def test_fit_cdm_preserves_monotonic_item_probabilities(
     )
 
     assert np.all(1.0 - model.slip > model.guess)  # type: ignore[attr-defined]
+
+
+def _skewed_dina_data(
+    seed: int = 8, n_persons: int = 3000
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Simulate DINA responses with slip and guess 0.2 and a skewed class law."""
+    rng = np.random.default_rng(seed)
+    base = np.array(
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1]]
+    )
+    q_matrix = np.vstack([base, base[:5]])
+    patterns = (np.arange(8)[:, None] >> np.arange(3)) & 1
+    prior = np.array([0.40, 0.02, 0.02, 0.06, 0.02, 0.06, 0.02, 0.40])
+    alpha = patterns[rng.choice(8, n_persons, p=prior)]
+    ideal = np.all(alpha[:, None, :] >= q_matrix[None], axis=2)
+    responses = (rng.random(ideal.shape) < np.where(ideal, 0.8, 0.2)).astype(int)
+    return responses, q_matrix, alpha
+
+
+def test_fitted_model_classifies_with_estimated_class_probabilities() -> None:
+    """MAP classification defaults to the fitted, strongly skewed prior."""
+    responses, q_matrix, alpha = _skewed_dina_data()
+
+    model, class_probabilities = fit_cdm(responses, q_matrix)
+
+    accuracy = {
+        method: np.mean(
+            np.all(model.classify_respondents(responses, method=method) == alpha, 1)
+        )
+        for method in ("MLE", "MAP")
+    }
+    # A uniform default prior made MAP identical to MLE (accuracy 0.697);
+    # the fitted prior gives 0.872.
+    assert accuracy["MAP"] > accuracy["MLE"] + 0.1
+    np.testing.assert_array_equal(model.class_probabilities, class_probabilities)
+    np.testing.assert_array_equal(
+        model.classify_respondents(responses, method="MAP"),
+        model.classify_respondents(
+            responses, method="MAP", pattern_prior=class_probabilities
+        ),
+    )
+    np.testing.assert_allclose(
+        model.attribute_marginals(responses),
+        model.attribute_marginals(responses, class_probabilities),
+    )
+    copied = model.copy()
+    np.testing.assert_array_equal(copied.class_probabilities, class_probabilities)
+    assert DINA(12, 3, q_matrix).class_probabilities is None
+
+
+def test_fit_cdm_returns_result_that_still_unpacks() -> None:
+    responses, q_matrix, _ = _skewed_dina_data(seed=3, n_persons=400)
+
+    result = fit_cdm(responses, q_matrix, max_iter=500)
+    model, class_probabilities = result
+
+    assert result[0] is model and result[1] is class_probabilities
+    expected_ll = np.sum(
+        np.log(np.exp(model.pattern_log_likelihoods(responses)) @ class_probabilities)
+    )
+    np.testing.assert_allclose(result.log_likelihood, expected_ll)
+    assert result.n_parameters == 24 + 7
+    np.testing.assert_allclose(result.aic, -2 * expected_ll + 2 * 31)
+    np.testing.assert_allclose(result.bic, -2 * expected_ll + 31 * np.log(400))
+    assert result.converged and result.n_iterations < 500
+    stopped = fit_cdm(responses, q_matrix, max_iter=1)
+    assert not stopped.converged and stopped.n_iterations == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "reduced"),
+    [("GDINA", "saturated"), ("acdm", "ACDM"), (" LLM", "LLM"), ("RRUM", "RRUM")],
+)
+def test_fit_cdm_routes_gdina_models(
+    q_matrix: np.ndarray, name: str, reduced: str
+) -> None:
+    from mirt.models.cdm_advanced import GDINA
+
+    responses = np.random.default_rng(4).integers(0, 2, size=(60, 6))
+
+    model, _ = fit_cdm(responses, q_matrix, model=name, max_iter=3)
+
+    assert isinstance(model, GDINA)
+    assert model.reduced_models == [reduced] * 6
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"tol": True}, "tol"),
+        ({"responses": [[0, -1], [1, -1]], "q_matrix": np.eye(2)}, "observed"),
+    ],
+)
+def test_fit_cdm_validates_like_fit_gdina(
+    kwargs: dict[str, object], message: str
+) -> None:
+    arguments: dict[str, object] = {"responses": [[0, 1]], "q_matrix": np.eye(2)}
+    arguments.update(kwargs)
+    with pytest.raises(ValueError, match=message):
+        fit_cdm(**arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("model_name", ["DINA", "DINO"])
+def test_fit_cdm_imposes_attribute_hierarchy(
+    q_matrix: np.ndarray, model_name: str
+) -> None:
+    from mirt.models.cdm_advanced import AttributeHierarchy
+
+    hierarchy = AttributeHierarchy(
+        adjacency=np.array([[0, 1, 0], [0, 0, 1], [0, 0, 0]])
+    )
+    responses = np.random.default_rng(6).integers(0, 2, size=(150, 6))
+
+    result = fit_cdm(responses, q_matrix, model=model_name, hierarchy=hierarchy)
+
+    valid = np.array(
+        [hierarchy.is_valid_pattern(row) for row in result.model.attribute_patterns]
+    )
+    assert np.all(result.class_probabilities[~valid] == 0.0)
+    assert result.n_parameters == result.model.n_parameters + int(valid.sum()) - 1
+    classified = result.model.classify_respondents(responses)
+    assert all(hierarchy.is_valid_pattern(row) for row in classified)
+
+
+def test_simulate_draws_from_pattern_probabilities(q_matrix: np.ndarray) -> None:
+    model = DINA(n_items=6, n_attributes=3, q_matrix=q_matrix)
+    model.set_parameters(slip=np.linspace(0.05, 0.3, 6), guess=np.full(6, 0.2))
+    prior = np.array([0.3, 0.0, 0.1, 0.1, 0.2, 0.0, 0.1, 0.2])
+
+    alpha = model.sample_attribute_patterns(20_000, seed=1, class_probabilities=prior)
+    responses = model.simulate(alpha, seed=2)
+
+    codes = alpha @ (2 ** np.arange(3))
+    np.testing.assert_allclose(
+        np.bincount(codes, minlength=8) / 20_000, prior, atol=0.01
+    )
+    assert responses.shape == (20_000, 6)
+    np.testing.assert_allclose(
+        responses.mean(axis=0), (model.probability(alpha)).mean(axis=0), atol=0.015
+    )
+    np.testing.assert_array_equal(model.simulate(alpha[:50], seed=2), responses[:50])
+    with pytest.raises(ValueError, match="n_persons"):
+        model.sample_attribute_patterns(-1)
+
+
+def test_cdm_fitting_api_is_exported() -> None:
+    import mirt
+    from mirt.models.cdm import CDMResult
+    from mirt.models.cdm_advanced import (
+        AttributeHierarchy,
+        fit_gdina,
+        fit_higher_order_cdm,
+    )
+
+    assert mirt.fit_gdina is fit_gdina
+    assert mirt.fit_higher_order_cdm is fit_higher_order_cdm
+    assert mirt.AttributeHierarchy is AttributeHierarchy
+    assert mirt.CDMResult is CDMResult

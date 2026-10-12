@@ -5,14 +5,12 @@ import pytest
 from scipy.special import logsumexp
 
 import mirt
-import mirt.backends.rust.estimation as rust_estimation
-from mirt.backends.rust._helpers import RUST_AVAILABLE
 from mirt.estimation.bl import BLEstimator
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.gvem import GVEMEstimator
 from mirt.estimation.mcem import MCEMEstimator, QMCEMEstimator, StochasticEMEstimator
 from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
-from mirt.estimation.quadrature import GaussHermiteQuadrature
+from mirt.estimation.quadrature import build_quadrature, default_quadpts
 from mirt.estimation.sparse_bayesian import SparseBayesianEstimator
 from mirt.estimation.weighted import WeightedEMEstimator
 from mirt.exceptions import MirtValidationError
@@ -38,8 +36,9 @@ def _fixed_model():
     return model.set_free_parameter_masks({"discrimination": mask})
 
 
-def _marginal_log_likelihood(model, responses, n_quadpts=21):
-    quadrature = GaussHermiteQuadrature(n_quadpts)
+def _marginal_log_likelihood(model, responses):
+    # The default EM grid of one factor.
+    quadrature = build_quadrature(default_quadpts(1), 1)
     log_joint = model.log_likelihood_batch(responses, quadrature.nodes) + np.log(
         quadrature.weights
     )
@@ -55,9 +54,17 @@ def _marginal_log_likelihood(model, responses, n_quadpts=21):
         MCEMEstimator(n_samples=50, max_iter=3, seed=1),
         QMCEMEstimator(n_samples=64, max_iter=3, seed=1),
         StochasticEMEstimator(max_iter=3, seed=1),
+        # The native 2PL kernels ignore masks, so masked models avoid them.
+        MHRMEstimator(n_cycles=40, burnin=10, seed=1, use_rust=True),
+        MHRMEstimator(n_cycles=40, burnin=10, seed=1, use_rust=False),
+        GibbsSampler(n_iter=40, burnin=10, seed=1, use_rust=True),
+        GibbsSampler(n_iter=40, burnin=10, seed=1, use_rust=False),
     ],
-    ids=lambda estimator: type(estimator).__name__,
+    ids=lambda estimator: (
+        f"{type(estimator).__name__}-{getattr(estimator, 'use_rust', '')}"
+    ),
 )
+@pytest.mark.filterwarnings("ignore:MHRM stopped:RuntimeWarning")
 def test_fixed_coordinates_survive_fitting(estimator, responses):
     model = _fixed_model()
     result = estimator.fit(model, responses)
@@ -69,14 +76,10 @@ def test_fixed_coordinates_survive_fitting(estimator, responses):
 @pytest.mark.parametrize(
     "make_estimator",
     [
-        lambda: MHRMEstimator(n_cycles=5, burnin=2, use_rust=True),
-        lambda: MHRMEstimator(n_cycles=5, burnin=2, use_rust=False),
-        lambda: GibbsSampler(n_iter=5, burnin=2, use_rust=True),
-        lambda: GibbsSampler(n_iter=5, burnin=2, use_rust=False),
         lambda: GVEMEstimator(max_iter=5),
         lambda: SparseBayesianEstimator(k_max=1, max_iter=5),
     ],
-    ids=["mhrm-native", "mhrm-numpy", "gibbs-native", "gibbs-numpy", "gvem", "ssl"],
+    ids=["gvem", "ssl"],
 )
 def test_estimators_that_move_fixed_coordinates_reject_masks(make_estimator, responses):
     model = _fixed_model()
@@ -183,11 +186,7 @@ def test_other_estimators_honor_start(estimator, responses, monkeypatch):
     np.testing.assert_array_equal(seen[2], 1.0)
 
 
-def test_fit_mirt_start_values_and_fixed_hold_coordinates(responses, monkeypatch):
-    def native_fit(*args, **kwargs):
-        raise AssertionError("the native 2PL fast path ignores user values")
-
-    monkeypatch.setattr(rust_estimation, "_em_fit_2pl_prepared", native_fit)
+def test_fit_mirt_start_values_and_fixed_hold_coordinates(responses):
     start = np.full(_N_ITEMS, 1.2)
     start[0] = 2.25
     fixed = np.zeros(_N_ITEMS, dtype=bool)
@@ -204,25 +203,15 @@ def test_fit_mirt_start_values_and_fixed_hold_coordinates(responses, monkeypatch
     assert np.all(result.standard_errors["discrimination"][1:] > 0.0)
 
 
-@pytest.mark.skipif(not RUST_AVAILABLE, reason="native 2PL EM is unavailable")
-def test_fit_mirt_keeps_the_native_path_without_effective_restrictions(
-    responses, monkeypatch
-):
-    calls = []
-    native = rust_estimation._em_fit_2pl_prepared
-
-    def record(*args, **kwargs):
-        calls.append(True)
-        return native(*args, **kwargs)
-
-    monkeypatch.setattr(rust_estimation, "_em_fit_2pl_prepared", record)
-    mirt.fit_mirt(
-        responses,
-        fixed={"difficulty": False},
-        priors={},
-        compute_standard_errors=False,
+def test_fit_mirt_ignores_restrictions_that_restrict_nothing(responses):
+    options = {"compute_standard_errors": False, "quadrature": "gauss-hermite"}
+    plain = mirt.fit_mirt(responses, **options)
+    restricted = mirt.fit_mirt(
+        responses, fixed={"difficulty": False}, priors={}, **options
     )
-    assert calls == [True]
+    assert restricted.n_iterations == plain.n_iterations
+    for name, values in plain.model.parameters.items():
+        np.testing.assert_array_equal(restricted.model.parameters[name], values)
 
 
 def test_fit_mirt_scalar_fixed_mask_fixes_a_whole_parameter(responses):
@@ -253,11 +242,20 @@ def test_fit_mirt_rejects_invalid_fixed_masks(responses, fixed, message):
         mirt.fit_mirt(responses, fixed=fixed)
 
 
-def test_fit_mirt_samplers_reject_fixed_and_honor_start_values(responses, monkeypatch):
-    with pytest.raises(MirtValidationError, match="set_free_parameter_masks"):
-        mirt.fit_mirt(
-            responses, estimation="MHRM", max_iter=5, fixed={"discrimination": True}
+@pytest.mark.filterwarnings("ignore:MHRM stopped:RuntimeWarning")
+def test_fit_mirt_samplers_hold_fixed_and_honor_start_values(responses, monkeypatch):
+    # The samplers used to reject masks; they now hold the coordinates.
+    for estimation in ("MHRM", "MCMC"):
+        result = mirt.fit_mirt(
+            responses,
+            estimation=estimation,
+            max_iter=40,
+            fixed={"discrimination": True},
         )
+        np.testing.assert_array_equal(
+            result.model.parameters["discrimination"], np.ones(_N_ITEMS)
+        )
+        assert result.n_parameters == _N_ITEMS
 
     seen = {}
     original = MHRMEstimator.fit

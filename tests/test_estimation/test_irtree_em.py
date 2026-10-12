@@ -191,16 +191,43 @@ def test_fit_reports_final_state_covariance_and_parameter_uncertainty() -> None:
         assert np.all(np.isfinite(parameter_se))
         assert np.all(parameter_se > 0.0)
 
+    # Trait means and variances are fixed; only the correlations are free.
     expected_parameters = (
-        2 * model.n_items * model.n_nodes
-        + model.n_traits
-        + model.n_traits * (model.n_traits + 1) // 2
+        2 * model.n_items * model.n_nodes + model.n_traits * (model.n_traits - 1) // 2
     )
-    assert result.n_parameters == expected_parameters
+    assert result.n_parameters == expected_parameters == model.n_parameters
+    np.testing.assert_array_equal(result.trait_means, np.zeros(model.n_traits))
+    np.testing.assert_allclose(np.diag(result.trait_covariance), 1.0)
     for trait_idx in range(model.n_traits):
         assert f"Variance: {result.trait_covariance[trait_idx, trait_idx]:>8.4f}" in (
             result.trait_summary()
         )
+
+
+def test_free_slopes_fix_trait_scale_and_estimate_only_correlations() -> None:
+    rng = np.random.default_rng(3)
+    correlation = np.array([[1.0, 0.4], [0.4, 1.0]])
+    generating_model = IRTreeModel(n_items=6, tree_spec="direction_intensity")
+    generating_model.set_parameters(
+        discrimination=rng.uniform(0.8, 2.0, (6, generating_model.n_nodes)),
+        difficulty=rng.normal(0.0, 0.8, (6, generating_model.n_nodes)),
+    )
+    theta = rng.multivariate_normal(np.zeros(2), correlation, size=500)
+    responses = generating_model.simulate(theta, seed=4)
+    model = IRTreeModel(n_items=6, tree_spec="direction_intensity")
+    estimator = IRTreeEMEstimator(n_quadpts=7, tol=1e-6)
+
+    result = estimator.fit(model, responses)
+
+    # Free slopes and locations leave the trait scale unidentified, which
+    # used to let free means and variances drift without converging.
+    assert result.converged
+    np.testing.assert_array_equal(result.trait_means, np.zeros(2))
+    np.testing.assert_allclose(np.diag(result.trait_covariance), 1.0)
+    np.testing.assert_allclose(result.trait_covariance, result.trait_correlations)
+    assert result.n_parameters == model.n_parameters == 2 * 6 * model.n_nodes + 1
+    assert np.all(np.diff(estimator.convergence_history) > -1e-8)
+    assert result.trait_correlations[0, 1] == pytest.approx(0.4, abs=0.15)
 
 
 def test_uncorrelated_model_keeps_fixed_identity_distribution() -> None:
@@ -325,19 +352,21 @@ def test_marginal_grid_m_step_matches_full_product_grid(
     full = fit()
 
     assert collapsed.n_iterations == full.n_iterations == 20
+    # The correlation M-step is iterative, so rounding differences between
+    # the grids reach the nearly flat node objectives of the constant item.
     np.testing.assert_allclose(
-        collapsed.log_likelihood, full.log_likelihood, rtol=0.0, atol=1e-8
+        collapsed.log_likelihood, full.log_likelihood, rtol=0.0, atol=1e-7
     )
     for name in collapsed.model._parameters:
         np.testing.assert_allclose(
             collapsed.model._parameters[name],
             full.model._parameters[name],
             rtol=0.0,
-            atol=1e-6,
+            atol=1e-5,
         )
         np.testing.assert_allclose(
             collapsed.standard_errors[name],
             full.standard_errors[name],
-            rtol=1e-6,
+            rtol=1e-5,
             atol=1e-9,
         )

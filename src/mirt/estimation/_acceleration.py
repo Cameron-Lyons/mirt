@@ -144,14 +144,24 @@ class FreeItemParameters:
 def _keeps_threshold_order(
     model: BaseItemModel, updates: dict[str, NDArray[np.float64]]
 ) -> bool:
-    """Require graded thresholds to stay ordered like the current iterate."""
+    """Require graded thresholds to stay ordered like the current iterate.
+
+    Graded bifactor items store decreasing intercepts, the negated thresholds.
+    """
+    from mirt.models.bifactor import GradedBifactorModel
     from mirt.models.polytomous import GradedResponseModel
 
-    if not isinstance(model, GradedResponseModel) or "thresholds" not in updates:
+    if isinstance(model, GradedResponseModel):
+        stored, orientation = "thresholds", 1.0
+    elif isinstance(model, GradedBifactorModel):
+        stored, orientation = "intercepts", -1.0
+    else:
+        return True
+    if stored not in updates:
         return True
     n_gaps = np.asarray(model.n_categories) - 2
-    current = np.diff(model.parameters["thresholds"], axis=1)
-    proposed = np.diff(updates["thresholds"], axis=1)
+    current = orientation * np.diff(model.parameters[stored], axis=1)
+    proposed = orientation * np.diff(updates[stored], axis=1)
     used = np.arange(current.shape[1]) < n_gaps[:, None]
     required = np.minimum(THRESHOLD_GAP, current)
     return bool(np.all(proposed[used] >= required[used]))

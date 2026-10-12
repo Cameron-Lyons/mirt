@@ -153,6 +153,42 @@ class TestGVEMEstimator:
         assert model.is_fitted
         assert np.allclose(model.discrimination, 1.0)
 
+    def test_1pl_fit_matches_across_backends(self, dichotomous_responses):
+        """Every backend updates 1PL intercepts with the unit slopes."""
+        import mirt
+
+        responses = dichotomous_responses["responses"].copy()
+        responses[np.random.default_rng(4).random(responses.shape) < 0.2] = -1
+        results = {}
+        previous = mirt.get_backend()
+        try:
+            for backend in ("numpy", "auto"):
+                mirt.set_backend(backend)
+                model = OneParameterLogistic(n_items=responses.shape[1])
+                estimator = GVEMEstimator(max_iter=300, tol=1e-8, use_gpu=False)
+                results[backend] = estimator.fit(model, responses)
+        finally:
+            mirt.set_backend(previous)
+
+        numpy_fit, auto_fit = results["numpy"], results["auto"]
+        np.testing.assert_allclose(
+            auto_fit.model.difficulty, numpy_fit.model.difficulty, atol=1e-10
+        )
+        assert auto_fit.n_iterations == numpy_fit.n_iterations
+        assert auto_fit.elbo == pytest.approx(numpy_fit.elbo, abs=1e-8)
+
+    def test_rejects_estimated_common_slope(self, dichotomous_responses):
+        """The closed-form M-step would give every item its own slope."""
+        from mirt.exceptions import MirtModelError
+
+        responses = dichotomous_responses["responses"]
+        n_items = dichotomous_responses["n_items"]
+        model = OneParameterLogistic(n_items=n_items, estimate_discrimination=True)
+
+        with pytest.raises(MirtModelError, match="keeps equal across items"):
+            GVEMEstimator(max_iter=5).fit(model, responses)
+        assert not model.is_fitted
+
     def test_unsupported_model(self, dichotomous_responses):
         """Test that unsupported models raise an error."""
         from mirt.models.dichotomous import ThreeParameterLogistic
@@ -229,3 +265,94 @@ class TestGVEMEstimator:
 
         assert lam[1] < lam[0]
         assert lam[2] < lam[1]
+
+
+@pytest.fixture(scope="module")
+def two_pl_data():
+    import mirt
+
+    return mirt.simdata(n_persons=600, n_items=12, seed=11)
+
+
+def _quadrature_marginal(model, responses, n_points=81):
+    from mirt.estimation.quadrature import GaussHermiteQuadrature
+    from mirt.utils.numeric import logsumexp
+
+    quadrature = GaussHermiteQuadrature(n_points=n_points, n_dimensions=1)
+    log_likelihood = np.column_stack(
+        [model.log_likelihood(responses, point[None]) for point in quadrature.nodes]
+    )
+    return float(np.sum(logsumexp(log_likelihood + np.log(quadrature.weights), axis=1)))
+
+
+class TestGVEMReporting:
+    """The ELBO is not a likelihood, and its curvature is not information."""
+
+    def test_log_likelihood_is_marginal_and_elbo_is_separate(self, two_pl_data):
+        from mirt.estimation.gvem import GVEMResult
+
+        result = GVEMEstimator(use_gpu=False).fit(
+            TwoParameterLogistic(n_items=12), two_pl_data
+        )
+
+        expected = _quadrature_marginal(result.model, two_pl_data)
+        assert isinstance(result, GVEMResult)
+        assert result.log_likelihood == pytest.approx(expected, abs=0.05)
+        assert result.elbo < result.log_likelihood - 1.0
+        assert result.aic == pytest.approx(
+            -2 * result.log_likelihood + 2 * result.n_parameters
+        )
+        assert result.bic == pytest.approx(
+            -2 * result.log_likelihood + result.n_parameters * np.log(600)
+        )
+
+    def test_unidimensional_errors_use_observed_information(self, two_pl_data):
+        from mirt.estimation.em import EMEstimator
+
+        result = GVEMEstimator(use_gpu=False).fit(
+            TwoParameterLogistic(n_items=12), two_pl_data
+        )
+        reference = EMEstimator(se_method="oakes").fit(
+            TwoParameterLogistic(n_items=12), two_pl_data
+        )
+
+        assert result.se_method == "oakes"
+        assert result.vcov is not None and result.vcov.shape == (24, 24)
+        np.testing.assert_allclose(
+            np.sqrt(np.diag(result.vcov)),
+            np.concatenate(
+                [
+                    result.standard_errors["discrimination"],
+                    result.standard_errors["difficulty"],
+                ]
+            ),
+        )
+        for name in ("discrimination", "difficulty"):
+            ratio = result.standard_errors[name] / reference.standard_errors[name]
+            # GVEM's smaller slopes have somewhat smaller errors; the fixed
+            # variational curvature reported before was up to 6 times smaller.
+            assert np.all((ratio > 0.5) & (ratio < 1.4))
+
+    def test_multidimensional_errors_are_labelled_variational(self, rng):
+        responses = rng.integers(0, 2, (150, 6))
+        result = GVEMEstimator(max_iter=20, use_gpu=False).fit(
+            TwoParameterLogistic(n_items=6, n_factors=2), responses
+        )
+
+        assert result.se_method == "variational_curvature"
+        assert result.vcov is None
+        assert np.isfinite(result.elbo)
+
+    def test_fixed_prior_is_recorded_as_latent_population(self, two_pl_data):
+        prior_mean = np.array([0.3])
+        prior_cov = np.array([[1.5]])
+
+        result = GVEMEstimator(max_iter=30, use_gpu=False).fit(
+            TwoParameterLogistic(n_items=12),
+            two_pl_data,
+            prior_mean=prior_mean,
+            prior_cov=prior_cov,
+        )
+
+        np.testing.assert_array_equal(result.latent_mean, prior_mean)
+        np.testing.assert_array_equal(result.latent_covariance, prior_cov)

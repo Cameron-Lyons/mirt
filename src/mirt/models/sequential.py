@@ -16,8 +16,13 @@ from mirt._categorical import (
 )
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
-from mirt.exceptions import MirtValidationError
-from mirt.models.base import PolytomousItemModel, _AtomicParameterState
+from mirt.exceptions import MirtIndexError, MirtValidationError
+from mirt.models.base import (
+    PolytomousItemModel,
+    _AtomicParameterState,
+    validate_category_index,
+)
+from mirt.models.polytomous import _score_variance
 
 
 def _safe_sigmoid(values: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -174,20 +179,11 @@ class _OrdinalLogitModel(_AtomicParameterState, PolytomousItemModel):
         super().set_item_parameter(item_idx, param_name, value)
 
     def _validate_category(self, item_idx: int, category: int) -> int:
-        if isinstance(category, bool) or not isinstance(category, (int, np.integer)):
-            raise MirtValidationError(
-                "category must be an integer",
-                parameter="category",
-                value=category,
-                expected="integer",
-            )
-        category = int(category)
-        n_categories = self._n_categories[item_idx]
-        if category < 0 or category >= n_categories:
-            raise IndexError(
-                f"Category {category} out of range [0, {n_categories}) for item {item_idx}"
-            )
-        return category
+        """Return ``category`` checked against item ``item_idx``'s categories.
+
+        See :func:`~mirt.models.base.validate_category_index`.
+        """
+        return validate_category_index(category, self._n_categories[item_idx])
 
     def _prepare_theta(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         theta_2d = self._ensure_theta_2d(theta)
@@ -429,8 +425,9 @@ class _SequentialProcessModel(_OrdinalLogitModel):
         item_idx = self._validate_item_index(item_idx)
         step_idx = self._validate_category(item_idx, step_idx)
         if step_idx == self._n_categories[item_idx] - 1:
-            raise IndexError(
-                f"Step {step_idx} out of range [0, {self._n_categories[item_idx] - 1})"
+            raise MirtIndexError(
+                f"Step {step_idx} out of range [0, {self._n_categories[item_idx] - 1})",
+                parameter="step_idx",
             )
         return self._item_step_probabilities(theta_1d, item_idx)[:, step_idx]
 
@@ -594,8 +591,7 @@ class AdjacentCategoryModel(_OrdinalLogitModel):
         self,
         theta: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        probabilities = self._all_probabilities(theta)
-        categories = np.arange(self.max_categories)[None, None, :]
-        expected = np.sum(probabilities * categories, axis=2)
-        variance = np.sum(probabilities * categories**2, axis=2) - expected**2
+        # The centered score variance cannot cancel below zero in the tails,
+        # where E[k^2] - E[k]^2 loses all precision.
+        variance = _score_variance(self._all_probabilities(theta))
         return self.discrimination[None, :] ** 2 * variance

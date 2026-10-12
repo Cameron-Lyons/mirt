@@ -33,6 +33,8 @@ _LAZY_IMPORTS = {
     "LeaveOneOut": "mirt.utils.cv",
     "Scorer": "mirt.utils.cv",
     "LogLikelihoodScorer": "mirt.utils.cv",
+    "PluginLogLikelihoodScorer": "mirt.utils.cv",
+    "AbilityRMSEScorer": "mirt.utils.cv",
     "AICScorer": "mirt.utils.cv",
     "BICScorer": "mirt.utils.cv",
     "fit_models": "mirt.utils.batch",

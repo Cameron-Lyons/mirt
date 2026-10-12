@@ -8,11 +8,11 @@ plotting package.
 Item parameter standard errors
 ------------------------------
 
-EM fits of unidimensional 1PL-4PL, GRM, GPCM and PCM models report
-observed-information standard errors by default. The information is the
-negative Hessian of the marginal log-likelihood, computed exactly from Louis's
-(1982) missing-information identity, which is also the target of the Oakes
-(1999) method. The fit also stores the covariance of the free parameters:
+EM fits report observed-information standard errors by default. The
+information is the negative Hessian of the marginal log-likelihood, computed
+exactly from Louis's (1982) missing-information identity, which is also the
+target of the Oakes (1999) method. The fit also stores the covariance of the
+free parameters:
 
 .. code-block:: python
 
@@ -32,27 +32,49 @@ Select another estimator with ``se_method`` on ``fit_mirt`` or
 * ``"complete_data"``: itemwise curvature of the expected complete-data
   likelihood. It omits the information lost to the unobserved latent trait
   and covariances between parameters, so it understates uncertainty, often by
-  20-60%. It does not produce a covariance matrix.
+  20-60% for unidimensional models and two- to fivefold for nominal and
+  multidimensional ones. It does not produce a covariance matrix.
 
-The default ``"auto"`` uses ``"oakes"`` for unidimensional 1PL-4PL, GRM,
-GPCM, PCM, RSM and GRSM items, whose item derivatives have closed forms, and
-``"complete_data"`` for other item models.
+The default ``"auto"`` uses ``"oakes"`` for every model whose likelihood is a
+product of item curves with exact item-local derivatives.
+Unidimensional 1PL-4PL, GRM, GPCM, PCM, RSM and GRSM items have closed-form
+derivatives; the other models difference each item's own curve, which gives
+the same exact information: nominal, multidimensional (including
+model-syntax fits), bifactor, 5PL, complementary and negative log-log,
+unipolar log-logistic, compensatory-logic, nested-logit, monotone
+polynomial and spline, sequential, continuation-ratio, adjacent-category,
+GGUM, ideal-point, hyperbolic cosine, zero-inflated and hurdle models,
+:class:`~mirt.models.custom.CustomItemModel` and mixed-format tests of
+them. Testlet models, which ``EMEstimator`` fits by the dimension reduction
+of ``BifactorEMEstimator``, get the exact observed information from the
+reduced posteriors there. Testlet models kept on the product grid by another
+option, and estimator subclasses that replace the E-step likelihood, get
+``"complete_data"`` from ``"auto"``; an explicit ``"oakes"`` differences
+their marginal likelihood instead, which takes O(P^2) likelihood evaluations
+for P parameters.
 For EM, Bock-Lieberman and MH-RM fits, ``result.se_method`` names the
 estimator used, so check it before relying on the errors; it is ``None`` for
-estimators that do not record one. An explicit ``"oakes"`` also works for
-those models. Every built-in model whose likelihood is a product of item
-curves still gets the exact information by differencing each item's own
-curve: nominal, multidimensional (including model-syntax fits), bifactor,
-5PL, complementary and negative log-log, unipolar log-logistic,
-compensatory-logic, nested-logit, monotone polynomial and spline,
-sequential, continuation-ratio, adjacent-category, GGUM, ideal-point,
-hyperbolic cosine, zero-inflated and hurdle models. Custom, testlet and
-mixture models difference the marginal likelihood instead, which takes
-O(P^2) likelihood evaluations for P parameters. Exploratory
-multidimensional solutions are rotationally unidentified, so their
-information matrix is singular. MH-RM fits report ``"oakes"`` for the
-closed-form families and otherwise ``"mhrm_iterate_sd"``, the spread of the
-Robbins-Monro iterates, which is not a standard error.
+estimators that do not record one.
+
+Exploratory multidimensional solutions are rotationally unidentified, so
+their information matrix is singular. Their ``n_parameters``, and hence AIC,
+BIC and likelihood-ratio degrees of freedom, leave out the ``F(F - 1) / 2``
+rotation angles of ``F`` factors, as R mirt does by fixing the upper
+triangle of the first ``F - 1`` items' slopes at zero. The matrix estimators
+hold those slopes at their estimates instead, with ``NaN`` standard errors,
+and report the errors of the other parameters for that rotation. MH-RM fits
+report ``"oakes"`` for the closed-form unidimensional families and otherwise
+``"mhrm_iterate_sd"``, the spread of the Robbins-Monro iterates, which is not
+a standard error.
+
+``WeightedEMEstimator`` fits with survey weights default to the design-based
+sandwich (``se_method="sandwich"``, Binder, 1983): the weighted observed
+information around the cross-product of the persons' marginal scores weighted
+by the squared survey weights. It is invariant to the normalization of the
+weights but ignores clustering and stratification. Its ``"oakes"`` and
+``"crossprod"`` treat the weights as frequency weights, which reproduces the
+errors of the expanded data for integer weights with
+``normalize_weights=False``.
 
 The matrix estimators treat the latent density as fixed, which slightly
 understates uncertainty when its mean, variance or shape is estimated.
@@ -62,8 +84,8 @@ errors are conditional on them. The cost grows as N Q P^2 for N distinct
 response patterns, Q quadrature nodes and P parameters; dichotomous models
 use a factorization that reduces it to N Q J^2 for J items.
 ``BLEstimator`` inverts the full Hessian of its marginal likelihood, exact for
-the built-in models above and differenced over every pair of parameters for
-custom models, and labels its results ``"hessian"``.
+the models above and differenced over every pair of parameters for other
+models, and labels its results ``"hessian"``.
 
 :func:`mirt.compute_se` recomputes errors from a fitted model and a final
 posterior. Its matrix methods (``"oakes"``, ``"louis"``, ``"sem"``,
@@ -110,6 +132,27 @@ fit are not represented:
    # H0: the first item's discrimination stays at 1.
    test = mirt.lagrange(constrained, responses, param_indices=[0])
 
+Profile-likelihood intervals
+----------------------------
+
+``PLCI`` computes a profile-likelihood interval for the discrimination or
+difficulty of one item of a unidimensional dichotomous model, as
+``PLCI.mirt`` does in R: the values whose profile log-likelihood lies within
+``chi2(1).ppf(1 - alpha) / 2`` of its maximum. At each candidate value it
+fixes the parameter and refits every other parameter with the estimator
+settings of the fit, starting from the nearest value already profiled, so
+an interval takes 10-20 refits. Unlike a Wald interval it can be asymmetric:
+
+.. code-block:: python
+
+   result = mirt.fit_mirt(responses, model="2PL")
+   interval = mirt.PLCI(result, responses, param_idx=0, param_name="discrimination")
+   interval.lower, interval.upper
+
+``method="conditional"`` holds the other parameters at their estimates
+instead. It needs no refits, but ignores their uncertainty, so its intervals
+are too narrow, often by 10-40%.
+
 Draw and summarize parameters
 -----------------------------
 
@@ -117,7 +160,12 @@ Draw and summarize parameters
 multivariate-normal approximation defined by ``result.vcov``. Guessing, upper
 and asymmetry parameters of supported logistic models are drawn from the same
 covariance; fixed parameters and parameters on a bound stay at their
-estimates.
+estimates. Graded, partial-credit, nominal and other models without a
+per-item difficulty draw every stored parameter into ``samples.parameters``,
+keyed by parameter name with shape ``(n_samples, *parameter.shape)``; draws
+outside the bounds used in estimation, or with disordered graded thresholds,
+are redrawn, as in R's ``draw_parameters``. ``posterior_summary`` summarizes
+each of these parameters.
 
 .. code-block:: python
 
@@ -148,9 +196,11 @@ draws, request the narrowest empirical interval containing the target mass:
 A result without ``vcov``, for example an MCMC fit or one using
 ``se_method="complete_data"``, is sampled from its standard errors with a
 warning that cross-parameter covariance is ignored. For a bare model, pass a
-covariance through ``vcov``. It lists discrimination (item-major), then
-difficulty, and optionally guessing, slipping, upper and asymmetry. Without a
-covariance, bare models fall back to fixed sampling scales unrelated to the
+covariance through ``vcov``. For dichotomous logistic models it lists
+discrimination (item-major), then difficulty, and optionally guessing,
+slipping, upper and asymmetry; for other models it follows ``result.vcov``,
+one row per free coordinate of ``model.parameters``. Without a covariance,
+bare dichotomous models fall back to fixed sampling scales unrelated to the
 data. This fallback emits a ``FutureWarning`` and will be removed.
 
 Propagate uncertainty to scores
@@ -218,10 +268,13 @@ Ability uncertainty and missing responses
 
 ``generate_plausible_values`` draws from each respondent's joint ability
 posterior. With ``method="posterior"``, draws are quadrature nodes selected
-according to their posterior mass. Increase ``n_quadpts`` for a finer grid;
-the sampler preserves factor dependence and introduces no additional noise.
-Normal scoring priors must have finite means and symmetric, positive-definite
-covariance matrices.
+according to their posterior mass. The default grid matches EAP scoring in
+``fscores``: 49 nodes per dimension for one or two factors, 21 for three, 9 for
+four, 7 for five and 5 for six or more. A grid much coarser than a posterior's
+spread misstates it, so on long tests with narrow posteriors keep at least the
+default, or increase ``n_quadpts`` for a finer grid; the sampler preserves
+factor dependence and introduces no additional noise. Normal scoring priors
+must have finite means and symmetric, positive-definite covariance matrices.
 
 .. code-block:: python
 
@@ -284,7 +337,11 @@ quadrature, as recorded in ``FitResult.refit_recipe``. A Bayes modal fit is
 therefore bootstrapped as a Bayes modal estimator, and an estimated factor
 covariance or population mean is re-estimated in every replicate. Parametric
 replicates draw abilities from the fit's ``latent_mean`` and
-``latent_covariance``. Replicates skip standard errors. A bare item model is
+``latent_covariance``, and simulate as many persons as the fit
+(``FitResult.n_observations``). Pass the observed ``responses`` to
+``parametric_bootstrap`` to apply their missing-data pattern to every
+replicate; complete replicates understate the standard errors of a fit to
+incomplete data. Replicates skip standard errors. A bare item model is
 refitted by the default EM estimator of its family.
 
 ``bootstrap_ci(..., method="BCa")`` uses bias ranks that account for ties and
@@ -305,7 +362,8 @@ to the observed responses and to every replicate with identical estimator
 settings, and replicates keep the observed missing-data pattern. Fit results
 are refitted with their recorded estimators, priors and constraints, and
 their degrees of freedom come from ``FitResult.n_parameters``, which counts
-estimated latent covariances and each equality-constraint group once.
+estimated latent covariances and each equality-constraint group once and
+leaves out the rotational indeterminacy of exploratory factors.
 
 .. code-block:: python
 

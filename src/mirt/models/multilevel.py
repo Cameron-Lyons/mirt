@@ -8,6 +8,7 @@ This module provides:
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Self
@@ -329,6 +330,17 @@ def _simulate_responses(
     return responses
 
 
+def _warn_inert_variances(name: str, *, stacklevel: int) -> None:
+    """Warn that a CrossedRandomEffectsModel variance setting has no effect."""
+    warnings.warn(
+        f"CrossedRandomEffectsModel.{name} is deprecated and will be removed: "
+        "the person, item and rater variance components do not enter its "
+        "probabilities, likelihood or simulations",
+        DeprecationWarning,
+        stacklevel=stacklevel,
+    )
+
+
 def _sample_abilities(
     model: BaseItemModel,
     means: NDArray[np.float64],
@@ -376,7 +388,14 @@ class RandomEffectSpec:
 
 @dataclass
 class MultilevelIRTResult:
-    """Results from multilevel IRT estimation."""
+    """Results from multilevel IRT estimation.
+
+    .. deprecated::
+        No estimator returns this class, and creating one emits a
+        ``DeprecationWarning``; it will be removed. :class:`mirt.MixedEffectsIRT`
+        estimates group effects and returns a
+        :class:`~mirt.estimation.mixed.MixedEffectsFitResult`.
+    """
 
     model: MultilevelIRTModel
     fixed_effects: dict[str, NDArray[np.float64]]
@@ -387,6 +406,15 @@ class MultilevelIRTResult:
     dic: float
     n_iterations: int
     converged: bool
+
+    def __post_init__(self) -> None:
+        warnings.warn(
+            "MultilevelIRTResult is deprecated and will be removed: no "
+            "estimator returns it; MixedEffectsIRT returns a "
+            "MixedEffectsFitResult",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 class MultilevelIRTModel:
@@ -900,6 +928,13 @@ class CrossedRandomEffectsModel:
     assignment vector is accepted and reshaped using the base model's item
     count. Rater effects shift the base model probability on the log-odds
     scale.
+
+    Only the base model and the rater shifts enter :meth:`probability`,
+    :meth:`log_likelihood` and :meth:`simulate`. The stored person, item and
+    rater variance components describe nothing in the model, so
+    ``include_item_effects``, :meth:`set_variance_components`,
+    :attr:`variance_components` and :attr:`variance_partition` are
+    deprecated and emit a ``DeprecationWarning``.
     """
 
     def __init__(
@@ -907,15 +942,36 @@ class CrossedRandomEffectsModel:
         base_model: BaseItemModel,
         n_raters: int,
         rater_assignments: NDArray[np.int_] | None = None,
-        include_item_effects: bool = True,
+        include_item_effects: bool | None = None,
         include_rater_effects: bool = True,
     ) -> None:
+        """Initialize the model.
+
+        Parameters
+        ----------
+        base_model : BaseItemModel
+            Dichotomous item model, copied.
+        n_raters : int
+            Number of raters.
+        rater_assignments : ndarray of int, optional
+            Rater of each person-item observation, of shape
+            ``(n_persons, n_items)`` or flattened.
+        include_item_effects : bool, optional
+            Deprecated and without effect: no item variance enters the model.
+            Passing it emits a ``DeprecationWarning``.
+        include_rater_effects : bool, default=True
+            Whether rater shifts apply.
+        """
         if (
             isinstance(n_raters, (bool, np.bool_))
             or not isinstance(n_raters, (int, np.integer))
             or n_raters <= 0
         ):
             raise ValueError("n_raters must be a positive integer")
+        if include_item_effects is None:
+            include_item_effects = True
+        else:
+            _warn_inert_variances("include_item_effects", stacklevel=3)
         if not isinstance(include_item_effects, (bool, np.bool_)):
             raise TypeError("include_item_effects must be boolean")
         if not isinstance(include_rater_effects, (bool, np.bool_)):
@@ -989,6 +1045,16 @@ class CrossedRandomEffectsModel:
 
     @property
     def variance_components(self) -> dict[str, float]:
+        """Return the stored variance components.
+
+        .. deprecated::
+            They do not enter the probabilities, likelihood or simulations,
+            and reading them emits a ``DeprecationWarning``.
+        """
+        _warn_inert_variances("variance_components", stacklevel=3)
+        return self._variance_components()
+
+    def _variance_components(self) -> dict[str, float]:
         components = {"person": self._person_variance}
         if self._include_item_effects:
             components["item"] = self._item_variance
@@ -998,8 +1064,14 @@ class CrossedRandomEffectsModel:
 
     @property
     def variance_partition(self) -> dict[str, float]:
-        """Return each enabled variance component as a share of the total."""
-        components = self.variance_components
+        """Return each enabled variance component as a share of the total.
+
+        .. deprecated::
+            The components do not enter the model, and reading this emits a
+            ``DeprecationWarning``.
+        """
+        _warn_inert_variances("variance_partition", stacklevel=3)
+        components = self._variance_components()
         total = sum(components.values())
         return {name: value / total for name, value in components.items()}
 
@@ -1013,7 +1085,13 @@ class CrossedRandomEffectsModel:
         item: float | None = None,
         rater: float | None = None,
     ) -> Self:
-        """Set supplied variance components atomically."""
+        """Set supplied variance components atomically.
+
+        .. deprecated::
+            The components do not enter the probabilities, likelihood or
+            simulations, and setting them emits a ``DeprecationWarning``.
+        """
+        _warn_inert_variances("set_variance_components", stacklevel=3)
         new_person = _finite_variance(person, "person", positive=True)
         new_item = (
             self._item_variance
@@ -1160,9 +1238,9 @@ class CrossedRandomEffectsModel:
             base_model=self._base_model,
             n_raters=self._n_raters,
             rater_assignments=self._rater_assignments,
-            include_item_effects=self._include_item_effects,
             include_rater_effects=self._include_rater_effects,
         )
+        new_model._include_item_effects = self._include_item_effects
         new_model._rater_effects = self._rater_effects.copy()
         new_model._person_variance = self._person_variance
         new_model._item_variance = self._item_variance

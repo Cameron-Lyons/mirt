@@ -15,6 +15,7 @@ from scipy.special import expit
 
 from mirt import compute_fit_indices, compute_m2, fit_mirt
 from mirt.diagnostics import modelfit
+from mirt.exceptions import MirtValidationError
 from mirt.models import (
     FourParameterLogistic,
     GradedResponseModel,
@@ -89,13 +90,29 @@ def _category_probability_derivatives(model, nodes):
     return probabilities, derivatives
 
 
-def _exhaustive_distribution(model, nodes, weights):
+def _univariate_rows(model, statistic):
+    """Item and category (None: score) of every univariate moment."""
+    counts = model.n_categories if model.is_polytomous else [2] * model.n_items
+    if statistic != "C2":
+        return [(item, None) for item in range(model.n_items)]
+    return [
+        (item, category)
+        for item, count in enumerate(counts)
+        for category in range(1, count)
+    ]
+
+
+def _exhaustive_distribution(model, nodes, weights, statistic="M2*"):
     counts = model.n_categories if model.is_polytomous else [2] * model.n_items
     patterns = np.array(list(product(*(range(count) for count in counts))))
+    rows = _univariate_rows(model, statistic)
     feature = np.array(
         [
             [
-                *row,
+                *(
+                    row[item] if category is None else row[item] == category
+                    for item, category in rows
+                ),
                 *(
                     row[j] * row[k]
                     for j in range(model.n_items)
@@ -121,13 +138,14 @@ def _exhaustive_distribution(model, nodes, weights):
     return patterns, feature, mass, feature.T @ derivative_mass
 
 
-def _oracle(model, responses, theta=None, n_points=31):
+def _oracle(model, responses, theta=None, n_points=31, statistic="M2*"):
     """Covariance of every available-case mean from full pattern probabilities."""
     n_items = model.n_items
+    rows = _univariate_rows(model, statistic)
     present = np.isfinite(responses) & (responses >= 0)
     mask = np.column_stack(
         [
-            present,
+            *(present[:, item] for item, _ in rows),
             *(
                 present[:, j] & present[:, k]
                 for j in range(n_items)
@@ -139,7 +157,12 @@ def _oracle(model, responses, theta=None, n_points=31):
     observed_rows = np.nan_to_num(np.where(present, responses, np.nan))
     observed_features = np.column_stack(
         [
-            observed_rows,
+            *(
+                observed_rows[:, item]
+                if category is None
+                else present[:, item] & (observed_rows[:, item] == category)
+                for item, category in rows
+            ),
             *(
                 observed_rows[:, j] * observed_rows[:, k]
                 for j in range(n_items)
@@ -154,7 +177,9 @@ def _oracle(model, responses, theta=None, n_points=31):
     jacobian = None
     nodes, weights = _nodes(n_points, model.n_factors)
     if theta is None:
-        _, features, mass, derivative = _exhaustive_distribution(model, nodes, weights)
+        _, features, mass, derivative = _exhaustive_distribution(
+            model, nodes, weights, statistic
+        )
         means = mass @ features
         centered = features - means
         population_cov = (centered * mass[:, None]).T @ centered
@@ -165,7 +190,7 @@ def _oracle(model, responses, theta=None, n_points=31):
         nodes = np.asarray(theta).reshape(len(responses), model.n_factors)
         for row, node in enumerate(nodes):
             _, features, mass, derivative = _exhaustive_distribution(
-                model, node[None, :], np.ones(1)
+                model, node[None, :], np.ones(1), statistic
             )
             mean = mass @ features
             centered = (features - mean) * mask[row]
@@ -212,6 +237,117 @@ def test_exhaustive_pattern_covariance_and_projection(polytomous, fixed_theta, m
     assert actual["df"] == df
     assert actual["M2"] == pytest.approx(expected, rel=2e-7, abs=2e-7)
     assert actual["p_value"] == pytest.approx(stats.chi2.sf(expected, df), abs=1e-9)
+
+
+@pytest.mark.parametrize("fixed_theta", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_c2_matches_exhaustive_category_moments(fixed_theta, missing):
+    rng = np.random.default_rng(2718)
+    model = GradedResponseModel(5, n_categories=[2, 3, 4, 3, 5])
+    model.set_parameters(discrimination=np.array([0.65, 1.3, 0.8, 1.65, 0.9]))
+    responses = rng.integers(0, model.n_categories, size=(23, 5)).astype(float)
+    if missing:
+        responses[rng.random(responses.shape) < 0.25] = np.nan
+        responses[0] = -1
+    theta = rng.normal(size=len(responses)) if fixed_theta else None
+    expected, df = _oracle(model, responses, theta, statistic="C2")
+    actual = compute_m2(model, responses, theta=theta, n_quadpts=31, type="C2")
+    if not missing:
+        # 12 category proportions and 10 cross-products against 17 parameters.
+        assert df == 5
+    assert actual["df"] == df
+    assert actual["M2"] == pytest.approx(expected, rel=2e-7, abs=2e-7)
+
+
+def test_c2_of_binary_items_is_m2():
+    model = TwoParameterLogistic(5)
+    model.set_parameters(
+        discrimination=np.array([0.7, 1.2, 0.9, 1.5, 1.1]),
+        difficulty=np.array([-0.8, -0.2, 0.3, 0.9, 0.0]),
+    )
+    responses = np.random.default_rng(5).integers(0, 2, size=(80, 5))
+    m2 = compute_m2(model, responses, n_quadpts=21)
+    c2 = compute_m2(model, responses, n_quadpts=21, type="C2")
+    assert c2["df"] == m2["df"]
+    assert c2["M2"] == pytest.approx(m2["M2"], rel=1e-10)
+    indices = compute_fit_indices(model, responses, n_quadpts=21, type="C2")
+    reference = compute_fit_indices(model, responses, n_quadpts=21)
+    for name in ("M2", "RMSEA", "CFI", "TLI"):
+        assert indices[name] == pytest.approx(reference[name], rel=1e-10)
+
+
+def test_default_replaces_untestable_m2_star_with_c2():
+    """Six five-category graded items: 30 parameters, 21 M2* and 39 C2 moments."""
+    rng = np.random.default_rng(41)
+    model = GradedResponseModel(6, n_categories=5)
+    discrimination = np.array([0.70, 1.05, 0.95, 1.29, 0.71, 0.80])
+    intercepts = np.array(
+        [
+            [-0.15, -0.78, -1.48, -2.22],
+            [1.99, 0.99, -0.14, -1.28],
+            [-0.17, -0.97, -1.81, -2.73],
+            [2.65, 1.59, 0.33, -0.94],
+            [-0.49, -1.17, -1.88, -2.62],
+            [0.02, -0.78, -1.67, -2.43],
+        ]
+    )
+    model.set_parameters(
+        discrimination=discrimination,
+        thresholds=-intercepts / discrimination[:, None],
+    )
+    theta = rng.normal(size=(600, 1))
+    probabilities = model.probability(theta)
+    cumulative = probabilities.cumsum(axis=2)
+    responses = (rng.random((600, 6, 1)) > cumulative).sum(axis=2)
+
+    m2_star = compute_m2(model, responses, type="M2*")
+    assert m2_star["df"] == 0 and np.isnan(m2_star["M2"])
+    with pytest.warns(UserWarning, match="reporting C2 on 9 df"):
+        default = compute_fit_indices(model, responses)
+    c2 = compute_fit_indices(model, responses, type="C2")
+    assert default["M2_df"] == c2["M2_df"] == 9
+    for name in ("M2", "M2_p", "RMSEA", "CFI", "TLI", "SRMSR"):
+        assert np.isfinite(c2[name])
+        assert default[name] == pytest.approx(c2[name])
+
+
+def test_c2_latent_jacobian_differentiates_category_moments():
+    model = GradedResponseModel(4, n_categories=[3, 4, 3, 2], n_factors=2)
+    model.set_parameters(
+        discrimination=np.array([[1.2, 0.0], [0.9, 0.3], [0.0, 1.4], [0.4, 1.0]])
+    )
+    layout = modelfit._moment_layout(model, "C2")
+    correlation = 0.4
+    latent = modelfit._LatentNormal(
+        np.zeros(2), np.array([[1.0, correlation], [correlation, 1.0]]), ((0, 1),)
+    )
+    jacobian = modelfit._latent_moment_jacobian(model, 11, latent, layout)
+
+    def moments(value):
+        population = modelfit._LatentNormal(
+            np.zeros(2), np.array([[1.0, value], [value, 1.0]])
+        )
+        nodes, weights = modelfit._latent_grid(model, 11, population)
+        return modelfit._integrate_layout_features(model, nodes, weights, layout)
+
+    step = 1e-5
+    expected = (moments(correlation + step) - moments(correlation - step)) / (2 * step)
+    # 2 + 3 + 2 + 1 category proportions and 6 cross-products.
+    assert jacobian.shape == (14, 1)
+    np.testing.assert_allclose(jacobian[:, 0], expected, rtol=1e-5, atol=1e-9)
+    # Category proportions of the items that load on one factor (rows 0-1 and
+    # 5-6) do not depend on the factor correlation, up to quadrature error.
+    single = jacobian[[0, 1, 5, 6], 0]
+    assert np.abs(single).max() < 1e-4 * np.abs(jacobian[8:, 0]).max()
+
+
+def test_full_m2_of_polytomous_items_is_rejected():
+    model = GradedResponseModel(4, n_categories=3)
+    responses = np.random.default_rng(3).integers(0, 3, size=(50, 4))
+    with pytest.raises(MirtValidationError, match="requires binary items"):
+        compute_m2(model, responses, type="M2")
+    with pytest.raises(MirtValidationError, match="type must be one of"):
+        compute_fit_indices(model, responses, type="C3")
 
 
 def test_multidimensional_rotation_redundancy_uses_tangent_rank():

@@ -184,7 +184,9 @@ def test_standardized_loadings_and_communalities_preserve_large_slopes(scale):
     model = MultidimensionalModel(1, 3).set_parameters(slopes=slopes)
     with localcontext() as context:
         context.prec = 100
-        a = [Decimal.from_float(float(value)) for value in slopes[0]]
+        # Slopes are divided by D = 1.702 first, as in R mirt's summary().
+        scaling = Decimal("1.702")
+        a = [Decimal.from_float(float(value)) / scaling for value in slopes[0]]
         norm = sum(value * value for value in a)
         expected_loadings = np.array([float(value / (1 + norm).sqrt()) for value in a])
         expected_communality = float(norm / (1 + norm))
@@ -192,8 +194,12 @@ def test_standardized_loadings_and_communalities_preserve_large_slopes(scale):
         actual = model.get_factor_loadings()
         communality = model.communalities()
     np.testing.assert_allclose(actual[0], expected_loadings, rtol=5e-15, atol=0.0)
+    # A communality near 1e-320 is subnormal and keeps only a few digits.
     np.testing.assert_allclose(
-        communality, [expected_communality], rtol=5e-15, atol=0.0
+        communality,
+        [expected_communality],
+        rtol=5e-15,
+        atol=4 * np.finfo(np.float64).smallest_subnormal,
     )
     assert 0.0 <= communality[0] <= 1.0
     unstandardized = model.get_factor_loadings(standardized=False)

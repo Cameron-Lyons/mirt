@@ -443,3 +443,155 @@ def test_item_fit_tables_share_flag_rules(
             "",
         ]
         assert rows[-1][1] == "NA"
+
+
+def _rendered_report(
+    report_type: str, result: Any, responses: Any, **kwargs: Any
+) -> str:
+    from mirt.reports import generate_report
+
+    return generate_report(result, responses, report_type=report_type, **kwargs)
+
+
+@pytest.fixture(scope="module")
+def ordinal_family_fits() -> dict[str, tuple[Any, np.ndarray]]:
+    from mirt import fit_mirt, simdata
+
+    binary = np.asarray(simdata(model="2PL", n_persons=200, n_items=6, seed=7))
+    ordinal = np.asarray(
+        simdata(model="GRM", n_persons=200, n_items=4, n_categories=4, seed=7)
+    )
+    mixed = np.column_stack([binary[:, :3], ordinal[:, :2]])
+    fits = {
+        name: (fit_mirt(ordinal, model=name, max_iter=20), ordinal)
+        for name in ("GPCM", "PCM", "NRM")
+    }
+    fits["confirmatory"] = (
+        fit_mirt(binary, model="2PL", spec="F1=1-3\nF2=4-6", max_iter=20),
+        binary,
+    )
+    fits["mixed"] = (
+        fit_mirt(mixed, model=["2PL"] * 3 + ["GRM"] * 2, max_iter=20),
+        mixed,
+    )
+    return fits
+
+
+@pytest.mark.parametrize("family", ["GPCM", "PCM", "NRM", "confirmatory", "mixed"])
+def test_item_reports_draw_wright_maps_for_every_family(
+    ordinal_family_fits: dict[str, tuple[Any, np.ndarray]], family: str
+) -> None:
+    # These families used to fail the report: the Wright map raised for
+    # step parameters, nominal intercepts, zero slopes and mixed models.
+    from mirt import fscores
+
+    result, responses = ordinal_family_fits[family]
+    theta = fscores(result, responses).theta
+
+    html = _rendered_report("item_analysis", result, responses, theta=theta)
+
+    section = html[html.index("<h2>Person-Item Map (Wright Map)</h2>") :]
+    if family == "NRM":
+        assert "Wright map not shown" in section
+        assert "nominal response items" in section
+    elif family == "confirmatory":
+        assert 'alt="Wright Map (factor 1)"' in section
+        assert 'alt="Wright Map (factor 2)"' in section
+    else:
+        assert 'alt="Wright Map"' in section
+        assert "Wright map not shown" not in section
+
+
+def test_full_diagnostic_notes_a_missing_wright_map(
+    ordinal_family_fits: dict[str, tuple[Any, np.ndarray]],
+) -> None:
+    from mirt import fscores
+
+    result, responses = ordinal_family_fits["NRM"]
+    theta = fscores(result, responses).theta
+
+    html = _rendered_report(
+        "full_diagnostic", result, responses, theta=theta, include_ld=False
+    )
+
+    assert "<h3>Wright Map</h3>" in html
+    assert "Wright map not shown" in html
+
+
+def test_reports_read_nullable_and_reordered_frames(
+    fitted_report_data: tuple[Any, np.ndarray],
+) -> None:
+    # pd.NA used to fail every report: np.asarray made an object array.
+    import pandas as pd
+
+    from mirt import fit_mirt
+
+    _, responses = fitted_report_data
+    values = responses.astype(float)
+    values[np.random.default_rng(3).random(values.shape) < 0.05] = np.nan
+    names = [f"Q{index}" for index in range(values.shape[1])]
+    nullable = pd.DataFrame(values, columns=names).astype("Int64")
+    result = fit_mirt(nullable, model="2PL", max_iter=40)
+    reordered = nullable[names[::-1]]
+
+    for report_type, heading in (
+        ("item_analysis", "Item Fit Statistics"),
+        ("model_fit", "Fit Indices"),
+        ("full_diagnostic", "Model Fit Indices"),
+    ):
+        reference = _section_rows(
+            _rendered_report(report_type, result, values, include_plots=False),
+            heading,
+        )
+        for frame in (nullable, reordered):
+            html = _rendered_report(report_type, result, frame, include_plots=False)
+            assert _section_rows(html, heading) == reference
+
+
+def test_fit_reports_name_the_limited_information_statistic(
+    fitted_report_data: tuple[Any, np.ndarray],
+) -> None:
+    # Six five-category GRM items have 30 parameters and 21 M2* moments, so
+    # M2* has no degrees of freedom and compute_fit_indices falls back to C2
+    # with a warning; the reports labelled that value "M2".
+    import warnings
+
+    from mirt import fit_mirt, simdata
+    from mirt.diagnostics.modelfit import compute_fit_indices
+
+    short_scale = np.asarray(
+        simdata(model="GRM", n_persons=300, n_items=6, n_categories=5, seed=11)
+    )
+    graded = fit_mirt(short_scale, model="GRM", max_iter=50)
+    c2 = compute_fit_indices(graded, short_scale, type="C2")
+    assert c2["M2_df"] > 0
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model_fit = _rendered_report(
+            "model_fit", graded, short_scale, include_plots=False
+        )
+        full = _rendered_report(
+            "full_diagnostic",
+            graded,
+            short_scale,
+            include_ld=False,
+            include_plots=False,
+        )
+    assert not [warning for warning in caught if "C2" in str(warning.message)]
+
+    model_fit_row = _section_rows(model_fit, "Fit Indices")[0]
+    full_row = _section_rows(full, "Model Fit Indices")[0]
+    assert model_fit_row[0] == full_row[0] == "C2"
+    assert float(model_fit_row[1]) == pytest.approx(c2["M2"], abs=5e-3)
+    assert f"df = {c2['M2_df']:.0f}" in model_fit_row[2]
+    assert "M2* has no degrees of freedom" in model_fit
+
+    binary_result, binary_responses = fitted_report_data
+    binary_row = _section_rows(
+        _rendered_report(
+            "model_fit", binary_result, binary_responses, include_plots=False
+        ),
+        "Fit Indices",
+    )[0]
+    assert binary_row[0] == "M2"

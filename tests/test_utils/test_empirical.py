@@ -331,7 +331,9 @@ def test_polytomous_dif_metrics_use_expected_category_scores() -> None:
     shifted[0, :3] += 0.45
     focal.set_parameters(thresholds=shifted)
 
-    effect = empirical_ES(reference, focal, item_idx=0, n_points=51)
+    effect = empirical_ES(
+        reference, focal, item_idx=0, theta_range=(-4.0, 4.0), n_points=51
+    )
     rmsd = RMSD_DIF(reference, focal, item_idx=0, n_points=51)
     weighted_rmsd = weighted_RMSD_DIF(reference, focal, item_idx=0, n_points=51)
 
@@ -343,10 +345,155 @@ def test_polytomous_dif_metrics_use_expected_category_scores() -> None:
     weights = stats.norm.pdf(theta[:, 0])
     weights /= weights.sum()
 
-    assert_allclose(effect.signed_es, np.sum(weights * difference))
-    assert_allclose(effect.unsigned_es, np.sum(weights * np.abs(difference)))
+    # Without focal abilities only the standard-normal statistics exist.
+    assert_allclose(effect.sidn, np.sum(weights * difference))
+    assert_allclose(effect.uidn, np.sum(weights * np.abs(difference)))
+    assert effect.signed_es == effect.sidn
+    assert effect.unsigned_es == effect.uidn
+    assert np.isnan(effect.sids) and np.isnan(effect.essd)
+    assert effect.classification is None
     assert_allclose(rmsd, np.sqrt(np.mean(difference**2)))
     assert_allclose(weighted_rmsd, np.sqrt(np.sum(weights * difference**2)))
+
+
+R_THETA_FOCAL = np.array([-2.9, -2.1, -1.6, -1.5, -1.2, -0.8, -0.3, 0.4])
+
+
+def _r_effect_size_models(polytomous: bool):
+    """Group models of the R mirt 1.48 empirical_ES reference fits."""
+    if polytomous:
+        reference = GradedResponseModel(2, n_categories=3).set_parameters(
+            discrimination=np.array([1.2, 0.9]),
+            thresholds=np.array([[-1.0, 0.5], [-0.2, 1.1]]),
+        )
+        focal = GradedResponseModel(2, n_categories=3).set_parameters(
+            discrimination=np.array([1.2, 1.4]),
+            thresholds=np.array([[-0.6, 0.9], [-0.2, 1.1]]),
+        )
+        return reference, focal
+    reference = TwoParameterLogistic(3).set_parameters(
+        discrimination=np.array([1.5, 1.0, 0.8]),
+        difficulty=np.array([1.0, -0.5, 0.0]),
+    )
+    focal = TwoParameterLogistic(3).set_parameters(
+        discrimination=np.array([1.5, 1.2, 0.8]),
+        difficulty=np.array([1.5, -0.5, 0.3]),
+    )
+    return reference, focal
+
+
+# R mirt 1.48: empirical_ES(multipleGroup(...), Theta.focal = R_THETA_FOCAL)
+# for two-group models with these fixed parameters (d = -a * b). Columns are
+# SIDS, UIDS, SIDN, UIDN, ESSD, theta of max D, max D, mean.ES.foc and
+# mean.ES.ref.
+R_EMPIRICAL_ES = {
+    False: [
+        [-0.03362759646, 0.03362759646, -0.03318497139, 0.03318497139,
+         -0.43066688135, 0.4, -0.12794154780, 0.0372859972, 0.07091359366],
+        [-0.01824758036, 0.02960361352, -0.01818704270, 0.02802385619,
+         -0.08327563944, -2.1, -0.04012004855, 0.3302510244, 0.34849860476],
+        [-0.04247698351, 0.04247698351, -0.04239704087, 0.04239704087,
+         -0.27934863865, 0.4, -0.05933491199, 0.2496900547, 0.29216703818],
+    ],
+    True: [
+        [-0.1367936608, 0.1367936608, -0.1365460766, 0.1365460766,
+         -0.3671260975, -0.3, -0.1947576283, 0.4605690844, 0.5973627453],
+        [-0.1205363183, 0.1205363183, -0.1202988413, 0.1255313684,
+         -0.4003755887, -1.2, -0.1648614390, 0.3220502353, 0.4425865536],
+    ],
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("polytomous", [False, True])
+def test_empirical_es_matches_r_mirt(polytomous: bool) -> None:
+    reference, focal = _r_effect_size_models(polytomous)
+
+    for item_idx, expected in enumerate(R_EMPIRICAL_ES[polytomous]):
+        effect = empirical_ES(
+            reference, focal, item_idx, theta_focal=R_THETA_FOCAL[:, None]
+        )
+        actual = [
+            effect.sids,
+            effect.uids,
+            effect.sidn,
+            effect.uidn,
+            effect.essd,
+            effect.theta_max_d,
+            effect.max_d,
+            effect.mean_es_focal,
+            effect.mean_es_ref,
+        ]
+        assert_allclose(actual, expected, rtol=1e-8, atol=1e-10)
+        assert (effect.signed_es, effect.unsigned_es) == (effect.sids, effect.uids)
+
+
+def test_empirical_es_integrates_over_the_focal_abilities() -> None:
+    reference = TwoParameterLogistic(1).set_parameters(
+        discrimination=np.array([1.5]), difficulty=np.array([1.0])
+    )
+    focal = TwoParameterLogistic(1).set_parameters(
+        discrimination=np.array([1.5]), difficulty=np.array([1.5])
+    )
+    theta_focal = np.random.default_rng(0).normal(-1.5, 1.0, 2000)
+
+    effect = empirical_ES(reference, focal, 0, theta_focal=theta_focal)
+
+    difference = (
+        focal.probability(theta_focal[:, None], 0)
+        - reference.probability(theta_focal[:, None], 0)
+    ).ravel()
+    assert effect.sids == pytest.approx(np.mean(difference))
+    # A low-ability focal group meets little of this hard item's DIF; a
+    # standard-normal focal density reports about 3.6 times as much.
+    assert effect.sids == pytest.approx(-0.0254, abs=1e-3)
+    assert effect.sidn == pytest.approx(-0.0254, abs=1e-3)
+    assert empirical_ES(reference, focal, 0).sidn == pytest.approx(-0.0920, abs=1e-3)
+    assert effect.classification == "small"
+
+
+def test_empirical_es_focal_weight_is_deprecated_and_ignored() -> None:
+    reference, focal = _r_effect_size_models(polytomous=False)
+    expected = empirical_ES(reference, focal, 0, theta_focal=R_THETA_FOCAL)
+
+    with pytest.warns(DeprecationWarning, match="focal_weight is deprecated"):
+        effect = empirical_ES(
+            reference, focal, 0, focal_weight=0.0, theta_focal=R_THETA_FOCAL
+        )
+
+    assert effect == expected
+
+
+def test_rmsd_dif_weights_by_the_focal_abilities() -> None:
+    reference, focal = _r_effect_size_models(polytomous=False)
+    theta = R_THETA_FOCAL[:, None]
+    difference = (focal.probability(theta, 0) - reference.probability(theta, 0)).ravel()
+    grid = np.linspace(-4.0, 4.0, 101)
+    weights = stats.norm.pdf(grid, loc=R_THETA_FOCAL.mean())
+    weights /= weights.sum()
+    grid_difference = (
+        focal.probability(grid[:, None], 0) - reference.probability(grid[:, None], 0)
+    ).ravel()
+
+    rmsd = RMSD_DIF(reference, focal, 0, theta_focal=R_THETA_FOCAL)
+    weighted = weighted_RMSD_DIF(reference, focal, 0, theta_focal=R_THETA_FOCAL)
+
+    assert rmsd == pytest.approx(np.sqrt(np.mean(difference**2)))
+    assert weighted == pytest.approx(np.sqrt(np.sum(weights * grid_difference**2)))
+
+
+@pytest.mark.parametrize(
+    ("theta_focal", "message"),
+    [
+        (np.zeros((2, 2)), "shape"),
+        (np.array([]), "at least one"),
+        (np.array([0.0, np.nan]), "finite"),
+        (["low"], "numeric"),
+    ],
+)
+@pytest.mark.parametrize("function", [empirical_ES, RMSD_DIF, weighted_RMSD_DIF])
+def test_dif_metrics_validate_theta_focal(function, theta_focal, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        function(_binary_model(1), _binary_model(1), 0, theta_focal=theta_focal)
 
 
 def test_item_gam_is_exported_and_supports_polytomous_scores() -> None:

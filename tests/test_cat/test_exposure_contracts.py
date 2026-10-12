@@ -181,13 +181,7 @@ def test_progressive_restricted_batches_information_once() -> None:
     assert eligible == {2, 5}
     assert model.calls == 1
     assert_allclose(model.last_theta, [[0.25]])
-    assert control.max_information_seen == {
-        0: 0.1,
-        1: 0.8,
-        2: 1.0,
-        3: 0.6,
-        5: 0.95,
-    }
+    assert_allclose(control._latest_information, [1.0, 0.95])
 
 
 def test_progressive_restricted_selection_is_seeded_and_progressive() -> None:
@@ -336,7 +330,7 @@ def test_progressive_restricted_evaluates_items_when_bulk_output_is_not_itemwise
     control = ProgressiveRestricted(window_size=0.6)
 
     assert control.filter_items({0, 1, 2}, model, 0.0) == {0, 1}
-    assert control.max_information_seen == {0: 0.5, 1: 1.0, 2: 0.2}
+    assert_allclose(control._latest_information, [0.5, 1.0])
     assert model.calls == 4
 
 
@@ -347,7 +341,7 @@ def test_progressive_restricted_works_in_multidimensional_engine() -> None:
     engine = MCATEngine(model, exposure_control=control, max_items=2)
 
     assert engine.select_next_item() in set(range(model.n_items))
-    assert len(control.max_information_seen) == model.n_items
+    assert control._latest_item_indices.size >= 1
 
 
 def test_factory_accepts_surrounding_whitespace() -> None:

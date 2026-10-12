@@ -43,10 +43,10 @@ napoleon_include_init_with_doc = True
 napoleon_use_param = False
 napoleon_use_rtype = False
 napoleon_use_ivar = True
-
-# Attribute types such as "ndarray of shape (n_factors, n_factors)" make every
-# word a cross-reference; names shared by several classes are then ambiguous.
-suppress_warnings = ["ref.python"]
+# Link known types such as ``int`` and keep shape descriptions such as
+# "ndarray of shape (n_items,)" literal, rather than cross-referencing
+# every word, which made names shared by several classes ambiguous.
+napoleon_preprocess_types = True
 
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3", None),

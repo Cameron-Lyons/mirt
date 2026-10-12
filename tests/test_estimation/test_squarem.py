@@ -8,12 +8,14 @@ from mirt.estimation import _acceleration
 from mirt.estimation import em as em_module
 from mirt.estimation._acceleration import (
     FreeItemParameters,
+    _keeps_threshold_order,
     squarem_point,
     squarem_step_length,
 )
 from mirt.estimation.em import EMEstimator
 from mirt.estimation.latent_density import EmpiricalHistogram, GaussianDensity
 from mirt.exceptions import MirtValidationError
+from mirt.models.bifactor import GradedBifactorModel
 from mirt.models.dichotomous import (
     OneParameterLogistic,
     ThreeParameterLogistic,
@@ -52,7 +54,10 @@ CASES = {
 # A two-factor fit leaves its staggered start and then converges slowly along
 # a weakly identified rotation, so plain EM at tol=1e-6 stops slightly short
 # of the optimum that SQUAREM reaches.
-TOLERANCES = {"2PL-2D": (5e-5, 5e-3)}
+# Exploratory loadings, which may be negative, are identified only up to a
+# rotation, so the two fixed points can differ along the nearly flat
+# rotational direction (here by 0.025 on a loading of -4.3).
+TOLERANCES = {"2PL-2D": (1e-4, 5e-2)}
 
 
 def _fit(factory, responses, n_quadpts, **options):
@@ -91,7 +96,8 @@ def test_squarem_reaches_the_plain_em_optimum_in_fewer_e_steps(kind):
     assert np.all(np.diff(history) >= -1e-8)
 
 
-def test_squarem_3pl_improves_on_plain_em_without_the_fused_iteration(monkeypatch):
+@pytest.mark.skipif(not em_module.RUST_AVAILABLE, reason="needs the native kernels")
+def test_squarem_3pl_extrapolates_the_fused_native_iteration(monkeypatch):
     responses = simdata(model="3PL", n_items=8, n_persons=3000, seed=5)
     plain, plain_fit, _ = _fit(
         lambda: ThreeParameterLogistic(8),
@@ -100,20 +106,49 @@ def test_squarem_3pl_improves_on_plain_em_without_the_fused_iteration(monkeypatc
         use_rust=False,
         item_optim_ftol=1e-10,
     )
+    fused = em_module.em_iteration_3pl
+    calls = []
 
-    def fused(*args, **kwargs):
-        raise AssertionError("SQUAREM must use the generic E- and M-steps")
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return fused(*args, **kwargs)
 
-    monkeypatch.setattr(em_module, "em_iteration_3pl", fused)
+    def generic(*args):
+        raise AssertionError("the fused iteration supplies every M-step")
+
+    monkeypatch.setattr(em_module, "em_iteration_3pl", counted)
+    monkeypatch.setattr(EMEstimator, "_m_step", generic)
     model, fit, _ = _fit(
         lambda: ThreeParameterLogistic(8), responses, 15, accelerate="squarem"
     )
 
+    # Every E-step runs the fused iteration, whose M-step SQUAREM installs.
+    assert len(calls) == fit.n_iterations
     # The 3PL likelihood is flat, so plain EM stops short of the optimum.
     assert fit.converged
     assert fit.n_iterations < plain_fit.n_iterations
     assert fit.log_likelihood >= plain_fit.log_likelihood - 1e-6
     for name, values in plain.parameters.items():
+        np.testing.assert_allclose(model.parameters[name], values, atol=2e-2)
+
+
+def test_squarem_3pl_falls_back_to_the_generic_steps(monkeypatch):
+    responses = simdata(model="3PL", n_items=8, n_persons=3000, seed=5)
+    reference, reference_fit, _ = _fit(
+        lambda: ThreeParameterLogistic(8), responses, 15, accelerate="squarem"
+    )
+
+    def failing(*args, **kwargs):
+        raise RuntimeError("native kernel failure")
+
+    monkeypatch.setattr(em_module, "em_iteration_3pl", failing)
+    model, fit, _ = _fit(
+        lambda: ThreeParameterLogistic(8), responses, 15, accelerate="squarem"
+    )
+
+    assert fit.converged
+    assert fit.log_likelihood == pytest.approx(reference_fit.log_likelihood, abs=1e-3)
+    for name, values in reference.parameters.items():
         np.testing.assert_allclose(model.parameters[name], values, atol=2e-2)
 
 
@@ -136,6 +171,20 @@ def test_squarem_keeps_graded_thresholds_ordered(monkeypatch):
     )
     assert fit.converged and proposals
     assert np.all(np.diff(model.parameters["thresholds"], axis=1) > 0)
+
+
+def test_graded_bifactor_intercepts_must_keep_decreasing():
+    model = GradedBifactorModel(3, specific_factors=[0, 0, 1], n_categories=[2, 4, 3])
+    intercepts = model.parameters["intercepts"]
+
+    assert _keeps_threshold_order(model, {"intercepts": intercepts - 0.5})
+    # The padding of the two-category item never enters a curve.
+    padded = intercepts.copy()
+    padded[0, 1:] = [5.0, 9.0]
+    assert _keeps_threshold_order(model, {"intercepts": padded})
+    disordered = intercepts.copy()
+    disordered[1, :3] = disordered[1, :3][::-1]
+    assert not _keeps_threshold_order(model, {"intercepts": disordered})
 
 
 @pytest.mark.parametrize("ordered", [True, False])
@@ -348,22 +397,16 @@ def test_free_item_parameters_pack_only_free_coordinates():
 
     rasch = FreeItemParameters(OneParameterLogistic(4))
     assert rasch.get(OneParameterLogistic(4)).size == 4
-    np.testing.assert_array_equal(rasch.lower, np.full(4, -6.0))
+    np.testing.assert_array_equal(rasch.lower, np.full(4, -30.0))
 
 
-def test_fit_mirt_squarem_bypasses_the_native_2pl_fit(monkeypatch):
+def test_fit_mirt_squarem_reaches_the_plain_em_optimum():
     import mirt
-    import mirt.backends.rust.estimation as rust_estimation
 
     responses = simdata(model="2PL", n_items=8, n_persons=500, seed=12)
     plain = EMEstimator(tol=1e-6, max_iter=3000, compute_standard_errors=False).fit(
         TwoParameterLogistic(8), responses
     )
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("the native full-EM fit runs plain EM")
-
-    monkeypatch.setattr(rust_estimation, "_em_fit_2pl_prepared", forbidden)
     result = mirt.fit_mirt(responses, tol=1e-6, max_iter=3000, accelerate="squarem")
     assert result.converged
     assert result.n_iterations < plain.n_iterations

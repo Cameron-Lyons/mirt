@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from mirt.cat._information import item_information
+from mirt.cat._names import resolve_name
 from mirt.cat._native import register_native_defaults as _register_native_defaults
 
 if TYPE_CHECKING:
@@ -62,23 +64,10 @@ def _candidate_information(
     """Return candidate item information at one ability point.
 
     Dichotomous models usually return one value per item from a single bulk
-    call. Polytomous models define ``information(theta)`` as total test
-    information, so they, and any model whose bulk output is not item-wise,
-    are evaluated one candidate at a time.
+    call, and built-in polytomous models use their all-item information
+    kernel. Other models are evaluated one candidate at a time.
     """
-    if not model.is_polytomous:
-        information = np.asarray(model.information(theta), dtype=np.float64)
-        if information.size == model.n_items:
-            return information.reshape(-1)[item_indices]
-    return np.array(
-        [
-            np.asarray(
-                model.information(theta, item_idx=int(item_idx)), dtype=np.float64
-            ).sum()
-            for item_idx in item_indices
-        ],
-        dtype=np.float64,
-    )
+    return item_information(model, theta, item_indices)[0]
 
 
 @dataclass(frozen=True)
@@ -216,11 +205,27 @@ class SympsonHetter(ExposureControl):
     seed : int | None, optional
         Random seed for reproducibility.
 
+    Notes
+    -----
+    Parameters are calibrated iteratively: simulate a sample of examinees
+    with the current parameters, then call :meth:`calibrate`, and repeat
+    until the maximum exposure rate settles near ``target_rate``. Each
+    calibration uses only the sessions recorded since the previous one and
+    then clears the counts, so every round measures the current parameters.
+
     References
     ----------
     Sympson, J. B., & Hetter, R. D. (1985). Controlling item-exposure
     rates in computerized adaptive testing. Proceedings of the 27th
     annual meeting of the Military Testing Association.
+
+    Examples
+    --------
+    >>> control = SympsonHetter(target_rate=0.2, seed=1)
+    >>> engine = CATEngine(model, exposure_control=control, max_items=20, seed=2)
+    >>> for _ in range(20):
+    ...     engine.run_batch_simulation(simulated_thetas)
+    ...     control.calibrate(model.n_items)
     """
 
     def __init__(
@@ -260,6 +265,9 @@ class SympsonHetter(ExposureControl):
         self._eligibility_counts: Counter[int] = Counter()
         self._opportunity_counts: Counter[int] = Counter()
         self._n_examinees = 0
+        # After reset_counts, the session open at that moment (or the next
+        # one) is counted when it records its first selection.
+        self._uncounted_session = False
 
     @property
     def exposure_parameters(self) -> dict[int, float]:
@@ -302,10 +310,27 @@ class SympsonHetter(ExposureControl):
 
     def update(self, selected_item: int) -> None:
         item_idx = _validate_item_index(selected_item, name="selected_item")
+        if self._uncounted_session:
+            self._n_examinees += 1
+            self._uncounted_session = False
         self._selection_counts[item_idx] += 1
 
     def reset(self) -> None:
         self._n_examinees += 1
+        self._uncounted_session = False
+
+    def reset_counts(self) -> None:
+        """Clear the recorded selections, eligibilities and sessions.
+
+        Exposure parameters are kept. The session in progress, if it selects
+        another item, counts as the first session of the new tally, so an
+        engine's open session needs no reset.
+        """
+        self._selection_counts.clear()
+        self._eligibility_counts.clear()
+        self._opportunity_counts.clear()
+        self._n_examinees = 0
+        self._uncounted_session = True
 
     def record_sessions(
         self,
@@ -503,17 +528,26 @@ class SympsonHetter(ExposureControl):
             n_examinees=self._n_examinees,
         )
 
-    def calibrate(self, n_items: int) -> None:
+    def calibrate(self, n_items: int, *, reset_counts: bool = True) -> None:
         """Recalibrate exposure parameters based on observed rates.
 
-        Should be called periodically during operational testing
-        to adjust parameters.
+        An item administered to more than ``target_rate`` of the recorded
+        examinees has its parameter scaled by ``target_rate / rate``; other
+        items have it raised by 10%, up to 1. Repeat simulation and
+        calibration until the rates settle near the target.
 
         Parameters
         ----------
         n_items : int
             Total number of items in the pool.
+        reset_counts : bool, default=True
+            Clear the recorded counts afterwards (see :meth:`reset_counts`),
+            so the next calibration measures only sessions run under the
+            updated parameters. Accumulated counts mix sessions from earlier
+            parameters, and the iteration then stalls above the target.
         """
+        if not isinstance(reset_counts, (bool, np.bool_)):
+            raise TypeError("reset_counts must be a boolean")
         if (
             isinstance(n_items, (bool, np.bool_))
             or not isinstance(n_items, Integral)
@@ -535,6 +569,8 @@ class SympsonHetter(ExposureControl):
                 current = self._params.get(item_idx, 1.0)
                 updated = current * 1.1
             self._params[item_idx] = float(np.clip(updated, 0.0, 1.0))
+        if reset_counts:
+            self.reset_counts()
 
     def get_exposure_rates(self) -> dict[int, float]:
         """Get current exposure rates for all items.
@@ -631,19 +667,45 @@ class Randomesque(ExposureControl):
 
 
 class ProgressiveRestricted(ExposureControl):
-    """Progressive information-window exposure control.
+    """Progressive-restricted exposure control (Revuelta & Ponsoda, 1998).
 
-    Restricts the item pool to candidates within a fixed information window
-    of the most informative available item. Selection within that window
-    blends a random component with item information. Randomness dominates at
-    the start of a test, while information dominates near the test horizon.
+    The method combines two rules:
+
+    * **Restricted**: an item is ineligible while its exposure rate, the
+      share of examinees so far (the current one included) who were
+      administered it, is at least ``max_exposure``. When the restriction
+      would exclude every candidate, all candidates stay eligible.
+    * **Progressive**: among the eligible items the engine administers the
+      item maximizing ``(1 - w) * R_j + w * I_j``, where ``I_j`` is the
+      item's Fisher information at the current ability estimate, ``R_j`` is
+      drawn uniformly from ``[0, max_k I_k]`` (the largest information among
+      the eligible items), and ``w = (s / L) ** acceleration`` after ``s`` of
+      ``L`` items. The first item is drawn at random and information
+      dominates near the end of the test. ``L`` is the length the engine's
+      stopping rules enforce, or the pool size.
+
+    Exposure rates count the sessions the engine opens: every examinee
+    whose session selects an item counts once. Run all examinees of a
+    simulation or an operational window through the same instance.
 
     Parameters
     ----------
-    window_size : float, optional
-        Size of the eligibility window in information units. Default is 0.5.
+    window_size : float | None, optional
+        Optionally limit the progressive stage to eligible items within
+        ``window_size`` information units of the most informative eligible
+        item. Default is None, which uses every eligible item as in the
+        original method. The window's effect depends on the information
+        scale of the pool: a narrow window leaves few items for the random
+        component and weakens exposure control.
     seed : int | None, optional
         Random seed for reproducibility.
+    max_exposure : float | None, optional
+        Maximum exposure rate ``r_max`` in ``(0, 1]``. Default is 0.25.
+        None disables the restriction, giving the progressive method alone.
+    acceleration : float, optional
+        Positive exponent of the progressive weight. The default 1 is the
+        linear schedule ``s / L`` of the original method; larger values keep
+        the random component longer.
 
     References
     ----------
@@ -652,24 +714,68 @@ class ProgressiveRestricted(ExposureControl):
     Educational Measurement, 35(4), 311-327.
     """
 
-    def __init__(self, window_size: float = 0.5, seed: int | None = None) -> None:
-        if isinstance(window_size, (bool, np.bool_)) or not isinstance(
-            window_size, Real
+    def __init__(
+        self,
+        window_size: float | None = None,
+        seed: int | None = None,
+        *,
+        max_exposure: float | None = 0.25,
+        acceleration: float = 1.0,
+    ) -> None:
+        if window_size is not None:
+            if isinstance(window_size, (bool, np.bool_)) or not isinstance(
+                window_size, Real
+            ):
+                raise TypeError("window_size must be a real number or None")
+            window_size = float(window_size)
+            if not np.isfinite(window_size) or window_size < 0.0:
+                raise ValueError("window_size must be finite and non-negative")
+        if max_exposure is not None:
+            max_exposure = _validate_probability(max_exposure, name="max_exposure")
+            if max_exposure == 0.0:
+                raise ValueError("max_exposure must be greater than 0")
+        if isinstance(acceleration, (bool, np.bool_)) or not isinstance(
+            acceleration, Real
         ):
-            raise TypeError("window_size must be a real number")
-        window_size = float(window_size)
-        if not np.isfinite(window_size) or window_size < 0.0:
-            raise ValueError("window_size must be finite and non-negative")
-        self.window_size: float = window_size
+            raise TypeError("acceleration must be a real number")
+        acceleration = float(acceleration)
+        if not np.isfinite(acceleration) or acceleration <= 0.0:
+            raise ValueError("acceleration must be finite and positive")
+
+        self.window_size: float | None = window_size
+        self.max_exposure: float | None = max_exposure
+        self.acceleration: float = acceleration
         self.rng: np.random.Generator = np.random.default_rng(seed)
-        self._max_info_seen: dict[int, float] = {}
+        self._selection_counts: Counter[int] = Counter()
+        self._n_examinees: int = 0
         self._latest_item_indices: NDArray[np.int_] = np.empty(0, dtype=np.int_)
         self._latest_information: NDArray[np.float64] = np.empty(0, dtype=np.float64)
 
     @property
-    def max_information_seen(self) -> dict[int, float]:
-        """Return the maximum observed information for each evaluated item."""
-        return dict(self._max_info_seen)
+    def n_examinees(self) -> int:
+        """Return the number of recorded examinee sessions."""
+        return self._n_examinees
+
+    def get_exposure_rates(self) -> dict[int, float]:
+        """Return the exposure rate of every administered item."""
+        if self._n_examinees == 0:
+            return {item_idx: 0.0 for item_idx in sorted(self._selection_counts)}
+        return {
+            item_idx: count / self._n_examinees
+            for item_idx, count in sorted(self._selection_counts.items())
+        }
+
+    def _restrict(self, item_indices: NDArray[np.int_]) -> NDArray[np.int_]:
+        """Drop items whose exposure rate has reached ``max_exposure``."""
+        if self.max_exposure is None or self._n_examinees == 0:
+            return item_indices
+        counts = np.fromiter(
+            (self._selection_counts.get(int(item_idx), 0) for item_idx in item_indices),
+            dtype=np.float64,
+            count=len(item_indices),
+        )
+        below = counts / self._n_examinees < self.max_exposure
+        return item_indices[below] if np.any(below) else item_indices
 
     def filter_items(
         self,
@@ -704,6 +810,7 @@ class ProgressiveRestricted(ExposureControl):
         if not np.all(np.isfinite(theta_arr)):
             raise ValueError("theta values must be finite")
 
+        item_indices = self._restrict(item_indices)
         candidate_information = _candidate_information(model, theta_arr, item_indices)
 
         finite = np.isfinite(candidate_information)
@@ -712,20 +819,10 @@ class ProgressiveRestricted(ExposureControl):
             self._latest_information = candidate_information.copy()
             return {int(item_idx) for item_idx in item_indices}
 
-        for item_idx, information in zip(
-            item_indices[finite],
-            candidate_information[finite],
-            strict=True,
-        ):
-            item = int(item_idx)
-            value = float(information)
-            self._max_info_seen[item] = max(
-                value,
-                self._max_info_seen.get(item, -np.inf),
-            )
-
-        threshold = float(np.max(candidate_information[finite])) - self.window_size
-        eligible_mask = finite & (candidate_information >= threshold)
+        eligible_mask = finite
+        if self.window_size is not None:
+            threshold = float(np.max(candidate_information[finite])) - self.window_size
+            eligible_mask = finite & (candidate_information >= threshold)
         eligible_indices = item_indices[eligible_mask]
         eligible_information = candidate_information[eligible_mask]
 
@@ -740,7 +837,7 @@ class ProgressiveRestricted(ExposureControl):
         n_administered: int,
         max_items: int,
     ) -> int:
-        """Select progressively from the most recent eligibility window.
+        """Select progressively from the most recent eligible items.
 
         Parameters
         ----------
@@ -787,12 +884,17 @@ class ProgressiveRestricted(ExposureControl):
         if progress >= 1.0:
             return int(item_indices[int(np.argmax(information))])
 
+        weight = progress**self.acceleration
         random_component = self.rng.uniform(0.0, max_information, len(item_indices))
-        weights = (1.0 - progress) * random_component + progress * information
+        weights = (1.0 - weight) * random_component + weight * information
         return int(item_indices[int(np.argmax(weights))])
 
+    def update(self, selected_item: int) -> None:
+        item_idx = _validate_item_index(selected_item, name="selected_item")
+        self._selection_counts[item_idx] += 1
+
     def reset(self) -> None:
-        self._max_info_seen.clear()
+        self._n_examinees += 1
         self._latest_item_indices = np.empty(0, dtype=np.int_)
         self._latest_information = np.empty(0, dtype=np.float64)
 
@@ -807,7 +909,9 @@ def create_exposure_control(
     ----------
     method : str | None
         Exposure control method name. One of: "sympson-hetter",
-        "randomesque", "progressive", None (no control).
+        "randomesque", "progressive", "none", or None (no control). Names
+        match regardless of case and surrounding whitespace, and ``"_"`` is
+        accepted for ``"-"``, so ``"sympson_hetter"`` also works.
     **kwargs
         Additional keyword arguments passed to the constructor.
 
@@ -824,18 +928,11 @@ def create_exposure_control(
     if method is None:
         return NoExposureControl()
 
-    methods = {
+    methods: dict[str, type[ExposureControl]] = {
         "sympson-hetter": SympsonHetter,
         "randomesque": Randomesque,
         "progressive": ProgressiveRestricted,
         "none": NoExposureControl,
     }
-
-    method_lower = method.strip().lower()
-    if method_lower not in methods:
-        valid = ", ".join(methods.keys())
-        raise ValueError(
-            f"Unknown exposure control method '{method}'. Valid options: {valid}"
-        )
-
-    return methods[method_lower](**kwargs)
+    _, control_class = resolve_name(method, methods, kind="exposure control method")
+    return control_class(**kwargs)

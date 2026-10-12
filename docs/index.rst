@@ -19,6 +19,7 @@ powered by a Rust backend for computational efficiency.
    guides/explanatory
    guides/multilevel
    guides/irtree
+   guides/latent_class
    guides/mfrm
    guides/information
    guides/dif

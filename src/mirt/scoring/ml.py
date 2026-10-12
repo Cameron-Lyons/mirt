@@ -6,31 +6,78 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize, minimize_scalar
 
+from mirt._model_defaults import uses_builtin_model_hooks
 from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import (
+    extreme_response_rows,
     finite_difference_se,
     finite_difference_se_rows,
+    measured_factors,
     observed_test_information,
-    resolve_n_jobs,
     score_pattern_chunks,
     score_responses_parallel,
     supports_row_batched_scoring,
     unique_response_patterns,
     validate_scoring_responses,
 )
-from mirt.scoring._optimization import bounded_scalar_minimize, validate_theta_bounds
-from mirt.utils.numeric import compute_hessian_se
+from mirt.scoring._optimization import (
+    RowObjective,
+    batched_newton_minimize,
+    bounded_scalar_minimize,
+    finite_difference_derivatives,
+    free_block_standard_errors,
+    validate_theta_bounds,
+)
+from mirt.utils._parallel import resolve_n_jobs
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+
+
+def _bounded_ml_standard_errors(
+    objective: RowObjective,
+    theta: NDArray[np.float64],
+    measured: NDArray[np.bool_],
+    lower: float,
+    upper: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return ML estimates and SEs with the extreme-coordinate convention.
+
+    ``objective(rows, x)`` is each row's negative log-likelihood. A
+    coordinate that no observed item measures is reported as zero, and one on
+    a bound whose likelihood still increases beyond it is snapped to that
+    bound; both get infinite standard errors. The remaining coordinates take
+    standard errors from the inverse of their finite-difference Hessian block.
+    """
+    theta = np.where(measured, theta, 0.0)
+    span = 1e-7 * max(1.0, abs(lower), abs(upper))
+    theta = np.where(theta <= lower + span, lower, theta)
+    theta = np.where(theta >= upper - span, upper, theta)
+    standard_error = np.full(theta.shape, np.inf, dtype=np.float64)
+    if theta.shape[0] == 0:
+        return theta, standard_error
+    _, gradient, hessian, finite = finite_difference_derivatives(
+        objective, np.arange(theta.shape[0], dtype=np.intp), theta, h=1e-5
+    )
+    unbounded = ((theta <= lower) & (gradient > 0.0)) | (
+        (theta >= upper) & (gradient < 0.0)
+    )
+    free = measured & ~unbounded
+    hessian[~finite] = np.nan
+    block_se = free_block_standard_errors(hessian, free)
+    standard_error[free] = block_se[free]
+    return theta, standard_error
 
 
 class MLScorer:
     """Maximum likelihood ability scoring.
 
     Built-in unidimensional models are scored for every distinct response
-    pattern with one row-batched bounded Brent search. Subclasses and
-    instances that override the per-pattern hook keep the per-pattern path.
+    pattern with one row-batched bounded Brent search, and built-in
+    multidimensional models (whose log-concave likelihoods have a unique
+    maximum) with one row-batched projected Newton search whose unconverged
+    rows fall back to L-BFGS-B. Other models, subclasses and instances that
+    override the per-pattern hooks keep the per-pattern optimizers.
 
     Parameters
     ----------
@@ -39,6 +86,21 @@ class MLScorer:
     n_jobs : int, default=1
         Number of response patterns to optimize in parallel on the
         per-pattern path. ``-1`` uses all available CPU cores.
+
+    Notes
+    -----
+    A response pattern whose observed responses are all in the lowest
+    category, or all in each item's highest category, has no finite maximum
+    likelihood estimate. Every model family reports it at the lower or upper
+    bound in every coordinate with an infinite standard error (R's mirt
+    reports ``-Inf``/``Inf`` with a missing standard error). In
+    multidimensional models, a coordinate whose likelihood still increases at
+    a bound, such as a factor whose items are all answered in their lowest or
+    highest category in a simple-structure model, is likewise reported at
+    that bound with an infinite standard error, and the other coordinates take
+    standard errors conditional on it. A pattern without observed items, and
+    a factor that no observed item measures, receive zero with an infinite
+    standard error.
     """
 
     def __init__(
@@ -78,16 +140,27 @@ class MLScorer:
                 theta=native[0][inverse], standard_error=native[1][inverse], method="ML"
             )
 
+        per_pattern_hook = (
+            "_score_unidimensional" if n_factors == 1 else "_score_multidimensional"
+        )
         if (
-            n_factors == 1
-            and type(self) is MLScorer
-            and "_score_unidimensional" not in vars(self)
+            type(self) is MLScorer
+            and per_pattern_hook not in vars(self)
             and supports_row_batched_scoring(model)
+            # Newton search is local; built-in multidimensional likelihoods
+            # are log-concave, while noncompensatory and custom curves can
+            # have several maxima.
+            and (n_factors == 1 or uses_builtin_model_hooks(model, likelihood=True))
         ):
-            theta_ml, theta_se = score_pattern_chunks(
-                patterns,
-                lambda chunk: self._score_unidimensional_batch(model, chunk),
-            )
+
+            def score_chunk(
+                chunk: NDArray[np.int_],
+            ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+                if n_factors == 1:
+                    return self._score_unidimensional_batch(model, chunk)
+                return self._score_multidimensional_batch(model, chunk)
+
+            theta_ml, theta_se = score_pattern_chunks(patterns, score_chunk)
             return ScoreResult(
                 theta=theta_ml[inverse], standard_error=theta_se[inverse], method="ML"
             )
@@ -129,12 +202,11 @@ class MLScorer:
         if len(valid_responses) == 0:
             return 0.0, np.inf
 
-        if not model.is_polytomous:
-            prop_correct = valid_responses.mean()
-            if prop_correct == 0:
-                return self.theta_bounds[0], np.inf
-            if prop_correct == 1:
-                return self.theta_bounds[1], np.inf
+        all_lowest, all_highest = extreme_response_rows(model, responses)
+        if all_lowest[0]:
+            return self.theta_bounds[0], np.inf
+        if all_highest[0]:
+            return self.theta_bounds[1], np.inf
 
         result = minimize_scalar(
             neg_log_likelihood,
@@ -169,14 +241,10 @@ class MLScorer:
         n_observed = observed.sum(axis=1)
         theta = np.zeros(patterns.shape[0], dtype=np.float64)
         standard_error = np.full(patterns.shape[0], np.inf, dtype=np.float64)
-        optimize = n_observed > 0
-        if not model.is_polytomous:
-            n_correct = np.where(observed, patterns, 0).sum(axis=1)
-            all_incorrect = optimize & (n_correct == 0)
-            all_correct = optimize & (n_correct == n_observed)
-            theta[all_incorrect] = lower
-            theta[all_correct] = upper
-            optimize &= ~(all_incorrect | all_correct)
+        all_lowest, all_highest = extreme_response_rows(model, patterns)
+        theta[all_lowest] = lower
+        theta[all_highest] = upper
+        optimize = (n_observed > 0) & ~(all_lowest | all_highest)
 
         rows = np.flatnonzero(optimize)
         if rows.size == 0:
@@ -210,28 +278,88 @@ class MLScorer:
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Score one ``(1, n_items)`` pattern with L-BFGS-B from the origin."""
         n_factors = model.n_factors
+        lower, upper = self.theta_bounds
 
         def neg_log_likelihood(theta: NDArray[np.float64]) -> float:
             theta_arr = theta.reshape(1, -1)
             ll = model.log_likelihood(responses, theta_arr)[0]
             return -ll
 
-        valid_responses = responses[responses >= 0]
-        if len(valid_responses) == 0:
+        observed = responses >= 0
+        if not observed.any():
             return np.zeros(n_factors), np.full(n_factors, np.inf)
+        all_lowest, all_highest = extreme_response_rows(model, responses)
+        if all_lowest[0] or all_highest[0]:
+            bound = lower if all_lowest[0] else upper
+            return np.full(n_factors, bound), np.full(n_factors, np.inf)
 
         result = minimize(
             neg_log_likelihood,
             x0=np.zeros(n_factors),
             method="L-BFGS-B",
-            bounds=[(self.theta_bounds[0], self.theta_bounds[1])] * n_factors,
+            bounds=[(lower, upper)] * n_factors,
         )
 
-        theta_est = result.x
-        se_est = compute_hessian_se(neg_log_likelihood, theta_est)
+        def objective(
+            rows: NDArray[np.intp], values: NDArray[np.float64]
+        ) -> NDArray[np.float64]:
+            return np.array([neg_log_likelihood(value) for value in values])
 
-        return theta_est, se_est
+        theta, standard_error = _bounded_ml_standard_errors(
+            objective,
+            np.asarray(result.x, dtype=np.float64)[None, :],
+            measured_factors(model, observed),
+            lower,
+            upper,
+        )
+        return theta[0], standard_error[0]
+
+    def _score_multidimensional_batch(
+        self,
+        model: BaseItemModel,
+        patterns: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Find every pattern's likelihood maximum with a shared Newton search.
+
+        Rows for which the projected Newton search does not converge are
+        re-solved by :meth:`_score_multidimensional`.
+        """
+        lower, upper = self.theta_bounds
+        n_patterns, n_factors = patterns.shape[0], model.n_factors
+        observed = patterns >= 0
+        theta = np.zeros((n_patterns, n_factors), dtype=np.float64)
+        standard_error = np.full((n_patterns, n_factors), np.inf, dtype=np.float64)
+        all_lowest, all_highest = extreme_response_rows(model, patterns)
+        theta[all_lowest] = lower
+        theta[all_highest] = upper
+        rows = np.flatnonzero(observed.any(axis=1) & ~(all_lowest | all_highest))
+        if rows.size == 0:
+            return theta, standard_error
+
+        def neg_log_likelihood(
+            subset: NDArray[np.intp],
+            values: NDArray[np.float64],
+        ) -> NDArray[np.float64]:
+            return -model.log_likelihood(patterns[rows[subset]], values)
+
+        estimate, _, converged = batched_newton_minimize(
+            neg_log_likelihood, np.zeros((rows.size, n_factors)), lower, upper
+        )
+        solved = np.flatnonzero(converged)
+        theta[rows[solved]], standard_error[rows[solved]] = _bounded_ml_standard_errors(
+            lambda subset, values: neg_log_likelihood(solved[subset], values),
+            estimate[solved],
+            measured_factors(model, observed[rows[solved]]),
+            lower,
+            upper,
+        )
+        for row in rows[~converged]:
+            theta[row], standard_error[row] = self._score_multidimensional(
+                model, patterns[row : row + 1]
+            )
+        return theta, standard_error
 
     def __repr__(self) -> str:
         return f"MLScorer(bounds={self.theta_bounds})"

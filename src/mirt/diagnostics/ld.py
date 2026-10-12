@@ -5,9 +5,13 @@ a key assumption in IRT. When local independence is violated, item responses
 are correlated beyond what is explained by the latent trait(s).
 
 Statistics implemented:
-- Yen's Q3 statistic (Yen, 1984)
-- Chen & Thissen's LD χ² statistic (Chen & Thissen, 1997)
-- G² (likelihood ratio) statistic
+- Yen's Q3 statistic (Yen, 1984): the correlation of the raw residuals
+  ``x - E[x | theta_hat]`` of two items.
+- Chen & Thissen's LD χ² statistic (Chen & Thissen, 1997), comparing each
+  pair's observed ``K_i x K_j`` table with the table the model implies
+  marginally over the latent population.
+- G² (likelihood ratio) statistic on the same tables
+- Signed Cramér's V of the LD χ²
 - Adjusted residual correlations
 
 References:
@@ -21,6 +25,7 @@ References:
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import TYPE_CHECKING
@@ -30,14 +35,15 @@ from numpy.typing import ArrayLike, NDArray
 from scipy import stats
 
 from mirt._correlation import q3_correlations
-from mirt._local_dependence import ld_pair_statistics
-from mirt.constants import PROB_EPSILON
+from mirt._local_dependence import MarginalLDStatistics, model_ld_statistics
+from mirt.diagnostics._quadrature import resolve_diagnostic_quadpts
+from mirt.diagnostics._utils import aligned_missing_coded_responses
 from mirt.diagnostics.multiple_testing import (
     PValueAdjustment,
     adjust_p_values,
     validate_p_value_adjustment,
 )
-from mirt.utils.data import _missing_coded_responses
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -53,7 +59,8 @@ class LDResult:
     q3_matrix : NDArray
         Matrix of Yen's Q3 statistics for each item pair
     ld_chi2_matrix : NDArray
-        Matrix of LD χ² statistics for each item pair
+        Matrix of LD χ² statistics for each item pair. The diagonal and pairs
+        with fewer than 10 joint responses are ``NaN``.
     g2_matrix : NDArray
         Matrix of G² (LR) statistics for each item pair
     adj_residual_corr : NDArray
@@ -71,6 +78,16 @@ class LDResult:
         Multiplicity-adjusted chi-square p-values for every eligible pair.
     p_adjustment : str
         Multiple-testing adjustment used for chi-square pair selection.
+    chi2_df_matrix : NDArray or None
+        Degrees of freedom ``(K_i - 1)(K_j - 1)`` of each pair's χ² and G²,
+        where ``K`` is an item's number of categories. ``None`` means one
+        degree of freedom for every pair.
+    cramers_v_matrix : NDArray or None
+        Signed Cramér's V, ``sqrt(χ² / (N_ij (min(K_i, K_j) - 1)))`` for the
+        ``N_ij`` joint responses. Its sign is that of the observed minus the
+        model-implied Goodman-Kruskal gamma, so positive values indicate
+        positive local dependence. This is the upper triangle of
+        ``residuals(type = "LD")`` in the R package mirt.
     """
 
     q3_matrix: NDArray[np.float64]
@@ -83,6 +100,8 @@ class LDResult:
     chi2_p_value_matrix: NDArray[np.float64] | None = None
     chi2_adjusted_p_value_matrix: NDArray[np.float64] | None = None
     p_adjustment: PValueAdjustment = "none"
+    chi2_df_matrix: NDArray[np.float64] | None = None
+    cramers_v_matrix: NDArray[np.float64] | None = None
 
     def summary(self) -> str:
         """Generate a formatted summary of LD results."""
@@ -158,10 +177,13 @@ def compute_ld_statistics(
     model: BaseItemModel | FitResult,
     responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     q3_threshold: float = 0.2,
     alpha: float = 0.05,
     p_adjust: PValueAdjustment = "none",
+    *,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> LDResult:
     """Compute local dependence statistics for all item pairs.
 
@@ -169,47 +191,87 @@ def compute_ld_statistics(
     ----------
     model : BaseItemModel or FitResult
         Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
-        are then EAP scores under its estimated latent covariance.
+        are then EAP scores, and the LD χ² tables integrate over its estimated
+        latent population.
     responses : array-like of shape (n_persons, n_items)
         Integer response matrix. Negative codes, ``NaN`` and the nulls of
         nullable DataFrame columns denote missing responses.
     theta : NDArray of shape (n_persons,) or (n_persons, n_factors), optional
-        Ability estimates. If None, EAP estimates are computed.
-    n_quadpts : int
-        Number of quadrature points for computing expected values
+        Ability estimates for Q3. If None, EAP estimates are computed. The LD
+        χ² and G² statistics do not use abilities.
+    n_quadpts : int, optional
+        Quadrature points per latent dimension, for the EAP abilities and for
+        the model-implied pair tables. The default depends on the number of
+        factors: 49 points for one or two, 21 for three, 9 for four, 7 for
+        five and 5 for more (fewer beyond seven factors, so that the grid has
+        at most 100,000 nodes).
     q3_threshold : float
-        Threshold for flagging Q3 values (default 0.2)
+        Threshold for flagging Q3 values (default 0.2). Must be finite and
+        nonnegative.
     alpha : float
-        Significance level for flagging LD χ² values
+        Significance level for flagging LD χ² values, strictly between 0
+        and 1.
     p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, default="none"
         Multiple-testing adjustment across eligible item pairs.
+    prior_mean, prior_cov : array-like, optional
+        Mean and covariance of the normal latent population, for the EAP
+        abilities and the pair tables. They default to the estimated
+        population of a ``FitResult`` and to the standard normal otherwise.
 
     Returns
     -------
     LDResult
         Object containing all LD statistics and flagged pairs
+
+    Raises
+    ------
+    TypeError
+        If ``q3_threshold`` or ``alpha`` is not a real number.
+    MirtValidationError
+        If ``q3_threshold``, ``alpha`` or ``n_quadpts`` is out of range, or the
+        model is a ``MixtureIRT`` or ``HigherOrderCDM``.
+
+    Notes
+    -----
+    The LD χ² is the statistic of Chen & Thissen (1997). For items ``i`` and
+    ``j`` with ``K_i`` and ``K_j`` categories, it compares the observed
+    ``K_i x K_j`` table of the ``N_ij`` persons who answered both items with
+    the expected table ``N_ij * sum_q w_q P_ik(theta_q) P_jl(theta_q)``. The
+    expected table integrates over the latent population. It has
+    ``(K_i - 1)(K_j - 1)`` degrees of freedom. Pairs with fewer than 10 joint
+    responses have no statistic. The statistics match ``residuals(type =
+    "LD")`` and ``residuals(type = "LDG2")`` in the R package mirt, up to the
+    quadrature rule.
     """
     p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = _missing_coded_responses(responses)
+    q3_threshold = _validate_finite_pair_scalar(
+        q3_threshold, name="q3_threshold", lower=0.0, lower_inclusive=True
+    )
+    alpha = _validate_finite_pair_scalar(alpha, name="alpha", lower=0.0, upper=1.0)
+    responses = aligned_missing_coded_responses(model, responses)
     n_items = responses.shape[1]
-    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
-
-    residuals, positive_probabilities = _compute_residuals_and_positive_probabilities(
+    item_model, theta = _ability_matrix(
         model,
         responses,
         theta,
+        n_quadpts=n_quadpts,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
     )
 
-    q3_matrix = _compute_q3(residuals, responses)
+    q3_matrix = _q3_matrix(item_model, responses, theta)
     adj_residual_corr = _adjust_q3(q3_matrix)
 
-    ld_chi2_matrix, g2_matrix = _compute_ld_chi2_g2(
+    statistics = _compute_ld_chi2_g2(
         model,
         responses,
-        theta,
         n_quadpts,
-        positive_probabilities=positive_probabilities,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
     )
+    ld_chi2_matrix = statistics.chi2
+    g2_matrix = statistics.g2
+    assert g2_matrix is not None
 
     rows, columns = np.triu_indices(n_items, k=1)
     q3_values = q3_matrix[rows, columns]
@@ -222,7 +284,9 @@ def compute_ld_statistics(
     ]
 
     chi2_values = ld_chi2_matrix[rows, columns]
-    p_values, adjusted_p_values = _chi2_pair_p_values(chi2_values, p_adjust)
+    p_values, adjusted_p_values = _chi2_pair_p_values(
+        chi2_values, p_adjust, statistics.df[rows, columns]
+    )
     chi2_mask = adjusted_p_values < alpha
     chi2_flagged = [
         (int(i), int(j), float(value), float(p_value))
@@ -248,7 +312,7 @@ def compute_ld_statistics(
         adjusted_p_values,
     )
 
-    item_names = model.item_names if hasattr(model, "item_names") else None
+    item_names = getattr(item_model, "item_names", None)
 
     return LDResult(
         q3_matrix=q3_matrix,
@@ -261,6 +325,8 @@ def compute_ld_statistics(
         chi2_p_value_matrix=chi2_p_value_matrix,
         chi2_adjusted_p_value_matrix=chi2_adjusted_p_value_matrix,
         p_adjustment=p_adjust,
+        chi2_df_matrix=statistics.df,
+        cramers_v_matrix=statistics.cramers_v,
     )
 
 
@@ -271,8 +337,11 @@ def compute_q3(
 ) -> NDArray[np.float64]:
     """Compute Yen's Q3 statistics for all item pairs.
 
-    Q3 is the correlation between residuals for pairs of items.
-    Under local independence, Q3 should be approximately -1/(n_items - 1).
+    Q3 is the correlation between the raw residuals ``x - E[x | theta]`` of
+    two items, where ``E[x | theta]`` is the expected item score (the
+    expected category for polytomous items) at the ability estimates (Yen,
+    1984). Under local independence, Q3 should be approximately
+    ``-1/(n_items - 1)``.
 
     Parameters
     ----------
@@ -288,78 +357,101 @@ def compute_q3(
     Returns
     -------
     NDArray
-        Matrix of Q3 statistics
+        Matrix of Q3 statistics, with a zero diagonal. Pairs with fewer than
+        three joint responses are zero.
     """
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     model, theta = _ability_matrix(model, responses, theta)
 
-    residuals, _ = _compute_residuals_and_positive_probabilities(
-        model, responses, theta
-    )
-    return _compute_q3(residuals, responses)
+    return _q3_matrix(model, responses, theta)
 
 
 def compute_ld_chi2(
     model: BaseItemModel | FitResult,
     responses: ArrayLike,
     theta: NDArray[np.float64] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     p_adjust: PValueAdjustment = "none",
+    *,
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Compute Chen & Thissen's LD χ² statistics.
 
     Parameters
     ----------
     model : BaseItemModel or FitResult
-        Fitted IRT model, or the ``FitResult`` of a fit. Omitted abilities
-        are then EAP scores under its estimated latent covariance.
+        Fitted IRT model, or the ``FitResult`` of a fit. The expected tables
+        of a ``FitResult`` integrate over its estimated latent population.
     responses : array-like of shape (n_persons, n_items)
         Response matrix. Negative codes, ``NaN`` and the nulls of nullable
         DataFrame columns denote missing responses.
     theta : NDArray, optional
-        Ability estimates
-    n_quadpts : int
-        Number of quadrature points
+        Deprecated and ignored. The statistic integrates over the latent
+        population instead of conditioning on ability estimates. Passing it
+        emits a ``DeprecationWarning``.
+    n_quadpts : int, optional
+        Quadrature points per latent dimension for the model-implied pair
+        tables. The default depends on the number of factors, as in
+        :func:`compute_ld_statistics`.
     p_adjust : {"none", "bonferroni", "holm", "fdr_bh"}, default="none"
         Multiple-testing adjustment across eligible item pairs.
+    prior_mean, prior_cov : array-like, optional
+        Mean and covariance of the normal latent population. They default to
+        the estimated population of a ``FitResult`` and to the standard normal
+        otherwise.
 
     Returns
     -------
     chi2_matrix : NDArray
-        Matrix of LD χ² statistics
+        Matrix of LD χ² statistics on ``(K_i - 1)(K_j - 1)`` degrees of
+        freedom.
     p_value_matrix : NDArray
         Matrix of raw or adjusted p-values, according to ``p_adjust``.
+        The diagonal and pairs with fewer than 10 joint responses are
+        ``NaN`` in both matrices.
+
+    Notes
+    -----
+    See :func:`compute_ld_statistics` for the definition of the statistic.
     """
+    if theta is not None:
+        warnings.warn(
+            "theta is deprecated for compute_ld_chi2 and ignored: the LD "
+            "chi-square integrates over the latent population",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     p_adjust = validate_p_value_adjustment(p_adjust, name="p_adjust")
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     n_items = responses.shape[1]
-    model, theta = _ability_matrix(model, responses, theta, n_quadpts=n_quadpts)
 
-    chi2_matrix, _ = _compute_ld_chi2_g2(model, responses, theta, n_quadpts)
-
-    p_value_matrix = np.zeros_like(chi2_matrix)
+    statistics = _compute_ld_chi2_g2(
+        model,
+        responses,
+        n_quadpts,
+        prior_mean=prior_mean,
+        prior_cov=prior_cov,
+        compute_g2=False,
+    )
     rows, columns = np.triu_indices(n_items, k=1)
-    values = chi2_matrix[rows, columns]
-    _, p_values = _chi2_pair_p_values(values, p_adjust)
-    valid = ~np.isnan(p_values)
-    valid_rows = rows[valid]
-    valid_columns = columns[valid]
-    p_value_matrix[valid_rows, valid_columns] = p_values[valid]
-    p_value_matrix[valid_columns, valid_rows] = p_values[valid]
-
-    return chi2_matrix, p_value_matrix
+    _, p_values = _chi2_pair_p_values(
+        statistics.chi2[rows, columns], p_adjust, statistics.df[rows, columns]
+    )
+    return statistics.chi2, _symmetric_pair_matrix(n_items, rows, columns, p_values)
 
 
 def _ability_matrix(
     model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64] | None,
-    **fscores_kwargs: int,
+    **fscores_kwargs: object,
 ) -> tuple[BaseItemModel, NDArray[np.float64]]:
     """Return the item model and person abilities as an ``(n, n_factors)`` matrix.
 
     Missing abilities default to EAP scores under the latent population of a
-    ``FitResult``, as :func:`mirt.fscores` computes them.
+    ``FitResult``, as :func:`mirt.fscores` computes them. Scoring options
+    that are ``None`` keep the defaults of :func:`mirt.fscores`.
     """
     from mirt.results._common import resolve_item_model
 
@@ -367,9 +459,10 @@ def _ability_matrix(
     if theta is None:
         from mirt.scoring import fscores
 
-        theta = fscores(
-            model_or_result, responses, method="EAP", **fscores_kwargs
-        ).theta
+        options = {
+            name: value for name, value in fscores_kwargs.items() if value is not None
+        }
+        theta = fscores(model_or_result, responses, method="EAP", **options).theta
 
     theta = np.atleast_2d(theta)
     if theta.shape[0] == 1 and responses.shape[0] > 1:
@@ -377,48 +470,32 @@ def _ability_matrix(
     return model, theta
 
 
-def _compute_residuals_and_positive_probabilities(
+def _compute_raw_residuals(
     model: BaseItemModel,
     responses: NDArray[np.int_],
     theta: NDArray[np.float64],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Compute residuals and positive-response probabilities in one pass."""
+) -> NDArray[np.float64]:
+    """Return raw residuals ``x - E[x | theta]``; missing responses are NaN."""
     from mirt.diagnostics.residuals import (
         _all_item_expected_value_variance,
         _item_expected_value_variance,
     )
 
     n_persons, n_items = responses.shape
+    valid = responses >= 0
     batched = _all_item_expected_value_variance(model, theta, n_items)
     if batched is not None:
-        probabilities, expected, variance = batched
-        valid = responses >= 0
-        residuals = np.where(
-            valid,
-            (responses - expected) / np.sqrt(variance + PROB_EPSILON),
-            np.nan,
-        )
-        positive = (
-            1.0 - probabilities[:, :, 0] if probabilities.ndim == 3 else probabilities
-        )
-        return residuals, np.asarray(positive, dtype=np.float64)
+        _, expected, _ = batched
+        return np.where(valid, responses - expected, np.nan)
 
     residuals = np.full((n_persons, n_items), np.nan)
-    positive = np.empty((n_persons, n_items), dtype=np.float64)
     for item_idx in range(n_items):
-        probabilities, expected, variance = _item_expected_value_variance(
-            model,
-            theta,
-            item_idx,
+        _, expected, _ = _item_expected_value_variance(model, theta, item_idx)
+        observed = valid[:, item_idx]
+        residuals[observed, item_idx] = (
+            responses[observed, item_idx] - expected[observed]
         )
-        positive[:, item_idx] = (
-            1.0 - probabilities[:, 0] if probabilities.ndim == 2 else probabilities
-        )
-        valid = responses[:, item_idx] >= 0
-        residuals[valid, item_idx] = (
-            responses[valid, item_idx] - expected[valid]
-        ) / np.sqrt(variance[valid] + PROB_EPSILON)
-    return residuals, positive
+    return residuals
 
 
 def _compute_q3(
@@ -427,6 +504,16 @@ def _compute_q3(
 ) -> NDArray[np.float64]:
     """Compute Q3 (residual correlation) matrix."""
     return q3_correlations(residuals, responses >= 0)
+
+
+def _q3_matrix(
+    model: BaseItemModel,
+    responses: NDArray[np.int_],
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return Yen's Q3 at the abilities ``theta``."""
+    residuals = _compute_raw_residuals(model, responses, theta)
+    return _compute_q3(residuals, responses)
 
 
 def _adjust_q3(q3_matrix: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -438,34 +525,32 @@ def _adjust_q3(q3_matrix: NDArray[np.float64]) -> NDArray[np.float64]:
 
 
 def _compute_ld_chi2_g2(
-    model: BaseItemModel,
+    model_or_result: BaseItemModel | FitResult,
     responses: NDArray[np.int_],
-    theta: NDArray[np.float64],
-    n_quadpts: int,
+    n_quadpts: int | None,
     *,
-    positive_probabilities: NDArray[np.float64] | None = None,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    prior_mean: ArrayLike | None = None,
+    prior_cov: ArrayLike | None = None,
+    compute_g2: bool = True,
+) -> MarginalLDStatistics:
     """Compute LD χ² and G² statistics for item pairs.
 
-    Uses the Chen & Thissen (1997) approach comparing observed and
-    expected cross-classification frequencies.
+    Uses the Chen & Thissen (1997) approach: observed cross-classification
+    frequencies are compared with the model-implied marginal frequencies,
+    integrated over the latent population on a Gauss-Hermite grid.
     """
-    del n_quadpts  # Retained for compatibility with the public call path.
-    n_persons, n_items = responses.shape
+    from mirt.results._common import resolve_latent_prior
 
-    if positive_probabilities is None:
-        positive_probabilities = np.empty((n_persons, n_items), dtype=np.float64)
-        for item_idx in range(n_items):
-            probabilities = np.asarray(model.probability(theta, item_idx))
-            if probabilities.ndim == 2:
-                probabilities = 1.0 - probabilities[:, 0]
-            positive_probabilities[:, item_idx] = probabilities
-    elif positive_probabilities.shape != (n_persons, n_items):
-        raise ValueError("positive_probabilities must match the response matrix shape")
-
-    chi2_matrix, g2_matrix = ld_pair_statistics(responses, positive_probabilities)
-    assert g2_matrix is not None
-    return chi2_matrix, g2_matrix
+    model, mean, cov = resolve_latent_prior(model_or_result, prior_mean, prior_cov)
+    n_points = resolve_diagnostic_quadpts(n_quadpts, getattr(model, "n_factors", 1))
+    return model_ld_statistics(
+        model,
+        responses,
+        n_quadpts=n_points,
+        prior_mean=mean,
+        prior_cov=cov,
+        compute_g2=compute_g2,
+    )
 
 
 def flag_ld_pairs(
@@ -535,7 +620,9 @@ def flag_ld_pairs(
 
     if method in ("chi2", "both"):
         chi2_values = ld_result.ld_chi2_matrix[rows, columns]
-        _, selected_p_values = _chi2_pair_p_values(chi2_values, p_adjust)
+        _, selected_p_values = _chi2_pair_p_values(
+            chi2_values, p_adjust, _pair_degrees(ld_result, rows, columns)
+        )
         selected |= selected_p_values < chi2_alpha
 
     return [
@@ -578,7 +665,11 @@ def ld_summary_table(
     q3_values = ld_result.q3_matrix[rows, columns]
     chi2_values = ld_result.ld_chi2_matrix[rows, columns]
     if ld_result.chi2_adjusted_p_value_matrix is None:
-        _, p_values = _chi2_pair_p_values(chi2_values, ld_result.p_adjustment)
+        _, p_values = _chi2_pair_p_values(
+            chi2_values,
+            ld_result.p_adjustment,
+            _pair_degrees(ld_result, rows, columns),
+        )
     else:
         p_values = ld_result.chi2_adjusted_p_value_matrix[rows, columns]
 
@@ -629,12 +720,25 @@ def ld_summary_table(
 def _chi2_pair_p_values(
     chi2_values: NDArray[np.float64],
     p_adjust: PValueAdjustment,
+    degrees: NDArray[np.float64] | float = 1.0,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Return raw and adjusted p-values for one upper-triangle family."""
     raw = np.full(chi2_values.shape, np.nan)
+    degrees = np.broadcast_to(np.asarray(degrees, dtype=np.float64), raw.shape)
     valid = ~np.isnan(chi2_values)
-    raw[valid] = stats.chi2.sf(chi2_values[valid], df=1)
+    raw[valid] = stats.chi2.sf(chi2_values[valid], df=degrees[valid])
     return raw, adjust_p_values(raw, p_adjust)
+
+
+def _pair_degrees(
+    ld_result: LDResult,
+    rows: NDArray[np.intp],
+    columns: NDArray[np.intp],
+) -> NDArray[np.float64] | float:
+    """Return stored pair degrees of freedom, or one for older results."""
+    if ld_result.chi2_df_matrix is None:
+        return 1.0
+    return ld_result.chi2_df_matrix[rows, columns]
 
 
 def _symmetric_pair_matrix(
@@ -670,7 +774,9 @@ def _validate_finite_pair_scalar(
             bound = f"at least {lower}" if lower_inclusive else f"greater than {lower}"
         else:
             bound = f"strictly between {lower} and {upper}"
-        raise ValueError(f"{name} must be finite and {bound}")
+        raise MirtValidationError(
+            f"{name} must be finite and {bound}", parameter=name, value=value
+        )
     return validated
 
 

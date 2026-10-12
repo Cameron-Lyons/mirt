@@ -26,7 +26,11 @@ from mirt.equating.linking import (
     LinkingConstants,
     LinkingFitStatistics,
     LinkingResult,
+    _compute_anchor_diagnostics,
+    _compute_fit_statistics,
+    _link_form,
     _normalize_anchor_indices,
+    _robust_z_scores,
     _validate_curve_grid,
     _validate_linking_constants,
     _validate_transform_constants,
@@ -57,6 +61,65 @@ class PolytomousLinkingResult(LinkingResult):
     category_fit: dict[int, float] | None = None
 
 
+@dataclass(frozen=True, eq=False)
+class _PolytomousForm:
+    """Anchor parameters of one GRM, GPCM/PCM, or NRM form.
+
+    ``slopes`` holds each ordered anchor's discrimination as a one-element
+    array, or each NRM anchor's category slopes; ``locations`` holds the
+    thresholds, steps, or NRM category intercepts. The two parts are the
+    form's coordinates in that order, each anchor's values in turn.
+    """
+
+    family: Literal["grm", "gpcm", "nrm"]
+    slopes: list[NDArray[np.float64]]
+    locations: list[NDArray[np.float64]]
+    label: str = "model"
+
+    @classmethod
+    def ordered(
+        cls,
+        family: Literal["grm", "gpcm"],
+        discrimination: NDArray[np.float64],
+        locations: list[NDArray[np.float64]],
+        label: str = "model",
+    ) -> "_PolytomousForm":
+        """Wrap scalar discriminations and ordered category locations."""
+        return cls(
+            family,
+            [np.array([value], dtype=np.float64) for value in discrimination],
+            locations,
+            label,
+        )
+
+    @property
+    def discrimination(self) -> NDArray[np.float64]:
+        """Scalar discriminations of an ordered form."""
+        return np.array([values[0] for values in self.slopes], dtype=np.float64)
+
+    def take(self, positions: NDArray[np.intp] | list[int]) -> "_PolytomousForm":
+        """Select, reorder, or resample anchor positions."""
+        return _PolytomousForm(
+            self.family,
+            [self.slopes[int(position)] for position in positions],
+            [self.locations[int(position)] for position in positions],
+            self.label,
+        )
+
+    def replaced(self, part: int, coordinate: int, value: float) -> "_PolytomousForm":
+        """Form with one coordinate of ``slopes`` (part 0) or ``locations`` set."""
+        values = [array.copy() for array in (self.slopes, self.locations)[part]]
+        for array in values:
+            if coordinate < array.size:
+                array[coordinate] = value
+                break
+            coordinate -= array.size
+        else:
+            raise IndexError("coordinate is outside the form's parameters")
+        parts = (values, self.locations) if part == 0 else (self.slopes, values)
+        return _PolytomousForm(self.family, *parts, label=self.label)
+
+
 def link_grm(
     model_old: "BaseItemModel",
     model_new: "BaseItemModel",
@@ -69,12 +132,20 @@ def link_grm(
     n_theta: int = 61,
     weights: NDArray[np.float64] | None = None,
     compute_diagnostics: bool = True,
+    compute_se: bool = False,
+    n_bootstrap: int = 200,
+    random_state: int | np.random.Generator | None = None,
 ) -> LinkingResult:
     """Link a new Graded Response Model to an old/reference calibration.
 
     The returned constants place ``model_new`` on the ``model_old`` scale:
     ``a_old = a_new / A`` and ``threshold_old = A * threshold_new + B``.
     Corresponding anchor items must have the same number of categories.
+    With ``compute_se=True``, ``A_se`` and ``B_se`` are paired-anchor
+    bootstrap standard errors from ``n_bootstrap`` replicates seeded by
+    ``random_state``, as in :func:`~mirt.equating.link`;
+    :func:`~mirt.equating.delta_method_se` propagates the calibrations'
+    parameter covariance instead.
     """
     return _link_ordered_model(
         model_old,
@@ -87,6 +158,9 @@ def link_grm(
         weights,
         compute_diagnostics,
         "grm",
+        compute_se,
+        n_bootstrap,
+        random_state,
     )
 
 
@@ -102,12 +176,16 @@ def link_gpcm(
     n_theta: int = 61,
     weights: NDArray[np.float64] | None = None,
     compute_diagnostics: bool = True,
+    compute_se: bool = False,
+    n_bootstrap: int = 200,
+    random_state: int | np.random.Generator | None = None,
 ) -> LinkingResult:
     """Link a new Generalized Partial Credit Model to a reference scale.
 
     The returned constants place ``model_new`` on the ``model_old`` scale:
     ``a_old = a_new / A`` and ``step_old = A * step_new + B``.
     Corresponding anchor items must have the same number of categories.
+    Standard errors are as in :func:`link_grm`.
     """
     return _link_ordered_model(
         model_old,
@@ -120,6 +198,9 @@ def link_gpcm(
         weights,
         compute_diagnostics,
         "gpcm",
+        compute_se,
+        n_bootstrap,
+        random_state,
     )
 
 
@@ -134,10 +215,14 @@ def _link_ordered_model(
     weights: NDArray[np.float64] | None,
     compute_diagnostics: bool,
     model_type: Literal["grm", "gpcm"],
+    compute_se: bool = False,
+    n_bootstrap: int = 200,
+    random_state: int | np.random.Generator | None = None,
 ) -> LinkingResult:
     """Link GRM thresholds or GPCM steps, which share one ordered kernel."""
     if method not in _ORDERED_METHODS:
         raise ValueError(f"Unknown method: {method}")
+    _validate_bootstrap_request(compute_se, n_bootstrap)
     old_items, new_items, theta_grid, normalized_weights = _validate_link_inputs(
         model_old,
         model_new,
@@ -164,6 +249,17 @@ def _link_ordered_model(
         model_type,
     )
     A, B = _validate_linking_constants(A, B, method)
+    A_se, B_se = None, None
+    if compute_se:
+        A_se, B_se = _anchor_bootstrap_se(
+            _PolytomousForm.ordered(model_type, disc_old, locations_old),
+            _PolytomousForm.ordered(model_type, disc_new, locations_new),
+            method,
+            n_bootstrap,
+            theta_grid,
+            normalized_weights,
+            random_state,
+        )
 
     fit_statistics = None
     anchor_diagnostics = None
@@ -192,7 +288,7 @@ def _link_ordered_model(
         )
 
     return LinkingResult(
-        constants=LinkingConstants(A=A, B=B, method=method),
+        constants=LinkingConstants(A=A, B=B, A_se=A_se, B_se=B_se, method=method),
         anchor_items=old_items,
         fit_statistics=fit_statistics,
         anchor_diagnostics=anchor_diagnostics,
@@ -210,15 +306,20 @@ def link_nrm(
     weights: NDArray[np.float64] | None = None,
     method: Literal["stocking_lord", "haebara"] = "stocking_lord",
     compute_diagnostics: bool = True,
+    compute_se: bool = False,
+    n_bootstrap: int = 200,
+    random_state: int | np.random.Generator | None = None,
 ) -> LinkingResult:
     """Link a new Nominal Response Model to an old/reference calibration.
 
     NRM category logits transform as ``slope_old = slope_new / A`` and
     ``intercept_old = intercept_new - slope_new * B / A``. Both expected-score
     (Stocking-Lord) and category-curve (Haebara) objectives are available.
+    Standard errors are as in :func:`link_grm`.
     """
     if method not in _NRM_METHODS:
         raise ValueError(f"Unknown method: {method}")
+    _validate_bootstrap_request(compute_se, n_bootstrap)
     old_items, new_items, theta_grid, normalized_weights = _validate_link_inputs(
         model_old,
         model_new,
@@ -241,6 +342,17 @@ def link_nrm(
         method,
     )
     A, B = _validate_linking_constants(A, B, method)
+    A_se, B_se = None, None
+    if compute_se:
+        A_se, B_se = _anchor_bootstrap_se(
+            _PolytomousForm("nrm", slopes_old, intercepts_old),
+            _PolytomousForm("nrm", slopes_new, intercepts_new),
+            method,
+            n_bootstrap,
+            theta_grid,
+            normalized_weights,
+            random_state,
+        )
 
     fit_statistics = None
     anchor_diagnostics = None
@@ -267,7 +379,7 @@ def link_nrm(
         )
 
     return LinkingResult(
-        constants=LinkingConstants(A=A, B=B, method=method),
+        constants=LinkingConstants(A=A, B=B, A_se=A_se, B_se=B_se, method=method),
         anchor_items=old_items,
         fit_statistics=fit_statistics,
         anchor_diagnostics=anchor_diagnostics,
@@ -414,6 +526,282 @@ def _linker_for(model: "BaseItemModel") -> Callable[..., LinkingResult]:
     if model_type is None:
         return link
     return {"grm": link_grm, "gpcm": link_gpcm, "nrm": link_nrm}[model_type]
+
+
+def _link_diagnostics(
+    model_old: "BaseItemModel",
+    model_new: "BaseItemModel",
+    anchors_old: list[int],
+    anchors_new: list[int],
+    A: float,
+    B: float,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+) -> tuple[AnchorDiagnostics | None, LinkingFitStatistics | None]:
+    """Diagnose given constants with each family's own anchor curves.
+
+    Dichotomous forms use the core linking curves, and GRM, GPCM/PCM and NRM
+    anchors their family kernels. Other polytomous families, and pairs of
+    different polytomous families, have no parametric diagnostics.
+    """
+    if not (model_old.is_polytomous or model_new.is_polytomous):
+        form_old = _link_form(model_old, anchors_old, "old")
+        form_new = _link_form(model_new, anchors_new, "new")
+        return (
+            _compute_anchor_diagnostics(
+                form_old, form_new, A, B, anchors_old, theta_grid
+            ),
+            _compute_fit_statistics(form_old, form_new, A, B, theta_grid, weights),
+        )
+    model_type = _polytomous_model_type(model_old)
+    if (
+        model_type is None
+        or not (model_old.is_polytomous and model_new.is_polytomous)
+        or _polytomous_model_type(model_new) != model_type
+    ):
+        return None, None
+    old_categories = model_old.n_categories
+    new_categories = model_new.n_categories
+    if any(
+        old_categories[old] != new_categories[new]
+        for old, new in zip(anchors_old, anchors_new, strict=True)
+    ):
+        raise ValueError(
+            "Corresponding anchor items must have the same number of categories"
+        )
+    if model_type == "nrm":
+        slopes_old, intercepts_old = _extract_nrm_parameters(
+            model_old, anchors_old, "old"
+        )
+        slopes_new, intercepts_new = _extract_nrm_parameters(
+            model_new, anchors_new, "new"
+        )
+        nrm = (slopes_old, intercepts_old, slopes_new, intercepts_new, A, B)
+        return (
+            _compute_nrm_diagnostics(*nrm, anchors_old, theta_grid),
+            _compute_nrm_fit(*nrm, theta_grid, weights),
+        )
+    extract_locations = _extract_thresholds if model_type == "grm" else _extract_steps
+    ordered = (
+        _extract_discrimination(model_old, anchors_old, "old"),
+        extract_locations(model_old, anchors_old, "old"),
+        _extract_discrimination(model_new, anchors_new, "new"),
+        extract_locations(model_new, anchors_new, "new"),
+        A,
+        B,
+    )
+    return (
+        _compute_ordered_diagnostics(*ordered, anchors_old, theta_grid, model_type),
+        _compute_ordered_fit(*ordered, theta_grid, weights, model_type),
+    )
+
+
+def _require_polytomous_family(
+    model: "BaseItemModel",
+) -> Literal["grm", "gpcm", "nrm"]:
+    """Return the linker family of a GRM, GPCM/PCM, or NRM model."""
+    from mirt.models.mixed_format import require_single_family
+
+    require_single_family(model, "Polytomous linking")
+    family = _polytomous_model_type(model)
+    if family is None:
+        raise ValueError(
+            f"{getattr(model, 'model_name', type(model).__name__)} models have no "
+            "polytomous linker; GRM, GPCM, PCM, and NRM forms are supported"
+        )
+    return family
+
+
+def _polytomous_parameter_names(model: "BaseItemModel") -> tuple[str, str]:
+    """Stored names of a polytomous form's slope and location parameters."""
+    family = _require_polytomous_family(model)
+    if family == "nrm":
+        return "slopes", "intercepts"
+    candidates = (
+        ("thresholds", "difficulty")
+        if family == "grm"
+        else ("steps", "step_parameters")
+    )
+    location_name, _ = _require_named_parameter(
+        model.parameters, candidates, family.upper()
+    )
+    return "discrimination", location_name
+
+
+def _polytomous_form(
+    model: "BaseItemModel", anchors: list[int], label: str
+) -> _PolytomousForm:
+    """Extract one validated polytomous form for its family's linker."""
+    family = _require_polytomous_family(model)
+    if family == "nrm":
+        slopes, intercepts = _extract_nrm_parameters(model, anchors, label)
+        return _PolytomousForm("nrm", slopes, intercepts, label)
+    extract_locations = _extract_thresholds if family == "grm" else _extract_steps
+    return _PolytomousForm.ordered(
+        family,
+        _extract_discrimination(model, anchors, label),
+        extract_locations(model, anchors, label),
+        label,
+    )
+
+
+def _polytomous_constants(
+    form_old: _PolytomousForm,
+    form_new: _PolytomousForm,
+    method: str,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+) -> tuple[float, float, dict]:
+    """Estimate linking constants of two aligned forms of one family."""
+    if form_old.family == "nrm":
+        return _link_nrm_parameters(
+            form_old.slopes,
+            form_old.locations,
+            form_new.slopes,
+            form_new.locations,
+            theta_grid,
+            weights,
+            method,
+        )
+    return _link_ordered_parameters(
+        form_old.discrimination,
+        form_old.locations,
+        form_new.discrimination,
+        form_new.locations,
+        theta_grid,
+        weights,
+        method,
+        form_old.family,
+    )
+
+
+def _validate_bootstrap_request(compute_se: bool, n_bootstrap: int) -> None:
+    """Validate the bootstrap options of the polytomous linkers."""
+    if not isinstance(compute_se, (bool, np.bool_)):
+        raise ValueError("compute_se must be boolean")
+    if not compute_se:
+        return
+    if isinstance(n_bootstrap, (bool, np.bool_)) or not isinstance(
+        n_bootstrap, (int, np.integer)
+    ):
+        raise ValueError("n_bootstrap must be an integer")
+    if n_bootstrap < 2:
+        raise ValueError("n_bootstrap must be at least 2")
+
+
+def _anchor_bootstrap_se(
+    form_old: _PolytomousForm,
+    form_new: _PolytomousForm,
+    method: str,
+    n_bootstrap: int,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    random_state: int | np.random.Generator | None,
+) -> tuple[float, float]:
+    """Paired-anchor bootstrap standard errors of polytomous constants."""
+    rng = np.random.default_rng(random_state)
+    n_anchors = len(form_old.slopes)
+    samples = np.empty((int(n_bootstrap), 2), dtype=np.float64)
+    for replicate in range(int(n_bootstrap)):
+        positions = rng.integers(0, n_anchors, n_anchors)
+        A, B, _ = _polytomous_constants(
+            form_old.take(positions),
+            form_new.take(positions),
+            method,
+            theta_grid,
+            weights,
+        )
+        samples[replicate] = _validate_linking_constants(A, B, method)
+    A_se, B_se = np.std(samples, axis=0, ddof=1)
+    return float(A_se), float(B_se)
+
+
+def _category_curves_and_slopes(
+    family: Literal["grm", "gpcm", "nrm"],
+    theta: NDArray[np.float64],
+    slopes: NDArray[np.float64],
+    locations: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Category curves of equally sized items and their theta derivatives.
+
+    ``slopes`` holds GRM/GPCM discriminations or NRM category slopes, and
+    ``locations`` thresholds, steps, or NRM category intercepts.
+    """
+    if family == "grm":
+        cumulative = expit(
+            slopes[None, :, None] * (theta[:, None, None] - locations[None, :, :])
+        )
+        derivative = slopes[None, :, None] * cumulative * (1.0 - cumulative)
+        probabilities = _grm_category_probs_batch(theta, slopes, locations)
+        theta_slopes = np.empty_like(probabilities)
+        theta_slopes[:, :, 0] = -derivative[:, :, 0]
+        theta_slopes[:, :, 1:-1] = derivative[:, :, :-1] - derivative[:, :, 1:]
+        theta_slopes[:, :, -1] = derivative[:, :, -1]
+        return probabilities, theta_slopes
+    if family == "gpcm":
+        probabilities = _gpcm_category_probs_batch(theta, slopes, locations)
+        scores = np.arange(probabilities.shape[2], dtype=np.float64)
+        # Category logits have theta slope a * k, so dP_k = a P_k (k - E[k]).
+        expected = probabilities @ scores
+        return probabilities, slopes[None, :, None] * probabilities * (
+            scores[None, None, :] - expected[:, :, None]
+        )
+    probabilities = _nrm_category_probs_batch(theta, slopes, locations)
+    mean_slope = np.sum(probabilities * slopes[None, :, :], axis=2)
+    return probabilities, probabilities * (slopes[None, :, :] - mean_slope[:, :, None])
+
+
+def _polytomous_criterion_gradient(
+    form_old: _PolytomousForm,
+    form_new: _PolytomousForm,
+    theta_grid: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    method: str,
+    params: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Gradient of a Stocking-Lord or Haebara criterion in ``(log A, B)``.
+
+    The placed new curves depend on ``(A, B)`` only through
+    ``u = (theta - B) / A``, so ``dP/dB = -S`` and
+    ``dP/dlog(A) = -(theta - B) S`` for their theta slopes ``S``.
+    """
+    A, B = float(np.exp(params[0])), float(params[1])
+    tcc_old = np.zeros(theta_grid.size)
+    tcc_new = np.zeros(theta_grid.size)
+    tcc_slope = np.zeros(theta_grid.size)
+    # Theta-wise sums of (old - new) * S; dF/dB is twice their weighted sum.
+    residual_slopes = np.zeros(theta_grid.size)
+    for indices in _group_indices(form_old.locations):
+        old_slopes = np.stack([form_old.slopes[index] for index in indices])
+        old_locations = np.stack([form_old.locations[index] for index in indices])
+        new_slopes = np.stack([form_new.slopes[index] for index in indices])
+        new_locations = np.stack([form_new.locations[index] for index in indices])
+        if form_old.family == "nrm":
+            placed = (new_slopes / A, new_locations - new_slopes * B / A)
+        else:
+            old_slopes, new_slopes = old_slopes[:, 0], new_slopes[:, 0]
+            placed = (new_slopes / A, A * new_locations + B)
+        curves_old, _ = _category_curves_and_slopes(
+            form_old.family, theta_grid, old_slopes, old_locations
+        )
+        curves_new, slopes_new = _category_curves_and_slopes(
+            form_old.family, theta_grid, *placed
+        )
+        if method == "stocking_lord":
+            scores = np.arange(curves_old.shape[2], dtype=np.float64)
+            tcc_old += np.sum(curves_old @ scores, axis=1)
+            tcc_new += np.sum(curves_new @ scores, axis=1)
+            tcc_slope += np.sum(slopes_new @ scores, axis=1)
+        else:
+            residual_slopes += np.sum(
+                (curves_old - curves_new) * slopes_new, axis=(1, 2)
+            )
+    if method == "stocking_lord":
+        residual_slopes = (tcc_old - tcc_new) * tcc_slope
+    weighted = 2.0 * weights * residual_slopes
+    return np.array(
+        [float(np.sum(weighted * (theta_grid - B))), float(np.sum(weighted))]
+    )
 
 
 def _require_parameter(
@@ -1015,19 +1403,6 @@ def _compute_ordered_fit(
         weighted_rmse=float(np.hypot(rmse_a, rmse_b)),
         tcc_rmse=tcc_rmse,
     )
-
-
-def _robust_z_scores(values: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Compute MAD-based scores while retaining isolated tied outliers."""
-    median = float(np.median(values))
-    mad = float(np.median(np.abs(values - median)) * 1.4826)
-    if mad >= 1e-10:
-        return (values - median) / mad
-    matches = np.isclose(values, median, rtol=1e-8, atol=1e-10)
-    scores = np.zeros_like(values)
-    differences = values[~matches] - median
-    scores[~matches] = np.copysign(np.inf, differences)
-    return scores
 
 
 def _compute_ordered_diagnostics(

@@ -311,3 +311,24 @@ def test_category_mstep_avoids_full_posterior_row_copies(monkeypatch, factory):
     finally:
         tracemalloc.stop()
     assert peak < posterior.nbytes / 2
+
+
+def test_held_partial_credit_slope_is_the_stored_common_value():
+    # Regression: the itemwise PCM objective used a unit slope whenever the
+    # family held it, also while the common-slope step held an estimate.
+    rng = np.random.default_rng(12)
+    held = PartialCreditModel(2, n_categories=4, estimate_discrimination=True)
+    held.set_parameters(discrimination=np.full(2, 1.7))
+    held._estimate_discrimination = False
+    free = GeneralizedPartialCredit(2, n_categories=4)
+    free.set_parameters(discrimination=np.full(2, 1.7), steps=held.steps)
+    theta = GaussHermiteQuadrature(11).nodes
+    counts = rng.uniform(0.0, 5.0, (11, 4))
+    steps = np.array([-0.4, 0.2, 0.9])
+
+    value, gradient = prepare_polytomous_objective(held, 1, theta, counts, 1e-10)(steps)
+    expected, full = prepare_polytomous_objective(free, 1, theta, counts, 1e-10)(
+        np.concatenate(([1.7], steps))
+    )
+    assert value == pytest.approx(expected, rel=1e-12)
+    np.testing.assert_allclose(gradient, full[1:], rtol=1e-12)

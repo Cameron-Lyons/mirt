@@ -96,12 +96,20 @@ def create_icc_plot_base64(
         return figure_to_base64(fig, dpi=dpi)
 
 
+def _factor_count(model: BaseItemModel) -> int:
+    """Number of factors of a model, one when it does not say."""
+    return int(getattr(model, "n_factors", 1))
+
+
 def create_information_plot_base64(
     model: BaseItemModel,
     test_info: bool = True,
     dpi: int = 100,
 ) -> str:
     """Create information function plot and return as base64.
+
+    A multidimensional model gets one curve per factor: the test
+    information along that factor with the other factors at zero.
 
     Parameters
     ----------
@@ -119,8 +127,21 @@ def create_information_plot_base64(
     """
     from mirt.plotting import plot_information
 
+    n_factors = _factor_count(model)
     with _figure((10, 6)) as (fig, ax):
-        plot_information(model, test_info=test_info, ax=ax)
+        if n_factors == 1:
+            plot_information(model, test_info=test_info, ax=ax)
+        else:
+            for factor in range(n_factors):
+                plot_information(
+                    model,
+                    test_info=test_info,
+                    ax=ax,
+                    factor=factor,
+                    label=f"Factor {factor + 1}",
+                )
+            ax.set_ylabel("Test information along each factor")
+            ax.legend(loc="best")
         return figure_to_base64(fig, dpi=dpi)
 
 
@@ -160,6 +181,8 @@ def create_wright_map_base64(
     model: BaseItemModel,
     theta: NDArray[np.float64],
     dpi: int = 100,
+    *,
+    factor: int = 0,
 ) -> str:
     """Create Wright map and return as base64.
 
@@ -171,16 +194,24 @@ def create_wright_map_base64(
         Ability estimates.
     dpi : int
         Plot resolution.
+    factor : int, default=0
+        Factor of a multidimensional model to map.
 
     Returns
     -------
     str
         Base64-encoded PNG.
+
+    Raises
+    ------
+    ValueError
+        If no item has a location on the factor (see
+        :func:`mirt.plotting.plot_person_item_map`).
     """
     from mirt.plotting import plot_person_item_map
 
     with _figure((10, 8)) as (fig, ax):
-        plot_person_item_map(model, theta, ax=ax)
+        plot_person_item_map(model, theta, ax=ax, factor=factor)
         return figure_to_base64(fig, dpi=dpi)
 
 
@@ -244,6 +275,9 @@ def create_ability_distribution_base64(
 def create_se_plot_base64(model: BaseItemModel, dpi: int = 100) -> str:
     """Create standard error of measurement plot and return as base64.
 
+    A multidimensional model gets one curve per factor, from the test
+    information along that factor.
+
     Parameters
     ----------
     model : BaseItemModel
@@ -258,6 +292,13 @@ def create_se_plot_base64(model: BaseItemModel, dpi: int = 100) -> str:
     """
     from mirt.plotting import plot_se
 
+    n_factors = _factor_count(model)
     with _figure((10, 6)) as (fig, ax):
-        plot_se(model, ax=ax)
+        if n_factors == 1:
+            plot_se(model, ax=ax)
+        else:
+            for factor in range(n_factors):
+                plot_se(model, ax=ax, factor=factor, label=f"Factor {factor + 1}")
+            ax.set_ylabel("Standard error along each factor")
+            ax.legend(loc="best")
         return figure_to_base64(fig, dpi=dpi)

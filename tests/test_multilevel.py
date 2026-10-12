@@ -1,5 +1,7 @@
 """Tests for multilevel IRT models."""
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -380,13 +382,14 @@ class TestCrossedRandomEffectsModel:
         np.testing.assert_array_equal(model.rater_effects, effects)
 
     def test_set_variance_components(self):
-        """Test setting variance components."""
+        """The inert variance components still round-trip, with a warning."""
         base_model = TwoParameterLogistic(n_items=5)
         model = CrossedRandomEffectsModel(base_model=base_model, n_raters=3)
 
-        model.set_variance_components(person=1.5, item=0.3, rater=0.2)
-
-        vc = model.variance_components
+        with pytest.warns(DeprecationWarning, match="set_variance_components"):
+            model.set_variance_components(person=1.5, item=0.3, rater=0.2)
+        with pytest.warns(DeprecationWarning, match="variance_components"):
+            vc = model.variance_components
         assert vc["person"] == 1.5
         assert vc["item"] == 0.3
         assert vc["rater"] == 0.2
@@ -547,14 +550,42 @@ class TestCrossedRandomEffectsModel:
             model.log_likelihood(responses, np.array([[0.0]]))
 
     def test_variance_partition_respects_enabled_components(self):
+        with pytest.warns(DeprecationWarning, match="include_item_effects"):
+            model = CrossedRandomEffectsModel(
+                TwoParameterLogistic(n_items=2),
+                2,
+                include_item_effects=False,
+            )
+        with pytest.warns(DeprecationWarning, match="set_variance_components"):
+            model.set_variance_components(person=3.0, rater=1.0)
+
+        with pytest.warns(DeprecationWarning, match="variance_partition"):
+            assert model.variance_partition == {"person": 0.75, "rater": 0.25}
+
+    def test_variance_components_do_not_enter_the_model(self):
+        """The deprecated components are inert, which their warnings state."""
+        assignments = np.array([[0, 1], [1, 0]])
         model = CrossedRandomEffectsModel(
-            TwoParameterLogistic(n_items=2),
-            2,
-            include_item_effects=False,
-        ).set_variance_components(person=3.0, rater=1.0)
+            TwoParameterLogistic(n_items=2), 2, assignments
+        ).set_rater_effects(np.array([0.3, -0.2]))
+        theta = np.array([[-0.5], [0.8]])
+        responses = np.array([[1, 0], [0, 1]])
+        before = (
+            model.assigned_probability(theta),
+            model.log_likelihood(responses, theta),
+        )
 
-        assert model.variance_partition == {"person": 0.75, "rater": 0.25}
+        with pytest.warns(DeprecationWarning, match="do not enter"):
+            model.set_variance_components(person=4.0, item=2.0, rater=3.0)
 
+        np.testing.assert_array_equal(model.assigned_probability(theta), before[0])
+        assert model.log_likelihood(responses, theta) == before[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            copied = model.copy()
+        np.testing.assert_array_equal(copied.rater_effects, model.rater_effects)
+
+    @pytest.mark.filterwarnings("ignore:CrossedRandomEffectsModel:DeprecationWarning")
     def test_setters_validate_finite_values_atomically(self):
         model = CrossedRandomEffectsModel(TwoParameterLogistic(n_items=2), 2)
         with pytest.raises(ValueError, match="finite"):
@@ -710,3 +741,11 @@ class TestNestedHierarchy:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_unused_multilevel_result_is_deprecated():
+    from mirt.models.multilevel import MultilevelIRTResult
+
+    model = MultilevelIRTModel(TwoParameterLogistic(n_items=2), np.array([0, 1]))
+    with pytest.warns(DeprecationWarning, match="MultilevelIRTResult is deprecated"):
+        MultilevelIRTResult(model, {}, {}, {}, {}, 0.0, 0.0, 1, True)

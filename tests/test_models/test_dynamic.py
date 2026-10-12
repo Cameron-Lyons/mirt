@@ -1398,8 +1398,17 @@ class TestGrowthMixtureModel:
     )
     def test_n_fitted_parameters(self, growth_type, expected):
         model = GrowthMixtureModel(n_classes=3, growth_type=growth_type)
+        fixed = GrowthMixtureModel(
+            n_classes=3, growth_type=growth_type, estimate_variances=False
+        )
+        random_intercept = GrowthMixtureModel(
+            n_classes=3, growth_type=growth_type, slope_var=0.0
+        )
 
-        assert model.n_fitted_parameters == expected
+        # Residual, intercept and slope variances; a zero variance stays fixed.
+        assert model.n_fitted_parameters == expected + 3
+        assert fixed.n_fitted_parameters == expected
+        assert random_intercept.n_fitted_parameters == expected + 2
 
     def test_fit_returns_structured_diagnostics(self):
         source = GrowthMixtureModel(
@@ -1418,7 +1427,7 @@ class TestGrowthMixtureModel:
         assert result.classifications.shape == (40,)
         assert result.posteriors.shape == (40, 2)
         assert result.n_observations == 40
-        assert result.n_parameters == model.n_fitted_parameters == 5
+        assert result.n_parameters == model.n_fitted_parameters == 8
         assert result.aic == pytest.approx(
             2 * result.n_parameters - 2 * result.log_likelihood
         )
@@ -1617,7 +1626,7 @@ class TestGrowthMixtureResult:
         assert np.array_equal(result.class_counts, np.array([1, 1, 3]))
         assert_allclose(result.class_shares, np.array([0.2, 0.2, 0.6]))
         assert result.n_observations == 5
-        assert result.n_parameters == 8
+        assert result.n_parameters == 11
 
     def test_quadratic_summary_includes_curvature_and_iterations(self):
         model = GrowthMixtureModel(
@@ -1640,7 +1649,7 @@ class TestGrowthMixtureResult:
         summary = result.summary()
 
         assert "Observations:       3" in summary
-        assert "Fitted Parameters:  7" in summary
+        assert "Fitted Parameters:  10" in summary
         assert "Iterations:         12" in summary
         assert "Quadratic=-0.200" in summary
         assert "Quadratic=0.300" in summary

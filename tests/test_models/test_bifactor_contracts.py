@@ -98,24 +98,73 @@ def test_copy_preserves_structure_state_and_parameter_independence() -> None:
     assert model.general_loadings[0] == 0.5
 
 
-def test_reliability_coefficients_use_factor_level_score_variance() -> None:
-    model = BifactorModel(4, specific_factors=[2, 2, 5, 5]).set_parameters(
-        general_loadings=np.array([0.5, 0.7, 0.4, 0.6]),
-        specific_loadings=np.array([0.3, 0.2, 0.8, 0.5]),
-        intercepts=np.zeros(4),
+def _r_reference_model() -> BifactorModel:
+    return BifactorModel(8, specific_factors=[3] * 4 + [8] * 4).set_parameters(
+        general_loadings=np.array([1.5, 0.8, 1.2, 2.0, 0.6, 1.0, 1.4, 0.9]),
+        specific_loadings=np.array([0.8, 1.1, 0.3, 0.6, 1.5, 0.4, 0.7, 1.0]),
+        intercepts=np.zeros(8),
     )
-    general_variance = (0.5 + 0.7 + 0.4 + 0.6) ** 2
-    specific_variance = (0.3 + 0.2) ** 2 + (0.8 + 0.5) ** 2
-    total_variance = general_variance + specific_variance + 4
-    subscale_common = (0.4 + 0.6) ** 2 + (0.8 + 0.5) ** 2
 
-    assert_allclose(model.omega_hierarchical(), general_variance / total_variance)
-    assert_allclose(
-        model.omega_total(),
-        (general_variance + specific_variance) / total_variance,
+
+def test_standardized_loadings_match_r_summary() -> None:
+    # R mirt 1.48: summary(bfactor(...)) with these slopes fixed; slopes are
+    # divided by D = 1.702 before standardizing (the raw-slope conversion gives
+    # 0.761 instead of 0.624 for the first general loading).
+    model = _r_reference_model()
+    expected = np.array(
+        [
+            [0.623551, 0.332560, 0.0],
+            [0.367189, 0.504884, 0.0],
+            [0.570343, 0.142586, 0.0],
+            [0.742433, 0.222730, 0.0],
+            [0.255683, 0.0, 0.639207],
+            [0.496487, 0.0, 0.198595],
+            [0.605454, 0.0, 0.302727],
+            [0.414839, 0.0, 0.460932],
+        ]
     )
-    assert_allclose(model.omega_subscale(5), subscale_common / (subscale_common + 2))
+    h2 = [0.499412, 0.389736, 0.345622, 0.600815, 0.473959, 0.285939, 0.458218]
+
+    assert_allclose(model.get_factor_loadings(), expected, atol=1e-6)
+    assert_allclose(model.communalities()[:7], h2, atol=1e-6)
+    assert_array_equal(
+        model.get_factor_loadings(standardized=False)[:, 0],
+        [1.5, 0.8, 1.2, 2.0, 0.6, 1.0, 1.4, 0.9],
+    )
+
+
+def test_reliability_coefficients_use_standardized_loadings() -> None:
+    # McDonald's omegas and ECV from R's standardized loadings and h2 for the
+    # model above. The raw slopes gave omega_h 0.754 and omega_t 0.932.
+    model = _r_reference_model()
+
+    assert model.omega_hierarchical() == pytest.approx(0.659619, abs=1e-6)
+    assert model.omega_total() == pytest.approx(0.818882, abs=1e-6)
+    assert model.omega_subscale(3) == pytest.approx(0.757277, abs=1e-6)
     assert np.isnan(model.omega_subscale(0))
+    ecv = model.explained_common_variance()
+    assert ecv["general"] == pytest.approx(0.654600, abs=1e-6)
+    assert ecv["specific_3"] == pytest.approx(0.126647, abs=1e-6)
+    assert ecv["specific_8"] == pytest.approx(0.218753, abs=1e-6)
+
+
+def test_equal_loadings_omegas_use_the_logistic_scaling() -> None:
+    # Ten items, general slopes 1.5 and specific slopes 0.8: the D-free
+    # computation gave omega_h 0.8427 and omega_t 0.9625.
+    model = BifactorModel(10, [0] * 5 + [1] * 5).set_parameters(
+        general_loadings=np.full(10, 1.5), specific_loadings=np.full(10, 0.8)
+    )
+    general, specific = 1.5 / 1.702, 0.8 / 1.702
+    norm = np.sqrt(1 + general**2 + specific**2)
+    general_sum = (10 * general / norm) ** 2
+    specific_sum = 2 * (5 * specific / norm) ** 2
+    unique = 10 / norm**2
+
+    assert model.omega_hierarchical() == pytest.approx(
+        general_sum / (general_sum + specific_sum + unique)
+    )
+    assert model.omega_hierarchical() == pytest.approx(0.7868, abs=1e-4)
+    assert model.omega_total() == pytest.approx(0.8987, abs=1e-4)
 
 
 def test_explained_common_variance_uses_external_factor_labels() -> None:

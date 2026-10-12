@@ -2,7 +2,7 @@
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose
+from numpy.testing import assert_allclose, assert_array_equal
 
 from mirt.scoring.ml import MLScorer
 
@@ -280,3 +280,158 @@ class TestMLScorerEmptyResponses:
 
         assert result.theta[0] == 0.0
         assert np.isinf(result.standard_error[0])
+
+
+# Two-factor simple structure, rounded from the parity fit, with R mirt 1.48
+# references from fscores(method="ML", max_theta=6) on the same parameters.
+_PARITY_SLOPES = np.array(
+    [
+        [0.85, 0.0],
+        [1.45, 0.0],
+        [1.19, 0.0],
+        [0.83, 0.0],
+        [2.30, 0.0],
+        [0.0, 1.54],
+        [0.0, 2.09],
+        [0.0, 1.93],
+        [0.0, 1.21],
+        [0.0, 1.29],
+    ]
+)
+_PARITY_INTERCEPTS = np.array(
+    [0.39, -1.20, 0.35, -0.97, 0.11, 0.55, 0.20, -1.19, 0.78, 0.67]
+)
+_PARITY_PATTERNS = np.array(
+    [
+        [1, 1, 1, 0, 0, 0, 1, 0, 1, 1],
+        [-1, -1, -1, 0, 0, 0, 0, 0, 1, 1],
+        [1] * 10,
+        [0, 0, 0, 0, 0, 1, 1, 1, 1, 1],
+        [1, 0, 1, 1, 1, 1, 1, 0, 1, 0],
+    ]
+)
+
+
+def _parity_model():
+    from mirt.models import MultidimensionalModel
+
+    model = MultidimensionalModel(10, n_factors=2)
+    model.set_parameters(slopes=_PARITY_SLOPES, intercepts=_PARITY_INTERCEPTS)
+    model._is_fitted = True
+    return model
+
+
+def _extreme_cases():
+    from mirt.models import (
+        BifactorModel,
+        GradedResponseModel,
+        MixedItemModel,
+        MultidimensionalModel,
+        NoncompensatoryModel,
+        TwoParameterLogistic,
+    )
+
+    rng = np.random.default_rng(12)
+    two_pl = TwoParameterLogistic(4)
+    two_pl.set_parameters(
+        discrimination=rng.uniform(0.7, 1.8, 4), difficulty=rng.normal(size=4)
+    )
+    graded = GradedResponseModel(4, n_categories=[3, 4, 3, 5])
+    efa = TwoParameterLogistic(6, n_factors=2)
+    efa.set_parameters(
+        discrimination=rng.uniform(0.4, 1.6, (6, 2)), difficulty=rng.normal(size=6)
+    )
+    mirt3 = MultidimensionalModel(6, n_factors=3)
+    mirt3.set_parameters(slopes=rng.uniform(0.3, 1.5, (6, 3)))
+    bifactor = BifactorModel(6, specific_factors=[0, 0, 0, 1, 1, 1])
+    graded2 = GradedResponseModel(5, n_categories=3, n_factors=2)
+    noncompensatory = NoncompensatoryModel(4, n_factors=2)
+    cases = [two_pl, graded, efa, mirt3, bifactor, graded2, noncompensatory]
+    for model in cases:
+        model._is_fitted = True
+    mixed = MixedItemModel([(two_pl, [0, 2, 4, 6]), (graded, [1, 3, 5, 7])])
+    mixed._is_fitted = True
+    return [*cases, mixed]
+
+
+@pytest.mark.parametrize(
+    "model",
+    _extreme_cases(),
+    ids=["2PL", "GRM", "2PL-2f", "MIRT-3f", "bifactor", "GRM-2f", "noncomp", "mixed"],
+)
+def test_ml_extreme_patterns_follow_one_convention_for_every_family(model):
+    """All-lowest and all-highest patterns sit on the bounds with infinite SE."""
+    top = np.asarray(model.n_categories) - 1 if model.is_polytomous else 1
+    lowest = np.zeros((1, model.n_items), dtype=int)
+    highest = np.broadcast_to(top, (1, model.n_items)).astype(int).copy()
+    lowest[0, 1] = -1
+    highest[0, 0] = -1
+    bounds = (-4.0, 3.0)
+
+    result = MLScorer(theta_bounds=bounds).score(model, np.vstack([lowest, highest]))
+
+    theta = result.theta.reshape(2, -1)
+    standard_error = result.standard_error.reshape(2, -1)
+    assert np.all(theta[0] == bounds[0])
+    assert np.all(theta[1] == bounds[1])
+    assert np.all(np.isposinf(standard_error))
+
+
+def test_multidimensional_ml_matches_r_and_flags_unbounded_factors():
+    """Finite estimates match R; factors without a finite ML get the bound."""
+    result = MLScorer().score(_parity_model(), _PARITY_PATTERNS)
+
+    # R mirt 1.48 references for the finite estimates.
+    assert_allclose(result.theta[0], [0.2184021, 0.1112702], atol=2e-5)
+    assert_allclose(result.standard_error[0], [0.6624992, 0.5814070], atol=5e-4)
+    assert_allclose(result.theta[4], [1.1641610, 0.1964072], atol=2e-5)
+    assert_allclose(result.standard_error[4], [0.8932882, 0.5861332], atol=5e-4)
+    # Every observed F1 item of rows 1 and 3 is wrong, and every F2 item of
+    # row 3 right: those coordinates have no finite ML. R reports Inf/-Inf or
+    # stops unconverged at its search bound. With simple structure, F2 of row
+    # 1 is then the unidimensional ML of its own items.
+    assert result.theta[1, 0] == -6.0 and np.isposinf(result.standard_error[1, 0])
+    assert_allclose(result.theta[1, 1], -0.6279840, atol=2e-5)
+    assert_allclose(result.standard_error[1, 1], 0.6395667, atol=5e-4)
+    assert_array_equal(result.theta[2], [6.0, 6.0])
+    assert_array_equal(result.theta[3], [-6.0, 6.0])
+    assert np.all(np.isposinf(result.standard_error[2:4]))
+
+
+def test_batched_multidimensional_ml_reaches_the_per_pattern_optimum(monkeypatch):
+    """Built-in models share one Newton search and lose no likelihood."""
+    from mirt import simdata
+    from mirt.models import MultidimensionalModel
+
+    rng = np.random.default_rng(3)
+    model = MultidimensionalModel(12, n_factors=2)
+    model.set_parameters(
+        slopes=rng.uniform(0.4, 1.8, (12, 2)), intercepts=rng.normal(size=12)
+    )
+    model._is_fitted = True
+    responses = np.asarray(simdata(model=model, n_persons=150, seed=4))
+    responses[rng.random(responses.shape) < 0.1] = -1
+
+    class PerPattern(MLScorer):
+        pass
+
+    reference = PerPattern().score(model, responses)
+    calls = 0
+    original = MLScorer._score_multidimensional
+
+    def counted(self, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(MLScorer, "_score_multidimensional", counted)
+    batched = MLScorer().score(model, responses)
+
+    assert calls == 0
+    batched_ll = model.log_likelihood(responses, batched.theta)
+    reference_ll = model.log_likelihood(responses, reference.theta)
+    assert np.all(batched_ll >= reference_ll - 1e-7)
+    assert_allclose(batched.theta, reference.theta, atol=2e-3)
+    assert_array_equal(
+        np.isposinf(batched.standard_error), np.isposinf(reference.standard_error)
+    )

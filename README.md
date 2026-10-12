@@ -11,13 +11,14 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Polytomous**: GRM, GPCM, PCM, NRM, rating scale (RSM) and graded rating scale (GRSM)
 - **Mixed formats**: One family per item, e.g. 3PL multiple choice with GRM constructed response
 - **Multidimensional**: Exploratory and confirmatory MIRT with estimated factor correlations
-- **Bifactor**: Bifactor and hierarchical models, with dimension-reduction EM for any number of specific factors
+- **Bifactor**: Bifactor and hierarchical models with dichotomous, graded (Likert) or mixed items, with dimension-reduction EM for any number of specific factors
 
 ### Advanced Models
-- **Cognitive Diagnostic**: DINA, DINO, G-DINA
+- **Cognitive Diagnostic**: DINA, DINO, G-DINA with reduced models, higher-order CDMs and attribute hierarchies
 - **Testlet**: Random effects for item bundles
 - **Nested Logit**: Keyed multiple-choice items with informative distractors
 - **Mixture IRT**: Latent class IRT models
+- **Latent Class Analysis**: Unconstrained latent class models for binary and polytomous items, like R mirt's `mdirt()`, with multiple starts and observed-information standard errors
 - **Zero-Inflated**: ZI-2PL, ZI-3PL, Hurdle IRT
 - **Unfolding**: GGUM, Ideal Point, Hyperbolic Cosine
 - **Nonparametric**: Monotonic spline and weighted kernel-smoothed IRFs
@@ -26,10 +27,10 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **Network Psychometrics**: Ising and sparse Gaussian graphical models
 
 ### Estimation Methods
-- **EM Algorithm**: Gauss-Hermite quadrature (with Rust acceleration) and optional SQUAREM acceleration
+- **EM Algorithm**: R mirt's rectangular quadrature grid with dimension-dependent point counts (61 points for one factor, 31 for two, 15 for three; Gauss-Hermite nodes for coarser grids), Rust acceleration, and optional SQUAREM acceleration
 - **Estimation controls**: Starting values, fixed parameters, item priors (Bayes modal EM), and R-style model syntax
-- **Standard errors**: Observed-information (Louis/Oakes) standard errors and parameter covariance by default for unidimensional 1PL-4PL, graded, partial credit, rating scale, and mixed-format EM fits; cross-product and sandwich alternatives
-- **GVEM**: Gaussian Variational EM for fast high-dimensional estimation
+- **Standard errors**: Observed-information (Louis/Oakes) standard errors and parameter covariance by default for EM fits of 1PL-4PL, graded, partial credit, nominal and rating scale models with any number of factors, and of model-syntax, bifactor, custom and mixed-format models; cross-product and sandwich alternatives, and design-based sandwich errors for survey-weighted fits
+- **GVEM**: Gaussian Variational EM for fast high-dimensional estimation (approximate: slopes are biased toward zero, Cho et al. 2021; use EM, QMC-EM or MH-RM when unbiased estimates matter)
 - **Sparse Bayesian**: Spike-slab LASSO for automatic structure discovery
 - **MHRM**: Metropolis-Hastings Robbins-Monro (Cai, 2010) for dichotomous and polytomous items
 - **MCMC**: Gibbs sampling for Bayesian estimation
@@ -45,13 +46,13 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - **MCAT**: Multidimensional CAT with D-optimality and trace criteria
 
 ### Diagnostics & DIF
-- **Item fit**: Infit, outfit (with standardized z values), S-X2, X2/G2, and PV-Q1 with multiple-testing control
+- **Item fit**: Infit, outfit (with standardized z values), item-level Zh, S-X2, X2/G2, and PV-Q1 with multiple-testing control
 - **Person fit**: Zh, lz, infit/outfit
-- **Model fit**: M2, RMSEA, CFI, TLI, SRMSR
+- **Model fit**: M2, M2*, C2, RMSEA, CFI, TLI, SRMSR
 - **DIF analysis**: Multiple-group likelihood ratio (drop/add schemes, anchor selection), linked Wald and Lord, Raju
 - **GRDIF**: Multi-group residual DIF with robust scaling and multiplicity control
 - **DTF/DRF**: Differential test/response functioning
-- **SIBTEST**: Simultaneous item bias test
+- **SIBTEST**: Simultaneous item bias test for binary and polytomous items, crossing DIF with a randomization test, and multi-group GSIBTEST
 - **Local dependence**: Q3, chi-square residuals, and pairwise multiplicity control
 
 ### Additional Features
@@ -60,7 +61,7 @@ A comprehensive Python implementation of Item Response Theory (IRT) models with 
 - Bootstrap standard errors, confidence intervals, and likelihood-ratio tests
 - Plausible values for population inference, with population or latent-regression priors
 - Missing data imputation with calibrated-model reuse and joint posterior ability draws
-- Built-in sample datasets
+- Built-in sample datasets: the published LSAT6 and LSAT7 tables, plus simulated stand-ins (not the R mirt data of the same names)
 - Simulation from fitted dichotomous and polytomous models
 - Plotting (ICC, information, Wright maps, DIF)
 - DataFrame input and output (pandas or polars): column names become item names, and NaN marks missing responses when fitting
@@ -228,6 +229,13 @@ bifactor_data = mirt.simdata(
 )
 result_bf = mirt.bfactor(bifactor_data, specific)
 print(result_bf.model.general_loadings)
+
+# Graded (Likert) items, like R's bfactor(data, model, itemtype = "graded").
+graded = mirt.GradedBifactorModel(20, specific, n_categories=5)
+graded.set_parameters(general_loadings=np.full(20, 1.4), specific_loadings=np.ones(20))
+likert_data = graded.simulate(rng.standard_normal((1000, 5)), seed=5)
+result_gbf = mirt.bfactor(likert_data, specific, model="graded")
+print(result_gbf.coef())  # general_loadings, specific_loadings, intercepts_1-4
 ```
 
 ### Weighted Nonparametric Calibration
@@ -427,12 +435,23 @@ print(f"Covariance: {mcat_result.covariance}")
 ```python
 from mirt import fit_cdm
 q_matrix = np.tile([[1, 0], [1, 1], [0, 1], [1, 1]], (5, 1))  # one row per item
-cdm_model, profile_posteriors = fit_cdm(responses, q_matrix, model="DINA")
+cdm_fit = fit_cdm(responses, q_matrix, model="DINA")  # or "GDINA", "ACDM", ...
+print(cdm_fit.log_likelihood, cdm_fit.bic, cdm_fit.converged)
+# Estimated class distribution over the 2**K mastery patterns; the fitted
+# model also uses it as the prior for scoring respondents.
+class_probabilities = cdm_fit.class_probabilities
+profiles = cdm_fit.model.classify_respondents(responses, method="MAP")
+mastery = cdm_fit.model.attribute_marginals(responses)
 
 from mirt import fit_mixture_irt
 mix_model, class_posteriors = fit_mixture_irt(
     responses, n_classes=2, base_model="2PL"
 )
+
+from mirt import fit_lca  # R mirt's mdirt(); also available as mirt.mdirt
+lca = fit_lca(responses, n_classes=3, n_starts=10, seed=1)
+print(lca.bic, lca.entropy, lca.class_proportions)  # classes largest first
+latent_classes = lca.classify()
 
 from mirt import TestletModel, create_testlet_structure
 testlet_struct = create_testlet_structure(n_items=20, testlet_sizes=[5, 5, 5, 5])
@@ -628,7 +647,7 @@ plot_person_item_map(result.model, eap.theta)
 
 | Model | Description | Parameters |
 |-------|-------------|------------|
-| 1PL/Rasch | One-parameter logistic | difficulty (b) |
+| 1PL/Rasch | One-parameter logistic with one estimated slope for all items (equivalent to R's `Rasch`) | common discrimination (a), difficulty (b) |
 | 2PL | Two-parameter logistic | discrimination (a), difficulty (b) |
 | 3PL | Three-parameter logistic | a, b, guessing (c) |
 | 4PL | Four-parameter logistic | a, b, c, upper asymptote (d) |
@@ -640,7 +659,7 @@ plot_person_item_map(result.model, eap.theta)
 |-------|-------------|----------|
 | GRM | Graded Response Model | Ordered categories (Likert) |
 | GPCM | Generalized Partial Credit | Partial credit scoring |
-| PCM | Partial Credit Model | Rasch for polytomous |
+| PCM | Partial Credit Model | Rasch for polytomous, with one estimated common slope |
 | RSM | Rating Scale Model | Rasch rating scale with thresholds shared by all items |
 | GRSM | Graded Rating Scale Model | Graded items sharing one slope and threshold set |
 | NRM | Nominal Response Model | Unordered categories |
@@ -653,10 +672,11 @@ plot_person_item_map(result.model, eap.theta)
 | MIRT | Multidimensional IRT |
 | Bifactor | General + specific factors |
 | Mixed format | A different item family for each item on one trait |
-| DINA/DINO | Cognitive diagnostic |
+| DINA/DINO/G-DINA | Cognitive diagnostic, including higher-order CDMs |
 | Testlet | Local dependence modeling |
 | Nested Logit | Keyed response and conditional distractor modeling |
 | Mixture IRT | Latent class IRT |
+| Latent class | Unconstrained latent class analysis (`fit_lca()`, alias `mdirt()`) |
 | GGUM | Generalized graded unfolding |
 | MFRM | Many-facet Rasch models for rater and task effects |
 | BKT | Bayesian knowledge tracing of per-skill mastery |
@@ -678,13 +698,15 @@ plot_person_item_map(result.model, eap.theta)
 | `multigroup_dif()` | Multiple-group likelihood-ratio DIF with drop/add schemes |
 | `fit_mfrm()` | Many-facet Rasch models by marginal maximum likelihood |
 | `fit_bkt_em()` | Bayesian knowledge tracing by Baum-Welch EM |
-| `load_dataset()` | Load sample datasets |
+| `fit_cdm()`, `fit_gdina()`, `fit_higher_order_cdm()` | Cognitive diagnosis models by EM, returning a `CDMResult` |
+| `fit_lca()`, `mdirt()` | Latent class analysis by EM, returning an `LCAResult` |
+| `load_dataset()` | Load sample datasets (LSAT6 and LSAT7 are published data; the others are simulated stand-ins) |
 
 ### Estimator Classes
 
 | Class | Description |
 |-------|-------------|
-| `EMEstimator` | Standard EM with Gauss-Hermite quadrature, item priors, and SQUAREM |
+| `EMEstimator` | Standard EM on rectangular or Gauss-Hermite quadrature, item priors, equality constraints, and SQUAREM |
 | `BifactorEMEstimator` | Bifactor EM on two-dimensional grids per specific factor |
 | `MixedFormatEMEstimator` | EM for tests that mix item families |
 | `MHRMEstimator` | Metropolis-Hastings Robbins-Monro |
@@ -698,7 +720,7 @@ plot_person_item_map(result.model, eap.theta)
 
 | Function | Description |
 |----------|-------------|
-| `compute_fit_indices()` | M2/M2* score moments, RMSEA, CFI, TLI, SRMSR |
+| `compute_fit_indices()` | M2/M2*/C2 limited-information statistics, RMSEA, CFI, TLI, SRMSR |
 | `compare_models()` | AIC/BIC comparison |
 | `anova_irt()` | Likelihood ratio tests |
 | `compute_dtf()` | Differential test functioning |
@@ -725,7 +747,9 @@ plot_person_item_map(result.model, eap.theta)
 | `cross_validate()` | Validated K-fold, stratified, group-aware, and leave-one-out evaluation with optional process parallelism and shared per-fold ability estimates |
 | `cv_select_lambda()` | Held-out regularization selection with optional process-parallel fold evaluation |
 | `impute_responses()` | Missing data imputation |
+| `averageMI()` | Rubin's rules with R's t statistics and p-values, and optional Barnard-Rubin small-sample degrees of freedom |
 | `itemstats()` | Item distributions, modes, entropy, and effective category counts |
+| `traditional()` | Cronbach's alpha, alpha if deleted, standardized alpha, SEM, and item-total correlations for binary and polytomous items, with R's complete-case or pairwise missing-data handling |
 | `missing_patterns()` | Frequency-ranked missing-response pattern analysis |
 | `gen_random_pars()` | Valid random starting values that preserve model constraints |
 | `multi_start_fit()` | Repeated fitting with deterministic best-fit selection |
@@ -738,11 +762,11 @@ plot_person_item_map(result.model, eap.theta)
 | `Q3()` | Yen's Q3 local dependence statistic |
 | `LD_X2()` | Chen & Thissen LD chi-square |
 | `fixed_item_calibration()` | Fixed-item parameter calibration (FIPC) for any item family |
-| `fixed_calib()` | Legacy 2PL fixed-item calibration |
+| `fixed_calib()` | 2PL fixed-item calibration under a fixed standard normal population |
 | `link()` / `chain_link()` | IRT linking of separately calibrated forms |
 | `kernel_equating()` / `irt_kernel_equating()` | Gaussian kernel equating of observed or IRT score distributions |
 | `equate()` | Deprecated; use `link()` |
-| `RCI()` | Reliable Change Index for clinical significance |
+| `RCI()` | Jacobson-Truax, Iverson (pre- and post-test errors, as R) and Hageman-Arrindell reliable change indices |
 | `PLCI()` | Profile-likelihood confidence intervals |
 | `wald()` | Wald tests using a fit's parameter covariance |
 | `draw_parameters()` | Draw item parameters from a fit's asymptotic covariance |
@@ -753,15 +777,15 @@ plot_person_item_map(result.model, eap.theta)
 | `conditional_effects()` / `shrinkage_estimates()` | Mixed-model effect and reliability summaries |
 | `empirical_plot()` / `empirical_rmsea()` | Binned binary and polytomous empirical-fit diagnostics |
 | `itemGAM()` | Kernel-smoothed observed-versus-expected item scores |
-| `rotate_loadings()` | Varimax, quartimax, equamax, oblimin, promax, and geomin rotations |
+| `rotate_loadings()` | Orthogonal (varimax, quartimax, equamax, geominT, bifactorT, targetT, pstT) and oblique (oblimin, quartimin, promax, geominQ, bifactorQ, targetQ, pstQ) rotations by gradient projection, as GPArotation |
 
 ### Data Transformation Functions
 
 | Function | Description |
 |----------|-------------|
-| `key2binary()` | Score multiple choice with answer key |
-| `poly2dich()` | Convert polytomous to dichotomous |
-| `reverse_score()` | Reverse score items |
+| `key2binary()` | Score multiple choice with answer key; missing answers stay missing |
+| `poly2dich()` | Threshold, median, cumulative, adjacent-category or per-category dichotomization |
+| `reverse_score()` | Reverse score items against each item's maximum, keeping missing codes |
 | `expand_table()` | Expand frequency table to response matrix |
 | `collapse_table()` | Collapse responses to frequency table |
 | `collapse_patterns()` | Collapse duplicate response patterns for efficient estimation |
@@ -772,9 +796,9 @@ plot_person_item_map(result.model, eap.theta)
 
 | Function | Description |
 |----------|-------------|
-| `testinfo()` | Test information function |
-| `iteminfo()` | Item information function |
-| `areainfo()` | Area under information curve |
+| `testinfo()` | Test information function; directional (`degrees=`) or matrix information for multidimensional models |
+| `iteminfo()` | Item information function, with the same directional and matrix options |
+| `areainfo()` | Area under information curve, optionally with R's total information and proportion |
 | `expected_score()` | Expected score at theta |
 | `gen_difficulty()` | Generalized difficulty index |
 | `theta_for_score()` | Find theta for target score |
@@ -789,8 +813,8 @@ plot_person_item_map(result.model, eap.theta)
 | Mixed item types | `itemtype` vector | `fit_mirt(model=[...])` |
 | Multidimensional | Full support | Full support |
 | Model syntax | `mirt.model()` | `mirt_model()` (FIXED, START, PRIOR, COV) |
-| Bifactor | Yes | Yes (`bfactor()` with dimension reduction) |
-| Cognitive diagnostic | mirtCAT separate | Built-in (DINA, DINO) |
+| Bifactor | Yes | Yes (`bfactor()` with dimension reduction, dichotomous and graded items) |
+| Cognitive diagnostic | mirtCAT separate | Built-in (DINA, DINO, G-DINA, higher-order) |
 | Estimation | EM, MHRM, MCMC | EM (with SQUAREM), GVEM, Sparse Bayesian, MHRM, MCMC |
 | Automatic structure discovery | No | Yes (spike-slab LASSO) |
 | CAT | mirtCAT package | Built-in (unidimensional, MCAT, shadow tests) |
@@ -807,18 +831,23 @@ When the Rust backend is available (automatically built during installation), th
 
 | Category | Accelerated Operations |
 |----------|------------------------|
-| **Likelihood** | Log-likelihood computation for 2PL, 3PL, and multidimensional models |
-| **EM Algorithm** | E-step (posterior computation), M-step (Newton-Raphson optimization), full EM fitting |
-| **Multigroup** | E-step for all models (2PL, 3PL, GRM, GPCM, NRM), expected counts |
-| **Scoring** | EAP scores, WLE scores, Lord-Wingersky recursion for sum scores |
-| **Diagnostics** | Q3 matrix, LD chi-square, infit/outfit statistics, standardized residuals |
-| **Calibration** | Fixed-item calibration EM algorithm (`fixed_calib`) |
-| **SIBTEST** | Beta statistic computation, all-items SIBTEST |
-| **CAT** | Item information, item selection, EAP updates, batch simulation |
+| **Likelihood** | GRM and GPCM log-likelihoods; posterior normalization of EM E-steps |
+| **EM Algorithm** | Fused 3PL EM iterations, GRM/GPCM/PCM M-steps, regularized coordinate-descent M-steps |
+| **Multigroup** | E-step for 2PL, 3PL, GRM, GPCM, and NRM |
+| **Scoring** | MAP and ML scores; posterior intervals |
+| **Equating** | Lord-Wingersky observed-score distributions of 2PL forms |
+| **Diagnostics** | Alpha if item deleted, pointwise 2PL log-likelihood |
+| **CAT** | Batch simulation and conditional MSE |
 | **Simulation** | Response generation for 2PL/3PL, GRM, GPCM |
-| **Bootstrap** | Index generation, resampling, parallel bootstrap fitting |
-| **Plausible Values** | Posterior sampling, MCMC generation |
-| **MCMC** | Gibbs sampling for 2PL, MHRM estimation |
+| **Bootstrap** | Parallel 2PL bootstrap fitting of Gauss-Hermite fits |
+| **MHRM** | Burn-in cycles of unidimensional 2PL MHRM fits |
+| **Knowledge tracing** | BKT forward-backward (single and batched) and Viterbi decoding |
+| **Response times** | Joint response and response-time log-likelihoods, Gibbs person updates |
+| **Explanatory** | Marginal log-likelihood of explanatory IRT models |
+
+Gibbs sampling, GVEM, WLE and EAPsum scoring, 2PL EM fits, residuals and Yen's
+Q3 run in NumPy on every backend: their former native kernels were no faster
+than the vectorized NumPy paths.
 
 ### Fallback contract
 
@@ -831,7 +860,7 @@ Rust wrappers declare one of four modes (see each module's `FALLBACK_MODE`):
 | **required** | Raises `RuntimeError` (accelerated-only entry point; use the public Python estimator instead) |
 | **mixed** | Module contains more than one of the modes above |
 
-Most hot paths (likelihood, E-step, scoring, diagnostics, simulation) are **numpy**. A few full-fit helpers such as `em_fit_2pl` are **required** — `fit_mirt(..., estimation="EM")` still works without Rust via `EMEstimator`.
+Most hot paths (likelihood, E-step, scoring, diagnostics, simulation) are **numpy**. The accelerated-only helpers `bootstrap_fit_2pl` and `mhrm_fit_2pl` are **required**; `bootstrap_se()` and `MHRMEstimator` still work without Rust through their Python implementations.
 
 Disable Rust globally with:
 
@@ -841,6 +870,8 @@ mirt.set_backend("numpy")
 ```
 
 Per-call `use_rust=False` also disables Rust for that call. `mirt.should_use_rust()` reports the effective decision.
+
+GPU dispatch (EM and GVEM, with PyTorch and CUDA) follows the same preference: `"auto"` and `"gpu"` use an available GPU, `"rust"` and `"numpy"` do not. An explicit `use_gpu=True` or `use_gpu=False` on `fit_mirt` or an estimator takes precedence for that fit.
 
 The Rust backend provides significant speedups for large datasets (1000+ persons) due to:
 
@@ -954,7 +985,7 @@ The following are guaranteed stable and will not have breaking changes in v1.x r
 
 - Internal `_rust_backend` / `backends.rust` module functions (use public wrappers instead)
 - MCMC samplers (`GibbsSampler`, `MHRMEstimator`) - API may be refined
-- Cognitive Diagnostic Models (`DINA`, `DINO`, `fit_cdm()`) - under active development
+- Cognitive Diagnostic Models (`DINA`, `DINO`, `GDINA`, `HigherOrderCDM`, `fit_cdm()`, `fit_gdina()`, `fit_higher_order_cdm()`) - under active development
 
 ### Versioning Policy
 
@@ -986,3 +1017,4 @@ If you use this package in your research, please cite:
 - Cho, A. E., Wang, C., Zhang, X., & Xu, G. (2021). Gaussian variational estimation for multidimensional item response theory. *British Journal of Mathematical and Statistical Psychology*, 74, 52-85.
 - Rockova, V., & George, E. I. (2018). The spike-and-slab LASSO. *Journal of the American Statistical Association*, 113(521), 431-444.
 - de la Torre, J. (2011). The generalized DINA model framework. *Psychometrika*, 76(2), 179-199.
+- de la Torre, J., & Douglas, J. A. (2004). Higher-order latent trait models for cognitive diagnosis. *Psychometrika*, 69(3), 333-353.

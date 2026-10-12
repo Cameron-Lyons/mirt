@@ -53,9 +53,9 @@ def test_tensor_item_parameters_roundtrip_without_aliasing(factors):
 @pytest.mark.parametrize("weighted", [False, True])
 def test_tensor_standard_errors_match_independent_softmax_curvature(weighted):
     model = NominalResponseModel(2, n_categories=[2, 4], n_factors=2)
-    estimator = (
-        WeightedEMEstimator(n_quadpts=5) if weighted else EMEstimator(n_quadpts=5)
-    )
+    # Itemwise complete-data curvature; "auto" gives the observed information.
+    options = {"n_quadpts": 5, "se_method": "complete_data"}
+    estimator = WeightedEMEstimator(**options) if weighted else EMEstimator(**options)
     estimator._quadrature = GaussHermiteQuadrature(5, 2)
     points = estimator._quadrature.nodes
     rng = np.random.default_rng(619)

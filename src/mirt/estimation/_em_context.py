@@ -35,7 +35,11 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
             responses = np.ascontiguousarray(responses, dtype=np.int32)
         self.responses = responses
         self._observed: NDArray[np.bool_] | None = None
+        self._complete: bool | None = None
         self._components: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None
+        # One-hot category indicators of small matrices, with the category
+        # counts they were built for.
+        self._indicators: tuple[tuple[int, ...], NDArray[np.float64]] | None = None
         self._resources = ExitStack()
         self._executor: ThreadPoolExecutor | None = None
         self._native_pool: Any = None
@@ -46,6 +50,13 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
             self._observed = self.responses >= 0
         return self._observed
 
+    @property
+    def complete(self) -> bool:
+        """Whether every response is observed."""
+        if self._complete is None:
+            self._complete = bool(np.all(self.observed))
+        return self._complete
+
     def expected_counts(
         self,
         posterior: NDArray[np.float64],
@@ -53,18 +64,36 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         *,
         cache_components: bool = True,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Accumulate all item counts with bounded floating-point scratch space."""
+        """Accumulate all item counts with bounded floating-point scratch space.
+
+        Without missing responses every item's observed count at a node is
+        the node's (person-weighted) posterior mass, so only the correct
+        counts take a product with the responses.
+        """
         n_persons, n_items = self.responses.shape
+        node_mass = None
+        if self.complete:
+            node_mass = (
+                posterior.sum(axis=0)
+                if person_weights is None
+                else np.asarray(person_weights, dtype=np.float64) @ posterior
+            )
         if (
             person_weights is None
             and cache_components
             and 2 * self.responses.size <= _MAX_COUNT_ENTRIES
         ):
             correct, observed = self.response_components(0, n_persons)
+            if node_mass is not None:
+                return correct.T @ posterior, np.tile(node_mass, (n_items, 1))
             return correct.T @ posterior, observed.T @ posterior
 
         correct_counts = np.zeros((n_items, posterior.shape[1]))
-        observed_counts = np.zeros_like(correct_counts)
+        observed_counts = (
+            np.zeros_like(correct_counts)
+            if node_mass is None
+            else np.tile(node_mass, (n_items, 1))
+        )
         max_entries = _MAX_COUNT_ENTRIES
         if person_weights is not None or not cache_components:
             max_entries = min(max_entries, _MAX_DIRECT_COUNT_ENTRIES)
@@ -82,7 +111,8 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
                 )
             weights = posterior[start:stop]
             correct_counts += correct.T @ weights
-            observed_counts += observed.T @ weights
+            if node_mass is None:
+                observed_counts += observed.T @ weights
             del correct, observed
         return correct_counts, observed_counts
 
@@ -130,19 +160,30 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
 
         Returns one ``(n_points, n_categories[j])`` array per item, equal to
         :meth:`expected_category_counts` for that item. Missing responses and
-        codes outside an item's categories contribute nothing.
+        codes outside an item's categories contribute nothing. Small response
+        matrices keep their one-hot indicators for the next call, so each
+        E/M cycle takes one product with the posterior.
         """
         sizes = np.asarray(n_categories, dtype=np.intp)
         offsets = np.concatenate(([0], np.cumsum(sizes)))
         n_persons = self.responses.shape[0]
-        counts = np.zeros((posterior.shape[1], int(offsets[-1])))
-        chunk_size = max(1, _MAX_COUNT_ENTRIES // max(1, int(offsets[-1])))
-        for start in range(0, n_persons, chunk_size):
-            block = self.responses[start : start + chunk_size]
-            rows, items = np.nonzero((block >= 0) & (block < sizes))
-            indicators = np.zeros((block.shape[0], counts.shape[1]))
-            indicators[rows, offsets[items] + block[rows, items]] = 1.0
-            counts += posterior[start : start + chunk_size].T @ indicators
+        width = int(offsets[-1])
+        if n_persons * width <= _MAX_COUNT_ENTRIES:
+            key = tuple(int(size) for size in sizes)
+            if self._indicators is None or self._indicators[0] != key:
+                self._indicators = (
+                    key,
+                    _category_indicators(self.responses, sizes, offsets),
+                )
+            counts = posterior.T @ self._indicators[1]
+        else:
+            counts = np.zeros((posterior.shape[1], width))
+            chunk_size = max(1, _MAX_COUNT_ENTRIES // max(1, width))
+            for start in range(0, n_persons, chunk_size):
+                block = self.responses[start : start + chunk_size]
+                counts += posterior[start : start + chunk_size].T @ (
+                    _category_indicators(block, sizes, offsets)
+                )
         return [
             np.ascontiguousarray(counts[:, low:high])
             for low, high in zip(offsets[:-1], offsets[1:], strict=True)
@@ -198,3 +239,17 @@ class EMFitContext(AbstractContextManager["EMFitContext"]):
         finally:
             self._executor = None
             self._native_pool = None
+
+
+def _category_indicators(
+    block: NDArray[np.int_], sizes: NDArray[np.intp], offsets: NDArray[np.intp]
+) -> NDArray[np.float64]:
+    """Return one-hot indicators of a response block's categories.
+
+    Column ``offsets[j] + c`` marks code ``c`` of item ``j``. Missing
+    responses and codes outside an item's categories have no indicator.
+    """
+    rows, items = np.nonzero((block >= 0) & (block < sizes))
+    indicators = np.zeros((block.shape[0], int(offsets[-1])))
+    indicators[rows, offsets[items] + block[rows, items]] = 1.0
+    return indicators

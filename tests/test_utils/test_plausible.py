@@ -1252,3 +1252,36 @@ class TestPopulationPrior:
 
         with pytest.raises(ValueError, match=message):
             generate_plausible_values(model, responses, method=method, **prior)
+
+
+def test_default_posterior_grid_reproduces_narrow_posteriors():
+    """Default draws match each person's posterior variance on a long test."""
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.scoring.eap import EAPScorer
+
+    rng = np.random.default_rng(0)
+    model = TwoParameterLogistic(n_items=60)
+    model.set_parameters(
+        discrimination=rng.uniform(0.8, 2.2, 60), difficulty=rng.normal(size=60)
+    )
+    model._is_fitted = True
+    theta = rng.standard_normal(600)
+    logits = model.parameters["discrimination"] * (
+        theta[:, None] - model.parameters["difficulty"]
+    )
+    responses = (rng.random(logits.shape) < 1.0 / (1.0 + np.exp(-logits))).astype(int)
+
+    posterior = EAPScorer(n_quadpts=201).score(model, responses)
+    draws = generate_plausible_values(model, responses, n_plausible=200, seed=1)
+
+    ratio = draws[:, 0, :].var(axis=1, ddof=1) / posterior.standard_error**2
+    # With 200 draws a ratio has Monte Carlo SD of about 0.1. The former
+    # 21-node default gave a 10-90% range of 0.15-2.31 here.
+    p10, p50, p90 = np.percentile(ratio, [10, 50, 90])
+    assert 0.7 < p10 and p90 < 1.35 and abs(p50 - 1.0) < 0.06
+    np.testing.assert_array_equal(
+        draws,
+        generate_plausible_values(
+            model, responses, n_plausible=200, seed=1, n_quadpts=49
+        ),
+    )

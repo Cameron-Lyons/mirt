@@ -11,12 +11,12 @@ the exact Louis observed information and marginal scores: 1PL-4PL with any
 number of factors, GRM, GPCM, PCM, NRM, RSM, GRSM, ``MultidimensionalModel``,
 ``BifactorModel``, the other built-in families whose likelihood is a product
 of item curves (5PL, log-log, nested-logit, sequential, unfolding,
-zero-inflated, ...), and mixed-format combinations of them without shared
-parameters. Unidimensional 1PL-4PL, GRM, GPCM, PCM, RSM and GRSM items have
+zero-inflated, ...), ``CustomItemModel``, and mixed-format combinations of
+them. Unidimensional 1PL-4PL, GRM, GPCM, PCM, RSM and GRSM items have
 closed-form item derivatives; the others difference one item curve at a
-time. Remaining models, such as custom, testlet or mixture models,
-difference the marginal log-likelihood, which costs O(P^2) likelihood
-evaluations for P parameters.
+time. Remaining models, such as testlet or mixture models, difference the
+marginal log-likelihood, which costs O(P^2) likelihood evaluations for P
+parameters.
 
 The public ``compute_*`` functions estimate every free coordinate unless
 they receive ``bounds``. Fits pass the optimizer boxes, so coordinates on a
@@ -644,12 +644,13 @@ def compute_observed_information(
     Built-in item models whose person likelihood is a product of item
     curves (1PL-4PL, GRM, GPCM, PCM, NRM, RSM, GRSM, multidimensional,
     bifactor and the other built-in families such as 5PL, log-log,
-    nested-logit, sequential, unfolding and zero-inflated models, and
-    mixed-format combinations of them) use the exact Louis identity, for
-    which ``h`` is unused. Other models, such as custom, testlet or mixture
-    models, use central differences of the marginal log-likelihood with step
-    ``h``, at a cost of O(P^2) likelihood evaluations for P parameters. Rows
-    and columns follow the free parameters in ``model.parameters`` order.
+    nested-logit, sequential, unfolding and zero-inflated models, custom
+    item models, and mixed-format combinations of them) use the exact Louis
+    identity, for which ``h`` is unused. Other models, such as testlet or
+    mixture models, use central differences of the marginal log-likelihood
+    with step ``h``, at a cost of O(P^2) likelihood evaluations for P
+    parameters. Rows and columns follow the free parameters in
+    ``model.parameters`` order.
     """
     step = _validate_step_size(h)
     response_array = np.asarray(responses)
@@ -975,10 +976,12 @@ def estimate_covariance(
     method: Literal["oakes", "crossprod", "sandwich"],
     *,
     frequencies: NDArray[np.float64] | None = None,
+    meat_weights: NDArray[np.float64] | None = None,
     h: float = 1e-5,
     bounds: Callable[[str], tuple[float, float]] | None = None,
     prior_information: Mapping[str, NDArray[np.float64]] | None = None,
     tied: TiedCoordinates | None = None,
+    held: Mapping[str, NDArray[np.bool_]] | None = None,
 ) -> CovarianceEstimate:
     """Estimate the free-parameter covariance of a fitted marginal model.
 
@@ -996,12 +999,21 @@ def estimate_covariance(
     method : {"oakes", "crossprod", "sandwich"}
         Observed information, score cross-product, or their sandwich.
     frequencies : ndarray of shape (n_rows,), optional
-        Number of persons sharing each response row.
+        Number of persons sharing each response row, or person weights that
+        multiply each row's information and score cross-product.
+    meat_weights : ndarray of shape (n_rows,), optional
+        Weights of the score cross-product, which default to
+        ``frequencies``. A design-based sandwich for survey weights ``w``
+        passes ``frequencies=w`` and ``meat_weights=w**2`` (Binder, 1983).
     h : float, default=1e-5
         Finite-difference step for models without exact derivatives.
     bounds : callable, optional
         Maps a parameter name to its optimizer box. Free coordinates on a
         bound are held fixed and receive NaN standard errors.
+    held : mapping of str to ndarray of bool, optional
+        Free coordinates to hold fixed as if on a bound, by stored parameter
+        name, in the stored shapes, for example slopes that identify an
+        exploratory rotation.
     prior_information : mapping of str to ndarray, optional
         Negative second derivative of an independent item log-prior, in the
         stored parameter shapes, for Bayes modal estimates. It is added to the
@@ -1024,6 +1036,12 @@ def estimate_covariance(
     ------
     MirtValidationError
         If ``prior_information`` names a parameter that ``model`` lacks.
+
+    References
+    ----------
+    Binder, D. A. (1983). On the variances of asymptotically normal
+    estimators from complex surveys. *International Statistical Review*,
+    51(3), 279-292.
     """
     mass = _validate_prior_mass(prior_mass, quadrature.nodes.shape[0])
     # A misnamed prior would otherwise drop out of the information.
@@ -1043,12 +1061,15 @@ def estimate_covariance(
         mass,
         _validate_step_size(h),
         person_weights=frequencies,
+        meat_weights=meat_weights,
         observed=method != "crossprod",
     )
     information, meat = _with_prior_information(
         method, information, meat, layouts, prior_information
     )
     active = _active_coordinates(layouts, bounds)
+    if held:
+        active &= ~_free_values(held, layouts).astype(np.bool_)
     if tied is None:
         covariance = _covariance(method, information, meat, active)
     else:

@@ -11,7 +11,6 @@ if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import ArrayLike, NDArray
 
-    from mirt.estimation._em_context import EMFitContext
     from mirt.estimation._shared_step import EqualityConstraints
     from mirt.estimation.mcmc import MCMCResult
     from mirt.estimation.priors import Prior, PriorSpecification
@@ -19,7 +18,9 @@ if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
-    _ItemFamily = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
+    _ItemFamily = Literal[
+        "1PL", "Rasch", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"
+    ]
 
 
 def fit_mirt(
@@ -28,7 +29,7 @@ def fit_mirt(
     n_factors: int = 1,
     n_categories: int | Sequence[int] | None = None,
     estimation: Literal["EM", "MHRM", "MCMC", "Gibbs"] = "EM",
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     verbose: bool = False,
@@ -44,6 +45,9 @@ def fit_mirt(
     spec: ModelSpec | str | None = None,
     accelerate: Literal["none", "squarem"] = "none",
     constraints: EqualityConstraints | None = None,
+    quadrature: Literal["auto", "rectangular", "gauss-hermite"] = "auto",
+    seed: int | None = None,
+    use_gpu: bool | Literal["auto"] = "auto",
 ) -> FitResult:
     """Fit an Item Response Theory model to response data.
 
@@ -61,13 +65,17 @@ def fit_mirt(
     model : str or sequence of str, default="2PL"
         IRT model to fit:
 
-        - "1PL": One-parameter logistic (Rasch-like with common discrimination)
+        - "1PL": One-parameter logistic with one discrimination common to
+          all items, estimated by EM; equivalent to R mirt's
+          ``itemtype="Rasch"``, whose estimated latent standard deviation is
+          the common slope (see below); "Rasch" is accepted as an alias
         - "2PL": Two-parameter logistic
         - "3PL": Three-parameter logistic (with guessing)
         - "4PL": Four-parameter logistic (with guessing and slipping)
         - "GRM": Graded Response Model (polytomous)
         - "GPCM": Generalized Partial Credit Model (polytomous)
-        - "PCM": Partial Credit Model (polytomous)
+        - "PCM": Partial Credit Model (polytomous) with a common
+          discrimination, estimated by EM like that of "1PL"
         - "NRM": Nominal Response Model (polytomous)
 
         A sequence names one family per item for a mixed-format test, for
@@ -77,6 +85,17 @@ def fit_mirt(
         whose parameters are qualified by family, such as ``"3PL.guessing"``,
         in ``start_values``, ``fixed`` and the results. Mixed formats require
         ``estimation="EM"``; a sequence naming one family fits that family.
+
+        "1PL" and "PCM" fits under EM estimate the common discrimination
+        ``a`` as one parameter, so a 1PL has ``n_items + 1`` parameters and
+        the likelihood of R's Rasch model, which instead fixes the slopes at
+        1 and estimates the latent variance ``a**2``; R's difficulties are
+        ``a`` times these. ``fixed={"discrimination": True}`` holds ``a`` at
+        its starting value (1 by default), the Rasch model for a
+        standard-normal trait. Other estimation methods raise
+        ``MirtValidationError`` for "1PL" and "PCM"; ``spec`` fits and the
+        1PL and PCM items of a mixed-format test hold ``a`` at 1, and with
+        ``spec``, ``COV = F*F`` estimates the latent variance instead.
 
     n_factors : int, default=1
         Number of latent factors. Only "2PL", "GRM", "GPCM" and "NRM" support
@@ -90,18 +109,25 @@ def fit_mirt(
         Estimation method. "MCMC" and "Gibbs" are aliases for Gibbs sampling;
         results are returned as a FitResult with posterior-mean parameters and
         chain standard deviations as standard errors. MHRM standard errors
-        are observed-information errors for the families that
-        ``se_method="auto"`` gives ``"oakes"`` under EM, and otherwise the
-        spread of the Robbins-Monro iterates (``se_method="mhrm_iterate_sd"``,
-        see :class:`~mirt.estimation.mcmc.MHRMEstimator`).
-    n_quadpts : int, default=21
-        Number of quadrature points for numerical integration (EM, and the
-        observed-information standard errors of MHRM).
+        are observed-information errors for unidimensional 2PL-4PL, GRM and
+        GPCM fits, and otherwise the spread of the Robbins-Monro
+        iterates (``se_method="mhrm_iterate_sd"``, see
+        :class:`~mirt.estimation.mcmc.MHRMEstimator`).
+    n_quadpts : int, optional
+        Quadrature points per latent dimension, at least 5, for EM and the
+        observed-information standard errors of MHRM. The default depends on
+        the number of factors, as in R mirt: 61 for one factor, 31 for two,
+        15 for three, 9 for four, 7 for five and 5 for six. Larger models need
+        an explicit value or ``estimation="MHRM"``, and grids whose EM
+        arrays would exceed about a gigabyte warn.
     max_iter : int, default=500
         Maximum number of EM iterations (EM) or MHRM cycles / MCMC iterations
-        depending on method.
+        depending on method. Must be a positive integer.
     tol : float, default=1e-4
-        Convergence tolerance for parameter change (EM).
+        Convergence tolerance of EM: iteration stops when the marginal
+        log-likelihood (log-posterior with ``priors``) changes by less than
+        ``tol`` in absolute value between consecutive iterations. Must be
+        finite and positive.
     verbose : bool, default=False
         Print iteration progress.
     item_names : list of str, optional
@@ -120,27 +146,33 @@ def fit_mirt(
     fixed : mapping of str to bool or array of bool, optional
         Coordinates to hold at their starting values, by parameter name.
         ``True`` fixes a coordinate; a scalar applies to the whole parameter.
-        Supported by EM; MHRM and Gibbs sampling raise ``MirtValidationError``.
+        Supported by EM, MHRM and Gibbs sampling; masked models run the NumPy
+        samplers.
     priors : PriorSpecification or mapping of str to Prior, optional
         Item-parameter priors for Bayes modal estimation with EM, for example
         ``{"guessing": BetaPrior(5, 17)}``. See ``EMEstimator(item_priors=...)``.
+        With ``estimation="MCMC"`` or ``"Gibbs"`` they replace the sampler's
+        default priors (see :class:`GibbsSampler`); MHRM rejects them.
         The result reports ``log_posterior``, and standard errors add the
         prior's negative second derivative to the information, so they reflect
-        the curvature of the log-posterior. Starting values, fixed coordinates
-        and priors bypass the native 2PL EM fast path, and ``start_values``
-        runs MHRM and Gibbs sampling with the NumPy samplers.
+        the curvature of the log-posterior. ``start_values`` runs MHRM with
+        the NumPy sampler instead of the native burn-in.
     se_method : {"auto", "oakes", "crossprod", "sandwich", "complete_data"}, \
 default="auto"
         Standard-error estimator for EM fits (see :class:`EMEstimator`).
         ``"oakes"`` uses the observed information of the marginal likelihood,
         ``"crossprod"`` the outer product of person scores, ``"sandwich"``
         their robust combination, and ``"complete_data"`` itemwise
-        complete-data curvature, which understates uncertainty. ``"auto"``
-        selects ``"oakes"`` for unidimensional 1PL-4PL, GRM, GPCM and PCM fits
-        and ``"complete_data"`` otherwise. The matrix methods also store the
-        parameter covariance in ``FitResult.vcov``, and ``FitResult.se_method``
-        records the estimator used. Other estimation methods accept only
-        ``"auto"``.
+        complete-data curvature, which understates uncertainty, often two-
+        to fivefold for "NRM" and multidimensional fits. ``"auto"`` selects
+        ``"oakes"`` for every family above, with any number of factors and
+        with ``spec``, and for mixed-format tests of them. Exploratory fits
+        with ``n_factors >= 2`` are rotationally unidentified, so the upper
+        triangle of the first ``n_factors - 1`` items' slopes is held at its
+        estimates and gets ``NaN`` standard errors. The matrix methods also
+        store the parameter covariance in ``FitResult.vcov``, and
+        ``FitResult.se_method`` records the estimator used. Other estimation
+        methods accept only ``"auto"``.
     spec : ModelSpec or str, optional
         Confirmatory structure from :func:`mirt_model`, or model syntax that
         is parsed against the item names. Items load only on their factors,
@@ -156,9 +188,12 @@ default="auto"
     accelerate : {"none", "squarem"}, default="none"
         EM acceleration (see :class:`EMEstimator`). ``"squarem"`` extrapolates
         consecutive EM steps by SQUAREM, which usually needs far fewer
-        iterations on slowly converging fits. It runs the generic EM loop, so
-        a unidimensional 2PL fit skips the native full-EM fast path. Other
-        estimation methods accept only ``"none"``.
+        iterations on slowly converging fits. With ``"none"``, EM takes the
+        guarded parameter-expanded (PX-EM) steps of :class:`EMEstimator`
+        where they apply; ``EMEstimator(px_em=False)`` fits by plain EM.
+        Other estimation methods accept only ``"none"``. Mixed-format models
+        and ``spec`` fits with ``COV`` terms, whose latent covariance is
+        estimated, run plain EM instead and warn.
     constraints : sequence, optional
         Equality constraints across items for EM, like ``CONSTRAIN`` in R's
         ``mirt.model``. Each entry ties one stored parameter of several items,
@@ -169,10 +204,27 @@ default="auto"
         ``("thresholds", [0, 1], 2)``; without it whole rows are tied.
         Equal slopes for every item give a 2PL the Rasch structure with an
         estimated common slope. Each group counts as one parameter, tied
-        coordinates share their estimate and standard error, and the
-        constrained fit skips the native 2PL fast path (see
+        coordinates share their estimate and standard error (see
         :class:`EMEstimator`). Mixed-format models and other estimation
         methods raise an error.
+    quadrature : {"auto", "rectangular", "gauss-hermite"}, default="auto"
+        Quadrature rule of EM (see :class:`EMEstimator`). ``"rectangular"``
+        is R mirt's grid of equally spaced nodes on ``[-6, 6]``, which
+        integrates the peaked likelihoods of long or discriminating tests
+        accurately; ``"auto"`` uses it for 15 or more points per dimension,
+        including the defaults for up to three factors, and Gauss-Hermite
+        nodes for coarser grids.
+    seed : int, optional
+        Seed of the stochastic estimators (``"MHRM"``, ``"MCMC"`` and
+        ``"Gibbs"``), so their fits can be reproduced. EM is deterministic and
+        ignores it.
+    use_gpu : bool or "auto", default="auto"
+        Whether EM evaluates unidimensional likelihoods on a GPU when one is
+        available (see :class:`EMEstimator`). ``"auto"`` follows
+        :func:`set_backend`: the ``"auto"`` and ``"gpu"`` preferences use an
+        available GPU, ``"rust"`` and ``"numpy"`` do not. ``True`` and
+        ``False`` override the preference. The other estimation methods do
+        not use a GPU and ignore it.
 
     Returns
     -------
@@ -194,14 +246,27 @@ default="auto"
         If ``n_factors`` is not a positive integer, the estimation method is
         unknown, a polytomous category count is invalid, per-item families
         do not name every item or are used without EM, ``accelerate`` is
-        unknown or requested for a method other than EM, or ``constraints``
+        unknown or requested for a method other than EM, ``constraints``
         are malformed, tie fixed or unknown coordinates, or are used without
-        EM.
+        EM, ``n_quadpts`` is not an integer of at least 5 (or the default
+        grid of more than six factors is too large), ``quadrature`` is
+        unknown, ``max_iter`` is not a positive integer, ``tol`` is not
+        finite and positive, ``use_gpu`` is neither a boolean nor "auto", or
+        ``model`` is "1PL" or "PCM" with an estimation method other than EM.
     MirtModelError
         If the model type is unknown or does not support ``n_factors``, or
         ``constraints`` are given for per-item model families.
     NotImplementedError
         If a ``CONSTRAIN`` group in ``spec`` equates different parameters.
+
+    Warns
+    -----
+    RuntimeWarning
+        If ``spec`` describes a "2PL" bifactor structure, which
+        :func:`bfactor` fits much faster on two-dimensional grids.
+    UserWarning
+        If ``accelerate="squarem"`` falls back to plain EM (see
+        ``accelerate``).
 
     Examples
     --------
@@ -215,15 +280,20 @@ default="auto"
     """
     import numpy as np
 
-    from mirt._backend_config import should_use_rust
-    from mirt.backends.rust.estimation import _em_fit_2pl_prepared
-    from mirt.estimation._em_context import EMFitContext
+    from mirt._backend_config import validate_use_gpu
     from mirt.estimation._item_priors import validate_item_priors
-    from mirt.estimation._refit import RefitRecipe
     from mirt.estimation._shared_step import validate_equality_constraints
-    from mirt.estimation.base import _apply_starting_values, _free_masks_from_fixed
+    from mirt.estimation.base import (
+        _apply_starting_values,
+        _free_masks_from_fixed,
+        _validate_convergence_controls,
+    )
     from mirt.estimation.em import _ACCELERATIONS, EMEstimator
-    from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
+    from mirt.estimation.quadrature import (
+        resolve_quadpts,
+        validate_quadpts,
+        validate_quadrature_rule,
+    )
     from mirt.estimation.standard_errors import validate_se_method
     from mirt.exceptions import MirtValidationError
     from mirt.models._factory import (
@@ -233,6 +303,13 @@ default="auto"
         validate_n_factors,
     )
 
+    # Every estimation path validates the integration and convergence
+    # controls alike.
+    max_iter, tol = _validate_convergence_controls(max_iter, tol)
+    if n_quadpts is not None:
+        n_quadpts = validate_quadpts(n_quadpts)
+    quadrature = validate_quadrature_rule(quadrature)
+    use_gpu = validate_use_gpu(use_gpu)
     if not isinstance(compute_standard_errors, (bool, np.bool_)):
         raise MirtValidationError(
             "compute_standard_errors must be a boolean",
@@ -275,8 +352,9 @@ default="auto"
     from mirt.typing import EstimationMethod
     from mirt.utils.data import response_column_names, validate_responses
 
-    # Reject unknown families and factor counts before reading the data.
-    validate_item_types(model)
+    # Reject unknown families and factor counts before reading the data, and
+    # resolve the "Rasch" alias to "1PL".
+    model = validate_item_types(model)
     n_factors = validate_n_factors(n_factors)
 
     if item_names is None:
@@ -305,6 +383,8 @@ default="auto"
             se_method=se_method,
             accelerate=accelerate,
             constraints=equality,
+            quadrature=quadrature,
+            use_gpu=use_gpu,
         )
 
     n_persons, n_items = data.shape
@@ -315,6 +395,18 @@ default="auto"
     item_types = validate_item_types(model, n_items)
     if not isinstance(item_types, str) and len(set(item_types)) == 1:
         item_types = item_types[0]
+    if item_types in ("1PL", "PCM") and estimation != "EM":
+        # The samplers cannot tie slopes, and a unit-slope Rasch model under
+        # the same name would be a different model from the EM fit.
+        raise MirtValidationError(
+            f"model={item_types!r} estimates one discrimination common to all "
+            "items, which only estimation='EM' supports; fit it with EM, or "
+            "fit the unit-slope Rasch model with the estimator directly, for "
+            "example MHRMEstimator().fit(OneParameterLogistic(n_items), data)",
+            parameter="estimation",
+            value=estimation,
+            expected="EM",
+        )
     if isinstance(item_types, str):
         irt_model = build_item_model(
             item_types,
@@ -323,6 +415,8 @@ default="auto"
             n_categories=n_categories,
             item_names=item_names,
             responses=data,
+            # EM estimates the common slope of the Rasch families.
+            estimate_discrimination=item_types in ("1PL", "PCM"),
         )
     elif estimation != "EM":
         raise MirtValidationError(
@@ -343,87 +437,40 @@ default="auto"
     estimation_method: EstimationMethod = estimation
 
     item_priors = validate_item_priors(priors)
-    if item_priors is not None and estimation_method in ("MHRM", "MCMC", "Gibbs"):
+    if item_priors is not None and estimation_method == "MHRM":
         raise MirtValidationError(
-            "priors are supported only with estimation='EM'",
+            "priors are supported only with estimation='EM', 'MCMC' or 'Gibbs'",
             parameter="priors",
             value=estimation,
-            expected="EM",
+            expected="EM, MCMC, or Gibbs",
         )
     if fixed is not None:
-        irt_model.set_free_parameter_masks(_free_masks_from_fixed(irt_model, fixed))
+        masks = _free_masks_from_fixed(irt_model, fixed)
+        if getattr(irt_model, "estimate_discrimination", False) and not np.any(
+            masks["discrimination"]
+        ):
+            # A common slope held at 1 is the family's own unit-slope model,
+            # which keeps the native M-steps; another value stays a mask.
+            start = {} if start_values is None else start_values
+            if np.all(np.asarray(start.get("discrimination", 1.0)) == 1.0):
+                irt_model = build_item_model(
+                    item_types,
+                    n_items,
+                    n_categories=(
+                        irt_model.n_categories if irt_model.is_polytomous else None
+                    ),
+                    item_names=item_names,
+                )
+                masks = {
+                    name: mask
+                    for name, mask in masks.items()
+                    if name != "discrimination"
+                }
+        irt_model.set_free_parameter_masks(masks)
     if start_values is not None and estimation_method != "EM":
-        # The native samplers do not accept starting values.
+        # The native MHRM burn-in starts from its own values.
         _apply_starting_values(irt_model, start_values)
         use_rust = False
-    # The native 2PL path starts from its own values, ignores masks, priors and
-    # constraints, and runs plain EM.
-    customized = (
-        start_values is not None
-        or bool(irt_model._free_parameter_restrictions)
-        or item_priors is not None
-        or accelerate != "none"
-        or bool(equality)
-    )
-
-    if (
-        should_use_rust(use_rust)
-        and item_types == "2PL"
-        and n_factors == 1
-        and estimation_method == "EM"
-        and not customized
-    ):
-        with EMFitContext(data, compress=True, native=True) as context:
-            discrimination, difficulty, log_likelihood, n_iterations, converged = (
-                _em_fit_2pl_prepared(
-                    context.responses, n_quadpts, max_iter, tol, context.frequencies
-                )
-            )
-
-            discrimination = np.asarray(discrimination)
-            difficulty = np.asarray(difficulty)
-            irt_model._parameters = {
-                "discrimination": discrimination,
-                "difficulty": difficulty,
-            }
-            irt_model._is_fitted = True
-
-            standard_errors: dict[str, NDArray[np.float64]] = {}
-            used_se_method = covariance = None
-            if compute_standard_errors:
-                standard_errors, used_se_method, covariance = _native_2pl_errors(
-                    irt_model, context, n_quadpts, se_method
-                )
-
-            n_params = 2 * n_items
-            aic = -2 * log_likelihood + 2 * n_params
-            bic = -2 * log_likelihood + np.log(n_persons) * n_params
-
-            return FitResult(
-                model=irt_model,
-                log_likelihood=log_likelihood,
-                n_iterations=n_iterations,
-                converged=converged,
-                standard_errors=standard_errors,
-                aic=aic,
-                bic=bic,
-                n_observations=n_persons,
-                n_parameters=n_params,
-                se_method=used_se_method,
-                vcov=covariance,
-                # Refits use the equivalent EM settings.
-                refit_recipe=RefitRecipe(
-                    EMEstimator,
-                    {
-                        "n_quadpts": n_quadpts,
-                        "max_iter": max_iter,
-                        "tol": tol,
-                        "use_rust": use_rust,
-                        "se_method": se_method,
-                    },
-                ),
-            )
-
     if estimation_method == "EM":
         estimator_class = EMEstimator
         if not isinstance(item_types, str):
@@ -435,16 +482,25 @@ default="auto"
             max_iter=max_iter,
             tol=tol,
             verbose=verbose,
+            use_gpu=use_gpu,
             use_rust=use_rust,
             compute_standard_errors=compute_standard_errors,
             item_priors=item_priors,
             se_method=se_method,
             accelerate=accelerate,
             constraints=equality,
+            quadrature=quadrature,
         )
-        if start_values is None:
-            return estimator.fit(irt_model, data)
-        return estimator.fit(irt_model, data, start=start_values)
+        fitted = (
+            estimator.fit(irt_model, data)
+            if start_values is None
+            else estimator.fit(irt_model, data, start=start_values)
+        )
+        _warn_slopes_on_lower_bound(getattr(fitted, "model", None))
+        return fitted
+
+    # The samplers' module imports scipy.stats, which EM fits do not need.
+    from mirt.estimation.mcmc import GibbsSampler, MHRMEstimator
 
     if estimation_method == "MHRM":
         return MHRMEstimator(
@@ -452,8 +508,10 @@ default="auto"
             burnin=min(500, max(max_iter // 4, 1)),
             verbose=verbose,
             use_rust=use_rust,
+            seed=seed,
             compute_standard_errors=compute_standard_errors,
-            n_quadpts=n_quadpts,
+            # Observed-information errors, for unidimensional families only.
+            n_quadpts=resolve_quadpts(n_quadpts, min(n_factors, 6)),
         ).fit(irt_model, data)
 
     if estimation_method in ("MCMC", "Gibbs"):
@@ -464,6 +522,8 @@ default="auto"
             burnin=burnin,
             verbose=verbose,
             use_rust=use_rust,
+            priors=priors,
+            seed=seed,
         ).fit(irt_model, data)
         result = _mcmc_result_to_fit_result(mcmc, n_persons)
         if not compute_standard_errors:
@@ -478,51 +538,43 @@ default="auto"
     )
 
 
-def _native_2pl_errors(
-    model: BaseItemModel,
-    context: EMFitContext,
-    n_quadpts: int,
-    se_method: str,
-) -> tuple[dict[str, NDArray[np.float64]], str, NDArray[np.float64] | None]:
-    """Standard errors for the native 2PL fit, matching ``EMEstimator``.
+def _warn_slopes_on_lower_bound(model: BaseItemModel | None) -> None:
+    """Warn when unidimensional slope estimates end on their positive lower bound.
 
-    Returns the errors, the method used, and the free-parameter covariance
-    (``None`` for complete-data curvature).
+    Such an item, typically reverse-keyed or miskeyed, discriminates
+    negatively; R mirt estimates a negative slope, which this package's
+    unidimensional models do not allow.
     """
-    from mirt.constants import PROB_EPSILON
-    from mirt.estimation._item_information import item_standard_errors
-    from mirt.estimation.base import _parameter_bounds
-    from mirt.estimation.em import _weight_posterior
-    from mirt.estimation.quadrature import GaussHermiteQuadrature
-    from mirt.estimation.standard_errors import (
-        _posterior_from_model,
-        estimate_covariance,
-    )
+    import warnings
 
-    quadrature = GaussHermiteQuadrature(n_points=n_quadpts, n_dimensions=1)
-    if se_method == "complete_data":
-        posterior = _posterior_from_model(model, context.responses, quadrature)
-        errors = item_standard_errors(
-            model,
-            context.responses,
-            _weight_posterior(posterior, context.frequencies),
-            quadrature.nodes,
-            PROB_EPSILON,
-            context=context,
-        )
-        assert errors is not None
-        return errors, "complete_data", None
-    method = "oakes" if se_method == "auto" else se_method
-    estimate = estimate_covariance(
-        model,
-        context.responses,
-        quadrature,
-        quadrature.weights,
-        method,
-        frequencies=context.frequencies,
-        bounds=lambda name: _parameter_bounds(model, name),
+    import numpy as np
+
+    from mirt.estimation.base import _parameter_bounds
+    from mirt.models.base import BaseItemModel
+
+    if (
+        not isinstance(model, BaseItemModel)
+        or model.n_factors != 1
+        or "discrimination" not in model.parameters
+    ):
+        return
+    free = np.asarray(model.free_parameter_masks["discrimination"], dtype=np.bool_)
+    low, _ = _parameter_bounds(model, "discrimination")
+    if low <= 0.0 or not np.any(free):
+        return
+    slopes = np.asarray(model.parameters["discrimination"], dtype=np.float64)
+    pinned = np.flatnonzero(free.reshape(slopes.shape) & (slopes <= low + 1e-6))
+    if pinned.size == 0:
+        return
+    names = ", ".join(str(model.item_names[item]) for item in pinned[:10])
+    warnings.warn(
+        f"discrimination of {names} ended on the lower bound {low:g}; such an "
+        "item discriminates negatively (reverse-keyed or miskeyed). Recode it "
+        "(for example 1 - x, or max - x for polytomous items) and refit; R mirt "
+        "would report a negative slope",
+        UserWarning,
+        stacklevel=3,
     )
-    return estimate.standard_errors, method, estimate.covariance
 
 
 def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
@@ -549,7 +601,7 @@ def _mcmc_result_to_fit_result(mcmc: MCMCResult, n_persons: int) -> FitResult:
 
     aic = -2 * mcmc.log_likelihood + 2 * n_params
     bic = -2 * mcmc.log_likelihood + np.log(max(n_persons, 1)) * n_params
-    converged = bool(mcmc.rhat) and all(r < 1.1 for r in mcmc.rhat.values())
+    converged = mcmc.converged
 
     return FitResult(
         model=model,
@@ -572,7 +624,7 @@ def itemfit(
     p_adjust: Literal["bonferroni", "holm", "fdr_bh", "none"] = "none",
     *,
     min_expected: float = 1.0,
-    n_quadpts: int = 41,
+    n_quadpts: int | None = None,
     quadrature_points: NDArray[np.float64] | None = None,
     quadrature_weights: NDArray[np.float64] | None = None,
     item_parameter_counts: NDArray[np.int_] | None = None,
@@ -608,6 +660,8 @@ def itemfit(
           approximately standard normal only with ``theta`` independent of
           these responses; with the default EAP abilities they are biased
           toward overfit and descriptive (a warning is issued)
+        - "Zh": Item-level standardized log-likelihood (Drasgow, Levine &
+          Williams, 1985), as in R's ``itemfit(fit_stats = "Zh")``
         - "S_X2": Orlando-Thissen S-X2 statistic
         - "X2", "G2": Bock/Yen chi-square and likelihood-ratio statistics
           over ability groups (approximate p-values, liberal on short tests)
@@ -626,8 +680,11 @@ def itemfit(
     min_expected : float, default=1.0
         Minimum expected S-X2 cell count for adjacent score/category pooling.
         Zero disables sparse-cell pooling.
-    n_quadpts : int, default=41
-        Gauss-Hermite quadrature points per model factor for S-X2.
+    n_quadpts : int, optional
+        Gauss-Hermite quadrature points per model factor for S-X2. ``None``
+        (default) uses 41 for one or two factors and fewer for more factors
+        (21 for three, 9 for four, 7 for five), keeping the grid at no more
+        than 100,000 points.
     quadrature_points, quadrature_weights : ndarray, optional
         Explicit latent grid and nonnegative probability masses for S-X2.
         Supply both to test a different fitted latent distribution.
@@ -651,13 +708,15 @@ def itemfit(
         statistics. Defaults to ``result.latent_covariance`` when the fit
         estimated one, and to the identity otherwise.
     theta : ndarray of shape (n_persons,) or (n_persons, n_factors), optional
-        Abilities for the mean-square and X2/G2 statistics, such as estimates
-        from an independent calibration. EAP scores of ``responses`` by
-        default. See :func:`mirt.diagnostics.compute_itemfit`.
+        Abilities for the mean-square, Zh and X2/G2 statistics, such as
+        estimates from an independent calibration. EAP scores of
+        ``responses`` by default. See :func:`mirt.diagnostics.compute_itemfit`.
     constraints : sequence, optional
-        The ``constraints`` of a ``fit_mirt`` fit. A group of ``k`` tied
-        coordinates counts as one parameter, ``1/k`` per item, in the
-        chi-square degrees of freedom.
+        Equality constraints of the fit. A group of ``k`` tied coordinates
+        counts as one parameter, ``1/k`` per item, in the chi-square degrees
+        of freedom. Defaults to the constraints ``result`` was fitted with
+        (``fit_mirt(constraints=...)`` or ``CONSTRAIN``); pass ``[]`` to count
+        every free coordinate separately.
 
     Returns
     -------
@@ -676,6 +735,7 @@ def itemfit(
     >>> # Flag items with infit > 1.2 or < 0.8
     >>> print(fit_stats[(fit_stats['infit'] > 1.2) | (fit_stats['infit'] < 0.8)])
     """
+    from mirt.diagnostics._utils import resolve_fit_constraints
     from mirt.diagnostics.itemfit import compute_itemfit
     from mirt.utils.dataframe import create_dataframe
 
@@ -685,6 +745,7 @@ def itemfit(
         prior_mean = getattr(result, "latent_mean", None)
     if prior_cov is None:
         prior_cov = getattr(result, "latent_covariance", None)
+    constraints = resolve_fit_constraints(result, constraints)
 
     fit_stats = compute_itemfit(
         result.model,
@@ -811,7 +872,7 @@ def dif(
     model: Literal["1PL", "2PL", "3PL", "GRM", "GPCM"] = "2PL",
     method: Literal["likelihood_ratio", "wald", "lord", "raju"] = "likelihood_ratio",
     n_categories: int | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     focal_group: str | int | None = None,
@@ -846,14 +907,17 @@ def dif(
             - 'lord': Lord's chi-square test, an alias of 'wald'
             - 'raju': Raju's area measures between linked curves (no p-value)
         n_categories: Number of categories for polytomous models.
-        n_quadpts: Number of quadrature points for EM.
+        n_quadpts: Quadrature points per dimension for EM; ``None`` uses the
+            default grid of :func:`fit_mirt` (61 rectangular points).
         max_iter: Maximum EM iterations.
         tol: Convergence tolerance.
         focal_group: Which group to use as focal (default: second unique group).
         p_adjust: Multiple-testing adjustment across items. Default 'none',
             as in :func:`mirt.multigroup.multigroup_dif` and R's
             ``mirt::DIF``.
-        anchors: Items assumed free of DIF, by index or name; they are not
+        anchors: Items assumed free of DIF, by 0-based index or by name
+            (DataFrame column names, otherwise ``Item_1``, ``Item_2``, ...
+            as in :func:`fit_mirt` and :func:`itemfit`); they are not
             tested. They anchor the likelihood-ratio models or define the
             linking for the other methods.
         scheme: Likelihood-ratio scheme: 'drop', 'add', 'drop_sequential' or
@@ -861,16 +925,21 @@ def dif(
         n_jobs: Worker processes for likelihood-ratio refits.
 
     Returns:
-        DataFrame with DIF statistics for each item:
-            - statistic: Test statistic
-            - df: Degrees of freedom
-            - p_value: P-value
-            - p_value_adjusted: Multiplicity-adjusted P-value
-            - effect_size: Focal-minus-reference location difference
-            - classification: ETS classification using adjusted P-values
-            - adjustment: Multiple-testing method
-            - tested: Whether the item was tested
-            - converged: Whether the underlying fits converged
+        DataFrame with one row per item, labelled by item name like
+        :func:`itemfit` (the ``item`` index for pandas, the first column
+        for polars), with DIF statistics:
+
+        - statistic: Test statistic
+        - df: Degrees of freedom
+        - p_value: P-value
+        - p_value_adjusted: Multiplicity-adjusted P-value
+        - effect_size: Focal-minus-reference location difference
+        - ets_effect: MH D-DIF (binary items) or SMD/SD (polytomous
+          items) behind the ETS class
+        - classification: ETS classification using adjusted P-values
+        - adjustment: Multiple-testing method
+        - tested: Whether the item was tested
+        - converged: Whether the underlying fits converged
     """
     from mirt.diagnostics.dif import compute_dif
     from mirt.utils.dataframe import create_dataframe
@@ -890,11 +959,13 @@ def dif(
         scheme=scheme,
         n_jobs=n_jobs,
     )
-    metadata = {"method", "anchors", "linking_constants"}
+    metadata = {"item_names", "method", "anchors", "linking_constants", "ets_scale"}
     columns = {
         name: values for name, values in dif_results.items() if name not in metadata
     }
-    return create_dataframe(columns, index_name="item")
+    return create_dataframe(
+        columns, index=dif_results.get("item_names"), index_name="item"
+    )
 
 
 __all__ = build_all_exports()

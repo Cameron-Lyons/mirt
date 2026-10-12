@@ -281,11 +281,14 @@ def test_configural_end_to_end_matches_sum_of_separate_standardized_model_likeli
     fit = MultigroupEMEstimator(n_quadpts=21, max_iter=150, tol=1e-6).fit(
         MultigroupModel(OneParameterLogistic(5), 2), data, "configural"
     )
+    # The multigroup 1PL holds the slopes at one on 21 Gauss-Hermite nodes.
     separate = [
         fit_mirt(
             group,
             model="1PL",
             n_quadpts=21,
+            quadrature="gauss-hermite",
+            fixed={"discrimination": True},
             max_iter=150,
             tol=1e-6,
             compute_standard_errors=False,
@@ -301,3 +304,73 @@ def test_configural_end_to_end_matches_sum_of_separate_standardized_model_likeli
     for distribution in fit.latent_distributions:
         assert_allclose(distribution.mean, [0])
         assert_allclose(distribution.cov, [[1]])
+
+
+def _impact_data(seed=23, n_persons=300, n_items=8):
+    """Two 2PL groups, the focal one N(0.6, 1.5) on the reference scale."""
+    rng = np.random.default_rng(seed)
+    slopes = rng.uniform(1.0, 2.0, n_items)
+    difficulty = rng.normal(0.0, 1.0, n_items)
+    theta = np.concatenate(
+        [rng.normal(0.0, 1.0, n_persons), rng.normal(0.6, np.sqrt(1.5), n_persons)]
+    )
+    probability = 1 / (1 + np.exp(-slopes * (theta[:, None] - difficulty)))
+    data = (rng.random(probability.shape) < probability).astype(int)
+    return data, np.repeat(["A", "B"], n_persons)
+
+
+def test_free_means_and_variances_fix_or_free_latent_moments_independently():
+    from mirt.multigroup import fit_multigroup
+
+    data, groups = _impact_data()
+    fits = {
+        options: fit_multigroup(
+            data,
+            groups,
+            invariance="scalar",
+            free_means=options[0],
+            free_variances=options[1],
+            n_quadpts=31,
+        )
+        for options in ((None, None), (False, None), (None, False), (False, False))
+    }
+
+    full = fits[None, None].latent_distributions[1]
+    assert full.estimate_mean and full.estimate_cov
+    assert full.mean[0] == pytest.approx(0.6, abs=0.2)
+    no_impact = fits[False, None].latent_distributions[1]
+    assert not no_impact.estimate_mean and no_impact.estimate_cov
+    assert no_impact.mean[0] == 0.0
+    no_spread = fits[None, False].latent_distributions[1]
+    assert no_spread.estimate_mean and no_spread.cov[0, 0] == 1.0
+    assert fits[False, False].latent_distributions[1].n_free_parameters == 0
+    counts = {key: fit.n_parameters for key, fit in fits.items()}
+    assert counts == {
+        (None, None): 18,
+        (False, None): 17,
+        (None, False): 17,
+        (False, False): 16,
+    }
+    # The mean difference is tested by the nested fit without free means.
+    assert fits[None, None].log_likelihood > fits[False, None].log_likelihood + 5
+    assert fits[False, None].log_likelihood > fits[False, False].log_likelihood
+    table = fits[False, None].latent_pars()
+    flags = table["free_mean"].to_list(), table["free_variance"].to_list()
+    assert flags == ([False, False], [False, True])
+
+
+def test_free_moments_without_anchors_are_rejected():
+    from mirt.exceptions import MirtValidationError
+    from mirt.multigroup import fit_multigroup
+
+    data, groups = _impact_data(n_persons=60)
+    with pytest.raises(MirtValidationError, match="means of groups"):
+        fit_multigroup(data, groups, invariance="metric", free_means=True)
+    with pytest.raises(MirtValidationError, match="variances of groups"):
+        fit_multigroup(data, groups, invariance="configural", free_variances=True)
+    with pytest.raises(ValueError, match="cannot be combined"):
+        fit_multigroup(
+            data, groups, invariance=InvarianceSpec("scalar"), free_means=False
+        )
+    with pytest.raises(ValueError, match="free_means must be"):
+        InvarianceSpec("scalar", free_means="yes")

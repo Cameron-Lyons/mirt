@@ -1,23 +1,25 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from numbers import Integral, Real
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
 
+from mirt._backend_config import gpu_dispatch_allowed, validate_use_gpu
 from mirt._gpu_backend import (
     gvem_compute_elbo_gpu,
     gvem_e_step_gpu,
     gvem_m_step_gpu,
     is_gpu_available,
 )
-from mirt.backends.rust.gvem import gvem_compute_elbo as _rust_gvem_compute_elbo
-from mirt.backends.rust.gvem import gvem_e_step as _rust_gvem_e_step
-from mirt.backends.rust.gvem import gvem_m_step as _rust_gvem_m_step
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
-from mirt.estimation._variational_objective import variational_elbo
+from mirt.estimation._variational_objective import (
+    affine_marginal_log_likelihood,
+    variational_elbo,
+)
 from mirt.estimation._variational_statistics import variational_item_statistics
 from mirt.estimation.base import (
     BaseEstimator,
@@ -27,10 +29,26 @@ from mirt.estimation.base import (
     _validate_start,
 )
 from mirt.exceptions import MirtValidationError
+from mirt.results.fit_result import FitResult
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
-    from mirt.results.fit_result import FitResult
+
+
+@dataclass
+class GVEMResult(FitResult):
+    """Result of :class:`GVEMEstimator`, a ``FitResult`` that keeps the ELBO.
+
+    ``log_likelihood``, AIC and BIC use the marginal log-likelihood at the
+    GVEM estimates, comparable with an EM fit, and ``elbo`` is the final
+    evidence lower bound that GVEM maximizes, which lies below it.
+    """
+
+    elbo: float = float("nan")
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.elbo = float(self.elbo)
 
 
 class GVEMEstimator(BaseEstimator):
@@ -55,6 +73,11 @@ class GVEMEstimator(BaseEstimator):
         Step size for numerical differentiation when computing standard errors.
         At the default step size, built-in 1PL/2PL models use exact diagonal
         curvature. Custom objectives and other step sizes use numerical differences.
+    use_gpu : bool or "auto", default="auto"
+        Whether to run the variational steps on a GPU when one is available.
+        ``"auto"`` follows :func:`~mirt.set_backend`: the ``"auto"`` and
+        ``"gpu"`` preferences use an available GPU, ``"rust"`` and
+        ``"numpy"`` do not. ``True`` and ``False`` override the preference.
 
     Notes
     -----
@@ -65,6 +88,29 @@ class GVEMEstimator(BaseEstimator):
 
     Currently supports 2PL models (unidimensional and multidimensional).
 
+    The estimates maximize the lower bound, not the likelihood, and are
+    biased toward smaller slopes (Cho et al., 2021). On a simulated 2PL with
+    1000 persons and 20 items, GVEM slopes were 0.79 to 1.01 times the EM
+    estimates and the difficulties of the easiest and hardest items moved by
+    up to 0.34; on a two-factor test with 16 items, the communalities
+    ``diag(A A')`` averaged 0.73 of EM's. Tighter ``tol`` or more
+    ``n_inner_iter`` leave this unchanged, because it is the bias of the
+    approximation rather than early stopping. Use GVEM for fast approximate
+    fits of many factors, and EM, QMC-EM or MH-RM when unbiased estimates
+    matter; importance-weighted GVEM (Ma et al., 2024) corrects the bias.
+
+    ``log_likelihood``, AIC and BIC use the marginal log-likelihood at the
+    estimates, integrated over the prior on EM's default grid for up to three
+    factors and by importance sampling from the variational posteriors for
+    more (see :class:`GVEMResult`); ``GVEMResult.elbo`` holds the lower
+    bound. Unidimensional fits report observed-information standard errors
+    of the marginal likelihood at the estimates (``se_method="oakes"``) and
+    their covariance in ``vcov``. Multidimensional fits report the diagonal
+    curvature of the bound with the variational posteriors held fixed
+    (``se_method="variational_curvature"``), which omits the latent
+    uncertainty and understates the standard errors severalfold; refit with
+    :class:`~mirt.estimation.em.EMEstimator` for usable uncertainty.
+
     References
     ----------
     Cho, A. E., Wang, C., Zhang, X., & Xu, G. (2021). Gaussian variational
@@ -73,7 +119,15 @@ class GVEMEstimator(BaseEstimator):
 
     Jaakkola, T. S., & Jordan, M. I. (2000). Bayesian parameter estimation
         via variational methods. Statistics and Computing, 10(1), 25-37.
+
+    Ma, C., Ouyang, J., Wang, C., & Xu, G. (2024). A note on improving
+        variational estimation for multidimensional item response theory.
+        Psychometrika, 89, 172-204.
     """
+
+    # The closed-form M-step moves every coordinate and gives every item its
+    # own slope, so it neither holds fixed values nor ties a common slope.
+    _holds_fixed_parameters = False
 
     def __init__(
         self,
@@ -109,22 +163,9 @@ class GVEMEstimator(BaseEstimator):
                 value=se_step_size,
                 expected="finite value > 0",
             )
-        if not (
-            isinstance(use_gpu, (bool, np.bool_))
-            or (isinstance(use_gpu, str) and use_gpu == "auto")
-        ):
-            raise MirtValidationError(
-                "use_gpu must be a boolean or 'auto'",
-                parameter="use_gpu",
-                value=use_gpu,
-                expected="True, False, or 'auto'",
-            )
-
+        self.use_gpu: bool | Literal["auto"] = validate_use_gpu(use_gpu)
         self.n_inner_iter: int = int(n_inner_iter)
         self.se_step_size: float = float(se_step_size)
-        self.use_gpu: bool | Literal["auto"] = (
-            bool(use_gpu) if isinstance(use_gpu, np.bool_) else use_gpu
-        )
 
         self._mu: NDArray[np.float64] | None = None
         self._sigma: NDArray[np.float64] | None = None
@@ -136,10 +177,8 @@ class GVEMEstimator(BaseEstimator):
 
     @property
     def _should_use_gpu(self) -> bool:
-        """Determine if GPU should be used based on settings and availability."""
-        if self.use_gpu is False:
-            return False
-        return is_gpu_available()
+        """Whether ``use_gpu``, the backend preference and a GPU allow GPU use."""
+        return gpu_dispatch_allowed(self.use_gpu) and is_gpu_available()
 
     def fit(
         self,
@@ -149,7 +188,7 @@ class GVEMEstimator(BaseEstimator):
         prior_cov: NDArray[np.float64] | None = None,
         *,
         start: StartValues = "default",
-    ) -> FitResult:
+    ) -> GVEMResult:
         """Fit model using Gaussian Variational EM algorithm.
 
         Parameters
@@ -167,8 +206,9 @@ class GVEMEstimator(BaseEstimator):
 
         Returns
         -------
-        FitResult
-            Fitted model with estimates, ELBO, and diagnostics.
+        GVEMResult
+            Fitted model with estimates, the marginal log-likelihood, the
+            ELBO and diagnostics.
 
         Raises
         ------
@@ -177,17 +217,20 @@ class GVEMEstimator(BaseEstimator):
         MirtValidationError
             If ``set_free_parameter_masks`` fixes parameters, which the
             closed-form M-step cannot hold.
+        MirtModelError
+            If the model keeps a free parameter equal across items, such as
+            the common slope of ``OneParameterLogistic(...,
+            estimate_discrimination=True)``.
         """
-        from mirt.results.fit_result import FitResult
-
         if model.model_name not in ("2PL", "1PL"):
             raise ValueError(
                 f"GVEMEstimator currently only supports 2PL models, got {model.model_name}"
             )
+        self._check_shared_parameters(model)
         _reject_parameter_restrictions(model, "GVEMEstimator")
         start = _validate_start(start)
 
-        responses = self._validate_responses(responses, model.n_items)
+        responses = self._validate_responses(responses, model.n_items, model)
         n_persons = responses.shape[0]
         n_items = model.n_items
         n_factors = model.n_factors
@@ -244,20 +287,23 @@ class GVEMEstimator(BaseEstimator):
 
         model._is_fitted = True
 
-        standard_errors = self._compute_standard_errors(
+        standard_errors, se_method, vcov = self._standard_errors(
             model,
             responses,
             prior_mean,
             prior_cov,
         )
+        log_likelihood = self._marginal_log_likelihood(
+            model, responses, prior_mean, prior_cov
+        )
 
         n_params = model.n_parameters
-        aic = self._compute_aic(current_elbo, n_params)
-        bic = self._compute_bic(current_elbo, n_params, n_persons)
+        aic = self._compute_aic(log_likelihood, n_params)
+        bic = self._compute_bic(log_likelihood, n_params, n_persons)
 
-        return FitResult(
+        return GVEMResult(
             model=model,
-            log_likelihood=current_elbo,
+            log_likelihood=log_likelihood,
             n_iterations=iteration + 1,
             converged=converged,
             standard_errors=standard_errors,
@@ -265,7 +311,78 @@ class GVEMEstimator(BaseEstimator):
             bic=bic,
             n_observations=n_persons,
             n_parameters=n_params,
+            se_method=se_method,
+            vcov=vcov,
+            latent_covariance=(
+                None if np.array_equal(prior_cov, np.eye(n_factors)) else prior_cov
+            ),
+            latent_mean=prior_mean if np.any(prior_mean) else None,
+            elbo=current_elbo,
         )
+
+    def _marginal_log_likelihood(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        prior_cov: NDArray[np.float64],
+    ) -> float:
+        """Integrate the likelihood of the reported parameters over the prior."""
+        self._convert_to_slope_intercept(model)
+        value, _ = affine_marginal_log_likelihood(
+            responses,
+            self._slopes,
+            self._intercepts,
+            prior_mean,
+            prior_cov,
+            mu=self._mu,
+            sigma=self._sigma,
+        )
+        return value
+
+    def _standard_errors(
+        self,
+        model: BaseItemModel,
+        responses: NDArray[np.int_],
+        prior_mean: NDArray[np.float64],
+        prior_cov: NDArray[np.float64],
+    ) -> tuple[dict[str, NDArray[np.float64]], str, NDArray[np.float64] | None]:
+        """Return standard errors, their method and the parameter covariance.
+
+        Unidimensional built-in models use the observed information of the
+        marginal likelihood at the estimates, integrated on EM's default
+        grid over the prior. Others fall back to the variational curvature
+        of :meth:`_compute_standard_errors`.
+        """
+        from mirt.estimation._louis_information import has_analytic_item_derivatives
+        from mirt.estimation._patterns import (
+            compress_responses,
+            supports_pattern_compression,
+        )
+        from mirt.estimation.latent_density import GaussianDensity
+        from mirt.estimation.quadrature import build_quadrature, default_quadpts
+        from mirt.estimation.standard_errors import estimate_covariance
+
+        if not has_analytic_item_derivatives(model):
+            errors = self._compute_standard_errors(
+                model, responses, prior_mean, prior_cov
+            )
+            return errors, "variational_curvature", None
+        frequencies = None
+        if supports_pattern_compression(model):
+            responses, frequencies = compress_responses(responses)
+        quadrature = build_quadrature(default_quadpts(1), 1)
+        density = GaussianDensity(mean=prior_mean, cov=prior_cov, n_dimensions=1)
+        mass = np.exp(density.log_quadrature_mass(quadrature.nodes, quadrature.weights))
+        estimate = estimate_covariance(
+            model,
+            responses,
+            quadrature,
+            mass,
+            "oakes",
+            frequencies=frequencies,
+        )
+        return estimate.standard_errors, "oakes", estimate.covariance
 
     @staticmethod
     def _validate_prior(
@@ -421,22 +538,6 @@ class GVEMEstimator(BaseEstimator):
                 self._mu = centered_mu + prior_mean
                 return
 
-        rust_result = _rust_gvem_e_step(
-            responses,
-            self._slopes,
-            centered_intercepts,
-            prior_cov_inv,
-            centered_mu,
-            self._sigma,
-            self._xi,
-            self.n_inner_iter,
-        )
-
-        if rust_result is not None:
-            centered_mu, self._sigma, self._xi = rust_result
-            self._mu = centered_mu + prior_mean
-            return
-
         self._e_step_python(responses, prior_mean, prior_cov_inv)
 
     def _e_step_python(
@@ -445,7 +546,7 @@ class GVEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         prior_cov_inv: NDArray[np.float64],
     ) -> None:
-        """Python fallback for E-step."""
+        """CPU E-step."""
         self._mu, self._sigma, self._xi = variational_e_step(
             responses,
             self._slopes,
@@ -463,7 +564,14 @@ class GVEMEstimator(BaseEstimator):
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> None:
-        """M-step: update item parameters with closed-form updates."""
+        """M-step: update item parameters with closed-form updates.
+
+        The 1PL holds its slopes at 1, and its intercepts are updated with
+        those unit slopes.
+        """
+        fixed_loadings = model.model_name == "1PL"
+        if fixed_loadings:
+            self._slopes[np.any(responses >= 0, axis=0)] = 1.0
         if self._should_use_gpu:
             gpu_result = gvem_m_step_gpu(
                 responses,
@@ -472,27 +580,11 @@ class GVEMEstimator(BaseEstimator):
                 self._xi,
                 self._slopes,
                 self._intercepts,
+                estimate_loadings=not fixed_loadings,
             )
             if gpu_result is not None:
                 self._slopes, self._intercepts = gpu_result
-                if model.model_name == "1PL":
-                    self._slopes[:] = 1.0
                 return
-
-        rust_result = _rust_gvem_m_step(
-            responses,
-            self._mu,
-            self._sigma,
-            self._xi,
-            self._slopes,
-            self._intercepts,
-        )
-
-        if rust_result is not None:
-            self._slopes, self._intercepts = rust_result
-            if model.model_name == "1PL":
-                self._slopes[:] = 1.0
-            return
 
         self._m_step_python(model, responses)
 
@@ -501,7 +593,7 @@ class GVEMEstimator(BaseEstimator):
         model: BaseItemModel,
         responses: NDArray[np.int_],
     ) -> None:
-        """Python fallback for M-step."""
+        """CPU M-step."""
         fixed_loadings = model.model_name == "1PL"
         stats = variational_item_statistics(
             responses,
@@ -569,20 +661,6 @@ class GVEMEstimator(BaseEstimator):
             if gpu_result is not None:
                 return gpu_result
 
-        rust_result = _rust_gvem_compute_elbo(
-            responses,
-            self._slopes,
-            self._intercepts,
-            self._mu,
-            self._sigma,
-            self._xi,
-            prior_mean,
-            prior_cov,
-        )
-
-        if rust_result is not None:
-            return rust_result
-
         return self._compute_elbo_python(model, responses, prior_mean, prior_cov)
 
     def _compute_elbo_python(
@@ -592,7 +670,7 @@ class GVEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         prior_cov: NDArray[np.float64],
     ) -> float:
-        """Python fallback for ELBO computation."""
+        """CPU ELBO computation."""
         return variational_elbo(
             responses,
             self._slopes,
@@ -612,7 +690,11 @@ class GVEMEstimator(BaseEstimator):
         prior_mean: NDArray[np.float64],
         prior_cov: NDArray[np.float64],
     ) -> dict[str, NDArray[np.float64]]:
-        """Compute diagonal ELBO curvature with the variational state held fixed."""
+        """Compute diagonal ELBO curvature with the variational state held fixed.
+
+        Holding the variational posteriors fixed omits the latent
+        uncertainty, so these errors understate the sampling variability.
+        """
         from mirt.estimation._gvem_information import gvem_standard_errors
         from mirt.models.dichotomous import OneParameterLogistic, TwoParameterLogistic
 

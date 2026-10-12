@@ -62,7 +62,7 @@ def test_anchors_stay_fixed_and_the_population_is_estimated(shifted_2pl):
     assert np.all(errors[NEW_ITEMS] > 0.0)
 
 
-def test_mml_calibration_recovers_new_items_better_than_the_heuristic(shifted_2pl):
+def test_estimated_population_beats_the_standard_normal_wrapper(shifted_2pl):
     responses, anchors, discrimination, difficulty, _ = shifted_2pl
 
     result = fixed_item_calibration(
@@ -72,15 +72,16 @@ def test_mml_calibration_recovers_new_items_better_than_the_heuristic(shifted_2p
         anchors,
         compute_standard_errors=False,
     )
-    heuristic = fixed_calib(responses, anchors, ANCHORS)
+    # fixed_calib holds the population at N(0, 1), not this sample's N(0.5, 1.44).
+    standard_normal = fixed_calib(responses, anchors, ANCHORS)
 
     mml_error = np.abs(
         result.model.parameters["difficulty"][NEW_ITEMS] - difficulty[NEW_ITEMS]
     )
-    heuristic_error = np.abs(
-        np.asarray(heuristic.new_difficulty) - difficulty[NEW_ITEMS]
+    standard_normal_error = np.abs(
+        np.asarray(standard_normal.new_difficulty) - difficulty[NEW_ITEMS]
     )
-    assert np.sqrt(np.mean(mml_error**2)) < np.sqrt(np.mean(heuristic_error**2))
+    assert np.sqrt(np.mean(mml_error**2)) < np.sqrt(np.mean(standard_normal_error**2))
     assert mml_error.max() < 0.15
 
 

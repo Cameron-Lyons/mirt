@@ -856,6 +856,63 @@ class TestAverageMI:
         np.testing.assert_allclose(result.within_variance, [1.0, 4.0])
         np.testing.assert_allclose(result.total_variance, [4.0, 7.0])
 
+    def test_reports_r_t_statistics_and_p_values(self):
+        # R mirt 1.48 averageMI(par, SEpar) for three parameters over four
+        # imputations.
+        estimates = [
+            np.array([0.5, -1.2, 0.1]),
+            np.array([0.62, -1.0, 0.05]),
+            np.array([0.41, -1.31, 0.2]),
+            np.array([0.55, -1.1, -0.02]),
+        ]
+        errors = [
+            np.array([0.1, 0.2, 0.15]),
+            np.array([0.12, 0.19, 0.16]),
+            np.array([0.11, 0.21, 0.14]),
+            np.array([0.1, 0.2, 0.15]),
+        ]
+
+        result = averageMI(estimates, standard_errors=errors)
+
+        np.testing.assert_allclose(
+            result.standard_error, [0.1462019, 0.2493283, 0.1823401], atol=5e-8
+        )
+        np.testing.assert_allclose(
+            result.t_statistic, [3.5567250, -4.6224202, 0.4524512], atol=5e-8
+        )
+        np.testing.assert_allclose(
+            result.df, [14.418639053254, 23.705536389129, 28.976885740318]
+        )
+        np.testing.assert_allclose(
+            result.p_value, [0.003030690092, 0.00011148614, 0.65431322677], rtol=1e-7
+        )
+
+    def test_barnard_rubin_degrees_of_freedom(self):
+        estimates = [1.0, 1.3, 0.8, 1.1]
+        variances = [0.04, 0.05, 0.045, 0.04]
+        m = len(estimates)
+        within = np.mean(variances)
+        between = np.var(estimates, ddof=1)
+        total = within + (1 + 1 / m) * between
+        share = (1 + 1 / m) * between / total
+        rubin_df = (m - 1) / share**2
+        observed_df = (20 + 1) / (20 + 3) * 20 * (1 - share)
+        expected_df = 1 / (1 / rubin_df + 1 / observed_df)
+
+        rubin = averageMI(estimates, variances=variances)
+        adjusted = averageMI(estimates, variances=variances, df_complete=20)
+
+        assert rubin.df == pytest.approx(rubin_df)
+        assert adjusted.df == pytest.approx(expected_df)
+        assert adjusted.df < 20
+        assert adjusted.t_statistic == pytest.approx(rubin.t_statistic)
+        assert adjusted.p_value > rubin.p_value
+
+    @pytest.mark.parametrize("df_complete", [0.0, -1.0, np.inf, True])
+    def test_complete_data_degrees_of_freedom_must_be_positive(self, df_complete):
+        with pytest.raises(MirtValidationError, match="df_complete"):
+            averageMI([1.0, 2.0], variances=[1.0, 1.0], df_complete=df_complete)
+
     def test_zero_between_variance_is_stable(self):
         with np.errstate(all="raise"):
             result = averageMI([1.0, 1.0], variances=[1.0, 1.0])
@@ -863,6 +920,8 @@ class TestAverageMI:
         assert result.df == LARGE_DF
         assert result.lambda_hat == 0.0
         assert np.isfinite(result.fmi)
+        assert result.t_statistic == pytest.approx(1.0)
+        assert result.p_value == pytest.approx(0.31731050786291404)
 
     @pytest.mark.parametrize(
         ("variances", "standard_errors"),

@@ -129,7 +129,9 @@ class TestRefitRecipe:
 
         assert recipe.estimator is EMEstimator
         assert set(recipe.options["item_priors"]) == {"guessing"}
-        assert recipe.options["n_quadpts"] == 21
+        # The dimension-dependent default grid, resolved again by each refit.
+        assert recipe.options["n_quadpts"] is None
+        assert recipe.options["quadrature"] == "auto"
         assert recipe.latent_density is None
         assert "verbose" not in recipe.options
         assert "compute_standard_errors" not in recipe.options
@@ -184,6 +186,15 @@ class TestRefitRecipe:
 
         assert result.refit_recipe.options["item_priors"] == priors
         assert result.refit_recipe.build().item_priors == priors
+
+    def test_recipe_keeps_plain_em_without_expansion_steps(self):
+        data = np.asarray(simdata("2PL", n_persons=200, n_items=5, seed=2))
+        result = EMEstimator(px_em=False, compute_standard_errors=False).fit(
+            TwoParameterLogistic(5), data
+        )
+
+        assert result.refit_recipe.options["px_em"] is False
+        assert result.refit_recipe.build().px_em is False
 
     def test_estimators_without_a_known_constructor_record_no_recipe(self):
         class CustomEstimator(EMEstimator):
@@ -393,10 +404,15 @@ class TestBootstrapRefits:
         self, monkeypatch
     ):
         data = np.asarray(simdata("2PL", n_persons=100, n_items=3, seed=8))
-        plain = mirt.fit_mirt(data, model="2PL", n_quadpts=15)
+        plain = mirt.fit_mirt(
+            data, model="2PL", n_quadpts=15, quadrature="gauss-hermite"
+        )
         prior = mirt.fit_mirt(
             data, model="2PL", priors={"discrimination": LogNormalPrior(0, 0.5)}
         )
+        # The native kernel integrates on Gauss-Hermite nodes, so fits on the
+        # default rectangular grid are refitted by EM.
+        rectangular = mirt.fit_mirt(data, model="2PL", compute_standard_errors=False)
         calls = []
 
         def fake_bootstrap(responses, **kwargs):
@@ -409,9 +425,17 @@ class TestBootstrapRefits:
 
         mirt.bootstrap_se(plain, data, n_bootstrap=2, seed=1)
         errors = mirt.bootstrap_se(prior, data, n_bootstrap=2, seed=1)
+        mirt.bootstrap_se(rectangular, data, n_bootstrap=2, seed=1)
 
         assert len(calls) == 1
-        assert calls[0]["n_quadpts"] == 15
+        # Replicates integrate on the fit's grid and keep EM's boxes.
+        from mirt.estimation.quadrature import GaussHermiteQuadrature
+
+        grid = GaussHermiteQuadrature(n_points=15)
+        np.testing.assert_array_equal(calls[0]["quad_points"], grid.nodes.ravel())
+        np.testing.assert_array_equal(calls[0]["quad_weights"], grid.weights)
+        assert calls[0]["disc_bounds"] == (0.1, 20.0)
+        assert calls[0]["diff_bounds"] == (-30.0, 30.0)
         assert np.all(errors["discrimination"] > 0.0)
 
     def test_skipping_replicate_standard_errors_keeps_the_estimates(

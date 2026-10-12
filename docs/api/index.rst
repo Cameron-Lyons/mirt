@@ -49,6 +49,7 @@ Models
    ThreePLNestedLogit
    FourPLNestedLogit
    BifactorModel
+   GradedBifactorModel
    PartiallyCompensatoryModel
    NoncompensatoryModel
    DisjunctiveModel
@@ -58,6 +59,10 @@ Models
    ExplanatoryIRT
    RaschLLTM
    MixtureIRT
+   LatentClassModel
+   fit_lca
+   mdirt
+   LCAResult
    TestletModel
    BifactorTestletModel
    RandomTestletEffectsModel
@@ -72,6 +77,11 @@ Models
    DINO
    GDINA
    HigherOrderCDM
+   AttributeHierarchy
+   fit_cdm
+   fit_gdina
+   fit_higher_order_cdm
+   CDMResult
    IRTreeModel
 
 Custom Models
@@ -152,6 +162,7 @@ Diagnostics
    diagnostics.compute_personfit_significance
    diagnostics.psis_loo
    diagnostics.waic
+   diagnostics.loo_compare
    diagnostics.posterior_predictive_check
    diagnostics.posterior_predictive_checks
 

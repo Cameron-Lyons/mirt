@@ -32,9 +32,12 @@ from mirt.multigroup.invariance import (
     INTERCEPT_PARAMS,
     InvarianceSpec,
 )
-from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
+from mirt.utils._parallel import resolve_n_jobs
+from mirt.utils.bootstrap import _run_bootstrap_tasks
 
 if TYPE_CHECKING:
+    from mirt.estimation.quadrature import QuadratureRule
+    from mirt.model_syntax import ModelSpec
     from mirt.multigroup.latent import GroupLatentDistribution
     from mirt.multigroup.model import MultigroupModel
     from mirt.multigroup.results import MultigroupFitResult
@@ -60,11 +63,15 @@ _FIT_EXCEPTIONS = (
 
 @dataclass(frozen=True)
 class _FitSettings:
-    n_quadpts: int
+    n_quadpts: int | None
     max_iter: int
     tol: float
     reference_group: int
     families: tuple[str, ...]
+    quadrature: QuadratureRule = "auto"
+    # Factor correlations of a multidimensional model (see
+    # MultigroupEMEstimator.fit); None follows the loading pattern.
+    free_correlations: bool | NDArray[np.bool_] | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +82,7 @@ class _FitSummary:
     bic: float
     converged: bool
     item_parameters: tuple[dict[str, Any], ...]
+    latent_moments: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(slots=True)
@@ -101,6 +109,8 @@ class _DIFTestRow:
     converged: bool
     round: int
     group_parameters: tuple[dict[str, Any], ...] | None
+    # Latent (mean, variance) of each group in the model that frees the item.
+    group_latent: tuple[tuple[float, float], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -152,12 +162,15 @@ def multigroup_dif(
     p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
+    n_factors: int = 1,
+    spec: ModelSpec | str | None = None,
+    quadrature: QuadratureRule = "auto",
 ) -> Any:
     """Test items for DIF with nested multiple-group likelihood-ratio tests.
 
@@ -177,10 +190,14 @@ def multigroup_dif(
     model : str
         Item model passed to :func:`mirt.multigroup.fit_multigroup`.
     items : sequence of int or str, optional
-        Items to test, by index or name. Defaults to every non-anchor item.
+        Items to test, by 0-based index or by name. Names are DataFrame
+        column names, otherwise ``Item_1``, ``Item_2``, ... as in
+        :func:`mirt.fit_mirt` and :func:`mirt.itemfit`. Defaults to every
+        non-anchor item.
     anchors : sequence of int or str, optional
-        Items assumed free of DIF. They are constrained in every model and
-        never tested. Required by the ``"add"`` schemes.
+        Items assumed free of DIF, by index or name as for ``items``. They
+        are constrained in every model and never tested. Required by the
+        ``"add"`` schemes.
     scheme : {"drop", "add", "drop_sequential", "add_sequential"}
         ``"drop"`` starts from a fully constrained model and frees one
         studied item at a time; every other item acts as an anchor.
@@ -201,7 +218,9 @@ def multigroup_dif(
     n_categories : int or sequence of int, optional
         Category counts for polytomous items.
     n_quadpts, max_iter, tol : int, int, float
-        EM settings for every fit.
+        EM settings for every fit. ``n_quadpts=None`` uses the default grid
+        of :func:`mirt.multigroup.fit_multigroup` (61 rectangular points for
+        one factor).
     reference_group : int or str, optional
         Reference group index, or label matched against ``str(label)``. An
         integer that is also the label of another group raises
@@ -212,6 +231,10 @@ def multigroup_dif(
     n_jobs : int
         Worker processes for the independent per-item refits. ``-1`` uses
         all cores.
+    n_factors, spec, quadrature
+        Exploratory factors, model syntax and quadrature rule, as in
+        :func:`mirt.multigroup.fit_multigroup`. ``COV`` correlations of
+        ``spec`` are estimated in every model.
 
     Returns
     -------
@@ -275,6 +298,9 @@ def multigroup_dif(
         reference_group=reference_group,
         max_rounds=max_rounds,
         n_jobs=n_jobs,
+        n_factors=n_factors,
+        spec=spec,
+        quadrature=quadrature,
     )
     return table.to_dataframe()
 
@@ -290,12 +316,15 @@ def select_dif_anchors(
     p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
+    n_factors: int = 1,
+    spec: ModelSpec | str | None = None,
+    quadrature: QuadratureRule = "auto",
 ) -> list[int]:
     """Select DIF-free anchor items with all-other-as-anchor LR tests.
 
@@ -315,7 +344,7 @@ def select_dif_anchors(
         fewer than ``n_anchors``.
     parameters, p_adjust, alpha, n_categories, n_quadpts, max_iter, tol
         As for :func:`multigroup_dif`.
-    reference_group, max_rounds, n_jobs
+    reference_group, max_rounds, n_jobs, n_factors, spec, quadrature
         As for :func:`multigroup_dif`.
 
     Returns
@@ -352,6 +381,9 @@ def select_dif_anchors(
         reference_group=reference_group,
         max_rounds=max_rounds,
         n_jobs=n_jobs,
+        n_factors=n_factors,
+        spec=spec,
+        quadrature=quadrature,
     )
     tested = [row for row in table.rows if np.isfinite(row.p_value)]
     ranked = sorted(tested, key=lambda row: (-row.p_value, row.chi2, row.item))
@@ -375,18 +407,22 @@ def run_multigroup_dif(
     p_adjust: PValueAdjustment = "none",
     alpha: float = 0.05,
     n_categories: int | Sequence[int] | None = None,
-    n_quadpts: int = 21,
+    n_quadpts: int | None = None,
     max_iter: int = 500,
     tol: float = 1e-4,
     reference_group: int | str | None = None,
     max_rounds: int = 10,
     n_jobs: int = 1,
+    n_factors: int = 1,
+    spec: ModelSpec | str | None = None,
+    quadrature: QuadratureRule = "auto",
 ) -> _DIFTestTable:
     """Run :func:`multigroup_dif` and return rows with group parameters.
 
     This is the entry point of :func:`mirt.diagnostics.compute_dif`. The
-    per-item ``group_parameters`` come from the model in which the studied
-    item is free, ordered like ``group_labels``.
+    per-item ``group_parameters`` and ``group_latent`` (latent mean and
+    variance) come from the model in which the studied item is free,
+    ordered like ``group_labels``.
     """
     from mirt.multigroup import _prepare_multigroup
 
@@ -406,15 +442,17 @@ def run_multigroup_dif(
         or max_rounds < 1
     ):
         raise ValueError("max_rounds must be a positive integer")
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
 
-    start_model, responses, ref_idx = _prepare_multigroup(
+    start_model, responses, ref_idx, correlations = _prepare_multigroup(
         data,
         groups,
         model,
         n_categories=n_categories,
         reference_group=reference_group,
-        item_names=None,
+        item_names=default_item_names(data),
+        n_factors=n_factors,
+        spec=spec,
     )
     if (
         isinstance(ref_idx, (bool, np.bool_))
@@ -444,6 +482,8 @@ def run_multigroup_dif(
         tol=tol,
         reference_group=int(ref_idx),
         families=families,
+        quadrature=quadrature,
+        free_correlations=correlations,
     )
     rows = _run_rounds(
         start_model,
@@ -608,6 +648,7 @@ def _fit(
         n_quadpts=settings.n_quadpts,
         max_iter=settings.max_iter,
         tol=settings.tol,
+        quadrature=settings.quadrature,
     )
     return estimator.fit(
         copy.deepcopy(start_model),
@@ -615,6 +656,7 @@ def _fit(
         invariance=spec,
         reference_group=settings.reference_group,
         initial_latent=start_latent,
+        free_correlations=settings.free_correlations,
     )
 
 
@@ -641,6 +683,10 @@ def _summarize(result: MultigroupFitResult, item: int | None) -> _FitSummary:
         bic=float(result.bic),
         converged=bool(result.converged),
         item_parameters=() if item is None else _item_parameters(result.model, item),
+        latent_moments=tuple(
+            (float(np.ravel(group.mean)[0]), float(np.ravel(group.cov)[0]))
+            for group in result.latent_distributions
+        ),
     )
 
 
@@ -695,6 +741,7 @@ def _likelihood_ratio_row(
         converged=baseline.converged and alternative.converged,
         round=round_number,
         group_parameters=group_parameters,
+        group_latent=free.latent_moments or None,
     )
 
 
@@ -714,6 +761,25 @@ def _validate_parameter_families(
     return values
 
 
+def default_item_names(data: Any) -> list[str] | None:
+    """DataFrame column names, otherwise ``Item_1`` to ``Item_J``.
+
+    The 1-based defaults match :func:`mirt.fit_mirt` and
+    :func:`mirt.itemfit`. Shared with :func:`mirt.diagnostics.compute_dif`.
+    Data that is not a two-dimensional matrix gives ``None`` and is
+    rejected by response validation.
+    """
+    from mirt.utils.data import response_column_names
+
+    names = response_column_names(data)
+    if names is not None:
+        return names
+    shape = np.shape(data)
+    if len(shape) != 2:
+        return None
+    return [f"Item_{index + 1}" for index in range(shape[1])]
+
+
 def resolve_items(
     values: Sequence[int | str] | None,
     item_names: list[str],
@@ -727,11 +793,18 @@ def resolve_items(
         return None
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         values = list(np.atleast_1d(np.asarray(values, dtype=object)))
+    defaults = [f"Item_{index + 1}" for index in range(len(item_names))]
     resolved: list[int] = []
     for value in values:
         if isinstance(value, str):
             if value not in item_names:
-                raise ValueError(f"{name} contains unknown item name {value!r}")
+                message = f"{name} contains unknown item name {value!r}"
+                if item_names == defaults:
+                    message += (
+                        f"; default item names run from 'Item_1' to "
+                        f"'Item_{len(item_names)}', as in fit_mirt and itemfit"
+                    )
+                raise ValueError(message)
             resolved.append(item_names.index(value))
         elif isinstance(value, (bool, np.bool_)) or not isinstance(
             value, (int, np.integer)

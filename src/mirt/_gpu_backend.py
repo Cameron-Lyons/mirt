@@ -7,8 +7,11 @@ automatically detecting GPU availability and falling back gracefully.
 
 from __future__ import annotations
 
+import ast
+from functools import cache
 from importlib import import_module
 from importlib.util import find_spec
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -26,16 +29,65 @@ _gpu_device: Any = None
 def is_gpu_available() -> bool:
     """Check if GPU acceleration is available.
 
+    PyTorch is imported, which takes about half a second and 200 MB, only
+    when it is installed with CUDA or ROCm support; a missing or CPU-only
+    build answers ``False`` without importing it. The answer is cached.
+
     Returns
     -------
     bool
         True if PyTorch is installed and CUDA is available.
     """
+    if _torch is None and _torch_import_error is None:
+        if not is_torch_available() or _torch_build_supports_gpu() is False:
+            return False
     try:
         _load_torch()
     except ImportError:
         return False
     return bool(_gpu_available)
+
+
+@cache
+def _torch_build_supports_gpu() -> bool | None:
+    """Return whether the installed PyTorch build has CUDA or ROCm support.
+
+    Reads the ``cuda``, ``hip`` and ``rocm`` fields of ``torch/version.py``
+    without importing PyTorch. Returns ``None`` when PyTorch is missing or
+    the fields cannot be read, so callers import it to find out.
+    """
+    try:
+        spec = find_spec("torch")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.submodule_search_locations:
+        return None
+    version_file = Path(next(iter(spec.submodule_search_locations))) / "version.py"
+    try:
+        tree = ast.parse(version_file.read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+        return None
+    fields: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets: list[ast.expr] = [node.target]
+            value = node.value
+        elif isinstance(node, ast.Assign):
+            targets, value = list(node.targets), node.value
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and target.id in ("cuda", "hip", "rocm"):
+                fields[target.id] = (
+                    value.value if isinstance(value, ast.Constant) else value
+                )
+    if "cuda" not in fields:
+        return None
+    if all(field is None for field in fields.values()):
+        return False
+    if any(isinstance(field, str) for field in fields.values()):
+        return True
+    return None
 
 
 def is_torch_available() -> bool:
@@ -282,118 +334,6 @@ def compute_log_likelihoods_3pl_gpu(
     return to_numpy(log_likes)
 
 
-def compute_log_likelihoods_mirt_gpu(
-    responses: NDArray[np.int_],
-    quad_points: NDArray[np.float64],
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """GPU-accelerated log-likelihood for multidimensional 2PL model.
-
-    Parameters
-    ----------
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing responses coded as negative values.
-    quad_points : ndarray of shape (n_quad, n_factors)
-        Quadrature points in multidimensional space.
-    discrimination : ndarray of shape (n_items, n_factors)
-        Item discrimination parameters (factor loadings).
-    difficulty : ndarray of shape (n_items,)
-        Item difficulty parameters.
-
-    Returns
-    -------
-    ndarray of shape (n_persons, n_quad)
-        Log-likelihoods for each person at each quadrature point.
-    """
-    torch, device = _load_torch_runtime()
-
-    resp = torch.from_numpy(responses.astype(np.float64)).to(device)
-    theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
-    a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
-    b = torch.from_numpy(difficulty.astype(np.float64)).to(device)
-
-    a_sum = a.sum(dim=1)
-    z = torch.einsum("qf,jf->qj", theta, a) - a_sum[None, :] * b[None, :]
-
-    probs = torch.sigmoid(z)
-    probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
-
-    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
-
-    return to_numpy(log_likes)
-
-
-def e_step_complete_gpu(
-    responses: NDArray[np.int_],
-    quad_points: NDArray[np.float64],
-    quad_weights: NDArray[np.float64],
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    prior_mean: float = 0.0,
-    prior_var: float = 1.0,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """GPU-accelerated complete E-step for 2PL model.
-
-    Computes posterior weights and marginal likelihoods in a single pass.
-
-    Parameters
-    ----------
-    responses : ndarray of shape (n_persons, n_items)
-        Response matrix. Missing responses coded as negative values.
-    quad_points : ndarray of shape (n_quad,)
-        Quadrature points.
-    quad_weights : ndarray of shape (n_quad,)
-        Quadrature weights.
-    discrimination : ndarray of shape (n_items,)
-        Item discrimination parameters.
-    difficulty : ndarray of shape (n_items,)
-        Item difficulty parameters.
-    prior_mean : float
-        Mean of the prior distribution.
-    prior_var : float
-        Variance of the prior distribution.
-
-    Returns
-    -------
-    posterior_weights : ndarray of shape (n_persons, n_quad)
-        Posterior probability weights for each person at each quadrature point.
-    marginal_ll : ndarray of shape (n_persons,)
-        Marginal likelihood for each person.
-    """
-    torch, device = _load_torch_runtime()
-
-    resp = torch.from_numpy(responses.astype(np.float64)).to(device)
-    theta = torch.from_numpy(quad_points.astype(np.float64)).to(device)
-    weights = torch.from_numpy(quad_weights.astype(np.float64)).to(device)
-    a = torch.from_numpy(discrimination.astype(np.float64)).to(device)
-    b = torch.from_numpy(difficulty.astype(np.float64)).to(device)
-
-    z = a[None, :] * (theta[:, None] - b[None, :])
-    probs = torch.sigmoid(z)
-    probs = probs.clamp(PROB_EPSILON, 1 - PROB_EPSILON)
-
-    log_likes = _aggregate_dichotomous_log_likelihoods(torch, resp, probs)
-
-    log_reference = -0.5 * (np.log(2 * np.pi) + theta**2)
-    log_target = (
-        -0.5 * np.log(2 * np.pi * prior_var)
-        - 0.5 * ((theta - prior_mean) ** 2) / prior_var
-    )
-    log_prior_mass = torch.log(weights + 1e-300) + log_target - log_reference
-    log_prior_mass -= torch.logsumexp(log_prior_mass, dim=0)
-
-    log_joint = log_likes + log_prior_mass[None, :]
-
-    log_marginal = torch.logsumexp(log_joint, dim=1, keepdim=True)
-    log_posterior = log_joint - log_marginal
-
-    posterior_weights = torch.exp(log_posterior)
-    marginal_ll = torch.exp(log_marginal.squeeze(1))
-
-    return to_numpy(posterior_weights), to_numpy(marginal_ll)
-
-
 def _torch_jj_lambda(torch: ModuleType, xi: Any) -> Any:
     """Evaluate the Jaakkola--Jordan coefficient without zero divisions."""
     xi_abs = torch.abs(xi)
@@ -567,6 +507,8 @@ def gvem_m_step_gpu(
     xi: NDArray[np.float64],
     current_slopes: NDArray[np.float64],
     current_intercepts: NDArray[np.float64],
+    *,
+    estimate_loadings: bool = True,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
     """GPU-accelerated M-step for GVEM estimator.
 
@@ -586,6 +528,10 @@ def gvem_m_step_gpu(
         Current slope estimates.
     current_intercepts : ndarray of shape (n_items,)
         Current intercept estimates.
+    estimate_loadings : bool, default=True
+        Whether to solve for the slopes. ``False`` keeps ``current_slopes``,
+        as for the unit slopes of a 1PL, and updates the intercepts given
+        them.
 
     Returns
     -------
@@ -608,26 +554,30 @@ def gvem_m_step_gpu(
 
     lam = _torch_jj_lambda(torch, xi_t)
     weights = torch.where(valid_mask, 2.0 * lam, 0.0)
-    second_moments = sigma_t + torch.einsum("if,ig->ifg", mu_t, mu_t)
-    slope_system = torch.einsum("ij,ifg->jfg", weights, second_moments)
-    slope_system += REGULARIZATION_EPSILON * torch.eye(
-        n_factors,
-        device=device,
-        dtype=torch.float64,
-    ).unsqueeze(0)
-
+    current_a = torch.as_tensor(current_slopes, device=device, dtype=torch.float64)
     current_d = torch.as_tensor(
         current_intercepts,
         device=device,
         dtype=torch.float64,
     )
-    slope_coefficients = torch.where(
-        valid_mask,
-        resp - 0.5 - weights * current_d.unsqueeze(0),
-        0.0,
-    )
-    slope_rhs = torch.einsum("ij,if->jf", slope_coefficients, mu_t)
-    new_slopes = torch.linalg.solve(slope_system, slope_rhs.unsqueeze(2)).squeeze(2)
+    if estimate_loadings:
+        second_moments = sigma_t + torch.einsum("if,ig->ifg", mu_t, mu_t)
+        slope_system = torch.einsum("ij,ifg->jfg", weights, second_moments)
+        slope_system += REGULARIZATION_EPSILON * torch.eye(
+            n_factors,
+            device=device,
+            dtype=torch.float64,
+        ).unsqueeze(0)
+        slope_coefficients = torch.where(
+            valid_mask,
+            resp - 0.5 - weights * current_d.unsqueeze(0),
+            0.0,
+        )
+        slope_rhs = torch.einsum("ij,if->jf", slope_coefficients, mu_t)
+        new_slopes = torch.linalg.solve(slope_system, slope_rhs.unsqueeze(2)).squeeze(2)
+    else:
+        # The intercepts must be updated with the slopes the model holds.
+        new_slopes = current_a
 
     linear_terms = mu_t @ new_slopes.T
     intercept_numerator = torch.where(
@@ -643,7 +593,6 @@ def gvem_m_step_gpu(
     ).clamp(-10.0, 10.0)
 
     valid_items = valid_mask.any(dim=0)
-    current_a = torch.as_tensor(current_slopes, device=device, dtype=torch.float64)
     new_slopes = torch.where(valid_items[:, None], new_slopes, current_a)
     new_intercepts = torch.where(valid_items, new_intercepts, current_d)
 

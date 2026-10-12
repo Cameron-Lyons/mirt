@@ -171,41 +171,88 @@ class TestEmpiricalHistogramWoods:
         assert result.shape == (n_bins,)
         assert np.all(np.isfinite(result))
 
-    def test_extrapolation_factor(self):
-        d0 = EmpiricalHistogramWoods(extrapolation_factor=0.0)
-        d1 = EmpiricalHistogramWoods(extrapolation_factor=2.0)
-
-        n_bins = 20
-        theta = np.linspace(-3, 3, n_bins)
+    def test_extrapolation_factor_is_deprecated_and_ignored(self):
+        # The factor blended in a quadratic log-tail fit, which inflated the
+        # tails every EM cycle; Woods' standardization has no such factor.
+        theta = np.linspace(-3, 3, 20)
         weights = np.exp(-0.5 * (theta + 1) ** 2) + 0.3 * np.exp(
             -0.5 * (theta - 2) ** 2
         )
-        weights[0] = 0.001
-        weights[-1] = 0.001
+        reference = EmpiricalHistogramWoods()
+        with pytest.warns(DeprecationWarning, match="extrapolation_factor"):
+            deprecated = EmpiricalHistogramWoods(extrapolation_factor=2.0)
 
-        d0.update(theta, weights)
-        d1.update(theta, weights)
+        reference.update(theta, weights)
+        deprecated.update(theta, weights)
 
-        ld0 = d0.log_density(theta)
-        ld1 = d1.log_density(theta)
-        assert not np.allclose(ld0, ld1)
+        assert_allclose(deprecated.probabilities, reference.probabilities)
 
     def test_n_parameters(self):
+        # The mean and variance are fixed, as in R mirt's dentype="EHW",
+        # which counts quadpts - 3 density parameters.
         d = EmpiricalHistogramWoods()
-        d.update(np.zeros(10), np.ones(10))
-        assert d.n_parameters == 9
+        d.update(np.linspace(-3, 3, 10), np.ones(10))
+        assert d.n_parameters == 7
+
+    def test_update_standardizes_the_posterior_histogram(self):
+        theta = np.linspace(-6, 6, 61)
+        counts = stats.norm.pdf(theta, loc=0.5, scale=1.3) * (1 + 0.4 * np.tanh(theta))
+        d = EmpiricalHistogramWoods()
+
+        d.update(theta, counts)
+
+        probabilities = d.probabilities
+        mean = probabilities @ theta
+        assert abs(mean) < 1e-10
+        assert abs(probabilities @ (theta - mean) ** 2 - 1.0) < 1e-10
+
+    def test_shifted_histogram_is_moved_back_on_an_equally_spaced_grid(self):
+        # A pure shift is undone exactly, as by R mirt's standardizeQuadrature
+        # (which agrees with this rescaling to 4e-10 for such input).
+        theta = np.linspace(-6, 6, 121)
+        d = EmpiricalHistogramWoods()
+        d.update(theta, stats.norm.pdf(theta))
+        standard = d.probabilities
+        shifted = np.concatenate([np.zeros(4), standard[:-4]])
+
+        d.update(theta, shifted)
+
+        assert_allclose(d.probabilities, standard, atol=1e-9)
+
+    def test_update_never_fits_the_counts_worse(self):
+        theta = np.linspace(-6, 6, 61)
+        rng = np.random.default_rng(3)
+        d = EmpiricalHistogramWoods()
+        d.log_quadrature_mass(theta, stats.norm.pdf(theta))
+        for _ in range(20):
+            counts = stats.norm.pdf(theta, rng.normal(0, 0.3), rng.uniform(0.7, 1.4))
+            counts *= rng.uniform(0.5, 1.5, len(theta))
+            counts /= counts.sum()
+            before = counts @ np.log(d.probabilities)
+
+            d.update(theta, counts)
+
+            assert counts @ np.log(d.probabilities) >= before
 
 
 class TestDavidianCurve:
     def test_default_initialization(self):
+        # Mean 0 and variance 1 constrain two of the four coefficients.
         d = DavidianCurve()
         assert d.degree == 4
-        assert d.n_parameters == 4
+        assert d.standardize
+        assert d.n_parameters == 2
+        assert_allclose([d.mean, d.variance], [0.0, 1.0], atol=1e-14)
 
     def test_custom_degree(self):
         d = DavidianCurve(degree=6)
         assert d.degree == 6
-        assert d.n_parameters == 6
+        assert d.n_parameters == 4
+        assert DavidianCurve(degree=6, standardize=False).n_parameters == 6
+
+    def test_standardize_must_be_boolean(self):
+        with pytest.raises(TypeError, match="standardize"):
+            DavidianCurve(standardize=1)
 
     def test_log_density_shape(self):
         d = DavidianCurve(degree=4)
@@ -246,6 +293,43 @@ class TestDavidianCurve:
         theta = np.array([0.0])
         ld = d.log_density(theta)
         assert np.isfinite(ld[0])
+
+    def test_update_standardizes_the_curve(self):
+        # The curve used to follow the counts to mean 0.8 and sd 1.2, moving
+        # the latent location and scale into the item parameters.
+        theta = np.linspace(-6, 6, 61)
+        counts = stats.norm.pdf(theta, loc=0.8, scale=1.2) * (1 + 0.5 * np.tanh(theta))
+        d = DavidianCurve(degree=4)
+
+        d.update(theta, counts)
+
+        assert_allclose([d.mean, d.variance], [0.0, 1.0], atol=1e-10)
+        assert d.coefficients[3:].any()
+        masses = np.exp(d.log_quadrature_mass(theta, stats.norm.pdf(theta)))
+        mean = masses @ theta
+        assert abs(mean) < 1e-5
+        assert abs(masses @ (theta - mean) ** 2 - 1.0) < 1e-5
+
+    def test_update_maximizes_the_expected_log_likelihood(self):
+        # On Gauss-Hermite nodes the curve's quadrature masses are w * g**2,
+        # so the counts are fitted at least as well as by the standard normal.
+        nodes, weights = np.polynomial.hermite_e.hermegauss(21)
+        weights /= weights.sum()
+        counts = weights * (1 + 0.6 * np.tanh(nodes))
+        d = DavidianCurve(degree=4)
+        start = counts @ d.log_quadrature_mass(nodes, weights)
+
+        d.update(nodes, counts)
+
+        assert counts @ d.log_quadrature_mass(nodes, weights) > start + 1e-3
+
+    def test_unstandardized_update_follows_the_counts(self):
+        theta = np.linspace(-6, 6, 61)
+        d = DavidianCurve(degree=4, standardize=False)
+
+        d.update(theta, stats.norm.pdf(theta, loc=0.8))
+
+        assert d.mean == pytest.approx(0.8, abs=0.05)
 
 
 class TestMixtureDensity:
@@ -289,16 +373,37 @@ class TestMixtureDensity:
         assert result.shape == (10,)
 
     def test_update_changes_params(self):
+        # Counts at -1 and 1 have mean 0 and variance 1, so the standardized
+        # components move toward them.
         d = MixtureDensity(n_components=2)
         means_before = d.means.copy()
-        theta = np.concatenate([np.full(20, -2), np.full(20, 2)])
+        theta = np.concatenate([np.full(20, -1), np.full(20, 1)])
         weights = np.ones(40) / 40
         d.update(theta, weights)
         assert not np.allclose(d.means, means_before, atol=0.01)
+        assert np.all(np.abs(d.means) > np.abs(means_before))
+
+    def test_unstandardized_update_follows_the_counts(self):
+        d = MixtureDensity(n_components=2, standardize=False)
+        theta = np.concatenate([np.full(20, -2), np.full(20, 2)])
+        d.update(theta, np.ones(40) / 40)
+        assert_allclose(d.means, [-2.0, 2.0], atol=0.01)
+
+    def test_default_start_and_update_are_standardized(self):
+        d = MixtureDensity(n_components=3)
+        assert_allclose([d.mean, d.variance], [0.0, 1.0], atol=1e-14)
+        theta = np.linspace(-6, 6, 61)
+        counts = stats.norm.pdf(theta, loc=0.5, scale=1.4) * (1 + 0.5 * np.tanh(theta))
+
+        d.update(theta, counts)
+
+        assert_allclose([d.mean, d.variance], [0.0, 1.0], atol=1e-12)
 
     def test_n_parameters(self):
+        # Mean 0 and variance 1 constrain two of the eight free parameters.
         d = MixtureDensity(n_components=3)
-        assert d.n_parameters == 8
+        assert d.n_parameters == 6
+        assert MixtureDensity(n_components=3, standardize=False).n_parameters == 8
 
 
 class TestCustomDensity:
@@ -434,3 +539,92 @@ def test_univariate_density_names_require_one_factor(responses_2pl):
     assert estimator._latent_density.n_parameters == 7**2 - 1
     with pytest.raises(MirtValidationError, match="Unknown latent density"):
         EMEstimator(latent_density="lognormal")
+
+
+@pytest.fixture(scope="module")
+def standard_normal_2pl():
+    """2PL responses of standard-normal persons, with their Gaussian fit."""
+    rng = np.random.default_rng(8)
+    n_items = 12
+    truth = TwoParameterLogistic(n_items)
+    truth.set_parameters(
+        discrimination=rng.uniform(0.8, 2.0, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+    )
+    theta = rng.standard_normal((1500, 1))
+    responses = (rng.random((1500, n_items)) < truth.probability(theta)).astype(int)
+    gaussian = EMEstimator(n_quadpts=21, compute_standard_errors=False).fit(
+        TwoParameterLogistic(n_items), responses
+    )
+    return responses, gaussian
+
+
+@pytest.mark.parametrize("name", ["ehw", "davidian", "mixture"])
+def test_estimated_densities_stay_standardized_under_em(name, standard_normal_2pl):
+    # On N(0, 1) data the Woods histogram used to run its mass to the top
+    # node (mean +7.3) while the log-likelihood fell by 5,220, and the
+    # Davidian curve and mixture drifted to mean +0.2 and sd 1.2, which
+    # shifted difficulties by +0.18 and shrank slopes by 10-16%.
+    responses, gaussian = standard_normal_2pl
+    estimator = EMEstimator(
+        latent_density=name,
+        n_quadpts=21,
+        max_iter=150,
+        compute_standard_errors=False,
+    )
+    result = estimator.fit(TwoParameterLogistic(responses.shape[1]), responses)
+
+    history = np.asarray(estimator.convergence_history)
+    assert np.all(np.diff(history) > -1e-8 * np.abs(history[1:]))
+    quadrature = estimator._quadrature
+    theta = quadrature.nodes[:, 0]
+    masses = np.exp(
+        estimator._latent_density.log_quadrature_mass(
+            quadrature.nodes, quadrature.weights
+        )
+    )
+    mean = masses @ theta
+    assert abs(mean) < 1e-5
+    assert abs(masses @ (theta - mean) ** 2 - 1.0) < 1e-5
+    assert result.latent_mean is None
+    assert result.latent_covariance is None
+
+    shift = result.model.difficulty - gaussian.model.difficulty
+    ratio = result.model.discrimination / gaussian.model.discrimination
+    assert abs(np.mean(shift)) < 0.05
+    assert 0.9 < np.mean(ratio) < 1.15
+
+
+def test_refit_recipe_keeps_the_standardized_density(standard_normal_2pl):
+    responses, _ = standard_normal_2pl
+    estimator = EMEstimator(
+        latent_density="davidian",
+        n_quadpts=21,
+        max_iter=40,
+        compute_standard_errors=False,
+    )
+    result = estimator.fit(TwoParameterLogistic(responses.shape[1]), responses)
+
+    density = result.refit_recipe.latent_density
+    assert isinstance(density, DavidianCurve)
+    assert density is not estimator._latent_density
+    assert_allclose([density.mean, density.variance], [0.0, 1.0], atol=1e-10)
+    rebuilt = result.refit_recipe.build()._latent_density_spec
+    assert isinstance(rebuilt, DavidianCurve) and rebuilt is not density
+    assert_allclose(rebuilt.coefficients, density.coefficients)
+
+
+def test_unstandardized_density_reports_its_moments(standard_normal_2pl):
+    # Without standardization the fitted population is no longer the
+    # standard normal that latent_mean=None stands for.
+    responses, _ = standard_normal_2pl
+    density = MixtureDensity(standardize=False)
+    result = EMEstimator(
+        latent_density=density,
+        n_quadpts=21,
+        max_iter=30,
+        compute_standard_errors=False,
+    ).fit(TwoParameterLogistic(responses.shape[1]), responses)
+
+    assert_allclose(result.latent_mean, [density.mean])
+    assert_allclose(result.latent_covariance, [[density.variance]])

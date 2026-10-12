@@ -10,11 +10,15 @@ from mirt.estimation.em import EMEstimator
 from mirt.exceptions import MirtValidationError
 from mirt.models.cdm import DINA, DINO
 from mirt.models.cdm_advanced import GDINA
+from mirt.models.compensatory import NoncompensatoryModel
 from mirt.models.custom import CustomItemModel, create_item_type
+from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.models.explanatory import LLTM, ExplanatoryIRT, RaschLLTM
 from mirt.models.nested import FourPLNestedLogit, ThreePLNestedLogit, TwoPLNestedLogit
 from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
     GradedRatingScaleModel,
+    GradedResponseModel,
     NominalResponseModel,
     RatingScaleModel,
 )
@@ -28,6 +32,7 @@ from mirt.models.testlet import (
     RandomTestletEffectsModel,
     TestletModel,
 )
+from mirt.utils.extraction import estfun
 
 
 def test_gdina_counts_declared_reduced_designs_not_metadata_or_padding():
@@ -178,7 +183,8 @@ def test_custom_equal_bounds_are_fixed_coefficients():
 )
 def test_standalone_testlet_loading_is_fixed(family):
     model = family(3, [0, 0, -1])
-    assert model.n_parameters == 3 + 2 + 3 + 1
+    # The testlet variance is fixed while its loadings are free.
+    assert model.n_parameters == 3 + 2 + 3
     assert_array_equal(
         model.free_parameter_masks["testlet_loadings"], [True, True, False]
     )
@@ -311,7 +317,10 @@ def test_nominal_public_setters_preserve_raw_probabilities_and_reference_zero(
     assert_allclose(model.probability(theta), reference, atol=2e-15)
     model.set_parameters(slopes=slopes + 1, intercepts=intercepts - 2)
     assert_allclose(model.probability(theta), reference, atol=2e-15)
-    assert model.n_parameters == ((2 - 1) + (4 - 1)) * (n_factors + 1)
+    # Exploratory factors leave n_factors * (n_factors - 1) / 2 slopes to rotation.
+    assert model.n_parameters == ((2 - 1) + (4 - 1)) * (n_factors + 1) - (
+        n_factors * (n_factors - 1) // 2
+    )
     assert_array_equal(model.slopes[:, 0], 0)
     assert_array_equal(model.intercepts[:, 0], 0)
     before = model.parameters
@@ -365,7 +374,8 @@ def test_common_slope_and_global_feature_moment_derivatives_match_analytic_oracl
 
 def test_declared_equal_testlet_loadings_count_one_coefficient_per_testlet():
     model = BifactorTestletModel(5, [3, 3, 8, 8, -1], constrain_testlet_loadings=True)
-    assert model.n_parameters == 5 + 5 + 2 + 2
+    # One common loading per testlet; the variances it scales are fixed.
+    assert model.n_parameters == 5 + 5 + 2
     assert_array_equal(
         model.free_parameter_masks["testlet_loadings"],
         [True, False, True, False, False],
@@ -483,3 +493,71 @@ def test_common_testlet_loading_uncertainty_follows_grouped_linear_map(first):
     assert_array_equal(
         model._expand_parameter_standard_errors("difficulty", ordinary), ordinary
     )
+
+
+def _exploratory_counts(n_factors):
+    return {
+        "2PL": TwoParameterLogistic(10, n_factors=n_factors).n_parameters,
+        "GRM": GradedResponseModel(10, 4, n_factors=n_factors).n_parameters,
+        "GPCM": GeneralizedPartialCredit(10, 4, n_factors=n_factors).n_parameters,
+        "NRM": NominalResponseModel(10, 4, n_factors=n_factors).n_parameters,
+    }
+
+
+@pytest.mark.parametrize("n_factors", [1, 2, 3])
+def test_exploratory_counts_leave_out_the_rotational_indeterminacy(n_factors):
+    # R mirt fixes the upper triangle of the first n_factors - 1 items' slopes.
+    rotation = n_factors * (n_factors - 1) // 2
+
+    assert _exploratory_counts(n_factors) == {
+        "2PL": 10 * (n_factors + 1) - rotation,
+        "GRM": 10 * (n_factors + 3) - rotation,
+        "GPCM": 10 * (n_factors + 3) - rotation,
+        "NRM": 10 * 3 * (n_factors + 1) - rotation,
+    }
+
+
+def test_slope_intercept_mirt_counts_leave_out_the_rotation():
+    from mirt.models.multidimensional import MultidimensionalModel
+
+    pattern = np.zeros((10, 2))
+    pattern[:5, 0] = pattern[5:, 1] = 1.0
+
+    assert MultidimensionalModel(10, 2).n_parameters == 10 * 3 - 1
+    assert MultidimensionalModel(10, 3).n_parameters == 10 * 4 - 3
+    confirmatory = MultidimensionalModel(
+        10, 2, model_type="confirmatory", loading_pattern=pattern
+    )
+    assert confirmatory.n_parameters == 10 + 10
+
+
+def test_loading_patterns_and_noncompensatory_slopes_keep_every_coordinate():
+    pattern = np.zeros((10, 2), dtype=np.bool_)
+    pattern[:5, 0] = pattern[5:, 1] = True
+    confirmatory = TwoParameterLogistic(10, n_factors=2)
+    confirmatory.set_free_parameter_masks({"discrimination": pattern})
+    graded = GradedResponseModel(10, 4, n_factors=2)
+    graded.set_free_parameter_masks({"discrimination": pattern})
+
+    assert confirmatory.n_parameters == 10 + 10
+    assert graded.n_parameters == 10 + 30
+    # A rotation changes a product of per-factor curves.
+    assert NoncompensatoryModel(10, n_factors=2).n_parameters == 40
+
+
+def test_exploratory_fit_criteria_and_scores_use_the_identified_count():
+    rng = np.random.default_rng(5)
+    generator = TwoParameterLogistic(6, n_factors=2).set_parameters(
+        discrimination=rng.uniform(0.6, 1.6, (6, 2)), difficulty=rng.normal(size=6)
+    )
+    responses = generator.simulate(rng.normal(size=(300, 2)), seed=6)
+
+    result = EMEstimator(n_quadpts=11, max_iter=60, compute_standard_errors=False).fit(
+        TwoParameterLogistic(6, n_factors=2), responses
+    )
+
+    assert result.n_parameters == 6 * 3 - 1
+    assert_allclose(result.aic, -2.0 * result.log_likelihood + 2.0 * 17)
+    graded = GradedResponseModel(3, 3, n_factors=2)
+    scores = estfun(graded, np.array([[0, 1, 2], [2, 1, 0]]), np.zeros((2, 2)))
+    assert scores.shape == (2, 3 * 4)

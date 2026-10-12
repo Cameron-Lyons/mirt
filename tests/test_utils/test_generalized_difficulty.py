@@ -12,10 +12,10 @@ from mirt.models.dichotomous import (
     OneParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
-    UnipolarLogLogistic,
 )
 from mirt.models.multidimensional import MultidimensionalModel
 from mirt.models.polytomous import GeneralizedPartialCredit
+from mirt.models.unfolding import IdealPointModel
 from mirt.utils.information import gen_difficulty
 
 
@@ -186,7 +186,7 @@ def test_custom_targets_outside_finite_curve_range_clamp_by_direction():
 
 
 def test_nonmonotonic_custom_curve_is_rejected():
-    model = UnipolarLogLogistic(2)
+    model = IdealPointModel(2)
 
     with pytest.raises(ValueError, match="must be monotonic and vary"):
         gen_difficulty(model, target_prob=0.2, theta_range=(-4.0, 4.0))

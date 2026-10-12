@@ -443,3 +443,120 @@ def test_multidimensional_latent_table_and_result_metadata(
     assert result.group_labels == ["reference", "focal"]
     assert "Multigroup IRT Analysis Results" in result.summary()
     assert "n_groups=2" in repr(result)
+
+
+def _scored_fit() -> tuple[MultigroupFitResult, np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(12)
+    slopes = rng.uniform(1.0, 2.0, 6)
+    difficulty = rng.normal(0.0, 1.0, 6)
+    theta = np.concatenate([rng.normal(0.0, 1.0, 150), rng.normal(0.8, 1.3, 150)])
+    p = 1 / (1 + np.exp(-slopes * (theta[:, None] - difficulty)))
+    data = (rng.random(p.shape) < p).astype(int)
+    data[150:, 5] = -1  # an item the focal group never answered
+    groups = np.array(["ref"] * 150 + ["focal"] * 150)
+    result = fit_multigroup(
+        data,
+        groups,
+        invariance="scalar",
+        reference_group="ref",
+        free_items={"difficulty": [2]},
+    )
+    return result, data, groups
+
+
+@pytest.mark.parametrize("method", ["EAP", "MAP", "ML"])
+def test_multigroup_scores_use_each_group_and_its_prior(method: str) -> None:
+    import mirt
+
+    result, data, groups = _scored_fit()
+    order = np.random.default_rng(0).permutation(len(data))
+    scores = mirt.fscores(result, data[order], method=method, groups=groups[order])
+
+    for g, label in enumerate(result.group_labels):
+        rows = groups[order] == label
+        distribution = result.latent_distributions[g]
+        expected = mirt.fscores(
+            result.model.get_group_model(g),
+            data[order][rows],
+            method=method,
+            prior_mean=distribution.mean,
+            prior_cov=distribution.cov,
+        )
+        np.testing.assert_array_equal(scores.theta[rows], expected.theta)
+        np.testing.assert_array_equal(
+            scores.standard_error[rows], expected.standard_error
+        )
+    if method != "ML":
+        # The focal prior, not the reference N(0, 1), shrinks focal scores.
+        focal = groups[order] == "focal"
+        standard = mirt.fscores(
+            result.model.get_group_model(0), data[order][focal], method=method
+        )
+        assert not np.allclose(scores.theta[focal], standard.theta)
+
+
+def test_multigroup_scoring_validates_groups_and_priors() -> None:
+    import mirt
+    from mirt.exceptions import MirtValidationError
+
+    result, data, groups = _scored_fit()
+    with pytest.raises(MirtValidationError, match="pass groups"):
+        mirt.fscores(result, data)
+    with pytest.raises(MirtValidationError, match="omit prior_mean"):
+        mirt.fscores(result, data, prior_mean=np.zeros(1), groups=groups)
+    with pytest.raises(MirtValidationError, match="unknown labels \\['other'\\]"):
+        result.fscores(data, np.where(groups == "ref", "other", groups))
+    with pytest.raises(MirtValidationError, match="one label per response row"):
+        result.fscores(data, groups[:-1])
+    with pytest.raises(MirtValidationError, match="only to multigroup"):
+        mirt.fscores(result.model.get_group_model(0), data, groups=groups)
+
+
+def test_multigroup_result_round_trips_through_json() -> None:
+    result, data, groups = _scored_fit()
+    result.model.fix_item_parameters({"discrimination": {4: 1.25}})
+    restored = MultigroupFitResult.from_json(result.to_json())
+
+    assert restored.group_labels == result.group_labels == ["focal", "ref"]
+    assert restored.model.unobserved_items(0) == [5]
+    assert restored.model.fixed_item_parameters["discrimination"][4] == 1.25
+    for name in restored.model.parameter_names:
+        for item in range(6):
+            assert restored.model.is_item_parameter_shared(
+                name, item
+            ) == result.model.is_item_parameter_shared(name, item)
+    assert restored.model.n_parameters == result.model.n_parameters
+    for g in range(2):
+        for name, values in result.model.get_group_parameters(g).items():
+            np.testing.assert_array_equal(
+                restored.model.get_group_parameters(g)[name], values
+            )
+            np.testing.assert_array_equal(
+                restored.standard_errors[name][g], result.standard_errors[name][g]
+            )
+        for key in ("mean", "cov"):
+            np.testing.assert_array_equal(
+                getattr(restored.latent_distributions[g], key),
+                getattr(result.latent_distributions[g], key),
+            )
+            np.testing.assert_array_equal(
+                restored.latent_standard_errors[g][key],
+                result.latent_standard_errors[g][key],
+            )
+    np.testing.assert_array_equal(restored.vcov, result.vcov)
+    assert restored.vcov_labels == result.vcov_labels
+    assert restored.fit_statistics() == result.fit_statistics()
+    np.testing.assert_array_equal(
+        restored.fscores(data, groups).theta, result.fscores(data, groups).theta
+    )
+
+    from mirt.exceptions import MirtValidationError
+
+    payload = result.to_dict(include_standard_errors=False)
+    assert "vcov" not in payload
+    with pytest.raises(MirtValidationError, match="unknown fields: extra"):
+        MultigroupFitResult.from_dict({**payload, "extra": 1})
+    with pytest.raises(MirtValidationError, match="missing required fields: links"):
+        MultigroupFitResult.from_dict(
+            {key: value for key, value in payload.items() if key != "links"}
+        )

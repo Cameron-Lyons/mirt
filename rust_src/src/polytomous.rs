@@ -1,7 +1,7 @@
 //! Polytomous IRT model computations (GRM, GPCM).
 
 use crate::likelihood_cache::cached_likelihoods;
-use crate::utils::{EPSILON, grm_category_probability};
+use crate::utils::{floor_probability, grm_category_probability};
 use numpy::ndarray::ArrayView2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyIndexError, PyValueError};
@@ -88,7 +88,7 @@ pub(crate) fn grm_log_row(theta: f64, discrimination: f64, thresholds: &[f64], r
 /// Turn adjacent-category increments into log category probabilities.
 ///
 /// Category 0 has logit zero and category `k` the sum of `increment(1..=k)`.
-/// Probabilities are floored at `EPSILON` before taking logs.
+/// Probabilities are floored at `EPSILON` before taking logs; NaN stays NaN.
 pub(crate) fn adjacent_log_row(row: &mut [f64], increment: impl Fn(usize) -> f64) {
     row[0] = 0.0;
     for k in 1..row.len() {
@@ -102,7 +102,7 @@ pub(crate) fn log_softmax_floor(row: &mut [f64]) {
     let max = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let log_denom = max + row.iter().map(|&v| (v - max).exp()).sum::<f64>().ln();
     for value in row {
-        *value = (*value - log_denom).exp().max(EPSILON).ln();
+        *value = floor_probability((*value - log_denom).exp()).ln();
     }
 }
 

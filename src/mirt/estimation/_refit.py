@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 # utilities, are chosen by every refitting caller itself.
 _EM_SETTINGS = (
     "n_quadpts",
+    "quadrature",
     "max_iter",
     "tol",
     "prob_epsilon",
@@ -40,11 +41,12 @@ _EM_SETTINGS = (
     "use_gpu",
     "use_rust",
     "accelerate",
+    "px_em",
     "item_priors",
     "se_method",
     "constraints",
 )
-_BIFACTOR_SETTINGS = ("n_quadpts", "max_iter", "tol", "se_method")
+_BIFACTOR_SETTINGS = ("n_quadpts", "quadrature", "max_iter", "tol", "se_method")
 
 
 @dataclass(frozen=True, eq=False)
@@ -155,13 +157,33 @@ def gaussian_population(
 
     A :class:`~mirt.estimation.latent_density.GaussianDensity`, including a
     ``FactorCovarianceDensity`` and the estimated population of fixed-item
-    calibration, yields copies of its final mean and covariance. A zero mean
-    or an identity covariance is returned as ``None``, the standard-normal
-    default of the consumers of ``FitResult.latent_mean`` and
-    ``FitResult.latent_covariance``. Other densities yield ``(None, None)``.
+    calibration, yields copies of its final mean and covariance. A
+    :class:`~mirt.estimation.latent_density.DavidianCurve` or
+    :class:`~mirt.estimation.latent_density.MixtureDensity` yields its
+    analytic mean and variance, which standardization holds at 0 and 1. A
+    zero mean or an identity covariance is returned as ``None``, the
+    standard-normal default of the consumers of ``FitResult.latent_mean`` and
+    ``FitResult.latent_covariance``. Other densities, including
+    ``EmpiricalHistogramWoods``, which is always standardized, yield
+    ``(None, None)``.
     """
-    from mirt.estimation.latent_density import GaussianDensity
+    from mirt.estimation.latent_density import (
+        _STANDARD_MOMENT_TOL,
+        DavidianCurve,
+        GaussianDensity,
+        MixtureDensity,
+    )
 
+    if isinstance(density, (DavidianCurve, MixtureDensity)):
+        location, variance = density.mean, density.variance
+        return (
+            None
+            if abs(location) <= _STANDARD_MOMENT_TOL
+            else np.array([location], dtype=np.float64),
+            None
+            if abs(variance - 1.0) <= _STANDARD_MOMENT_TOL
+            else np.array([[variance]], dtype=np.float64),
+        )
     if not isinstance(density, GaussianDensity):
         return None, None
     mean = np.array(density.mean, dtype=np.float64) if np.any(density.mean) else None
@@ -206,7 +228,9 @@ def em_estimator_for(
         With a recipe, the recorded estimator class and settings. Otherwise
         ``MixedFormatEMEstimator`` for mixed-format models,
         ``BifactorEMEstimator`` for built-in bifactor models when it takes
-        every option, and ``EMEstimator`` for other models.
+        every option, and ``EMEstimator`` for other models, which itself fits
+        testlet models by the same dimension reduction when its settings
+        allow.
 
     Raises
     ------

@@ -231,6 +231,8 @@ def test_kernel_respects_fixed_thresholds():
             1e-10,
             1e-10,
             1,
+            (0.1, 5.0),
+            (-6.0, 6.0),
             None,
         )[0]
 
@@ -271,6 +273,8 @@ def test_kernel_orders_items_with_unequal_categories_and_missing_data():
             1e-12,
             1e-10,
             n_jobs,
+            (0.1, 5.0),
+            (-6.0, 6.0),
             None,
         )
         for n_jobs in (1, 2)
@@ -281,3 +285,79 @@ def test_kernel_orders_items_with_unequal_categories_and_missing_data():
         gaps = np.diff(fitted[0][item, 1:k])
         assert np.all(gaps >= 1e-6 * (1 - 1e-9)), fitted[0]
         assert np.min(gaps) < 1e-5, fitted[0]
+
+
+@pytest.mark.parametrize("model_class", ["GRM", "GPCM"])
+def test_native_step_keeps_the_boxes_of_parameter_bounds(monkeypatch, model_class):
+    # The native optimizer hardcoded slopes in [0.1, 5] and locations in
+    # [-6, 6]; it now takes the boxes that the generic optimizer uses.
+    import mirt.estimation.base as estimation_base
+    from mirt.models.polytomous import GeneralizedPartialCredit
+
+    rng = np.random.default_rng(12)
+    theta = rng.standard_normal(500)
+    data = np.column_stack(
+        [np.digitize(2.5 * theta + rng.logistic(size=500), [-1, 1]) for _ in range(3)]
+    )
+    points = np.linspace(-4.0, 4.0, 21)
+    posterior = np.exp(-0.5 * (points - theta[:, None]) ** 2)
+    posterior /= posterior.sum(axis=1, keepdims=True)
+    name = "thresholds" if model_class == "GRM" else "steps"
+    boxes = {"discrimination": (0.2, 0.45), name: (-0.4, 0.4)}
+
+    def step() -> dict[str, np.ndarray]:
+        family = (
+            GradedResponseModel if model_class == "GRM" else GeneralizedPartialCredit
+        )
+        model = family(3, n_categories=3)
+        model.set_parameters(
+            discrimination=np.full(3, 0.3), **{name: np.tile([-0.2, 0.2], (3, 1))}
+        )
+        assert try_polytomous_m_step(
+            model,
+            data,
+            posterior,
+            points,
+            max_iter=200,
+            ftol=1e-12,
+            epsilon=1e-10,
+            n_jobs=1,
+        )
+        return model.parameters
+
+    unrestricted = step()
+    original = estimation_base._parameter_bounds
+    monkeypatch.setattr(
+        estimation_base,
+        "_parameter_bounds",
+        lambda model, parameter: boxes.get(parameter) or original(model, parameter),
+    )
+    restricted = step()
+
+    for parameter, (low, high) in boxes.items():
+        free = unrestricted[parameter]
+        assert np.any((free < low) | (free > high))
+        values = restricted[parameter]
+        assert np.all((values >= low) & (values <= high))
+        assert np.any((values == low) | (values == high))
+
+
+def test_kernel_rejects_inverted_boxes():
+    responses = np.zeros((2, 1), dtype=np.int32)
+    with pytest.raises(ValueError, match="slope_bounds must satisfy lower <= upper"):
+        mirt_rs.m_step_polytomous(
+            responses,
+            np.full((2, 3), 1 / 3),
+            np.array([-1.0, 0.0, 1.0]),
+            np.array([[1.0, 0.0]]),
+            np.ones((1, 2), dtype=bool),
+            np.array([2], dtype=np.int32),
+            True,
+            10,
+            1e-8,
+            1e-10,
+            1,
+            (5.0, 0.1),
+            (-6.0, 6.0),
+            None,
+        )

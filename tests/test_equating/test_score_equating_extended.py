@@ -348,3 +348,254 @@ def test_bracketed_root_solves_steep_and_flat_monotone_curves(function, inverse)
 
     np.testing.assert_allclose(function(roots), targets, atol=1e-13)
     np.testing.assert_allclose(roots, inverse(targets), rtol=1e-9, atol=1e-12)
+
+
+def _random_graded_form(n_items: int, seed: int) -> GradedResponseModel:
+    rng = np.random.default_rng(seed)
+    model = GradedResponseModel(n_items, n_categories=5)
+    model.set_parameters(
+        discrimination=rng.uniform(0.6, 2.0, n_items),
+        thresholds=np.sort(rng.normal(0.0, 1.0, (n_items, 4)), axis=1),
+    )
+    return model
+
+
+def _random_three_pl_form(n_items: int, seed: int) -> ThreeParameterLogistic:
+    rng = np.random.default_rng(seed)
+    model = ThreeParameterLogistic(n_items)
+    model.set_parameters(
+        discrimination=rng.uniform(0.6, 2.0, n_items),
+        difficulty=rng.normal(0.0, 1.0, n_items),
+        guessing=rng.uniform(0.1, 0.25, n_items),
+    )
+    return model
+
+
+def _true_score_oracle(old, new, linking, score):
+    """Solve the old curve with Brent's method and read the new curve there."""
+    from scipy.optimize import brentq
+
+    def expected(model, theta):
+        probabilities = model.probability(np.array([[theta]]))[0]
+        if probabilities.ndim == 1:
+            return float(np.sum(probabilities))
+        return float(np.sum(probabilities * np.arange(probabilities.shape[1])))
+
+    root = brentq(
+        lambda theta: expected(old, theta) - score,
+        -60.0,
+        60.0,
+        xtol=1e-15,
+        rtol=1e-15,
+        maxiter=500,
+    )
+    A, B = linking.constants.A, linking.constants.B
+    return expected(new, (root - B) / A)
+
+
+@pytest.mark.parametrize("family", ["grm", "3pl"])
+def test_true_score_equating_matches_brent_oracle(family: str) -> None:
+    """Seeded root finding keeps equated scores exact to rounding level."""
+    make_form = _random_graded_form if family == "grm" else _random_three_pl_form
+    old, new = make_form(12, 1), make_form(12, 2)
+    linking = LinkingResult(LinkingConstants(A=1.2, B=-0.3), anchor_items=[])
+
+    result = true_score_equating(old, new, linking_result=linking)
+
+    lower = float(np.sum(getattr(old, "guessing", np.zeros(old.n_items))))
+    interior = (result.old_scores > lower) & (result.old_scores < result.old_scores[-1])
+    expected = [
+        _true_score_oracle(old, new, linking, score)
+        for score in result.old_scores[interior]
+    ]
+    np.testing.assert_allclose(result.new_scores[interior], expected, atol=1e-10)
+
+
+def test_true_score_roots_need_about_one_curve_evaluation() -> None:
+    """Grid-seeded roots usually evaluate the old form once per score.
+
+    The previous unseeded false-position search needed close to six.
+    """
+    old, new = _random_graded_form(30, 1), _random_graded_form(30, 2)
+    sizes: list[int] = []
+    probability = old.probability
+
+    def counted(theta, item_idx=None):
+        sizes.append(len(theta))
+        return probability(theta, item_idx)
+
+    old.probability = counted  # type: ignore[method-assign]
+    result = true_score_equating(old, new)
+
+    n_interior = len(result.old_scores) - 2
+    # The first call validates the curve on the search grid.
+    assert sum(sizes[1:]) <= 1.5 * n_interior
+
+
+def test_lagrange_derivatives_are_exact_at_and_between_nodes() -> None:
+    from mirt.equating.score_equating import _lagrange_weights
+
+    nodes = np.tile(np.array([0.0, 1.0, 2.0, 3.0]), (3, 1))
+    points = np.array([1.0, 1.5, 3.0])
+
+    values = _lagrange_weights(nodes, points) @ (nodes[0] ** 3)
+    slopes = _lagrange_weights(nodes, points, derivative=True) @ (nodes[0] ** 3)
+
+    np.testing.assert_allclose(values, points**3, atol=1e-12)
+    np.testing.assert_allclose(slopes, 3.0 * points**2, atol=1e-12)
+
+
+def test_seeded_root_solver_converges_from_inexact_inverse() -> None:
+    from mirt.equating.score_equating import _solve_bracketed
+
+    targets = np.array([-0.9, -1e-6, 0.0, 0.3, 0.999])
+    lower = np.full(len(targets), -1.0)
+    upper = np.full(len(targets), 1.0)
+
+    def function(x):
+        return np.expm1(8.0 * x)
+
+    def inverse(values, rows):
+        # A deliberately biased approximate inverse.
+        return np.log1p(values) / 8.0 * (1.0 + 1e-3) + 1e-4
+
+    roots, residuals = _solve_bracketed(
+        function,
+        targets,
+        lower,
+        upper,
+        function(lower),
+        function(upper),
+        inverse=inverse,
+    )
+
+    np.testing.assert_allclose(function(roots), targets, atol=1e-13)
+    np.testing.assert_allclose(residuals, function(roots) - targets, atol=1e-15)
+    np.testing.assert_allclose(roots, np.log1p(targets) / 8.0, rtol=1e-9, atol=1e-12)
+
+
+def test_loglinear_smoothing_preserves_four_moments() -> None:
+    """The log-linear option is the moment-preserving ML presmoother."""
+    from mirt.equating.score_equating import _loglinear_smooth
+
+    rng = np.random.default_rng(4)
+    counts = rng.multinomial(400, np.r_[np.full(10, 0.06), np.full(11, 0.0364)])
+    distribution = counts / counts.sum()
+
+    smoothed = _loglinear_smooth(distribution)
+
+    scores = np.arange(len(distribution), dtype=np.float64)
+    for power in range(1, 5):
+        assert smoothed @ scores**power == pytest.approx(
+            distribution @ scores**power, rel=1e-8
+        )
+    assert smoothed.sum() == pytest.approx(1.0)
+    assert np.all(smoothed > 0.0)
+    # A fifth moment is not constrained.
+    assert smoothed @ scores**5 != pytest.approx(distribution @ scores**5, rel=1e-8)
+
+
+@pytest.mark.parametrize(
+    ("distribution", "degree"),
+    [([0.2, 0.3, 0.5], 1), ([0.5, 0.0, 0.5, 0.0], 1), ([0.4, 0.6], 0)],
+)
+def test_loglinear_smoothing_lowers_its_degree_for_short_distributions(
+    distribution, degree
+) -> None:
+    from mirt.equating.score_equating import _loglinear_smooth
+
+    values = np.asarray(distribution, dtype=np.float64)
+    smoothed = _loglinear_smooth(values)
+
+    scores = np.arange(len(values), dtype=np.float64)
+    if degree == 0:
+        np.testing.assert_array_equal(smoothed, values)
+    else:
+        assert smoothed @ scores == pytest.approx(values @ scores, rel=1e-10)
+
+
+class _UnusableLastItem2PL(TwoParameterLogistic):
+    """A 2PL whose last item, e.g. an uncalibrated bank item, has NaN curves."""
+
+    def probability(self, theta, item_idx=None):
+        probabilities = np.array(super().probability(theta, item_idx), dtype=float)
+        if item_idx is None:
+            probabilities[..., -1] = np.nan
+        return probabilities
+
+
+class _UnusableGraded(GradedResponseModel):
+    """A GRM with NaN curves for its last item and its padded categories."""
+
+    def probability(self, theta, item_idx=None):
+        probabilities = np.array(super().probability(theta, item_idx), dtype=float)
+        if item_idx is None:
+            probabilities[:, -1, :] = np.nan
+            for item, count in enumerate(self.n_categories):
+                probabilities[:, item, count:] = np.nan
+        return probabilities
+
+
+def test_true_score_roots_ignore_unselected_items() -> None:
+    """Only selected items' curves enter the root search, as in validation."""
+    slopes_old, slopes_new = np.linspace(0.8, 1.6, 6), np.linspace(0.9, 1.5, 6)
+    locations_old = np.linspace(-1.0, 1.0, 6)
+    locations_new = np.linspace(-1.2, 0.8, 6)
+    forms = []
+    for model_type in (_UnusableLastItem2PL, TwoParameterLogistic):
+        old, new = model_type(6), model_type(6)
+        old.set_parameters(discrimination=slopes_old, difficulty=locations_old)
+        new.set_parameters(discrimination=slopes_new, difficulty=locations_new)
+        forms.append((old, new))
+    items = [0, 1, 2, 3, 4]
+
+    result = true_score_equating(*forms[0], items_old=items, items_new=items)
+    reference = true_score_equating(*forms[1], items_old=items, items_new=items)
+
+    np.testing.assert_array_equal(result.new_scores, reference.new_scores)
+    np.testing.assert_allclose(
+        result.new_scores,
+        [0.0, 1.141316, 2.272009, 3.292744, 4.199456, 5.0],
+        atol=5e-7,
+    )
+
+
+def test_true_score_roots_ignore_unselected_and_padded_categories() -> None:
+    counts = [3, 5, 4, 5, 5]
+    forms = []
+    for model_type in (_UnusableGraded, GradedResponseModel):
+        pair = []
+        for seed in (1, 2):
+            rng = np.random.default_rng(seed)
+            model = model_type(5, n_categories=counts)
+            thresholds = np.sort(rng.normal(0.0, 1.0, (5, 4)), axis=1)
+            model.set_parameters(
+                discrimination=rng.uniform(0.6, 2.0, 5), thresholds=thresholds
+            )
+            pair.append(model)
+        forms.append(pair)
+    items = [0, 1, 2, 3]
+
+    result = true_score_equating(*forms[0], items_old=items, items_new=items)
+    reference = true_score_equating(*forms[1], items_old=items, items_new=items)
+
+    np.testing.assert_allclose(
+        result.new_scores, reference.new_scores, rtol=0.0, atol=1e-12
+    )
+
+
+def test_true_score_roots_reject_invalid_probabilities() -> None:
+    """Curves are checked at the roots, not only on the validation grid."""
+    old, new = _random_three_pl_form(8, 1), _random_three_pl_form(8, 2)
+    probability = old.probability
+    calls = []
+
+    def inflated_after_validation(theta, item_idx=None):
+        calls.append(len(theta))
+        values = np.array(probability(theta, item_idx), dtype=float)
+        return values if len(calls) == 1 else 1.5 * values
+
+    old.probability = inflated_after_validation  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match=r"outside \[0, 1\]"):
+        true_score_equating(old, new)

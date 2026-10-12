@@ -129,7 +129,8 @@ def test_progressive_control_supports_ordinal_cat(strategy):
 
     assert information[first] >= information.max() - control.window_size
     assert result.n_items_administered == 5
-    assert control.max_information_seen
+    # The constructor's session and the simulation's session.
+    assert control.n_examinees == 2
 
 
 def test_progressive_control_supports_multidimensional_ordinal_mcat():

@@ -1,5 +1,6 @@
 """Reliability functions for IRT models."""
 
+import warnings
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
@@ -7,11 +8,13 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.special import expit
 
-from mirt._information import _test_information, _theta_array
+from mirt._information import _resolve_model, _test_information, _theta_array
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
+    from mirt.results.score_result import ScoreResult
 
 
 Density = Literal["norm", "uniform"] | Callable[[NDArray[np.float64]], ArrayLike]
@@ -79,6 +82,7 @@ def conditional_rxx(
     from mirt.results._common import resolve_latent_prior
 
     model, _, latent_cov = resolve_latent_prior(model)
+    model = _resolve_model(model)
     if model.n_factors != 1:
         raise ValueError("conditional_rxx supports unidimensional models only")
     if latent_variance is None:
@@ -180,6 +184,7 @@ def marginal_rxx(
     from mirt.results._common import resolve_latent_prior
 
     model, latent_mean, latent_cov = resolve_latent_prior(model)
+    model = _resolve_model(model)
     if model.n_factors != 1:
         raise ValueError("marginal_rxx supports unidimensional models only")
     if isinstance(n_points, bool) or not isinstance(n_points, int) or n_points < 2:
@@ -229,43 +234,137 @@ def marginal_rxx(
     return float(np.clip(reliability, 0.0, 1.0))
 
 
+_ML_SCORE_METHODS = frozenset({"ML", "WLE"})
+
+
+def _score_result_arrays(
+    scores: "ScoreResult",
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return a ScoreResult's finite score rows, as R's ``empirical_rxx`` does.
+
+    Rows whose estimate or standard error is not finite, such as maximum
+    likelihood scores of all-correct patterns, are dropped.
+    """
+    theta = np.asarray(scores.theta, dtype=np.float64)
+    errors = np.asarray(scores.standard_error, dtype=np.float64)
+    if theta.ndim == 1:
+        theta = theta.reshape(-1, 1)
+        errors = errors.reshape(-1, 1)
+    keep = np.all(np.isfinite(theta), axis=1) & np.all(np.isfinite(errors), axis=1)
+    return theta[keep], errors[keep]
+
+
 def empirical_rxx(
-    model: "BaseItemModel",
-    theta_estimates: ArrayLike,
-    method: Literal["posterior_variance", "information"] = "information",
+    model: "BaseItemModel | FitResult",
+    theta_estimates: "ArrayLike | ScoreResult",
+    method: Literal["posterior_variance", "information"] | None = None,
     standard_errors: ArrayLike | None = None,
+    scores_include_error: bool | None = None,
 ) -> Reliability:
     """Compute empirical reliability from ability estimates.
 
-    Reliability is ``Var(theta) / (Var(theta) + E[SE**2])``. Information-
-    based estimates derive the standard errors from test information and
-    currently require a unidimensional model. Posterior-variance estimates
-    use standard errors returned by a scoring method and support any number
-    of factors.
+    As in R's ``empirical_rxx``, reliability is either
+    ``Var(theta_hat) / (Var(theta_hat) + E[SE**2])``, for posterior scores
+    (EAP, MAP, EAPsum) whose shrunken variance estimates the true-score
+    variance, or ``1 - E[SE**2] / Var(theta_hat)`` (R's ``T_as_X = TRUE``),
+    for maximum-likelihood scores (ML, WLE) whose variance already contains
+    the measurement error.
+
+    Pass the ``ScoreResult`` of :func:`mirt.fscores` to use its standard
+    errors and pick the formula from its scoring method; this reproduces R's
+    ``empirical_rxx(fscores(mod, full.scores.SE = TRUE))`` for EAP scores.
+    Without standard errors, they are derived from test information as
+    ``1 / sqrt(I(theta_hat))``, the asymptotic error of maximum-likelihood
+    estimates, which suits ML and WLE scores only and needs a
+    unidimensional model.
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
-    theta_estimates : array-like
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
+    theta_estimates : array-like or ScoreResult
         Ability estimates with shape ``(n_persons,)`` or
-        ``(n_persons, n_factors)``.
-    method : {"posterior_variance", "information"}, default="information"
-        Source of each respondent's error variance.
+        ``(n_persons, n_factors)``, or a ``ScoreResult``. Rows of a
+        ``ScoreResult`` with a non-finite estimate or standard error are
+        dropped, as R does.
+    method : {"posterior_variance", "information"}, optional
+        Source of each respondent's error variance. ``"posterior_variance"``
+        uses the score standard errors; ``"information"`` uses
+        ``1 / I(theta_hat)``. Defaults to ``"posterior_variance"`` when
+        standard errors are available (``standard_errors`` or a
+        ``ScoreResult``) and to ``"information"`` otherwise, with a warning
+        because the information-based errors assume ML or WLE scores.
     standard_errors : array-like, optional
         Score standard errors matching ``theta_estimates``. Required when
-        ``method="posterior_variance"``.
+        ``method="posterior_variance"`` and ``theta_estimates`` is an array.
+    scores_include_error : bool, optional
+        Whether ``Var(theta_hat)`` already contains the error variance (R's
+        ``T_as_X``), selecting ``1 - E[SE**2] / Var(theta_hat)``. Defaults to
+        True for ``method="information"`` and for ML or WLE ``ScoreResult``
+        input, and to False (R's default) otherwise.
 
     Returns
     -------
     float or ndarray
-        One coefficient for a unidimensional model, or one coefficient per
-        factor for a multidimensional posterior-variance estimate.
-    """
-    if method not in {"posterior_variance", "information"}:
-        raise ValueError("method must be 'posterior_variance' or 'information'")
+        One coefficient in [0, 1] for a unidimensional model, or one
+        coefficient per factor for a multidimensional posterior-variance
+        estimate.
 
-    theta = _theta_array(model, theta_estimates)
+    Examples
+    --------
+    >>> scores = fscores(result, responses, method="EAP")
+    >>> empirical_rxx(result, scores)  # R: empirical_rxx(fscores(mod, full.scores.SE=TRUE))
+    >>> ml_scores = fscores(result, responses, method="ML")
+    >>> empirical_rxx(result, ml_scores)  # R: T_as_X = TRUE
+    """
+    from mirt.results.score_result import ScoreResult
+
+    model = _resolve_model(model)
+    score_method: str | None = None
+    if isinstance(theta_estimates, ScoreResult):
+        if standard_errors is not None:
+            raise MirtValidationError(
+                "standard_errors cannot be combined with a ScoreResult, which "
+                "carries its own standard errors",
+                parameter="standard_errors",
+            )
+        score_method = theta_estimates.method
+        theta_values, score_errors = _score_result_arrays(theta_estimates)
+        if method is None or method == "posterior_variance":
+            standard_errors = score_errors
+    else:
+        theta_values = theta_estimates
+    if method is None:
+        method = "information" if standard_errors is None else "posterior_variance"
+        if method == "information":
+            warnings.warn(
+                "empirical_rxx received no standard errors, so they are derived "
+                "from test information, which assumes ML or WLE ability "
+                "estimates; pass the ScoreResult from fscores() or "
+                "standard_errors for EAP or MAP scores",
+                UserWarning,
+                stacklevel=2,
+            )
+    if method not in {"posterior_variance", "information"}:
+        raise MirtValidationError(
+            "method must be 'posterior_variance' or 'information'",
+            parameter="method",
+            value=method,
+            expected="'posterior_variance' or 'information'",
+        )
+    if scores_include_error is None:
+        scores_include_error = method == "information" or (
+            score_method is not None and score_method.upper() in _ML_SCORE_METHODS
+        )
+    elif not isinstance(scores_include_error, (bool, np.bool_)):
+        raise MirtValidationError(
+            "scores_include_error must be boolean",
+            parameter="scores_include_error",
+            value=scores_include_error,
+            expected="True, False, or None",
+        )
+
+    theta = _theta_array(model, theta_values)
     if theta.shape[0] < 2:
         raise ValueError("theta_estimates must contain at least two respondents")
 
@@ -309,13 +408,24 @@ def empirical_rxx(
         np.einsum("ij,ij->j", scaled_errors, scaled_errors) / theta.shape[0]
     )
 
-    denominator = observed_variance + average_error_variance
-    reliability = np.divide(
-        observed_variance,
-        denominator,
-        out=np.zeros_like(observed_variance),
-        where=denominator > 0.0,
-    )
+    if scores_include_error:
+        # Var(theta_hat) = Var(theta) + E[SE^2], so the true-score share is
+        # what remains after removing the error variance.
+        error_share = np.divide(
+            average_error_variance,
+            observed_variance,
+            out=np.ones_like(observed_variance),
+            where=observed_variance > 0.0,
+        )
+        reliability = 1.0 - error_share
+    else:
+        denominator = observed_variance + average_error_variance
+        reliability = np.divide(
+            observed_variance,
+            denominator,
+            out=np.zeros_like(observed_variance),
+            where=denominator > 0.0,
+        )
     reliability = np.clip(reliability, 0.0, 1.0)
     if model.n_factors == 1:
         return float(reliability[0])
@@ -323,7 +433,7 @@ def empirical_rxx(
 
 
 def sem(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: ArrayLike,
 ) -> NDArray[np.float64]:
     """Compute the standard error of measurement at given theta values.
@@ -335,8 +445,8 @@ def sem(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values at which to compute the standard error.
 
@@ -346,6 +456,7 @@ def sem(
         One standard error for each theta point. Uninformative points are
         represented by positive infinity.
     """
+    model = _resolve_model(model)
     theta_array = _theta_array(model, theta)
     test_information = _test_information(model, theta_array)
     return np.divide(

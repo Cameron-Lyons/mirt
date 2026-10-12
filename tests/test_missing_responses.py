@@ -366,7 +366,7 @@ _MODEL_FIT_AND_LD_CALLS: dict[str, Callable[[Any, Any, np.ndarray], Any]] = {
         result.model, data, theta
     ),
     "utils_q3": lambda result, data, theta: mirt.Q3(result.model, data, theta),
-    "utils_ld_x2": lambda result, data, theta: LD_X2(result.model, data, theta),
+    "utils_ld_x2": lambda result, data, _: LD_X2(result.model, data),
 }
 
 

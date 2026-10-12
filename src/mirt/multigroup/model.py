@@ -111,6 +111,10 @@ class MultigroupModel:
         self._base_model_class = base_model.__class__
         self._is_polytomous = base_model.is_polytomous
         self._fixed_item_parameters: dict[str, dict[int, NDArray[np.float64]]] = {}
+        # Items without responses in each group, set by the estimator.
+        self._unobserved_items: list[frozenset[int]] = [
+            frozenset() for _ in range(self.n_groups)
+        ]
 
     @property
     def group_models(self) -> list[BaseItemModel]:
@@ -386,6 +390,8 @@ class MultigroupModel:
         A shared coordinate is known when it is fixed in any group. Such a
         coordinate contributes no fitted parameter in the remaining groups.
         Synchronization propagates that known value to all linked groups.
+        Group-specific coordinates of items without responses in the group
+        (see :meth:`unobserved_items`) carry no information and are not free.
         """
         masks = self._raw_free_parameter_masks(group_idx)
         fixed_masks = [
@@ -395,7 +401,32 @@ class MultigroupModel:
             if self._parameter_links[name].is_shared:
                 known = np.logical_or.reduce([group[name] for group in fixed_masks])
                 masks[name] &= ~(known & self._shared_coordinate_mask(name))
+        for name, mask in masks.items():
+            if self._parameter_is_item_major(name):
+                for item in self.unobserved_items(group_idx):
+                    if not self._parameter_links[name].is_item_shared(item):
+                        mask[item] = False
         return masks
+
+    def unobserved_items(self, group_idx: int) -> list[int]:
+        """Items without any response in a group in the latest fit.
+
+        Their group-specific parameters are excluded from estimation and from
+        :attr:`n_parameters`; shared parameters stay identified by the other
+        groups.
+        """
+        validated = self._validate_group_index(group_idx, name="group_idx")
+        return sorted(
+            getattr(self, "_unobserved_items", [frozenset()] * self.n_groups)[validated]
+        )
+
+    def _set_unobserved_items(self, items: Sequence[Sequence[int]]) -> None:
+        """Record each group's items without responses."""
+        if len(items) != self.n_groups:
+            raise ValueError("unobserved items must be given for every group")
+        self._unobserved_items = [
+            frozenset(int(item) for item in group_items) for group_items in items
+        ]
 
     def enforce_fixed_parameters(self) -> None:
         """Restore fixed values after initialization or synchronization."""
@@ -576,14 +607,22 @@ class MultigroupModel:
 
     @property
     def n_parameters(self) -> int:
-        """Total number of free parameters accounting for constraints."""
+        """Total number of free parameters accounting for constraints.
+
+        Exploratory multidimensional slopes are identified only up to an
+        orthogonal rotation of the factors, so ``F(F - 1) / 2`` coordinates
+        per group are not counted when the slopes are group-specific, and
+        once when they are shared, since one rotation of every group keeps
+        the reference factors uncorrelated. R mirt fixes as many slopes.
+        """
         n_params = 0
+        all_masks = [
+            self.effective_free_parameter_masks(group_idx)
+            for group_idx in range(self.n_groups)
+        ]
 
         for param_name in self.parameter_names:
-            masks = [
-                self.effective_free_parameter_masks(group_idx)[param_name]
-                for group_idx in range(self.n_groups)
-            ]
+            masks = [group_masks[param_name] for group_masks in all_masks]
             expected_shape = masks[0].shape
             if any(mask.shape != expected_shape for mask in masks[1:]):
                 raise ValueError(
@@ -608,6 +647,14 @@ class MultigroupModel:
             else:
                 n_params += sum(int(np.count_nonzero(mask)) for mask in masks)
 
+        slopes = getattr(self._group_models[0], "_rotatable_slopes", None)
+        if slopes in self._parameter_links:
+            rotations = [
+                group._rotational_indeterminacy(masks)
+                for group, masks in zip(self._group_models, all_masks, strict=True)
+            ]
+            shared = self._parameter_links[slopes].is_shared
+            n_params -= max(rotations) if shared else sum(rotations)
         return n_params
 
     def __repr__(self) -> str:

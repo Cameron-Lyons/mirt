@@ -23,6 +23,19 @@ def test_clinical_and_confidence_share_one_set_of_validators():
         assert module.as_finite_vector is as_finite_vector
 
 
+def test_results_and_person_fit_share_the_alpha_validator():
+    from mirt.diagnostics import personfit
+    from mirt.results import _common
+
+    assert _common.validate_alpha is validate_alpha
+    assert personfit._validate_alpha is validate_alpha
+    for alpha in (True, np.bool_(True), [0.05], np.nan, 1.0):
+        with pytest.raises(MirtValidationError, match="alpha must be"):
+            personfit.compute_personfit_significance(np.zeros(3), alpha=alpha)
+        with pytest.raises(MirtValidationError, match="alpha must be"):
+            _common.normal_critical_value(alpha)
+
+
 @pytest.mark.parametrize("value", [1, 2.5, np.float32(-3.0), np.int64(4)])
 def test_finite_scalars_are_returned_as_floats(value):
     result = validate_finite_scalar(value, "value")

@@ -324,37 +324,3 @@ def multigroup_e_step_nrm(
         )
 
     return None
-
-
-def multigroup_expected_counts(
-    responses_list: list[NDArray[np.int_]],
-    posterior_weights_list: list[NDArray[np.float64]],
-) -> tuple[list[NDArray[np.float64]], list[NDArray[np.float64]]] | None:
-    """Compute expected counts for all groups in parallel.
-
-    Parameters
-    ----------
-    responses_list : list of NDArray
-        Response matrices, one per group (n_persons_g, n_items)
-    posterior_weights_list : list of NDArray
-        Posterior weights, one per group (n_persons_g, n_quad)
-
-    Returns
-    -------
-    tuple or None
-        (r_k_list, n_k_list) or None if Rust unavailable
-        - r_k_list: list of (n_items, n_quad) expected correct counts
-        - n_k_list: list of (n_items, n_quad) expected total counts
-
-    Raises
-    ------
-    ValueError
-        If the lists differ in length or a posterior has the wrong row count.
-    """
-    if rust_enabled():
-        responses_int = [_ensure_i32(r) for r in responses_list]
-        weights_float = [_ensure_f64(w) for w in posterior_weights_list]
-
-        return mirt_rs.multigroup_expected_counts(responses_int, weights_float)
-
-    return None

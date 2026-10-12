@@ -8,6 +8,7 @@ from scipy.special import xlog1py, xlogy
 
 from mirt._logistic import _affine_logits, _logistic_probability
 from mirt._model_defaults import uses_builtin_model_hooks
+from mirt.estimation._dichotomous_objective import logistic_tails
 from mirt.models.base import BaseItemModel
 
 _Objective = Callable[[NDArray[np.float64]], tuple[float, NDArray[np.float64]]]
@@ -27,7 +28,9 @@ def prepare_affine_objective(
     Trial parameters must lie within ``bounds``, as enforced by L-BFGS-B. This
     lets ordinary quadrature grids skip repeated overflow checks, while grids
     with large coordinates still use the shared exact-recovery logit kernel.
-    Custom model implementations retain their probability-based objective.
+    Nodes whose probability lies beyond ``[epsilon, 1 - epsilon]`` keep the
+    exact likelihood and gradient at finite logits. Custom model
+    implementations retain their probability-based objective.
     """
     from mirt.models.bifactor import BifactorModel
     from mirt.models.multidimensional import MultidimensionalModel
@@ -69,15 +72,22 @@ def prepare_affine_objective(
             logits += params[-1]
         else:
             logits = _affine_logits(points, params[:-1], params[-1])
-        probability = _logistic_probability(logits, None, None)
+        # Saturated nodes below need the logits.
+        probability = _logistic_probability(logits.copy(), None, None)
         interior = (probability > epsilon) & (probability < 1.0 - epsilon)
         np.clip(probability, epsilon, 1.0 - epsilon, out=probability)
-        loss = -float(
-            np.sum(xlogy(correct, probability) + xlog1py(incorrect, -probability))
-        )
-        # The clipped objective is constant beyond each probability boundary.
+        terms = xlogy(correct, probability) + xlog1py(incorrect, -probability)
         residual = observed * probability - correct
-        residual[~interior] = 0.0
+        saturated = np.flatnonzero(~interior)
+        if saturated.size:
+            # The clipped objective is flat beyond each probability bound,
+            # which stalls the optimizer on items whose responses lie there.
+            residual[saturated] = 0.0
+            rows = saturated[np.isfinite(logits[saturated])]
+            terms[rows], residual[rows] = logistic_tails(
+                logits[rows], observed[rows], correct[rows]
+            )
+        loss = -float(np.sum(terms))
         gradient = np.empty(params.size)
         gradient[:-1] = points.T @ residual
         gradient[-1] = residual.sum()

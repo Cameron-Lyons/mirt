@@ -1,11 +1,12 @@
 """Fixed-item calibration and test equating functions.
 
 Provides functions for calibrating new items to an existing scale
-and equating test forms. :func:`fixed_calib` uses the Rust backend for
-performance when available; :func:`fixed_item_calibration` calibrates any
-item model family by marginal maximum likelihood.
+and equating test forms. :func:`fixed_item_calibration` calibrates any item
+model family by marginal maximum likelihood; :func:`fixed_calib` is its 2PL
+convenience wrapper under a standard normal population.
 """
 
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -13,18 +14,12 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtDataError, MirtValidationError
 
 if TYPE_CHECKING:
+    from mirt.estimation.em import EMEstimator
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
-
-try:
-    from mirt.backends.rust._helpers import RUST_AVAILABLE
-    from mirt.backends.rust.calibration import fixed_calib_em
-except ImportError:
-    RUST_AVAILABLE = False
 
 
 @dataclass
@@ -240,96 +235,24 @@ def _item_log_likelihood(
     return correct @ log_probability.T + incorrect @ log_complement.T
 
 
-def _fixed_calib_e_step(
-    anchor_log_likelihood: NDArray[np.float64],
-    new_responses: NDArray[np.int32],
+def _fixed_calib_scores(
+    responses: NDArray[np.int32],
     theta_grid: NDArray[np.float64],
-    log_weights: NDArray[np.float64],
-    new_discrimination: NDArray[np.float64],
-    new_difficulty: NDArray[np.float64],
+    weights: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], float]:
-    new_log_likelihood = _item_log_likelihood(
-        new_responses,
-        theta_grid,
-        new_discrimination,
-        new_difficulty,
+    """Return EAP abilities and the marginal log-likelihood on a prior grid."""
+    log_joint = (
+        _item_log_likelihood(responses, theta_grid, discrimination, difficulty)
+        + np.log(weights)[None, :]
     )
-    log_joint = anchor_log_likelihood + new_log_likelihood + log_weights[None, :]
     row_maximum = np.max(log_joint, axis=1, keepdims=True)
     scaled_joint = np.exp(log_joint - row_maximum)
     scaled_marginal = np.sum(scaled_joint, axis=1, keepdims=True)
     posterior = scaled_joint / scaled_marginal
     log_marginal = row_maximum[:, 0] + np.log(scaled_marginal[:, 0])
-    return posterior, float(np.sum(log_marginal))
-
-
-def _fixed_calib_m_step(
-    responses: NDArray[np.int32],
-    posterior: NDArray[np.float64],
-    theta_grid: NDArray[np.float64],
-    discrimination: NDArray[np.float64],
-    difficulty: NDArray[np.float64],
-    disc_bounds: tuple[float, float],
-    diff_bounds: tuple[float, float],
-    prob_clamp: tuple[float, float],
-    min_count: float,
-    min_valid_points: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Update new-item parameters from posterior expected counts."""
-    valid = (responses >= 0).astype(np.float64)
-    correct = (responses == 1).astype(np.float64)
-    counts = valid.T @ posterior
-    correct_counts = correct.T @ posterior
-
-    updated_disc = discrimination.copy()
-    updated_diff = difficulty.copy()
-    valid_points = counts > min_count
-    eligible = np.count_nonzero(valid_points, axis=1) >= min_valid_points
-    if not np.any(eligible):
-        return updated_disc, updated_diff
-
-    proportions = correct_counts / np.maximum(counts, PROB_EPSILON)
-    proportions = np.clip(proportions, *prob_clamp)
-    logits = np.log(proportions / (1.0 - proportions))
-    regression_weights = np.where(valid_points, counts, 0.0)
-    weight_sums = np.sum(regression_weights, axis=1)
-    safe_weight_sums = np.where(weight_sums > 0.0, weight_sums, 1.0)
-
-    mean_theta = (
-        np.sum(regression_weights * theta_grid[None, :], axis=1) / safe_weight_sums
-    )
-    mean_logit = np.sum(regression_weights * logits, axis=1) / safe_weight_sums
-    centered_theta = theta_grid[None, :] - mean_theta[:, None]
-    variance = (
-        np.sum(
-            regression_weights * centered_theta * centered_theta,
-            axis=1,
-        )
-        / safe_weight_sums
-    )
-    covariance = (
-        np.sum(
-            regression_weights * centered_theta * (logits - mean_logit[:, None]),
-            axis=1,
-        )
-        / safe_weight_sums
-    )
-
-    eligible &= variance > PROB_EPSILON
-    fitted_disc = np.clip(
-        np.divide(
-            covariance,
-            variance,
-            out=np.zeros_like(covariance),
-            where=eligible,
-        ),
-        *disc_bounds,
-    )
-    fitted_diff = np.clip(mean_theta - mean_logit / fitted_disc, *diff_bounds)
-    updated_disc[eligible] = fitted_disc[eligible]
-    updated_diff[eligible] = fitted_diff[eligible]
-
-    return updated_disc, updated_diff
+    return posterior @ theta_grid, float(np.sum(log_marginal))
 
 
 def fixed_calib(
@@ -344,16 +267,22 @@ def fixed_calib(
     use_rust: bool = True,
     disc_bounds: tuple[float, float] = (0.2, 5.0),
     diff_bounds: tuple[float, float] = (-5.0, 5.0),
-    prob_clamp: tuple[float, float] = (0.01, 0.99),
+    prob_clamp: tuple[float, float] | None = None,
     init_disc: float = 1.0,
     init_diff: float = 0.0,
-    min_count: float = 1.0,
-    min_valid_points: int = 3,
+    min_count: float | None = None,
+    min_valid_points: int | None = None,
 ) -> CalibrationResult:
-    """Calibrate new items while holding anchor items fixed.
+    """Calibrate new 2PL items by MML while anchor items stay fixed.
 
-    This function estimates parameters for new items on a scale
-    defined by anchor items with known (fixed) parameters.
+    This 2PL convenience wrapper of :func:`fixed_item_calibration` places
+    new items on the scale of anchor items with known (fixed) parameters.
+    The calibration population is held at the standard normal, so the new
+    items' parameters are the marginal maximum likelihood estimates of
+    ``fixed_item_calibration(..., estimate_mean=False, estimate_cov=False)``,
+    the estimator of R mirt's ``fixedCalib(..., PAU = "NWU")``. Use
+    :func:`fixed_item_calibration` directly to estimate the population or to
+    calibrate other item families.
 
     Parameters
     ----------
@@ -366,36 +295,52 @@ def fixed_calib(
     anchor_items : list of int
         Column indices of anchor items in responses.
     new_items : list of int, optional
-        Column indices of new items. If None, all non-anchor items.
+        Column indices of new items. If None, all non-anchor items. Columns in
+        neither list are ignored.
     model_type : str
         Model type for new items. Default "2PL".
     n_quadpts : int
-        Number of quadrature points. Default 21.
+        Number of quadrature points, at least 5. Default 21.
     max_iter : int
-        Maximum iterations. Default 500.
+        Maximum EM iterations. Default 500.
     tol : float
-        Convergence tolerance. Default 1e-4.
+        Convergence tolerance for the change in marginal log-likelihood.
+        Default 1e-4.
     use_rust : bool
-        Use Rust backend for performance. Default True.
+        Accepted for backward compatibility and validated. It no longer
+        selects an estimator. Default True.
     disc_bounds : tuple[float, float]
-        Bounds for discrimination parameters (min, max). Default (0.2, 5.0).
+        Bounds for discrimination parameters (min, max). Estimates outside
+        them are clipped. Default (0.2, 5.0).
     diff_bounds : tuple[float, float]
-        Bounds for difficulty parameters (min, max). Default (-5.0, 5.0).
-    prob_clamp : tuple[float, float]
-        Bounds for probability clipping (min, max). Default (0.01, 0.99).
+        Bounds for difficulty parameters (min, max). Estimates outside them
+        are clipped. Default (-5.0, 5.0).
+    prob_clamp : tuple[float, float], optional
+        Deprecated and ignored. Passing it emits a ``DeprecationWarning``.
     init_disc : float
-        Initial discrimination value. Default 1.0.
+        Starting discrimination of the new items. Default 1.0.
     init_diff : float
-        Initial difficulty value. Default 0.0.
-    min_count : float
-        Minimum count threshold for valid quadrature points. Default 1.0.
-    min_valid_points : int
-        Minimum number of valid points for regression. Default 3.
+        Starting difficulty of the new items. Default 0.0.
+    min_count : float, optional
+        Deprecated and ignored. Passing it emits a ``DeprecationWarning``.
+    min_valid_points : int, optional
+        Deprecated and ignored. Passing it emits a ``DeprecationWarning``.
 
     Returns
     -------
     CalibrationResult
-        Calibrated parameters for new items.
+        Calibrated parameters for new items. ``theta`` holds EAP abilities
+        under the standard normal population, and ``log_likelihood`` is the
+        marginal log-likelihood of the anchor and new items, both evaluated
+        at the returned parameters. ``n_iterations`` and ``converged``
+        describe the EM fit.
+
+    Notes
+    -----
+    Earlier releases replaced the M-step by a weighted least-squares line
+    through clipped quadrature-node logits. That estimator was not maximum
+    likelihood and biased items with extreme difficulties; ``prob_clamp``,
+    ``min_count`` and ``min_valid_points`` tuned it.
 
     Examples
     --------
@@ -406,6 +351,8 @@ def fixed_calib(
     ... )
     >>> print(f"New item difficulties: {result.new_difficulty}")
     """
+    from mirt.models.dichotomous import TwoParameterLogistic
+
     responses_int = _normalize_binary_responses(responses)
     n_total_items = responses_int.shape[1]
 
@@ -416,45 +363,38 @@ def fixed_calib(
             value=model_type,
             expected="2PL",
         )
-
-    n_quadpts = _validate_positive_integer(n_quadpts, name="n_quadpts", minimum=2)
-    max_iter = _validate_positive_integer(max_iter, name="max_iter")
-    min_valid_points = _validate_positive_integer(
-        min_valid_points, name="min_valid_points", minimum=2
-    )
-    if min_valid_points > n_quadpts:
+    for name, value in (
+        ("prob_clamp", prob_clamp),
+        ("min_count", min_count),
+        ("min_valid_points", min_valid_points),
+    ):
+        if value is not None:
+            warnings.warn(
+                f"{name} is deprecated and ignored: fixed_calib estimates new "
+                "items by marginal maximum likelihood",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+    if not isinstance(use_rust, (bool, np.bool_)):
         raise MirtValidationError(
-            "min_valid_points must not exceed n_quadpts",
-            parameter="min_valid_points",
-            value=min_valid_points,
+            "use_rust must be a boolean", parameter="use_rust", value=use_rust
         )
 
+    n_quadpts = _validate_positive_integer(n_quadpts, name="n_quadpts", minimum=5)
+    max_iter = _validate_positive_integer(max_iter, name="max_iter")
     tol = _validate_finite_number(tol, name="tol")
-    min_count = _validate_finite_number(min_count, name="min_count")
     init_disc = _validate_finite_number(init_disc, name="init_disc")
     init_diff = _validate_finite_number(init_diff, name="init_diff")
     if tol <= 0:
         raise MirtValidationError(
             "tol must be a positive finite number", parameter="tol", value=tol
         )
-    if min_count < 0:
-        raise MirtValidationError(
-            "min_count must be a non-negative finite number",
-            parameter="min_count",
-            value=min_count,
-        )
 
     disc_bounds = _validate_bounds(disc_bounds, name="disc_bounds")
     diff_bounds = _validate_bounds(diff_bounds, name="diff_bounds")
-    prob_clamp = _validate_bounds(prob_clamp, name="prob_clamp")
     if disc_bounds[0] <= 0:
         raise MirtValidationError(
             "disc_bounds must be strictly positive", parameter="disc_bounds"
-        )
-    if not 0 < prob_clamp[0] < prob_clamp[1] < 1:
-        raise MirtValidationError(
-            "prob_clamp values must lie strictly between 0 and 1",
-            parameter="prob_clamp",
         )
     if not disc_bounds[0] <= init_disc <= disc_bounds[1]:
         raise MirtValidationError(
@@ -523,109 +463,47 @@ def fixed_calib(
             parameter="anchor_model",
         )
 
-    can_use_rust = use_rust and RUST_AVAILABLE
-
-    theta_grid = np.linspace(-4, 4, n_quadpts)
-    weights = np.exp(-0.5 * theta_grid**2)
-    weights = weights / np.sum(weights)
-
-    if can_use_rust:
-        new_disc, new_diff, theta_est, log_likelihood, n_iterations, converged = (
-            fixed_calib_em(
-                responses_int,
-                anchor_items,
-                new_items,
-                anchor_disc.astype(np.float64),
-                anchor_diff.astype(np.float64),
-                theta_grid.astype(np.float64),
-                weights.astype(np.float64),
-                max_iter,
-                tol,
-                disc_bounds,
-                diff_bounds,
-                prob_clamp,
-                init_disc,
-                init_diff,
-                min_count,
-                min_valid_points,
-            )
-        )
-
-        return CalibrationResult(
-            new_discrimination=np.asarray(new_disc),
-            new_difficulty=np.asarray(new_diff),
-            theta=np.asarray(theta_est),
-            log_likelihood=float(log_likelihood),
-            n_iterations=int(n_iterations),
-            converged=bool(converged),
-        )
-
-    n_new = len(new_items)
-    new_disc = np.full(n_new, init_disc)
-    new_diff = np.full(n_new, init_diff)
-    anchor_responses = responses_int[:, anchor_items]
-    new_responses = responses_int[:, new_items]
-    anchor_ll = _item_log_likelihood(
-        anchor_responses, theta_grid, anchor_disc, anchor_diff
+    # The calibration model holds the anchor columns first, then the new ones.
+    calibration_responses = responses_int[:, anchor_items + new_items]
+    n_anchor, n_new = len(anchor_items), len(new_items)
+    template = TwoParameterLogistic(n_items=n_anchor + n_new).set_parameters(
+        discrimination=np.concatenate([anchor_disc, np.full(n_new, init_disc)]),
+        difficulty=np.concatenate([anchor_diff, np.full(n_new, init_diff)]),
     )
-    log_weights = np.log(weights)
-
-    converged = False
-    previous_log_likelihood = -np.inf
-
-    for iteration in range(max_iter):
-        posterior, log_likelihood = _fixed_calib_e_step(
-            anchor_ll,
-            new_responses,
-            theta_grid,
-            log_weights,
-            new_disc,
-            new_diff,
-        )
-        if abs(log_likelihood - previous_log_likelihood) < tol:
-            converged = True
-            break
-        previous_log_likelihood = log_likelihood
-
-        old_disc = new_disc.copy()
-        old_diff = new_diff.copy()
-        new_disc, new_diff = _fixed_calib_m_step(
-            new_responses,
-            posterior,
-            theta_grid,
-            new_disc,
-            new_diff,
-            disc_bounds,
-            diff_bounds,
-            prob_clamp,
-            min_count,
-            min_valid_points,
-        )
-
-        param_change = np.max(np.abs(new_disc - old_disc)) + np.max(
-            np.abs(new_diff - old_diff)
-        )
-        if param_change < tol:
-            converged = True
-            break
-
-    posterior, log_likelihood = _fixed_calib_e_step(
-        anchor_ll,
-        new_responses,
-        theta_grid,
-        log_weights,
-        new_disc,
-        new_diff,
+    calibration, estimator = _calibrate_fixed_items(
+        calibration_responses,
+        template,
+        list(range(n_anchor)),
+        None,
+        estimate_mean=False,
+        estimate_cov=False,
+        n_quadpts=n_quadpts,
+        max_iter=max_iter,
+        tol=tol,
+        compute_standard_errors=False,
     )
-    theta_est = posterior @ theta_grid
+
+    parameters = calibration.model.parameters
+    new_disc = np.clip(parameters["discrimination"][n_anchor:], *disc_bounds)
+    new_diff = np.clip(parameters["difficulty"][n_anchor:], *diff_bounds)
+    # Scores and likelihood use the estimator's standard-normal grid.
+    quadrature = estimator._quadrature
+    assert quadrature is not None
+    theta_est, log_likelihood = _fixed_calib_scores(
+        calibration_responses,
+        quadrature.nodes[:, 0],
+        quadrature.weights,
+        np.concatenate([anchor_disc, new_disc]),
+        np.concatenate([anchor_diff, new_diff]),
+    )
 
     return CalibrationResult(
         new_discrimination=new_disc,
         new_difficulty=new_diff,
         theta=theta_est,
         log_likelihood=log_likelihood,
-        n_iterations=iteration + 1,
-        converged=converged,
+        n_iterations=calibration.fit_result.n_iterations,
+        converged=calibration.fit_result.converged,
     )
 
 
@@ -853,6 +731,35 @@ def fixed_item_calibration(
     >>> bool(np.allclose(result.model.parameters["difficulty"][:6], b[:6]))
     True
     """
+    result, _ = _calibrate_fixed_items(
+        responses,
+        model,
+        anchor_items,
+        anchor_parameters,
+        estimate_mean=estimate_mean,
+        estimate_cov=estimate_cov,
+        n_quadpts=n_quadpts,
+        max_iter=max_iter,
+        tol=tol,
+        compute_standard_errors=compute_standard_errors,
+    )
+    return result
+
+
+def _calibrate_fixed_items(
+    responses: ArrayLike,
+    model: "BaseItemModel",
+    anchor_items: list[int],
+    anchor_parameters: "BaseItemModel | FitResult | Mapping[str, ArrayLike] | None",
+    *,
+    estimate_mean: bool,
+    estimate_cov: bool,
+    n_quadpts: int,
+    max_iter: int,
+    tol: float,
+    compute_standard_errors: bool,
+) -> "tuple[FixedItemCalibrationResult, EMEstimator]":
+    """Run :func:`fixed_item_calibration` and return its fitted estimator too."""
     from mirt.estimation.em import EMEstimator
     from mirt.estimation.latent_density import GaussianDensity
     from mirt.models.base import BaseItemModel
@@ -927,13 +834,14 @@ def fixed_item_calibration(
         compute_standard_errors=bool(compute_standard_errors),
     )
     fit_result = estimator.fit(calibration_model, validated)
-    return FixedItemCalibrationResult(
+    result = FixedItemCalibrationResult(
         fit_result=fit_result,
         latent_mean=np.array(density.mean, dtype=np.float64),
         latent_cov=np.array(density.cov, dtype=np.float64),
         anchor_items=anchor_items,
         new_items=new_items,
     )
+    return result, estimator
 
 
 def equate(
@@ -991,8 +899,6 @@ def equate(
     >>> eq = equate(old_model, new_model, [0,1,2], [0,1,2])
     >>> theta_on_old_scale = transform_theta(theta_new, eq)
     """
-    import warnings
-
     from mirt.equating.linking import link
 
     warnings.warn(

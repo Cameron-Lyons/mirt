@@ -15,6 +15,7 @@ from mirt.cat._engine_common import (
     finalize_administered_item,
     get_pending_item,
     initialize_common_engine,
+    is_numerical_scoring_failure,
     record_item_administration,
     reset_session_state,
     run_simulation_loop,
@@ -23,7 +24,11 @@ from mirt.cat._engine_common import (
     simulate_error_moments,
     validate_replications,
     validate_simulation_values,
+    validate_test_length,
+    warn_scoring_failure,
 )
+from mirt.cat._names import canonical_name
+from mirt.cat._stopping_common import item_limit
 from mirt.cat.content import ContentConstraint
 from mirt.cat.exposure import ExposureControl
 from mirt.cat.mcat_selection import (
@@ -42,6 +47,46 @@ from mirt.constants import PROB_CLIP_MAX, PROB_CLIP_MIN
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
+
+_SCORING_METHODS = ("EAP", "MAP")
+_STOPPING_NAMES = (
+    "trace",
+    "determinant",
+    "max_se",
+    "avg_se",
+    "max_items",
+    "theta_change",
+    "classification",
+    "combined",
+)
+
+
+def _square_matrix(value: Any, n_factors: int, name: str) -> NDArray[np.float64]:
+    """Return a copied ``(n_factors, n_factors)`` float matrix."""
+    matrix = np.array(value, dtype=np.float64, copy=True)
+    if matrix.shape != (n_factors, n_factors):
+        raise ValueError(
+            f"{name} must have shape ({n_factors}, {n_factors}), got {matrix.shape}"
+        )
+    return matrix
+
+
+def _named_stopping_rule(
+    name: str, trace_threshold: float, max_items: int | None
+) -> MCATStoppingRule:
+    """Build a stopping rule named by a canonical ``MCATEngine`` option."""
+    if name == "trace":
+        return CovarianceTraceStop(trace_threshold)
+    if name == "max_items":
+        if max_items is None:
+            raise ValueError("stopping_rule='max_items' requires max_items")
+        return MaxItemsMCATStop(max_items)
+    if name in ("classification", "combined"):
+        raise ValueError(
+            f"stopping_rule={name!r} needs arguments; pass an MCATStoppingRule instance"
+        )
+    return create_mcat_stopping_rule(name)
 
 
 def _validate_batch_controls(
@@ -70,46 +115,77 @@ class MCATEngine:
 
     Parameters
     ----------
-    model : BaseItemModel
-        Fitted multidimensional IRT model containing item parameters.
+    model : BaseItemModel | FitResult
+        Fitted multidimensional IRT model containing item parameters, or the
+        ``FitResult`` of its calibration, whose ``latent_mean`` and
+        ``latent_covariance`` (for example the factor correlations) then
+        supply the default scoring prior.
     item_selection : MCATSelectionStrategy | str
         Item selection strategy or name. Default is "D-optimality".
         Options: "D-optimality", "A-optimality", "C-optimality", "KL",
         "Bayesian", "random".
     stopping_rule : MCATStoppingRule | str
-        Stopping rule or name. Default is "trace".
-        Options: "trace", "determinant", "max_se", "avg_se", "max_items",
-        "theta_change".
+        Stopping rule or name. Default is "trace" (uses ``trace_threshold``).
+        Options: "trace", "determinant", "max_se", "avg_se", "max_items"
+        (uses ``max_items``, which is then required), and "theta_change".
+        Rules that need further settings, such as
+        ``CompositeClassificationStop``, are passed as objects. Progressive
+        exposure control plans over the length the rules enforce:
+        ``max_items`` or a ``MaxItemsMCATStop`` in the rule, otherwise the
+        pool size.
     scoring_method : {"EAP", "MAP"}
         Method for ability estimation. Default is "EAP", which retains the
         full posterior covariance. MAP uses a diagonal SE approximation.
+        Names ignore case. Both use the normal prior
+        ``N(prior_mean, prior_cov)``.
     initial_theta : NDArray[np.float64] | None
-        Initial ability estimates. Default is zeros.
+        Ability estimates before the first response, which select the first
+        item. Default is ``prior_mean``.
     initial_covariance : NDArray[np.float64] | None
-        Initial covariance matrix. Default is identity.
+        Covariance before the first response. With no response it is the
+        prior covariance, so it is the default scoring ``prior_cov`` when
+        given. Default is ``prior_cov``.
     trace_threshold : float
         Trace threshold for stopping rule. Default is 0.5.
     max_items : int | None
         Maximum number of items to administer. Default is None.
     min_items : int
-        Minimum number of items before stopping. Default is 1.
+        Minimum number of items before stopping, a non-negative integer that
+        may not exceed ``max_items`` or the length a maximum-length stopping
+        rule allows. Default is 1.
     exposure_control : ExposureControl | str | None
         Exposure control method. Default is None (no control).
     content_constraint : ContentConstraint | None
         Content balancing constraint. Default is None.
     n_quadpts : int
-        Number of quadrature points for EAP scoring. Default is 21.
+        Number of quadrature points per factor for EAP scoring, an integer
+        of at least 5. Default is 21.
     theta_bounds : tuple[float, float]
-        Bounds for ability estimation. Default is (-4.0, 4.0).
+        Bounds for MAP ability estimation. Default is (-4.0, 4.0).
     seed : int | None
         Random seed for reproducibility.
+    prior_mean : NDArray[np.float64] | None
+        Mean of the normal scoring prior. Default is the ``latent_mean`` of
+        a ``FitResult`` that has one, otherwise zeros.
+    prior_cov : NDArray[np.float64] | None
+        Positive definite covariance of the normal scoring prior, used by
+        every ability update. Default is ``initial_covariance`` when given,
+        else the ``latent_covariance`` of a ``FitResult`` that has one,
+        otherwise the identity.
+
+    Raises
+    ------
+    ValueError
+        If the model is not fitted or is unidimensional, or if
+        ``scoring_method``, ``n_quadpts``, ``theta_bounds``, the prior, the
+        initial state, or ``min_items`` is invalid.
 
     Examples
     --------
     >>> from mirt import fit_mirt
     >>> from mirt.cat import MCATEngine
-    >>> result = fit_mirt(data, model="MIRT", n_factors=2)
-    >>> mcat = MCATEngine(result.model, trace_threshold=0.5, max_items=30)
+    >>> result = fit_mirt(data, model="2PL", n_factors=2)
+    >>> mcat = MCATEngine(result, trace_threshold=0.5, max_items=30)
     >>> state = mcat.get_current_state()
     >>> while not state.is_complete:
     ...     response = get_response(state.next_item)
@@ -119,7 +195,7 @@ class MCATEngine:
 
     def __init__(
         self,
-        model: BaseItemModel,
+        model: BaseItemModel | FitResult,
         item_selection: MCATSelectionStrategy | str = "D-optimality",
         stopping_rule: MCATStoppingRule | str = "trace",
         scoring_method: Literal["EAP", "MAP"] = "EAP",
@@ -133,11 +209,18 @@ class MCATEngine:
         n_quadpts: int = 21,
         theta_bounds: tuple[float, float] = (-4.0, 4.0),
         seed: int | None = None,
+        prior_mean: NDArray[np.float64] | None = None,
+        prior_cov: NDArray[np.float64] | None = None,
     ):
+        from mirt.results._common import resolve_latent_prior
+        from mirt.scoring._common import resolve_prior_distribution
+
+        model, fitted_mean, fitted_cov = resolve_latent_prior(model)
         initialize_common_engine(
             self,
             model=model,
             scoring_method=scoring_method,
+            scoring_methods=_SCORING_METHODS,
             n_quadpts=n_quadpts,
             theta_bounds=theta_bounds,
             seed=seed,
@@ -152,8 +235,24 @@ class MCATEngine:
 
         self.n_factors = model.n_factors
 
+        if initial_covariance is not None:
+            initial_covariance = _square_matrix(
+                initial_covariance, self.n_factors, "initial_covariance"
+            )
+        if prior_mean is None:
+            prior_mean = fitted_mean
+        if prior_cov is None:
+            prior_cov = (
+                initial_covariance if initial_covariance is not None else fitted_cov
+            )
+        mean, cov = resolve_prior_distribution(
+            n_factors=self.n_factors, prior_mean=prior_mean, prior_cov=prior_cov
+        )
+        self.prior_mean: NDArray[np.float64] = mean
+        self.prior_cov: NDArray[np.float64] = cov
+
         if initial_theta is None:
-            self.initial_theta = np.zeros(self.n_factors)
+            self.initial_theta = self.prior_mean.copy()
         else:
             self.initial_theta = np.asarray(initial_theta)
             if self.initial_theta.shape != (self.n_factors,):
@@ -162,40 +261,39 @@ class MCATEngine:
                     f"got {self.initial_theta.shape}"
                 )
 
-        if initial_covariance is None:
-            self.initial_covariance = np.eye(self.n_factors)
-        else:
-            self.initial_covariance = np.asarray(initial_covariance)
-            if self.initial_covariance.shape != (self.n_factors, self.n_factors):
-                raise ValueError(
-                    f"initial_covariance must have shape "
-                    f"({self.n_factors}, {self.n_factors}), "
-                    f"got {self.initial_covariance.shape}"
-                )
+        self.initial_covariance = (
+            self.prior_cov.copy() if initial_covariance is None else initial_covariance
+        )
 
         if isinstance(item_selection, str):
             self._selection = create_mcat_selection_strategy(item_selection)
         else:
             self._selection = item_selection
 
+        rule_name = None
         if isinstance(stopping_rule, str):
-            if stopping_rule == "trace":
-                base_rule = CovarianceTraceStop(trace_threshold)
-            else:
-                base_rule = create_mcat_stopping_rule(stopping_rule)
+            rule_name = canonical_name(
+                stopping_rule, _STOPPING_NAMES, kind="MCAT stopping rule"
+            )
+            base_rule = _named_stopping_rule(rule_name, trace_threshold, max_items)
         else:
             base_rule = stopping_rule
 
         rules: list[MCATStoppingRule] = [base_rule]
-        if max_items is not None:
+        # A rule named "max_items" already enforces max_items.
+        if max_items is not None and rule_name != "max_items":
             rules.append(MaxItemsMCATStop(max_items))
+        min_items = validate_test_length(
+            min_items,
+            rules,
+            length_rule=MaxItemsMCATStop,
+            combined_rule=CombinedMCATStop,
+        )
 
         if len(rules) > 1 or min_items > 1:
             self._stopping = CombinedMCATStop(rules, operator="or", min_items=min_items)
         else:
             self._stopping = base_rule
-
-        self._selection_horizon = max_items if max_items is not None else model.n_items
 
         self._exposure = configure_exposure_control(exposure_control, seed=seed)
         self._content = configure_content_constraint(content_constraint)
@@ -211,6 +309,18 @@ class MCATEngine:
         self._info_history: list[float] = []
         self._is_complete = False
         self._stopping_reason = ""
+
+    @property
+    def _selection_horizon(self) -> int:
+        """Return the test length that selection and exposure plan over.
+
+        Strata, shadow tests and progressive exposure span the length the
+        stopping rules enforce, whether set by ``max_items`` or a rule. It is
+        read at each selection, so a rule changed after construction counts.
+        """
+        n_items = self.model.n_items
+        limit = item_limit(self._stopping, MaxItemsMCATStop, CombinedMCATStop)
+        return n_items if limit is None else min(limit, n_items)
 
     def reset(self) -> None:
         """Reset the engine for a new examinee.
@@ -350,8 +460,27 @@ class MCATEngine:
 
         return self.get_current_state()
 
+    def _scoring_prior(
+        self,
+    ) -> tuple[NDArray[np.float64] | None, NDArray[np.float64] | None]:
+        """Return the scoring prior's mean and covariance for the scorers.
+
+        Each part is None when it takes its standard-normal default.
+        """
+        mean = np.asarray(self.prior_mean, dtype=np.float64)
+        cov = np.asarray(self.prior_cov, dtype=np.float64)
+        return (
+            None if not np.any(mean) else mean,
+            None if np.array_equal(cov, np.eye(self.n_factors)) else cov,
+        )
+
     def _update_theta(self) -> None:
-        """Update ability estimates based on administered items."""
+        """Update ability estimates based on administered items.
+
+        A numerical scoring failure, such as a posterior without finite mass,
+        warns and keeps the previous estimate. Configuration errors
+        propagate.
+        """
         try:
             if self.scoring_method == "EAP":
                 from mirt.cat._eap import score_binary_eap
@@ -361,10 +490,13 @@ class MCATEngine:
                 if moments is not None:
                     theta, covariance = moments
                 else:
+                    prior_mean, prior_cov = self._scoring_prior()
                     posterior = ability_posterior(
                         self.model,
                         build_administered_response_matrix(self),
                         n_quadpts=self.n_quadpts,
+                        prior_mean=prior_mean,
+                        prior_cov=prior_cov,
                     )
                     theta = posterior.mean.ravel()
                     centered_points = posterior.points - theta
@@ -372,21 +504,17 @@ class MCATEngine:
                         posterior.weights[0, :, None] * centered_points
                     )
             else:
-                result = score_administered_responses(self)
+                result = score_administered_responses(self, bounds=self.theta_bounds)
                 theta = result.theta.ravel()
                 covariance = np.diag(result.standard_error.ravel() ** 2)
 
             self._current_theta = theta
             self._current_covariance = covariance
 
-        except (
-            ValueError,
-            RuntimeError,
-            ArithmeticError,
-            FloatingPointError,
-            np.linalg.LinAlgError,
-        ):
-            pass
+        except (ArithmeticError, np.linalg.LinAlgError, ValueError) as error:
+            if not is_numerical_scoring_failure(error):
+                raise
+            warn_scoring_failure(self, error, "keeping the previous estimate")
 
     def get_result(self) -> MCATResult:
         """Get the final MCAT result.
@@ -416,6 +544,7 @@ class MCATEngine:
             se_history=list(self._se_history),
             covariance_history=list(self._covariance_history),
             item_info_history=list(self._info_history),
+            polytomous=bool(self.model.is_polytomous),
         )
 
     def run_simulation(

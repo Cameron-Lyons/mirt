@@ -71,6 +71,13 @@ Category models can have different category counts for each item. Tensor
 functions also run on CPU when CUDA is unavailable; EM uses its ordinary
 CPU path in that case.
 
+EM and GVEM use an available GPU under the default ``mirt.set_backend("auto")``
+(and ``"gpu"``). ``mirt.set_backend("rust")`` and ``mirt.set_backend("numpy")``
+keep them on the CPU. An explicit ``use_gpu=True`` or ``use_gpu=False``, on
+``fit_mirt`` or an estimator, overrides the preference for that fit. A CPU-only
+PyTorch build is recognized from its version file, so it is not imported to
+look for a GPU.
+
 For development:
 
 .. code-block:: bash

@@ -299,20 +299,25 @@ def calibrate_vertical_scale(
     reference_grade: int,
     *,
     enforce_monotonicity: bool,
-    n_quadpts: int,
+    n_quadpts: int | None,
     max_iter: int,
     tol: float,
 ) -> VerticalScaleResult:
-    """Fit a shared physical-item bank and grade-specific ability densities."""
+    """Fit a shared physical-item bank and grade-specific ability densities.
+
+    ``n_quadpts=None`` uses the multigroup default grid; grades are scored
+    with the default EAP grid then. EM is accelerated by SQUAREM, and
+    ``max_iter`` bounds its M-steps.
+    """
     from mirt.equating.vertical import VerticalScaleResult
     from mirt.multigroup.estimator import MultigroupEMEstimator
     from mirt.multigroup.model import MultigroupModel
     from mirt.scoring import fscores
 
-    for name, value, minimum in (
-        ("n_quadpts", n_quadpts, 5),
-        ("max_iter", max_iter, 1),
-    ):
+    controls: tuple[tuple[str, Any, int], ...] = (("max_iter", max_iter, 1),)
+    if n_quadpts is not None:
+        controls = (("n_quadpts", n_quadpts, 5), *controls)
+    for name, value, minimum in controls:
         if (
             isinstance(value, (bool, np.bool_))
             or not isinstance(value, (int, np.integer))
@@ -376,7 +381,11 @@ def calibrate_vertical_scale(
                 fixed_parameters.setdefault(name, {})[column] = value
 
     joint_model = MultigroupModel(global_model, len(grade_data))
-    estimator = MultigroupEMEstimator(n_quadpts=n_quadpts, max_iter=max_iter, tol=tol)
+    # Grade means linked only through a few anchors drift slowly along a
+    # flat likelihood ridge; plain EM needs thousands of cycles there.
+    estimator = MultigroupEMEstimator(
+        n_quadpts=n_quadpts, max_iter=max_iter, tol=tol, accelerate="squarem"
+    )
     fit_kwargs: dict[str, Any] = {
         "invariance": "strict",
         "reference_group": reference_grade,
@@ -388,7 +397,8 @@ def calibrate_vertical_scale(
     fitted = estimator.fit(joint_model, design.responses, **fit_kwargs)
     if not fitted.converged:
         raise RuntimeError(
-            f"{method} vertical calibration failed to converge after {fitted.n_iterations} iterations"
+            f"{method} vertical calibration failed to converge after {max_iter} "
+            "iterations"
         )
 
     calibrated_models, scores, distributions, item_maps = {}, {}, {}, {}

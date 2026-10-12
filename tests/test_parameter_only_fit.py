@@ -103,6 +103,7 @@ def test_spawned_dtf_bootstrap_matches_serial_results() -> None:
     groups = np.repeat((0, 1), responses.shape[0])
     options = {
         "model": "1PL",
+        "method": "signed",
         "n_quadpts": 7,
         "n_bootstrap": 4,
         "random_state": 2026,

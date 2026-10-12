@@ -284,9 +284,6 @@ class TestLimitedInformationFit:
         (residuals.compute_outfit_infit, {}),
         (residuals.identify_misfitting_patterns, {}),
         (ld.compute_q3, {}),
-        # These score on their own ``n_quadpts`` grid (default 21).
-        (ld.compute_ld_chi2, {"n_quadpts": 21}),
-        (ld.compute_ld_statistics, {"n_quadpts": 21}),
     ],
 )
 def test_eap_based_diagnostics_score_under_the_fitted_covariance(
@@ -298,6 +295,17 @@ def test_eap_based_diagnostics_score_under_the_fitted_covariance(
     ).theta
     fitted = function(result, data)
     explicit = function(result.model, data, theta)
+    identity = function(result.model, data)
+    assert _same(fitted, explicit)
+    assert not _same(fitted, identity)
+
+
+@pytest.mark.parametrize("function", [ld.compute_ld_chi2, ld.compute_ld_statistics])
+def test_ld_chi2_integrates_over_the_fitted_covariance(correlated, function):
+    """Chen-Thissen tables integrate over the fit's population, like M2."""
+    data, result = correlated
+    fitted = function(result, data)
+    explicit = function(result.model, data, prior_cov=result.latent_covariance)
     identity = function(result.model, data)
     assert _same(fitted, explicit)
     assert not _same(fitted, identity)

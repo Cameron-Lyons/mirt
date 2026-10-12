@@ -17,6 +17,7 @@ from mirt.utils.cv import (
     KFold,
     LeaveOneOut,
     LogLikelihoodScorer,
+    PluginLogLikelihoodScorer,
     Scorer,
     StratifiedGroupKFold,
     StratifiedKFold,
@@ -448,6 +449,42 @@ class TestLogLikelihoodScorer:
     def test_name(self):
         scorer = LogLikelihoodScorer()
         assert scorer.name == "log_likelihood"
+        assert scorer.ability_method is None
+        assert PluginLogLikelihoodScorer().name == "plugin_log_likelihood"
+
+    def test_scores_the_marginal_likelihood_of_the_fit(self):
+        # Regression: the default scorer evaluated each test person at an EAP
+        # estimated from that person's own responses, a plug-in likelihood
+        # far above the marginal likelihood that the fit maximizes.
+        responses = mirt.simdata(model="2PL", n_persons=300, n_items=6, seed=4)
+        responses[::7, 2] = -1
+        result = mirt.fit_mirt(responses, model="2PL", n_quadpts=21)
+
+        score = LogLikelihoodScorer()(result, responses, responses)
+        plugin = PluginLogLikelihoodScorer()(result, responses, responses)
+
+        assert score == pytest.approx(result.log_likelihood, rel=1e-9)
+        assert plugin > score + 50.0
+
+    def test_held_out_likelihood_prefers_the_true_dimensionality(self):
+        # Regression: the plug-in score gave the 2-factor model of
+        # unidimensional data about 40 log-likelihood units more per fold.
+        responses = mirt.simdata(model="2PL", n_persons=400, n_items=8, seed=21)
+        splitter = KFold(n_splits=3, random_state=0)
+        scores = {
+            n_factors: cross_validate(
+                "2PL",
+                responses,
+                splitter=splitter,
+                n_factors=n_factors,
+                n_quadpts=11,
+                max_iter=200,
+                tol=1e-3,
+            ).mean_scores["log_likelihood"]
+            for n_factors in (1, 2)
+        }
+
+        assert scores[1] > scores[2]
 
 
 class TestAICScorer:
@@ -611,7 +648,7 @@ class TestCrossValidate:
             responses,
             splitter=splitter,
             scorers=[
-                LogLikelihoodScorer(),
+                PluginLogLikelihoodScorer(),
                 AbilityRMSEScorer(true_theta),
                 row_count,
             ],
@@ -633,7 +670,7 @@ class TestCrossValidate:
 
         assert scoring_calls == [(0, "EAP"), (1, "EAP"), (2, "EAP")]
         assert row_count.calls == 3
-        assert_allclose(result.scores["log_likelihood"], expected_log_likelihood)
+        assert_allclose(result.scores["plugin_log_likelihood"], expected_log_likelihood)
         assert_allclose(result.scores["ability_rmse"], expected_rmse)
         assert result.scores["test_rows"] == expected_rows
 

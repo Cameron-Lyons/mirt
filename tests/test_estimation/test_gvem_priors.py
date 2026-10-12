@@ -180,7 +180,7 @@ def test_vectorized_e_step_matches_shifted_prior_reference() -> None:
     assert_allclose(estimator._sigma[2], prior_cov, rtol=1e-12, atol=1e-12)
 
 
-def test_native_e_step_recenters_shifted_prior(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gpu_e_step_recenters_shifted_prior(monkeypatch: pytest.MonkeyPatch) -> None:
     prior_mean = np.array([0.4, -0.25])
     prior_cov = np.array([[1.2, 0.1], [0.1, 0.8]])
     model = TwoParameterLogistic(n_items=2, n_factors=2)
@@ -191,7 +191,7 @@ def test_native_e_step_recenters_shifted_prior(monkeypatch: pytest.MonkeyPatch) 
     estimator._initialize_variational_params(1, 2, 2, prior_mean, prior_cov)
     captured: dict[str, np.ndarray] = {}
 
-    def fake_native(
+    def fake_gpu(
         responses: np.ndarray,
         slopes: np.ndarray,
         intercepts: np.ndarray,
@@ -206,7 +206,8 @@ def test_native_e_step_recenters_shifted_prior(monkeypatch: pytest.MonkeyPatch) 
         captured["mu"] = mu.copy()
         return mu, sigma, xi
 
-    monkeypatch.setattr(gvem_module, "_rust_gvem_e_step", fake_native)
+    monkeypatch.setattr(gvem_module, "gvem_e_step_gpu", fake_gpu)
+    monkeypatch.setattr(GVEMEstimator, "_should_use_gpu", property(lambda self: True))
     estimator._e_step(
         model,
         np.array([[-1, -1]], dtype=np.int64),

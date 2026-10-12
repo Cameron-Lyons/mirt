@@ -185,6 +185,7 @@ class ItemPriorPenalty:
 
     def __init__(self, priors: Mapping[str, Prior]) -> None:
         self.priors = dict(priors)
+        self._bounds: dict[tuple[str, tuple[float, float]], tuple[float, float]] = {}
 
     def item_terms(
         self, model: BaseItemModel, item_idx: int
@@ -202,6 +203,21 @@ class ItemPriorPenalty:
                 terms.append((slice(offset, offset + n_free), name, prior))
             offset += n_free
         return terms
+
+    def bounds(self, name: str, bound: tuple[float, float]) -> tuple[float, float]:
+        """Return the optimizer box of parameter ``name`` within its prior's support.
+
+        This is the box that :meth:`penalize` gives the parameter's
+        coordinates. Boxes are cached, since locating a support boundary
+        takes many density evaluations.
+        """
+        prior = self.priors.get(name)
+        if prior is None:
+            return bound
+        key = (name, (float(bound[0]), float(bound[1])))
+        if key not in self._bounds:
+            self._bounds[key] = _supported_bounds(bound, name, prior)
+        return self._bounds[key]
 
     def log_prior(self, model: BaseItemModel) -> float:
         """Return the summed log-prior of every free item coordinate."""
@@ -287,17 +303,25 @@ class ItemPriorPenalty:
 def _supported_bounds(
     bound: tuple[float, float], name: str, prior: Prior
 ) -> tuple[float, float]:
-    """Move box ends with zero prior density slightly into the box."""
+    """Move box ends with zero prior density slightly into the prior's support.
+
+    A box end outside the support, such as the negative slopes of a box that
+    a log-normal slope prior excludes, moves to just inside the support
+    boundary, which bisection locates from a point of positive density.
+    """
     lower, upper = bound
     if lower is None or upper is None:
         return bound
     shift = _BOUND_SHRINK * (upper - lower)
     ends = np.array([lower, upper], dtype=np.float64)
     density = np.asarray(prior.log_pdf(ends), dtype=np.float64)
+    inside = _supported_point(prior, float(lower), float(upper))
     if not np.isfinite(density[0]):
-        ends[0] += shift
+        edge = lower if inside is None else _support_edge(prior, lower, inside)
+        ends[0] = edge + shift
     if not np.isfinite(density[1]):
-        ends[1] -= shift
+        edge = upper if inside is None else _support_edge(prior, upper, inside)
+        ends[1] = edge - shift
     if not np.all(np.isfinite(prior.log_pdf(ends))):
         raise MirtValidationError(
             f"the prior for {name!r} must have positive density on the "
@@ -306,3 +330,65 @@ def _supported_bounds(
             value=name,
         )
     return float(ends[0]), float(ends[1])
+
+
+def _supported_point(prior: Prior, lower: float, upper: float) -> float | None:
+    """Return a point of the box with positive prior density, or None."""
+    candidates = [0.5 * (lower + upper), *np.linspace(lower, upper, 65)[1:-1]]
+    try:
+        candidates.insert(0, float(prior.mean()))
+    except (NotImplementedError, TypeError, ValueError):
+        pass
+    for point in candidates:
+        if lower < point < upper and np.isfinite(
+            np.asarray(prior.log_pdf(np.array([point])), dtype=np.float64)[0]
+        ):
+            return float(point)
+    return None
+
+
+def _support_edge(prior: Prior, outside: float, inside: float) -> float:
+    """Bisect for the support boundary between a point without density and one with."""
+    for _ in range(80):
+        middle = 0.5 * (outside + inside)
+        if np.isfinite(np.asarray(prior.log_pdf(np.array([middle])))[0]):
+            inside = middle
+        else:
+            outside = middle
+    return inside
+
+
+def subtract_coordinate_priors(
+    priors: Sequence[tuple[slice, Prior]],
+    x: NDArray[np.float64],
+    loss: NDArray[np.float64],
+    gradient: NDArray[np.float64] | None = None,
+    information: NDArray[np.float64] | None = None,
+) -> None:
+    """Subtract coordinate log-priors from batched item objectives in place.
+
+    Each ``(columns, prior)`` pair applies ``prior`` to those columns of every
+    row of ``x``. ``loss`` loses each row's log-prior and ``gradient`` its
+    derivatives. The diagonal of ``information`` gains the prior's negative
+    curvature where that is positive, so Fisher information stays positive
+    definite; the optimum depends only on the objective and its gradient.
+    """
+    for columns, prior in priors:
+        values = x[:, columns]
+        flat = values.ravel()
+        loss -= (
+            np.asarray(prior.log_pdf(flat), dtype=np.float64)
+            .reshape(values.shape)
+            .sum(axis=1)
+        )
+        if gradient is None or information is None:
+            continue
+        gradient[:, columns] -= np.asarray(
+            prior.grad_log_pdf(flat), dtype=np.float64
+        ).reshape(values.shape)
+        curvature = -np.asarray(prior.hess_log_pdf(flat), dtype=np.float64)
+        diagonal = np.arange(columns.start, columns.stop)
+        # NaN outside the support propagates and marks the row unusable.
+        information[:, diagonal, diagonal] += np.maximum(curvature, 0.0).reshape(
+            values.shape
+        )

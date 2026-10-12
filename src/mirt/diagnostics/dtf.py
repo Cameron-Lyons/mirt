@@ -28,7 +28,8 @@ from mirt.diagnostics._utils import (
     summarize_bootstrap,
     validate_two_group_inputs,
 )
-from mirt.utils.bootstrap import _run_bootstrap_tasks, _validate_n_jobs
+from mirt.utils._parallel import resolve_n_jobs
+from mirt.utils.bootstrap import _run_bootstrap_tasks
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -38,6 +39,7 @@ DTFMethod = Literal["signed", "unsigned", "expected_score"]
 DTFWeighting = Literal["normal", "uniform"] | NDArray[np.float64]
 _VALID_MODELS = frozenset({"1PL", "2PL", "3PL", "GRM", "GPCM"})
 _VALID_METHODS = frozenset({"signed", "unsigned", "expected_score"})
+_ITEM_DIF_STATISTICS = ("sDIF", "uDIF", "dDIF")
 _BOOTSTRAP_EXCEPTIONS = (
     ValueError,
     RuntimeError,
@@ -108,6 +110,8 @@ def compute_dtf(
         ``"unsigned"`` and ``"expected_score"`` average the absolute
         expected-score difference; the latter name is retained for API
         compatibility and emphasizes the returned pointwise difference curve.
+        Only ``"signed"`` gets a p-value, as in R's ``mirt::DTF``, which
+        tests sDTF alone; see Returns.
     theta_range
         Strictly increasing finite integration limits.
     n_quadpts
@@ -140,12 +144,40 @@ def compute_dtf(
     dict
         Statistic, uncertainty estimates, expected-score curves, pointwise
         differences, group metadata, grid, and bootstrap diagnostics.
+        ``DTF_SE`` is the bootstrap standard error and
+        ``confidence_interval`` the percentile interval. ``p_value`` is the
+        two-sided normal test of ``DTF / DTF_SE`` for ``method="signed"``
+        and ``NaN`` otherwise: an unsigned DTF is positive whenever the
+        estimated curves differ, so neither that ratio nor its interval,
+        which excludes zero by construction, tests the absence of DTF.
+        Report the unsigned value and its interval as an effect size, and
+        test with the signed statistic or item-level DIF tests.
         ``linking_constants`` holds ``(A, B)`` with
         ``theta_reference = A * theta_focal + B``, or None when unlinked;
         ``expected_score_focal`` is on the reference scale when linked.
 
+        ``item_dif`` holds the item-level differences of R's
+        ``DRF(..., DIF=TRUE)`` (Chalmers, 2018) from the same fits and
+        bootstrap replicates: ``sDIF``, ``uDIF`` and ``dDIF`` are each
+        item's signed, unsigned and root-mean-square expected-score
+        difference (reference minus focal, the reverse of R's orientation)
+        averaged over the ability weighting, each with ``_SE`` bootstrap
+        standard errors and ``_ci`` percentile intervals of shape
+        ``(n_items, 2)``. ``sDIF_p_value`` is the two-sided normal test of
+        ``sDIF / sDIF_SE``; the nonnegative ``uDIF`` and ``dDIF`` get no
+        p-value, as for the unsigned DTF. Separately calibrated anchors also
+        get item differences, which reflect only sampling error and linking.
+
     References
     ----------
+    Chalmers, R. P. (2018). Model-based measures for detecting and
+    quantifying response bias. Psychometrika, 83(3), 696-732.
+
+    Chalmers, R. P., Counsell, A., & Flora, D. B. (2016). It might not make
+    a big DIF: Improved differential test functioning statistics that
+    account for sampling variability. Educational and Psychological
+    Measurement, 76(1), 114-140.
+
     van der Linden, W. J., Raju, N. S., & Fleer, P. F. (1995).
     IRT-based internal measures of differential functioning of items and tests.
     Applied Psychological Measurement, 19(4), 353-368.
@@ -160,13 +192,13 @@ def compute_dtf(
         n_bootstrap=n_bootstrap,
         confidence_level=confidence_level,
     )
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
     anchors = resolve_anchor_items(anchor_items, values.shape[1])
 
     ref_data, focal_data, ref_mask, focal_mask, ref_group, selected_focal = (
         split_groups(values, labels, focal_group=focal_group)
     )
-    theta_grid, _ = create_theta_grid(theta_limits, n_quadpts)
+    theta_grid = create_theta_grid(theta_limits, n_quadpts)
     integration_weights, weighting_name = _create_integration_weights(
         theta_grid, weighting
     )
@@ -185,12 +217,17 @@ def compute_dtf(
         ref_result.model, focal_result.model, anchors
     )
 
-    expected_ref = _compute_expected_score(ref_result.model, theta_grid)
-    expected_focal = _compute_expected_score(focal_model, theta_grid)
+    item_ref = _compute_expected_item_scores(ref_result.model, theta_grid)
+    item_focal = _compute_expected_item_scores(focal_model, theta_grid)
+    expected_ref = np.sum(item_ref, axis=1)
+    expected_focal = np.sum(item_focal, axis=1)
     difference = expected_ref - expected_focal
     statistic = _aggregate_dtf(difference, theta_grid, method, integration_weights)
+    item_observed = _item_dif_statistics(
+        item_ref - item_focal, theta_grid, integration_weights
+    )
 
-    bootstrap = _bootstrap_dtf_statistics(
+    bootstrap, item_replicates = _bootstrap_dtf_statistics(
         data=values,
         groups=labels,
         model=model,
@@ -232,6 +269,12 @@ def compute_dtf(
         "n_jobs": n_jobs,
         "anchor_items": anchors,
         "linking_constants": linking_constants,
+        "item_dif": _summarize_item_dif(
+            item_observed,
+            item_replicates,
+            n_requested=n_bootstrap,
+            confidence_level=confidence_level,
+        ),
     }
 
 
@@ -311,6 +354,14 @@ def _compute_expected_score(
     theta: NDArray[np.float64],
 ) -> NDArray[np.float64]:
     """Compute expected total score with one full probability evaluation."""
+    return np.sum(_compute_expected_item_scores(model, theta), axis=1)
+
+
+def _compute_expected_item_scores(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Expected item scores ``(n_theta, n_items)`` from one probability call."""
     theta_values = np.asarray(theta, dtype=np.float64)
     if theta_values.ndim != 1 or theta_values.size == 0:
         raise ValueError("theta must be a nonempty one-dimensional array")
@@ -332,18 +383,18 @@ def _compute_expected_score(
     if probabilities.ndim == 1:
         if n_items != 1 or probabilities.shape != (n_theta,):
             raise ValueError("one-dimensional probabilities require a one-item model")
-        return probabilities.copy()
+        return probabilities.reshape(-1, 1)
     if probabilities.ndim == 2:
         if probabilities.shape != (n_theta, n_items):
             raise ValueError("dichotomous probability shape must be (n_theta, n_items)")
-        return np.sum(probabilities, axis=1)
+        return probabilities
     if probabilities.ndim == 3:
         if probabilities.shape[:2] != (n_theta, n_items):
             raise ValueError(
                 "polytomous probability shape must be (n_theta, n_items, n_categories)"
             )
         categories = np.arange(probabilities.shape[2], dtype=np.float64)
-        return np.sum(probabilities * categories, axis=(1, 2))
+        return probabilities @ categories
     raise ValueError(
         "model probability output must be one-, two-, or three-dimensional"
     )
@@ -364,6 +415,62 @@ def _aggregate_dtf(
     return float(integrate.trapezoid(values * integration_weights, theta_grid))
 
 
+def _item_dif_statistics(
+    item_difference: NDArray[np.float64],
+    theta_grid: NDArray[np.float64],
+    integration_weights: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Signed, unsigned and root-mean-square item differences ``(3, n_items)``.
+
+    These are R's ``DRF(..., DIF=TRUE)`` sDIF, uDIF and dDIF, averaged over
+    the ability weights.
+    """
+    weights = integration_weights[:, None]
+    return np.vstack(
+        [
+            integrate.trapezoid(item_difference * weights, theta_grid, axis=0),
+            integrate.trapezoid(np.abs(item_difference) * weights, theta_grid, axis=0),
+            np.sqrt(
+                integrate.trapezoid(item_difference**2 * weights, theta_grid, axis=0)
+            ),
+        ]
+    )
+
+
+def _summarize_item_dif(
+    observed: NDArray[np.float64],
+    replicates: NDArray[np.float64],
+    *,
+    n_requested: int,
+    confidence_level: float,
+) -> dict[str, NDArray[np.float64]]:
+    """Bootstrap SEs, percentile intervals and sDIF p-values per item."""
+    n_items = observed.shape[1]
+    summary: dict[str, NDArray[np.float64]] = {}
+    for row, name in enumerate(_ITEM_DIF_STATISTICS):
+        errors = np.full(n_items, np.nan)
+        intervals = np.full((n_items, 2), np.nan)
+        p_values = np.full(n_items, np.nan)
+        for item in range(n_items if n_requested else 0):
+            item_summary = summarize_bootstrap(
+                replicates[:, row, item],
+                observed=float(observed[row, item]),
+                n_requested=n_requested,
+                confidence_level=confidence_level,
+                # Only the signed difference can be tested against zero.
+                test_zero=name == "sDIF",
+            )
+            errors[item] = item_summary.standard_error
+            intervals[item] = item_summary.confidence_interval
+            p_values[item] = item_summary.p_value
+        summary[name] = observed[row].copy()
+        summary[f"{name}_SE"] = errors
+        summary[f"{name}_ci"] = intervals
+        if name == "sDIF":
+            summary["sDIF_p_value"] = p_values
+    return summary
+
+
 def _bootstrap_dtf_statistics(
     *,
     data: NDArray[np.int_],
@@ -381,16 +488,26 @@ def _bootstrap_dtf_statistics(
     fit_kwargs: dict[str, Any],
     n_jobs: int = 1,
     anchor_items: list[int] | None = None,
-) -> BootstrapSummary:
+) -> tuple[BootstrapSummary, NDArray[np.float64]]:
+    """Bootstrap the DTF statistic and the item differences.
+
+    Returns the summary of the DTF statistic and the item replicates of
+    :func:`_item_dif_statistics`, ``(n_bootstrap, 3, n_items)`` with
+    ``NaN`` rows for failed refits.
+    """
+    n_items = data.shape[1]
     if n_bootstrap == 0:
-        return BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0)
+        return (
+            BootstrapSummary(np.nan, np.nan, (np.nan, np.nan), 0, 0),
+            np.empty((0, len(_ITEM_DIF_STATISTICS), n_items)),
+        )
 
     rng = np.random.default_rng(random_state)
     ref_indices = np.flatnonzero(groups == ref_group)
     focal_indices = np.flatnonzero(groups == focal_group)
     ref_data = data[ref_indices]
     focal_data = data[focal_indices]
-    n_jobs = _validate_n_jobs(n_jobs)
+    n_jobs = resolve_n_jobs(n_jobs)
     tasks = [
         _DTFBootstrapTask(
             ref_data=ref_data,
@@ -413,19 +530,30 @@ def _bootstrap_dtf_statistics(
         )
     ]
     task_results = _run_bootstrap_tasks(_fit_dtf_bootstrap_task, tasks, n_jobs)
-    return summarize_bootstrap(
-        [statistic for task_result in task_results for statistic in task_result],
+    replicates = np.array(
+        [values for task_result in task_results for values in task_result]
+    ).reshape(n_bootstrap, 1 + len(_ITEM_DIF_STATISTICS) * n_items)
+    summary = summarize_bootstrap(
+        replicates[:, 0],
         observed=observed_dtf,
         n_requested=n_bootstrap,
         confidence_level=confidence_level,
+        # An unsigned area is never negative, so |DTF| / SE is no test of 0.
+        test_zero=method == "signed",
     )
+    return summary, replicates[:, 1:].reshape(n_bootstrap, -1, n_items)
 
 
-def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[float]:
-    """Fit one deterministic chunk of DTF bootstrap replicates."""
+def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[NDArray[np.float64]]:
+    """Fit one deterministic chunk of DTF bootstrap replicates.
+
+    Each replicate is the DTF statistic followed by the flattened item
+    differences of :func:`_item_dif_statistics`, all ``NaN`` on failure.
+    """
     rng = np.random.default_rng()
     rng.bit_generator.state = task.rng_state
-    statistics: list[float] = []
+    n_values = 1 + len(_ITEM_DIF_STATISTICS) * task.ref_data.shape[1]
+    statistics: list[NDArray[np.float64]] = []
     for _ in range(task.n_replicates):
         sampled_ref = rng.integers(
             0, task.ref_data.shape[0], size=task.ref_data.shape[0]
@@ -443,17 +571,29 @@ def _fit_dtf_bootstrap_task(task: _DTFBootstrapTask) -> list[float]:
             focal_model, _ = _place_focal(
                 ref_result.model, focal_result.model, task.anchor_items
             )
-            expected_ref = _compute_expected_score(ref_result.model, task.theta_grid)
-            expected_focal = _compute_expected_score(focal_model, task.theta_grid)
-            statistic = _aggregate_dtf(
-                expected_ref - expected_focal,
-                task.theta_grid,
-                task.method,
-                task.integration_weights,
+            item_difference = _compute_expected_item_scores(
+                ref_result.model, task.theta_grid
+            ) - _compute_expected_item_scores(focal_model, task.theta_grid)
+            values = np.concatenate(
+                [
+                    [
+                        _aggregate_dtf(
+                            np.sum(item_difference, axis=1),
+                            task.theta_grid,
+                            task.method,
+                            task.integration_weights,
+                        )
+                    ],
+                    _item_dif_statistics(
+                        item_difference, task.theta_grid, task.integration_weights
+                    ).ravel(),
+                ]
             )
         except _BOOTSTRAP_EXCEPTIONS:
-            statistic = np.nan
-        statistics.append(statistic if np.isfinite(statistic) else np.nan)
+            values = np.full(n_values, np.nan)
+        if values.shape != (n_values,):
+            values = np.full(n_values, np.nan)
+        statistics.append(np.where(np.isfinite(values), values, np.nan))
     return statistics
 
 

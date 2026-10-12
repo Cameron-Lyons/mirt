@@ -392,10 +392,14 @@ class TestBootstrap:
         self.install_data_driven_fit(monkeypatch)
         data, groups = base_data()
 
-        first = compute_dtf(data, groups, n_bootstrap=20, random_state=123, n_quadpts=9)
-        second = compute_dtf(
-            data, groups, n_bootstrap=20, random_state=123, n_quadpts=9
-        )
+        options = {
+            "method": "signed",
+            "n_bootstrap": 20,
+            "random_state": 123,
+            "n_quadpts": 9,
+        }
+        first = compute_dtf(data, groups, **options)
+        second = compute_dtf(data, groups, **options)
 
         assert first["DTF_SE"] == pytest.approx(second["DTF_SE"])
         assert first["p_value"] == pytest.approx(second["p_value"])
@@ -417,6 +421,7 @@ class TestBootstrap:
         monkeypatch.setattr("mirt.diagnostics.dtf._run_bootstrap_tasks", run_inline)
         data, groups = base_data()
         options = {
+            "method": "signed",
             "n_bootstrap": 24,
             "random_state": 2718,
             "n_quadpts": 9,
@@ -454,7 +459,7 @@ class TestBootstrap:
         theta = np.linspace(-2.0, 2.0, 9)
         weights, _ = _create_integration_weights(theta, "normal")
 
-        summary = _bootstrap_dtf_statistics(
+        summary, _ = _bootstrap_dtf_statistics(
             data=data,
             groups=groups,
             model="2PL",
@@ -483,7 +488,7 @@ class TestBootstrap:
         theta = np.linspace(-2.0, 2.0, 9)
         weights, _ = _create_integration_weights(theta, "normal")
 
-        summary = _bootstrap_dtf_statistics(
+        summary, _ = _bootstrap_dtf_statistics(
             data=data,
             groups=groups,
             model="2PL",
@@ -524,8 +529,8 @@ class TestBootstrap:
             fit_kwargs={},
         )
 
-        null = _bootstrap_dtf_statistics(observed_dtf=0.0, **common)
-        distant = _bootstrap_dtf_statistics(observed_dtf=10.0, **common)
+        null, _ = _bootstrap_dtf_statistics(observed_dtf=0.0, **common)
+        distant, _ = _bootstrap_dtf_statistics(observed_dtf=10.0, **common)
 
         assert null.p_value == 1.0
         assert distant.p_value < 1e-6
@@ -547,11 +552,11 @@ class TestBootstrap:
         theta = np.linspace(-2.0, 2.0, 9)
         weights, _ = _create_integration_weights(theta, "normal")
 
-        summary = _bootstrap_dtf_statistics(
+        summary, _ = _bootstrap_dtf_statistics(
             data=data,
             groups=groups,
             model="2PL",
-            method="unsigned",
+            method="signed",
             theta_grid=theta,
             integration_weights=weights,
             observed_dtf=observed_dtf,
@@ -572,7 +577,7 @@ class TestBootstrap:
         theta = np.linspace(-2.0, 2.0, 9)
         weights, _ = _create_integration_weights(theta, "normal")
 
-        summary = _bootstrap_dtf_statistics(
+        summary, _ = _bootstrap_dtf_statistics(
             data=data,
             groups=groups,
             model="2PL",
@@ -589,9 +594,61 @@ class TestBootstrap:
         )
 
         assert np.isfinite(summary.standard_error)
-        assert 0.0 <= summary.p_value <= 1.0
+        assert np.isnan(summary.p_value)
         assert summary.confidence_interval[0] <= summary.confidence_interval[1]
         assert summary.n_successful == 10
+
+    def test_item_differences_partition_the_signed_dtf(self, monkeypatch):
+        # Like R's DRF(..., DIF=TRUE): per-item signed, unsigned and RMS
+        # expected-score differences from the same fits and replicates.
+        install_group_models(
+            monkeypatch, BinaryModel([0.8, 0.4]), BinaryModel([0.6, 0.5])
+        )
+        data, groups = base_data()
+
+        result = compute_dtf(data, groups, method="signed", n_bootstrap=0)
+
+        items = result["item_dif"]
+        np.testing.assert_allclose(items["sDIF"], [0.2, -0.1])
+        np.testing.assert_allclose(items["uDIF"], [0.2, 0.1])
+        np.testing.assert_allclose(items["dDIF"], [0.2, 0.1])
+        assert np.sum(items["sDIF"]) == pytest.approx(result["DTF"])
+        assert items["sDIF_ci"].shape == (2, 2)
+        assert np.all(np.isnan(items["sDIF_SE"]))
+
+    def test_item_differences_get_bootstrap_uncertainty(self, monkeypatch):
+        self.install_data_driven_fit(monkeypatch)
+        data, groups = base_data()
+
+        result = compute_dtf(
+            data, groups, method="unsigned", n_bootstrap=20, random_state=5
+        )
+
+        items = result["item_dif"]
+        for name in ("sDIF", "uDIF", "dDIF"):
+            assert np.all(np.isfinite(items[f"{name}_SE"])), name
+            assert np.all(items[f"{name}_ci"][:, 0] <= items[f"{name}_ci"][:, 1])
+        assert np.all((items["sDIF_p_value"] >= 0) & (items["sDIF_p_value"] <= 1))
+        assert "uDIF_p_value" not in items
+
+    def test_only_signed_dtf_reports_a_p_value(self, monkeypatch):
+        # An unsigned DTF is positive whenever the curves differ, so the
+        # z test |DTF| / SE rejected about 20% of DTF-free analyses.
+        self.install_data_driven_fit(monkeypatch)
+        data, groups = base_data()
+        options = {"n_bootstrap": 20, "random_state": 123, "n_quadpts": 9}
+
+        results = {
+            method: compute_dtf(data, groups, method=method, **options)
+            for method in ("signed", "unsigned", "expected_score")
+        }
+
+        assert 0.0 <= results["signed"]["p_value"] <= 1.0
+        for method in ("unsigned", "expected_score"):
+            result = results[method]
+            assert np.isnan(result["p_value"]), method
+            assert np.isfinite(result["DTF_SE"])
+            assert np.all(np.isfinite(result["confidence_interval"]))
 
 
 def _impact_calibrations() -> tuple[TwoParameterLogistic, TwoParameterLogistic]:

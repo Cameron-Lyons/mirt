@@ -1,4 +1,5 @@
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from typing import Self
 
 import numpy as np
 from numpy.typing import NDArray
@@ -13,7 +14,11 @@ from mirt.backends.rust.polytomous import (
 )
 from mirt.constants import PROB_EPSILON
 from mirt.exceptions import MirtValidationError
-from mirt.models.base import PolytomousItemModel
+from mirt.models.base import (
+    PolytomousItemModel,
+    _validated_category_counts,
+    validate_category_index,
+)
 
 _MAX_PROBABILITY_CHUNK_ENTRIES = 1_000_000
 _MAX_VECTORIZED_INFORMATION_ROWS = 256
@@ -27,6 +32,27 @@ def _identify_rating_scale_origin(
     offset = float(parameters["thresholds"][0])
     parameters["difficulty"] += offset
     parameters["thresholds"] -= offset
+
+
+def _rating_scale_categories(model_name: str, n_categories: int | list[int]) -> int:
+    """Return the one category count that a rating-scale family shares.
+
+    A sequence must repeat a single count; its length is not checked.
+    """
+    if isinstance(n_categories, (int, np.integer)) and not isinstance(
+        n_categories, (bool, np.bool_)
+    ):
+        return int(n_categories)
+    try:
+        length = len(n_categories)
+    except TypeError:
+        length = 1
+    counts = _validated_category_counts(length, n_categories)
+    if len(set(counts)) != 1:
+        raise ValueError(
+            f"{model_name} requires all items to have the same number of categories"
+        )
+    return counts[0]
 
 
 def _category_count_chunks(
@@ -169,6 +195,28 @@ def _vectorized_item_information(
     return information
 
 
+def _require_finite_parameters(
+    model: PolytomousItemModel,
+    parameters: dict[str, NDArray[np.float64]],
+    padded: str,
+) -> None:
+    """Reject non-finite values, ignoring the padding columns of ``padded``.
+
+    Padding beyond an item's own thresholds or steps never enters a curve,
+    so tables padded with ``NaN``, as R mirt prints them, remain accepted.
+    """
+    for name, values in parameters.items():
+        if name == padded:
+            values = values[model._category_columns(values.shape[1], 1)]
+        if not np.all(np.isfinite(values)):
+            raise MirtValidationError(
+                f"{name} must contain only finite values",
+                parameter=name,
+                value=values,
+                expected="finite values",
+            )
+
+
 def _sum_item_information_matrices(
     model: "GradedResponseModel | GeneralizedPartialCredit | NominalResponseModel",
     theta: NDArray[np.float64],
@@ -183,8 +231,23 @@ def _sum_item_information_matrices(
 
 @_register_builtin_model
 class GradedResponseModel(PolytomousItemModel):
+    """Graded response model (Samejima, 1969).
+
+    The cumulative logits are ``a * (theta - b_k)`` in one dimension and
+    ``a @ theta - sum(a) * b_k`` in several. Category probabilities are
+    nonnegative only when these logits decrease in ``k``: for a positive
+    slope (or slope sum), each item's active thresholds must be
+    nondecreasing. :meth:`set_parameters` requires finite discriminations and
+    active thresholds but does not enforce that order, because estimators
+    accept disordered starting thresholds and order the free ones in their
+    first M-step; :func:`mirt.equating.link_grm` and the estimators check it
+    where it matters.
+    """
+
     model_name = "GRM"
     supports_multidimensional = True
+    _rotatable_slopes = "discrimination"
+    _slope_sum_locations = ("thresholds",)
 
     def _initialize_parameters(self) -> None:
         if self.n_factors == 1:
@@ -225,14 +288,46 @@ class GradedResponseModel(PolytomousItemModel):
             canonical[~self._category_columns(canonical.shape[1], 1)] = 0.0
         return canonical
 
+    def set_parameters(self, **params: NDArray[np.float64]) -> "GradedResponseModel":
+        """Set parameters atomically after validating the complete state.
+
+        Raises
+        ------
+        MirtValidationError
+            If a discrimination or active threshold is not finite. The model
+            is left unchanged.
+        """
+        candidate = {**self._parameters, **self._coerce_parameter_updates(params)}
+        self._validate_parameter_state(candidate)
+        self._parameters = candidate
+        return self
+
+    def _validate_parameter_state(
+        self,
+        parameters: dict[str, NDArray[np.float64]],
+    ) -> None:
+        """Require finite discriminations and active thresholds."""
+        _require_finite_parameters(self, parameters, "thresholds")
+
     def cumulative_probability(
         self,
         theta: NDArray[np.float64],
         item_idx: int,
         threshold_idx: int,
     ) -> NDArray[np.float64]:
+        """Return ``P(X >= threshold_idx + 1 | theta)`` for one item.
+
+        ``threshold_idx`` must lie in ``[0, n_categories[item_idx] - 1)``;
+        booleans, non-integers, negative indices and padding columns raise
+        :class:`~mirt.exceptions.MirtIndexError`.
+        """
         theta = self._ensure_theta_2d(theta)
         item_idx = self._validate_item_index(item_idx)
+        threshold_idx = validate_category_index(
+            threshold_idx,
+            self._n_categories[item_idx] - 1,
+            parameter="threshold_idx",
+        )
 
         a = self._parameters["discrimination"]
         b = self._parameters["thresholds"][item_idx, threshold_idx]
@@ -253,11 +348,7 @@ class GradedResponseModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         item_idx = self._validate_item_index(item_idx)
-        n_cat = self._n_categories[item_idx]
-
-        if category < 0 or category >= n_cat:
-            raise ValueError(f"Category {category} out of range [0, {n_cat})")
-
+        category = validate_category_index(category, self._n_categories[item_idx])
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def _category_probabilities(
@@ -437,6 +528,8 @@ class GeneralizedPartialCredit(PolytomousItemModel):
 
     model_name = "GPCM"
     supports_multidimensional = True
+    _rotatable_slopes = "discrimination"
+    _slope_sum_locations = ("steps",)
 
     def _initialize_parameters(self) -> None:
         if self.n_factors == 1:
@@ -477,6 +570,29 @@ class GeneralizedPartialCredit(PolytomousItemModel):
             canonical[~self._category_columns(canonical.shape[1], 1)] = 0.0
         return canonical
 
+    def set_parameters(
+        self, **params: NDArray[np.float64]
+    ) -> "GeneralizedPartialCredit":
+        """Set parameters atomically after validating the complete state.
+
+        Raises
+        ------
+        MirtValidationError
+            If a discrimination or active step is not finite. Steps may be in
+            any order. The model is left unchanged.
+        """
+        candidate = {**self._parameters, **self._coerce_parameter_updates(params)}
+        self._validate_parameter_state(candidate)
+        self._parameters = candidate
+        return self
+
+    def _validate_parameter_state(
+        self,
+        parameters: dict[str, NDArray[np.float64]],
+    ) -> None:
+        """Require finite discriminations and active steps."""
+        _require_finite_parameters(self, parameters, "steps")
+
     def category_probability(
         self,
         theta: NDArray[np.float64],
@@ -485,11 +601,7 @@ class GeneralizedPartialCredit(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
         item_idx = self._validate_item_index(item_idx)
-        n_cat = self._n_categories[item_idx]
-
-        if category < 0 or category >= n_cat:
-            raise ValueError(f"Category {category} out of range [0, {n_cat})")
-
+        category = validate_category_index(category, self._n_categories[item_idx])
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def _category_probabilities(
@@ -661,6 +773,32 @@ class GeneralizedPartialCredit(PolytomousItemModel):
 
 @_register_builtin_model
 class PartialCreditModel(GeneralizedPartialCredit):
+    """Partial credit model with a discrimination common to all items.
+
+    Adjacent categories have log odds ``a * (theta - step)`` with one slope
+    ``a`` for every item. By default ``a`` is held at 1, the Rasch partial
+    credit model for a standard-normal trait. With
+    ``estimate_discrimination=True`` the common slope is estimated as one
+    parameter, which is equivalent to R mirt's ``itemtype="Rasch"`` for
+    polytomous items (unit slopes with an estimated latent variance; the
+    common slope is the latent standard deviation).
+    ``fit_mirt(model="PCM")`` fits that model.
+
+    Parameters
+    ----------
+    n_items : int
+        Number of items.
+    n_categories : int or list of int
+        Category count of every item, or one count per item.
+    n_factors : int, default=1
+        Number of latent factors; only one is supported.
+    item_names : list of str, optional
+        Item labels.
+    estimate_discrimination : bool, default=False
+        Whether the common discrimination is a free parameter, as for
+        :class:`~mirt.models.dichotomous.OneParameterLogistic`.
+    """
+
     model_name = "PCM"
     supports_multidimensional = False
 
@@ -670,10 +808,30 @@ class PartialCreditModel(GeneralizedPartialCredit):
         n_categories: int | list[int],
         n_factors: int = 1,
         item_names: list[str] | None = None,
+        *,
+        estimate_discrimination: bool = False,
     ) -> None:
         if n_factors != 1:
             raise ValueError("PCM only supports unidimensional analysis")
+        if not isinstance(estimate_discrimination, (bool, np.bool_)):
+            raise MirtValidationError(
+                "estimate_discrimination must be a boolean",
+                parameter="estimate_discrimination",
+                value=estimate_discrimination,
+                expected="bool",
+            )
+        self._estimate_discrimination = bool(estimate_discrimination)
         super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
+
+    @property
+    def estimate_discrimination(self) -> bool:
+        """Whether the common discrimination is a free parameter."""
+        return self._estimate_discrimination
+
+    @property
+    def _tied_parameters(self) -> tuple[str, ...]:
+        """Per-item parameters that estimation keeps equal across items."""
+        return ("discrimination",) if self._estimate_discrimination else ()
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.ones(self.n_items)
@@ -690,8 +848,43 @@ class PartialCreditModel(GeneralizedPartialCredit):
     @property
     def free_parameter_masks(self) -> dict[str, NDArray[np.bool_]]:
         masks = super().free_parameter_masks
-        masks["discrimination"] = np.zeros_like(self.discrimination, dtype=np.bool_)
+        masks["discrimination"] = np.full(
+            self.discrimination.shape, self._estimate_discrimination, dtype=np.bool_
+        )
         return self._apply_free_parameter_restrictions(masks)
+
+    @property
+    def n_parameters(self) -> int:
+        """Number of free parameters, counting a free common slope once."""
+        masks = self.free_parameter_masks
+        count = sum(int(np.count_nonzero(mask)) for mask in masks.values())
+        return count - max(int(np.count_nonzero(masks["discrimination"])) - 1, 0)
+
+    def set_free_parameter_masks(
+        self, masks: Mapping[str, NDArray[np.bool_]] | None
+    ) -> Self:
+        """Restrict free coordinates; a common slope is fixed for all items or none.
+
+        Raises
+        ------
+        MirtValidationError
+            If a mask fixes the common discrimination for some items only.
+        """
+        if masks is not None and isinstance(masks, Mapping):
+            mask = masks.get("discrimination")
+            if mask is not None:
+                values = np.asarray(mask)
+                if (
+                    values.dtype == np.bool_
+                    and values.size
+                    and values.any() != values.all()
+                ):
+                    raise MirtValidationError(
+                        "the common PCM discrimination is free or fixed for every "
+                        "item together",
+                        parameter="masks",
+                    )
+        return super().set_free_parameter_masks(masks)
 
     def _canonical_parameter_values(
         self,
@@ -699,14 +892,26 @@ class PartialCreditModel(GeneralizedPartialCredit):
         values: NDArray[np.float64],
     ) -> NDArray[np.float64]:
         canonical = super()._canonical_parameter_values(name, values)
-        if name == "discrimination":
+        if name == "discrimination" and not self._estimate_discrimination:
             canonical.fill(1.0)
         return canonical
 
     def set_parameters(self, **params: NDArray[np.float64]) -> "PartialCreditModel":
-        if "discrimination" in params:
+        if "discrimination" in params and not self._estimate_discrimination:
             raise ValueError("Cannot set discrimination in PCM (fixed to 1)")
         return super().set_parameters(**params)
+
+    def copy(self) -> Self:
+        new_model = self.__class__(
+            n_items=self.n_items,
+            n_categories=self._n_categories.copy(),
+            item_names=self.item_names.copy(),
+            estimate_discrimination=self._estimate_discrimination,
+        )
+        new_model._parameters = {k: v.copy() for k, v in self._parameters.items()}
+        self._copy_parameter_restrictions_to(new_model)
+        new_model._is_fitted = self._is_fitted
+        return new_model
 
 
 class RatingScaleModel(PolytomousItemModel):
@@ -766,15 +971,8 @@ class RatingScaleModel(PolytomousItemModel):
         if n_factors != 1:
             raise ValueError("RSM only supports unidimensional analysis")
 
-        if isinstance(n_categories, list):
-            if len(set(n_categories)) != 1:
-                raise ValueError(
-                    "RSM requires all items to have the same number of categories"
-                )
-            n_categories = n_categories[0]
-
-        self._n_cats = n_categories
-        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
+        self._n_cats = _rating_scale_categories("RSM", n_categories)
+        super().__init__(n_items, self._n_cats, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["difficulty"] = np.zeros(self.n_items)
@@ -831,11 +1029,7 @@ class RatingScaleModel(PolytomousItemModel):
         """
         theta = self._ensure_theta_2d(theta)
         item_idx = self._validate_item_index(item_idx)
-        n_cat = self._n_cats
-
-        if category < 0 or category >= n_cat:
-            raise ValueError(f"Category {category} out of range [0, {n_cat})")
-
+        category = validate_category_index(category, self._n_cats)
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def _category_probabilities(
@@ -1005,15 +1199,8 @@ class GradedRatingScaleModel(PolytomousItemModel):
         if n_factors != 1:
             raise ValueError("GRSM only supports unidimensional analysis")
 
-        if isinstance(n_categories, list):
-            if len(set(n_categories)) != 1:
-                raise ValueError(
-                    "GRSM requires all items to have the same number of categories"
-                )
-            n_categories = n_categories[0]
-
-        self._n_cats = n_categories
-        super().__init__(n_items, n_categories, n_factors=1, item_names=item_names)
+        self._n_cats = _rating_scale_categories("GRSM", n_categories)
+        super().__init__(n_items, self._n_cats, n_factors=1, item_names=item_names)
 
     def _initialize_parameters(self) -> None:
         self._parameters["discrimination"] = np.array([1.0])
@@ -1057,9 +1244,18 @@ class GradedRatingScaleModel(PolytomousItemModel):
         item_idx: int,
         threshold_idx: int,
     ) -> NDArray[np.float64]:
+        """Return ``P(X >= threshold_idx + 1 | theta)`` for one item.
+
+        ``threshold_idx`` must lie in ``[0, n_categories - 1)``; booleans,
+        non-integers and negative indices raise
+        :class:`~mirt.exceptions.MirtIndexError`.
+        """
         theta = self._ensure_theta_2d(theta)
         theta_1d = theta.ravel()
         item_idx = self._validate_item_index(item_idx)
+        threshold_idx = validate_category_index(
+            threshold_idx, self._n_cats - 1, parameter="threshold_idx"
+        )
 
         a = self._parameters["discrimination"][0]
         b_j = self._parameters["difficulty"][item_idx]
@@ -1075,11 +1271,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
         category: int,
     ) -> NDArray[np.float64]:
         item_idx = self._validate_item_index(item_idx)
-        n_cat = self._n_cats
-
-        if category < 0 or category >= n_cat:
-            raise ValueError(f"Category {category} out of range [0, {n_cat})")
-
+        category = validate_category_index(category, self._n_cats)
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def _category_probabilities(
@@ -1201,6 +1393,7 @@ class GradedRatingScaleModel(PolytomousItemModel):
 class NominalResponseModel(PolytomousItemModel):
     model_name = "NRM"
     supports_multidimensional = True
+    _rotatable_slopes = "slopes"
 
     def _initialize_parameters(self) -> None:
         max_cats = max(self._n_categories)
@@ -1287,11 +1480,7 @@ class NominalResponseModel(PolytomousItemModel):
     ) -> NDArray[np.float64]:
         theta = self._ensure_theta_2d(theta)
         item_idx = self._validate_item_index(item_idx)
-        n_cat = self._n_categories[item_idx]
-
-        if category < 0 or category >= n_cat:
-            raise ValueError(f"Category {category} out of range [0, {n_cat})")
-
+        category = validate_category_index(category, self._n_categories[item_idx])
         return self._category_probabilities(theta, item_idx)[:, category]
 
     def _category_probabilities(
@@ -1399,41 +1588,30 @@ class NominalResponseModel(PolytomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int,
     ) -> NDArray[np.float64]:
-        n_persons = theta.shape[0]
+        """Return the trace of the slope covariance under the category curves.
+
+        The centered form ``sum_c P_c |a_c - E[a]|^2`` cannot cancel below
+        zero in the tails, where ``E[a^2] - E[a]^2`` loses all precision.
+        """
         n_cat = self._n_categories[item_idx]
-
-        a = self._parameters["slopes"]
-        probs = self.probability(theta, item_idx)
-
-        if self.n_factors == 1:
-            a_item = a[item_idx, :n_cat]
-
-            expected_a = np.sum(probs * a_item, axis=1)
-
-            expected_a_sq = np.sum(probs * (a_item**2), axis=1)
-
-            info = expected_a_sq - expected_a**2
-        else:
-            info = np.zeros(n_persons)
-            for f in range(self.n_factors):
-                a_f = a[item_idx, :n_cat, f]
-                expected_a = np.sum(probs * a_f, axis=1)
-                expected_a_sq = np.sum(probs * (a_f**2), axis=1)
-                info += expected_a_sq - expected_a**2
-
-        return info
+        slopes = self._parameters["slopes"][item_idx, :n_cat].reshape(
+            n_cat, self.n_factors
+        )
+        probabilities = self.probability(theta, item_idx)
+        centered = slopes[None, :, :] - (probabilities @ slopes)[:, None, :]
+        return np.einsum("nc,ncf,ncf->n", probabilities, centered, centered)
 
     def _information_by_item(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         slopes = self._parameters["slopes"].reshape(
             self.n_items, self.max_categories, self.n_factors
         )
-        squared_slopes = slopes**2
 
         def kernel(block: NDArray[np.float64]) -> NDArray[np.float64]:
             probabilities = self.probability(block)
             expected = np.einsum("njc,jcf->njf", probabilities, slopes)
-            expected_squared = np.einsum("njc,jcf->njf", probabilities, squared_slopes)
-            return np.sum(expected_squared - expected**2, axis=2)
+            # Zero-probability padding adds nothing to the centered sum.
+            centered = slopes[None, :, :, :] - expected[:, :, None, :]
+            return np.einsum("njc,njcf,njcf->nj", probabilities, centered, centered)
 
         return _vectorized_item_information(self, NominalResponseModel, theta, kernel)
 

@@ -30,10 +30,13 @@ Prefer :func:`mirt.equating.link` for unidimensional dichotomous linking with
 Stocking–Lord, Haebara, mean/sigma, mean/mean, and additional regression methods.
 Curve matching includes the lower and upper asymptotes of 3PL and 4PL items and
 the 5PL asymmetry. Other dichotomous families, such as CLL, NLL, ULL, and
-zero-inflated models, are matched through their own response functions.
+zero-inflated models, and subclasses that override a built-in response
+function, are matched through their own response functions.
 Use :func:`mirt.equating.link_grm`, :func:`mirt.equating.link_gpcm`, and
 :func:`mirt.equating.link_nrm` for polytomous models, or
-:func:`mirt.equating.link_mirt` for multidimensional models.
+:func:`mirt.equating.link_mirt` for multidimensional models. Like ``link``,
+the polytomous linkers accept ``compute_se=True`` for paired-anchor bootstrap
+standard errors (``n_bootstrap`` replicates seeded by ``random_state``).
 
 Population-weighted linking
 ---------------------------
@@ -86,18 +89,46 @@ The standalone :func:`mirt.equating.accumulate_constants` instead accepts
 forward coordinate maps ``theta[t + 1] = A[t] * theta[t] + B[t]``.
 Invert pairwise ``link`` constants before passing them to that helper.
 
+Pass each calibration's parameter covariance as ``vcovs`` (matrices or
+``FitResult`` objects, as for :func:`mirt.equating.delta_method_se`) to obtain
+delta-method standard errors. Each pairwise result receives ``A_se`` and
+``B_se``, and ``cumulative_A_se``, ``cumulative_B_se``, and
+``cumulative_covariance`` propagate them through the composition. The
+calibrations are independent samples, but a form in two adjacent links
+contributes to both; the propagation differentiates every link with respect to
+that form's anchor parameters, so the covariance this induces between adjacent
+links is included.
+
+.. code-block:: python
+
+   fits = [fit_t0, fit_t1, fit_t2]
+   result = chain_link(
+       [fit.model for fit in fits],
+       [([0, 1, 2], [4, 5, 6]), ([7, 8, 9], [0, 1, 2])],
+       vcovs=fits,
+   )
+   result.cumulative_A_se, result.cumulative_B_se
+
 :func:`mirt.equating.concurrent_link` fits all form transformations jointly.
 Its connected anchor design can include adjacent and nonadjacent forms.
 ``reference_index`` fixes the chosen calibration at ``(A, B) = (1, 0)`` and
 defines the population-weighting grid used during optimization. Stocking–Lord
 and TCC match summed expected-score curves; Haebara matches paired item curves
-and the full category probabilities of polytomous items. An exhausted or failed
-optimization raises an error instead of returning unconverged constants.
+and the full category probabilities of polytomous items. The criterion is
+minimized by bounded trust-region least squares in each form's ``(log A, B)``,
+with derivatives from the theta slopes of the form's own curves. ``tol`` is the
+relative tolerance on the change in those parameters; the default ``1e-10``
+recovers exactly linkable forms to rounding accuracy, as ``chain_link`` does,
+and ``max_iter`` bounds the number of criterion evaluations. An exhausted or
+failed optimization raises an error instead of returning unconverged
+constants.
 
 ``vertical_scale(..., method="concurrent")`` performs the same simultaneous
 curve matching for an adjacent-grade design, using ``reference_grade`` as the
 fixed calibration. Its adjacent-pair diagnostics describe the transformations
-implied by the final joint solution. ``linking_method`` supports
+implied by the final joint solution, using each family's own curves for
+dichotomous, GRM, GPCM/PCM, and NRM grades; other polytomous families are
+matched without per-pair diagnostics. ``linking_method`` supports
 ``"stocking_lord"``, ``"tcc"``, and ``"haebara"`` for concurrent scaling.
 Set ``enforce_monotonicity=False`` to inspect the calibrated grade means;
 enabling it shifts grade locations to enforce increasing mean ability.
@@ -119,6 +150,13 @@ identical parameters across grades. Fixed-anchor calibration freezes shared
 items administered in the reference grade at that model's values. Anchors that
 bridge later grades are estimated jointly on the identified scale. It estimates
 unique items and nonreference grade distributions from the response likelihood.
+The joint EM integrates every grade on one grid, by default 61 points equally
+spaced on ``[-6, 6]`` of the reference grade's scale and weighted by each
+grade's own normal density, as in R's ``multipleGroup``. Grades several
+standard deviations above the reference grade are therefore integrated as
+accurately as the reference grade, and the grid grows to cover grades whose
+distributions reach beyond ``[-6, 6]``; ``n_quadpts`` sets the number of
+points.
 
 .. code-block:: python
 
@@ -134,7 +172,6 @@ unique items and nonreference grade distributions from the response likelihood.
        method="fixed_anchor",
        reference_grade=0,
        enforce_monotonicity=True,
-       n_quadpts=31,
        max_iter=500,
        tol=1e-4,
    )
@@ -176,6 +213,33 @@ distributions. Set it to ``False`` to estimate unrestricted grade means;
 Calibration raises an error if the reference fit or joint EM fit does not
 converge.
 
+Multidimensional linking
+------------------------
+
+:func:`mirt.equating.link_mirt` places a source calibration on a target
+metric from the anchors' slopes and intercepts. ``rotation="orthogonal"``
+fits the orthogonal Procrustes rotation, optionally with a uniform dilation;
+``rotation="oblique"`` fits a general nonsingular transformation by least
+squares, the oblique Procrustes linking of Li and Lissitz (2000), which
+recovers any exact linear metric difference. ``gamma`` below 1 ridges the
+oblique transformation toward the orthogonal solution (``gamma=0`` returns
+it). The ridge can stabilize nearly collinear anchors but biases a genuine
+oblique difference, so it is opt-in. The translation is the least-squares fit
+of every anchor intercept. Multidimensional GRM and GPCM models are supported
+alongside slope-intercept models and the multidimensional 2PL: each category
+intercept ``-sum(a) * b_k`` transforms as ``d_k - (a @ R) @ t``, and polytomous
+anchors must have the same number of categories on both forms.
+:func:`mirt.equating.transform_mirt_parameters` and
+:func:`mirt.equating.transform_mirt_theta` apply a transformation while
+preserving every category probability.
+
+:func:`mirt.equating.target_rotation` rotates loadings toward a fully specified
+target. Its orthogonal mode is the orthogonal Procrustes solution
+(GPArotation's ``targetT``); its oblique mode is the oblique target rotation of
+Browne (2001), GPArotation's ``targetQ``, whose rotated factors keep unit
+variance, so the implied factor correlation matrix
+``inv(rotation) @ inv(rotation).T`` has a unit diagonal.
+
 Score conversions across calibrations
 -------------------------------------
 
@@ -208,10 +272,12 @@ equating accept this result and evaluate the new form at
 True-score equating solves the old form's test characteristic curve for the
 ability at each score by bracketed root finding, then evaluates the new form
 at that ability. ``theta_range`` sets the reporting grid in ``result.theta``
-and seeds the search; abilities outside it are still found. Scores at or
-below the sum of the old form's lower asymptotes (for example the 3PL
-guessing parameters) have no true-score ability. Following Kolen and Brennan
-(2014, sec. 6.5), they map linearly from ``(0, 0)`` to the two forms'
+and seeds the search; abilities outside it are still found. Local inverse
+interpolation of the curve on that grid starts each root, so equated scores
+usually reach rounding accuracy after one further curve evaluation per score.
+Scores at or below the sum of the old form's lower asymptotes (for example the
+3PL guessing parameters) have no true-score ability. Following Kolen and
+Brennan (2014, sec. 6.5), they map linearly from ``(0, 0)`` to the two forms'
 lower-asymptote sums. Scores at or above the old upper-asymptote sum map
 linearly to the maximum scores, so a perfect score on the old form equates to a
 perfect score on the new form. The asymptote sums are evaluated numerically
@@ -239,8 +305,10 @@ and retains only the marginal score distribution across batches. Omit
 curves use the Python path even when Rust is installed.
 
 Use ``smoothing="none"`` for the original score distributions,
-``"loglinear"`` for a polynomial fit to log probabilities, or ``"kernel"``
-for Gaussian smoothing before percentile matching. The ``"kernel"`` option
+``"loglinear"`` for the maximum-likelihood log-linear presmoother of kernel
+equating (degree 4, which preserves the first four moments, or the highest
+degree a short distribution supports), or ``"kernel"`` for Gaussian
+smoothing before percentile matching. The ``"kernel"`` option
 smooths the discrete distributions; it is not kernel equating, which is
 described below.
 
@@ -329,6 +397,37 @@ analysis can be scaled up without changing its samples.
 Closed-form anchor bootstraps are already evaluated as vectorized batches and
 do not need multiple workers.
 
+Both this bootstrap and the delta method below accept GRM, GPCM/PCM, and NRM
+forms with the methods of their family's linker.
+
+:func:`mirt.equating.delta_method_se` instead propagates each calibration's
+parameter covariance. It accepts ``FitResult`` objects directly, mapping
+``FitResult.vcov`` through its labels and taking the models from the results,
+or matrices over either the free parameters (``FitResult.vcov`` order) or every
+stored coordinate. A result without ``vcov``, such as one fitted with
+``se_method="complete_data"``, falls back to its squared standard errors with a
+warning, so the standard errors then ignore covariances between estimates.
+Only the anchors' rows and columns are read and validated. Fixed coordinates
+and ``NaN`` rows, such as asymptotes held at an optimizer bound, have zero
+variance. Native curve families propagate
+every per-item parameter of the anchors, including zero-inflation
+probabilities. Polytomous anchors propagate their discriminations (NRM category
+slopes) and every active threshold, step, or category intercept; Stocking–Lord
+and Haebara constants are differentiated through the criterion's first-order
+condition with its analytic gradient, so no re-optimization is needed.
+
+.. code-block:: python
+
+   from mirt import fit_mirt
+   from mirt.equating import delta_method_se, link
+
+   fit_old = fit_mirt(responses_old, model="3PL")
+   fit_new = fit_mirt(responses_new, model="3PL")
+   result = link(fit_old.model, fit_new.model, anchor_items_old, anchor_items_new)
+   se_a, se_b = delta_method_se(
+       result, fit_old, fit_new, anchor_items_old, anchor_items_new
+   )
+
 Fixed-item calibration
 ----------------------
 
@@ -361,8 +460,9 @@ anchor items, in ``anchor_items`` order, or a mapping from parameter names to
 anchor rows. Anchor parameters report zero standard errors, and the new items'
 standard errors are conditional on the estimated population. Parameters shared
 by all items, such as rating-scale thresholds, belong to the anchored scale and
-stay fixed. The legacy :func:`mirt.fixed_calib` fits only new 2PL items under a
-standard normal population. :doc:`mixed_format` shows how to calibrate
+stay fixed. :func:`mirt.fixed_calib` is a 2PL wrapper of the same estimator
+that holds the population at the standard normal, like R mirt's
+``fixedCalib(PAU = "NWU")``. :doc:`mixed_format` shows how to calibrate
 mixed-format tests against fixed anchors.
 
 See ``examples/equating.py``.

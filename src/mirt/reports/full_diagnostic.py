@@ -20,19 +20,27 @@ class FullDiagnosticReport(ReportBuilder):
     """Generate comprehensive HTML diagnostic report.
 
     This report includes all available diagnostics:
+
     - Model summary and parameters with confidence intervals
     - Item fit statistics (infit/outfit)
-    - Model fit indices (M2, RMSEA, CFI, TLI, SRMSR)
+    - Model fit indices (M2, M2* or C2, RMSEA, CFI, TLI, SRMSR)
     - Local dependence analysis (Q3 matrix, flagged pairs)
     - Ability distribution (if theta provided)
-    - All relevant plots (ICC, information, Wright map, fit plots)
+    - All relevant plots (ICC, information, Wright map, fit plots); a note
+      replaces Wright maps that do not apply
+
+    The limited-information statistic is M2 for binary items and M2* for
+    ordinal items, or C2 when M2* has no degrees of freedom, and is labelled
+    accordingly.
 
     Parameters
     ----------
     fit_result : FitResult
         Fitted model result.
-    responses : ndarray
-        Response matrix (n_persons x n_items).
+    responses : array-like or DataFrame
+        Response matrix (n_persons x n_items). DataFrame columns are matched
+        to the model's item names, and ``NaN``, nullable-column nulls
+        (``pd.NA``) and negative codes are missing responses.
     theta : ndarray, optional
         Ability estimates. If None, some plots are omitted.
     include_ld : bool
@@ -65,14 +73,13 @@ class FullDiagnosticReport(ReportBuilder):
         include_plots: bool = True,
     ) -> None:
         super().__init__(fit_result, title)
-        self.responses = np.asarray(responses)
+        self.responses = self._response_matrix(responses)
         self.theta = theta
         self.include_ld = include_ld
         self.include_plots = include_plots
 
     def _build_content(self) -> str:
         from mirt.diagnostics.itemfit import compute_itemfit
-        from mirt.diagnostics.modelfit import compute_fit_indices
         from mirt.reports._templates import section
 
         sections = []
@@ -90,8 +97,8 @@ class FullDiagnosticReport(ReportBuilder):
             )
         )
 
-        fit_indices = compute_fit_indices(self.fit_result, self.responses)
-        sections.append(self._build_modelfit_section(fit_indices))
+        fit_indices, statistic = self._limited_information_fit(self.responses)
+        sections.append(self._build_modelfit_section(fit_indices, statistic))
 
         if self.include_ld:
             try:
@@ -121,7 +128,6 @@ class FullDiagnosticReport(ReportBuilder):
                 create_information_plot_base64,
                 create_itemfit_plot_base64,
                 create_se_plot_base64,
-                create_wright_map_base64,
             )
             from mirt.reports._templates import embedded_plot
 
@@ -167,26 +173,21 @@ class FullDiagnosticReport(ReportBuilder):
                     )
                 )
 
-                wright_base64 = create_wright_map_base64(
-                    self.fit_result.model, self.theta
-                )
                 sections.append(
-                    section(
-                        "Wright Map",
-                        embedded_plot(wright_base64, "Wright Map"),
-                        level=3,
-                    )
+                    self._wright_map_section(self.theta, "Wright Map", level=3)
                 )
 
         return "\n".join(sections)
 
-    def _build_modelfit_section(self, fit_indices: dict[str, float]) -> str:
+    def _build_modelfit_section(
+        self, fit_indices: dict[str, float], statistic: str = "M2"
+    ) -> str:
         from mirt.reports._templates import format_value, section, table_from_data
 
         headers = ["Index", "Value"]
         rows = [
             [
-                "M2",
+                statistic,
                 f"{fit_indices['M2']:.2f} (df = {fit_indices['M2_df']:.0f}, p = {fit_indices['M2_p']:.4f})",
             ],
             [
@@ -197,7 +198,10 @@ class FullDiagnosticReport(ReportBuilder):
             ["TLI", format_value(fit_indices["TLI"], ".4f")],
             ["SRMSR", format_value(fit_indices["SRMSR"], ".4f")],
         ]
-        return section("Model Fit Indices", table_from_data(headers, rows))
+        return section(
+            "Model Fit Indices",
+            table_from_data(headers, rows) + self._statistic_note(statistic),
+        )
 
     def _build_ld_section(self, ld_results: LDResult) -> str:
         from mirt.reports._templates import section, summary_box, table_from_data

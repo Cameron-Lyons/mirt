@@ -19,6 +19,7 @@ from mirt.equating.linking import (
     _orthogonal_link,
 )
 from mirt.models.dichotomous import (
+    FiveParameterLogistic,
     FourParameterLogistic,
     ThreeParameterLogistic,
     TwoParameterLogistic,
@@ -961,3 +962,158 @@ class TestLeastSquaresCurveLinking:
             np.testing.assert_allclose(
                 objective.jacobian(parameters), numerical, rtol=1e-6, atol=1e-9
             )
+
+
+class _NormalOgive2PL(TwoParameterLogistic):
+    """A 2PL subclass whose response function is the normal ogive."""
+
+    def probability(self, theta, item_idx=None):
+        from scipy.special import ndtr
+
+        theta = np.asarray(theta, dtype=np.float64).reshape(-1, 1)
+        slopes = self.discrimination
+        locations = self.difficulty
+        if item_idx is not None:
+            return ndtr(slopes[item_idx] * (theta[:, 0] - locations[item_idx]))
+        return ndtr(slopes[None, :] * (theta - locations[None, :]))
+
+
+class TestOverriddenResponseFunctions:
+    """The closed-form kernel applies only to unmodified built-in families."""
+
+    def test_built_in_logistic_forms_use_the_closed_form(self):
+        from mirt.equating.linking import _link_form
+        from mirt.models.dichotomous import FiveParameterLogistic
+
+        for model in (TwoParameterLogistic(4), FiveParameterLogistic(4)):
+            assert not _link_form(model, [0, 1], "old").is_native
+
+    def test_instance_override_uses_the_model_curves(self):
+        from mirt.equating.linking import _link_form
+
+        model = TwoParameterLogistic(4)
+        model.probability = _NormalOgive2PL(4).probability
+
+        assert _link_form(model, [0, 1], "old").is_native
+
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    def test_subclass_override_is_linked_on_its_own_curves(self, method):
+        from mirt.equating.linking import _link_form
+
+        old, new = _noisy_affine_pair(_NormalOgive2PL, n_items=10, seed=1)
+        anchors = list(range(10))
+        assert _link_form(old, anchors, "old").is_native
+
+        result = link(old, new, anchors, anchors, method=method)
+
+        A, B, criterion = _native_curve_oracle(
+            old, new, method, [np.log(result.constants.A), result.constants.B]
+        )
+        assert result.constants.A == pytest.approx(A, abs=1e-6)
+        assert result.constants.B == pytest.approx(B, abs=1e-6)
+        theta = np.linspace(-4.0, 4.0, 61)
+        weights = np.exp(-0.5 * theta**2)
+        weights /= weights.sum()
+        placed = new.probability(((theta - B) / A)[:, None]).sum(axis=1)
+        tcc_difference = old.probability(theta[:, None]).sum(axis=1) - placed
+        assert result.fit_statistics.tcc_rmse == pytest.approx(
+            np.sqrt(np.sum(weights * tcc_difference**2)), rel=1e-6
+        )
+
+    @pytest.mark.parametrize("family", ["3PL", "5PL"])
+    @pytest.mark.parametrize("method", ["stocking_lord", "haebara"])
+    def test_plain_subclasses_keep_the_closed_form(self, family, method):
+        """A subclass that changes no curve hook is linked like its family."""
+        from mirt.equating import delta_method_se
+        from mirt.equating.linking import _link_form
+
+        base, plain = _PLAIN_SUBCLASSES[family]
+        old, new = _noisy_affine_pair(base, n_items=10, seed=2, **_SHAPES[family])
+        plain_old, plain_new = plain(10), plain(10)
+        plain_old.set_parameters(**old.parameters)
+        plain_new.set_parameters(**new.parameters)
+        anchors = list(range(8))
+        assert not _link_form(plain_old, anchors, "old").is_native
+
+        reference = link(old, new, anchors, anchors, method=method)
+        result = link(plain_old, plain_new, anchors, anchors, method=method)
+
+        assert result.constants.A == reference.constants.A
+        assert result.constants.B == reference.constants.B
+        vcov = np.eye(old.n_parameters) * 1e-3
+        assert delta_method_se(
+            result, vcov, vcov, anchors, anchors, plain_old, plain_new
+        ) == delta_method_se(reference, vcov, vcov, anchors, anchors, old, new)
+
+    @pytest.mark.parametrize(
+        "subclass",
+        ["logistic_evaluator", "curve_block", "added_asymptote", "dispatch"],
+    )
+    def test_subclasses_changing_curve_hooks_use_their_curves(self, subclass):
+        from mirt.equating.linking import _link_form
+
+        model = _CURVE_HOOK_SUBCLASSES[subclass](4)
+
+        assert _link_form(model, [0, 1], "old").is_native
+
+
+class _Plain3PL(ThreeParameterLogistic):
+    """A 3PL subclass that changes no response hook."""
+
+
+class _Plain5PL(FiveParameterLogistic):
+    """A 5PL subclass that changes no response hook."""
+
+
+_PLAIN_SUBCLASSES = {
+    "3PL": (ThreeParameterLogistic, _Plain3PL),
+    "5PL": (FiveParameterLogistic, _Plain5PL),
+}
+_SHAPES = {
+    "3PL": {"guessing": np.full(10, 0.15)},
+    "5PL": {
+        "guessing": np.full(10, 0.1),
+        "upper": np.full(10, 0.95),
+        "asymmetry": np.linspace(0.7, 1.4, 10),
+    },
+}
+
+
+class _ShiftedLogistic3PL(ThreeParameterLogistic):
+    def _evaluate_logistic(self, theta, item_idx, **options):
+        return super()._evaluate_logistic(np.asarray(theta) + 0.1, item_idx, **options)
+
+
+class _ShiftedBlock5PL(FiveParameterLogistic):
+    def _evaluate_block(self, theta, *parameters, **options):
+        return super()._evaluate_block(theta + 0.1, *parameters, **options)
+
+
+class _GuessingProperty2PL(TwoParameterLogistic):
+    @property
+    def guessing(self):
+        return np.full(self.n_items, 0.2)
+
+
+class _RedispatchedCurve2PL(TwoParameterLogistic):
+    _curve_evaluator = "_evaluate_shifted"
+
+    def _evaluate_shifted(self, theta, item_idx, **options):
+        return self._evaluate_logistic(np.asarray(theta) - 0.1, item_idx, **options)
+
+
+_CURVE_HOOK_SUBCLASSES = {
+    "logistic_evaluator": _ShiftedLogistic3PL,
+    "curve_block": _ShiftedBlock5PL,
+    "added_asymptote": _GuessingProperty2PL,
+    "dispatch": _RedispatchedCurve2PL,
+}
+
+
+def test_robust_z_scores_sign_tied_outliers():
+    """A zero MAD keeps ties at zero and signs every other value."""
+    from mirt.equating.linking import _robust_z_scores
+
+    scores = _robust_z_scores(np.array([1.0, 1.0, 1.0, 0.0, 3.0]))
+
+    np.testing.assert_array_equal(scores, [0.0, 0.0, 0.0, -np.inf, np.inf])

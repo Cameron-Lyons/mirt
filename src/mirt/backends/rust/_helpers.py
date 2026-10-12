@@ -13,11 +13,17 @@ Each wrapper module declares ``FALLBACK_MODE`` as one of:
   estimators).
 * ``"mixed"`` — module contains more than one of the modes above; see the
   module docstring for per-function notes.
+
+Wrappers validate shapes, indices and controls before calling the extension,
+because a Rust panic surfaces as ``pyo3_runtime.PanicException``, a
+:class:`BaseException` that ``except Exception`` does not catch.
+:func:`_call_native` re-raises any remaining panic as :class:`RuntimeError`.
 """
 
 from __future__ import annotations
 
-from typing import NoReturn
+from collections.abc import Callable
+from typing import Any, NoReturn, TypeVar
 
 import numpy as np
 from numpy.typing import NDArray
@@ -72,24 +78,69 @@ def _ensure_i32(arr: NDArray[np.integer] | None) -> NDArray[np.int32] | None:
     return np.ascontiguousarray(arr, dtype=np.int32)
 
 
-def _ensure_i64(arr: NDArray[np.integer] | None) -> NDArray[np.int64] | None:
-    """Return a contiguous int64 array, avoiding copies when possible."""
-    if arr is None:
-        return None
-    return np.ascontiguousarray(arr, dtype=np.int64)
+_INT32_MIN = int(np.iinfo(np.int32).min)
+_INT32_MAX = int(np.iinfo(np.int32).max)
+_T = TypeVar("_T")
+
+
+def _category_codes(responses: NDArray[Any]) -> NDArray[np.int32]:
+    """Return contiguous int32 category codes with every missing code as -1.
+
+    Negative and ``NaN`` entries are missing. An int32 cast would wrap
+    observed codes above ``2**31 - 1`` into valid categories (and turn ``NaN``
+    into an arbitrary integer), so such codes raise instead.
+
+    Raises
+    ------
+    IndexError
+        If an observed code does not fit in int32.
+    ValueError
+        If an observed floating-point code is not an integer.
+    """
+    values = np.asarray(responses)
+    if values.dtype == np.int32:
+        return np.ascontiguousarray(values)
+    if values.dtype.kind in "iu" and values.size:
+        # Codes that fit in int32 keep their sign, hence their missingness.
+        if _INT32_MIN <= values.min() and values.max() <= _INT32_MAX:
+            return np.ascontiguousarray(values, dtype=np.int32)
+    observed = values >= 0
+    if values.dtype.kind == "f" and np.any(observed & (values != np.trunc(values))):
+        raise ValueError("observed response codes must be integers")
+    if np.any(observed & (values > _INT32_MAX)):
+        raise IndexError("response category is outside the item category range")
+    return np.where(observed, values, -1).astype(np.int32)
+
+
+def _is_native_panic(error: BaseException) -> bool:
+    """Return whether ``error`` is the exception of a panicking Rust kernel.
+
+    pyo3 raises ``pyo3_runtime.PanicException``, which derives from
+    :class:`BaseException` and is not importable, so it is matched by name.
+    """
+    error_type = type(error)
+    return (
+        error_type.__name__ == "PanicException"
+        and error_type.__module__ == "pyo3_runtime"
+    )
+
+
+def _call_native(kernel: Callable[..., _T], *args: Any) -> _T:
+    """Call a Rust kernel, re-raising a Rust panic as :class:`RuntimeError`.
+
+    Callers with a NumPy fallback catch ``RuntimeError`` (or ``Exception``),
+    which a panic would otherwise bypass.
+    """
+    try:
+        return kernel(*args)
+    except BaseException as error:
+        if not _is_native_panic(error):
+            raise
+        name = getattr(kernel, "__name__", "kernel")
+        raise RuntimeError(f"native {name} failed: {error}") from error
 
 
 _MAX_VECTOR_CHUNK_ENTRIES = 1_000_000
-
-
-def _prepare_binary_response_components(
-    responses: NDArray[np.int_],
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Prepare binary response matrices used by vectorized log-likelihood code."""
-    response_matrix = np.asarray(responses)
-    valid = (response_matrix >= 0).astype(np.float64)
-    correct = (response_matrix == 1).astype(np.float64)
-    return correct, valid
 
 
 def _entry_chunk_size(n_rows: int, entries_per_row: int) -> int:
@@ -98,66 +149,3 @@ def _entry_chunk_size(n_rows: int, entries_per_row: int) -> int:
         1,
         min(n_rows, _MAX_VECTOR_CHUNK_ENTRIES // max(1, entries_per_row)),
     )
-
-
-def _quad_chunk_size(n_quad: int, n_items: int) -> int:
-    """Select a quadrature chunk size with bounded temporary memory."""
-    return _entry_chunk_size(n_quad, n_items)
-
-
-class PreparedArrays:
-    """Pre-converted arrays for EM estimation to avoid repeated conversions."""
-
-    __slots__ = (
-        "responses_i32",
-        "quad_points_f64",
-        "quad_weights_f64",
-        "discrimination_f64",
-        "difficulty_f64",
-        "guessing_f64",
-        "thresholds_f64",
-        "n_categories_i32",
-    )
-
-    def __init__(
-        self,
-        responses: NDArray[np.integer] | None = None,
-        quad_points: NDArray[np.floating] | None = None,
-        quad_weights: NDArray[np.floating] | None = None,
-        discrimination: NDArray[np.floating] | None = None,
-        difficulty: NDArray[np.floating] | None = None,
-        guessing: NDArray[np.floating] | None = None,
-        thresholds: NDArray[np.floating] | None = None,
-        n_categories: NDArray[np.integer] | None = None,
-    ):
-        """Pre-convert arrays once for use in EM iteration loops.
-
-        Use this to avoid repeated dtype conversions when calling Rust functions
-        multiple times with the same arrays (e.g., in EM iterations where only
-        parameters change).
-        """
-        self.responses_i32 = _ensure_i32(responses)
-        self.quad_points_f64 = _ensure_f64(quad_points)
-        self.quad_weights_f64 = _ensure_f64(quad_weights)
-        self.discrimination_f64 = _ensure_f64(discrimination)
-        self.difficulty_f64 = _ensure_f64(difficulty)
-        self.guessing_f64 = _ensure_f64(guessing)
-        self.thresholds_f64 = _ensure_f64(thresholds)
-        self.n_categories_i32 = _ensure_i32(n_categories)
-
-    def update_params(
-        self,
-        discrimination: NDArray[np.floating] | None = None,
-        difficulty: NDArray[np.floating] | None = None,
-        guessing: NDArray[np.floating] | None = None,
-        thresholds: NDArray[np.floating] | None = None,
-    ) -> None:
-        """Update parameter arrays (used during M-step)."""
-        if discrimination is not None:
-            self.discrimination_f64 = _ensure_f64(discrimination)
-        if difficulty is not None:
-            self.difficulty_f64 = _ensure_f64(difficulty)
-        if guessing is not None:
-            self.guessing_f64 = _ensure_f64(guessing)
-        if thresholds is not None:
-            self.thresholds_f64 = _ensure_f64(thresholds)

@@ -3,12 +3,16 @@
 import numpy as np
 import pytest
 
+from mirt.exceptions import MirtValidationError
 from mirt.models.polytomous import (
     GeneralizedPartialCredit,
+    GradedRatingScaleModel,
     GradedResponseModel,
     NominalResponseModel,
     PartialCreditModel,
+    RatingScaleModel,
 )
+from mirt.utils.information import testinfo as total_information
 
 
 class TestGradedResponseModel:
@@ -290,3 +294,98 @@ class TestCategoryProbabilityBounds:
 
         with pytest.raises(ValueError, match="out of range"):
             model.category_probability(theta, item_idx=0, category=-1)
+
+
+class TestParameterDomains:
+    """Setters reject states whose category curves are undefined."""
+
+    @pytest.mark.parametrize("value", [np.nan, np.inf])
+    @pytest.mark.parametrize(
+        "ModelClass", [GradedResponseModel, GeneralizedPartialCredit]
+    )
+    def test_nonfinite_discrimination_is_rejected_atomically(self, ModelClass, value):
+        model = ModelClass(2, n_categories=4)
+        before = model.parameters
+        locations = "thresholds" if ModelClass is GradedResponseModel else "steps"
+
+        with pytest.raises(MirtValidationError, match="finite"):
+            model.set_parameters(
+                discrimination=np.array([value, 1.0]),
+                **{locations: np.zeros((2, 3))},
+            )
+
+        for name, values in before.items():
+            np.testing.assert_array_equal(model.parameters[name], values)
+
+    def test_gpcm_rejects_nonfinite_steps_but_accepts_disordered_ones(self):
+        model = GeneralizedPartialCredit(2, n_categories=3)
+
+        with pytest.raises(MirtValidationError, match="steps"):
+            model.set_parameters(steps=np.array([[np.nan, 0.0], [0.0, 1.0]]))
+        model.set_parameters(steps=np.array([[1.0, -1.0], [0.0, 0.0]]))
+
+        assert np.all(model.probability(np.array([0.0])) >= 0.0)
+
+    def test_grm_padding_is_not_validated(self):
+        model = GradedResponseModel(2, n_categories=[3, 4])
+
+        model.set_parameters(thresholds=np.array([[-1.0, 1.0, np.nan], [-1, 0, 1]]))
+
+        np.testing.assert_allclose(model.probability(np.array([0.0]), 0).sum(), 1.0)
+
+
+class TestCategoryCounts:
+    """Category counts accept NumPy integers and reject other numbers."""
+
+    @pytest.mark.parametrize(
+        "ModelClass",
+        [
+            GradedResponseModel,
+            GeneralizedPartialCredit,
+            PartialCreditModel,
+            NominalResponseModel,
+            RatingScaleModel,
+            GradedRatingScaleModel,
+        ],
+    )
+    def test_numpy_integer_counts_are_accepted(self, ModelClass):
+        responses = np.array([[0, 3, 1], [2, 1, 0]])
+
+        scalar = ModelClass(3, n_categories=responses.max() + 1)
+        sequence = ModelClass(3, n_categories=list(np.full(3, 4, dtype=np.int32)))
+
+        assert scalar.n_categories == sequence.n_categories == [4, 4, 4]
+        assert all(type(count) is int for count in scalar.n_categories)
+
+    @pytest.mark.parametrize("n_categories", [4.0, True, [4, 4.0], [4, True], "4"])
+    @pytest.mark.parametrize(
+        "ModelClass", [GradedResponseModel, NominalResponseModel, RatingScaleModel]
+    )
+    def test_non_integer_counts_are_rejected(self, ModelClass, n_categories):
+        with pytest.raises(MirtValidationError, match="n_categories"):
+            ModelClass(2, n_categories=n_categories)
+
+
+def test_nominal_information_is_never_negative_in_the_tails():
+    rng = np.random.default_rng(1)
+    theta = np.linspace(-40.0, 40.0, 801)
+    for n_factors in (1, 2):
+        shape = (6, 6) if n_factors == 1 else (6, 6, n_factors)
+        model = NominalResponseModel(6, n_categories=6, n_factors=n_factors)
+        model.set_parameters(
+            slopes=rng.normal(0.0, 2.0, shape), intercepts=rng.normal(0.0, 2.0, (6, 6))
+        )
+        points = theta[:, None] * np.ones(n_factors)
+
+        by_item = np.column_stack([model.information(points, j) for j in range(6)])
+        vectorized = model.information(points[:200])
+        trace = np.einsum(
+            "jnff->nj",
+            np.stack([model.item_information_matrix(points, j) for j in range(6)]),
+        )
+
+        # E[a^2] - E[a]^2 gave values down to -7e-15 here.
+        assert np.all(by_item >= 0.0)
+        np.testing.assert_allclose(by_item, trace, rtol=1e-12, atol=1e-300)
+        np.testing.assert_allclose(vectorized, by_item[:200].sum(axis=1), rtol=1e-12)
+        assert np.all(total_information(model, points) >= 0.0)

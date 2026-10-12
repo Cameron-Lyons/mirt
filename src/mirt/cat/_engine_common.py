@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import warnings
+from collections.abc import Callable, Sequence
+from numbers import Integral
 from typing import Any
 
 import numpy as np
 
+from mirt.cat._names import canonical_name
+from mirt.cat._stopping_common import integer, item_limit
 from mirt.cat.content import ContentConstraint, NoContentConstraint
 from mirt.cat.exposure import (
     ExposureControl,
@@ -67,27 +71,105 @@ def validate_simulation_values(values: Any, *, name: str) -> np.ndarray:
     return result
 
 
+def validate_quadrature_count(n_quadpts: Any) -> int:
+    """Return an EAP quadrature count, an integer of at least 5."""
+    if (
+        isinstance(n_quadpts, (bool, np.bool_))
+        or not isinstance(n_quadpts, Integral)
+        or n_quadpts < 5
+    ):
+        raise ValueError("n_quadpts must be an integer of at least 5 for EAP scoring")
+    return int(n_quadpts)
+
+
+def validate_test_length(
+    min_items: Any,
+    rules: Sequence[Any],
+    *,
+    length_rule: type,
+    combined_rule: type,
+) -> int:
+    """Validate ``min_items`` against the length the ``"or"``-combined rules allow.
+
+    A minimum above the maximum length would administer more items than
+    ``max_items`` (or a maximum-length rule) allows while reporting that
+    maximum as the stopping reason.
+    """
+    minimum = integer(min_items, "min_items", minimum=0)
+    limits = [item_limit(rule, length_rule, combined_rule) for rule in rules]
+    known = [limit for limit in limits if limit is not None]
+    if known and minimum > min(known):
+        raise ValueError(
+            f"min_items ({minimum}) exceeds the maximum test length "
+            f"({min(known)}) that max_items or the stopping rule sets"
+        )
+    return minimum
+
+
 def initialize_common_engine(
     engine: Any,
     *,
     model: Any,
     scoring_method: str,
+    scoring_methods: tuple[str, ...],
     n_quadpts: int,
     theta_bounds: tuple[float, float],
     seed: int | None,
     engine_name: str,
 ) -> None:
-    """Initialize attributes shared by CAT and MCAT engines."""
+    """Initialize attributes shared by CAT and MCAT engines.
+
+    ``scoring_method`` matches one of ``scoring_methods`` regardless of case
+    and surrounding whitespace. EAP scoring requires an integer ``n_quadpts``
+    of at least 5, and ``theta_bounds`` must be finite and increasing, so a
+    misconfigured engine fails here rather than during a session.
+    """
+    from mirt.scoring._optimization import validate_theta_bounds
+
     if not model.is_fitted:
         raise ValueError(f"Model must be fitted before use in {engine_name}")
 
+    method = canonical_name(
+        scoring_method, scoring_methods, kind=f"{engine_name}Engine scoring_method"
+    )
+    if method == "EAP":
+        n_quadpts = validate_quadrature_count(n_quadpts)
+    try:
+        bounds = validate_theta_bounds(theta_bounds)
+    except ValueError as error:
+        raise ValueError(
+            "theta_bounds must contain two finite values with lower < upper"
+        ) from error
+
     engine.model = model
-    engine.scoring_method = scoring_method
+    engine.scoring_method = method
     engine.n_quadpts = n_quadpts
-    engine.theta_bounds = theta_bounds
+    engine.theta_bounds = bounds
     engine.seed = seed
     engine.rng = np.random.default_rng(seed)
     engine._exposure_session_used = False
+
+
+def is_numerical_scoring_failure(error: BaseException) -> bool:
+    """Whether a scoring error reflects numerics rather than configuration.
+
+    Scorers report non-finite posterior mass or objective values with a
+    ``ValueError`` that names the finiteness requirement; arithmetic and
+    linear-algebra errors are numerical too.
+    """
+    if isinstance(error, (ArithmeticError, np.linalg.LinAlgError)):
+        return True
+    return isinstance(error, ValueError) and "finite" in str(error)
+
+
+def warn_scoring_failure(engine: Any, error: BaseException, fallback: str) -> None:
+    """Warn that an ability update failed numerically and name the fallback."""
+    warnings.warn(
+        f"{engine.scoring_method} ability update after "
+        f"{len(engine._items_administered)} items failed ({error}); {fallback}",
+        RuntimeWarning,
+        stacklevel=4,
+    )
 
 
 def reset_session_state(
@@ -316,12 +398,18 @@ def score_administered_responses(
     *,
     bounds: tuple[float, float] | None = None,
 ) -> Any:
-    """Run `fscores` for the current administered responses."""
+    """Run `fscores` for the current administered responses.
+
+    EAP and MAP integrate over the engine's scoring prior.
+    """
     from mirt.scoring import fscores
 
-    scoring_kwargs = {
+    prior_mean, prior_cov = engine._scoring_prior()
+    scoring_kwargs: dict[str, Any] = {
         "method": engine.scoring_method,
         "n_quadpts": engine.n_quadpts,
+        "prior_mean": prior_mean,
+        "prior_cov": prior_cov,
     }
     if bounds is not None:
         scoring_kwargs["bounds"] = bounds

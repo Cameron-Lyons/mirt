@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import lgamma
 from numbers import Integral, Real
 from typing import TYPE_CHECKING
 
@@ -15,13 +14,18 @@ from mirt.constants import (
     REGULARIZATION_EPSILON,
 )
 from mirt.estimation._variational import jaakkola_lambda, variational_e_step
-from mirt.estimation._variational_objective import variational_elbo
+from mirt.estimation._variational_objective import (
+    affine_marginal_log_likelihood,
+    variational_elbo,
+)
 from mirt.estimation._variational_statistics import variational_item_statistics
 from mirt.estimation.base import BaseEstimator, _reject_parameter_restrictions
+from mirt.estimation.regularized import ebic_penalty
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.models.multidimensional import MultidimensionalModel
 
 
 def _finite_float(value: object, name: str) -> float:
@@ -49,7 +53,10 @@ class SparseBayesianResult:
     Attributes
     ----------
     model : BaseItemModel
-        Fitted model with sparse loadings.
+        Fitted model. For a 2PL it is a slope-intercept
+        :class:`~mirt.models.multidimensional.MultidimensionalModel` with the
+        sparse loadings as slopes and ``intercepts``, so an item whose
+        loadings are all zero keeps its intercept; a 1PL is returned itself.
     loadings : NDArray[np.float64]
         Full factor loading matrix (n_items x k_max).
     sparse_loadings : NDArray[np.float64]
@@ -65,13 +72,19 @@ class SparseBayesianResult:
     sparsity_pattern : NDArray[np.bool_]
         Boolean mask of non-zero loadings.
     elbo : float
-        Final evidence lower bound.
+        Final evidence lower bound, including the spike-slab log-prior.
     log_likelihood : float
-        Approximate log-likelihood at convergence.
+        Marginal log-likelihood at the sparse loadings and intercepts,
+        integrated over the latent prior on EM's default grid for up to three
+        factors, so that it is comparable with an EM fit, and by importance
+        sampling from the variational posteriors (500 seeded draws per
+        person) otherwise.
     bic : float
-        BIC computed with effective number of parameters.
+        BIC from ``log_likelihood`` with the intercepts and the selected
+        loadings as parameters.
     ebic : float
-        Extended BIC for high-dimensional model selection.
+        Extended BIC, ``bic + log C(n_items * k_max, n_selected)`` (Chen and
+        Chen, 2008).
     n_iterations : int
         Number of EM iterations.
     converged : bool
@@ -334,6 +347,10 @@ class SparseBayesianEstimator(BaseEstimator):
     Rockova, V. & George, E.I. (2018). The Spike-and-Slab LASSO. JASA.
     """
 
+    # The variational updates move every coordinate and give every item its
+    # own loadings, so they neither hold fixed values nor tie a common slope.
+    _holds_fixed_parameters = False
+
     def __init__(
         self,
         k_max: int = 5,
@@ -408,6 +425,8 @@ class SparseBayesianEstimator(BaseEstimator):
         self._xi: NDArray[np.float64] | None = None
         self._elbo_history: list[float] = []
         self._fixed_loadings: bool = False
+        self._prior_mean: NDArray[np.float64] | None = None
+        self._prior_cov: NDArray[np.float64] | None = None
 
     def fit(
         self,
@@ -440,6 +459,10 @@ class SparseBayesianEstimator(BaseEstimator):
             If ``model.n_factors`` differs from ``k_max``, or if
             ``set_free_parameter_masks`` fixes parameters, which the
             variational updates cannot hold.
+        MirtModelError
+            If the model keeps a free parameter equal across items, such as
+            the common slope of ``OneParameterLogistic(...,
+            estimate_discrimination=True)``.
         """
         if model.model_name not in ("2PL", "1PL"):
             raise ValueError(
@@ -452,12 +475,14 @@ class SparseBayesianEstimator(BaseEstimator):
                 value=self.k_max,
                 expected=str(model.n_factors),
             )
+        self._check_shared_parameters(model)
         _reject_parameter_restrictions(model, "SparseBayesianEstimator")
 
-        responses = self._validate_responses(responses, model.n_items)
+        responses = self._validate_responses(responses, model.n_items, model)
         n_persons, n_items = responses.shape
 
         prior_mean, prior_cov = self._validate_prior(prior_mean, prior_cov)
+        self._prior_mean, self._prior_cov = prior_mean, prior_cov
         prior_cov_inv = np.linalg.solve(prior_cov, np.eye(self.k_max))
         self._fixed_loadings = model.model_name == "1PL"
 
@@ -522,15 +547,11 @@ class SparseBayesianEstimator(BaseEstimator):
         log_likelihood = self._compute_log_likelihood(responses, sparse_loadings)
         bic = -2 * log_likelihood + n_effective_params * np.log(n_persons)
         n_loading_candidates = 0 if self._fixed_loadings else n_items * self.k_max
-        log_model_count = (
-            lgamma(n_loading_candidates + 1)
-            - lgamma(n_selected_loadings + 1)
-            - lgamma(n_loading_candidates - n_selected_loadings + 1)
-            if n_loading_candidates
-            else 0.0
-        )
-        ebic = bic + log_model_count
+        ebic = bic + ebic_penalty(n_loading_candidates, n_selected_loadings)
 
+        # The 2PL difficulty form a'(theta - b) has no intercept when an item's
+        # loadings sum to zero, so the input model keeps difficulty 0 for such
+        # items and the result carries the slope-intercept fit.
         model._parameters["discrimination"] = (
             sparse_loadings.ravel() if model.n_factors == 1 else sparse_loadings.copy()
         )
@@ -538,9 +559,14 @@ class SparseBayesianEstimator(BaseEstimator):
             sparse_loadings
         )
         model._is_fitted = True
+        fitted_model = (
+            model
+            if self._fixed_loadings
+            else self._slope_intercept_model(model, sparse_loadings)
+        )
 
         return SparseBayesianResult(
-            model=model,
+            model=fitted_model,
             loadings=self._loadings.copy(),
             sparse_loadings=sparse_loadings,
             intercepts=self._intercepts.copy(),
@@ -649,6 +675,28 @@ class SparseBayesianEstimator(BaseEstimator):
             self._loadings = rng.normal(0, 0.5, (n_items, self.k_max))
             self._loadings[counts == 0] = 0.0
             self._gamma = self._ssl_prior.compute_posterior_inclusion(self._loadings)
+
+    def _slope_intercept_model(
+        self,
+        model: BaseItemModel,
+        sparse_loadings: NDArray[np.float64],
+    ) -> MultidimensionalModel:
+        """Return the fitted slopes and intercepts as a fitted MIRT model."""
+        from mirt.models.multidimensional import MultidimensionalModel
+
+        n_items, n_factors = sparse_loadings.shape
+        fitted = MultidimensionalModel(
+            n_items=n_items,
+            n_factors=n_factors,
+            item_names=list(model.item_names),
+            model_type="exploratory" if n_factors > 1 else "confirmatory",
+            loading_pattern=None if n_factors > 1 else np.ones((n_items, 1)),
+        )
+        fitted.set_parameters(
+            slopes=sparse_loadings.copy(), intercepts=self._intercepts.copy()
+        )
+        fitted._is_fitted = True
+        return fitted
 
     def _compute_difficulty_from_intercept(
         self,
@@ -763,10 +811,26 @@ class SparseBayesianEstimator(BaseEstimator):
         responses: NDArray[np.int_],
         loadings: NDArray[np.float64],
     ) -> float:
-        """Return stable conditional log-likelihood at posterior means."""
-        eta = self._mu @ loadings.T + self._intercepts
-        terms = responses * eta - np.logaddexp(0.0, eta)
-        return float(np.sum(terms[responses >= 0]))
+        """Return the marginal log-likelihood under the fitted latent prior.
+
+        The conditional log-likelihood at the variational means, reported
+        before, ignores the latent uncertainty and exceeded the marginal
+        value by thousands, which made BIC favor extra dimensions.
+        """
+        prior_mean = (
+            np.zeros(self.k_max) if self._prior_mean is None else self._prior_mean
+        )
+        prior_cov = np.eye(self.k_max) if self._prior_cov is None else self._prior_cov
+        value, _ = affine_marginal_log_likelihood(
+            responses,
+            loadings,
+            self._intercepts,
+            prior_mean,
+            prior_cov,
+            mu=self._mu,
+            sigma=self._sigma,
+        )
+        return value
 
     def _apply_sparsity(self) -> NDArray[np.float64]:
         """Set loadings with low inclusion probability to exactly zero."""

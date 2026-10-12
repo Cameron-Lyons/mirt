@@ -11,7 +11,11 @@ from numpy.typing import NDArray
 from mirt._core import sigmoid
 from mirt.constants import PROB_EPSILON
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.estimation.regularized import RegularizedMIRTEstimator, RegularizedMIRTResult
+from mirt.estimation.regularized import (
+    RegularizedMIRTEstimator,
+    RegularizedMIRTResult,
+    ebic_penalty,
+)
 from mirt.exceptions import MirtDataError, MirtEstimationError, MirtValidationError
 from mirt.utils._parallel import _process_pool, resolve_n_jobs
 from mirt.utils.data import validate_responses
@@ -106,32 +110,28 @@ class _RegularizationFoldTask:
     tol: float
 
 
-def _evaluate_regularization_fold(
-    task: _RegularizationFoldTask,
-) -> tuple[int, list[float], list[float]]:
-    """Fit and score every penalty value for one independent fold."""
-    train_data = task.responses[task.fold_indices != task.fold_index]
-    test_data = task.responses[task.fold_indices == task.fold_index]
-    estimator_options = {
-        "penalty": task.penalty,
-        "alpha": task.alpha,
-        "n_factors": task.n_factors,
-        "n_quadpts": task.n_quadpts,
-        "max_iter": task.max_iter,
-        "tol": task.tol,
-        "verbose": False,
-    }
-    scores: list[float] = []
-    nonzero: list[float] = []
-    for lambda_value in task.lambda_values:
-        estimator = RegularizedMIRTEstimator(**estimator_options)
+def _warm_started_path(
+    estimator: RegularizedMIRTEstimator,
+    responses: NDArray[np.int_],
+    lambda_values: tuple[float, ...] | list[float],
+    *,
+    isolate_failures: bool,
+) -> list[RegularizedMIRTResult | None]:
+    """Fit penalties from the smallest up, each starting from the previous fit.
+
+    The smallest penalty starts from the estimator's reference solution, as
+    :meth:`RegularizedMIRTEstimator.fit_path` does. With
+    ``isolate_failures``, a failed fit yields ``None`` and the next penalty
+    starts from the last successful fit.
+    """
+    results: list[RegularizedMIRTResult | None] = [None] * len(lambda_values)
+    previous: RegularizedMIRTResult | None = None
+    for index in np.argsort(lambda_values, kind="stable"):
         try:
-            result = estimator.fit(train_data, lambda_val=lambda_value)
-            score = _score_regularized_result(
-                result,
-                test_data,
-                criterion=task.criterion,
-                n_quadpts=task.n_quadpts,
+            result = estimator.fit(
+                responses,
+                lambda_val=lambda_values[index],
+                start="default" if previous is None else previous,
             )
         except (
             ValueError,
@@ -140,9 +140,60 @@ def _evaluate_regularization_fold(
             FloatingPointError,
             np.linalg.LinAlgError,
         ):
-            score = np.nan
+            if not isolate_failures:
+                raise
+            continue
+        results[index] = previous = result
+    return results
+
+
+def _evaluate_regularization_fold(
+    task: _RegularizationFoldTask,
+) -> tuple[int, list[float], list[float]]:
+    """Fit and score every penalty value for one independent fold.
+
+    The fold's penalties form a warm-started path on its training data.
+    """
+    train_data = task.responses[task.fold_indices != task.fold_index]
+    test_data = task.responses[task.fold_indices == task.fold_index]
+    estimator = RegularizedMIRTEstimator(
+        penalty=task.penalty,
+        alpha=task.alpha,
+        n_factors=task.n_factors,
+        n_quadpts=task.n_quadpts,
+        max_iter=task.max_iter,
+        tol=task.tol,
+        verbose=False,
+    )
+    scores: list[float] = []
+    nonzero: list[float] = []
+    fits = _warm_started_path(
+        estimator, train_data, task.lambda_values, isolate_failures=True
+    )
+    for result in fits:
+        score = np.nan
+        if result is not None:
+            try:
+                score = _score_regularized_result(
+                    result,
+                    test_data,
+                    criterion=task.criterion,
+                    n_quadpts=task.n_quadpts,
+                )
+            except (
+                ValueError,
+                RuntimeError,
+                ArithmeticError,
+                FloatingPointError,
+                np.linalg.LinAlgError,
+            ):
+                score = np.nan
         scores.append(float(score))
-        nonzero.append(float(result.n_nonzero) if np.isfinite(score) else np.nan)
+        nonzero.append(
+            float(result.n_nonzero)
+            if result is not None and np.isfinite(score)
+            else np.nan
+        )
     return task.fold_index, scores, nonzero
 
 
@@ -166,11 +217,20 @@ def cv_select_lambda(
 ) -> RegularizationCVResult:
     """Select regularization strength with person-level cross-validation.
 
+    Without ``lambda_values``, ``n_lambda`` penalties are spaced
+    geometrically from the full-data ``lambda_max`` of
+    :meth:`RegularizedMIRTEstimator.fit_path` down to one hundredth of it.
+    Each fold fits the penalties as a warm-started path on its training
+    data, from the smallest penalty up, and the final model is fitted the
+    same way on all responses up to the selected penalty.
+
     Held-out scores integrate over the latent trait distribution rather than
     evaluating every person at a zero trait vector. All stored scores use a
     higher-is-better orientation; BIC and EBIC are negated and normalized by
-    the held-out fold size. Independent folds can run in separate processes
-    with ``n_jobs``; use ``-1`` for all available CPUs.
+    the held-out fold size. EBIC adds ``log C(n_items * n_factors,
+    n_nonzero)`` to BIC (:func:`~mirt.estimation.regularized.ebic_penalty`).
+    Independent folds can run in separate processes with ``n_jobs``; use
+    ``-1`` for all available CPUs.
 
     Workers use ``spawn`` by default and preserve the configured mirt backend.
     Supply ``mp_context=multiprocessing.get_context(...)`` to select another
@@ -324,7 +384,12 @@ def cv_select_lambda(
         tol=tol / 10,
         verbose=verbose,
     )
-    best_result = final_estimator.fit(responses, lambda_val=final_lambda)
+    final_path = [value for value in lambda_values if value < final_lambda]
+    final_path.append(final_lambda)
+    best_result = _warm_started_path(
+        final_estimator, responses, final_path, isolate_failures=False
+    )[-1]
+    assert best_result is not None
 
     return RegularizationCVResult(
         lambda_values=lambda_values,
@@ -398,14 +463,13 @@ def _score_regularized_result(
 ) -> float:
     """Convert held-out likelihood or information criterion to a score."""
     test_ll = _compute_test_ll(result, test_data, n_quadpts=n_quadpts)
-    n_persons, n_items = test_data.shape
+    n_persons = test_data.shape[0]
     if criterion == "log_likelihood":
         return test_ll / n_persons
 
     information_criterion = -2 * test_ll + result.n_parameters * np.log(n_persons)
     if criterion == "ebic":
-        n_factors = result.loadings.shape[1]
-        information_criterion += n_items * n_factors * np.log(2)
+        information_criterion += ebic_penalty(result.loadings.size, result.n_nonzero)
     return -float(information_criterion) / n_persons
 
 
@@ -422,7 +486,19 @@ def information_criteria_path(
     tol: float = 1e-3,
     verbose: bool = False,
 ) -> tuple[float, RegularizedMIRTResult, list[RegularizedMIRTResult]]:
-    """Select regularization strength using a full-data information criterion."""
+    """Select regularization strength using a full-data information criterion.
+
+    Without ``lambda_values``, ``n_lambda`` penalties are spaced
+    geometrically from ``lambda_max`` down to one hundredth of it and fitted
+    as a warm-started path (see :meth:`RegularizedMIRTEstimator.fit_path`).
+    ``"ebic"`` is BIC plus ``log C(n_items * n_factors, n_nonzero)``.
+
+    Returns
+    -------
+    tuple
+        The selected penalty, its fit and the fits of every penalty, in the
+        order of ``lambda_values`` (largest first for a generated grid).
+    """
     responses = _validate_regularization_inputs(
         responses,
         penalty=penalty,

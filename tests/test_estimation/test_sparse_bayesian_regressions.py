@@ -10,16 +10,18 @@ import pytest
 from numpy.testing import assert_allclose
 
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
+from mirt.estimation.quadrature import GaussHermiteQuadrature
 from mirt.estimation.sparse_bayesian import (
     SparseBayesianEstimator,
     SparseBayesianResult,
     SpikeSlabLassoPrior,
 )
-from mirt.exceptions import MirtValidationError
+from mirt.exceptions import MirtModelError, MirtValidationError
 from mirt.models.dichotomous import (
     OneParameterLogistic,
     TwoParameterLogistic,
 )
+from mirt.utils.numeric import logsumexp
 
 
 def _slow_e_step(
@@ -383,13 +385,22 @@ def test_fit_handles_all_missing_rows_and_items_with_shifted_prior() -> None:
     assert_allclose(estimator._sigma[0], prior_cov, atol=1e-13)
     assert_allclose(result.loadings[2], 0.0, atol=0.0)
     assert result.intercepts[2] == pytest.approx(0.0)
-    assert result.model.difficulty[2] == pytest.approx(0.0)
+    assert result.model.intercepts[2] == pytest.approx(0.0)
     assert estimator.variational_means.shape == (4, 2)
     assert estimator.variational_covariances.shape == (4, 2, 2)
 
     means = estimator.variational_means
     means[0] = 100.0
     assert_allclose(estimator.variational_means[0], prior_mean, atol=1e-14)
+
+
+def test_fit_rejects_estimated_common_slope() -> None:
+    responses = np.array([[0, 0, 1], [0, 1, 1], [1, 0, 1], [1, 1, 0]])
+    model = OneParameterLogistic(n_items=3, estimate_discrimination=True)
+
+    with pytest.raises(MirtModelError, match="keeps equal across items"):
+        SparseBayesianEstimator(k_max=1, max_iter=2).fit(model, responses)
+    assert not model.is_fitted
 
 
 def test_one_factor_fit_preserves_model_parameter_shape() -> None:
@@ -454,3 +465,61 @@ def test_fit_reports_data_likelihood_and_combinatorial_ebic() -> None:
     assert result.log_likelihood != pytest.approx(result.elbo)
     assert result.bic == pytest.approx(expected_bic)
     assert result.ebic == pytest.approx(expected_bic + expected_log_models)
+
+
+def _noise_item_responses(seed: int = 7) -> np.ndarray:
+    """Two-factor simple structure plus two items without loadings."""
+    rng = np.random.default_rng(seed)
+    slopes = np.zeros((12, 2))
+    slopes[:5, 0] = rng.uniform(1.2, 2.0, 5)
+    slopes[5:10, 1] = rng.uniform(1.2, 2.0, 5)
+    intercepts = rng.uniform(-1.0, 1.0, 12)
+    intercepts[10:] = [2.0, -2.0]
+    theta = rng.standard_normal((800, 2))
+    probabilities = 1 / (1 + np.exp(-(theta @ slopes.T + intercepts)))
+    return (rng.random(probabilities.shape) < probabilities).astype(np.int64)
+
+
+@pytest.fixture(scope="module")
+def noise_item_fit() -> tuple[
+    np.ndarray, SparseBayesianEstimator, SparseBayesianResult
+]:
+    responses = _noise_item_responses()
+    estimator = SparseBayesianEstimator(k_max=2)
+    result = estimator.fit(TwoParameterLogistic(n_items=12, n_factors=2), responses)
+    return responses, estimator, result
+
+
+def test_items_without_loadings_keep_their_intercepts(noise_item_fit) -> None:
+    # The 2PL difficulty form cannot hold an intercept when the loadings sum
+    # to zero, so the fitted model predicted 0.5 for these items.
+    responses, _, result = noise_item_fit
+
+    assert_allclose(result.sparse_loadings[10:], 0.0, atol=0.0)
+    predicted = result.model.probability(np.zeros((1, 2)))[0, 10:]
+    assert_allclose(predicted, responses[:, 10:].mean(axis=0), atol=0.03)
+    assert_allclose(
+        result.model.probability(np.zeros((1, 2)))[0],
+        1 / (1 + np.exp(-result.intercepts)),
+    )
+
+
+def test_log_likelihood_is_the_marginal_likelihood(noise_item_fit) -> None:
+    # The conditional log-likelihood at the variational means exceeded the
+    # marginal likelihood by hundreds and made BIC favor extra dimensions.
+    responses, estimator, result = noise_item_fit
+    quadrature = GaussHermiteQuadrature(n_points=41, n_dimensions=2)
+    logits = quadrature.nodes @ result.sparse_loadings.T + result.intercepts
+    log_joint = (responses == 1) @ -np.logaddexp(0.0, -logits).T + (
+        responses == 0
+    ) @ -np.logaddexp(0.0, logits).T
+    expected = float(np.sum(logsumexp(log_joint + np.log(quadrature.weights), axis=1)))
+    eta = estimator._mu @ result.sparse_loadings.T + result.intercepts
+    conditional = float(np.sum(responses * eta - np.logaddexp(0.0, eta)))
+
+    assert result.log_likelihood == pytest.approx(expected, abs=0.5)
+    assert conditional - expected > 100.0
+    n_parameters = 12 + int(np.count_nonzero(result.sparsity_pattern))
+    assert result.bic == pytest.approx(
+        -2.0 * result.log_likelihood + n_parameters * np.log(len(responses))
+    )

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -900,6 +900,13 @@ class MIResult:
         Fraction of missing information.
     lambda_hat : float or NDArray[np.float64]
         Proportion of variation due to missingness.
+    t_statistic : float or NDArray[np.float64]
+        Wald statistic ``estimate / standard_error`` for a zero null value
+        (R's ``t``). Infinite for a nonzero estimate without uncertainty and
+        NaN for a zero estimate without uncertainty.
+    p_value : float or NDArray[np.float64]
+        Two-sided p-value of ``t_statistic`` on a t distribution with ``df``
+        degrees of freedom (R's ``p``).
     """
 
     estimate: float | NDArray[np.float64]
@@ -910,12 +917,15 @@ class MIResult:
     df: float | NDArray[np.float64]
     fmi: float | NDArray[np.float64]
     lambda_hat: float | NDArray[np.float64]
+    t_statistic: float | NDArray[np.float64] = field(default=np.nan)
+    p_value: float | NDArray[np.float64] = field(default=np.nan)
 
 
 def averageMI(
     estimates: Sequence[float | NDArray[np.float64]],
     variances: Sequence[float | NDArray[np.float64]] | None = None,
     standard_errors: Sequence[float | NDArray[np.float64]] | None = None,
+    df_complete: float | None = None,
 ) -> MIResult:
     """Combine results from multiple imputation using Rubin's rules.
 
@@ -934,6 +944,12 @@ def averageMI(
     standard_errors : list of float or ndarray, optional
         Standard errors from each imputation. Squared to get variances. Provide
         exactly one of standard_errors or variances.
+    df_complete : float, optional
+        Degrees of freedom of the complete-data analysis. When given, ``df``
+        uses the Barnard and Rubin (1999) small-sample adjustment, which
+        never exceeds ``df_complete``. By default the complete data are
+        treated as large, giving Rubin's (1987) degrees of freedom as R's
+        ``averageMI`` does.
 
     Returns
     -------
@@ -947,6 +963,8 @@ def averageMI(
         - df: Degrees of freedom for t-distribution
         - fmi: Fraction of missing information
         - lambda_hat: Proportion of variation due to missingness
+        - t_statistic, p_value: Wald test of a zero value on ``df``
+          degrees of freedom
 
     Examples
     --------
@@ -970,9 +988,29 @@ def averageMI(
     - Between variance: B = var(Q_m)
     - Total variance: T = U_bar + (1 + 1/m) * B
     - Degrees of freedom: Rubin's large-sample approximation
+      ``nu_old = (m - 1) / lambda**2`` with ``lambda = (1 + 1/m) * B / T``,
+      or with ``df_complete`` the Barnard-Rubin value
+      ``1 / (1 / nu_old + 1 / nu_obs)``, where
+      ``nu_obs = (nu_com + 1) / (nu_com + 3) * nu_com * (1 - lambda)``
+    - t = Q_bar / sqrt(T) and its two-sided p-value on those degrees of
+      freedom, as R's ``averageMI`` reports
+
+    References
+    ----------
+    Barnard, J., & Rubin, D. B. (1999). Small-sample degrees of freedom with
+    multiple imputation. *Biometrika, 86*(4), 948-955.
     """
+    from scipy import stats
+
+    from mirt.utils._validation import validate_positive_scalar
+
     if (variances is None) == (standard_errors is None):
         raise MirtValidationError("Provide exactly one of variances or standard_errors")
+    complete_df = (
+        None
+        if df_complete is None
+        else validate_positive_scalar(df_complete, "df_complete")
+    )
 
     m = len(estimates)
     if m < 2:
@@ -1034,8 +1072,22 @@ def averageMI(
         out=np.zeros_like(total_var),
         where=total_var > 0,
     )
-    fmi = lambda_hat + 2 / (df_old + 3) * (1 - lambda_hat)
+    df = df_old
+    if complete_df is not None:
+        observed_df = (
+            (complete_df + 1.0) / (complete_df + 3.0) * complete_df * (1.0 - lambda_hat)
+        )
+        df = np.divide(
+            df_old * observed_df,
+            df_old + observed_df,
+            out=np.zeros_like(observed_df),
+            where=observed_df > 0.0,
+        )
+    fmi = lambda_hat + 2 / (df + 3) * (1 - lambda_hat)
     fmi = np.clip(fmi, 0, 1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t_statistic = q_bar / se
+    p_value = 2.0 * stats.t.sf(np.abs(t_statistic), df)
 
     if q_bar.ndim == 0:
         return MIResult(
@@ -1044,9 +1096,11 @@ def averageMI(
             between_variance=float(b),
             total_variance=float(total_var),
             standard_error=float(se),
-            df=float(df_old),
+            df=float(df),
             fmi=float(fmi),
             lambda_hat=float(lambda_hat),
+            t_statistic=float(t_statistic),
+            p_value=float(p_value),
         )
 
     return MIResult(
@@ -1055,7 +1109,9 @@ def averageMI(
         between_variance=b,
         total_variance=total_var,
         standard_error=se,
-        df=df_old,
+        df=df,
         fmi=fmi,
         lambda_hat=lambda_hat,
+        t_statistic=t_statistic,
+        p_value=np.asarray(p_value, dtype=np.float64),
     )

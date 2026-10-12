@@ -101,7 +101,7 @@ def polytomous_item_curvature(
     result["steps"][: categories - 1] = scale**2 * np.sum(
         total[:, None] * tails * (1.0 - tails), axis=0
     )
-    if type(model) is PartialCreditModel:
+    if type(model) is PartialCreditModel and not model.estimate_discrimination:
         return result
 
     category = np.arange(categories)

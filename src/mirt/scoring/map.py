@@ -11,7 +11,6 @@ from mirt.results.score_result import ScoreResult
 from mirt.scoring._common import (
     finite_difference_se,
     finite_difference_se_rows,
-    resolve_n_jobs,
     resolve_prior_distribution,
     score_pattern_chunks,
     score_responses_parallel,
@@ -25,6 +24,7 @@ from mirt.scoring._optimization import (
     bounded_scalar_minimize,
     validate_theta_bounds,
 )
+from mirt.utils._parallel import resolve_n_jobs
 from mirt.utils.numeric import compute_hessian_se
 
 if TYPE_CHECKING:

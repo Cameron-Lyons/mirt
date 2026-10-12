@@ -4,11 +4,19 @@ This module provides functions to compute and analyze residuals from
 IRT models, which are useful for detecting model misfit and identifying
 aberrant response patterns.
 
-Residual types:
-- Raw residuals: O - E
-- Standardized residuals: (O - E) / sqrt(E * (1 - E))
-- Pearson residuals: (O - E) / sqrt(E)
-- Deviance residuals: sign(O - E) * sqrt(2 * |log(p)|)
+Residual types, for an item score ``x`` with expected value
+``E = E[x | theta]`` and probability ``P(x | theta)`` of the observed category:
+
+- Raw residuals: ``x - E``
+- Standardized residuals: ``(x - E) / sqrt(Var[x | theta])``, with the model
+  variance of the item score (``E * (1 - E)`` for binary items). This is the
+  Pearson residual of a generalized linear model, and the ``"pearson"`` type
+  of :func:`mirt.utils.residuals.residuals`.
+- Pearson residuals (``"pearson"``): ``(x - E) / sqrt(E)``, the Poisson form
+  that divides by the expected score. For binary items it is the Pearson
+  residual of the response-one cell alone, not the Bernoulli Pearson
+  residual; use ``"standardized"`` for that.
+- Deviance residuals: ``sign(x - E) * sqrt(-2 * log(P(x | theta)))``
 
 References:
     Hambleton, R. K., & Swaminathan, H. (1985). Item response theory:
@@ -24,7 +32,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.constants import PROB_EPSILON
-from mirt.utils.data import _missing_coded_responses
+from mirt.diagnostics._utils import aligned_missing_coded_responses
 from mirt.utils.numeric import (
     _fit_cell_terms,
     _FitStatsAccumulator,
@@ -103,9 +111,10 @@ class ResidualAnalysisResult:
     raw_residuals : NDArray
         Raw residuals (observed - expected)
     standardized_residuals : NDArray
-        Standardized residuals
+        Standardized residuals ``(x - E) / sqrt(Var[x | theta])``
     pearson_residuals : NDArray
-        Pearson residuals
+        Poisson-form Pearson residuals ``(x - E) / sqrt(E)``; see the module
+        notes
     deviance_residuals : NDArray
         Deviance (likelihood) residuals
     expected_values : NDArray
@@ -435,14 +444,22 @@ def compute_residuals(
     theta : ndarray, optional
         Ability estimates. If None, EAP estimates are computed.
     residual_type : str
-        Type of residual: "raw", "standardized", "pearson", or "deviance"
+        Type of residual, for the item score ``x`` and its expected value
+        ``E = E[x | theta]``:
+
+        - "raw": ``x - E``
+        - "standardized": ``(x - E) / sqrt(Var[x | theta])``
+        - "pearson": ``(x - E) / sqrt(E)``, the Poisson form. This is not the
+          ``"pearson"`` type of :func:`mirt.utils.residuals.residuals`, which
+          is an alias of "standardized".
+        - "deviance": ``sign(x - E) * sqrt(-2 log P(x | theta))``
 
     Returns
     -------
     ndarray
         Residual matrix of same shape as responses
     """
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     if residual_type not in _RESIDUAL_TYPES:
         raise ValueError(f"Unknown residual type: {residual_type}")
 
@@ -479,7 +496,7 @@ def analyze_residuals(
     ResidualAnalysisResult
         Complete residual analysis results
     """
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     model, theta_array = _resolve_theta(model, responses, theta)
     computation = _compute_residual_arrays(
         model,
@@ -638,7 +655,7 @@ def compute_outfit_infit(
         raise ValueError("include_counts must be boolean")
     if not isinstance(include_standardized, (bool, np.bool_)):
         raise ValueError("include_standardized must be boolean")
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     if responses.ndim != 2:
         raise ValueError("responses must be a two-dimensional matrix")
     model, theta_array = _resolve_theta(model, responses, theta)
@@ -689,7 +706,7 @@ def identify_misfitting_patterns(
     dict
         Dictionary with 'misfitting_persons', 'misfitting_items', 'aberrant_responses'
     """
-    responses = _missing_coded_responses(responses)
+    responses = aligned_missing_coded_responses(model, responses)
     model, theta_array = _resolve_theta(model, responses, theta)
     n_persons, n_items = responses.shape
     totals = _ItemPersonFit(n_persons, n_items)

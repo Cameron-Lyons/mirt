@@ -44,7 +44,7 @@ def test_plain_utils_import_defers_dependencies_and_modules() -> None:
         "numpy_loaded": False,
         "scipy_loaded": False,
         "utils_submodules": [],
-        "export_count": 120,
+        "export_count": 122,
         "exports_visible": True,
     }
 
@@ -141,7 +141,7 @@ def test_star_import_resolves_every_public_utility_export(residuals_last: bool) 
 
     assert result == {
         "matches_all": True,
-        "export_count": 120,
+        "export_count": 122,
         "all_cached": True,
         "residuals_is_function": True,
     }

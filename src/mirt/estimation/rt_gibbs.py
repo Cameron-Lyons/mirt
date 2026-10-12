@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
-from scipy.special import logsumexp
+from scipy.special import expit, logsumexp
 
-from mirt._core import sigmoid
-from mirt.backends.rust.response_time import rt_accept_person_proposals
+from mirt.backends.rust.response_time import (
+    rt_accept_person_proposals,
+    rt_joint_log_likelihood,
+)
 from mirt.constants import PROB_EPSILON
+from mirt.estimation._identified_covariance import sample_unit_leading_covariance
 from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
@@ -20,6 +24,62 @@ if TYPE_CHECKING:
 # touches per-item sufficient statistics, and five steps recover most of the
 # mixing of a direct draw.
 _TIME_DISCRIMINATION_MH_STEPS = 5
+# Random-walk scales for the accuracy item updates: (log a, b) jointly, and
+# guessing on the logit scale of c / guess_upper.
+_ACCURACY_PROPOSAL_SD = 0.1
+_GUESSING_LOGIT_PROPOSAL_SD = 0.3
+_GUESSING_LOGIT_LIMIT = 30.0
+# Person-by-item cells evaluated at once by the vectorized item updates.
+_ITEM_UPDATE_MAX_VALUES = 1_000_000
+# Population parameters fixed by the identification constraints. They stay in
+# ``chains`` as constants but are left out of the convergence diagnostics.
+_FIXED_POPULATION_PARAMETERS = ("mu_theta", "mu_tau", "sigma_11")
+
+
+def _accuracy_log_likelihoods(
+    correct: NDArray[np.bool_],
+    observed: NDArray[np.bool_],
+    theta: NDArray[np.float64],
+    discrimination: NDArray[np.float64],
+    difficulty: NDArray[np.float64],
+    guessing_sets: Sequence[NDArray[np.float64] | None],
+) -> NDArray[np.float64]:
+    """Sum every item's accuracy log likelihood over persons.
+
+    The logistic curve is evaluated once per person chunk and shared by all
+    guessing vectors in ``guessing_sets``; ``None`` selects the 2PL. Each
+    cell takes the log of its clipped response probability, as
+    :func:`rt_joint_log_likelihood` does, so every Gibbs block targets the
+    same likelihood.
+
+    Returns
+    -------
+    NDArray
+        Shape ``(len(guessing_sets), n_items)``.
+    """
+    n_persons, n_items = correct.shape
+    totals = np.zeros((len(guessing_sets), n_items), dtype=np.float64)
+    rows_per_chunk = max(1, _ITEM_UPDATE_MAX_VALUES // max(n_items, 1))
+    for start in range(0, n_persons, rows_per_chunk):
+        stop = min(start + rows_per_chunk, n_persons)
+        chunk_correct = correct[start:stop]
+        chunk_observed = observed[start:stop]
+        logistic = expit(discrimination * (theta[start:stop, None] - difficulty))
+        complement = 1.0 - logistic
+        for set_idx, guessing in enumerate(guessing_sets):
+            if guessing is None:
+                probability = np.where(chunk_correct, logistic, complement)
+            else:
+                probability = np.where(
+                    chunk_correct,
+                    guessing + (1.0 - guessing) * logistic,
+                    (1.0 - guessing) * complement,
+                )
+            np.clip(probability, PROB_EPSILON, 1.0 - PROB_EPSILON, out=probability)
+            np.log(probability, out=probability)
+            probability *= chunk_observed
+            totals[set_idx] += np.sum(probability, axis=0)
+    return totals
 
 
 @dataclass
@@ -28,8 +88,12 @@ class RTModelPriors:
 
     Item parameters have independent normal priors: ``log a_j`` and ``b_j``
     for accuracy, ``log alpha_j`` (time discrimination) and ``beta_j`` (time
-    intensity) for speed. The person ability-speed pairs share a
-    normal/inverse-Wishart population prior.
+    intensity) for speed. A 3PL guessing parameter ``c_j`` has a
+    ``Beta(guess_alpha, guess_beta)`` prior truncated to
+    ``(0, guess_upper)``. The person ability-speed pairs are
+    ``N(0, Sigma)`` with ``Var(theta) = Sigma[0, 0] = 1``, which identifies
+    the model. ``Sigma`` has the inverse-Wishart prior
+    ``IW(sigma_df, sigma_scale)`` conditioned on that unit ability variance.
 
     Attributes
     ----------
@@ -49,15 +113,26 @@ class RTModelPriors:
         Prior mean for time intensity
     time_int_var : float
         Prior variance for time intensity
-    mu_mean : NDArray
-        Prior mean for population mean
-    mu_cov : NDArray
-        Prior covariance for population mean
+    mu_mean : NDArray, optional
+        Deprecated and ignored. The ability-speed mean is fixed at zero to
+        identify the model. Passing a value other than the former default
+        ``[0, 0]`` emits a ``DeprecationWarning``.
+    mu_cov : NDArray, optional
+        Deprecated and ignored, like ``mu_mean``. Passing a value other than
+        the former default ``10 * I`` emits a ``DeprecationWarning``.
     sigma_df : int
         Degrees of freedom for inverse-Wishart prior on Σ. It only affects
         the ability-speed covariance, not the item parameters.
     sigma_scale : NDArray
         Scale matrix for inverse-Wishart prior on Σ
+    guess_alpha : float
+        First Beta shape parameter of the 3PL guessing prior
+    guess_beta : float
+        Second Beta shape parameter of the 3PL guessing prior
+    guess_upper : float
+        Upper bound of the guessing parameters, in ``(0, 1]``. The default
+        ``0.5`` with ``guess_alpha = guess_beta = 1`` is a uniform prior on
+        ``(0, 0.5)``.
     """
 
     disc_mean: float = 0.0
@@ -72,6 +147,9 @@ class RTModelPriors:
     mu_cov: NDArray[np.float64] | None = None
     sigma_df: int = 4
     sigma_scale: NDArray[np.float64] | None = None
+    guess_alpha: float = 1.0
+    guess_beta: float = 1.0
+    guess_upper: float = 0.5
 
     def __post_init__(self) -> None:
         for name in ("disc_mean", "diff_mean", "time_disc_mean", "time_int_mean"):
@@ -94,7 +172,14 @@ class RTModelPriors:
                 )
             setattr(self, name, numeric)
 
-        for name in ("disc_var", "diff_var", "time_disc_var", "time_int_var"):
+        for name in (
+            "disc_var",
+            "diff_var",
+            "time_disc_var",
+            "time_int_var",
+            "guess_alpha",
+            "guess_beta",
+        ):
             value = getattr(self, name)
             try:
                 numeric = float(value)
@@ -131,21 +216,62 @@ class RTModelPriors:
             )
         self.sigma_df = int(self.sigma_df)
 
+        try:
+            guess_upper = float(self.guess_upper)
+        except (TypeError, ValueError) as exc:
+            raise MirtValidationError(
+                "guess_upper must be in (0, 1]",
+                parameter="guess_upper",
+                value=self.guess_upper,
+                expected="0 < guess_upper <= 1",
+            ) from exc
+        if (
+            isinstance(self.guess_upper, (bool, np.bool_))
+            or not np.isfinite(guess_upper)
+            or not 0.0 < guess_upper <= 1.0
+        ):
+            raise MirtValidationError(
+                "guess_upper must be in (0, 1]",
+                parameter="guess_upper",
+                value=self.guess_upper,
+                expected="0 < guess_upper <= 1",
+            )
+        self.guess_upper = guess_upper
+
+        # The population mean is fixed at zero for identification, so these
+        # former priors are validated for compatibility but otherwise unused.
         if self.mu_mean is None:
             self.mu_mean = np.zeros(2)
         else:
             self.mu_mean = self._validated_array("mu_mean", self.mu_mean, (2,))
+            self._warn_ignored_mean_prior("mu_mean", self.mu_mean, np.zeros(2))
         if self.mu_cov is None:
             self.mu_cov = np.eye(2) * 10
         else:
             self.mu_cov = self._validated_array(
                 "mu_cov", self.mu_cov, (2, 2), positive_definite=True
             )
+            self._warn_ignored_mean_prior("mu_cov", self.mu_cov, np.eye(2) * 10)
         if self.sigma_scale is None:
             self.sigma_scale = np.eye(2)
         else:
             self.sigma_scale = self._validated_array(
                 "sigma_scale", self.sigma_scale, (2, 2), positive_definite=True
+            )
+
+    @staticmethod
+    def _warn_ignored_mean_prior(
+        name: str,
+        value: NDArray[np.float64],
+        former_default: NDArray[np.float64],
+    ) -> None:
+        """Warn when a population-mean prior that no longer applies is set."""
+        if not np.array_equal(value, former_default):
+            warnings.warn(
+                f"{name} is deprecated and ignored: the ability-speed mean is "
+                "fixed at zero to identify the response-time model",
+                DeprecationWarning,
+                stacklevel=4,
             )
 
     @staticmethod
@@ -197,6 +323,15 @@ class ResponseTimeGibbsSampler:
 
     Implements a blocked Gibbs sampler for the Van der Linden hierarchical
     model with MCMC estimation of all parameters.
+
+    The accuracy likelihood is invariant to a common shift and rescaling of
+    ability and difficulty, and the log-normal time model to a common shift
+    of speed and time intensity. The sampler fixes those directions as in
+    van der Linden (2007) and Fox, Klein Entink and van der Linden (2007):
+    the ability and speed means are zero and the ability variance is one.
+    Only ``Var(tau)`` and ``Cov(theta, tau)`` are sampled, so
+    ``mu_theta``, ``mu_tau`` and ``sigma_11`` are constant in the chains and
+    left out of ``rhat`` and ``ess``.
 
     Parameters
     ----------
@@ -354,7 +489,9 @@ class ResponseTimeGibbsSampler:
         Returns
         -------
         ResponseTimeResult
-            Fitted model with posterior samples
+            Fitted model with posterior samples. ``log_likelihood``, ``dic``
+            and ``waic`` evaluate every retained draw with the item and person
+            parameters of the same iteration.
         """
         from mirt.models.response_time import ResponseTimeModel, ResponseTimeResult
 
@@ -400,20 +537,18 @@ class ResponseTimeGibbsSampler:
             else None,
             time_discrimination=np.mean(chains["time_discrimination"], axis=0),
             time_intensity=np.mean(chains["time_intensity"], axis=0),
-            ability_speed_mean=np.array(
-                [np.mean(chains["mu_theta"]), np.mean(chains["mu_tau"])]
-            ),
+            ability_speed_mean=np.zeros(2),
             ability_speed_cov=np.array(
                 [
-                    [np.mean(chains["sigma_11"]), np.mean(chains["sigma_12"])],
+                    [1.0, np.mean(chains["sigma_12"])],
                     [np.mean(chains["sigma_12"]), np.mean(chains["sigma_22"])],
                 ]
             ),
             use_rust=self.use_rust,
         )
 
-        sample_log_likelihoods = self._posterior_log_likelihoods(
-            model, responses, log_rt, theta_samples, tau_samples
+        sample_log_likelihoods = self._draw_log_likelihoods(
+            responses, log_rt, theta_samples, tau_samples, chains
         )
         log_likelihood = float(np.mean(np.sum(sample_log_likelihoods, axis=1)))
 
@@ -434,8 +569,13 @@ class ResponseTimeGibbsSampler:
             sample_log_likelihoods,
         )
 
-        rhat = self._compute_rhat(diagnostic_chains)
-        ess = self._compute_ess(diagnostic_chains)
+        sampled_chains = {
+            name: values
+            for name, values in diagnostic_chains.items()
+            if name not in _FIXED_POPULATION_PARAMETERS
+        }
+        rhat = self._compute_rhat(sampled_chains)
+        ess = self._compute_ess(sampled_chains)
 
         converged = all(np.isfinite(r) and r < 1.1 for r in rhat.values())
 
@@ -580,9 +720,14 @@ class ResponseTimeGibbsSampler:
         n_samples = len(range(self.burnin, self.n_iter, self.thin))
         disc = np.ones(n_items)
         diff = np.zeros(n_items)
-        guess = np.full(n_items, 0.2) if accuracy_model == "3PL" else None
+        guess = (
+            np.full(n_items, min(0.2, 0.5 * self.priors.guess_upper))
+            if accuracy_model == "3PL"
+            else None
+        )
         time_disc = np.ones(n_items)
         time_int = np.zeros(n_items)
+        # The identification constraints fix mu = 0 and sigma[0, 0] = 1.
         mu = np.zeros(2)
         sigma = np.eye(2)
         theta = rng.standard_normal(n_persons)
@@ -633,15 +778,17 @@ class ResponseTimeGibbsSampler:
                     current_proposal_sd *= 1.2
                 acceptance_counts[:] = 0
 
-            disc, diff = self._sample_accuracy_params(responses, theta, disc, diff, rng)
-            if accuracy_model == "3PL":
+            disc, diff = self._sample_accuracy_params(
+                responses, theta, disc, diff, rng, guess=guess
+            )
+            if guess is not None:
                 guess = self._sample_guessing_params(
                     responses, theta, disc, diff, guess, rng
                 )
             time_disc, time_int = self._sample_time_params(
                 log_rt, tau, time_disc, time_int, rng
             )
-            mu, sigma = self._sample_population_params(theta, tau, mu, sigma, rng)
+            sigma = self._sample_population_params(theta, tau, rng)
 
             if iteration >= self.burnin and (iteration - self.burnin) % self.thin == 0:
                 chains["discrimination"][sample_idx] = disc
@@ -721,71 +868,47 @@ class ResponseTimeGibbsSampler:
         disc: NDArray[np.float64],
         diff: NDArray[np.float64],
         rng: np.random.Generator,
+        guess: NDArray[np.float64] | None = None,
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Sample accuracy item parameters via MH."""
+        """Update every item's ``(log a_j, b_j)`` by one random-walk MH step.
+
+        Items are conditionally independent given ability, so all proposals
+        are drawn and accepted together. The acceptance ratio uses the
+        accuracy model's own likelihood: the 3PL with the current guessing
+        parameters when ``guess`` is given, otherwise the 2PL.
+        """
         n_items = len(disc)
+        log_disc = np.log(disc)
+        log_disc_prop = log_disc + rng.normal(0.0, _ACCURACY_PROPOSAL_SD, n_items)
+        diff_prop = diff + rng.normal(0.0, _ACCURACY_PROPOSAL_SD, n_items)
+        log_uniform = np.log(rng.random(n_items))
+        disc_prop = np.exp(log_disc_prop)
 
-        new_disc = disc.copy()
-        new_diff = diff.copy()
+        correct = responses == 1
+        observed = responses >= 0
+        log_like_curr = _accuracy_log_likelihoods(
+            correct, observed, theta, disc, diff, (guess,)
+        )[0]
+        log_like_prop = _accuracy_log_likelihoods(
+            correct, observed, theta, disc_prop, diff_prop, (guess,)
+        )[0]
 
-        for j in range(n_items):
-            log_disc_curr = np.log(disc[j])
-            log_disc_prop = log_disc_curr + rng.normal(0, 0.1)
-            disc_prop = np.exp(log_disc_prop)
+        priors = self.priors
 
-            diff_prop = diff[j] + rng.normal(0, 0.1)
-
-            observed = responses[:, j] >= 0
-            observed_theta = theta[observed]
-            observed_responses = responses[observed, j]
-            p_curr = np.clip(
-                sigmoid(disc[j] * (observed_theta - diff[j])),
-                PROB_EPSILON,
-                1 - PROB_EPSILON,
-            )
-            p_prop = np.clip(
-                sigmoid(disc_prop * (observed_theta - diff_prop)),
-                PROB_EPSILON,
-                1 - PROB_EPSILON,
-            )
-            log_like_curr = np.sum(
-                np.where(
-                    observed_responses == 1,
-                    np.log(p_curr),
-                    np.log1p(-p_curr),
-                )
-            )
-            log_like_prop = np.sum(
-                np.where(
-                    observed_responses == 1,
-                    np.log(p_prop),
-                    np.log1p(-p_prop),
-                )
+        def log_prior(
+            log_a: NDArray[np.float64], b: NDArray[np.float64]
+        ) -> NDArray[np.float64]:
+            return (
+                -0.5 * (log_a - priors.disc_mean) ** 2 / priors.disc_var
+                - 0.5 * (b - priors.diff_mean) ** 2 / priors.diff_var
             )
 
-            log_prior_curr = (
-                -0.5
-                * (log_disc_curr - self.priors.disc_mean) ** 2
-                / self.priors.disc_var
-                - 0.5 * (diff[j] - self.priors.diff_mean) ** 2 / self.priors.diff_var
-            )
-            log_prior_prop = (
-                -0.5
-                * (log_disc_prop - self.priors.disc_mean) ** 2
-                / self.priors.disc_var
-                - 0.5 * (diff_prop - self.priors.diff_mean) ** 2 / self.priors.diff_var
-            )
-
-            # The walk and the prior both live on log a, so no Jacobian term.
-            log_accept = (log_like_prop + log_prior_prop) - (
-                log_like_curr + log_prior_curr
-            )
-
-            if np.log(rng.random()) < log_accept:
-                new_disc[j] = disc_prop
-                new_diff[j] = diff_prop
-
-        return new_disc, new_diff
+        # The walk and the prior both live on log a, so no Jacobian term.
+        log_accept = (log_like_prop + log_prior(log_disc_prop, diff_prop)) - (
+            log_like_curr + log_prior(log_disc, diff)
+        )
+        accepted = log_uniform < log_accept
+        return np.where(accepted, disc_prop, disc), np.where(accepted, diff_prop, diff)
 
     def _sample_guessing_params(
         self,
@@ -796,49 +919,50 @@ class ResponseTimeGibbsSampler:
         guess: NDArray[np.float64],
         rng: np.random.Generator,
     ) -> NDArray[np.float64]:
-        """Sample guessing parameters via MH."""
+        """Update every guessing parameter by one logit-scale MH step.
+
+        With ``U = guess_upper`` the walk moves ``eta_j = logit(c_j / U)``,
+        so proposals never leave ``(0, U)`` and the proposal is symmetric. The
+        target on the ``eta`` scale is the 3PL likelihood times the
+        ``Beta(guess_alpha, guess_beta)`` density of ``c_j`` times the
+        Jacobian ``dc / deta = c (U - c) / U``.
+        """
         n_items = len(guess)
+        upper = self.priors.guess_upper
+        alpha = self.priors.guess_alpha
+        beta = self.priors.guess_beta
+        log_upper = np.log(upper)
 
-        new_guess = guess.copy()
+        def log_density(eta: NDArray[np.float64]) -> NDArray[np.float64]:
+            log_guess = log_upper - np.logaddexp(0.0, -eta)
+            log_gap = log_upper - np.logaddexp(0.0, eta)
+            log_complement = np.log1p(-upper * expit(eta))
+            # alpha * log c combines the prior's (alpha - 1) log c with the
+            # Jacobian's log c; log_gap is the Jacobian's log(U - c).
+            return alpha * log_guess + (beta - 1.0) * log_complement + log_gap
 
-        for j in range(n_items):
-            guess_prop = guess[j] + rng.normal(0, 0.02)
-            guess_prop = np.clip(guess_prop, 0.01, 0.5)
+        eta = np.log(guess) - np.log(upper - guess)
+        eta_prop = eta + rng.normal(0.0, _GUESSING_LOGIT_PROPOSAL_SD, n_items)
+        guess_prop = upper * expit(eta_prop)
+        log_uniform = np.log(rng.random(n_items))
 
-            observed = responses[:, j] >= 0
-            observed_responses = responses[observed, j]
-            p_star = sigmoid(disc[j] * (theta[observed] - diff[j]))
-            p_curr = np.clip(
-                guess[j] + (1 - guess[j]) * p_star,
-                PROB_EPSILON,
-                1 - PROB_EPSILON,
-            )
-            p_prop = np.clip(
-                guess_prop + (1 - guess_prop) * p_star,
-                PROB_EPSILON,
-                1 - PROB_EPSILON,
-            )
-            log_like_curr = np.sum(
-                np.where(
-                    observed_responses == 1,
-                    np.log(p_curr),
-                    np.log1p(-p_curr),
-                )
-            )
-            log_like_prop = np.sum(
-                np.where(
-                    observed_responses == 1,
-                    np.log(p_prop),
-                    np.log1p(-p_prop),
-                )
-            )
-
-            log_accept = log_like_prop - log_like_curr
-
-            if np.log(rng.random()) < log_accept:
-                new_guess[j] = guess_prop
-
-        return new_guess
+        log_like_curr, log_like_prop = _accuracy_log_likelihoods(
+            responses == 1,
+            responses >= 0,
+            theta,
+            disc,
+            diff,
+            (guess, guess_prop),
+        )
+        log_accept = (log_like_prop + log_density(eta_prop)) - (
+            log_like_curr + log_density(eta)
+        )
+        # Rejecting |eta| >= 30 truncates the support to guessing values that
+        # stay distinguishable from 0 and U in floating point.
+        accepted = (log_uniform < log_accept) & (
+            np.abs(eta_prop) < _GUESSING_LOGIT_LIMIT
+        )
+        return np.where(accepted, guess_prop, guess)
 
     def _sample_time_params(
         self,
@@ -907,35 +1031,22 @@ class ResponseTimeGibbsSampler:
         self,
         theta: NDArray[np.float64],
         tau: NDArray[np.float64],
-        mu: NDArray[np.float64],
-        sigma: NDArray[np.float64],
         rng: np.random.Generator,
-    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Sample population mean and covariance."""
-        n_persons = len(theta)
-        person_params = np.column_stack([theta, tau])
+    ) -> NDArray[np.float64]:
+        """Draw the ability-speed covariance under the identification.
 
-        sample_mean = np.mean(person_params, axis=0)
-        prior_mean = self.priors.mu_mean
-        prior_cov = self.priors.mu_cov
-        sigma_inv = np.linalg.inv(sigma)
-        prior_cov_inv = np.linalg.inv(prior_cov)
-
-        post_cov = np.linalg.inv(prior_cov_inv + n_persons * sigma_inv)
-        post_mean = post_cov @ (
-            prior_cov_inv @ prior_mean + n_persons * sigma_inv @ sample_mean
+        The mean is fixed at zero and ``Sigma[0, 0] = Var(theta)`` at one, so
+        only ``Cov(theta, tau)`` and ``Var(tau)`` are random. They are drawn
+        exactly from the ``IW(sigma_df, sigma_scale)`` prior conditioned on
+        the unit ability variance: the conjugate regression of speed on
+        ability.
+        """
+        return sample_unit_leading_covariance(
+            np.column_stack([theta, tau]),
+            self.priors.sigma_df,
+            self.priors.sigma_scale,
+            rng,
         )
-
-        new_mu = rng.multivariate_normal(post_mean, post_cov)
-
-        centered = person_params - new_mu
-        scatter = centered.T @ centered
-        scale = self.priors.sigma_scale + scatter
-        df = self.priors.sigma_df + n_persons
-
-        new_sigma = stats.invwishart.rvs(df=df, scale=scale, random_state=rng)
-
-        return new_mu, new_sigma
 
     def _compute_dic(
         self,
@@ -988,6 +1099,37 @@ class ResponseTimeGibbsSampler:
         waic = -2 * (lppd - p_waic)
 
         return float(waic)
+
+    def _draw_log_likelihoods(
+        self,
+        responses: NDArray[np.int_],
+        log_rt: NDArray[np.float64],
+        theta_samples: NDArray[np.float64],
+        tau_samples: NDArray[np.float64],
+        chains: dict[str, NDArray[np.float64]],
+    ) -> NDArray[np.float64]:
+        """Evaluate every retained draw with its own iteration's parameters.
+
+        DIC and WAIC average the likelihood over the joint posterior, so each
+        ability-speed draw is paired with the item parameters stored at the
+        same iteration rather than with their posterior means.
+        """
+        guessing = chains.get("guessing")
+        log_likes = np.empty(theta_samples.shape, dtype=np.float64)
+        for sample_idx in range(theta_samples.shape[0]):
+            log_likes[sample_idx] = rt_joint_log_likelihood(
+                responses,
+                log_rt,
+                theta_samples[sample_idx],
+                tau_samples[sample_idx],
+                chains["discrimination"][sample_idx],
+                chains["difficulty"][sample_idx],
+                chains["time_discrimination"][sample_idx],
+                chains["time_intensity"][sample_idx],
+                None if guessing is None else guessing[sample_idx],
+                use_rust=self.use_rust,
+            )
+        return log_likes
 
     @staticmethod
     def _posterior_log_likelihoods(

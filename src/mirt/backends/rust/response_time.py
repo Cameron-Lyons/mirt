@@ -1,16 +1,20 @@
 """Rust backend: joint response-accuracy and response-time inference.
 
 Fallback mode: numpy. All functions provide vectorized NumPy fallbacks and
-honor the global backend preference.
+honor the global backend preference. Both paths raise :class:`ValueError`
+for arrays whose shapes disagree, which the kernels would otherwise index
+out of bounds.
 """
 
 from __future__ import annotations
+
+from collections.abc import Mapping
 
 import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
-from mirt.backends.rust._helpers import mirt_rs, rust_enabled
+from mirt.backends.rust._helpers import _call_native, mirt_rs, rust_enabled
 from mirt.constants import PROB_EPSILON
 
 FALLBACK_MODE = "numpy"
@@ -28,6 +32,47 @@ def _as_i32(values: NDArray[np.integer]) -> NDArray[np.int32]:
     return np.ascontiguousarray(values, dtype=np.int32)
 
 
+def _validate_rt_shapes(
+    responses: NDArray[np.integer],
+    log_rt: NDArray[np.float64],
+    person_values: Mapping[str, NDArray[np.float64]],
+    item_values: Mapping[str, NDArray[np.float64] | None],
+    *,
+    n_samples: int | None = None,
+) -> None:
+    """Check person and item arrays against the response matrix.
+
+    Person arrays have one entry per person, or ``(n_samples, n_persons)``
+    entries when ``n_samples`` is given; item arrays (``None`` for an absent
+    guessing vector) have one entry per item.
+
+    Raises
+    ------
+    ValueError
+        If ``responses`` is not a matrix, ``log_rt`` does not match it, or
+        another array does not have its expected shape.
+    """
+    response_shape = np.shape(responses)
+    if len(response_shape) != 2:
+        raise ValueError("responses must be a two-dimensional array")
+    if np.shape(log_rt) != response_shape:
+        raise ValueError(
+            f"log_rt must have shape {response_shape}, got {np.shape(log_rt)}"
+        )
+    n_persons, n_items = response_shape
+    person_shape = (n_persons,) if n_samples is None else (n_samples, n_persons)
+    for name, values in person_values.items():
+        if np.shape(values) != person_shape:
+            raise ValueError(
+                f"{name} must have shape {person_shape}, got {np.shape(values)}"
+            )
+    for name, values in item_values.items():
+        if values is not None and np.shape(values) != (n_items,):
+            raise ValueError(
+                f"{name} must have shape ({n_items},), got {np.shape(values)}"
+            )
+
+
 def rt_joint_log_likelihood(
     responses: NDArray[np.integer],
     log_rt: NDArray[np.float64],
@@ -42,6 +87,18 @@ def rt_joint_log_likelihood(
     use_rust: bool = True,
 ) -> NDArray[np.float64]:
     """Compute conditional joint log likelihoods for every person."""
+    _validate_rt_shapes(
+        responses,
+        log_rt,
+        {"theta": theta, "tau": tau},
+        {
+            "discrimination": discrimination,
+            "difficulty": difficulty,
+            "time_discrimination": time_discrimination,
+            "time_intensity": time_intensity,
+            "guessing": guessing,
+        },
+    )
     if use_rust and rust_enabled():
         arguments = (
             _as_i32(responses),
@@ -57,14 +114,16 @@ def rt_joint_log_likelihood(
         )
         if guessing is None:
             return np.asarray(
-                mirt_rs.rt_joint_log_likelihood(
+                _call_native(
+                    mirt_rs.rt_joint_log_likelihood,
                     *arguments,
                     *timing_arguments,
                 ),
                 dtype=np.float64,
             )
         return np.asarray(
-            mirt_rs.rt_joint_log_likelihood_3pl(
+            _call_native(
+                mirt_rs.rt_joint_log_likelihood_3pl,
                 *arguments,
                 _as_f64(guessing),
                 *timing_arguments,
@@ -122,9 +181,26 @@ def rt_joint_log_likelihood_samples(
     sample_chunk_size: int | None = None,
 ) -> NDArray[np.float64]:
     """Compute paired posterior log likelihoods for every sample and person."""
+    theta_shape = np.shape(theta)
+    if len(theta_shape) != 2:
+        raise ValueError("theta must have shape (n_samples, n_persons)")
+    _validate_rt_shapes(
+        responses,
+        log_rt,
+        {"theta": theta, "tau": tau},
+        {
+            "discrimination": discrimination,
+            "difficulty": difficulty,
+            "time_discrimination": time_discrimination,
+            "time_intensity": time_intensity,
+            "guessing": guessing,
+        },
+        n_samples=theta_shape[0],
+    )
     if use_rust and rust_enabled():
         return np.asarray(
-            mirt_rs.rt_joint_log_likelihood_samples(
+            _call_native(
+                mirt_rs.rt_joint_log_likelihood_samples,
                 _as_i32(responses),
                 _as_f64(log_rt),
                 _as_f64(theta),
@@ -216,8 +292,32 @@ def rt_accept_person_proposals(
     use_rust: bool = True,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
     """Accept or reject pre-generated joint ability and speed proposals."""
+    _validate_rt_shapes(
+        responses,
+        log_rt,
+        {
+            "theta": theta,
+            "tau": tau,
+            "theta_proposed": theta_proposed,
+            "tau_proposed": tau_proposed,
+            "log_uniform": log_uniform,
+        },
+        {
+            "discrimination": discrimination,
+            "difficulty": difficulty,
+            "time_discrimination": time_discrimination,
+            "time_intensity": time_intensity,
+            "guessing": guessing,
+        },
+    )
+    if np.shape(mean) != (2,) or np.shape(covariance_inverse) != (2, 2):
+        raise ValueError(
+            "mean must have shape (2,) and covariance_inverse shape (2, 2), got "
+            f"{np.shape(mean)} and {np.shape(covariance_inverse)}"
+        )
     if use_rust and rust_enabled():
-        new_theta, new_tau, accepted = mirt_rs.rt_accept_person_proposals(
+        new_theta, new_tau, accepted = _call_native(
+            mirt_rs.rt_accept_person_proposals,
             _as_i32(responses),
             _as_f64(log_rt),
             _as_f64(theta),

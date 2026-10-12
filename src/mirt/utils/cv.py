@@ -25,6 +25,8 @@ if TYPE_CHECKING:
 
 ModelType = Literal["1PL", "2PL", "3PL", "4PL", "GRM", "GPCM", "PCM", "NRM"]
 AbilityMethod = Literal["EAP", "MAP", "ML", "WLE", "EAPsum"]
+# Largest person-by-node likelihood matrix held while scoring a test fold.
+_MAX_SCORE_ELEMENTS = 4_000_000
 
 
 def _validate_split_responses(
@@ -639,17 +641,101 @@ class Scorer(ABC):
         ...
 
 
+def _held_out_log_likelihood(
+    result: FitResult,
+    responses: NDArray[np.int_],
+) -> float:
+    """Return the marginal log-likelihood of ``responses`` under a fit.
+
+    Each response pattern's likelihood is integrated over the fit's latent
+    population on the fit's own quadrature grid: the grid size, quadrature
+    rule and final latent density recorded in its ``refit_recipe``. A fit
+    without a recipe integrates over its ``latent_mean`` and
+    ``latent_covariance`` (standard normal by default) on the default
+    Gauss-Hermite grid. Scoring the training responses of an EM fit
+    therefore reproduces the fit's own marginal log-likelihood.
+    """
+    from copy import deepcopy
+
+    from scipy.special import logsumexp
+
+    from mirt.estimation.latent_density import GaussianDensity
+    from mirt.estimation.quadrature import build_quadrature, resolve_quadpts
+
+    model = result.model
+    n_factors = model.n_factors
+    recipe = getattr(result, "refit_recipe", None)
+    options = {} if recipe is None else recipe.options
+    n_points = resolve_quadpts(options.get("n_quadpts"), n_factors)
+    quadrature = build_quadrature(
+        n_points, n_factors, options.get("quadrature", "gauss-hermite")
+    )
+    if recipe is not None and recipe.latent_density is not None:
+        density = deepcopy(recipe.latent_density)
+    else:
+        density = GaussianDensity(
+            mean=getattr(result, "latent_mean", None),
+            cov=getattr(result, "latent_covariance", None),
+            n_dimensions=n_factors,
+        )
+    nodes = quadrature.nodes
+    log_mass = density.log_quadrature_mass(nodes, quadrature.weights)
+
+    # Persons are scored in blocks that bound the likelihood matrix.
+    block_size = max(1, _MAX_SCORE_ELEMENTS // nodes.shape[0])
+    total = 0.0
+    for start in range(0, responses.shape[0], block_size):
+        conditional = model.log_likelihood_batch(
+            responses[start : start + block_size], nodes
+        )
+        total += float(np.sum(logsumexp(conditional + log_mass[None, :], axis=1)))
+    return total
+
+
 @dataclass
 class LogLikelihoodScorer(Scorer):
-    """Scorer based on log-likelihood on held-out data.
+    """Scorer based on the held-out marginal log-likelihood.
 
-    Computes the log-likelihood of the test data given the model
-    fitted on training data.
+    Sums ``log ∫ P(x_i | θ) g(θ) dθ`` over the test persons, using the item
+    parameters and the latent population ``g`` of the model fitted on the
+    training data. The integral uses the training fit's quadrature grid and
+    latent density, so the test responses never inform their own ability
+    values and more flexible models are not rewarded for fitting them. Use
+    :class:`PluginLogLikelihoodScorer` for the conditional likelihood at
+    EAP estimates.
     """
 
     @property
     def name(self) -> str:
         return "log_likelihood"
+
+    def __call__(
+        self,
+        result: FitResult,
+        train_responses: NDArray[np.int_],
+        test_responses: NDArray[np.int_],
+        test_indices: NDArray[np.intp] | None = None,
+    ) -> float:
+        """Compute the marginal log-likelihood of the test data."""
+        _ = train_responses, test_indices
+        return _held_out_log_likelihood(result, test_responses)
+
+
+@dataclass
+class PluginLogLikelihoodScorer(Scorer):
+    """Scorer based on the conditional log-likelihood at EAP estimates.
+
+    Sums ``log P(x_i | θ̂_i)`` over the test persons, where ``θ̂_i`` is the
+    EAP estimate computed from person ``i``'s own test responses. Because
+    the test responses choose their own abilities, the score is optimistic
+    and favours models with more latent dimensions or item parameters; it is
+    not a held-out likelihood. :class:`LogLikelihoodScorer`, the default of
+    :func:`cross_validate`, integrates over the latent population instead.
+    """
+
+    @property
+    def name(self) -> str:
+        return "plugin_log_likelihood"
 
     @property
     def ability_method(self) -> Literal["EAP"]:
@@ -662,7 +748,7 @@ class LogLikelihoodScorer(Scorer):
         test_responses: NDArray[np.int_],
         test_indices: NDArray[np.intp] | None = None,
     ) -> float:
-        """Compute log-likelihood on test data."""
+        """Compute the plug-in log-likelihood on test data."""
         from mirt.scoring import fscores
 
         ability_result = fscores(
@@ -686,7 +772,7 @@ class LogLikelihoodScorer(Scorer):
         ability_result: ScoreResult,
         test_indices: NDArray[np.intp] | None = None,
     ) -> float:
-        """Compute held-out log-likelihood from estimated abilities."""
+        """Compute the plug-in log-likelihood from estimated abilities."""
         _ = train_responses, test_indices
         theta = ability_result.theta
         if theta.ndim == 1:
@@ -766,8 +852,9 @@ class AbilityRMSEScorer(Scorer):
 class AICScorer(Scorer):
     """Scorer based on AIC (Akaike Information Criterion).
 
-    Returns negative AIC since lower AIC is better but
-    cross-validation expects higher scores to be better.
+    Returns the negative AIC of the training-fold fit, since lower AIC is
+    better but cross-validation expects higher scores to be better. The test
+    responses are not used, so the score is not cross-validated.
     """
 
     @property
@@ -790,8 +877,9 @@ class AICScorer(Scorer):
 class BICScorer(Scorer):
     """Scorer based on BIC (Bayesian Information Criterion).
 
-    Returns negative BIC since lower BIC is better but
-    cross-validation expects higher scores to be better.
+    Returns the negative BIC of the training-fold fit, since lower BIC is
+    better but cross-validation expects higher scores to be better. The test
+    responses are not used, so the score is not cross-validated.
     """
 
     @property
@@ -1012,7 +1100,9 @@ def cross_validate(
     splitter : Splitter, optional
         Data splitting strategy. Default is KFold(n_splits=5).
     scorers : list[Scorer], optional
-        Scoring functions. Default is [LogLikelihoodScorer()].
+        Scoring functions. Default is ``[LogLikelihoodScorer()]``, the
+        held-out marginal log-likelihood of each test fold under the model
+        and latent population fitted to its training folds.
     n_categories : int, optional
         Number of categories for polytomous models.
     n_factors : int, default=1
@@ -1168,6 +1258,7 @@ __all__ = [
     "LeaveOneOut",
     "Scorer",
     "LogLikelihoodScorer",
+    "PluginLogLikelihoodScorer",
     "AbilityRMSEScorer",
     "AICScorer",
     "BICScorer",

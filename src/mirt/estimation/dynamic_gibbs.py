@@ -14,8 +14,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
 
-from mirt._core import sigmoid
-from mirt.constants import PROB_EPSILON
+from mirt.estimation._identified_covariance import sample_unit_leading_covariance
 from mirt.estimation.bkt_em import _bkt_result_fields, _prepare_bkt_fit
 from mirt.models.dynamic import (
     BKTModel,
@@ -25,27 +24,37 @@ from mirt.models.dynamic import (
 )
 
 _LONGITUDINAL_MAX_PROBABILITY_VALUES = 1_000_000
+# Largest person-occasion-by-item grid whose item-step log-likelihood cells
+# are kept so the next theta step can reuse its current-state term.
+_LONGITUDINAL_REUSE_MAX_VALUES = 4_000_000
 
 
-def _binary_log_likelihood(
-    probabilities: NDArray[np.float64],
+def _binary_log_likelihood_cells(
+    logits: NDArray[np.float64],
+    responses: NDArray[np.int_],
+) -> NDArray[np.float64]:
+    """Return per-cell 2PL log-likelihood contributions from the logits.
+
+    ``log P(X = 1) = -log(1 + exp(-z))`` and ``log P(X = 0) =
+    -log(1 + exp(z))``. One ``logaddexp`` on the response-signed logit is
+    exact in both tails, so no probability clipping is needed. Missing
+    responses contribute zero.
+    """
+    contributions = np.where(responses == 1, -logits, logits)
+    np.logaddexp(0.0, contributions, out=contributions)
+    np.negative(contributions, out=contributions)
+    contributions *= responses >= 0
+    return contributions
+
+
+def _binary_log_likelihood_from_logits(
+    logits: NDArray[np.float64],
     responses: NDArray[np.int_],
     *,
     axis: int,
 ) -> NDArray[np.float64]:
-    """Sum clipped binary log-likelihood contributions along one axis."""
-    np.clip(
-        probabilities,
-        PROB_EPSILON,
-        1.0 - PROB_EPSILON,
-        out=probabilities,
-    )
-    contributions = np.zeros_like(probabilities)
-    correct = responses == 1
-    incorrect = responses == 0
-    np.log(probabilities, out=contributions, where=correct)
-    np.log1p(-probabilities, out=contributions, where=incorrect)
-    return np.sum(contributions, axis=axis)
+    """Sum 2PL log-likelihood contributions along one axis from the logits."""
+    return np.sum(_binary_log_likelihood_cells(logits, responses), axis=axis)
 
 
 def _longitudinal_log_likelihood_rows(
@@ -60,14 +69,12 @@ def _longitudinal_log_likelihood_rows(
 
     for start in range(0, n_rows, rows_per_chunk):
         stop = min(start + rows_per_chunk, n_rows)
-        chunk_responses = responses[start:stop]
-        probabilities = np.asarray(
-            model.probability(theta[start:stop]),
-            dtype=np.float64,
+        logits = model.discrimination[None, :] * (
+            theta[start:stop, None] - model.difficulty[None, :]
         )
-        log_likelihood[start:stop] = _binary_log_likelihood(
-            probabilities,
-            chunk_responses,
+        log_likelihood[start:stop] = _binary_log_likelihood_from_logits(
+            logits,
+            responses[start:stop],
             axis=1,
         )
 
@@ -108,7 +115,14 @@ class BKTPriors:
 
 @dataclass
 class LongitudinalPriors:
-    """Prior specifications for longitudinal IRT parameters."""
+    """Prior specifications for longitudinal IRT parameters.
+
+    :class:`LongitudinalGibbsSampler` fixes ``growth_mean[0] = 0`` and
+    ``growth_cov[0, 0] = 1`` to identify the latent scale. The growth-mean
+    prior ``N(growth_mean_prior_mean, growth_mean_prior_cov)`` and the
+    covariance prior ``IW(growth_cov_prior_df, growth_cov_prior_scale)``
+    therefore apply conditionally on those fixed values.
+    """
 
     discrimination_mean: float = 1.0
     discrimination_var: float = 1.0
@@ -621,9 +635,21 @@ class LongitudinalGibbsSampler:
     1. θ trajectories by one Metropolis-Hastings step from the current chain
        state, with prior N(growth-curve prediction, residual variance)
     2. Growth factors (η₀, η₁) given θ trajectories
-    3. Item parameters given responses and θ
-    4. Population parameters
-    5. Residual variance
+    3. A common shift and a common rescaling of the whole latent scale, which
+       leave the likelihood unchanged (parameter-expansion moves)
+    4. Item parameters given responses and θ
+    5. Population parameters
+    6. Residual variance
+
+    The 2PL likelihood is unchanged when every θ is mapped to ``c θ + d``
+    together with ``a / c`` and ``c b + d``, so the latent location and scale
+    must be fixed. The sampler makes the intercept growth factor standard
+    normal, ``η₀ ~ N(0, 1)``: ``growth_mean[0] = 0`` and
+    ``growth_cov[0, 0] = 1`` in every draw. η₀ is the latent trait at time
+    zero net of the occasion residual, so with the default ``time_values``
+    this standardizes the first occasion. Item parameters, the remaining
+    growth means and covariances and the residual variance are reported on
+    that scale. AIC and BIC count only the free parameters.
     """
 
     def __init__(
@@ -731,10 +757,9 @@ class LongitudinalGibbsSampler:
 
         n_growth = model.n_growth_factors
         self.priors._validate_growth_dimension(n_growth)
-        growth_factors = rng.multivariate_normal(
-            np.zeros(n_growth), np.eye(n_growth), size=n_persons
+        growth_factors, theta_trajectories = self._initial_state(
+            responses, model, time_values
         )
-        theta_trajectories = model.compute_theta(growth_factors, time_values)
 
         chains: dict[str, list[Any]] = {
             "growth_factors": [],
@@ -745,6 +770,9 @@ class LongitudinalGibbsSampler:
             "residual_variance": [],
         }
 
+        # Row log-likelihoods at the current theta and item parameters, kept by
+        # the item step for the next theta step (neither changes in between).
+        current_row_log_likelihood: NDArray[np.float64] | None = None
         for iteration in range(self.n_iter):
             theta_trajectories = self._sample_theta(
                 responses,
@@ -753,13 +781,20 @@ class LongitudinalGibbsSampler:
                 growth_factors,
                 time_values,
                 rng,
+                current_log_likelihood=current_row_log_likelihood,
             )
 
             growth_factors = self._sample_growth_factors(
                 theta_trajectories, model, time_values, rng
             )
 
-            self._sample_item_params(responses, theta_trajectories, model, rng)
+            theta_trajectories, growth_factors = self._sample_location_scale(
+                theta_trajectories, growth_factors, model, rng
+            )
+
+            current_row_log_likelihood = self._sample_item_params(
+                responses, theta_trajectories, model, rng
+            )
 
             self._sample_population_params(growth_factors, model, rng)
 
@@ -790,7 +825,9 @@ class LongitudinalGibbsSampler:
         theta_final = model.compute_theta(growth_factors_final, time_values)
 
         ll_final = self._compute_log_likelihood(responses, theta_final, model)
-        n_params = 2 * n_items + n_growth + n_growth * (n_growth + 1) // 2 + 1
+        # Item parameters, free growth means and covariances (growth_mean[0]
+        # and growth_cov[0, 0] are fixed) and the residual variance.
+        n_params = 2 * n_items + (n_growth - 1) + n_growth * (n_growth + 1) // 2
         n_obs = np.sum(responses >= 0)
         aic = -2 * ll_final + 2 * n_params
         bic = -2 * ll_final + np.log(n_obs) * n_params
@@ -870,6 +907,45 @@ class LongitudinalGibbsSampler:
 
         return response_values.astype(np.int_, copy=False), times
 
+    @staticmethod
+    def _initial_state(
+        responses: NDArray[np.int_],
+        model: LongitudinalIRTModel,
+        time_values: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Start the chain from standardized empirical-logit trajectories.
+
+        Each person-occasion starts at the smoothed log-odds of its observed
+        responses, and the growth factors at their least-squares fit. Both are
+        mapped to the identified scale, on which the intercept factor has mean
+        zero and unit variance, and the residual variance starts at the mean
+        squared residual (at least 0.1). A random start far from that scale
+        took the random-walk theta updates thousands of sweeps to leave.
+        """
+        n_persons = responses.shape[0]
+        n_observed = np.count_nonzero(responses >= 0, axis=2)
+        n_correct = np.count_nonzero(responses == 1, axis=2)
+        empirical = np.log((n_correct + 0.5) / (n_observed - n_correct + 0.5))
+
+        design = np.ones((time_values.size, model.n_growth_factors))
+        design[:, 1] = time_values
+        if model.growth_model == "quadratic":
+            design[:, 2] = time_values**2
+        growth_factors = np.linalg.lstsq(design, empirical.T, rcond=None)[0].T
+        growth_factors = growth_factors.reshape(n_persons, model.n_growth_factors)
+
+        location = float(np.mean(growth_factors[:, 0]))
+        scale = float(np.std(growth_factors[:, 0]))
+        if not np.isfinite(scale) or scale <= 1e-8:
+            scale = 1.0
+        growth_factors[:, 0] -= location
+        growth_factors /= scale
+        theta = (empirical - location) / scale
+
+        residual = theta - growth_factors @ design.T
+        model.residual_variance = max(float(np.mean(residual**2)), 0.1)
+        return growth_factors, theta
+
     def _sample_theta(
         self,
         responses: NDArray[np.int_],
@@ -878,12 +954,15 @@ class LongitudinalGibbsSampler:
         growth_factors: NDArray[np.float64],
         time_values: NDArray[np.float64],
         rng: np.random.Generator,
+        current_log_likelihood: NDArray[np.float64] | None = None,
     ) -> NDArray[np.float64]:
         """Advance every theta trajectory by one random-walk MH step.
 
         The chain state ``theta_current`` is the starting point and the
         growth-curve prediction is the mean of the conditional prior
-        ``N(theta_pred, residual_variance)``.
+        ``N(theta_pred, residual_variance)``. ``current_log_likelihood``
+        optionally supplies the flattened row log-likelihoods at
+        ``theta_current`` and the current item parameters.
         """
         theta_pred = model.compute_theta(growth_factors, time_values).reshape(-1)
         current = np.asarray(theta_current, dtype=np.float64).reshape(-1)
@@ -891,11 +970,14 @@ class LongitudinalGibbsSampler:
         log_uniform = np.log(rng.random(current.shape))
 
         flat_responses = responses.reshape(-1, model.n_items)
-        ll_current = _longitudinal_log_likelihood_rows(
-            flat_responses,
-            current,
-            model,
-        )
+        if current_log_likelihood is None:
+            ll_current = _longitudinal_log_likelihood_rows(
+                flat_responses,
+                current,
+                model,
+            )
+        else:
+            ll_current = current_log_likelihood
         ll_proposed = _longitudinal_log_likelihood_rows(
             flat_responses,
             proposed,
@@ -949,8 +1031,16 @@ class LongitudinalGibbsSampler:
         theta_trajectories: NDArray[np.float64],
         model: LongitudinalIRTModel,
         rng: np.random.Generator,
-    ) -> None:
-        """Sample item parameters using MH."""
+    ) -> NDArray[np.float64] | None:
+        """Sample item parameters using MH.
+
+        Returns
+        -------
+        NDArray or None
+            Flattened row log-likelihoods at ``theta_trajectories`` and the
+            updated item parameters, for reuse by the next theta step. ``None``
+            when the response grid exceeds the cell-reuse budget.
+        """
         n_items = responses.shape[2]
         proposal_sd_a = 0.1
         proposal_sd_b = 0.15
@@ -982,28 +1072,26 @@ class LongitudinalGibbsSampler:
             1,
             _LONGITUDINAL_MAX_PROBABILITY_VALUES // n_items,
         )
+        keep_cells = flat_responses.size <= _LONGITUDINAL_REUSE_MAX_VALUES
+        current_cells: list[NDArray[np.float64]] = []
+        proposed_cells: list[NDArray[np.float64]] = []
         for start in range(0, flat_theta.size, rows_per_chunk):
             stop = min(start + rows_per_chunk, flat_theta.size)
             theta_chunk = flat_theta[start:stop, None]
             response_chunk = flat_responses[start:stop]
-            current_probability = np.asarray(
-                sigmoid(a_current * (theta_chunk - b_current)),
-                dtype=np.float64,
-            )
-            proposed_probability = np.asarray(
-                sigmoid(a_proposed * (theta_chunk - b_proposed)),
-                dtype=np.float64,
-            )
-            ll_current += _binary_log_likelihood(
-                current_probability,
+            current_chunk = _binary_log_likelihood_cells(
+                a_current * (theta_chunk - b_current),
                 response_chunk,
-                axis=0,
             )
-            ll_proposed += _binary_log_likelihood(
-                proposed_probability,
+            proposed_chunk = _binary_log_likelihood_cells(
+                a_proposed * (theta_chunk - b_proposed),
                 response_chunk,
-                axis=0,
             )
+            ll_current += np.sum(current_chunk, axis=0)
+            ll_proposed += np.sum(proposed_chunk, axis=0)
+            if keep_cells:
+                current_cells.append(current_chunk)
+                proposed_cells.append(proposed_chunk)
 
         prior_scale_a = np.sqrt(self.priors.discrimination_var)
         prior_scale_b = np.sqrt(self.priors.difficulty_var)
@@ -1030,6 +1118,16 @@ class LongitudinalGibbsSampler:
         )
         model.discrimination[accepted] = a_proposed[accepted]
         model.difficulty[accepted] = b_proposed[accepted]
+        if not keep_cells:
+            return None
+        return np.concatenate(
+            [
+                np.sum(np.where(accepted, proposed_chunk, current_chunk), axis=1)
+                for current_chunk, proposed_chunk in zip(
+                    current_cells, proposed_cells, strict=True
+                )
+            ]
+        )
 
     def _sample_population_params(
         self,
@@ -1037,44 +1135,196 @@ class LongitudinalGibbsSampler:
         model: LongitudinalIRTModel,
         rng: np.random.Generator,
     ) -> None:
-        """Sample population mean and covariance of growth factors."""
+        """Sample the growth-factor mean and covariance under the identification.
+
+        The intercept factor is standard normal: ``growth_mean[0] = 0`` and
+        ``growth_cov[0, 0] = 1``. The remaining means are drawn from their
+        normal full conditional given ``growth_mean[0] = 0``, and the
+        covariance from the inverse-Wishart prior conditioned on the unit
+        intercept variance.
+        """
         n_persons = growth_factors.shape[0]
         n_growth = growth_factors.shape[1]
 
         sample_mean = np.mean(growth_factors, axis=0)
+        prior_mean, prior_precision = self._growth_mean_prior(n_growth)
+
+        cov_inv = np.linalg.inv(model.growth_cov)
+        post_precision = prior_precision + n_persons * cov_inv
+
+        post_mean = np.linalg.solve(
+            post_precision,
+            prior_precision @ prior_mean + n_persons * cov_inv @ sample_mean,
+        )
+        # Condition the joint normal conditional on growth_mean[0] = 0: the
+        # remaining block keeps precision P_rr and shifts its mean by
+        # P_rr^-1 P_r0 (post_mean[0] - 0).
+        slope_precision = post_precision[1:, 1:]
+        slope_mean = post_mean[1:] + np.linalg.solve(
+            slope_precision,
+            post_precision[1:, 0] * post_mean[0],
+        )
+        slope_draw = slope_mean + np.linalg.solve(
+            np.linalg.cholesky(slope_precision).T,
+            rng.standard_normal(n_growth - 1),
+        )
+        model.growth_mean = np.concatenate(([0.0], slope_draw))
+
+        model.growth_cov = sample_unit_leading_covariance(
+            growth_factors - model.growth_mean,
+            self.priors.growth_cov_prior_df,
+            self._growth_cov_prior_scale(n_growth),
+            rng,
+        )
+
+    def _growth_mean_prior(
+        self, n_growth: int
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return the growth-mean prior mean and precision."""
         if self.priors.growth_mean_prior_cov is not None:
             prior_precision = np.linalg.inv(self.priors.growth_mean_prior_cov)
         else:
             prior_precision = np.eye(n_growth) * 0.01
-
-        cov_inv = np.linalg.inv(model.growth_cov)
-        post_precision = prior_precision + n_persons * cov_inv
-        post_cov = np.linalg.inv(post_precision)
-
         if self.priors.growth_mean_prior_mean is not None:
             prior_mean = self.priors.growth_mean_prior_mean
         else:
             prior_mean = np.zeros(n_growth)
+        return prior_mean, prior_precision
 
-        post_mean = post_cov @ (
-            prior_precision @ prior_mean + n_persons * cov_inv @ sample_mean
-        )
-        model.growth_mean = rng.multivariate_normal(post_mean, post_cov)
-
-        centered = growth_factors - model.growth_mean
-        S = centered.T @ centered
-
+    def _growth_cov_prior_scale(self, n_growth: int) -> NDArray[np.float64]:
+        """Return the inverse-Wishart scale of the growth covariance prior."""
         if self.priors.growth_cov_prior_scale is not None:
-            prior_scale = self.priors.growth_cov_prior_scale
-        else:
-            prior_scale = np.eye(n_growth)
+            return self.priors.growth_cov_prior_scale
+        return np.eye(n_growth)
 
-        df_post = self.priors.growth_cov_prior_df + n_persons
-        scale_post = prior_scale + S
+    def _sample_location_scale(
+        self,
+        theta_trajectories: NDArray[np.float64],
+        growth_factors: NDArray[np.float64],
+        model: LongitudinalIRTModel,
+        rng: np.random.Generator,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Move the whole state along the latent location and scale.
 
-        model.growth_cov = stats.invwishart.rvs(
-            df=df_post, scale=scale_post, random_state=rng
+        Single-site theta updates shift the common location and scale of the
+        latent trait only slowly, although given the growth factors both are
+        pinned by the standard-normal intercept factor. Two group moves
+        (Liu and Sabatti, 2000) cover those directions exactly. Both leave
+        the 2PL likelihood unchanged.
+
+        * Shift by ``d``: theta, the intercept factors and ``b`` gain ``d``
+          and the slope means lose ``gamma d``, where
+          ``gamma = growth_cov[0, 1:]``. The conditional of ``d`` is normal
+          and drawn exactly.
+        * Rescale by ``c = exp(u)``: theta, all growth factors, ``b``, the
+          slope means and the slope residual covariance
+          ``Omega = growth_cov[1:, 1:] - gamma gamma^T`` scale by ``c``
+          (covariances and the residual variance by ``c**2``), ``a`` by
+          ``1 / c``, and ``gamma`` is unchanged. A symmetric random walk on
+          ``u`` is accepted with the posterior ratio times the Jacobian.
+
+        ``growth_mean[0] = 0`` and ``growth_cov[0, 0] = 1`` hold throughout.
+        """
+        priors = self.priors
+        n_persons, n_growth = growth_factors.shape
+        n_items = model.n_items
+        n_slopes = n_growth - 1
+
+        prior_mean, prior_precision = self._growth_mean_prior(n_growth)
+        # Prior of the slope means given growth_mean[0] = 0.
+        slope_prior_precision = prior_precision[1:, 1:]
+        slope_prior_mean = prior_mean[1:] + np.linalg.solve(
+            slope_prior_precision, prior_precision[1:, 0] * prior_mean[0]
         )
+        difficulty_mean = priors.difficulty_mean
+        difficulty_var = priors.difficulty_var
+
+        # Location: an exact draw of the shift d.
+        intercepts = growth_factors[:, 0]
+        slope_means = model.growth_mean[1:]
+        loading = model.growth_cov[0, 1:]
+        weighted_loading = slope_prior_precision @ loading
+        precision = n_persons + n_items / difficulty_var + loading @ weighted_loading
+        linear = (
+            -np.sum(intercepts)
+            - np.sum(model.difficulty - difficulty_mean) / difficulty_var
+            + weighted_loading @ (slope_means - slope_prior_mean)
+        )
+        shift = linear / precision + rng.standard_normal() / np.sqrt(precision)
+        theta_trajectories = theta_trajectories + shift
+        growth_factors = growth_factors.copy()
+        growth_factors[:, 0] += shift
+        model.difficulty = model.difficulty + shift
+        model.growth_mean = np.concatenate(([0.0], slope_means - loading * shift))
+
+        # Scale: one random-walk Metropolis step on u = log c.
+        log_scale = rng.normal(0.0, 1.7 / np.sqrt(n_persons))
+        log_uniform = np.log(rng.random())
+        scale = np.exp(log_scale)
+        inverse_square_change = np.exp(-2.0 * log_scale) - 1.0
+
+        intercepts = growth_factors[:, 0]
+        slope_means = model.growth_mean[1:]
+        log_discrimination = np.log(model.discrimination) - np.log(
+            priors.discrimination_mean
+        )
+        slope_offset = slope_means - slope_prior_mean
+        scaled_offset = scale * slope_means - slope_prior_mean
+        residual_cov = model.growth_cov[1:, 1:] - np.outer(loading, loading)
+        prior_scale = self._growth_cov_prior_scale(n_growth)
+        prior_weight = prior_scale[0, 0]
+        prior_loading = prior_scale[0, 1:] / prior_weight
+        prior_residual_scale = prior_scale[1:, 1:] - prior_weight * np.outer(
+            prior_loading, prior_loading
+        )
+        loading_offset = loading - prior_loading
+        residual_quadratic = np.trace(
+            np.linalg.solve(residual_cov, prior_residual_scale)
+        ) + prior_weight * loading_offset @ np.linalg.solve(
+            residual_cov, loading_offset
+        )
+
+        log_accept = (
+            # Standard-normal intercept factors and their Jacobian.
+            -0.5 * (scale**2 - 1.0) * (intercepts @ intercepts)
+            + n_persons * log_scale
+            # Log-normal discrimination prior; its Jacobian cancels -log a.
+            - np.sum((log_discrimination - log_scale) ** 2 - log_discrimination**2)
+            / (2.0 * priors.discrimination_var)
+            # Normal difficulty prior and its Jacobian.
+            - np.sum(
+                (scale * model.difficulty - difficulty_mean) ** 2
+                - (model.difficulty - difficulty_mean) ** 2
+            )
+            / (2.0 * difficulty_var)
+            + n_items * log_scale
+            # Inverse-gamma residual-variance prior and its Jacobian.
+            - 2.0 * priors.residual_var_prior_shape * log_scale
+            - priors.residual_var_prior_rate
+            / model.residual_variance
+            * inverse_square_change
+            # Normal slope-mean prior and its Jacobian.
+            - 0.5
+            * (
+                scaled_offset @ slope_prior_precision @ scaled_offset
+                - slope_offset @ slope_prior_precision @ slope_offset
+            )
+            + n_slopes * log_scale
+            # Conditioned inverse-Wishart prior on (gamma, Omega), Jacobian.
+            - (priors.growth_cov_prior_df + 1.0) * n_slopes * log_scale
+            - 0.5 * inverse_square_change * residual_quadratic
+        )
+        if log_uniform < log_accept:
+            theta_trajectories = theta_trajectories * scale
+            growth_factors *= scale
+            model.discrimination = model.discrimination / scale
+            model.difficulty = model.difficulty * scale
+            model.residual_variance = model.residual_variance * scale**2
+            model.growth_mean = model.growth_mean * scale
+            growth_cov = model.growth_cov.copy()
+            growth_cov[1:, 1:] = scale**2 * residual_cov + np.outer(loading, loading)
+            model.growth_cov = growth_cov
+        return theta_trajectories, growth_factors
 
     def _sample_residual_variance(
         self,

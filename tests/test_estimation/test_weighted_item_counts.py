@@ -16,10 +16,14 @@ from mirt.estimation.weighted import WeightedEMEstimator
 
 @pytest.mark.parametrize("limit", [12, 1_000_000])
 @pytest.mark.parametrize("weighted", [False, True])
-def test_count_blocks_match_direct_weighted_aggregation(monkeypatch, limit, weighted):
+@pytest.mark.parametrize("complete", [False, True])
+def test_count_blocks_match_direct_weighted_aggregation(
+    monkeypatch, limit, weighted, complete
+):
     monkeypatch.setattr(context_module, "_MAX_COUNT_ENTRIES", limit)
     rng = np.random.default_rng(42)
-    responses = rng.integers(-2, 2, (23, 3))
+    # Complete responses take their observed counts from the posterior mass.
+    responses = rng.integers(0 if complete else -2, 2, (23, 3))
     posterior = rng.uniform(0.1, 1.0, (23, 14))[:, ::2]
     person_weights = rng.uniform(0.1, 2.0, 23) if weighted else None
     if weighted:
@@ -35,6 +39,8 @@ def test_count_blocks_match_direct_weighted_aggregation(monkeypatch, limit, weig
         correct, np.where(responses >= 0, responses, 0).T @ reference
     )
     np.testing.assert_allclose(observed, (responses >= 0).T @ reference)
+    assert context.complete == complete
+    assert observed.flags.writeable
     for before, after in zip(
         unweighted, context.expected_counts(posterior), strict=True
     ):
@@ -215,7 +221,7 @@ def test_weighted_fit_releases_response_context_on_failure(monkeypatch):
 
 
 def test_weighted_statistics_scratch_does_not_scale_with_posterior(monkeypatch):
-    estimator = WeightedEMEstimator(n_quadpts=7)
+    estimator = WeightedEMEstimator(n_quadpts=7, se_method="complete_data")
     estimator._quadrature = GaussHermiteQuadrature(7, 3)
     model = mirt.TwoParameterLogistic(2, n_factors=3)
     rng = np.random.default_rng(14)

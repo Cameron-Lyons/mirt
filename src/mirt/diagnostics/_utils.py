@@ -14,6 +14,7 @@ from scipy import stats
 from mirt.constants import PROB_EPSILON
 
 if TYPE_CHECKING:
+    from mirt.estimation._shared_step import EqualityConstraints
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
 
@@ -50,11 +51,16 @@ def summarize_bootstrap(
     observed: float,
     n_requested: int,
     confidence_level: float,
+    test_zero: bool = True,
 ) -> BootstrapSummary:
     """Summarize finite bootstrap replicates of a two-group statistic.
 
-    The p-value is the two-sided normal approximation ``|observed| / SE``.
-    Fewer than two finite replicates give ``NaN`` summaries.
+    The p-value is the two-sided normal approximation ``|observed| / SE``
+    of a test that the statistic is zero. Pass ``test_zero=False`` for a
+    statistic that cannot be negative, such as an unsigned area: zero is
+    then the boundary of its range and ``|observed| / SE`` has no normal
+    null distribution, so the p-value is ``NaN``. Fewer than two finite
+    replicates give ``NaN`` summaries.
     """
     estimates = np.asarray(
         [value for value in replicates if np.isfinite(value)], dtype=np.float64
@@ -67,7 +73,9 @@ def summarize_bootstrap(
         )
 
     standard_error = float(np.std(estimates, ddof=1))
-    if standard_error <= PROB_EPSILON:
+    if not test_zero:
+        p_value = np.nan
+    elif standard_error <= PROB_EPSILON:
         p_value = 1.0 if abs(observed) <= PROB_EPSILON else 0.0
     else:
         p_value = float(2.0 * stats.norm.sf(abs(observed) / standard_error))
@@ -403,7 +411,7 @@ def fit_linked_group_models(
 def create_theta_grid(
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 100,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+) -> NDArray[np.float64]:
     """Create theta grid for evaluation.
 
     Parameters
@@ -415,11 +423,55 @@ def create_theta_grid(
 
     Returns
     -------
-    theta_grid : ndarray
-        1D theta values
-    theta_2d : ndarray
-        2D theta values for model evaluation
+    ndarray of shape (n_points,)
+        Evenly spaced theta values.
     """
-    theta_grid = np.linspace(theta_range[0], theta_range[1], n_points)
-    theta_2d = theta_grid.reshape(-1, 1)
-    return theta_grid, theta_2d
+    return np.linspace(theta_range[0], theta_range[1], n_points)
+
+
+def resolve_fit_constraints(
+    model_or_result: BaseItemModel | FitResult,
+    constraints: EqualityConstraints | None,
+) -> EqualityConstraints | None:
+    """Return the equality constraints a fit diagnostic counts.
+
+    Explicit ``constraints`` take precedence; an empty sequence counts every
+    free coordinate separately. A ``FitResult`` otherwise supplies the
+    constraints of ``fit_mirt(constraints=...)`` or a ``CONSTRAIN`` statement
+    that its ``refit_recipe`` records. A bare model, or a result without a
+    recipe (such as one loaded from disk), has none. A family that ties a
+    parameter across items, such as the estimated common slope of a 1PL,
+    always adds that group.
+    """
+    from mirt.estimation.base import _family_tied_parameters, _with_family_ties
+    from mirt.results.fit_result import FitResult
+
+    model = (
+        model_or_result.model
+        if isinstance(model_or_result, FitResult)
+        else model_or_result
+    )
+    if constraints is None and isinstance(model_or_result, FitResult):
+        recipe = model_or_result.refit_recipe
+        fitted = None if recipe is None else recipe.options.get("constraints")
+        constraints = fitted or None
+    if _family_tied_parameters(model):
+        return _with_family_ties(constraints, model)
+    return constraints
+
+
+def aligned_missing_coded_responses(
+    model_or_result: Any, responses: Any
+) -> NDArray[Any]:
+    """Read responses with ``NaN`` as ``-1`` after matching them to the model.
+
+    DataFrame columns are matched to the model's item names by
+    :func:`mirt.utils.data.align_response_columns`, as :func:`mirt.fscores`
+    does, so diagnostics read a reordered frame like the original. Arrays keep
+    positional semantics.
+    """
+    from mirt.results._common import resolve_item_model
+    from mirt.utils.data import _missing_coded_responses, align_response_columns
+
+    item_names = getattr(resolve_item_model(model_or_result), "item_names", None)
+    return _missing_coded_responses(align_response_columns(responses, item_names))

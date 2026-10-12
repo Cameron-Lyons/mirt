@@ -78,6 +78,9 @@ class IRTreeResult:
 
     ``trait_covariance`` is optional and keyword-only. When omitted, traits
     have unit variances, so ``trait_correlations`` also gives their covariance.
+    :class:`IRTreeEMEstimator` fixes trait means at zero and variances at one
+    to identify the free node slopes, so its ``trait_covariance`` equals
+    ``trait_correlations``.
     """
 
     model: IRTreeModel
@@ -187,10 +190,19 @@ class IRTreeEMEstimator(BaseEstimator):
     tol : float
         Convergence tolerance for log-likelihood change
     estimate_correlations : bool
-        Whether to estimate the trait distribution when the model allows
+        Whether to estimate the trait correlations when the model allows
         correlated traits
     verbose : bool
         Print progress information
+
+    Notes
+    -----
+    Every decision node has a free slope and location, which leaves the
+    location and scale of each trait unidentified. Trait means are therefore
+    fixed at zero and variances at one, and only the trait correlations are
+    estimated, as R mirt does for multidimensional models. AIC and BIC count
+    the node parameters and the ``n_traits * (n_traits - 1) / 2``
+    correlations, matching ``IRTreeModel.n_parameters``.
     """
 
     def __init__(
@@ -589,25 +601,85 @@ class IRTreeEMEstimator(BaseEstimator):
         self,
         posterior_weights: NDArray[np.float64],
         _current_mean: NDArray[np.float64],
-        _current_cov: NDArray[np.float64],
+        current_cov: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """Update trait mean and covariance from posterior."""
+        """Update the trait correlations with means and variances fixed.
+
+        Free node slopes and locations leave the location and scale of every
+        trait unidentified, so the means stay at zero and the variances at
+        one. The correlations maximize the expected complete-data log prior
+        ``sum_q n_q log pi_q(R)``, with ``n_q`` the expected respondents at
+        quadrature point ``q`` and ``pi_q`` its normalized prior mass, so the
+        M-step is exact and EM never decreases the likelihood. ``R`` is
+        parametrized by a unit-diagonal lower-triangular factor with
+        normalized rows, which spans every positive definite correlation
+        matrix.
+
+        Returns
+        -------
+        tuple
+            Zero means and the updated correlation matrix.
+        """
         quad_points = self._quadrature.nodes
+        quad_weights = self._quadrature.weights
+        n_traits = quad_points.shape[1]
+        mean = np.zeros(n_traits)
+        if n_traits == 1:
+            return mean, np.ones((1, 1))
         point_weights = posterior_weights.sum(axis=0)
         total_weight = float(point_weights.sum())
-        new_mean = point_weights @ quad_points / total_weight
-        centered = quad_points - new_mean
-        new_cov = (centered * point_weights[:, None]).T @ centered / total_weight
-        new_cov = (new_cov + new_cov.T) * 0.5
+        rows, cols = np.tril_indices(n_traits, -1)
 
-        eigenvalues, eigenvectors = np.linalg.eigh(new_cov)
-        eigenvalues = np.maximum(eigenvalues, 1e-8)
-        new_cov = (eigenvectors * eigenvalues) @ eigenvectors.T
-        min_var = 0.1
-        variance_shortfall = np.maximum(min_var - np.diag(new_cov), 0.0)
-        new_cov += np.diag(variance_shortfall)
+        def factor(values: NDArray[np.float64]) -> tuple[NDArray, NDArray]:
+            lower = np.eye(n_traits)
+            lower[rows, cols] = values
+            norms = np.linalg.norm(lower, axis=1, keepdims=True)
+            return lower / norms, norms
 
-        return new_mean, new_cov
+        def correlation(values: NDArray[np.float64]) -> NDArray[np.float64]:
+            unit_rows, _ = factor(values)
+            matrix = unit_rows @ unit_rows.T
+            np.fill_diagonal(matrix, 1.0)
+            return matrix
+
+        def objective(
+            values: NDArray[np.float64],
+        ) -> tuple[float, NDArray[np.float64]]:
+            unit_rows, norms = factor(values)
+            matrix = unit_rows @ unit_rows.T
+            np.fill_diagonal(matrix, 1.0)
+            try:
+                log_mass = gaussian_log_quadrature_mass(
+                    quad_points, quad_weights, mean, matrix
+                )
+            except ValueError:
+                return np.inf, np.zeros_like(values)
+            # d/dR of -sum_q n_q log pi_q is -R^-1 A R^-1 / 2 with
+            # A = sum_q (n_q - N pi_q) x_q x_q', since the masses sum to one.
+            residual = point_weights - total_weight * np.exp(log_mass)
+            scatter = (quad_points * residual[:, None]).T @ quad_points
+            inverse = np.linalg.inv(matrix)
+            matrix_gradient = -0.5 * inverse @ scatter @ inverse
+            row_gradient = 2.0 * matrix_gradient @ unit_rows
+            row_gradient -= unit_rows * np.sum(
+                unit_rows * row_gradient, axis=1, keepdims=True
+            )
+            lower_gradient = row_gradient / norms
+            return -float(point_weights @ log_mass), lower_gradient[rows, cols]
+
+        cholesky = np.linalg.cholesky(current_cov)
+        start = cholesky[rows, cols] / np.diag(cholesky)[rows]
+        result = minimize(
+            objective,
+            start,
+            method="L-BFGS-B",
+            jac=True,
+            options={"ftol": 0.0, "gtol": 1e-9, "maxiter": 200},
+        )
+        best = start
+        if np.all(np.isfinite(result.x)) and result.fun <= objective(start)[0]:
+            best = result.x
+        return mean, correlation(best)
 
     def _compute_eap_scores(
         self,
@@ -697,13 +769,15 @@ class IRTreeEMEstimator(BaseEstimator):
         return se
 
     def _count_parameters(self, model: IRTreeModel, estimate_distribution: bool) -> int:
-        """Count total number of estimated parameters."""
+        """Count node parameters and, when estimated, trait correlations.
+
+        Trait means and variances are fixed for identification, so they are
+        not counted.
+        """
         n_item_params = 2 * model.n_items * model.n_nodes
         if not estimate_distribution:
             return n_item_params
-        n_mean_params = model.n_traits
-        n_cov_params = model.n_traits * (model.n_traits + 1) // 2
-        return n_item_params + n_mean_params + n_cov_params
+        return n_item_params + model.n_traits * (model.n_traits - 1) // 2
 
     @staticmethod
     def _cov_to_corr(cov: NDArray[np.float64]) -> NDArray[np.float64]:

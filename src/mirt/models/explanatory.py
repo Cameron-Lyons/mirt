@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Self
 
@@ -9,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from mirt._core import sigmoid
+from mirt.exceptions import MirtValidationError
 from mirt.models.base import DichotomousItemModel
 from mirt.utils.numeric import standard_normal_quadrature
 
@@ -77,17 +79,26 @@ def _names_or_default(
     return list(names)
 
 
-def _item_index(item_idx: int | None, n_items: int) -> int | None:
-    if item_idx is None:
-        return None
-    if (
-        isinstance(item_idx, (bool, np.bool_))
-        or not isinstance(item_idx, (int, np.integer))
-        or item_idx < 0
-        or item_idx >= n_items
-    ):
-        raise IndexError(f"item_idx must be in [0, {n_items})")
-    return int(item_idx)
+def _explanatory_shared_parameters(constrain_discrimination: bool) -> frozenset[str]:
+    """Return the parameters an explanatory item model shares across items."""
+    if constrain_discrimination:
+        return frozenset({"feature_weights", "discrimination"})
+    return frozenset({"feature_weights"})
+
+
+def _reject_feature_weight_item_update(param_name: str) -> None:
+    """Refuse a per-item update of the model-level feature weights."""
+    if param_name == "feature_weights":
+        raise MirtValidationError(
+            "Parameter feature_weights does not have per-item values; use "
+            "set_feature_weights",
+            parameter=param_name,
+        )
+
+
+def _optional_item(model: DichotomousItemModel, item_idx: int | None) -> int | None:
+    """Validate ``item_idx`` unless it is ``None``, which selects every item."""
+    return None if item_idx is None else model._validate_item_index(item_idx)
 
 
 def _person_vector(
@@ -114,9 +125,25 @@ def _person_vector(
     return vector.copy()
 
 
+def _warn_unused_result(name: str, replacement: str) -> None:
+    warnings.warn(
+        f"{name} is deprecated and will be removed: no estimator returns it; "
+        f"{replacement}",
+        DeprecationWarning,
+        stacklevel=4,
+    )
+
+
 @dataclass
 class LLTMResult:
-    """Results from LLTM estimation."""
+    """Results from LLTM estimation.
+
+    .. deprecated::
+        No estimator returns this class, and creating one emits a
+        ``DeprecationWarning``. ``EMEstimator().fit(LLTM(...), responses)``
+        returns a :class:`~mirt.results.fit_result.FitResult`, and
+        :class:`mirt.LLTM` a dictionary of results.
+    """
 
     feature_weights: NDArray[np.float64]
     feature_se: NDArray[np.float64]
@@ -127,10 +154,23 @@ class LLTMResult:
     n_iterations: int
     converged: bool
 
+    def __post_init__(self) -> None:
+        _warn_unused_result(
+            "LLTMResult",
+            "EMEstimator().fit(LLTM(...), responses) returns a FitResult",
+        )
+
 
 @dataclass
 class LatentRegressionResult:
-    """Results from latent regression estimation."""
+    """Results from latent regression estimation.
+
+    .. deprecated::
+        No estimator returns this class, and creating one emits a
+        ``DeprecationWarning``. :class:`mirt.MixedEffectsIRT` estimates
+        latent regressions and returns a
+        :class:`~mirt.estimation.mixed.MixedEffectsFitResult`.
+    """
 
     regression_weights: NDArray[np.float64]
     regression_se: NDArray[np.float64]
@@ -142,10 +182,23 @@ class LatentRegressionResult:
     n_iterations: int
     converged: bool
 
+    def __post_init__(self) -> None:
+        _warn_unused_result(
+            "LatentRegressionResult",
+            "MixedEffectsIRT(person_covariates=...).fit(responses) estimates "
+            "latent regressions",
+        )
+
 
 @dataclass
 class ExplanatoryIRTResult:
-    """Results from combined explanatory IRT estimation."""
+    """Results from combined explanatory IRT estimation.
+
+    .. deprecated::
+        No estimator returns this class, and creating one emits a
+        ``DeprecationWarning``. :class:`mirt.MixedEffectsIRT` estimates item
+        and person covariate effects together.
+    """
 
     feature_weights: NDArray[np.float64]
     feature_se: NDArray[np.float64]
@@ -159,6 +212,12 @@ class ExplanatoryIRTResult:
     bic: float
     n_iterations: int
     converged: bool
+
+    def __post_init__(self) -> None:
+        _warn_unused_result(
+            "ExplanatoryIRTResult",
+            "MixedEffectsIRT estimates item and person covariate effects",
+        )
 
 
 class LLTM(DichotomousItemModel):
@@ -198,6 +257,16 @@ class LLTM(DichotomousItemModel):
     where q_jk is the feature value for item j on feature k, and η_k is
     the weight for feature k.
 
+    :class:`~mirt.estimation.em.EMEstimator` fits the model by marginal
+    maximum likelihood with a standard-normal ability. The feature weights,
+    and the common discrimination when ``constrain_discrimination=True``,
+    are shared by the items, so its shared-parameter step estimates them
+    from every item's expected counts; free per-item discriminations are
+    updated item by item. With a common discrimination this is R mirt's
+    Rasch LLTM (``itemtype="Rasch"`` with ``item.formula``), whose latent
+    variance is the squared common slope. :class:`mirt.LLTM` fits the same
+    model from a Q-matrix and also tests it against the Rasch model.
+
     References
     ----------
     Fischer, G. H. (1973). The linear logistic test model as an instrument
@@ -207,6 +276,8 @@ class LLTM(DichotomousItemModel):
     model_name = "LLTM"
     n_params_per_item = 1
     supports_multidimensional = False
+    _global_parameters = frozenset({"feature_weights"})
+    _parameter_boxes = {"feature_weights": (-30.0, 30.0)}
 
     def __init__(
         self,
@@ -260,6 +331,15 @@ class LLTM(DichotomousItemModel):
     def constrain_discrimination(self) -> bool:
         """Whether item discriminations must share one common value."""
         return self._constrain_discrimination
+
+    @property
+    def _shared_parameters(self) -> frozenset[str]:
+        """Feature weights, and the common discrimination when constrained.
+
+        Each moves every item's curve, so EM's shared-parameter step
+        estimates them from all items' expected counts.
+        """
+        return _explanatory_shared_parameters(self._constrain_discrimination)
 
     @property
     def feature_weights(self) -> NDArray[np.float64]:
@@ -340,8 +420,8 @@ class LLTM(DichotomousItemModel):
         param_name: str,
         value: float | NDArray[np.float64],
     ) -> None:
-        index = _item_index(item_idx, self.n_items)
-        assert index is not None
+        index = self._validate_item_index(item_idx)
+        _reject_feature_weight_item_update(param_name)
         if param_name == "discrimination":
             if self._constrain_discrimination:
                 raise ValueError(
@@ -361,7 +441,7 @@ class LLTM(DichotomousItemModel):
         if not np.all(np.isfinite(theta)):
             raise ValueError("theta must contain only finite values")
         theta_1d = theta.ravel()
-        index = _item_index(item_idx, self.n_items)
+        index = _optional_item(self, item_idx)
 
         a = self._parameters["discrimination"]
         b = self.difficulty
@@ -378,7 +458,7 @@ class LLTM(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        index = _item_index(item_idx, self.n_items)
+        index = _optional_item(self, item_idx)
         p = self.probability(theta, index)
         q = 1.0 - p
 
@@ -599,11 +679,19 @@ class ExplanatoryIRT(DichotomousItemModel):
     - ε_i ~ N(0, σ²) is residual ability
     - Q_j are item j's features
     - η are feature weights
+
+    :class:`~mirt.estimation.em.EMEstimator` estimates the item side, the
+    feature weights and discriminations, as for :class:`LLTM`, with a
+    standard-normal ability; it does not use the person covariates, so the
+    latent regression keeps its values. :class:`mirt.MixedEffectsIRT`
+    estimates item and person covariate effects together.
     """
 
     model_name = "ExplanatoryIRT"
     n_params_per_item = 1
     supports_multidimensional = False
+    _global_parameters = frozenset({"feature_weights"})
+    _parameter_boxes = {"feature_weights": (-30.0, 30.0)}
 
     def __init__(
         self,
@@ -691,6 +779,11 @@ class ExplanatoryIRT(DichotomousItemModel):
     def include_intercept(self) -> bool:
         """Whether latent regression includes an intercept."""
         return self._include_intercept
+
+    @property
+    def _shared_parameters(self) -> frozenset[str]:
+        """Feature weights, and the common discrimination when constrained."""
+        return _explanatory_shared_parameters(self._constrain_discrimination)
 
     @property
     def feature_weights(self) -> NDArray[np.float64]:
@@ -783,8 +876,8 @@ class ExplanatoryIRT(DichotomousItemModel):
         param_name: str,
         value: float | NDArray[np.float64],
     ) -> None:
-        index = _item_index(item_idx, self.n_items)
-        assert index is not None
+        index = self._validate_item_index(item_idx)
+        _reject_feature_weight_item_update(param_name)
         if param_name == "discrimination":
             if self._constrain_discrimination:
                 raise ValueError(
@@ -812,7 +905,7 @@ class ExplanatoryIRT(DichotomousItemModel):
         if not np.all(np.isfinite(theta)):
             raise ValueError("theta must contain only finite values")
         theta_1d = theta.ravel()
-        index = _item_index(item_idx, self.n_items)
+        index = _optional_item(self, item_idx)
 
         a = self._parameters["discrimination"]
         b = self.difficulty
@@ -885,7 +978,7 @@ class ExplanatoryIRT(DichotomousItemModel):
             ``(n_persons,)`` when ``item_idx`` is supplied.
         """
         n_quadpts = _positive_integer(n_quadpts, "n_quadpts")
-        index = _item_index(item_idx, self.n_items)
+        index = _optional_item(self, item_idx)
         mean = self._latent_regression.predict_mean(covariates)
         nodes, weights = standard_normal_quadrature(n_quadpts)
         scale = np.sqrt(self._latent_regression.residual_variance)
@@ -951,7 +1044,7 @@ class ExplanatoryIRT(DichotomousItemModel):
         theta: NDArray[np.float64],
         item_idx: int | None = None,
     ) -> NDArray[np.float64]:
-        index = _item_index(item_idx, self.n_items)
+        index = _optional_item(self, item_idx)
         p = self.probability(theta, index)
         q = 1.0 - p
 

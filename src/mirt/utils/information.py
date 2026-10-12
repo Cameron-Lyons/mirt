@@ -5,20 +5,23 @@ area under information curves, and probability traces.
 """
 
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt import _information
 from mirt._information import (
+    _resolve_model,
     _test_information,
     _theta_array,
     _validate_information_values,
 )
+from mirt.exceptions import MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
+    from mirt.results.fit_result import FitResult
 
 
 _SCORE_INVERSION_TARGET_ELEMENTS = 2_000_000
@@ -110,81 +113,348 @@ def _item_information_matrix(
     return result
 
 
-def testinfo(
+def _validate_information_options(
+    degrees: ArrayLike | None, return_matrix: bool
+) -> None:
+    """Validate the mutually exclusive directional and matrix options."""
+    if not isinstance(return_matrix, (bool, np.bool_)):
+        raise MirtValidationError(
+            "return_matrix must be boolean",
+            parameter="return_matrix",
+            value=return_matrix,
+            expected="True or False",
+        )
+    if return_matrix and degrees is not None:
+        raise MirtValidationError(
+            "degrees and return_matrix cannot be combined",
+            parameter="degrees",
+            value=degrees,
+            expected="None when return_matrix=True",
+        )
+
+
+def _direction_cosines(
+    model: "BaseItemModel", degrees: ArrayLike
+) -> NDArray[np.float64]:
+    """Convert one angle per factor to a unit direction vector, as R does."""
+    try:
+        angles = np.asarray(degrees, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise MirtValidationError(
+            "degrees must contain numeric angles",
+            parameter="degrees",
+            value=degrees,
+            expected=f"{model.n_factors} finite angles in degrees",
+        ) from exc
+    angles = angles.reshape(1) if angles.ndim == 0 else angles
+    if angles.shape != (model.n_factors,) or not np.all(np.isfinite(angles)):
+        raise MirtValidationError(
+            "degrees must contain one finite angle per factor",
+            parameter="degrees",
+            value=angles.shape,
+            expected=f"({model.n_factors},)",
+        )
+    direction = np.cos(np.deg2rad(angles))
+    # cos(90 degrees) is 6e-17 in floating point; an axis must stay exact.
+    direction[np.abs(direction) < 1e-15] = 0.0
+    norm = float(np.linalg.norm(direction))
+    if norm < 1e-12:
+        raise MirtValidationError(
+            "degrees must describe a direction; every angle is 90 degrees",
+            parameter="degrees",
+            value=angles.tolist(),
+        )
+    return direction / norm
+
+
+def _rank_one_weights(
     model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    indices: NDArray[np.intp],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+    """Return ``(I_j / ||a_j||^2, a_j)`` for models with rank-one item matrices.
+
+    Compensatory logistic, graded and generalized partial credit items have
+    Fisher matrices ``I_j a_j a_j' / ||a_j||^2``, where ``I_j`` is the scalar
+    (trace) item information. Other models return None.
+    """
+    from mirt.scoring._common import _rank_one_slopes
+
+    slopes = _rank_one_slopes(model)
+    if slopes is None:
+        return None
+    selected = slopes[indices]
+    squared_norms = np.einsum("jf,jf->j", selected, selected)
+    traces = _item_information_matrix(model, theta, indices)
+    weights = np.divide(
+        traces,
+        squared_norms,
+        out=np.zeros_like(traces),
+        where=squared_norms > 0.0,
+    )
+    return weights, selected
+
+
+def _fisher_matrices(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    item_index: int,
+) -> NDArray[np.float64]:
+    """Return one item's validated Fisher matrices ``(n_theta, F, F)``.
+
+    Models with ``item_information_matrix`` supply exact matrices; other
+    models are differentiated numerically.
+    """
+    from mirt.scoring._common import _item_information_matrix as item_matrices
+
+    matrices = np.asarray(item_matrices(model, theta, item_index), dtype=np.float64)
+    expected = (theta.shape[0], model.n_factors, model.n_factors)
+    if matrices.shape != expected:
+        raise ValueError(
+            f"item information matrices have shape {matrices.shape}, expected {expected}"
+        )
+    if not np.all(np.isfinite(matrices)):
+        raise ValueError("model information must contain only finite values")
+    return matrices
+
+
+def _item_information_matrices(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    indices: NDArray[np.intp],
+) -> NDArray[np.float64]:
+    """Return selected item Fisher matrices with shape ``(n_theta, S, F, F)``."""
+    n_factors = model.n_factors
+    if n_factors == 1 or theta.shape[0] == 0:
+        traces = _item_information_matrix(model, theta, indices)
+        return np.broadcast_to(
+            traces[:, :, None, None], traces.shape + (n_factors, n_factors)
+        ).copy()
+    rank_one = _rank_one_weights(model, theta, indices)
+    if rank_one is not None:
+        weights, slopes = rank_one
+        outer = slopes[:, :, None] * slopes[:, None, :]
+        return weights[:, :, None, None] * outer[None]
+    result = np.empty((theta.shape[0], indices.size, n_factors, n_factors))
+    first_columns: dict[int, int] = {}
+    for column, index in enumerate(indices.tolist()):
+        if index in first_columns:
+            result[:, column] = result[:, first_columns[index]]
+        else:
+            result[:, column] = _fisher_matrices(model, theta, index)
+            first_columns[index] = column
+    return result
+
+
+def _directional_item_information(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+    indices: NDArray[np.intp],
+    direction: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return ``u' I_j(theta) u`` for each selected item, shape ``(n_theta, S)``."""
+    if model.n_factors == 1 or theta.shape[0] == 0:
+        # A unit direction in one dimension is +/-1.
+        return _item_information_matrix(model, theta, indices)
+    rank_one = _rank_one_weights(model, theta, indices)
+    if rank_one is not None:
+        weights, slopes = rank_one
+        return weights * np.square(slopes @ direction)
+    result = np.empty((theta.shape[0], indices.size))
+    first_columns: dict[int, int] = {}
+    for column, index in enumerate(indices.tolist()):
+        if index in first_columns:
+            result[:, column] = result[:, first_columns[index]]
+            continue
+        matrices = _fisher_matrices(model, theta, index)
+        result[:, column] = np.einsum("nfg,f,g->n", matrices, direction, direction)
+        first_columns[index] = column
+    # Numerical matrices are positive semi-definite up to rounding.
+    return np.maximum(result, 0.0)
+
+
+def _test_information_matrices(
+    model: "BaseItemModel",
+    theta: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return test Fisher matrices with shape ``(n_theta, F, F)``."""
+    n_factors = model.n_factors
+    if n_factors == 1 or theta.shape[0] == 0:
+        totals = _test_information(model, theta) if theta.shape[0] else np.empty(0)
+        return np.broadcast_to(
+            totals[:, None, None], totals.shape + (n_factors, n_factors)
+        ).copy()
+    indices = np.arange(model.n_items, dtype=np.intp)
+    rank_one = _rank_one_weights(model, theta, indices)
+    if rank_one is not None:
+        weights, slopes = rank_one
+        outer = (slopes[:, :, None] * slopes[:, None, :]).reshape(model.n_items, -1)
+        return (weights @ outer).reshape(theta.shape[0], n_factors, n_factors)
+    total = np.zeros((theta.shape[0], n_factors, n_factors))
+    for index in range(model.n_items):
+        total += _fisher_matrices(model, theta, index)
+    return total
+
+
+def testinfo(
+    model: "BaseItemModel | FitResult",
     theta: NDArray[np.float64] | float | list[float],
+    *,
+    degrees: ArrayLike | None = None,
+    return_matrix: bool = False,
 ) -> NDArray[np.float64]:
     """Compute test information function at given theta values.
 
     The test information is the sum of item information across all items.
+    For a multidimensional model the default value is the trace of the test
+    Fisher information matrix ``I(theta)``, the sum over factors of the
+    information along each factor axis. ``degrees`` gives the information
+    along one direction instead, as R's ``testinfo(..., degrees=)``, and
+    ``return_matrix=True`` returns the matrices themselves.
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values at which to compute information.
         Can be a scalar, list, or numpy array.
+    degrees : array-like of float, optional
+        One angle in degrees per factor between the direction and each factor
+        axis, as in R. The direction is the vector of cosines
+        ``cos(degrees)``, scaled to unit length, and the result is
+        ``u' I(theta) u``. For example ``degrees=[0, 90]`` measures along the
+        first of two factors, the diagonal element ``I_11(theta)``, and
+        ``[45, 45]`` along their diagonal. A unidimensional model has only
+        one direction, so its information is unchanged.
+    return_matrix : bool, default=False
+        If True, return the Fisher information matrix at each theta point
+        (R's ``multidim_matrix=TRUE``). Cannot be combined with ``degrees``.
 
     Returns
     -------
     NDArray[np.float64]
-        Test information values at each theta point.
-        Shape: (n_theta,) for unidimensional models.
+        Test information values at each theta point, with shape
+        ``(n_theta,)``, or matrices with shape
+        ``(n_theta, n_factors, n_factors)`` when ``return_matrix=True``.
 
     Examples
     --------
     >>> result = fit_mirt(responses, model="2PL")
     >>> theta = np.linspace(-3, 3, 61)
-    >>> info = testinfo(result.model, theta)
+    >>> info = testinfo(result, theta)
     >>> print(f"Max information at theta = {theta[np.argmax(info)]:.2f}")
+    >>> # Two-factor model: information along the first factor and at 45 degrees
+    >>> along_first = testinfo(md_result, [[0.0, 0.0]], degrees=[0, 90])
+    >>> diagonal = testinfo(md_result, [[0.0, 0.0]], degrees=[45, 45])
     """
-    return _test_information(model, _theta_array(model, theta, allow_empty=True))
+    model = _resolve_model(model)
+    _validate_information_options(degrees, return_matrix)
+    theta_arr = _theta_array(model, theta, allow_empty=True)
+    if return_matrix:
+        return _test_information_matrices(model, theta_arr)
+    if degrees is not None:
+        direction = _direction_cosines(model, degrees)
+        indices = np.arange(model.n_items, dtype=np.intp)
+        return np.sum(
+            _directional_item_information(model, theta_arr, indices, direction),
+            axis=1,
+        )
+    return _test_information(model, theta_arr)
 
 
 def iteminfo(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: NDArray[np.float64] | float | list[float],
     item_idx: int | ArrayLike | None = None,
+    *,
+    degrees: ArrayLike | None = None,
+    return_matrix: bool = False,
 ) -> NDArray[np.float64]:
     """Compute item information function at given theta values.
 
+    For a multidimensional model the default value is the trace of each
+    item's Fisher information matrix, the sum over factors of its
+    information along each factor axis. ``degrees`` and ``return_matrix``
+    select directional information or the matrices, as for
+    :func:`testinfo`.
+
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values at which to compute information.
     item_idx : int, array-like, or None
         Index or indices of items. If None, returns information for all items.
+    degrees : array-like of float, optional
+        One angle in degrees per factor (R's ``degrees``). The result is
+        ``u' I_j(theta) u`` for the unit direction ``u`` of the cosines
+        ``cos(degrees)``.
+    return_matrix : bool, default=False
+        If True, return each item's Fisher information matrices (R's
+        ``multidim_matrix=TRUE``). Cannot be combined with ``degrees``.
 
     Returns
     -------
     NDArray[np.float64]
         Item information values.
         Shape: (n_theta,) if single item, (n_theta, n_items) otherwise.
+        ``return_matrix=True`` appends two ``n_factors`` axes.
 
     Examples
     --------
     >>> info = iteminfo(result.model, theta=0.0, item_idx=0)
     >>> print(f"Item 0 information at theta=0: {info[0]:.3f}")
     """
+    model = _resolve_model(model)
+    _validate_information_options(degrees, return_matrix)
     theta_arr = _theta_array(model, theta, allow_empty=True)
-    if item_idx is None:
+    if item_idx is None and degrees is None and not return_matrix:
         return _item_information_matrix(model, theta_arr)
     indices, scalar_item, _ = _item_indices(model, item_idx)
-    information = _item_information_matrix(
-        model, theta_arr, indices, single_item=scalar_item
-    )
+    if return_matrix:
+        information = _item_information_matrices(model, theta_arr, indices)
+    elif degrees is not None:
+        direction = _direction_cosines(model, degrees)
+        information = _directional_item_information(
+            model, theta_arr, indices, direction
+        )
+    else:
+        information = _item_information_matrix(
+            model, theta_arr, indices, single_item=scalar_item
+        )
     return information[:, 0] if scalar_item else information
 
 
-def areainfo(
+def _information_tails(
     model: "BaseItemModel",
+    lower: float,
+    upper: float,
+    item_idx: int | ArrayLike | None,
+) -> Any:
+    """Integrate information beyond both ends of ``[lower, upper]``."""
+    from scipy.integrate import quad_vec
+
+    def information(theta_value: float) -> Any:
+        point = np.array([theta_value])
+        if item_idx is None:
+            return testinfo(model, point)[0]
+        return iteminfo(model, point, item_idx)[0]
+
+    below = quad_vec(information, -np.inf, lower)[0]
+    above = quad_vec(information, upper, np.inf)[0]
+    return np.asarray(below, dtype=np.float64) + np.asarray(above, dtype=np.float64)
+
+
+def areainfo(
+    model: "BaseItemModel | FitResult",
     theta_range: tuple[float, float] = (-4.0, 4.0),
     n_points: int = 100,
     item_idx: int | ArrayLike | None = None,
-) -> float | NDArray[np.float64]:
+    *,
+    return_details: bool = False,
+) -> float | NDArray[np.float64] | dict[str, Any]:
     """Compute area under the information curve.
 
     Integrates the information function over a range of theta values
@@ -192,8 +462,8 @@ def areainfo(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted unidimensional IRT model, or the ``FitResult`` of a fit.
     theta_range : tuple of float
         Range of theta values for integration. Default (-4, 4).
     n_points : int
@@ -201,13 +471,24 @@ def areainfo(
     item_idx : int, array-like, or None
         If provided, compute area for the selected item or items. If None,
         compute area for test information. A list preserves selection order.
+    return_details : bool, default=False
+        If True, return a dictionary like the data frame of R's
+        ``areainfo``: ``lower_bound``, ``upper_bound``, ``info`` (the area),
+        ``total_info`` (the integral over the whole real line), the
+        ``proportion`` of the total inside ``theta_range`` and ``n_items``,
+        the number of items integrated (all items for test information,
+        otherwise the number selected). ``total_info`` adds adaptive
+        quadrature of both tails to the area, so ``proportion`` never
+        exceeds one; it is NaN where the total is zero.
 
     Returns
     -------
-    float or NDArray[np.float64]
+    float or NDArray[np.float64] or dict
         Area under the information curve. A list of item indices returns one
         area per selected item; scalar and test-information queries return a
-        float.
+        float. ``return_details=True`` returns the dictionary described
+        above, whose ``info``, ``total_info`` and ``proportion`` follow the
+        same shapes.
 
     Examples
     --------
@@ -216,9 +497,19 @@ def areainfo(
     >>> item_area = areainfo(result.model, item_idx=0)
     >>> print(f"Item 0 information area: {item_area:.2f}")
     >>> selected_areas = areainfo(result.model, item_idx=[2, 0])
+    >>> details = areainfo(result, theta_range=(-2, 2), return_details=True)
+    >>> print(f"{details['proportion']:.1%} of all test information")
     """
+    model = _resolve_model(model)
     if model.n_factors != 1:
         raise ValueError("areainfo supports unidimensional models only")
+    if not isinstance(return_details, (bool, np.bool_)):
+        raise MirtValidationError(
+            "return_details must be boolean",
+            parameter="return_details",
+            value=return_details,
+            expected="True or False",
+        )
     lower, upper = _difficulty_theta_bounds(theta_range)
     if (
         isinstance(n_points, (bool, np.bool_))
@@ -233,10 +524,33 @@ def areainfo(
     else:
         info = testinfo(model, theta)
 
-    area = np.trapezoid(info, theta, axis=0)
-    if np.ndim(area) > 0:
-        return np.asarray(area, dtype=np.float64)
-    return float(area)
+    area_values = np.asarray(np.trapezoid(info, theta, axis=0), dtype=np.float64)
+    area: float | NDArray[np.float64] = (
+        area_values if area_values.ndim > 0 else float(area_values)
+    )
+    if not return_details:
+        return area
+
+    if item_idx is None:
+        n_items = model.n_items
+    else:
+        n_items = int(_item_indices(model, item_idx)[0].size)
+    total_values = area_values + _information_tails(model, lower, upper, item_idx)
+    proportion_values = np.divide(
+        area_values,
+        total_values,
+        out=np.full_like(total_values, np.nan),
+        where=total_values > 0.0,
+    )
+    scalar = area_values.ndim == 0
+    return {
+        "lower_bound": lower,
+        "upper_bound": upper,
+        "info": area,
+        "total_info": float(total_values) if scalar else total_values,
+        "proportion": float(proportion_values) if scalar else proportion_values,
+        "n_items": n_items,
+    }
 
 
 def _information_interval_chunk_size(
@@ -318,7 +632,7 @@ def _information_crossings(
 
 
 def information_intervals(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     min_information: float,
     theta_range: tuple[float, float] = (-6.0, 6.0),
     n_points: int = 1201,
@@ -332,8 +646,8 @@ def information_intervals(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted unidimensional IRT model.
+    model : BaseItemModel or FitResult
+        A fitted unidimensional IRT model, or the ``FitResult`` of a fit.
     min_information : float
         Strictly positive Fisher-information target. A maximum conditional
         standard error ``max_sem`` corresponds to ``1 / max_sem**2``.
@@ -359,6 +673,7 @@ def information_intervals(
     ...     result.model, min_information=4.0, item_idx=0
     ... )
     """
+    model = _resolve_model(model)
     if model.n_factors != 1:
         raise ValueError("information_intervals supports unidimensional models only")
     try:
@@ -425,7 +740,7 @@ def information_intervals(
 
 
 def probtrace(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: NDArray[np.float64] | float | list[float],
     item_idx: int | None = None,
 ) -> NDArray[np.float64]:
@@ -436,8 +751,8 @@ def probtrace(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values at which to compute probabilities.
     item_idx : int or None
@@ -456,6 +771,7 @@ def probtrace(
     >>> traces = probtrace(result.model, theta, item_idx=0)
     >>> # For 2PL: traces has shape (61,) - probability of correct response
     """
+    model = _resolve_model(model)
     theta_arr = _theta_array(model, theta, allow_empty=True)
     if item_idx is not None:
         indices, scalar_item, _ = _item_indices(model, item_idx)
@@ -468,7 +784,7 @@ def probtrace(
 
 
 def expected_score(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: NDArray[np.float64] | float | list[float],
     item_idx: int | ArrayLike | None = None,
 ) -> NDArray[np.float64]:
@@ -479,8 +795,8 @@ def expected_score(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values.
     item_idx : int, array-like, or None
@@ -497,6 +813,7 @@ def expected_score(
     >>> expected = expected_score(result.model, theta)
     >>> print(f"Expected test score at theta=0: {expected[1]:.2f}")
     """
+    model = _resolve_model(model)
     theta_arr = _theta_array(model, theta, allow_empty=True)
     score_method = getattr(model, "expected_score", None)
 
@@ -813,7 +1130,7 @@ def _numerical_difficulties(
 
 
 def gen_difficulty(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     item_idx: int | ArrayLike | None = None,
     target_prob: ArrayLike = 0.5,
     theta_range: tuple[float, float] = (-10.0, 10.0),
@@ -825,8 +1142,8 @@ def gen_difficulty(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     item_idx : int, array-like, or None
         Item index or one-dimensional item selection. If None, returns all items.
     target_prob : array-like
@@ -858,6 +1175,7 @@ def gen_difficulty(
     probabilities are not a single monotonic item-response curve; use
     ``expected_score`` or ``theta_for_score`` for those models.
     """
+    model = _resolve_model(model)
     if getattr(model, "is_polytomous", False):
         raise ValueError(
             "gen_difficulty supports dichotomous models only; use "
@@ -893,7 +1211,7 @@ def gen_difficulty(
 
 
 def expected_test_score(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     theta: NDArray[np.float64] | float | list[float],
 ) -> NDArray[np.float64]:
     """Compute expected total test score at given theta values.
@@ -903,8 +1221,8 @@ def expected_test_score(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     theta : array-like
         Ability values.
 
@@ -993,7 +1311,7 @@ def _invert_score_chunk(
 
 
 def theta_for_score(
-    model: "BaseItemModel",
+    model: "BaseItemModel | FitResult",
     target_score: ArrayLike,
     theta_range: tuple[float, float] = (-6.0, 6.0),
 ) -> NDArray[np.float64] | float:
@@ -1005,8 +1323,8 @@ def theta_for_score(
 
     Parameters
     ----------
-    model : BaseItemModel
-        A fitted IRT model.
+    model : BaseItemModel or FitResult
+        A fitted IRT model, or the ``FitResult`` of a fit.
     target_score : array-like
         Target expected score or scores. Array inputs retain their shape.
     theta_range : tuple
@@ -1027,6 +1345,7 @@ def theta_for_score(
     >>> targets = np.array([5.0, 10.0, 15.0])
     >>> theta = theta_for_score(result.model, targets)
     """
+    model = _resolve_model(model)
     if model.n_factors != 1:
         raise ValueError("theta_for_score supports unidimensional models only")
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from math import lgamma
 from numbers import Integral, Real
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeAlias
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from mirt._core import sigmoid
 from mirt._logistic import _affine_probability
@@ -14,7 +18,7 @@ from mirt.estimation._em_context import EMFitContext
 from mirt.estimation._posterior import normalize_log_posterior
 from mirt.estimation.base import BaseEstimator
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.exceptions import MirtDataError
+from mirt.exceptions import MirtDataError, MirtValidationError
 
 if TYPE_CHECKING:
     from mirt.estimation.latent_density import LatentDensity
@@ -22,6 +26,12 @@ if TYPE_CHECKING:
 
 _PENALTY_TYPES = frozenset(("lasso", "ridge", "elastic_net"))
 _MAX_ESTEP_TEMP_ENTRIES = 1_000_000
+_EBIC_GAMMA = 0.5
+# EM iterations of the unpenalized reference fit. It only provides starting
+# values, adaptive weights and the path scale: after the first few dozen
+# iterations EM merely drifts along the rotation, on which the likelihood is
+# flat up to quadrature error.
+_REFERENCE_MAX_ITER = 100
 
 
 def _validate_integer(value: object, name: str, *, minimum: int) -> int:
@@ -62,6 +72,56 @@ def _validate_real(
     return normalized
 
 
+def ebic_penalty(
+    n_candidates: int,
+    n_selected: int,
+    gamma: float = _EBIC_GAMMA,
+) -> float:
+    """Return the model-space term that the extended BIC adds to BIC.
+
+    Chen and Chen (2008) weight every model with ``k`` of ``P`` candidate
+    parameters by the number ``C(P, k)`` of such models, so that
+    ``EBIC = BIC + 2 * gamma * log C(P, k)``. Unlike a constant, the term
+    depends on the model size and changes which sparse model is selected.
+
+    Parameters
+    ----------
+    n_candidates : int
+        Number ``P`` of candidate parameters, such as every loading.
+    n_selected : int
+        Number ``k`` of selected (non-zero) candidates, ``0 <= k <= P``.
+    gamma : float, default=0.5
+        Weight of the model-space term in ``[0, 1]``; 0 gives BIC.
+
+    Returns
+    -------
+    float
+        ``2 * gamma * log C(P, k)``, and 0 without candidates.
+
+    References
+    ----------
+    Chen, J., & Chen, Z. (2008). Extended Bayesian information criteria for
+        model selection with large model spaces. Biometrika, 95, 759-771.
+    """
+    n_candidates = int(n_candidates)
+    n_selected = int(n_selected)
+    if n_candidates <= 0:
+        return 0.0
+    if not 0 <= n_selected <= n_candidates:
+        raise MirtValidationError(
+            "n_selected must lie between 0 and n_candidates",
+            parameter="n_selected",
+            value=n_selected,
+            expected=f"[0, {n_candidates}]",
+        )
+    log_count = (
+        lgamma(n_candidates + 1)
+        - lgamma(n_selected + 1)
+        - lgamma(n_candidates - n_selected + 1)
+    )
+    return 2.0 * float(gamma) * log_count
+
+
 @dataclass
 class PenaltySpec:
     """Specification for regularization penalty."""
@@ -89,10 +149,31 @@ class PenaltySpec:
         if self.alpha > 1.0:
             raise ValueError("alpha must be between 0 and 1")
 
+    @property
+    def l1_share(self) -> float:
+        """Share of ``lambda_val`` on the absolute loadings.
+
+        ``"lasso"`` is a pure L1 penalty and ``"ridge"`` a pure L2 penalty
+        whatever ``alpha`` holds; ``alpha`` mixes the two for
+        ``"elastic_net"`` only.
+        """
+        if self.type == "lasso":
+            return 1.0
+        if self.type == "ridge":
+            return 0.0
+        return self.alpha
+
 
 @dataclass
 class RegularizedMIRTResult:
-    """Result from regularized MIRT estimation."""
+    """Result from regularized MIRT estimation.
+
+    ``log_likelihood`` is the marginal log-likelihood at the estimates and
+    ``penalized_ll`` subtracts the penalty from it. AIC, BIC and EBIC count
+    the non-zero loadings and the intercepts. EBIC adds
+    ``2 * 0.5 * log C(n_items * n_factors, n_nonzero)`` to BIC (Chen and
+    Chen, 2008; see :func:`ebic_penalty`).
+    """
 
     model: MultidimensionalModel
     loadings: NDArray[np.float64]
@@ -175,6 +256,11 @@ class RegularizedMIRTResult:
         return (np.abs(self.loadings) >= threshold).astype(np.int_)
 
 
+RegularizedStart: TypeAlias = (
+    Literal["default"] | RegularizedMIRTResult | Mapping[str, ArrayLike]
+)
+
+
 class RegularizedMIRTEstimator(BaseEstimator):
     """Penalized estimation for exploratory MIRT with sparse factor loadings.
 
@@ -190,7 +276,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
     lambda_val : float, optional
         Regularization strength. If None, must be provided at fit time.
     alpha : float
-        Elastic net mixing parameter (1 = pure LASSO, 0 = pure ridge).
+        Elastic net mixing parameter (1 = pure LASSO, 0 = pure ridge). Used
+        by ``penalty="elastic_net"`` only.
     n_factors : int
         Number of latent factors to estimate.
     n_quadpts : int
@@ -207,6 +294,21 @@ class RegularizedMIRTEstimator(BaseEstimator):
         Use adaptive LASSO with weights from initial unpenalized fit.
     verbose : bool
         Print progress information.
+
+    Notes
+    -----
+    The penalized likelihood is not concave. With every loading at zero the
+    posterior equals the prior, so zero loadings are a stationary point for
+    every penalty, and equal starting loadings on every factor are kept equal
+    by the coordinate updates, which traps a fit in one factor duplicated.
+    Each fit therefore starts from a reference solution: an unpenalized EM
+    fit from loadings staggered across factors (item ``j`` loads 0.8 on
+    factor ``j mod n_factors`` and 0.4 on the others), rotated to varimax
+    simple structure. The rotation is orthogonal and leaves the likelihood
+    unchanged because the factors are independent standard normals. The
+    reference solution also gives the adaptive-LASSO weights
+    ``1 / |a_jk|`` and the largest penalty of the default path (see
+    :meth:`fit_path`).
     """
 
     def __init__(
@@ -249,6 +351,9 @@ class RegularizedMIRTEstimator(BaseEstimator):
         self._quadrature: GaussHermiteQuadrature | None = None
         self._adaptive_weights: NDArray[np.float64] | None = None
         self._fit_context: EMFitContext | None = None
+        self._reference_cache: (
+            tuple[tuple[object, ...], NDArray[np.float64], NDArray[np.float64]] | None
+        ) = None
 
     def _validated_binary_responses(
         self,
@@ -268,10 +373,30 @@ class RegularizedMIRTEstimator(BaseEstimator):
             )
         return validated
 
+    @contextmanager
+    def _prepared(self, responses: NDArray[np.int_]) -> Iterator[None]:
+        """Share one response preparation and quadrature grid within a call."""
+        previous_context = self._fit_context
+        if previous_context is not None and previous_context.responses is responses:
+            yield
+            return
+        with EMFitContext(responses) as context:
+            self._fit_context = context
+            self._quadrature = GaussHermiteQuadrature(
+                n_points=self.n_quadpts,
+                n_dimensions=self.n_factors,
+            )
+            try:
+                yield
+            finally:
+                self._fit_context = previous_context
+
     def fit(
         self,
         responses: NDArray[np.int_],
         lambda_val: float | None = None,
+        *,
+        start: RegularizedStart = "default",
     ) -> RegularizedMIRTResult:
         """Fit regularized MIRT model.
 
@@ -281,25 +406,76 @@ class RegularizedMIRTEstimator(BaseEstimator):
             Response matrix (n_persons, n_items). Missing values coded as -1.
         lambda_val : float, optional
             Override regularization strength.
+        start : "default", RegularizedMIRTResult or mapping, default="default"
+            Starting loadings and intercepts. ``"default"`` starts from the
+            varimax-rotated unpenalized solution (see the class notes). A
+            previous result, such as the fit at a neighbouring penalty, or a
+            mapping with ``"loadings"`` and ``"intercepts"`` arrays
+            warm-starts the fit. Adaptive weights always come from the
+            unpenalized solution.
 
         Returns
         -------
         RegularizedMIRTResult
             Fitted model with sparse loadings.
+
+        Raises
+        ------
+        MirtValidationError
+            If ``start`` is not ``"default"``, a result or a mapping of
+            finite arrays with the shapes of the loadings and intercepts.
         """
         responses = self._validated_binary_responses(responses)
-        previous_context = self._fit_context
-        with EMFitContext(responses) as context:
-            self._fit_context = context
+        initial = self._resolve_start(start, responses.shape[1])
+        with self._prepared(responses):
+            return self._fit_prepared(responses, lambda_val, initial)
+
+    def _resolve_start(
+        self,
+        start: RegularizedStart,
+        n_items: int,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+        """Return starting arrays, or ``None`` for the reference solution."""
+        if isinstance(start, str) and start == "default":
+            return None
+        if isinstance(start, RegularizedMIRTResult):
+            values: Mapping[str, ArrayLike] = {
+                "loadings": start.loadings,
+                "intercepts": start.intercepts,
+            }
+        elif isinstance(start, Mapping) and set(start) == {"loadings", "intercepts"}:
+            values = start
+        else:
+            raise MirtValidationError(
+                "start must be 'default', a RegularizedMIRTResult, or a mapping "
+                "with 'loadings' and 'intercepts'",
+                parameter="start",
+                value=type(start).__name__,
+            )
+        shapes = {"loadings": (n_items, self.n_factors), "intercepts": (n_items,)}
+        arrays = []
+        for name, shape in shapes.items():
             try:
-                return self._fit_prepared(responses, lambda_val)
-            finally:
-                self._fit_context = previous_context
+                array = np.array(values[name], dtype=np.float64, copy=True)
+            except (TypeError, ValueError) as exc:
+                raise MirtValidationError(
+                    f"starting {name} must be numeric", parameter="start"
+                ) from exc
+            if array.shape != shape or not np.all(np.isfinite(array)):
+                raise MirtValidationError(
+                    f"starting {name} must be finite with shape {shape}",
+                    parameter="start",
+                    value=array.shape,
+                    expected=str(shape),
+                )
+            arrays.append(array)
+        return arrays[0], arrays[1]
 
     def _fit_prepared(
         self,
         responses: NDArray[np.int_],
         lambda_val: float | None,
+        start: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
     ) -> RegularizedMIRTResult:
         """Fit using response preparation owned by the current call."""
         from mirt.estimation.latent_density import GaussianDensity
@@ -322,30 +498,21 @@ class RegularizedMIRTEstimator(BaseEstimator):
         )
         model._initialize_parameters()
 
-        self._quadrature = GaussHermiteQuadrature(
-            n_points=self.n_quadpts,
-            n_dimensions=self.n_factors,
-        )
-
         latent_density = GaussianDensity(
             mean=np.zeros(self.n_factors),
             cov=np.eye(self.n_factors),
             n_dimensions=self.n_factors,
         )
 
-        loadings = model.slopes.copy()
-        intercepts = model.intercepts.copy()
+        reference_loadings, reference_intercepts = self._reference_solution(responses)
+        if start is None:
+            loadings, intercepts = reference_loadings, reference_intercepts
+        else:
+            loadings, intercepts = (array.copy() for array in start)
 
         if self.adaptive:
-            init_loadings = self._fit_unpenalized_warmstart(
-                responses,
-                loadings.copy(),
-                intercepts.copy(),
-                latent_density,
-                max_iter=50,
-            )
             self._adaptive_weights = 1.0 / (
-                np.abs(init_loadings) + REGULARIZATION_EPSILON
+                np.abs(reference_loadings) + REGULARIZATION_EPSILON
             )
         else:
             self._adaptive_weights = np.ones_like(loadings)
@@ -399,9 +566,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
         aic = -2 * current_ll + 2 * n_params
         bic = -2 * current_ll + n_params * np.log(n_persons)
-        gamma = 0.5
-        log_model_space = n_items * self.n_factors * np.log(2.0)
-        ebic = bic + 2 * gamma * log_model_space
+        ebic = bic + ebic_penalty(loadings.size, n_nonzero)
 
         return RegularizedMIRTResult(
             model=model,
@@ -431,12 +596,22 @@ class RegularizedMIRTEstimator(BaseEstimator):
     ) -> list[RegularizedMIRTResult]:
         """Fit models for a sequence of lambda values.
 
+        The penalties are fitted from the smallest to the largest, each
+        starting from the fit at the next smaller penalty, and the smallest
+        from the reference solution (see the class notes). Increasing the
+        penalty therefore removes loadings from a solution that already has
+        simple structure. The reverse order cannot work: once every loading
+        of a factor is zero, that factor's posterior equals its prior and its
+        loadings stay zero at every smaller penalty.
+
         Parameters
         ----------
         responses : NDArray
             Response matrix.
         lambda_values : list, optional
-            Explicit lambda values. If None, generates geometric sequence.
+            Explicit lambda values. If None, generates a geometric sequence
+            of ``n_lambda`` values from ``lambda_max`` down to
+            ``lambda_max * lambda_min_ratio``.
         n_lambda : int
             Number of lambda values if generating sequence.
         lambda_min_ratio : float
@@ -445,7 +620,25 @@ class RegularizedMIRTEstimator(BaseEstimator):
         Returns
         -------
         list[RegularizedMIRTResult]
-            Results for each lambda value, from largest to smallest.
+            Results in the order of ``lambda_values``; a generated sequence
+            runs from the largest penalty to the smallest.
+
+        Notes
+        -----
+        ``lambda_max`` is the smallest L1 penalty at which the first M-step
+        from the reference solution sets every loading to zero. That M-step
+        maximizes, for each item, a concave expected complete-data
+        log-likelihood over the reference posterior, so by its KKT conditions
+        ``lambda_max = max_jk |sum_i (y_ij - p_j) E[theta_ik | y_i]| /
+        (w_jk * l1_share)``, where ``p_j`` is the item's observed proportion
+        correct, ``w_jk`` the adaptive weight (1 without ``adaptive``) and
+        ``l1_share`` is ``alpha`` for the elastic net and 1 otherwise. At and
+        above ``lambda_max`` the fit is all zero; just below it the first
+        M-step keeps the loading attaining the maximum. Because zero loadings
+        are a stationary point, a converged fit can still collapse to zero
+        somewhat below ``lambda_max``, so the largest penalties of a
+        generated path may fit the null model. A ridge penalty never zeroes
+        loadings, and its path uses the LASSO value as its scale.
         """
         responses = self._validated_binary_responses(responses)
         if lambda_values is None:
@@ -458,16 +651,6 @@ class RegularizedMIRTEstimator(BaseEstimator):
             )
             if lambda_min_ratio > 1.0:
                 raise ValueError("lambda_min_ratio must be at most 1")
-            lambda_max = self._compute_lambda_max(responses)
-            lambda_min = lambda_max * lambda_min_ratio
-            if lambda_max == 0.0:
-                lambda_values = [0.0] * n_lambda
-            else:
-                lambda_values = np.geomspace(
-                    lambda_max,
-                    lambda_min,
-                    n_lambda,
-                ).tolist()
         elif len(lambda_values) == 0:
             raise ValueError("lambda_values must contain at least one value")
         else:
@@ -481,14 +664,33 @@ class RegularizedMIRTEstimator(BaseEstimator):
                 for value in lambda_values
             ]
 
-        results = []
-        for lam in lambda_values:
-            if self.verbose:
-                print(f"\n--- Lambda = {lam:.6f} ---")
-            result = self.fit(responses, lambda_val=lam)
-            results.append(result)
+        original_lambda = self.penalty.lambda_val
+        with self._prepared(responses):
+            if lambda_values is None:
+                lambda_max = self._compute_lambda_max(responses)
+                if lambda_max == 0.0:
+                    lambda_values = [0.0] * n_lambda
+                else:
+                    lambda_values = np.geomspace(
+                        lambda_max,
+                        lambda_max * lambda_min_ratio,
+                        n_lambda,
+                    ).tolist()
 
-        return results
+            results: list[RegularizedMIRTResult | None] = [None] * len(lambda_values)
+            start = None
+            try:
+                for index in np.argsort(lambda_values, kind="stable"):
+                    lam = lambda_values[index]
+                    if self.verbose:
+                        print(f"\n--- Lambda = {lam:.6f} ---")
+                    result = self._fit_prepared(responses, lam, start)
+                    results[index] = result
+                    start = (result.loadings, result.intercepts)
+            finally:
+                self.penalty.lambda_val = original_lambda
+
+        return [result for result in results if result is not None]
 
     def _e_step(
         self,
@@ -549,7 +751,12 @@ class RegularizedMIRTEstimator(BaseEstimator):
         loadings: NDArray[np.float64],
         intercepts: NDArray[np.float64],
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-        """M-step with penalization via coordinate descent."""
+        """M-step with penalization via coordinate descent.
+
+        Each coordinate takes a Newton step on the expected complete-data
+        log-likelihood at its current value, followed by the proximal
+        operator of its penalty.
+        """
         from mirt._backend_config import should_use_rust
 
         quad_points = self._quadrature.nodes
@@ -559,6 +766,8 @@ class RegularizedMIRTEstimator(BaseEstimator):
         r_k_all, n_k_all = self._response_context(responses).expected_counts(
             posterior_weights
         )
+        # The native kernel selects its penalty by the L1 share alone.
+        l1_share = self.penalty.l1_share
 
         if should_use_rust():
             try:
@@ -574,7 +783,7 @@ class RegularizedMIRTEstimator(BaseEstimator):
                     intercepts,
                     self._adaptive_weights,
                     self.penalty.lambda_val,
-                    self.penalty.alpha,
+                    l1_share,
                     self.cd_max_iter,
                     self.cd_tol,
                 )
@@ -594,17 +803,15 @@ class RegularizedMIRTEstimator(BaseEstimator):
                 n_k = n_k_all[j]
 
                 for k in range(n_factors):
-                    partial_z = np.dot(quad_points, new_loadings[j]) + new_intercepts[j]
-                    partial_z -= quad_points[:, k] * new_loadings[j, k]
+                    z = np.dot(quad_points, new_loadings[j]) + new_intercepts[j]
+                    p = sigmoid(z)
+                    p = np.clip(p, PROB_EPSILON, 1 - PROB_EPSILON)
 
-                    p_partial = sigmoid(partial_z)
-                    p_partial = np.clip(p_partial, PROB_EPSILON, 1 - PROB_EPSILON)
-
-                    residual = r_k - n_k * p_partial
+                    residual = r_k - n_k * p
                     x_k = quad_points[:, k]
 
                     gradient = np.sum(residual * x_k)
-                    hessian = -np.sum(n_k * p_partial * (1 - p_partial) * x_k * x_k)
+                    hessian = -np.sum(n_k * p * (1 - p) * x_k * x_k)
 
                     if abs(hessian) < PROB_EPSILON:
                         continue
@@ -613,22 +820,10 @@ class RegularizedMIRTEstimator(BaseEstimator):
 
                     adaptive_weight = self._adaptive_weights[j, k]
                     lam_eff = self.penalty.lambda_val * adaptive_weight
-
-                    if self.penalty.type == "lasso":
-                        new_loadings[j, k] = self._soft_threshold(
-                            unpenalized, lam_eff / (-hessian)
-                        )
-                    elif self.penalty.type == "ridge":
-                        new_loadings[j, k] = unpenalized / (
-                            1 + 2 * lam_eff / (-hessian)
-                        )
-                    else:
-                        lasso_part = self.penalty.alpha * lam_eff
-                        ridge_part = (1 - self.penalty.alpha) * lam_eff
-                        shrunk = self._soft_threshold(
-                            unpenalized, lasso_part / (-hessian)
-                        )
-                        new_loadings[j, k] = shrunk / (1 + 2 * ridge_part / (-hessian))
+                    lasso_part = l1_share * lam_eff
+                    ridge_part = (1 - l1_share) * lam_eff
+                    shrunk = self._soft_threshold(unpenalized, lasso_part / (-hessian))
+                    new_loadings[j, k] = shrunk / (1 + 2 * ridge_part / (-hessian))
 
                 z = np.dot(quad_points, new_loadings[j]) + new_intercepts[j]
                 p = sigmoid(z)
@@ -656,86 +851,135 @@ class RegularizedMIRTEstimator(BaseEstimator):
             return 0.0
 
     def _compute_penalty(self, loadings: NDArray[np.float64]) -> float:
-        """Compute penalty term."""
-        weighted_loadings = loadings * self._adaptive_weights
-        lam = self.penalty.lambda_val
+        """Compute the penalty that the M-step's proximal updates apply.
 
-        if self.penalty.type == "lasso":
-            return lam * np.sum(np.abs(weighted_loadings))
-        elif self.penalty.type == "ridge":
-            return lam * np.sum(weighted_loadings**2)
-        else:
-            lasso_part = self.penalty.alpha * np.sum(np.abs(weighted_loadings))
-            ridge_part = (1 - self.penalty.alpha) * np.sum(weighted_loadings**2)
-            return lam * (lasso_part + ridge_part)
+        ``lambda * sum(w * (l1_share * |a| + (1 - l1_share) * a**2))`` with
+        the adaptive weights ``w``.
+        """
+        l1_share = self.penalty.l1_share
+        absolute = np.abs(loadings)
+        weighted = self._adaptive_weights * (
+            l1_share * absolute + (1 - l1_share) * absolute**2
+        )
+        return float(self.penalty.lambda_val * np.sum(weighted))
 
     def _compute_lambda_max(self, responses: NDArray[np.int_]) -> float:
-        """Compute maximum lambda that gives all-zero solution."""
+        """Return the smallest penalty whose first M-step zeroes every loading.
+
+        See the notes of :meth:`fit_path`. The gradient is that of each
+        item's expected complete-data log-likelihood under the posterior of
+        the reference solution, at zero loadings and the intercept that
+        reproduces the item's observed proportion correct.
+        """
         from mirt.estimation.latent_density import GaussianDensity
-        from mirt.models.multidimensional import MultidimensionalModel
 
-        n_items = responses.shape[1]
+        with self._prepared(responses):
+            loadings, intercepts = self._reference_solution(responses)
+            posterior_weights, _ = self._e_step(
+                responses,
+                loadings,
+                intercepts,
+                GaussianDensity(
+                    mean=np.zeros(self.n_factors),
+                    cov=np.eye(self.n_factors),
+                    n_dimensions=self.n_factors,
+                ),
+            )
+            r_k_all, n_k_all = self._response_context(responses).expected_counts(
+                posterior_weights
+            )
+            quad_points = self._quadrature.nodes
+        n_observed = n_k_all.sum(axis=1)
+        proportions = np.divide(
+            r_k_all.sum(axis=1),
+            n_observed,
+            out=np.zeros(len(n_observed)),
+            where=n_observed > 0.0,
+        )
+        gradient = np.abs((r_k_all - n_k_all * proportions[:, None]) @ quad_points)
+        if self.adaptive:
+            gradient *= np.abs(loadings) + REGULARIZATION_EPSILON
+        l1_share = self.penalty.l1_share
+        scale = l1_share if l1_share > 0.0 else 1.0
+        return float(np.max(gradient, initial=0.0) / scale)
 
-        model = MultidimensionalModel(n_items=n_items, n_factors=self.n_factors)
-        model._initialize_parameters()
-
-        self._quadrature = GaussHermiteQuadrature(
-            n_points=self.n_quadpts,
-            n_dimensions=self.n_factors,
+    def _reference_key(self, responses: NDArray[np.int_]) -> tuple[object, ...]:
+        """Identify the data and settings that determine the reference fit."""
+        data = np.ascontiguousarray(responses)
+        digest = hashlib.blake2b(data.view(np.uint8), digest_size=16).hexdigest()
+        return (
+            data.shape,
+            data.dtype.str,
+            digest,
+            self.n_factors,
+            self.n_quadpts,
+            self.max_iter,
+            self.tol,
+            self.cd_max_iter,
+            self.cd_tol,
         )
 
+    def _reference_solution(
+        self,
+        responses: NDArray[np.int_],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return the varimax-rotated unpenalized fit, computed once per data set.
+
+        EM starts from loadings staggered across factors and zero intercepts,
+        as exploratory EM does, and runs for at most ``min(max_iter, 100)``
+        iterations. Columns are
+        signed to have a non-negative sum and ordered by their sum of
+        squares.
+        """
+        from mirt.estimation.base import _stagger_factor_slopes
+        from mirt.estimation.latent_density import GaussianDensity
+        from mirt.models.multidimensional import MultidimensionalModel
+        from mirt.utils.rotation import rotate_loadings
+
+        key = self._reference_key(responses)
+        if self._reference_cache is not None and self._reference_cache[0] == key:
+            return self._reference_cache[1].copy(), self._reference_cache[2].copy()
+
+        n_items = responses.shape[1]
+        model = MultidimensionalModel(n_items=n_items, n_factors=self.n_factors)
+        model._initialize_parameters()
+        loadings = _stagger_factor_slopes(
+            model, "slopes", model.slopes, model.free_parameter_masks["slopes"]
+        ).copy()
+        intercepts = model.intercepts.copy()
         latent_density = GaussianDensity(
             mean=np.zeros(self.n_factors),
             cov=np.eye(self.n_factors),
             n_dimensions=self.n_factors,
         )
 
-        loadings = np.zeros((n_items, self.n_factors))
-        intercepts = np.zeros(n_items)
-
-        posterior_weights, _ = self._e_step(
-            responses, loadings, intercepts, latent_density
-        )
-
-        quad_points = self._quadrature.nodes
-
-        r_k_all, n_k_all = self._response_context(responses).expected_counts(
-            posterior_weights
-        )
-        probabilities = np.clip(
-            sigmoid(intercepts),
-            PROB_EPSILON,
-            1 - PROB_EPSILON,
-        )
-        residuals = r_k_all - n_k_all * probabilities[:, None]
-        max_gradient = float(np.max(np.abs(residuals @ quad_points), initial=0.0))
-        return max_gradient * 1.1
-
-    def _fit_unpenalized_warmstart(
-        self,
-        responses: NDArray[np.int_],
-        loadings: NDArray[np.float64],
-        intercepts: NDArray[np.float64],
-        latent_density: LatentDensity,
-        max_iter: int = 50,
-    ) -> NDArray[np.float64]:
-        """Fit unpenalized model for adaptive weights."""
         original_lambda = self.penalty.lambda_val
         original_weights = self._adaptive_weights
         self.penalty.lambda_val = 0.0
         self._adaptive_weights = np.ones_like(loadings)
         try:
-            for _ in range(max_iter):
-                posterior_weights, _ = self._e_step(
+            prev_ll = -np.inf
+            for _ in range(min(self.max_iter, _REFERENCE_MAX_ITER)):
+                posterior_weights, log_marginal = self._e_step(
                     responses, loadings, intercepts, latent_density
                 )
+                current_ll = float(log_marginal.sum())
+                if self._check_convergence(prev_ll, current_ll):
+                    break
+                prev_ll = current_ll
                 loadings, intercepts = self._m_step_penalized(
                     responses, posterior_weights, loadings, intercepts
                 )
                 n_k = posterior_weights.sum(axis=0)
                 del posterior_weights
                 latent_density.update(self._quadrature.nodes, n_k)
-            return loadings
         finally:
             self.penalty.lambda_val = original_lambda
             self._adaptive_weights = original_weights
+
+        if n_items >= self.n_factors and np.all(np.isfinite(loadings)):
+            loadings = rotate_loadings(loadings, method="varimax", normalize=True)[0]
+        loadings = loadings * np.where(loadings.sum(axis=0) < 0.0, -1.0, 1.0)
+        loadings = loadings[:, np.argsort(-np.sum(loadings**2, axis=0), kind="stable")]
+        self._reference_cache = (key, loadings.copy(), intercepts.copy())
+        return loadings, intercepts

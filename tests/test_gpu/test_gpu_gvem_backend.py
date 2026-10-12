@@ -284,3 +284,48 @@ def test_batched_m_step_matches_array_reference_and_retains_empty_items(
     np.testing.assert_allclose(actual[1], expected_intercepts, rtol=1e-12, atol=1e-12)
     np.testing.assert_array_equal(actual[0][0], current_slopes[0])
     assert actual[1][0] == current_intercepts[0]
+
+
+def test_batched_m_step_with_fixed_loadings_updates_intercepts_given_slopes(
+    cpu_tensor_runtime: Any,
+    gvem_inputs: dict[str, np.ndarray],
+) -> None:
+    # Regression: the 1PL intercepts were updated with freely solved slopes,
+    # which were only then reset to 1.
+    responses = gvem_inputs["responses"]
+    mu = gvem_inputs["mu"][:, :1]
+    sigma = gvem_inputs["sigma"][:, :1, :1]
+    xi = gvem_inputs["xi"]
+    current_slopes = np.ones((responses.shape[1], 1))
+    current_intercepts = gvem_inputs["intercepts"]
+
+    slopes, intercepts = cpu_tensor_runtime.gvem_m_step_gpu(
+        responses,
+        mu,
+        sigma,
+        xi,
+        current_slopes,
+        current_intercepts,
+        estimate_loadings=False,
+    )
+
+    valid = responses >= 0
+    weights = np.where(valid, 2.0 * _jj_lambda(xi), 0.0)
+    numerator = np.where(valid, responses - 0.5 - weights * mu, 0.0).sum(axis=0)
+    denominator = weights.sum(axis=0)
+    expected = np.where(
+        valid.any(axis=0),
+        np.clip(
+            np.divide(
+                numerator,
+                denominator,
+                where=denominator > 1e-12,
+                out=np.zeros_like(numerator),
+            ),
+            -10.0,
+            10.0,
+        ),
+        current_intercepts,
+    )
+    np.testing.assert_array_equal(slopes, current_slopes)
+    np.testing.assert_allclose(intercepts, expected, rtol=1e-12, atol=1e-12)

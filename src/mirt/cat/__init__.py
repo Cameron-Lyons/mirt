@@ -1,7 +1,7 @@
 """Computerized Adaptive Testing (CAT) module for mirt.
 
 This module provides comprehensive CAT functionality including:
-- Item selection strategies (MFI, MEI, KL, etc.)
+- Item selection strategies (MFI, MEI, posterior-weighted, KL, etc.)
 - Stopping rules (SE threshold, max items, etc.)
 - Exposure control (Sympson-Hetter, randomesque)
 - Content balancing (test blueprints) and shadow-test selection
@@ -17,7 +17,7 @@ Basic CAT session:
 >>> from mirt import fit_mirt
 >>> from mirt.cat import CATEngine
 >>> result = fit_mirt(data, model="2PL")
->>> cat = CATEngine(result.model, se_threshold=0.3, max_items=20)
+>>> cat = CATEngine(result, se_threshold=0.3, max_items=20)
 >>> state = cat.get_current_state()
 >>> while not state.is_complete:
 ...     # Display item state.next_item to examinee
@@ -42,12 +42,12 @@ With content balancing:
 ... ])
 >>> cat = CATEngine(model, content_constraint=blueprint)
 
-Multidimensional CAT:
+Multidimensional CAT, scoring with the calibration's latent covariance:
 
 >>> from mirt import fit_mirt
 >>> from mirt.cat import MCATEngine
->>> result = fit_mirt(data, model="MIRT", n_factors=2)
->>> mcat = MCATEngine(result.model, trace_threshold=0.5, max_items=30)
+>>> result = fit_mirt(data, model="2PL", n_factors=2)
+>>> mcat = MCATEngine(result, trace_threshold=0.5, max_items=30)
 >>> state = mcat.get_current_state()
 >>> while not state.is_complete:
 ...     response = get_response(state.next_item)
@@ -67,7 +67,11 @@ _LAZY_IMPORTS = {
     "ItemSelectionStrategy": "mirt.cat.selection",
     "MaxFisherInformation": "mirt.cat.selection",
     "MaxExpectedInformation": "mirt.cat.selection",
+    "MaxPosteriorWeightedInformation": "mirt.cat.selection",
+    "MaxLikelihoodWeightedInformation": "mirt.cat.selection",
     "KullbackLeibler": "mirt.cat.selection",
+    "PosteriorKullbackLeibler": "mirt.cat.selection",
+    "MinExpectedPosteriorVariance": "mirt.cat.selection",
     "UrryRule": "mirt.cat.selection",
     "RandomSelection": "mirt.cat.selection",
     "AStratified": "mirt.cat.selection",

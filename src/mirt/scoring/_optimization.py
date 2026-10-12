@@ -35,8 +35,8 @@ def validate_theta_bounds(bounds: object) -> tuple[float, float]:
 def bounded_scalar_minimize(
     objective: RowObjective,
     n_rows: int,
-    lower: float,
-    upper: float,
+    lower: float | NDArray[np.float64],
+    upper: float | NDArray[np.float64],
     *,
     xatol: float = 1e-5,
     maxiter: int = 500,
@@ -55,8 +55,8 @@ def bounded_scalar_minimize(
         ``rows`` evaluated at the matching entries of ``x``.
     n_rows : int
         Number of independent objectives.
-    lower, upper : float
-        Finite search interval shared by every row.
+    lower, upper : float or ndarray of shape (n_rows,)
+        Finite search interval, shared by every row or one per row.
     xatol : float, default=1e-5
         Absolute tolerance on the minimizer.
     maxiter : int, default=500
@@ -261,6 +261,42 @@ def batched_hessian_se(
         variances = np.diag(covariance)
         if np.all(np.isfinite(variances)) and np.all(variances > 0.0):
             standard_error[row] = np.sqrt(variances)
+    return standard_error
+
+
+def free_block_standard_errors(
+    matrices: NDArray[np.float64],
+    free: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    """Return ``sqrt(diag(inv(M_ff)))`` over each row's free coordinates.
+
+    ``matrices`` are symmetric curvature or information matrices with shape
+    ``(n_rows, n_dims, n_dims)`` and ``free`` marks the coordinates kept in
+    each row's block. As in :func:`batched_hessian_se`, a block that is
+    numerically singular, with an eigenvalue at or below ``sqrt(eps)`` times
+    its largest magnitude (at least one), that contains non-finite values or
+    whose inverse has a non-positive variance yields NaN for every free
+    coordinate of its row. Coordinates outside the block are NaN as well, so
+    callers fill them according to their own convention.
+    """
+    n_rows, n_dims = free.shape
+    standard_error = np.full((n_rows, n_dims), np.nan, dtype=np.float64)
+    if n_rows == 0:
+        return standard_error
+    identity = np.eye(n_dims)
+    reduced = np.where(free[:, :, None] & free[:, None, :], matrices, identity)
+    finite = np.all(np.isfinite(reduced), axis=(1, 2))
+    reduced[~finite] = identity
+    eigenvalues = np.linalg.eigvalsh(reduced)
+    scale = np.maximum(np.max(np.abs(eigenvalues), axis=1), 1.0)
+    tolerance = np.sqrt(np.finfo(np.float64).eps) * scale
+    regular = np.flatnonzero(finite & np.all(eigenvalues > tolerance[:, None], axis=1))
+    if regular.size == 0:
+        return standard_error
+    variances = np.diagonal(np.linalg.inv(reduced[regular]), axis1=1, axis2=2)
+    valid = np.all(np.isfinite(variances) & (variances > 0.0), axis=1)
+    rows = regular[valid]
+    standard_error[rows] = np.where(free[rows], np.sqrt(variances[valid]), np.nan)
     return standard_error
 
 

@@ -51,6 +51,44 @@ def drifting_models():
     return model_old, model_new
 
 
+def _polytomous_pair(family, seed, n_items=8, n_categories=4):
+    """Two noisy calibrations related by ``theta_old = 1.25 theta_new + 0.4``."""
+    from mirt.models.polytomous import GeneralizedPartialCredit, NominalResponseModel
+
+    rng = np.random.default_rng(seed)
+    scale, shift = 1.25, 0.4
+    shape = (n_items, n_categories - 1)
+    if family == "NRM":
+        slopes = np.sort(rng.normal(0.0, 1.0, (n_items, n_categories)), axis=1)
+        slopes -= slopes[:, :1]
+        intercepts = rng.normal(0.0, 1.0, slopes.shape)
+        intercepts -= intercepts[:, :1]
+        old = NominalResponseModel(n_items, n_categories=n_categories)
+        new = NominalResponseModel(n_items, n_categories=n_categories)
+        old.set_parameters(slopes=slopes, intercepts=intercepts)
+        new.set_parameters(
+            slopes=slopes * scale * np.exp(rng.normal(0.0, 0.05, slopes.shape)),
+            intercepts=intercepts
+            + slopes * shift
+            + rng.normal(0.0, 0.05, slopes.shape),
+        )
+        return old, new
+    model_type, name = {
+        "GRM": (GradedResponseModel, "thresholds"),
+        "GPCM": (GeneralizedPartialCredit, "steps"),
+    }[family]
+    slopes = rng.uniform(0.7, 2.0, n_items)
+    locations = np.sort(rng.normal(0.0, 1.0, shape), axis=1)
+    old = model_type(n_items, n_categories=n_categories)
+    new = model_type(n_items, n_categories=n_categories)
+    old.set_parameters(discrimination=slopes, **{name: locations})
+    new.set_parameters(
+        discrimination=slopes * scale * np.exp(rng.normal(0.0, 0.05, n_items)),
+        **{name: np.sort((locations - shift) / scale + rng.normal(0, 0.08, shape))},
+    )
+    return old, new
+
+
 class TestDetectDrift:
     """Tests for detect_drift function."""
 
@@ -139,6 +177,127 @@ class TestDetectDrift:
         assert np.isinf(result.drift_statistics[4])
         assert result.p_values is not None
         assert result.p_values[4] == 0.0
+
+    @pytest.mark.parametrize(
+        "model_type", [TwoParameterLogistic, ThreeParameterLogistic]
+    )
+    def test_automatic_constants_equal_stocking_lord_link(self, model_type):
+        """Dichotomous drift links with the estimator of link()."""
+        from mirt.equating import link
+
+        rng = np.random.default_rng(3)
+        n_items = 12
+        shape = (
+            {"guessing": np.full(n_items, 0.15)}
+            if model_type is ThreeParameterLogistic
+            else {}
+        )
+        model_old = model_type(n_items=n_items)
+        model_new = model_type(n_items=n_items)
+        slopes = rng.uniform(0.7, 2.0, n_items)
+        locations = rng.normal(0.0, 1.0, n_items)
+        model_old.set_parameters(discrimination=slopes, difficulty=locations, **shape)
+        model_new.set_parameters(
+            discrimination=slopes * 1.3 + rng.normal(0.0, 0.1, n_items),
+            difficulty=(locations + 0.6) / 1.3 + rng.normal(0.0, 0.15, n_items),
+            **shape,
+        )
+        anchors = list(range(8))
+        constants = link(
+            model_old, model_new, anchors, anchors, method="stocking_lord"
+        ).constants
+
+        automatic = detect_drift(model_old, model_new, anchors, anchors, method="area")
+        explicit = detect_drift(
+            model_old,
+            model_new,
+            anchors,
+            anchors,
+            method="area",
+            A=constants.A,
+            B=constants.B,
+        )
+
+        np.testing.assert_array_equal(
+            automatic.drift_statistics, explicit.drift_statistics
+        )
+
+    def test_robust_z_signs_tied_scale_outliers(self):
+        """A zero MAD reports changes below the median as negative infinity."""
+        model_old = TwoParameterLogistic(n_items=5)
+        model_new = TwoParameterLogistic(n_items=5)
+        model_old.set_parameters(discrimination=np.ones(5), difficulty=np.zeros(5))
+        model_new.set_parameters(
+            discrimination=np.ones(5),
+            difficulty=np.array([0.5, 0.5, 0.5, 0.0, 2.0]),
+        )
+
+        result = detect_drift(
+            model_old,
+            model_new,
+            list(range(5)),
+            list(range(5)),
+            method="robust_z",
+            A=1.0,
+            B=0.0,
+        )
+
+        np.testing.assert_array_equal(
+            result.drift_statistics, [0.0, 0.0, 0.0, -np.inf, np.inf]
+        )
+        assert result.flagged_items == [3, 4]
+
+    def test_given_constants_need_no_population_weights(self, drifting_models):
+        """Only constant estimation uses the normal weights of the grid."""
+        model_old, model_new = drifting_models
+        items = list(range(10))
+        # The standard normal density underflows to zero on this range.
+        theta_range = (-45.0, -39.0)
+
+        result = detect_drift(
+            model_old,
+            model_new,
+            items,
+            items,
+            method="area",
+            A=1.0,
+            B=0.0,
+            theta_range=theta_range,
+        )
+        signed, unsigned = signed_area_difference(
+            model_old, model_new, 0, 0, theta_range=theta_range
+        )
+        detect_drift(
+            model_old,
+            model_new,
+            items,
+            items,
+            method="robust_z",
+            A=1.0,
+            B=0.0,
+            theta_range=theta_range,
+        )
+
+        theta = np.linspace(*theta_range, 61)
+        difference = model_old.probability(theta[:, None]) - model_new.probability(
+            theta[:, None]
+        )
+        np.testing.assert_allclose(
+            result.drift_statistics,
+            np.trapezoid(np.abs(difference), theta, axis=0),
+            rtol=1e-12,
+        )
+        assert result.drift_statistics[0] > 0.0
+        assert 0.0 < abs(signed) <= unsigned
+        with pytest.raises(ValueError, match="positive sum"):
+            detect_drift(
+                model_old,
+                model_new,
+                items,
+                items,
+                method="area",
+                theta_range=theta_range,
+            )
 
     def test_area_uses_three_pl_guessing_parameter(self):
         """Area drift must use the actual model curve, including guessing."""
@@ -252,6 +411,63 @@ class TestDetectDrift:
 
         assert result.flagged_items == []
         np.testing.assert_allclose(result.drift_statistics, 0.0, atol=1e-6)
+
+    @pytest.mark.parametrize("family", ["GRM", "GPCM", "NRM"])
+    def test_polytomous_constants_equal_the_family_linker(self, family):
+        """Built-in polytomous drift links with its family's pairwise linker."""
+        from mirt.equating import link_gpcm, link_grm, link_nrm
+
+        old, new = _polytomous_pair(family, seed=5)
+        anchors = list(range(6))
+        linker = {"GRM": link_grm, "GPCM": link_gpcm, "NRM": link_nrm}[family]
+        constants = linker(old, new, anchors, anchors, method="stocking_lord").constants
+
+        automatic = detect_drift(old, new, anchors, anchors, method="area")
+        explicit = detect_drift(
+            old, new, anchors, anchors, method="area", A=constants.A, B=constants.B
+        )
+
+        np.testing.assert_array_equal(
+            automatic.drift_statistics, explicit.drift_statistics
+        )
+
+    def test_polytomous_linker_requires_matching_unmodified_families(self):
+        from mirt.equating.drift import _has_shared_polytomous_linker
+
+        class Subclassed(GradedResponseModel):
+            """Not a registered built-in, so its curves are its own."""
+
+        def graded(model_type=GradedResponseModel, counts=(4, 4, 4)):
+            return model_type(3, n_categories=list(counts))
+
+        items = [0, 1, 2]
+        assert _has_shared_polytomous_linker(graded(), graded(), items, items)
+        assert not _has_shared_polytomous_linker(
+            graded(), graded(counts=(4, 3, 4)), items, items
+        )
+        assert not _has_shared_polytomous_linker(
+            graded(), graded(Subclassed), items, items
+        )
+        assert not _has_shared_polytomous_linker(
+            graded(), _polytomous_pair("GPCM", seed=0)[0], items, items
+        )
+
+    def test_mismatched_categories_link_on_expected_scores(self):
+        """Anchors whose category counts differ still match expected scores."""
+        old = GradedResponseModel(n_items=3, n_categories=[3, 4, 4])
+        new = GradedResponseModel(n_items=3, n_categories=[4, 4, 4])
+        thresholds = np.array([[-1.0, 0.8, 0.0], [-1.5, -0.2, 1.2], [-0.6, 0.4, 1.4]])
+        old.set_parameters(
+            discrimination=np.array([0.8, 1.1, 1.5]), thresholds=thresholds
+        )
+        new.set_parameters(
+            discrimination=np.array([1.0, 1.4, 1.9]),
+            thresholds=np.array([[-1.2, 0.1, 0.9], [-1.0, 0.1, 1.2], [-0.3, 0.6, 1.3]]),
+        )
+
+        result = detect_drift(old, new, [0, 1, 2], [0, 1, 2], method="area")
+
+        assert np.all(np.isfinite(result.drift_statistics))
 
     def test_area_batches_dense_probability_evaluation(
         self, stable_models, monkeypatch

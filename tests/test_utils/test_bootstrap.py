@@ -858,6 +858,80 @@ class TestParametricBootstrap:
         for actual, reference in zip(captured, expected, strict=True):
             np.testing.assert_array_equal(actual, reference)
 
+    @staticmethod
+    def _capture_replicates(monkeypatch):
+        simulated = []
+
+        def fake_fit(self, fitted_model, responses):
+            simulated.append(responses.copy())
+            return SimpleNamespace(model=fitted_model)
+
+        monkeypatch.setattr(EMEstimator, "fit", fake_fit)
+        return simulated
+
+    def test_fit_result_replicates_have_its_sample_size(self, monkeypatch):
+        # Regression: replicates of a FitResult always simulated 500 persons,
+        # so bootstrap SEs described a different sample size than the fit's.
+        from mirt.results import FitResult
+
+        model = TwoParameterLogistic(n_items=4)
+        result = FitResult(model, -1.0, 1, True, {}, 0.0, 0.0, n_observations=137)
+        simulated = self._capture_replicates(monkeypatch)
+
+        parametric_bootstrap(result, n_bootstrap=2, seed=3)
+
+        assert [responses.shape for responses in simulated] == [(137, 4)] * 2
+
+    def test_replicates_keep_the_observed_missing_pattern(self, monkeypatch):
+        model = TwoParameterLogistic(n_items=5)
+        rng = np.random.default_rng(8)
+        observed = rng.integers(0, 2, size=(60, 5))
+        observed[rng.random(observed.shape) < 0.4] = -1
+        simulated = self._capture_replicates(monkeypatch)
+
+        parametric_bootstrap(model, n_bootstrap=3, seed=3, responses=observed)
+
+        assert len(simulated) == 3
+        for responses in simulated:
+            np.testing.assert_array_equal(responses < 0, observed < 0)
+            assert set(np.unique(responses[observed >= 0])) <= {0, 1}
+
+    def test_bare_model_without_sample_size_warns(self, monkeypatch):
+        simulated = self._capture_replicates(monkeypatch)
+
+        with pytest.warns(UserWarning, match="500 persons"):
+            parametric_bootstrap(TwoParameterLogistic(n_items=3), n_bootstrap=2)
+
+        assert all(responses.shape == (500, 3) for responses in simulated)
+
+    def test_rejects_person_count_that_differs_from_responses(self):
+        with pytest.raises(MirtValidationError, match="response rows"):
+            parametric_bootstrap(
+                TwoParameterLogistic(n_items=3),
+                n_bootstrap=2,
+                n_persons=10,
+                responses=np.zeros((12, 3), dtype=int),
+            )
+
+    def test_standard_errors_follow_the_fitted_design(self):
+        # Regression: at N=3000 the default 500-person replicates gave SEs
+        # 2.6 times the fit's; with half the responses missing, complete
+        # replicates gave SEs 43% too small.
+        import mirt
+
+        data = mirt.simdata(model="2PL", n_persons=1500, n_items=6, seed=4)
+        rng = np.random.default_rng(0)
+        incomplete = np.where(rng.random(data.shape) < 0.5, -1, data)
+        for responses in (data, incomplete):
+            fit = mirt.fit_mirt(responses, model="2PL")
+            errors = parametric_bootstrap(
+                fit, n_bootstrap=30, seed=1, responses=responses
+            )
+            ratio = np.mean(
+                errors["discrimination"] / fit.standard_errors["discrimination"]
+            )
+            assert 0.75 < ratio < 1.3
+
     @pytest.mark.parametrize("n_persons", [0, -1, 1.5, True])
     def test_rejects_invalid_person_count(self, fitted_2pl_model, n_persons):
         with pytest.raises(MirtValidationError, match="n_persons"):

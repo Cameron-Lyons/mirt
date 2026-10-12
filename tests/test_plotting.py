@@ -17,7 +17,12 @@ from mirt.models.dichotomous import TwoParameterLogistic
 from mirt.models.multidimensional import (
     MultidimensionalModel as RealMultidimensionalModel,
 )
-from mirt.models.polytomous import GradedResponseModel
+from mirt.models.polytomous import (
+    GeneralizedPartialCredit,
+    GradedResponseModel,
+    NominalResponseModel,
+    PartialCreditModel,
+)
 
 
 class RecordingAxes:
@@ -546,6 +551,109 @@ class TestInformation:
         assert model.information_calls == [None, 0]
 
 
+class TestFactorInformation:
+    """Multidimensional curves show the information along the plotted factor."""
+
+    theta_values = np.linspace(-2.0, 2.0, 5)
+
+    def _slice(self, factor: int, n_factors: int = 2) -> np.ndarray:
+        theta = np.zeros((self.theta_values.size, n_factors))
+        theta[:, factor] = self.theta_values
+        return theta
+
+    @staticmethod
+    def _logistic_information(slopes, intercepts, theta, factor):
+        logits = theta @ slopes.T + intercepts
+        probabilities = 1.0 / (1.0 + np.exp(-logits))
+        return probabilities * (1.0 - probabilities) * slopes[:, factor] ** 2
+
+    def test_information_and_se_use_the_factor_diagonal(self):
+        # R: testinfo(mod, Theta, degrees = c(0, 90)) is sum_j a_j1^2 P Q at
+        # Theta = (t, 0); the trace sum_j |a_j|^2 P Q used to be plotted.
+        slopes = np.array([[1.2, 0.5], [0.0, 1.0], [0.8, 0.8]])
+        intercepts = np.array([0.3, -0.4, 1.0])
+        model = RealMultidimensionalModel(n_items=3, n_factors=2)
+        model.set_parameters(slopes=slopes, intercepts=intercepts)
+
+        for factor in (0, 1):
+            expected = self._logistic_information(
+                slopes, intercepts, self._slice(factor), factor
+            )
+            information_axes = RecordingAxes()
+            plotting.plot_information(
+                model,
+                item_idx=[0, 1, 2],
+                theta_range=(-2, 2),
+                n_points=5,
+                factor=factor,
+                ax=information_axes,
+            )
+            curves = [call[0][1] for call in information_axes.calls["plot"]]
+            np.testing.assert_allclose(curves[0], expected.sum(axis=1), rtol=1e-12)
+            for column in range(3):
+                np.testing.assert_allclose(
+                    curves[column + 1], expected[:, column], rtol=1e-12
+                )
+            assert information_axes.calls["set_ylabel"][0][0] == (
+                f"Information (factor {factor + 1})",
+            )
+
+            se_axes = RecordingAxes()
+            plotting.plot_se(
+                model, theta_range=(-2, 2), n_points=5, factor=factor, ax=se_axes
+            )
+            np.testing.assert_allclose(
+                se_axes.calls["plot"][0][0][1],
+                1.0 / np.sqrt(expected.sum(axis=1)),
+                rtol=1e-12,
+            )
+
+    def test_models_without_information_matrices_are_differentiated(self):
+        # The test double has only the trace ``information`` method.
+        model = MultidimensionalModel()
+        slopes = model.parameters["slopes"]
+        intercepts = model.parameters["intercepts"]
+        expected = self._logistic_information(slopes, intercepts, self._slice(1), 1)
+
+        axes = RecordingAxes()
+        plotting.plot_information(
+            model, theta_range=(-2, 2), n_points=5, factor=1, ax=axes
+        )
+
+        np.testing.assert_allclose(
+            axes.calls["plot"][0][0][1], expected.sum(axis=1), rtol=1e-7
+        )
+
+    def test_dichotomous_and_graded_factors_match_their_matrices(self):
+        two_pl = TwoParameterLogistic(n_items=2, n_factors=2)
+        two_pl.set_parameters(
+            discrimination=np.array([[1.0, 0.4], [0.3, 1.5]]),
+            difficulty=np.array([0.2, -0.5]),
+        )
+        graded = GradedResponseModel(n_items=2, n_categories=[3, 4], n_factors=2)
+        graded.set_parameters(
+            discrimination=np.array([[1.1, 0.2], [0.6, 1.3]]),
+            thresholds=np.array([[-1.0, 0.5, 0.0], [-1.5, 0.0, 1.0]]),
+        )
+        theta = self._slice(0)
+        # 2PL: a_k^2 P Q along factor k.
+        slopes = two_pl.parameters["discrimination"]
+        probabilities = np.column_stack(
+            [two_pl.probability(theta, item) for item in range(2)]
+        )
+        two_pl_expected = np.sum(
+            probabilities * (1.0 - probabilities) * slopes[:, 0] ** 2, axis=1
+        )
+        graded_expected = graded.test_information_matrix(theta)[:, 0, 0]
+
+        for model, expected in ((two_pl, two_pl_expected), (graded, graded_expected)):
+            axes = RecordingAxes()
+            plotting.plot_information(
+                model, theta_range=(-2, 2), n_points=5, factor=0, ax=axes
+            )
+            np.testing.assert_allclose(axes.calls["plot"][0][0][1], expected, rtol=1e-6)
+
+
 class TestAbilityDistribution:
     def test_density_plot_forwards_histogram_style(self):
         axes = RecordingAxes()
@@ -678,6 +786,26 @@ class TestItemFit:
         assert not axes.calls["scatter"]
         assert not axes.calls["legend"]
 
+    @pytest.mark.parametrize("backend", ["pandas", "polars"])
+    def test_itemfit_accepts_mirt_itemfit_frames(self, backend):
+        import mirt
+        from mirt.utils import set_dataframe_backend
+
+        responses = mirt.simdata(model="2PL", n_persons=200, n_items=4, seed=3)
+        result = mirt.fit_mirt(responses, model="2PL", max_iter=50)
+        set_dataframe_backend(backend)
+        try:
+            frame = mirt.itemfit(result, responses)
+        finally:
+            set_dataframe_backend("auto")
+        axes = RecordingAxes()
+
+        plotting.plot_itemfit(frame, statistic="outfit", ax=axes)
+
+        expected = np.asarray(frame["outfit"].to_numpy(), dtype=float)
+        np.testing.assert_allclose(axes.calls["bar"][0][0][1], expected)
+        assert axes.calls["set_xticklabels"][0][0][0] == list(result.model.item_names)
+
     @pytest.mark.parametrize(
         ("fit_stats", "kwargs", "match"),
         [
@@ -801,6 +929,89 @@ class TestPersonItemMap:
         with pytest.raises(ValueError, match=match):
             plotting.plot_person_item_map(model, np.arange(3.0), ax=RecordingAxes())
 
+    def test_partial_credit_maps_use_mean_active_steps(self):
+        steps = np.array([[-1.0, 0.0, 2.0], [-0.5, 1.5, 0.0]])
+        gpcm = GeneralizedPartialCredit(n_items=2, n_categories=[4, 3])
+        gpcm.set_parameters(steps=steps)
+        pcm = PartialCreditModel(n_items=2, n_categories=[4, 3])
+        pcm.set_parameters(steps=steps)
+
+        for model in (gpcm, pcm):
+            axes = RecordingAxes()
+            plotting.plot_person_item_map(model, np.arange(5.0), ax=axes)
+            assert axes.secondary is not None
+            np.testing.assert_allclose(
+                axes.secondary.calls["scatter"][0][0][1], [1.0 / 3.0, 0.5]
+            )
+
+    def test_nominal_items_have_no_location(self):
+        model = NominalResponseModel(n_items=2, n_categories=3)
+
+        with pytest.raises(ValueError, match="nominal"):
+            plotting.plot_person_item_map(model, np.arange(5.0), ax=RecordingAxes())
+
+    def test_items_without_a_slope_on_the_factor_are_left_out(self):
+        model = RealMultidimensionalModel(n_items=3, n_factors=2)
+        model.set_parameters(
+            slopes=np.array([[1.0, 0.0], [0.5, 0.0], [0.0, 2.0]]),
+            intercepts=np.array([1.0, -1.0, 1.0]),
+        )
+        theta = np.column_stack((np.arange(4.0), np.arange(4.0)))
+
+        first = RecordingAxes()
+        plotting.plot_person_item_map(model, theta, factor=0, ax=first)
+        second = RecordingAxes()
+        plotting.plot_person_item_map(model, theta, factor=1, ax=second)
+
+        assert first.secondary is not None and second.secondary is not None
+        np.testing.assert_allclose(
+            first.secondary.calls["scatter"][0][0][1], [-1.0, 2.0]
+        )
+        assert len(first.secondary.calls["annotate"]) == 2
+        assert "1 item(s)" in first.calls["text"][0][0][2]
+        np.testing.assert_allclose(second.secondary.calls["scatter"][0][0][1], [-0.5])
+        assert second.calls["set_title"][0][0] == (
+            "Person-Item Map (Wright Map) (factor 2)",
+        )
+
+    def test_multidimensional_difficulties_are_placed_on_the_factor(self):
+        # The 2PL logit a @ theta - sum(a) * b is zero at sum(a) * b / a_k.
+        model = TwoParameterLogistic(n_items=2, n_factors=2)
+        model.set_parameters(
+            discrimination=np.array([[1.0, 1.0], [2.0, 0.0]]),
+            difficulty=np.array([0.5, -1.0]),
+        )
+        theta = np.column_stack((np.arange(4.0), np.arange(4.0)))
+
+        first = RecordingAxes()
+        plotting.plot_person_item_map(model, theta, factor=0, ax=first)
+        second = RecordingAxes()
+        plotting.plot_person_item_map(model, theta, factor=1, ax=second)
+
+        assert first.secondary is not None and second.secondary is not None
+        np.testing.assert_allclose(
+            first.secondary.calls["scatter"][0][0][1], [1.0, -1.0]
+        )
+        np.testing.assert_allclose(second.secondary.calls["scatter"][0][0][1], [1.0])
+
+    def test_mixed_format_maps_locate_each_component(self):
+        from mirt.models.mixed_format import MixedItemModel
+
+        model = MixedItemModel.from_itemtypes(
+            ["2PL", "GRM", "2PL", "NRM"], n_categories=[2, 3, 2, 3]
+        )
+        two_pl, graded, _ = model.component_models
+        two_pl.set_parameters(difficulty=np.array([-1.0, 1.5]))
+        graded.set_parameters(thresholds=np.array([[-0.5, 1.5]]))
+        axes = RecordingAxes()
+
+        plotting.plot_person_item_map(model, np.arange(5.0), ax=axes)
+
+        assert axes.secondary is not None
+        np.testing.assert_allclose(
+            axes.secondary.calls["scatter"][0][0][1], [-1.0, 0.5, 1.5]
+        )
+
     def test_invalid_bins_are_rejected(self):
         with pytest.raises(ValueError, match="valid histogram"):
             plotting.plot_person_item_map(
@@ -885,13 +1096,101 @@ class TestDifPlot:
         )
 
         assert not axes.calls["scatter"]
-        assert len(axes.calls["legend"]) == 1
+        assert not axes.calls["axhline"]
+        assert not axes.calls["legend"]
+
+        thresholds = RecordingAxes()
+        plotting.plot_dif(
+            {
+                "ets_effect": np.array([0.1]),
+                "classification": np.array(["A"]),
+                "ets_scale": "delta",
+            },
+            ax=thresholds,
+            color="black",
+        )
+
+        assert not thresholds.calls["scatter"]
+        assert len(thresholds.calls["legend"]) == 1
+
+    @pytest.mark.parametrize(
+        ("scale", "cuts", "label"),
+        [("delta", [1.0, 1.5], "|MH D-DIF|"), ("smd", [0.17, 0.25], "|SMD / SD|")],
+    )
+    def test_ets_effects_are_drawn_against_their_scale(self, scale, cuts, label):
+        # The ETS cut-offs apply to MH D-DIF (binary) or SMD/SD (polytomous),
+        # not to |effect_size|, which used to be drawn against 0.426/0.638.
+        results = {
+            "effect_size": np.array([0.9, -0.2, np.nan]),
+            "ets_effect": np.array([-1.7, 0.3, np.nan]),
+            "classification": np.array(["C", "B", "A"]),
+            "ets_scale": scale,
+            "item_names": ["Q1", "Q2", "Q3"],
+        }
+        axes = RecordingAxes()
+
+        plotting.plot_dif(results, ax=axes)
+
+        np.testing.assert_allclose(axes.calls["bar"][0][0][1], [1.7, 0.3, 0.0])
+        assert [call[1]["y"] for call in axes.calls["axhline"]] == cuts
+        assert axes.calls["set_ylabel"][0][0] == (label,)
+        assert axes.calls["set_xticklabels"][0][0][0] == ["Q1", "Q2", "Q3"]
+
+        explicit = RecordingAxes()
+        plotting.plot_dif(
+            {key: value for key, value in results.items() if key != "ets_scale"},
+            ets_scale=scale,
+            ax=explicit,
+        )
+        assert [call[1]["y"] for call in explicit.calls["axhline"]] == cuts
+
+        unscaled = RecordingAxes()
+        plotting.plot_dif(
+            {key: value for key, value in results.items() if key != "ets_scale"},
+            ax=unscaled,
+        )
+        assert not unscaled.calls["axhline"]
+
+    @pytest.mark.parametrize("backend", ["pandas", "polars"])
+    def test_dif_accepts_mirt_dif_frames(self, backend):
+        import mirt
+        from mirt.utils import set_dataframe_backend
+
+        responses = mirt.simdata(model="2PL", n_persons=300, n_items=4, seed=5)
+        groups = np.repeat([0, 1], 150)
+        set_dataframe_backend(backend)
+        try:
+            frame = mirt.dif(responses, groups, method="wald", max_iter=50)
+        finally:
+            set_dataframe_backend("auto")
+        axes = RecordingAxes()
+
+        plotting.plot_dif(frame, ets_scale="delta", ax=axes)
+
+        effects = np.asarray(frame["ets_effect"].to_numpy(), dtype=float)
+        np.testing.assert_allclose(
+            axes.calls["bar"][0][0][1], np.abs(np.nan_to_num(effects))
+        )
+        assert [call[1]["y"] for call in axes.calls["axhline"]] == [1.0, 1.5]
+        assert axes.calls["set_xticklabels"][0][0][0] == [
+            f"Item_{index + 1}" for index in range(4)
+        ]
 
     @pytest.mark.parametrize(
         ("results", "kwargs", "match"),
         [
             ([], {}, "mapping"),
             ({"classification": np.array(["A"])}, {}, "effect_size"),
+            (
+                {"ets_effect": np.array([0.1]), "classification": np.array(["A"])},
+                {"ets_scale": "logit"},
+                "ets_scale must be",
+            ),
+            (
+                {"effect_size": np.array([0.1]), "classification": np.array(["A"])},
+                {"ets_scale": "delta"},
+                "applies only",
+            ),
             ({"effect_size": np.array([0.1])}, {}, "classification"),
             (
                 {

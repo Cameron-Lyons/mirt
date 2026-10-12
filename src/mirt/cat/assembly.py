@@ -318,13 +318,23 @@ def _information_matrix(
     pool_size: int,
     item_indices: NDArray[np.intp] | None = None,
 ) -> NDArray[np.float64]:
-    """Evaluate sparse candidate subsets itemwise and dense pools in bulk."""
+    """Evaluate sparse candidate subsets itemwise and dense pools in bulk.
+
+    Built-in polytomous models, whose bulk ``information`` is the test
+    total, use their all-item information kernel for any subset.
+    """
     from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
+    from mirt.cat._information import polytomous_item_information
 
     theta_matrix = theta[:, None]
     indices = np.arange(pool_size) if item_indices is None else item_indices
     expected_shape = (theta.size, indices.size)
-    use_bulk = (
+    kernel = (
+        polytomous_item_information(model, theta_matrix, indices)
+        if getattr(model, "is_polytomous", False)
+        else None
+    )
+    use_bulk = kernel is None and (
         indices.size == pool_size
         or (indices.size > 64 and indices.size * 4 > pool_size)
         or not uses_builtin_model_hooks(model)
@@ -335,7 +345,9 @@ def _information_matrix(
         if use_bulk
         else np.empty((0, 0))
     )
-    if use_bulk:
+    if kernel is not None:
+        raw = kernel
+    elif use_bulk:
         if raw.shape != (theta.size, pool_size):
             raw = np.empty((0, 0))
         elif indices.size != pool_size:

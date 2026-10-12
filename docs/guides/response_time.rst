@@ -58,8 +58,10 @@ layout needed by WAIC, DIC, or other posterior summaries:
 The compiled path parallelizes the complete sample-person grid. The NumPy
 fallback selects memory-bounded sample batches automatically; set
 ``sample_chunk_size`` explicitly when a tighter memory ceiling is required.
-The Gibbs estimator uses this path automatically for its DIC and WAIC
-calculations.
+All draws share the model's item parameters. For its DIC and WAIC the Gibbs
+estimator instead pairs every retained ability-speed draw with the item
+parameters of the same iteration, so item uncertainty enters the deviance and
+the pointwise WAIC terms.
 
 Timing predictions
 ------------------
@@ -105,10 +107,26 @@ Fit all item, person, and population parameters with
    print(result.summary())
    print(result.person_summary(5))
 
+The accuracy model is unchanged when ability and difficulty are shifted and
+rescaled together, and the time model when speed and time intensity are
+shifted together. As in van der Linden (2007) and Fox, Klein Entink and van der
+Linden (2007), the sampler fixes these directions: the ability and speed means
+are zero and the ability variance is one. Only the speed variance and the
+ability-speed covariance are sampled, so ``mu_theta``, ``mu_tau`` and
+``sigma_11`` are constant in ``result.chains`` and do not appear in
+``result.rhat`` or ``result.ess``. Item parameters are reported on that scale.
+
 Item parameters have independent normal priors on log discrimination,
-difficulty, log time discrimination and time intensity; ``sigma_df`` and
-``sigma_scale`` only shape the inverse-Wishart prior on the ability-speed
-covariance.  Pass :class:`mirt.RTModelPriors` to change them:
+difficulty, log time discrimination and time intensity. With
+``accuracy_model="3PL"``, each guessing parameter has a
+``Beta(guess_alpha, guess_beta)`` prior truncated to ``(0, guess_upper)``; the
+default is uniform on ``(0, 0.5)``. The discrimination and difficulty updates
+use the 3PL likelihood, and guessing moves on the logit scale of
+``c / guess_upper`` with the Jacobian in its acceptance ratio, so draws never
+pile up at a bound. ``sigma_df`` and ``sigma_scale`` define the
+inverse-Wishart prior on the ability-speed covariance, conditioned on the unit
+ability variance. ``mu_mean`` and ``mu_cov`` are deprecated and ignored.
+Pass :class:`mirt.RTModelPriors` to change the priors:
 
 .. code-block:: python
 
@@ -117,6 +135,11 @@ covariance.  Pass :class:`mirt.RTModelPriors` to change them:
    priors = RTModelPriors(time_disc_mean=0.0, time_disc_var=0.25)
    result = ResponseTimeGibbsSampler(priors=priors, seed=42).fit(
        responses, response_times
+   )
+
+   guessing_priors = RTModelPriors(guess_alpha=5.0, guess_beta=17.0)
+   result_3pl = ResponseTimeGibbsSampler(priors=guessing_priors, seed=42).fit(
+       responses, response_times, accuracy_model="3PL"
    )
 
 Backend selection

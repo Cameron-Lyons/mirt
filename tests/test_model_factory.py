@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import warnings
+from typing import Any, get_args
 
 import numpy as np
 import pytest
@@ -109,10 +110,31 @@ def test_factory_covers_every_fit_mirt_family() -> None:
         assert model.model_name == name
 
 
+def _literal_values(alias: Any) -> set[str]:
+    values = set()
+    for argument in get_args(alias):
+        values |= _literal_values(argument) if get_args(argument) else {argument}
+    return values
+
+
+def test_all_model_type_names_only_name_fittable_models() -> None:
+    from mirt.typing import AdvancedModelType, AllModelType, CDMModelType
+
+    assert _literal_values(AllModelType) == set(ITEM_MODEL_FAMILIES) | (
+        _literal_values(CDMModelType)
+    )
+    advanced = _literal_values(AdvancedModelType)
+    assert advanced.isdisjoint(_literal_values(AllModelType))
+    for name in advanced:
+        with pytest.raises(MirtModelError, match="Unknown model"):
+            item_model_class(name)
+
+
 def test_factory_validates_codes_against_inferred_categories() -> None:
     responses = np.array([[0, 2, -1], [1, 0, 3], [1, 1, 0]])
 
-    model = build_item_model("GPCM", 3, responses=responses)
+    with pytest.warns(UserWarning, match="Item_3 never uses categories 1, 2"):
+        model = build_item_model("GPCM", 3, responses=responses)
     assert model.n_categories == [2, 3, 4]  # type: ignore[attr-defined]
 
     with pytest.raises(MirtDataError, match="below n_categories"):
@@ -221,3 +243,58 @@ def test_fit_multigroup_accepts_single_family_sequences(
         fit_multigroup(dichotomous, groups, model=["2PL"] * 4 + ["3PL"])
     with pytest.raises(MirtValidationError, match="names 4 items"):
         fit_multigroup(dichotomous, groups, model=["2PL"] * 4)
+
+
+def test_factory_rejects_items_with_one_observed_category_like_r() -> None:
+    # Regression: an item answered 1 by everyone was fitted silently to
+    # a = 4.6, b = -6 (the bound) with SE(a) = 133; R mirt stops instead.
+    responses = np.array([[1, 0, 2], [1, 1, -1], [1, 0, 0], [-1, 1, 1]])
+    names = ["Q1", "Q2", "Q3"]
+
+    for family in ("2PL", "GRM"):
+        codes = responses if family == "GRM" else np.minimum(responses, 1)
+        with pytest.raises(
+            MirtDataError,
+            match=r"one observed response category and cannot be estimated: Q1 \(",
+        ):
+            build_item_model(family, 3, item_names=names, responses=codes)
+    with pytest.raises(MirtDataError, match=r"estimated: Item_1, Item_3 \("):
+        fit_mirt(np.array([[1, 0, 0], [1, 1, 0], [1, 0, 0]]), model="2PL")
+    # An item without any observed response keeps its starting values.
+    unanswered = np.array([[0, -1], [1, -1], [1, -1]])
+    assert build_item_model("2PL", 2, responses=unanswered).n_items == 2
+
+
+def test_fit_warns_about_unused_interior_categories_and_recoding_matches_r() -> None:
+    # Regression: category 1 of the first item is never used. GRM thresholds
+    # collapsed to [-0.979, -0.979, 0.954] with NaN standard errors, GPCM steps
+    # ran to the bound, and neither warned. R mirt recodes the item to three
+    # categories; recoding as the warning suggests reproduces R mirt 1.48.
+    from mirt.utils import recode_responses
+
+    rng = np.random.default_rng(11)
+    theta = rng.normal(size=1500)
+    cumulative = 1 / (1 + np.exp(-1.5 * (theta[:, None, None] - np.array([-1, 0, 1]))))
+    responses = (rng.random((1500, 6))[:, :, None] < cumulative).sum(axis=2)
+    responses[responses[:, 0] == 1, 0] = 2
+
+    message = (
+        r"Item_1 never uses category 1 below its highest observed category 3; "
+        r".*recode_responses\(data, \{2: 1, 3: 2\}, items=\[0\]\)"
+    )
+    with pytest.warns(UserWarning, match=message) as caught:
+        fit_mirt(responses, model="GRM", max_iter=1, compute_standard_errors=False)
+    assert len(caught) == 1
+    assert caught[0].filename == __file__
+
+    recoded = recode_responses(responses, {2: 1, 3: 2}, items=[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        result = fit_mirt(recoded, model="GRM", compute_standard_errors=False)
+    slope = result.model.discrimination[0]
+    assert result.model.n_categories[0] == 3
+    # R: coef(mirt(data, 1, "graded"))$I1 = a1 1.4647, d1 1.5943, d2 -1.4797.
+    assert slope == pytest.approx(1.4647, abs=5e-3)
+    np.testing.assert_allclose(
+        -slope * result.model.thresholds[0, :2], [1.5943, -1.4797], atol=5e-3
+    )

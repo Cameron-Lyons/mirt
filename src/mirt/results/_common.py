@@ -11,37 +11,12 @@ from numpy.typing import ArrayLike, NDArray
 
 from mirt.exceptions import MirtValidationError
 
+# Re-exported: result objects share the utilities' significance-level validator.
+from mirt.utils._validation import validate_alpha as validate_alpha
+
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
     from mirt.results.fit_result import FitResult
-
-
-def validate_alpha(alpha: float) -> float:
-    """Validate and normalize a two-sided significance level."""
-    if isinstance(alpha, bool):
-        raise MirtValidationError(
-            "alpha must be a finite number strictly between 0 and 1",
-            parameter="alpha",
-            value=alpha,
-            expected="0 < alpha < 1",
-        )
-    try:
-        value = float(alpha)
-    except (TypeError, ValueError) as exc:
-        raise MirtValidationError(
-            "alpha must be a finite number strictly between 0 and 1",
-            parameter="alpha",
-            value=alpha,
-            expected="0 < alpha < 1",
-        ) from exc
-    if not math.isfinite(value) or not 0.0 < value < 1.0:
-        raise MirtValidationError(
-            "alpha must be a finite number strictly between 0 and 1",
-            parameter="alpha",
-            value=alpha,
-            expected="0 < alpha < 1",
-        )
-    return value
 
 
 def normal_critical_value(alpha: float) -> float:
@@ -115,6 +90,40 @@ def classify_from_probabilities(
     classifications[probabilities >= resolved] = "above"
     classifications[probabilities <= 1.0 - resolved] = "below"
     return classifications
+
+
+def validate_person_ids(
+    person_ids: list[Any] | NDArray[Any] | None,
+    n_persons: int,
+    *,
+    row_label: str,
+) -> list[Any] | None:
+    """Copy optional respondent identifiers, one per ``row_label`` row.
+
+    Raises
+    ------
+    MirtValidationError
+        If an array of identifiers is not one-dimensional or the number of
+        identifiers differs from ``n_persons``.
+    """
+    if person_ids is None:
+        return None
+    if isinstance(person_ids, np.ndarray) and person_ids.ndim != 1:
+        raise MirtValidationError(
+            "person_ids must be one-dimensional",
+            parameter="person_ids",
+            value=person_ids.shape,
+            expected=f"({n_persons},)",
+        )
+    resolved = list(person_ids)
+    if len(resolved) != n_persons:
+        raise MirtValidationError(
+            f"person_ids must contain one identifier per {row_label} row",
+            parameter="person_ids",
+            value=len(resolved),
+            expected=str(n_persons),
+        )
+    return resolved
 
 
 def resolve_item_model(model_or_result: Any) -> Any:

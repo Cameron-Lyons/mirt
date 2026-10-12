@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
@@ -11,7 +10,8 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from mirt.estimation.quadrature import GaussHermiteQuadrature
-from mirt.utils.data import _missing_coded_responses
+from mirt.exceptions import MirtDataError
+from mirt.utils.data import _missing_coded_responses, align_response_columns
 
 if TYPE_CHECKING:
     from mirt.models.base import BaseItemModel
@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 # Response patterns optimized together by row-batched scorers; bounds the
 # temporary likelihood arrays without giving up vectorization.
 BATCHED_SCORING_CHUNK_SIZE = 8192
+
+
+def _observed_item_masks(
+    model: BaseItemModel,
+    n_theta: int,
+    observed_mask: NDArray[np.bool_],
+) -> tuple[NDArray[np.bool_] | None, NDArray[np.intp]]:
+    """Return the per-row mask, if any, and the items observed by any row."""
+    observed_mask = np.asarray(observed_mask, dtype=np.bool_)
+    if observed_mask.shape == (model.n_items,):
+        return None, np.flatnonzero(observed_mask)
+    if observed_mask.shape == (n_theta, model.n_items):
+        return observed_mask, np.flatnonzero(observed_mask.any(axis=0))
+    raise ValueError(
+        f"observed_mask must have shape ({model.n_items},) or "
+        f"({n_theta}, {model.n_items}), got {observed_mask.shape}"
+    )
 
 
 def observed_test_information(
@@ -32,19 +49,8 @@ def observed_test_information(
     by every theta row, or an ``(n_theta, n_items)`` mask that pairs each
     theta row with its own observed items.
     """
-    observed_mask = np.asarray(observed_mask, dtype=np.bool_)
     n_theta = theta.shape[0]
-    if observed_mask.shape == (model.n_items,):
-        row_mask = None
-        observed_items = np.flatnonzero(observed_mask)
-    elif observed_mask.shape == (n_theta, model.n_items):
-        row_mask = observed_mask
-        observed_items = np.flatnonzero(observed_mask.any(axis=0))
-    else:
-        raise ValueError(
-            f"observed_mask must have shape ({model.n_items},) or "
-            f"({n_theta}, {model.n_items}), got {observed_mask.shape}"
-        )
+    row_mask, observed_items = _observed_item_masks(model, n_theta, observed_mask)
 
     if observed_items.size == 0:
         return np.zeros(n_theta, dtype=np.float64)
@@ -55,7 +61,7 @@ def observed_test_information(
         item_information = np.asarray(model.information(theta), dtype=np.float64)
         if item_information.shape == (n_theta, model.n_items):
             if row_mask is None:
-                return item_information[:, observed_mask].sum(axis=1)
+                return item_information[:, observed_items].sum(axis=1)
             return np.where(row_mask, item_information, 0.0).sum(axis=1)
 
     # Accumulate item by item so a row-specific mask adds exactly the same
@@ -71,6 +77,172 @@ def observed_test_information(
         information += item_total
 
     return information
+
+
+def _rank_one_slopes(model: BaseItemModel) -> NDArray[np.float64] | None:
+    """Return slope rows of an unmodified model with rank-one item matrices.
+
+    The compensatory logistic, graded and generalized partial credit models
+    give every item one ability gradient direction, its slope vector ``a``,
+    so the item Fisher matrix is ``I_j a a' / ||a||^2`` for the scalar item
+    information ``I_j`` (the matrix trace). Returns None for other models.
+    """
+    from mirt._model_defaults import uses_builtin_model_hooks, uses_original_model_hook
+    from mirt.models.bifactor import BifactorModel
+    from mirt.models.dichotomous import TwoParameterLogistic
+    from mirt.models.multidimensional import MultidimensionalModel
+    from mirt.models.polytomous import GeneralizedPartialCredit, GradedResponseModel
+
+    model_type = type(model)
+    if (
+        model_type
+        not in (
+            TwoParameterLogistic,
+            MultidimensionalModel,
+            BifactorModel,
+            GradedResponseModel,
+            GeneralizedPartialCredit,
+        )
+        or not uses_builtin_model_hooks(model)
+        or not uses_original_model_hook(model, "information")
+    ):
+        return None
+    if model_type is BifactorModel:
+        slopes = model.get_loading_matrix()
+    elif model_type is MultidimensionalModel:
+        slopes = model.parameters["slopes"]
+    else:
+        slopes = model.parameters["discrimination"]
+    return np.asarray(slopes, dtype=np.float64).reshape(model.n_items, model.n_factors)
+
+
+def _item_probability_columns(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+) -> NDArray[np.float64]:
+    """Return one item's category probabilities with shape ``(n_theta, C)``."""
+    probability = np.asarray(model.probability(theta, item_idx), dtype=np.float64)
+    if probability.ndim == 1 or probability.shape[-1:] == (1,):
+        correct = probability.reshape(theta.shape[0])
+        return np.column_stack((1.0 - correct, correct))
+    return probability.reshape(theta.shape[0], -1)
+
+
+def _numerical_item_information_matrix(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+) -> NDArray[np.float64]:
+    """Fisher matrices ``sum_c grad p_c grad p_c' / p_c`` by central differences.
+
+    Used for models that do not define ``item_information_matrix``.
+    """
+    from mirt.constants import PROB_EPSILON
+
+    n_theta, n_factors = theta.shape
+    probabilities = _item_probability_columns(model, theta, item_idx)
+    steps = 1e-5 * np.maximum(1.0, np.abs(theta))
+    gradient = np.empty(probabilities.shape + (n_factors,), dtype=np.float64)
+    for factor in range(n_factors):
+        shift = np.zeros_like(theta)
+        shift[:, factor] = steps[:, factor]
+        upper = _item_probability_columns(model, theta + shift, item_idx)
+        lower = _item_probability_columns(model, theta - shift, item_idx)
+        gradient[:, :, factor] = (upper - lower) / (2.0 * steps[:, factor, None])
+    scaled = gradient / np.maximum(probabilities, PROB_EPSILON)[:, :, None]
+    return np.einsum("ncf,ncg->nfg", scaled, gradient)
+
+
+def _item_information_matrix(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    item_idx: int,
+) -> NDArray[np.float64]:
+    """Return one item's Fisher matrices with shape ``(n_theta, F, F)``."""
+    from mirt.exceptions import MirtModelError
+
+    n_theta, n_factors = theta.shape
+    native = getattr(model, "item_information_matrix", None)
+    if callable(native):
+        try:
+            matrices = np.asarray(native(theta, item_idx), dtype=np.float64)
+        except MirtModelError:
+            # Mixed-format components without exact matrices.
+            pass
+        else:
+            return matrices.reshape(n_theta, n_factors, n_factors)
+    return _numerical_item_information_matrix(model, theta, item_idx)
+
+
+def observed_information_matrix(
+    model: BaseItemModel,
+    theta: NDArray[np.float64],
+    observed_mask: NDArray[np.bool_],
+) -> NDArray[np.float64]:
+    """Return Fisher information matrices contributed by observed items.
+
+    The result has shape ``(n_theta, n_factors, n_factors)``. Its trace is
+    :func:`observed_test_information`, and for one factor the two agree.
+    ``observed_mask`` is a shared ``(n_items,)`` mask or one mask per theta
+    row, as for :func:`observed_test_information`. Models without an
+    ``item_information_matrix`` method use ``sum_c grad p_c grad p_c' / p_c``
+    with central-difference probability gradients.
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    n_theta, n_factors = theta.shape
+    if n_factors == 1:
+        return observed_test_information(model, theta, observed_mask)[:, None, None]
+    row_mask, observed_items = _observed_item_masks(model, n_theta, observed_mask)
+    matrices = np.zeros((n_theta, n_factors, n_factors), dtype=np.float64)
+    if observed_items.size == 0:
+        return matrices
+
+    slopes = _rank_one_slopes(model)
+    if slopes is not None:
+        # Polytomous models return test totals from ``information``; their
+        # item columns come from the shared vectorized hook.
+        item_columns = getattr(model, "_information_by_item", model.information)
+        information = np.asarray(item_columns(theta), dtype=np.float64)
+        if information.shape == (n_theta, model.n_items):
+            squared_norms = np.einsum("jf,jf->j", slopes, slopes)
+            weights = np.divide(
+                information,
+                squared_norms,
+                out=np.zeros_like(information),
+                where=squared_norms > 0.0,
+            )
+            if row_mask is None:
+                row_mask = np.zeros((1, model.n_items), dtype=np.bool_)
+                row_mask[0, observed_items] = True
+            weights = np.where(row_mask, weights, 0.0)
+            return np.einsum("nj,jf,jg->nfg", weights, slopes, slopes)
+
+    for item_idx in observed_items.tolist():
+        item_matrices = _item_information_matrix(model, theta, item_idx)
+        if row_mask is not None:
+            item_matrices = np.where(
+                row_mask[:, item_idx, None, None], item_matrices, 0.0
+            )
+        matrices += item_matrices
+    return matrices
+
+
+def measured_factors(
+    model: BaseItemModel,
+    observed: NDArray[np.bool_],
+) -> NDArray[np.bool_]:
+    """Return which factors each response row's observed items measure.
+
+    ``observed`` has shape ``(n_rows, n_items)``. A factor is measured when
+    an observed item carries information about it; otherwise the row's
+    likelihood does not depend on that coordinate at all.
+    """
+    n_rows = observed.shape[0]
+    information = observed_information_matrix(
+        model, np.zeros((n_rows, model.n_factors)), observed
+    )
+    return np.diagonal(information, axis1=1, axis2=2) > 0.0
 
 
 def resolve_prior_distribution(
@@ -143,20 +315,6 @@ def build_quadrature(
     return quadrature.nodes, quadrature.weights
 
 
-def resolve_n_jobs(n_jobs: int) -> int:
-    """Resolve n_jobs configuration, including -1 for all cores."""
-    if (
-        isinstance(n_jobs, (bool, np.bool_))
-        or not isinstance(n_jobs, (int, np.integer))
-        or n_jobs == 0
-        or n_jobs < -1
-    ):
-        raise ValueError("n_jobs must be -1 or a positive integer")
-    if n_jobs == -1:
-        return os.cpu_count() or 1
-    return int(n_jobs)
-
-
 def validate_scoring_responses(
     model: BaseItemModel,
     responses: ArrayLike,
@@ -164,43 +322,85 @@ def validate_scoring_responses(
     """Validate a scoring matrix and normalize every missing code to -1.
 
     Negative codes, ``NaN`` and the missing entries of nullable DataFrame
-    columns are missing responses, as in :func:`mirt.fit_mirt`.
+    columns are missing responses, as in :func:`mirt.fit_mirt`. A DataFrame
+    with named columns is first matched to the model's item names by
+    :func:`mirt.utils.data.align_response_columns`.
+
+    Raises
+    ------
+    MirtDataError
+        If the matrix is not two-dimensional, has the wrong number of items,
+        or contains non-numeric, non-finite, fractional or out-of-range
+        response codes.
     """
-    raw = _missing_coded_responses(responses)
+    raw = _missing_coded_responses(
+        align_response_columns(responses, getattr(model, "item_names", None))
+    )
     if raw.ndim != 2:
-        raise ValueError(f"responses must be 2D, got {raw.ndim}D")
+        raise MirtDataError(f"responses must be 2D, got {raw.ndim}D")
     if raw.shape[1] != model.n_items:
-        raise ValueError(
-            f"responses has {raw.shape[1]} items, expected {model.n_items}"
+        raise MirtDataError(
+            f"responses has {raw.shape[1]} items, expected {model.n_items}",
+            n_items=raw.shape[1],
         )
     if raw.dtype.kind not in "biuf":
-        raise ValueError("responses must contain numeric values")
+        raise MirtDataError("responses must contain numeric values")
 
     if raw.dtype.kind in "biu":
         values = raw
     else:
         values = np.asarray(raw, dtype=np.float64)
         if not np.all(np.isfinite(values)):
-            raise ValueError("responses must contain only finite values")
+            raise MirtDataError("responses must contain only finite values")
     observed = values >= 0.0
-    if values.dtype.kind == "f" and np.any(
-        values[observed] != np.floor(values[observed])
-    ):
-        raise ValueError("observed responses must be integer-valued")
+    # Missing codes must be integers too, as in mirt.fit_mirt.
+    if values.dtype.kind == "f" and np.any(values != np.floor(values)):
+        raise MirtDataError("response codes must be integer-valued")
 
     if model.is_polytomous:
         category_counts = np.asarray(model.n_categories, dtype=np.float64)
         invalid = observed & (values >= category_counts[None, :])
         if np.any(invalid):
-            raise ValueError("observed responses exceed an item's category range")
+            item_idx = int(np.flatnonzero(np.any(invalid, axis=0))[0])
+            raise MirtDataError(
+                f"responses for item {item_idx} must be below "
+                f"{int(category_counts[item_idx])}, the item's category range",
+                item_idx=item_idx,
+            )
     elif np.any(observed & (values > 1.0)):
-        raise ValueError(
-            "dichotomous responses must contain only 0, 1, or missing values"
+        raise MirtDataError(
+            "dichotomous responses must be coded as 0 or 1; only 0, 1, or "
+            "missing values are allowed"
         )
 
     if values.dtype == np.dtype(np.int_) and np.all(observed | (values == -1)):
         return values
     return np.where(observed, values, -1.0).astype(np.int_, copy=False)
+
+
+def extreme_response_rows(
+    model: BaseItemModel,
+    patterns: NDArray[np.int_],
+) -> tuple[NDArray[np.bool_], NDArray[np.bool_]]:
+    """Flag rows answered only in the lowest or only in the highest category.
+
+    ``patterns`` are validated responses with missing entries coded
+    negative. A row is extreme when it observes at least one item and every
+    observed response is category zero (``all_lowest``) or every one is its
+    item's highest category (``all_highest``). Rows meeting both conditions
+    observe only single-category items, whose responses carry no
+    information, and are flagged as neither.
+    """
+    observed = patterns >= 0
+    if model.is_polytomous:
+        top = np.asarray(model.n_categories, dtype=np.int_) - 1
+    else:
+        top = np.ones(model.n_items, dtype=np.int_)
+    informative = observed.any(axis=1)
+    all_lowest = informative & np.all(~observed | (patterns == 0), axis=1)
+    all_highest = informative & np.all(~observed | (patterns == top[None, :]), axis=1)
+    both = all_lowest & all_highest
+    return all_lowest & ~both, all_highest & ~both
 
 
 def unique_response_patterns(
@@ -217,9 +417,13 @@ def finite_difference_se(
     objective: Callable[[float], float],
     estimate: float,
     *,
-    step: float = 1e-5,
+    step: float = 1e-4,
 ) -> float:
-    """Estimate SE from second finite difference of a scalar objective."""
+    """Estimate SE from second finite difference of a scalar objective.
+
+    The default step is near ``eps ** 0.25``, which balances the truncation
+    and rounding errors of the second difference.
+    """
     f_plus = objective(estimate + step)
     f_minus = objective(estimate - step)
     f_center = objective(estimate)
@@ -235,7 +439,7 @@ def finite_difference_se_rows(
     estimate: NDArray[np.float64],
     *,
     center: NDArray[np.float64] | None = None,
-    step: float = 1e-5,
+    step: float = 1e-4,
 ) -> NDArray[np.float64]:
     """Row-wise :func:`finite_difference_se` for independent scalar objectives.
 
@@ -307,6 +511,8 @@ def score_responses_parallel(
     ],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Execute per-person scoring either serially or with a thread pool."""
+    from mirt.utils._parallel import resolve_n_jobs
+
     n_persons = responses.shape[0]
     n_factors = model.n_factors
 

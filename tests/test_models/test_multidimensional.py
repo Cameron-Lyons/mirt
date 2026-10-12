@@ -140,6 +140,87 @@ class TestMultidimensionalModel:
         assert np.all(comm >= 0)
         assert np.all(comm <= 1)
 
+    def test_standardized_loadings_match_r_summary(self):
+        """Slopes are divided by D = 1.702 as in R mirt's summary()."""
+        # Regression: item 1 gave [0.821, 0.164] and h2 0.7006 against R's
+        # [0.655, 0.131] and 0.4468.
+        slopes = np.column_stack(
+            [[1.5, 2.0, 1.0, 0.3, 0.2, 0.4], [0.3, 0.1, 0.4, 1.7, 1.2, 2.5]]
+        )
+        model = MultidimensionalModel(6, 2).set_parameters(slopes=slopes)
+        # R mirt 1.48: summary(mod, rotate = "none") with these slopes fixed.
+        r_loadings = np.column_stack(
+            [
+                [0.655478, 0.761012, 0.496487, 0.123752, 0.095599, 0.131117],
+                [0.131096, 0.038051, 0.198595, 0.701259, 0.573591, 0.819483],
+            ]
+        )
+        r_h2 = [0.446837, 0.580587, 0.285939, 0.507078, 0.338146, 0.688743]
+
+        np.testing.assert_allclose(model.get_factor_loadings(), r_loadings, atol=1e-6)
+        np.testing.assert_allclose(model.communalities(), r_h2, atol=1e-6)
+        identity = model.get_factor_loadings(latent_covariance=np.eye(2))
+        np.testing.assert_allclose(identity, r_loadings, atol=1e-6)
+
+        # R with COV_11 = 2: loadings scale by the factor standard deviation.
+        variance = np.diag([2.0, 1.0])
+        np.testing.assert_allclose(
+            model.get_factor_loadings(latent_covariance=variance)[:3],
+            [[0.775279, 0.109641], [0.856439, 0.030280], [0.628893, 0.177878]],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            model.communalities(variance)[:3],
+            [0.613079, 0.734404, 0.427147],
+            atol=1e-6,
+        )
+
+    def test_standardized_loadings_use_factor_correlations(self):
+        """Correlated factors enter the latent response variance."""
+        slopes = np.array([[1.5, 0.3], [0.2, 1.2]])
+        model = MultidimensionalModel(2, 2).set_parameters(slopes=slopes)
+        correlation = np.array([[1.0, 0.5], [0.5, 1.0]])
+        scaled = slopes / 1.702
+        variance = 1.0 + np.einsum("ik,kl,il->i", scaled, correlation, scaled)
+
+        loadings = model.get_factor_loadings(latent_covariance=correlation)
+        communalities = model.communalities(correlation)
+
+        np.testing.assert_allclose(loadings, scaled / np.sqrt(variance)[:, None])
+        np.testing.assert_allclose(communalities, 1.0 - 1.0 / variance)
+        np.testing.assert_allclose(
+            communalities, np.einsum("ik,kl,il->i", loadings, correlation, loadings)
+        )
+        assert np.all(communalities > model.communalities())
+
+    @pytest.mark.parametrize(
+        ("covariance", "message"),
+        [
+            (np.eye(3), "shape"),
+            ([[1.0, 0.2], [0.3, 1.0]], "symmetric"),
+            ([[1.0, 2.0], [2.0, 1.0]], "positive definite"),
+            ([["a", 0.0], [0.0, 1.0]], "numeric"),
+        ],
+    )
+    def test_latent_covariance_is_validated(self, covariance, message):
+        from mirt.exceptions import MirtValidationError
+
+        model = MultidimensionalModel(3, 2)
+        with pytest.raises(MirtValidationError, match=message):
+            model.get_factor_loadings(latent_covariance=covariance)
+        with pytest.raises(MirtValidationError, match=message):
+            model.communalities(covariance)
+
+    def test_confirmatory_model_may_have_one_factor(self):
+        """The one-factor slope-intercept 2PL that model syntax fits."""
+        model = MultidimensionalModel(
+            3, 1, model_type="confirmatory", loading_pattern=np.ones((3, 1))
+        )
+        assert model.n_factors == 1
+        assert model.parameters["slopes"].shape == (3, 1)
+        with pytest.raises(ValueError, match="n_factors >= 2"):
+            MultidimensionalModel(3, 1)
+
 
 class TestBifactorModel:
     """Tests for Bifactor model."""

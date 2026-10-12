@@ -177,9 +177,12 @@ pub fn compute_optimized_scores<'py>(
             }
         }
         if map || information <= 0.0 {
-            information = (objective(theta + 1e-5) - 2.0 * objective(theta)
-                + objective(theta - 1e-5))
-                / 1e-10;
+            // A step near eps^(1/4) balances the truncation and rounding
+            // errors of the second difference.
+            let step = 1e-4;
+            information = (objective(theta + step) - 2.0 * objective(theta)
+                + objective(theta - step))
+                / (step * step);
         }
         (
             theta,

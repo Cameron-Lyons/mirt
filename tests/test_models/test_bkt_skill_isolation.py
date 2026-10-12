@@ -8,8 +8,6 @@ from numpy.testing import assert_allclose, assert_array_equal
 
 from mirt.backends.rust.dynamic import (
     bkt_backward,
-    bkt_ffbs,
-    bkt_ffbs_batch,
     bkt_forward,
     bkt_forward_backward_batch,
     bkt_viterbi,
@@ -206,30 +204,6 @@ def test_native_kernels_match_python_for_interleaved_skills(
     learned, log_likelihoods = native_batch
     assert_allclose(learned[0], python_gamma[:, 1])
     assert log_likelihoods[0] == pytest.approx(python_ll)
-
-    sampled = bkt_ffbs(
-        responses,
-        skills,
-        model.p_init,
-        model.p_learn,
-        model.p_forget,
-        model.p_slip,
-        model.p_guess,
-        seed=41,
-    )
-    sampled_batch = bkt_ffbs_batch(
-        responses[None, :],
-        skills,
-        model.p_init,
-        model.p_learn,
-        model.p_forget,
-        model.p_slip,
-        model.p_guess,
-        seed=41,
-    )
-    assert sampled is not None
-    assert sampled_batch is not None
-    assert_array_equal(sampled, sampled_batch[0])
 
 
 def test_vectorized_simulation_is_reproducible(model: BKTModel) -> None:

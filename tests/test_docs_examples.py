@@ -212,7 +212,9 @@ def test_api_reference_symbols_exist() -> None:
 
 def test_quickstart_fit_and_score_smoke() -> None:
     """Core quickstart flow should run end-to-end on bundled sample data."""
-    responses = mirt.load_dataset("LSAT7")["data"][:100]
+    # The rows are sorted by response pattern, so the first 100 answer item 1
+    # incorrectly throughout, an item fit_mirt (like R) cannot estimate.
+    responses = mirt.load_dataset("LSAT7")["data"][::10]
 
     result = mirt.fit_mirt(
         responses,

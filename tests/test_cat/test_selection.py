@@ -463,7 +463,8 @@ class TestCreateSelectionStrategy:
 
     def test_error_lists_canonical_names(self):
         with pytest.raises(
-            ValueError, match="MFI, MEI, KL, Urry, random, a-stratified"
+            ValueError,
+            match="MFI, MEI, MPWI, MLWI, KL, KLP, MEPV, Urry, random, a-stratified",
         ):
             create_selection_strategy("b-stratified")
 
@@ -751,3 +752,318 @@ class TestItemSelectionStrategyInterface:
                 model, theta=0.0, available_items=available
             )
             assert isinstance(criteria, dict)
+
+
+def _located_pool(model_class, locations):
+    """Polytomous or unfolding pool whose item locations are ``locations``."""
+    from mirt.models import (
+        GeneralizedGradedUnfolding,
+        GeneralizedPartialCredit,
+        IdealPointModel,
+        PartialCreditModel,
+    )
+
+    n_items = len(locations)
+    offsets = locations[:, None] + np.array([-0.8, 0.0, 0.8])
+    if model_class in (GeneralizedPartialCredit, PartialCreditModel):
+        model = model_class(n_items=n_items, n_categories=4)
+        model.set_parameters(steps=offsets)
+    elif model_class is GradedResponseModel:
+        model = model_class(n_items=n_items, n_categories=4)
+        model.set_parameters(thresholds=offsets)
+    elif model_class is GeneralizedGradedUnfolding:
+        model = model_class(n_items=n_items, n_categories=4)
+        model.set_parameters(location=locations)
+    else:
+        assert model_class is IdealPointModel
+        model = model_class(n_items=n_items)
+        model.set_parameters(location=locations)
+    model._is_fitted = True
+    return model
+
+
+class TestItemLocations:
+    """Urry and b-matching rank items by each family's location parameters."""
+
+    @pytest.fixture(
+        params=[
+            "GeneralizedPartialCredit",
+            "PartialCreditModel",
+            "GradedResponseModel",
+            "GeneralizedGradedUnfolding",
+            "IdealPointModel",
+        ]
+    )
+    def model_class(self, request):
+        import mirt.models
+
+        return getattr(mirt.models, request.param)
+
+    def test_urry_selects_the_nearest_location(self, model_class):
+        locations = np.linspace(-2.5, 2.5, 30)
+        model = _located_pool(model_class, locations)
+
+        # GPCM, PCM, GGUM and ideal-point items used to sit at 0, giving item 0.
+        for theta in (-2.0, 2.0):
+            expected = int(np.argmin(np.abs(locations - theta)))
+            assert UrryRule().select_item(model, theta, set(range(30))) == expected
+
+    def test_b_matching_uses_item_locations(self, model_class):
+        locations = np.linspace(-2.5, 2.5, 30)
+        model = _located_pool(model_class, locations)
+        strategy = AStratified(n_strata=1, within="b-matching")
+
+        criteria = strategy.get_item_criteria(model, 2.0, set(range(30)), [])
+
+        assert criteria == pytest.approx(
+            {item: -abs(2.0 - location) for item, location in enumerate(locations)}
+        )
+        engine = CATEngine(model, item_selection=strategy, max_items=1, initial_theta=2)
+        assert engine.select_next_item() == 26
+
+    def test_padded_steps_are_ignored(self):
+        from mirt.cat.selection import _item_locations
+        from mirt.models import GeneralizedPartialCredit
+
+        model = GeneralizedPartialCredit(n_items=2, n_categories=[3, 4])
+        model.set_parameters(steps=np.array([[-1.0, 0.0, 0.0], [0.0, 1.0, 2.0]]))
+
+        assert_locations = np.testing.assert_allclose
+        assert_locations(_item_locations(model), [-0.5, 1.0])
+
+    def test_models_without_locations_are_rejected(self):
+        from mirt.models import NominalResponseModel
+
+        model = NominalResponseModel(n_items=4, n_categories=3)
+        model._is_fitted = True
+        with pytest.raises(ValueError, match="no item locations"):
+            UrryRule().select_item(model, 0.0, {0, 1, 2, 3})
+
+    def test_urry_criteria_rank_like_selection(self):
+        model = _stratified_pool(50)
+        available = set(range(0, 50, 3))
+        criteria = UrryRule().get_item_criteria(model, 0.4, available)
+
+        assert list(criteria) == sorted(available)
+        assert max(criteria, key=criteria.__getitem__) == UrryRule().select_item(
+            model, 0.4, available
+        )
+        assert criteria == pytest.approx(
+            {item: -abs(0.4 - model.difficulty[item]) for item in available}
+        )
+
+
+class TestPolytomousInformationKernel:
+    """Polytomous item information comes from the all-item kernels."""
+
+    @staticmethod
+    def _pool(model_class, n_items=30):
+        rng = np.random.default_rng(3)
+        model = model_class(
+            n_items=n_items, n_categories=[3 + i % 2 for i in range(n_items)]
+        )
+        key = "thresholds" if model_class is GradedResponseModel else "steps"
+        model.set_parameters(
+            discrimination=rng.lognormal(0.0, 0.3, n_items),
+            **{key: np.sort(rng.normal(0.0, 1.0, (n_items, 3)), axis=1)},
+        )
+        model._is_fitted = True
+        return model
+
+    @staticmethod
+    def _itemwise(model, theta, items):
+        return np.array(
+            [
+                [
+                    float(model.information(row[None, :], item_idx=item).sum())
+                    for item in items
+                ]
+                for row in theta
+            ]
+        )
+
+    @pytest.fixture(params=["GradedResponseModel", "GeneralizedPartialCredit"])
+    def model(self, request):
+        import mirt.models
+
+        return self._pool(getattr(mirt.models, request.param))
+
+    def test_mfi_criteria_use_the_kernel(self, model, monkeypatch):
+        import mirt.cat.selection as selection
+
+        calls = []
+        original = selection.polytomous_item_information
+
+        def spy(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(selection, "polytomous_item_information", spy)
+        available = set(range(0, 30, 2))
+        criteria = MaxFisherInformation().get_item_criteria(model, 0.3, available)
+
+        assert calls == [1]
+        expected = self._itemwise(model, np.array([[0.3]]), sorted(available))[0]
+        np.testing.assert_allclose(list(criteria.values()), expected, atol=1e-12)
+        assert list(criteria) == sorted(available)
+
+    def test_exposure_stopping_and_assembly_match_itemwise_information(self, model):
+        from mirt.cat.assembly import _information_matrix
+        from mirt.cat.exposure import _candidate_information
+        from mirt.cat.results import CATState
+        from mirt.cat.stopping import MinInformationStop
+
+        items = np.arange(5, 25)
+        theta = np.array([[-0.4]])
+        np.testing.assert_allclose(
+            _candidate_information(model, theta, items),
+            self._itemwise(model, theta, items)[0],
+            atol=1e-12,
+        )
+        grid = np.linspace(-2.0, 2.0, 7)
+        np.testing.assert_allclose(
+            _information_matrix(model, grid, model.n_items, items),
+            self._itemwise(model, grid[:, None], items),
+            atol=1e-12,
+        )
+        state = CATState(theta=-0.4, standard_error=0.5, items_administered=[0, 1])
+        best = self._itemwise(model, theta, range(2, 30)).max()
+        assert MinInformationStop(model, threshold=best + 1e-9).should_stop(state)
+        assert not MinInformationStop(model, threshold=best - 1e-9).should_stop(state)
+
+    def test_randomesque_paths_match_itemwise_evaluation(self, model):
+        def run(model):
+            engine = CATEngine(
+                model, exposure_control=Randomesque(4, seed=2), max_items=8, seed=5
+            )
+            return [
+                r.items_administered
+                for r in engine.run_batch_simulation([-1.0, 0.0, 1.0])
+            ]
+
+        kernel_paths = run(model)
+        # An instance-level hook keeps the item-by-item reference evaluation.
+        with patch.object(model, "information", wraps=model.information):
+            itemwise_paths = run(model)
+        assert kernel_paths == itemwise_paths
+
+
+class TestPosteriorWeightedCriteria:
+    """MPWI, MLWI, KLP and MEPV integrate over the history posterior."""
+
+    HISTORY = ([3, 11, 20], [1, 0, 1])
+
+    @staticmethod
+    def _grid(flat=False, n=21, bounds=(-4.0, 4.0)):
+        nodes, weights = np.polynomial.legendre.leggauss(n)
+        half = (bounds[1] - bounds[0]) / 2
+        nodes = (bounds[1] + bounds[0]) / 2 + half * nodes
+        weights = half * weights
+        if not flat:
+            weights = weights * np.exp(-0.5 * nodes**2)
+        return nodes, weights
+
+    def _posterior(self, model, flat=False):
+        nodes, weights = self._grid(flat)
+        items, responses = self.HISTORY
+        likelihood = np.ones_like(nodes)
+        for item, response in zip(items, responses, strict=True):
+            likelihood *= self._curves(model, nodes[:, None], item)[:, response]
+        posterior = weights * likelihood
+        return nodes, posterior / posterior.sum()
+
+    @staticmethod
+    def _curves(model, theta, item):
+        p = np.asarray(model.probability(theta, item_idx=item)).reshape(len(theta), -1)
+        return p if model.is_polytomous else np.column_stack((1 - p[:, 0], p[:, 0]))
+
+    def _reference(self, name, model, theta, items):
+        flat = name == "MLWI"
+        nodes, posterior = self._posterior(model, flat)
+        values = []
+        for item in items:
+            curves = self._curves(model, nodes[:, None], item)
+            current = self._curves(model, np.array([[theta]]), item)[0]
+            if name in ("MPWI", "MLWI"):
+                info = model.information(nodes[:, None], item_idx=item)
+                values.append(posterior @ np.asarray(info).reshape(len(nodes)))
+            elif name == "KLP":
+                kl = np.sum(current * np.log(current / curves), axis=1)
+                values.append(posterior @ kl)
+            else:
+                expected = 0.0
+                for k, probability in enumerate(current):
+                    mass = posterior * curves[:, k]
+                    mean = mass @ nodes / mass.sum()
+                    expected += probability * (mass @ (nodes - mean) ** 2) / mass.sum()
+                values.append(-expected)
+        return np.array(values)
+
+    @pytest.fixture(params=["2PL", "GRM"])
+    def model(self, request):
+        rng = np.random.default_rng(8)
+        if request.param == "2PL":
+            pool = TwoParameterLogistic(n_items=30)
+            pool.set_parameters(
+                discrimination=rng.lognormal(0.0, 0.3, 30),
+                difficulty=rng.normal(0.0, 1.0, 30),
+            )
+        else:
+            pool = GradedResponseModel(n_items=30, n_categories=4)
+            pool.set_parameters(
+                discrimination=rng.lognormal(0.0, 0.3, 30),
+                thresholds=np.sort(rng.normal(0.0, 1.0, (30, 3)), axis=1),
+            )
+        pool._is_fitted = True
+        return pool
+
+    @pytest.mark.parametrize("name", ["MPWI", "MLWI", "KLP", "MEPV"])
+    def test_criteria_match_quadrature_references(self, model, name):
+        strategy = create_selection_strategy(name)
+        items, responses = self.HISTORY
+        available = set(range(30)) - set(items)
+
+        criteria = strategy.get_item_criteria(model, 0.4, available, items, responses)
+
+        assert list(criteria) == sorted(available)
+        expected = self._reference(name, model, 0.4, sorted(available))
+        np.testing.assert_allclose(list(criteria.values()), expected, rtol=1e-9)
+        best = max(criteria, key=criteria.__getitem__)
+        assert strategy.select_item(model, 0.4, available, items, responses) == best
+
+    @pytest.mark.parametrize("name", ["mpwi", "MLWI", "klp", "MEPV"])
+    def test_engine_runs_named_criteria_with_its_quadrature(self, model, name):
+        engine = CATEngine(model, item_selection=name, n_quadpts=15, max_items=5)
+
+        assert engine._selection.n_quadpts == 15
+        result = engine.run_simulation(0.5, lambda item, theta: item % 2)
+        assert result.n_items_administered == 5
+        assert len(set(result.items_administered)) == 5
+
+    def test_criteria_reject_multidimensional_models(self):
+        from mirt.models import MultidimensionalModel
+
+        model = MultidimensionalModel(n_items=4, n_factors=2)
+        model._is_fitted = True
+        with pytest.raises(ValueError, match="unidimensional"):
+            create_selection_strategy("MPWI").get_item_criteria(model, 0.0, {0, 1})
+
+    def test_shrinking_kl_interval(self):
+        model = _stratified_pool(40)
+        items = list(range(4))
+        available = set(range(4, 40))
+        shrinking = KullbackLeibler(delta=2.0, delta_scaling="sqrt_n")
+
+        criteria = shrinking.get_item_criteria(model, 0.3, available, items, [1] * 4)
+
+        # After four items, delta / sqrt(4) = 1.
+        expected = KullbackLeibler(delta=1.0).get_item_criteria(model, 0.3, available)
+        assert criteria == pytest.approx(expected, rel=1e-12)
+        first = shrinking.get_item_criteria(model, 0.3, available)
+        assert first == pytest.approx(
+            KullbackLeibler(delta=2.0).get_item_criteria(model, 0.3, available)
+        )
+
+    def test_kl_rejects_unknown_scaling(self):
+        with pytest.raises(ValueError, match="delta_scaling"):
+            KullbackLeibler(delta_scaling="log_n")

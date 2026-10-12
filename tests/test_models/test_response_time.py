@@ -310,7 +310,7 @@ def test_response_time_predictions_validate_input_shapes():
         model.response_time_cdf(np.ones(3), tau)
     with pytest.raises(MirtValidationError, match="quantile"):
         model.response_time_quantile(np.ones((2, 1)) * 0.5, tau)
-    with pytest.raises(IndexError, match="Item index"):
+    with pytest.raises(IndexError, match=r"item_idx 2 out of range"):
         model.response_time_cdf(1.0, tau, item_idx=2)
 
 

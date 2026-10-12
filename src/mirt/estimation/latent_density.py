@@ -5,10 +5,16 @@ This module provides various latent trait distribution options:
 - Empirical histogram (nonparametric)
 - Davidian curves (semi-parametric)
 - Custom density functions
+
+With free item parameters the location and scale of an estimated density
+are not identified. Woods' histogram, Davidian curves and Gaussian mixtures
+are therefore held at mean 0 and variance 1 in every EM cycle, so the item
+parameters stay on the scale of a standard-normal fit.
 """
 
 from __future__ import annotations
 
+import warnings
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from math import factorial
@@ -17,8 +23,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import stats
-from scipy.special import logsumexp
+from scipy.optimize import minimize
+from scipy.special import logsumexp, roots_hermitenorm
 
 from mirt._prior_mass import log_density_quadrature_mass, normalize_log_mass
 from mirt.constants import PROB_EPSILON, REGULARIZATION_EPSILON
@@ -132,6 +138,191 @@ def _normalize_probabilities(
         raise ValueError(f"{name} must have positive total mass")
     scaled = values.copy() / scale
     return scaled / scaled.sum()
+
+
+# Densities whose mean and variance are this close to 0 and 1 count as
+# standardized. Normal masses on the rectangular grid of [-6, 6] miss about
+# 4e-8 of the unit variance in the truncated tails.
+_STANDARD_MOMENT_TOL = 1e-6
+# Floor for histogram heights before taking logarithms.
+_TINY = 1e-300
+
+
+def _is_standard(mean: float, variance: float) -> bool:
+    """Return whether moments are those of a standardized density."""
+    return (
+        abs(mean) <= _STANDARD_MOMENT_TOL
+        and abs(variance - 1.0) <= _STANDARD_MOMENT_TOL
+    )
+
+
+def _grid_moments(
+    nodes: NDArray[np.float64], masses: NDArray[np.float64]
+) -> tuple[float, float]:
+    """Return the mean and variance of discrete masses on ``nodes``."""
+    mean = float(masses @ nodes)
+    return mean, float(masses @ (nodes - mean) ** 2)
+
+
+def _woods_standardize(
+    nodes: NDArray[np.float64], masses: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Standardize a histogram by Woods' (2007) interpolation-extrapolation.
+
+    The masses on the sorted ``nodes`` are read as density heights over
+    cells reaching halfway to the neighbouring nodes (the end cells are as
+    wide as the adjacent spacing). Moving every height to its standardized
+    node ``(node - mean) / sd`` standardizes the density. The moved heights
+    are interpolated linearly at the original nodes and, beyond the outermost
+    moved nodes, extrapolated with the log-linear decay of the two outermost
+    heights, never increasing outward. On an equally spaced grid this is the
+    ``standardizeQuadrature`` step of R's ``mirt``, with the interpolation
+    fractions taken over the rescaled spacing.
+    """
+    mean, variance = _grid_moments(nodes, masses)
+    if not variance > 0.0:
+        return masses.copy()
+    widths = np.empty_like(nodes)
+    widths[1:-1] = (nodes[2:] - nodes[:-2]) / 2.0
+    widths[0] = nodes[1] - nodes[0]
+    widths[-1] = nodes[-1] - nodes[-2]
+    heights = masses / widths
+    log_heights = np.log(np.maximum(heights, _TINY))
+    moved = (nodes - mean) / np.sqrt(variance)
+
+    standardized = np.interp(nodes, moved, heights)
+    for end, inner, outside in (
+        (0, 1, nodes < moved[0]),
+        (-1, -2, nodes > moved[-1]),
+    ):
+        decay = max(log_heights[inner] - log_heights[end], 0.0) / abs(
+            moved[inner] - moved[end]
+        )
+        distance = np.abs(nodes[outside] - moved[end])
+        standardized[outside] = np.exp(log_heights[end] - decay * distance)
+    standardized *= widths
+    return standardized / standardized.sum()
+
+
+def _tilt_to_standard(
+    nodes: NDArray[np.float64],
+    masses: NDArray[np.float64],
+    *,
+    max_iter: int = 100,
+) -> NDArray[np.float64] | None:
+    """Return the masses closest to ``masses`` with mean 0 and variance 1.
+
+    Minimizes the Kullback-Leibler divergence from ``masses`` under the two
+    moment constraints. The solution tilts the masses exponentially,
+    ``p ~ masses * exp(g @ lam)`` with the moment functions
+    ``g = (x, x**2 - 1)``, and damped Newton steps find ``lam`` by minimizing
+    the convex dual ``log(sum(masses * exp(g @ lam)))``. Returns ``None`` when
+    no distribution on the support of ``masses`` has these moments.
+    """
+    support = masses > 0.0
+    moments = np.column_stack([nodes[support], nodes[support] ** 2 - 1.0])
+    log_base = np.log(masses[support])
+    multipliers = np.zeros(2)
+    dual = float(logsumexp(log_base))
+    log_tilted = log_base - dual
+    for _ in range(max_iter):
+        tilted = np.exp(log_tilted)
+        residual = tilted @ moments
+        if np.max(np.abs(residual)) < 1e-12:
+            fitted = np.zeros_like(masses)
+            fitted[support] = tilted / tilted.sum()
+            return fitted
+        centered = moments - residual
+        hessian = (centered * tilted[:, None]).T @ centered
+        try:
+            step = np.linalg.solve(hessian, residual)
+        except np.linalg.LinAlgError:
+            return None
+        length = 1.0
+        while length > 1e-12:
+            trial = log_base + moments @ (multipliers - length * step)
+            trial_dual = float(logsumexp(trial))
+            if trial_dual <= dual + 1e-14 * max(1.0, abs(dual)):
+                break
+            length *= 0.5
+        else:
+            return None
+        multipliers = multipliers - length * step
+        dual = trial_dual
+        log_tilted = trial - trial_dual
+    return None
+
+
+def _best_on_segment(
+    counts: NDArray[np.float64],
+    start: NDArray[np.float64],
+    end: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Return the masses on the segment from ``start`` to ``end`` that
+    maximize ``sum(counts * log(masses))``.
+
+    The objective is concave along the segment, so bisection on its slope
+    finds the maximizer. The result fits at least as well as ``start``.
+    """
+    observed = counts > 0.0
+    weight, low_end, high_end = counts[observed], start[observed], end[observed]
+    change = high_end - low_end
+
+    def slope(step: float) -> float:
+        mixed = np.maximum(low_end + step * change, _TINY)
+        return float(weight @ (change / mixed))
+
+    if slope(1.0) >= 0.0:
+        return end.copy()
+    if slope(0.0) <= 0.0:
+        return start.copy()
+    low, high = 0.0, 1.0
+    for _ in range(60):
+        middle = 0.5 * (low + high)
+        if slope(middle) > 0.0:
+            low = middle
+        else:
+            high = middle
+    return start + low * (end - start)
+
+
+def _solve_quadratic_constraints(
+    coefficients: NDArray[np.float64],
+    matrices: list[NDArray[np.float64]],
+    targets: list[float],
+    *,
+    max_iter: int = 20,
+    tol: float = 1e-13,
+) -> NDArray[np.float64] | None:
+    """Move ``coefficients`` onto ``c @ M @ c = target`` for every pair.
+
+    Gauss-Newton steps take the minimum-norm correction of the linearized
+    constraints. Returns ``None`` when the constraints are not met within
+    ``tol`` after ``max_iter`` steps.
+    """
+    current = np.asarray(coefficients, dtype=np.float64)
+    if not np.all(np.isfinite(current)):
+        return None
+    for iteration in range(max_iter + 1):
+        residual = np.array(
+            [
+                float(current @ matrix @ current) - target
+                for matrix, target in zip(matrices, targets, strict=True)
+            ]
+        )
+        if np.max(np.abs(residual)) <= tol:
+            return current.copy()
+        if iteration == max_iter:
+            break
+        jacobian = np.array([2.0 * (matrix @ current) for matrix in matrices])
+        try:
+            correction = np.linalg.solve(jacobian @ jacobian.T, residual)
+        except np.linalg.LinAlgError:
+            return None
+        current = current - jacobian.T @ correction
+        if not np.all(np.isfinite(current)):
+            return None
+    return None
 
 
 class LatentDensity(ABC):
@@ -641,18 +832,53 @@ class EmpiricalHistogram(LatentDensity):
 
 
 class EmpiricalHistogramWoods(LatentDensity):
-    """Empirical histogram density with Woods extrapolation.
+    """Empirical histogram density standardized by Woods' method.
 
-    Extends the standard empirical histogram approach using the method
-    of Woods (2007) which extrapolates probabilities at the tails of
-    the distribution to improve estimation in sparse regions.
+    Like :class:`EmpiricalHistogram`, the density is a discrete distribution
+    over the quadrature nodes estimated from the posterior counts of each EM
+    cycle. With free item parameters the location and scale of a histogram
+    are not identified, so each update standardizes the posterior histogram
+    to mean 0 and variance 1 by the interpolation-extrapolation method of
+    Woods (2007), as R's ``mirt`` does for ``dentype="EHW"``: the nodes are
+    rescaled to the standardized scale, the histogram heights are
+    interpolated linearly back at the original nodes, and the tails beyond
+    the rescaled range are extrapolated with a log-linear decay. A final
+    exponential tilt, the smallest reweighting in Kullback-Leibler
+    divergence, makes the mean and variance exact.
+
+    Each update is a conditional maximization step. When the standardized
+    histogram would fit the posterior counts worse than the current one, the
+    update moves from the current histogram only as far toward it as
+    improves the fit; every histogram on the way has mean 0 and variance 1.
+    The marginal likelihood therefore never decreases across EM cycles. The
+    first E-step uses the standard-normal masses of the quadrature rule
+    unless ``initial_probs`` are given.
 
     Parameters
     ----------
-    n_bins : int
-        Number of histogram bins (equals n_quadpts typically)
-    extrapolation_factor : float
-        Factor controlling extrapolation strength (0.5-2.0 typical)
+    n_bins : int, optional
+        Number of histogram bins, which must equal the number of quadrature
+        nodes. Defaults to the number of nodes of the first evaluation.
+    extrapolation_factor : float, optional
+        Deprecated and ignored; Woods' standardization has no blending
+        factor. Passing it emits a ``DeprecationWarning``.
+    initial_probs : ndarray, optional
+        Starting probability masses, normalized to sum to one.
+
+    Notes
+    -----
+    On an equally spaced grid the rescaling is R's ``standardizeQuadrature``,
+    except that interpolation and extrapolation use the spacing of the
+    rescaled nodes; R uses the original spacing, which leaves the rescaled
+    mean off zero whenever the standard deviation differs from one.
+
+    The mean and variance constraints leave ``n_bins - 3`` free masses, the
+    count of :attr:`n_parameters` and of R's ``mirt``. Grids with fewer than
+    three distinct nodes cannot be rescaled and keep the posterior histogram.
+
+    Like any empirical histogram, the estimate converges slowly when response
+    patterns such as perfect scores pull mass toward the outermost nodes;
+    such fits may need a larger ``max_iter``.
 
     References
     ----------
@@ -664,20 +890,26 @@ class EmpiricalHistogramWoods(LatentDensity):
     def __init__(
         self,
         n_bins: int | None = None,
-        extrapolation_factor: float = 1.0,
+        extrapolation_factor: float | None = None,
         initial_probs: NDArray[np.float64] | None = None,
     ) -> None:
         self.n_bins = None if n_bins is None else _validate_count(n_bins, name="n_bins")
-        if isinstance(extrapolation_factor, (bool, np.bool_)) or not isinstance(
-            extrapolation_factor, Real
-        ):
-            raise TypeError("extrapolation_factor must be a real number")
-        extrapolation_factor = float(extrapolation_factor)
-        if not np.isfinite(extrapolation_factor) or extrapolation_factor < 0.0:
-            raise ValueError("extrapolation_factor must be finite and non-negative")
-        self.extrapolation_factor: float = extrapolation_factor
+        if extrapolation_factor is not None:
+            if isinstance(extrapolation_factor, (bool, np.bool_)) or not isinstance(
+                extrapolation_factor, Real
+            ):
+                raise TypeError("extrapolation_factor must be a real number")
+            extrapolation_factor = float(extrapolation_factor)
+            if not np.isfinite(extrapolation_factor) or extrapolation_factor < 0.0:
+                raise ValueError("extrapolation_factor must be finite and non-negative")
+            warnings.warn(
+                "extrapolation_factor is deprecated and ignored: Woods' "
+                "standardization has no blending factor",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        self.extrapolation_factor: float | None = extrapolation_factor
         self._probs: NDArray[np.float64] | None = None
-        self._theta_points: NDArray[np.float64] | None = None
 
         if initial_probs is not None:
             self._probs = _normalize_probabilities(
@@ -688,64 +920,18 @@ class EmpiricalHistogramWoods(LatentDensity):
             self.n_bins = len(self._probs)
 
     def _initialize(
-        self, n_points: int, theta_points: NDArray[np.float64] | None = None
+        self, n_points: int, reference: NDArray[np.float64] | None = None
     ) -> None:
-        """Initialize with uniform distribution."""
+        """Initialize with the reference masses, or uniformly without them."""
         if self.n_bins is not None and self.n_bins != n_points:
             raise ValueError(
                 f"density has {self.n_bins} bins but received {n_points} points"
             )
         if self._probs is None:
             self.n_bins = n_points
-            self._probs = np.ones(n_points) / n_points
-        if theta_points is not None:
-            self._theta_points = np.asarray(theta_points, dtype=np.float64).copy()
-
-    def _extrapolate_tails(self, probs: NDArray[np.float64]) -> NDArray[np.float64]:
-        """Apply Woods extrapolation to tail probabilities.
-
-        The method fits a polynomial to the log-probabilities in the
-        interior region and extrapolates to the tails.
-        """
-        n = len(probs)
-        if n < 5:
-            return probs
-
-        log_probs = np.log(np.clip(probs, PROB_EPSILON, None))
-
-        n_interior = max(3, n // 3)
-        lower_idx = n_interior
-        upper_idx = n - n_interior
-
-        interior_mask = np.zeros(n, dtype=bool)
-        interior_mask[lower_idx:upper_idx] = True
-
-        if interior_mask.sum() < 3:
-            return probs
-
-        x = np.arange(n)
-        try:
-            poly = np.polyfit(x[interior_mask], log_probs[interior_mask], deg=2)
-
-            lower_extrap = np.exp(np.polyval(poly, x[:lower_idx]))
-            upper_extrap = np.exp(np.polyval(poly, x[upper_idx:]))
-
-            extrap_probs = probs.copy()
-            alpha = self.extrapolation_factor
-
-            extrap_probs[:lower_idx] = (1 - alpha) * probs[
-                :lower_idx
-            ] + alpha * lower_extrap
-            extrap_probs[upper_idx:] = (1 - alpha) * probs[
-                upper_idx:
-            ] + alpha * upper_extrap
-
-            extrap_probs = np.clip(extrap_probs, PROB_EPSILON, None)
-            extrap_probs = extrap_probs / extrap_probs.sum()
-
-            return extrap_probs
-        except (np.linalg.LinAlgError, ValueError):
-            return probs
+            self._probs = (
+                np.ones(n_points) / n_points if reference is None else reference.copy()
+            )
 
     def log_density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         if self._probs is None:
@@ -762,14 +948,18 @@ class EmpiricalHistogramWoods(LatentDensity):
         theta: NDArray[np.float64],
         quadrature_weights: NDArray[np.float64],
     ) -> NDArray[np.float64]:
-        """Return the histogram's discrete masses without GH reweighting."""
+        """Return the histogram's discrete masses without GH reweighting.
+
+        An uninitialized histogram starts from the normalized quadrature
+        weights, the standard-normal masses on the quadrature nodes.
+        """
         n_points = _point_count(theta)
-        _normalize_weights(
+        reference = _normalize_weights(
             quadrature_weights,
             n_points=n_points,
             name="quadrature_weights",
         )
-        self._initialize(n_points, np.asarray(theta))
+        self._initialize(n_points, reference)
         return normalize_log_mass(self.log_density(theta))
 
     def update(
@@ -777,27 +967,55 @@ class EmpiricalHistogramWoods(LatentDensity):
         theta_points: NDArray[np.float64],
         weights: NDArray[np.float64],
     ) -> None:
-        n_points = _point_count(theta_points, name="theta_points")
-        normalized_weights = _normalize_weights(weights, n_points=n_points)
-        self._initialize(n_points, theta_points)
+        """Set the histogram to the standardized posterior histogram."""
+        nodes = _as_univariate_points(theta_points, name="theta_points")
+        counts = _normalize_weights(weights, n_points=len(nodes))
+        previous = self._probs
+        self._initialize(len(nodes))
 
-        raw_probs = np.clip(normalized_weights, PROB_EPSILON, None)
+        order = np.argsort(nodes, kind="stable")
+        sorted_nodes = nodes[order]
+        if len(nodes) < 3 or np.any(np.diff(sorted_nodes) <= 0.0):
+            self._probs = counts
+            return
+        fitted = self._standardize(
+            sorted_nodes,
+            counts[order],
+            None if previous is None else previous[order],
+        )
+        self._probs = np.empty_like(fitted)
+        self._probs[order] = fitted
 
-        self._probs = self._extrapolate_tails(raw_probs)
-
-        self._probs = np.clip(self._probs, PROB_EPSILON, None)
-        self._probs = self._probs / self._probs.sum()
+    @staticmethod
+    def _standardize(
+        nodes: NDArray[np.float64],
+        counts: NDArray[np.float64],
+        previous: NDArray[np.float64] | None,
+    ) -> NDArray[np.float64]:
+        """Return standardized masses that fit ``counts`` at least as well as
+        a standardized ``previous`` histogram."""
+        woods = _woods_standardize(nodes, counts)
+        candidate = _tilt_to_standard(nodes, woods)
+        if previous is None or not _is_standard(*_grid_moments(nodes, previous)):
+            return woods if candidate is None else candidate
+        if candidate is None:
+            return previous
+        # Both ends hold mean 0 and variance 1, and so does every point
+        # between them; the best of these fits the counts at least as well
+        # as the current histogram.
+        return _best_on_segment(counts, previous, candidate)
 
     @property
     def probabilities(self) -> NDArray[np.float64] | None:
-        """Return an owned copy of the extrapolated probability masses."""
+        """Return an owned copy of the standardized probability masses."""
         return None if self._probs is None else self._probs.copy()
 
     @property
     def n_parameters(self) -> int:
+        """Free masses: one fewer than the bins, less the two moments."""
         if self._probs is None:
             return 0
-        return len(self._probs) - 1
+        return max(len(self._probs) - 3, 0)
 
 
 class DavidianCurve(LatentDensity):
@@ -810,6 +1028,13 @@ class DavidianCurve(LatentDensity):
 
     where phi is standard normal and H_k are Hermite polynomials.
 
+    Each update maximizes the expected complete-data log-likelihood of the
+    posterior counts at the quadrature nodes over the normalized
+    coefficients. With ``standardize=True`` the maximization is restricted to
+    curves with mean 0 and variance 1, the identification of the
+    Davidian-curve IRT of Woods and Lin (2009), so the latent location and
+    scale cannot drift into the item parameters.
+
     Parameters
     ----------
     degree : int
@@ -817,19 +1042,47 @@ class DavidianCurve(LatentDensity):
         Higher values allow more flexible shapes.
     coefficients : ndarray, optional
         Initial coefficients. Default starts at standard normal.
+    standardize : bool, default=True
+        Hold the density at mean 0 and variance 1. Disable it only when
+        fixed item parameters identify the latent location and scale.
+
+    Notes
+    -----
+    The constrained maximization uses sequential quadratic programming, and
+    an update that would fit the counts worse than the current curve is
+    skipped. The analytic mean and variance of the curve are held at 0 and
+    1. On Gauss-Hermite nodes with at least ``degree + 2`` points the
+    normalization and moments of the quadrature masses are exact as well,
+    so every update is a conditional maximization step and the marginal
+    likelihood never decreases; on the fine rectangular grid they agree to
+    about ``1e-6``.
+
+    The mean and variance constraints leave ``degree - 2`` free coefficients,
+    the count of :attr:`n_parameters`; curves of degree 2 or less are then
+    held at the standard normal. R's ``mirt`` (``dentype="Davidian-k"``)
+    instead refits the curve to standardized posterior counts, which
+    standardizes it only approximately, and counts ``k`` parameters.
 
     References
     ----------
     Davidian, M., & Gallant, A. R. (1993). The nonlinear mixed effects
     model with a smooth random effects density. Biometrika, 80(3), 475-488.
+
+    Woods, C. M., & Lin, N. (2009). Item response theory with estimation
+    of the latent density using Davidian curves. Applied Psychological
+    Measurement, 33(2), 102-117.
     """
 
     def __init__(
         self,
         degree: int = 4,
         coefficients: NDArray[np.float64] | None = None,
+        standardize: bool = True,
     ) -> None:
         self.degree = _validate_count(degree, name="degree", allow_zero=True)
+        if not isinstance(standardize, (bool, np.bool_)):
+            raise TypeError("standardize must be a boolean")
+        self.standardize = bool(standardize)
 
         if coefficients is not None:
             self._coeffs = np.asarray(coefficients, dtype=np.float64)
@@ -843,6 +1096,7 @@ class DavidianCurve(LatentDensity):
             self._coeffs[0] = 1.0
 
         self._normalize_coefficients()
+        self._moments = self._moment_matrices()
 
     def _normalize_coefficients(self) -> None:
         """Normalize coefficients so density integrates to 1.
@@ -863,6 +1117,25 @@ class DavidianCurve(LatentDensity):
         if not np.isfinite(norm_sq) or norm_sq <= 0.0:
             raise ValueError("coefficients must define a finite positive density")
         self._coeffs = scaled_coefficients / np.sqrt(norm_sq)
+
+    def _moment_matrices(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
+        """Return the matrices ``M_r`` with ``E[x^r g(x)^2] = c @ M_r @ c``.
+
+        Expectations are under the standard normal, so the moments of the
+        curve are ratios to ``c @ M_0 @ c``. A Gauss-Hermite rule with
+        ``degree + 2`` nodes integrates these polynomials exactly.
+        """
+        nodes, weights = roots_hermitenorm(self.degree + 2)
+        weights = weights / weights.sum()
+        basis = self._hermite_polynomials(nodes)
+        weighted = basis * weights[:, None]
+        return (
+            weighted.T @ basis,
+            weighted.T @ (nodes[:, None] * basis),
+            weighted.T @ (nodes[:, None] ** 2 * basis),
+        )
 
     def _hermite_polynomials(self, x: NDArray[np.float64]) -> NDArray[np.float64]:
         """Compute probabilist's Hermite polynomials H_k(x).
@@ -887,6 +1160,9 @@ class DavidianCurve(LatentDensity):
         return H @ self._coeffs
 
     def log_density(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
+        # scipy.stats is slow to import, so only the densities that use it do.
+        from scipy import stats
+
         theta = _as_univariate_points(theta)
 
         log_phi = stats.norm.logpdf(theta)
@@ -898,38 +1174,98 @@ class DavidianCurve(LatentDensity):
 
         return log_phi + np.log(g_squared)
 
+    @property
+    def mean(self) -> float:
+        """Return the analytic curve mean."""
+        norm, first, _ = self._moments
+        coefficients = self._coeffs
+        return float(coefficients @ first @ coefficients) / float(
+            coefficients @ norm @ coefficients
+        )
+
+    @property
+    def variance(self) -> float:
+        """Return the analytic curve variance."""
+        norm, _, second = self._moments
+        coefficients = self._coeffs
+        second_moment = float(coefficients @ second @ coefficients) / float(
+            coefficients @ norm @ coefficients
+        )
+        return max(second_moment - self.mean**2, 0.0)
+
     def update(
         self,
         theta_points: NDArray[np.float64],
         weights: NDArray[np.float64],
     ) -> None:
-        """Update Davidian curve coefficients via weighted least squares."""
+        """Maximize the expected log-likelihood of the posterior counts."""
         theta = _as_univariate_points(theta_points, name="theta_points")
-        normalized_weights = _normalize_weights(weights, n_points=len(theta))
-
-        H = self._hermite_polynomials(theta)
-
-        phi = stats.norm.pdf(theta)
-
-        target = np.sqrt(normalized_weights / (phi + 1e-300))
-
-        try:
-            weighted_h = H * phi[:, None]
-            HtWH = H.T @ weighted_h
-            HtWy = H.T @ (phi * target)
-
-            reg = REGULARIZATION_EPSILON * np.eye(self.degree + 1)
-            coefficients = np.linalg.solve(HtWH + reg, HtWy)
-
-            if coefficients[0] < 0:
-                coefficients = -coefficients
-            if not np.all(np.isfinite(coefficients)):
-                return
-            self._coeffs = coefficients
-            self._normalize_coefficients()
-
-        except np.linalg.LinAlgError:
+        counts = _normalize_weights(weights, n_points=len(theta))
+        if self.degree == 0:
             return
+
+        # Optimize over the coordinates of the orthonormal polynomials
+        # H_k / sqrt(k!), which keeps high degrees well conditioned.
+        scale = 1.0 / np.sqrt(
+            np.array([factorial(k) for k in range(self.degree + 1)], dtype=np.float64)
+        )
+        basis = self._hermite_polynomials(theta) * scale
+        norm, first, second = (
+            scale[:, None] * matrix * scale for matrix in self._moments
+        )
+        # Quadratic constraints c @ M @ c = target: unit normalization and,
+        # when standardizing, zero mean and unit second moment.
+        matrices = [norm]
+        targets = [1.0]
+        if self.standardize:
+            matrices += [first, second - norm]
+            targets += [0.0, 0.0]
+
+        def fit(coefficients: NDArray[np.float64]) -> tuple[float, NDArray[np.float64]]:
+            values = basis @ coefficients
+            safe = np.where(np.abs(values) < 1e-150, 1e-150, values)
+            total = float(coefficients @ norm @ coefficients)
+            value = float(counts @ np.log(safe**2)) - np.log(total)
+            gradient = (
+                2.0 * (basis.T @ (counts / safe)) - 2.0 * (norm @ coefficients) / total
+            )
+            return value, gradient
+
+        def negative_fit(
+            coefficients: NDArray[np.float64],
+        ) -> tuple[float, NDArray[np.float64]]:
+            value, gradient = fit(coefficients)
+            return -value, -gradient
+
+        constraints = [
+            {
+                "type": "eq",
+                "fun": lambda c, m=matrix, t=target: float(c @ m @ c) - t,
+                "jac": lambda c, m=matrix: 2.0 * (m @ c),
+            }
+            for matrix, target in zip(matrices, targets, strict=True)
+        ]
+        current = self._coeffs / scale
+        with np.errstate(all="ignore"):
+            result = minimize(
+                negative_fit,
+                current,
+                jac=True,
+                method="SLSQP",
+                constraints=constraints,
+                options={"maxiter": 200, "ftol": 1e-12},
+            )
+        candidate = _solve_quadratic_constraints(result.x, matrices, targets)
+        if candidate is None:
+            return
+        feasible = _solve_quadratic_constraints(
+            current, matrices, targets, max_iter=0, tol=1e-10
+        )
+        if feasible is not None and fit(candidate)[0] < fit(current)[0]:
+            return
+        if candidate[0] < 0:
+            candidate = -candidate
+        self._coeffs = candidate * scale
 
     @property
     def coefficients(self) -> NDArray[np.float64]:
@@ -938,16 +1274,42 @@ class DavidianCurve(LatentDensity):
 
     @property
     def n_parameters(self) -> int:
-        return self.degree
+        """Free coefficients: the degree, less two moments when standardized."""
+        return max(self.degree - 2, 0) if self.standardize else self.degree
 
 
 class MixtureDensity(LatentDensity):
     """Mixture of Gaussians latent density.
 
+    Each update takes one EM step of the mixture fit to the posterior counts
+    at the quadrature nodes. With ``standardize=True`` the step is followed by
+    the affine rescaling of all component means and variances that gives the
+    mixture mean 0 and variance 1, so the latent location and scale cannot
+    drift into the item parameters. From a standardized mixture, the step is
+    halved until the rescaled mixture fits the counts at least as well as the
+    current one.
+
     Parameters
     ----------
     n_components : int
         Number of mixture components
+    means : ndarray, optional
+        Component means. Defaults to equally spaced means on ``[-1.5, 1.5]``.
+    variances : ndarray, optional
+        Component variances. Defaults to 0.5 for every component.
+    weights : ndarray, optional
+        Component weights, normalized to sum to one. Defaults to equal weights.
+    standardize : bool, default=True
+        Hold the mixture at mean 0 and variance 1 during EM. The default
+        means and variances are then rescaled to that standard; supplied
+        values are kept until the first update. Disable it only when fixed
+        item parameters identify the latent location and scale.
+
+    Notes
+    -----
+    Standardization constrains two of the ``3 * n_components - 1`` mixture
+    parameters, which leaves ``3 * n_components - 3`` for
+    :attr:`n_parameters`.
     """
 
     def __init__(
@@ -956,8 +1318,12 @@ class MixtureDensity(LatentDensity):
         means: NDArray[np.float64] | None = None,
         variances: NDArray[np.float64] | None = None,
         weights: NDArray[np.float64] | None = None,
+        standardize: bool = True,
     ) -> None:
         self.n_components = _validate_count(n_components, name="n_components")
+        if not isinstance(standardize, (bool, np.bool_)):
+            raise TypeError("standardize must be a boolean")
+        self.standardize = bool(standardize)
 
         if means is not None:
             self.means = np.asarray(means, dtype=np.float64)
@@ -987,6 +1353,22 @@ class MixtureDensity(LatentDensity):
             )
         else:
             self.weights = np.ones(self.n_components) / self.n_components
+
+        if self.standardize and means is None and variances is None:
+            self.means, self.variances = self._standardized(
+                self.means, self.variances, self.weights
+            )
+
+    @staticmethod
+    def _standardized(
+        means: NDArray[np.float64],
+        variances: NDArray[np.float64],
+        weights: NDArray[np.float64],
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Rescale components so the mixture has mean 0 and variance 1."""
+        mean = float(weights @ means)
+        variance = float(weights @ (variances + (means - mean) ** 2))
+        return (means - mean) / np.sqrt(variance), variances / variance
 
     def _component_log_density(
         self,
@@ -1039,6 +1421,8 @@ class MixtureDensity(LatentDensity):
 
     def cdf(self, theta: NDArray[np.float64]) -> NDArray[np.float64]:
         """Evaluate the cumulative mixture distribution at latent values."""
+        from scipy import stats
+
         points = _as_univariate_points(theta)
         standardized = (points[:, None] - self.means[None, :]) / np.sqrt(
             self.variances[None, :]
@@ -1125,27 +1509,55 @@ class MixtureDensity(LatentDensity):
         component_mass = weighted_responsibilities.sum(axis=0)
         active = component_mass > PROB_EPSILON
 
+        updated_means = self.means.copy()
+        updated_variances = self.variances.copy()
         if np.any(active):
-            updated_means = self.means.copy()
             updated_means[active] = (
                 weighted_responsibilities[:, active].T @ theta
             ) / component_mass[active]
 
             centered = theta[:, None] - updated_means[None, :]
-            updated_variances = self.variances.copy()
             updated_variances[active] = (
                 weighted_responsibilities[:, active] * centered[:, active] ** 2
             ).sum(axis=0) / component_mass[active]
+            updated_variances = np.maximum(updated_variances, 0.01)
 
+        updated_weights = np.maximum(component_mass, PROB_EPSILON)
+        updated_weights = updated_weights / updated_weights.sum()
+
+        if not self.standardize:
             self.means = updated_means
-            self.variances = np.maximum(updated_variances, 0.01)
+            self.variances = updated_variances
+            self.weights = updated_weights
+            return
 
-        self.weights = np.maximum(component_mass, PROB_EPSILON)
-        self.weights = self.weights / self.weights.sum()
+        start = (self.means, self.variances, self.weights)
+        current = (
+            float(normalized_weights @ self.log_density(theta))
+            if _is_standard(self.mean, self.variance)
+            else None
+        )
+        step = 1.0
+        for _ in range(30):
+            self.weights = start[2] + step * (updated_weights - start[2])
+            self.means, self.variances = self._standardized(
+                start[0] + step * (updated_means - start[0]),
+                start[1] + step * (updated_variances - start[1]),
+                self.weights,
+            )
+            if (
+                current is None
+                or float(normalized_weights @ self.log_density(theta)) >= current
+            ):
+                return
+            step *= 0.5
+        self.means, self.variances, self.weights = start
 
     @property
     def n_parameters(self) -> int:
-        return 3 * self.n_components - 1
+        """Free parameters, less the mean and variance when standardized."""
+        n_free = 3 * self.n_components - 1
+        return n_free - 2 if self.standardize else n_free
 
 
 class CustomDensity(LatentDensity):
