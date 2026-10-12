@@ -114,7 +114,7 @@ jobs:
           uv run --directory "$RUNNER_TEMP/sdist" --no-sync maturin build \
             --release --locked --out "$GITHUB_WORKSPACE/dist"
       - name: Upload wheel
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6
         with:
           name: ci-wheel
           path: dist/*.whl
@@ -149,7 +149,7 @@ jobs:
         run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --cov=mirt --cov-report=xml --cov-report=term-missing --junitxml=test-results.xml
       - name: Upload test reports
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6
         with:
           name: test-reports-python-${{ matrix.python-version }}
           path: |
@@ -184,7 +184,7 @@ jobs:
         run: uv run --no-sync pytest tests/ -m 'not slow and not performance' --junitxml=test-results-numpy.xml
       - name: Upload fallback test report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6
         with:
           name: test-reports-numpy
           path: test-results-numpy.xml
@@ -223,7 +223,7 @@ jobs:
             --suite scoring --suite posterior --suite score-equating --suite pointwise --suite multigroup-fit --backend rust --persons 2000 --items 30 \
             --repeats 3 --warmups 1 --json benchmark-report.json
       - name: Upload benchmark report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6
         with:
           name: benchmark-report-${{ github.sha }}
           path: benchmark-report.json
@@ -252,7 +252,7 @@ jobs:
         run: uv run --no-sync pytest tests/test_gpu/ -m 'not slow and not performance' -rs --junitxml=test-results-tensor.xml
       - name: Upload tensor parity report
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v6
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v6
         with:
           name: test-reports-tensor
           path: test-results-tensor.xml
