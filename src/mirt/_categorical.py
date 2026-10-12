@@ -122,10 +122,16 @@ def item_category_frequencies(
         stop = start + rows_per_block
         block = responses[start:stop]
         block_valid = valid[start:stop]
-        for category in range(n_categories):
-            frequencies[category] += np.count_nonzero(
-                (block == category) & block_valid, axis=0
-            )
+        # Encode (item, category) pairs into one histogram per bounded block.
+        encoded = np.flatnonzero(block_valid)
+        codes = block.ravel()[encoded].astype(np.intp, copy=False)
+        encoded %= n_items
+        encoded *= n_categories
+        encoded += codes
+        counts = np.bincount(encoded, minlength=n_items * n_categories)
+        frequencies += (
+            counts.astype(np.intp, copy=False).reshape(n_items, n_categories).T
+        )
     return frequencies
 
 

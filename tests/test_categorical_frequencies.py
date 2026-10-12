@@ -8,11 +8,13 @@ import mirt._categorical as categorical
 
 @pytest.mark.parametrize("chunk_elements", [1, 35, 1_000_000])
 @pytest.mark.parametrize("floating", [False, True])
+@pytest.mark.parametrize("n_categories", [6, 32])
 def test_frequencies_match_independent_item_counts(
-    monkeypatch, chunk_elements, floating
+    monkeypatch, chunk_elements, floating, n_categories
 ):
     rng = np.random.default_rng(54)
-    responses = rng.integers(-1, 6, size=(37, 10))[:, ::2]
+    responses = rng.integers(-1, n_categories, size=(37, 10))[:, ::2]
+    responses[0, 2] = n_categories - 1
     valid = responses >= 0
     valid[:, 0] = False
     valid[::3, 1] = False
@@ -20,7 +22,7 @@ def test_frequencies_match_independent_item_counts(
         responses = responses.astype(float)
         responses[~valid] = np.nan
     monkeypatch.setattr(categorical, "_FREQUENCY_CHUNK_ELEMENTS", chunk_elements)
-    expected = np.zeros((6, 5), dtype=np.intp)
+    expected = np.zeros((n_categories, 5), dtype=np.intp)
     for item in range(5):
         values, counts = np.unique(responses[valid[:, item], item], return_counts=True)
         expected[values.astype(int), item] = counts
